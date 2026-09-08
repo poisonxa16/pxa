@@ -1088,7 +1088,7 @@ than enforced, because this process `exec`s the server and cannot observe it.
 | id | Refuses |
 |---|---|
 | **R-08** | `cudagraph_mode` other than `FULL_DECODE_ONLY`. `FULL_AND_PIECEWISE` captures **prefill** graphs and returns fluent garbage from character zero on short raw completions. Its best aggregate (88.4) is *below* the correct config's (88.7) — there is no speed argument for it. |
-| **R-16** | A partial offload (`--ngl` < 99) on a GPU-only tier (PXQ1, PXQ6). No CPU codec exists; the run would abort. |
+| **R-16** | A partial offload (`--ngl` < 99) on PXQ1 or PXQ6. The launcher still refuses this pending validation of the CPU dequant path — the codec itself now covers all six tiers (`docs/PXQ-CPU-DOT.md`); this is a launcher policy hold, not a technical "would abort." |
 | **R-17A** | `-c` beyond the model's trained context. |
 | **R-17B** | GPU-resident weights alone exceeding total VRAM under full offload. |
 | **R-21** | `--np` above the measured cudagraph capture ladder `[1,2,4,8]`. A too-short ladder has cliffed before — a hardcoded `[1,2]` ladder cliffed at 3+ concurrent. Escape: `--accept-unmeasured`. |

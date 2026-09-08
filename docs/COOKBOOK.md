@@ -317,13 +317,18 @@ any PXQ tier offers:
 
 ```bash
 ./build/bin/llama-pxq-export in.gguf out-f16.gguf
-./build/bin/llama-quantize --allow-requantize --imatrix m.imatrix out-f16.gguf out-Q4_K_M.gguf Q4_K_M
+./build/bin/llama-quantize --allow-requantize --i-know-this-is-double-lossy --imatrix m.imatrix out-f16.gguf out-Q4_K_M.gguf Q4_K_M
 ```
 
 `llama-pxq-export` decodes the PXQ GGUF tensor by tensor into plain F16 (add `--type f32` for
 F32, `--cpu` to decode without a GPU); everything that isn't a PXQ tensor copies through
-byte for byte. `llama-quantize` then requantizes that plain file the normal way. The result
-loads in stock llama.cpp, no PXQ support required on the reading end.
+byte for byte. `llama-quantize` then requantizes that plain file the normal way — pass
+`--i-know-this-is-double-lossy` even here: most PXQ files carry a few non-PXQ tensors (an
+attention head or two, an embedding) already stored as `q8_0` or `mxfp4`, copied through
+verbatim by the export step, and `llama-quantize` refuses to requantize an already-quantized
+tensor without that flag. The result loads in stock llama.cpp, no PXQ support required on the
+reading end — proved end to end, CPU-only, export then requantize then a stock `llama-cli`
+load, on a real PXQ4 file.
 
 Say the quality cost plainly, in the tool's own words (`llama-quantize --help`, on
 `--i-know-this-is-double-lossy`): *"Two lossy passes compound: the second codec fits a grid to

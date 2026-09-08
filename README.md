@@ -177,6 +177,19 @@ starts**. `--explain` decides and runs nothing. Full details in
 [`docs/LAUNCHER.md`](docs/LAUNCHER.md); the same table written out as copy-paste commands is
 [`docs/COOKBOOK.md`](docs/COOKBOOK.md).
 
+**Leaving PXQ.** A PXQ file only loads on this engine — stock llama.cpp and stock ik_llama.cpp
+cannot load a PXQ tensor, full stop. `llama-pxq-export` turns one back into a plain GGUF so any
+stock reader can open it:
+
+```bash
+./build/bin/llama-pxq-export in.gguf out-f16.gguf --cpu
+./build/bin/llama-quantize --allow-requantize --i-know-this-is-double-lossy out-f16.gguf out-Q4_K_M.gguf Q4_K_M
+```
+
+Proved end to end on a 5.6 GB PXQ4 file, CPU only: export to F16 (109s) then requantize to
+Q4_K_M (87s) produced a file a stock `llama-cli` build loaded and generated from with no PXQ
+support compiled in. Details and the full recipe: [`docs/COOKBOOK.md`](docs/COOKBOOK.md#leave-pxq-export-and-requantize-to-a-stock-type).
+
 ---
 
 ## How it decides for you

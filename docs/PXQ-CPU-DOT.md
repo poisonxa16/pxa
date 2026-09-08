@@ -113,16 +113,17 @@ divergence is dominated by the CUDA GEMM snapping products to fp16 inside the MM
 
 | tier | id | CPU dequant (phase 1) | integer dot (phase 2) |
 |---|---|---|---|
-| PXQ1    | 248 | export path only | no — 1-bit sign codes |
+| PXQ1    | 248 | yes | no — 1-bit sign codes |
 | PXQ4    | 252 | yes | **yes** |
 | PXQ4-HQ | 253 | yes | **yes** |
 | PXQ2    | 254 | yes | no — 2-bit packing |
 | PXQ3    | 255 | yes | no — bit-plane packing |
-| PXQ6    | 256 | export path only | no — 32-entry book |
+| PXQ6    | 256 | yes | no — 32-entry book |
 
-On this branch `pxa_pxq_is_cpu_supported` is true for PXQ4/PXQ4-HQ/PXQ2/PXQ3; PXQ1 and PXQ6
-decode is the export lane's commit 41d7eba419 and reaches the CPU when that branch merges.
-Every tier the host can decode still runs; the ones without an integer dot run at phase-1 speed.
+`pxa_pxq_is_cpu_supported` is true for all six tiers now — the export lane's PXQ1/PXQ6 decode
+commit merged. Every tier the host can decode runs, on `-ngl 0`, a partial offload, and the
+fused CPU MoE op alike; the ones without an integer dot (PXQ1, PXQ2, PXQ3, PXQ6) run at
+phase-1 (dequant) speed instead of phase-2 speed.
 
 ## Tests
 
