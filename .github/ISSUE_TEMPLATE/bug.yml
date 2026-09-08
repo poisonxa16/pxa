@@ -1,0 +1,49 @@
+name: Bug report
+description: Something is wrong with the engine, the sidecar, the tarball or the image.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please include the startup banner. The `version:` line and the `PXA_AUTO:` block tell us
+        which build you are on and what it decided for your card, which is most of the diagnosis.
+  - type: textarea
+    id: banner
+    attributes:
+      label: Startup banner
+      description: The `version:` line, `PXA config level:` line and the full `PXA_AUTO:` block.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: card
+    attributes:
+      label: Card(s) and driver
+      description: "Output of: nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv"
+    validations:
+      required: true
+  - type: input
+    id: how
+    attributes:
+      label: How you installed
+      description: Tarball / container image / built from source (say which tag or commit).
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: The exact command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      render: text

@@ -1,0 +1,7 @@
+# Home 2x Tesla V100-PCIE-16GB, stock Qwen3.8-27B PXQ4 + PXQ4 DFlash2 drafter, vLLM sidecar, greedy 192 tokens, 12-run medians, MML 2048, all rows gate-settled (spread 0 at np1/np2, byte-identical or near-tie vs plain)
+cell,value,unit,notes
+plain decode,47.02,tok/s,m884 verify kernel on
+DFlash2 k=3,52.14,tok/s,acceptance ~2.9; lossless 12/12
+DFlash2 k=5,51.87,tok/s,bf16 drafter row
+DFlash2 k=7,82.18,tok/s,PXQ4 drafter incl. fc; fits only at MML 2048 on 16 GB
+DFlash2 k=7 (8 streams aggregate),86.23,tok/s,

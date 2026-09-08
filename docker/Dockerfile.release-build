@@ -1,0 +1,55 @@
+# docker/Dockerfile.release-build — the OLDER-glibc build environment for release tarballs.
+#
+# WHY THIS EXISTS: the campaign's day-to-day dev image (pxa-sm60-dev) is built on
+# nvidia/cuda:12.8.1-devel-ubuntu24.04 (glibc 2.39). Binaries linked there refuse to even start
+# on an older host ("version GLIBC_2.38 not found") -- confirmed by hand, packaging the first
+# release tarball. Building the RELEASE binaries here instead, on Ubuntu 22.04 (glibc 2.35,
+# GLIBCXX 3.4.30), lowers that floor to glibc >= 2.35 -- Ubuntu 22.04+, Debian 12+, RHEL 9+, and
+# (per objdump against the actual binary at packaging time) whatever else reports that floor via
+# `ldd --version`. It does NOT eliminate the floor: glibc/libstdc++ themselves are still never
+# bundled (same reason the NVIDIA driver isn't) -- an even older host still needs a newer distro
+# or a container with a new-enough userspace. What CAN be bundled is libgomp and libstdc++,
+# shipped in lib/ alongside the CUDA runtime libs, so a host slightly newer than this image but
+# still shy of whatever the *dev* image would have required is covered by the RPATH lookup.
+#
+# This is a BUILD SHELL, not a multi-stage app image: no COPY of source, no baked-in build. Bind-
+# mount the repo and run cmake/cmake --build inside it, same pattern as every other build
+# container this campaign uses (pxa-sm60-dev included). scripts/make-release-tarball.sh builds
+# this image itself (image tag pxa-release-build:cu128-u2204) and runs the build inside it when
+# BUILD_DIR is not already populated -- see BUILD_IMAGE / --build in that script's usage.
+#
+# Build:  docker build -f docker/Dockerfile.release-build -t pxa-release-build:cu128-u2204 .
+# Use:    docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=none \
+#           -v /path/to/repo:/work -w /work pxa-release-build:cu128-u2204 \
+#           bash -c 'cmake -B build-rel -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70" \
+#                    -DCMAKE_BUILD_TYPE=Release -DGGML_SCHED_MAX_COPIES=2 && \
+#                    cmake --build build-rel -j6 --target llama-server llama-cli llama-bench \
+#                    llama-perplexity llama-quantize llama-gguf-split test-pxq-cpu-dot \
+#                    test-kv-seq-shadow test-narrow-kernel-parity'
+
+ARG CUDA_VERSION=12.8.1
+ARG UBUNTU_VERSION=22.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+# Same install list as the campaign's day-to-day dev image (python3 + venv/pip, ninja-build,
+# git), plus build-essential (gcc/g++/make -- present in most "devel" CUDA images already, but
+# not guaranteed, so pinned explicitly here) and patchelf (needed to set an RPATH on the release
+# binaries; the day-to-day dev image does not carry it, which is why the first release tarball
+# shipped without a patched RPATH). NOT installing apt's cmake here on purpose -- see below.
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+      python3 python3-venv python3-pip ninja-build git \
+      build-essential patchelf binutils ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# CMake: Ubuntu 22.04's apt package is 3.22.1, which does not know how to enable the CUDA20
+# language dialect this codebase's CMakeLists.txt asks for (CMAKE_CXX_STANDARD 20 propagated to
+# CUDA-enabled targets) -- confirmed by hand: `cmake -B` failed with 'Target "ggml" requires the
+# language dialect "CUDA20" ... but CMake does not know the compile flags to use to enable it.'
+# CUDA20 dialect support needs a considerably newer CMake than 22.04 ships. Installing a recent
+# CMake from PyPI (the official Kitware wheel) instead, which lands in /usr/local/bin ahead of
+# apt's /usr/bin/cmake on PATH -- this does NOT change the compiler or glibc floor, only the
+# build tool's own understanding of newer CUDA/C++ dialects.
+RUN pip3 install --no-cache-dir "cmake>=3.28"
+
+WORKDIR /work

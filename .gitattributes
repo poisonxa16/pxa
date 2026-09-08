@@ -1,0 +1,21 @@
+# Release scrub (2026-09-06): box-bound harness scripts are excluded from `git archive`, which is what
+# the published tree is built from. They hardcode one machine's mounts and container names and are
+# not part of a release tarball. The trees that ship are scrubbed to env vars (see pxa/pxq4/BOX-ENV.md).
+pxa/pxq4/quiet-pxq23.sh export-ignore
+pxa/pxq4/convert-run.sh export-ignore
+pxa/pxq4/convert-fusion2-pxq3-m2.sh export-ignore
+pxa/pxq4/convert-coder35-m3.sh export-ignore
+pxa/pxq4/convert-coder35-m2.sh export-ignore
+pxa/pxq4/window.sh export-ignore
+pxa/pxq4/boot-pxq23.sh export-ignore
+pxa/pxq4/build-in-container.sh export-ignore
+pxa/pxq4/gpu3-unit.sh export-ignore
+pxa/pxq4/gpu3-q8.sh export-ignore
+pxa/pxq4/bench/boot.sh export-ignore
+pxa/pxq4/bench/window-phasep.sh export-ignore
+pxa/pxq4/bench/window-v100.sh export-ignore
+pxa/pxq4/bench/window-p100.sh export-ignore
+pxa/pxq4/bench/quiet-run.sh export-ignore
+pxa/pxq4/bench/cells.sh export-ignore
+pxa/pxq4/kernels-src/tests_pxq23/build_oracle.sh export-ignore
+pxa/pxq4/kernels-src/tests_pxq23/gpu3_keyset_gate.sh export-ignore

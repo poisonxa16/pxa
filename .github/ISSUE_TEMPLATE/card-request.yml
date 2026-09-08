@@ -1,0 +1,36 @@
+name: Card support request
+description: Ask for a Pascal or Volta card to be supported or auto-tuned.
+labels: [card-request]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The engine is compiled for `sm_60`, `sm_61` and `sm_70` — Pascal and Volta. If your card
+        is one of those and simply is not in the auto-tuning table yet, the fastest path is a
+        [benchmark report](https://github.com/poisonxa16/pxa/issues/new?template=benchmark-report.yml),
+        because a measured row beats a request. Use this template if you cannot run it yourself,
+        or if the card is outside those architectures.
+  - type: input
+    id: card
+    attributes:
+      label: Which card
+      placeholder: "Tesla P40 24 GB"
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: Compute capability, if you know it
+      placeholder: "sm_61"
+  - type: textarea
+    id: context
+    attributes:
+      label: What you are trying to run, and what happens today
+    validations:
+      required: true
+  - type: checkboxes
+    id: can-test
+    attributes:
+      label: Can you test?
+      options:
+        - label: I have this card and can run a benchmark or a debug build if someone tells me what to run.

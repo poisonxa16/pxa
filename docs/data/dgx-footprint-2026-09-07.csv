@@ -1,0 +1,11 @@
+# A third-party DGX-1 (8x V100-SXM2-32GB NVLink), TP2 cards 4-5, GMU 0.8 (25.6 GiB budget/rank), Qwen3.8-27B + DFlash2 drafter; quoted from both stacks' boot logs; prefill rows filled when measured
+group,cell,ours,his,unit,notes
+context,KV tokens per rank at k=7 (drafter resident),46681,26288,tokens,ours fp16 KV 205 KB/token; his fp8 KV 355 KB/token (attention block doubled to 1648 to equalise mamba pages)
+context,KV tokens per rank plain (no drafter),237568,348160,tokens,his fp8 KV wins here: 36.7 vs our 55.2 KB/token
+footprint,checkpoint on disk (target + drafter),20.72,25.70,GiB,PXQ4 19.29 + 1.43 vs NVFP4 22.12 + bf16 3.58
+footprint,resident per rank at k=7 (weights + drafter),14.88,15.05,GiB,'Model loading took' lines
+footprint,engine overhead per rank beyond weights and KV,1.44,1.49,GiB,same engine either side
+prefill,prefill @ 3121 tokens (TP2),2273,1735,tok/s,both as OpenAI servers same window MML 24576 MNBT 2048 no prefix cache; steady runs; TTFT ours 1373 ms vs his 1799
+prefill,prefill @ 20801 tokens (TP2),2191,944,tok/s,TTFT ours 9.47 s vs his 22.0 s; n=3 each
+ttft,time to first token @ 3121 tokens (s),1.373,1.799,s,lower is better; same server runs as the prefill rows
+ttft,time to first token @ 20801 tokens (s),9.47,22.0,s,lower is better; a 12.5 s head start per long request

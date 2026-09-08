@@ -1,0 +1,143 @@
+<title>pxa — before / after (shared scale)</title>
+<style>
+  :root{
+    --bg:#0a0d13; --panel:#0f141c; --line:rgba(255,255,255,.07);
+    --ink:#e8ebf0; --muted:#8b95a5; --faint:#5b6472;
+    --ik:#4a86c7; --prev:#e0912f; --new:#31d4b8;
+    --gain:#31d4b8; --flat:#5b6472; --grid:rgba(255,255,255,.06);
+    --track:rgba(255,255,255,.035);
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:
+      radial-gradient(120% 80% at 88% -10%, rgba(49,212,184,.055), transparent 60%),var(--bg);
+    color:var(--ink);font-family:var(--sans);font-variant-numeric:tabular-nums;
+    line-height:1.45;padding:34px clamp(18px,4vw,48px) 40px;}
+  .wrap{max-width:960px;margin:0 auto}
+  h1{font-size:clamp(21px,3.2vw,29px);font-weight:750;margin:0;letter-spacing:-.01em;text-wrap:balance}
+  h1 .accent{color:var(--new)}
+  .sub{color:var(--muted);font-size:13.5px;margin:7px 0 0}
+  .sub b{color:var(--ink);font-weight:600}
+  .sub code,code{font-family:var(--mono);font-size:.9em;color:var(--muted)}
+  .rule{height:3px;width:64px;margin:16px 0 20px;border-radius:2px;background:linear-gradient(90deg,var(--prev),var(--new))}
+  .legend{display:flex;flex-wrap:wrap;gap:16px 22px;margin:0 0 24px;font-size:12.5px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:8px}
+  .sw{width:26px;height:11px;border-radius:3px;display:inline-block}
+
+  .section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px 14px;margin:0 0 16px}
+  .slabel{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 4px}
+  .slabel b{color:var(--new);font-weight:640}
+  .plot{position:relative;padding-left:96px}                 /* room for card labels */
+  .gridlines{position:absolute;left:96px;right:0;top:26px;bottom:22px;pointer-events:none}
+  .gridlines i{position:absolute;top:0;bottom:0;width:1px;background:var(--grid)}
+  .ticks{position:relative;height:16px;margin-left:96px;margin-bottom:4px}
+  .ticks i{position:absolute;transform:translateX(-50%);font-size:10.5px;color:var(--faint);font-family:var(--mono)}
+  .cg{position:relative;margin:0 0 4px;padding:9px 0 7px;border-top:1px solid var(--line)}
+  .cg:first-of-type{border-top:0}
+  .cglabel{position:absolute;left:0;top:9px;width:88px;font-size:12.5px;font-weight:640;line-height:1.15}
+  .cglabel span{display:block;color:var(--faint);font-weight:500;font-size:10.5px;font-family:var(--mono);margin-top:2px}
+  .cgbadge{position:absolute;left:0;bottom:6px;font-size:10.5px;font-family:var(--mono);font-weight:700;
+    padding:1px 6px;border-radius:12px}
+  .cgbadge.up{color:var(--gain);background:rgba(49,212,184,.12);border:1px solid rgba(49,212,184,.26)}
+  .cgbadge.flat{color:var(--flat);background:rgba(255,255,255,.04);border:1px solid var(--line)}
+  .bars{margin-left:96px}
+  .bar{position:relative;height:22px;margin:4px 0;background:var(--track);border-radius:4px;overflow:hidden}
+  .fill{position:absolute;inset:0 auto 0 0;border-radius:4px;display:flex;align-items:center;min-width:2px;
+    transition:width .85s cubic-bezier(.2,.7,.2,1)}
+  .fill.ik{background:linear-gradient(90deg,#3f76ad,var(--ik))}
+  .fill.prev{background:linear-gradient(90deg,#c47c25,var(--prev))}
+  .fill.new{background:linear-gradient(90deg,#22b79e,var(--new))}
+  .val{position:absolute;left:calc(var(--w) + 8px);font-family:var(--mono);font-size:12px;font-weight:620;
+    color:var(--ink);white-space:nowrap;line-height:22px}
+  .val.inside{left:auto;right:8px;color:#04120f}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:6px}
+  @media(max-width:640px){.grid2{grid-template-columns:1fr}.plot,.ticks,.bars{padding-left:0;margin-left:0}
+    .gridlines{left:0}.cglabel{position:static;width:auto;margin-bottom:5px}.cg{padding-top:6px}.cgbadge{position:static;display:inline-block;margin-top:6px}}
+  .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+  .box.newf{border-color:rgba(49,212,184,.28)}
+  .box h3{margin:0 0 10px;font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+  .box.newf h3{color:var(--new)}
+  .feat{list-style:none;margin:0;padding:0;font-size:13px}
+  .feat li{padding:6px 0;border-top:1px solid var(--line);display:flex;gap:9px}
+  .feat li:first-child{border-top:0}.feat b{color:var(--ink);font-weight:640}
+  .feat .n{color:var(--new);font-family:var(--mono);font-weight:700;flex-shrink:0;width:44px}
+  .acc{font-size:13px;color:var(--muted);margin:0}.acc b{color:var(--ink)}
+  .acc .big{font-family:var(--mono);color:var(--new);font-weight:700}
+  .foot{color:var(--faint);font-size:11.5px;margin-top:20px;line-height:1.65}
+</style>
+
+<div class="wrap">
+  <h1>pxa — upstream → last release → <span class="accent">newest</span></h1>
+  <p class="sub"><b>35B MoE</b> · same card · same protocol · cold 5.8k-token prompt · temp 0 · median of 3 · prefill @ <code>-fa off</code>, decode @ <code>-fa on</code>, <code>-b 2048</code></p>
+  <div class="rule"></div>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--ik)"></i> upstream ik_llama.cpp (best IQ_K quant)</span>
+    <span><i class="sw" style="background:var(--prev)"></i> pxa — last release</span>
+    <span><i class="sw" style="background:var(--new)"></i> pxa — newest</span>
+  </div>
+
+  <div id="prefill" class="section"></div>
+  <div id="decode" class="section"></div>
+
+  <div class="grid2">
+    <div class="box newf">
+      <h3>New in this release</h3>
+      <ul class="feat">
+        <li><span class="n">↑45%</span><span><b>BALANCE mode</b> — P100 gets fa-off-class prefill in a fa-on serving config (834 → 1,206 t/s, decode held). One flag auto-tunes each card.</span></li>
+        <li><span class="n">↑18%</span><span><b>MTP speculative decode</b> — P100 63.4, V100 <b>108.3</b> t/s steady-state (~0.8 accept).</span></li>
+        <li><span class="n">↑39%</span><span><b>V100 tensor-core prefill</b> — 1,700 → 2,358 t/s (CUBLAS64 + WMMA-v2 expert GEMMs).</span></li>
+        <li><span class="n">NEW</span><span><b>GLM-4.7-Flash support</b> + the honest 5-bit <b>PXQ6</b> quant tier.</span></li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Accuracy — zero quality cost</h3>
+      <p class="acc">Same-quant control: pxa runs upstream's own IQ_K gguf <b>bit-identically</b> on the V100 (same temp-0 sha), decoding <span class="big">+2.7–3.3%</span> faster on every card.</p>
+      <p class="acc" style="margin-top:12px">Every lever is <b>bit-exact</b> (memcmp-verified) or <b>ppl-gated</b> — pure kernel speed, no quality traded for throughput.</p>
+    </div>
+  </div>
+
+  <p class="foot">
+    <b style="color:var(--muted)">Shared absolute scale within each metric</b> — every bar in a section is measured against the same axis, so a P100 reads shorter than a V100 (they are). The % gains are each card vs its <em>own</em> upstream baseline: the code doesn't turn a P100 into a V100, it gets far more out of the P100 you have. Bars marked (MTP) use speculative decode (n_max=1, ~0.8 accept, steady-state medians); V100 prefill is the merged WMMA-v2 figure (confirm-set median 2,384). <code>docs/lab/LEVERS.md</code> · <code>bench/fair-battle.md</code>
+  </p>
+</div>
+
+<script>
+  const D = {
+    prefill:{ axis:2400, tick:600, unit:"t/s", cards:[
+      {n:"Tesla P100", a:"sm_60", ik:645, prev:1213, new:1213, badge:{t:"carried",flat:1}},
+      {n:"Tesla V100", a:"sm_70", ik:1509, prev:1700, new:2358, badge:{t:"+39%"}},
+      {n:"GTX 1080 Ti", a:"sm_61", ik:1154, prev:1001, new:1001, badge:{t:"−13% vs ik",flat:1}},
+    ]},
+    decode:{ axis:120, tick:30, unit:"t/s", cards:[
+      {n:"Tesla P100", a:"sm_60", ik:44.7, prev:58.1, new:63.4, badge:{t:"+9% (MTP)"}},
+      {n:"Tesla V100", a:"sm_70", ik:84.5, prev:95.5, new:108.3, badge:{t:"+13% (MTP)"}},
+      {n:"GTX 1080 Ti", a:"sm_61", ik:52.2, prev:65.4, new:65.4, badge:{t:"+25% vs ik"}},
+    ]}
+  };
+  const fmt = v => Number.isInteger(v)? v.toLocaleString() : v.toFixed(1);
+  function render(id, label, m){
+    const ax=m.axis;
+    let grid="", ticks="";
+    for(let t=0;t<=ax;t+=m.tick){const p=t/ax*100;
+      grid+=`<i style="left:${p}%"></i>`;
+      ticks+=`<i style="left:${p}%">${t.toLocaleString()}</i>`;}
+    const bar=(cls,v)=>{const w=v/ax*100; const inside=w>26;
+      return `<div class="bar"><div class="fill ${cls}" style="width:${w}%;--w:${w}%">
+        ${inside?`<span class="val inside">${fmt(v)}</span>`:``}</div>
+        ${inside?``:`<span class="val" style="--w:${w}%">${fmt(v)}</span>`}</div>`;};
+    const groups=m.cards.map(c=>`
+      <div class="cg">
+        <div class="cglabel">${c.n}<span>${c.a}</span></div>
+        <span class="cgbadge ${c.badge.flat?'flat':'up'}">${c.badge.t}</span>
+        <div class="bars">${bar('ik',c.ik)}${bar('prev',c.prev)}${bar('new',c.new)}</div>
+      </div>`).join('');
+    document.getElementById(id).innerHTML=`
+      <div class="slabel">${label} — <b>${m.unit}</b> · one shared scale, all cards</div>
+      <div class="ticks">${ticks}</div>
+      <div class="plot"><div class="gridlines">${grid}</div>${groups}</div>`;
+  }
+  render('prefill','Prefill',D.prefill);
+  render('decode','Decode',D.decode);
+</script>

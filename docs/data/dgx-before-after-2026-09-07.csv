@@ -1,0 +1,7 @@
+# Same rig, same harness, same 16 GSM8K x 192 greedy tokens (third-party DGX-1, 8x V100-SXM2-32GB NVLink, cards 4-7). before = our stack on 2026-09-06 (the 2026-09-06 head-to-head session, 'ours before' column); after = v17 on 2026-09-07 (medians from the 2026-09-07 closing session); his = 1Cat vLLM NVFP4 as shipped
+tp,cell,before,after,his,notes
+tp2,plain decode,41.32,46.28,38.44,
+tp2,DFlash2 k=3,53.84,65.24,59.88,after = 09-07 morning run (not re-run with v17)
+tp2,DFlash2 k=7,76.71,121.17,114.50,after = median of 3; his = median of 6 alternating
+tp4,plain decode,64.81,65.72,61.03,
+tp4,DFlash2 k=7,110.66,159.58,161.37,medians of 3 alternating boots each, one window

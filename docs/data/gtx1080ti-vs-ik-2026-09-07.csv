@@ -1,0 +1,6 @@
+# 1x GTX 1080 Ti 11 GB (GPU 3), PXA-Fusion2-35B: ours = rc1 PXQ2 bare command line (rc1 AFTER arm, 2026-09-07, n=3, shared box); upstream ik_llama.cpp IQ2_KS from the 2026-09-05 published-tier session (the 2026-09-05 published-tier session); blank = not measured
+cell,ours,his,unit,notes
+cold prefill (-fa off),1333.5,1132.1,tok/s,rc1 row in the notes was 1363.5 on a quiet box
+chat prefill (-fa on),734.1,740.0,tok/s,tie within noise; notes row 746.6 on a quiet box
+cold decode,35.37,,tok/s,upstream cold decode not captured
+chat decode,64.23,53.3,tok/s,

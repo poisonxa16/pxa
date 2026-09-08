@@ -1,0 +1,26 @@
+vendor/ is a verbatim, unmodified copy taken from the READ-ONLY production tree
+
+    <build-host>:/path/to/engine-repo   branch fable9-swa-kv   HEAD acf8f245
+
+of exactly these files:
+
+    ggml/src/pxq-cpu.c                  the parity-locked CPU dequant
+    ggml/src/pxq-cpu.h                  its contract + layout ground truth (lines 1-18)
+    ggml/src/ggml-impl.h                GGML_COMPUTE_FP16_TO_FP32
+    ggml/include/ggml.h                 enum ggml_type (GGML_TYPE_PXQ4 = 252)
+    ggml/include/ggml-pxq6-tables.h     PXQ6_BOOK_INIT / PXQ6_SUB16_INIT (the frozen tables)
+    ggml/include/ggml-pxq2-tables.h     pulled in by pxq-cpu.c
+    ggml/include/ggml-pxq3-tables.h     pulled in by pxq-cpu.c
+    ggml/include/ggml-alloc.h           transitively included by ggml.h consumers
+    ggml/include/ggml-backend.h         transitively included by ggml.h consumers
+
+Copying is not modifying: nothing was written back to mgv-wt.  Refresh with
+
+    ssh <build-host> 'cd /path/to/engine-repo && tar cz ggml/src/pxq-cpu.c ggml/src/pxq-cpu.h \
+        ggml/src/ggml-impl.h ggml/include/ggml.h ggml/include/ggml-pxq6-tables.h \
+        ggml/include/ggml-pxq2-tables.h ggml/include/ggml-pxq3-tables.h \
+        ggml/include/ggml-alloc.h ggml/include/ggml-backend.h | base64 -w0' \
+      | base64 -d | tar xz -C vendor/
+
+and re-run tests/ afterwards: if the engine's dequant ever changes, gate G1 must be the
+thing that notices.

@@ -1,0 +1,8 @@
+# A third-party DGX-1 (8x V100-SXM2-32GB NVLink), HIS harness bench_pxa_dflash2.py (16 GSM8K x 192 greedy tokens, sequential, MML 4096, GMU 0.8), HIS cards 4-7, 2026-09-07; ours = PXQ4 27B target + PXQ4 DFlash2 drafter + pxa kernels (libpxq_sm70_v15, m884) inside his image v100-dflash2; his = NVFP4 target + bf16 drafter, fp8 KV (his own runs)
+tp,cards,cell,ours,his,ours_acc,his_acc,notes
+tp2,cards 4-5 (2x V100-SXM2-32GB),plain,46.28,38.44,,,ours with the v17 kernel fixes (single run; was 40.67); his from tp2-target.json
+tp2,cards 4-5 (2x V100-SXM2-32GB),dflash_k3,65.24,59.88,3.47,3.49,single run each in-window; identical acceptance = pure engine speed
+tp2,cards 4-5 (2x V100-SXM2-32GB),dflash_k7,121.17,114.50,5.31,5.40,MEDIANS: ours v17 fixes 3 boots (114.64/121.78/121.17), his 6 earlier alternating boots; was 117.56 vs 114.50 before the fixes
+tp4,cards 4-7 (4x V100-SXM2-32GB NVLink),plain,65.72,61.03,,,ours with the v17 fixes (was 65.59); his from his earlier tp4-target.json
+tp2,cards 4-5 (2x V100-SXM2-32GB),dflash_k7_mml8k,116.65,,5.36,,ours at --max-model-len 8192: inside the MML 4096 band (KV 80,573 tokens); his 8k not run
+tp4,cards 4-7 (4x V100-SXM2-32GB NVLink),dflash_k7,159.58,161.37,5.34,5.44,MEDIANS of 3 alternating in-window boots each with the v17 fixes (ours 159.58/160.30/152.15; his 161.57/154.39/161.37): inside the noise of his own stack; was 147.52 vs 164.06 before the fixes

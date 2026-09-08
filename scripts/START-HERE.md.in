@@ -1,0 +1,132 @@
+# START HERE — pxa @@TAG@@
+
+You have never built this project and don't need to. This package is a finished binary
+release: untar it, get a model, run one command.
+
+## Requirements
+
+- **Linux, x86_64.** (No macOS/Windows binaries in this package.)
+- **A recent-enough Linux distro: glibc >= @@GLIBC_FLOOR@@.** Concretely: @@DISTRO_HINT@@.
+  Check yours with `ldd --version` (first line). This is a real hard floor, not a "should work
+  on anything" guess: a binary from this same codebase, built against a newer glibc, was tested
+  by hand against an older distro and failed to even start ("version GLIBC_2.38 not found") --
+  an older-than-@@GLIBC_FLOOR@@ host will fail the exact same way, and there is no workaround
+  short of a distro upgrade or a container with a new-enough userspace. glibc itself is the one
+  thing this package cannot safely bundle (same reason it can't bundle the NVIDIA driver: it has
+  to match what the kernel/loader on your box already has). libstdc++ does NOT add a second
+  constraint here -- this package bundles its own copy in `lib/` (see GLIBCXX_FLOOR in VERSION
+  for exactly which one) and the wrapper scripts put it ahead of your system's on the library
+  search path, so only the glibc floor above matters.
+- **An NVIDIA GPU from the Pascal or Volta generation** — e.g. GTX 10-series / Tesla P100
+  (Pascal, "sm_60"/"sm_61") or Tesla V100 (Volta, "sm_70"). This build was compiled for exactly
+  those three architectures; it will not run GPU kernels on a Turing/Ampere/Ada/Hopper/Blackwell
+  card (it may still run on CPU, slowly — see docs/KNOWN-ISSUES.md).
+- **An NVIDIA driver new enough for the bundled CUDA @@CUDA_MAJOR_MINOR@@ runtime.** The
+  documented floor for CUDA @@CUDA_MAJOR_MINOR@@ is driver **@@DRIVER_FLOOR@@** or newer on
+  Linux. Check yours with `nvidia-smi` (top-right corner shows "Driver Version"). This package
+  was built and tested on driver @@BUILD_HOST_DRIVER@@.
+- Enough free disk + VRAM for whichever model tier you download (see step 2).
+- `python3` on your PATH (used only to run the launcher script; nothing to `pip install`).
+
+@@PATCHELF_NOTE@@
+
+## Three steps
+
+### 1. Untar
+
+```bash
+tar xzf pxa-@@TAG@@-linux-x86_64-cuda@@CUDA_MAJOR_MINOR@@-*.tar.gz
+cd pxa-@@TAG@@
+```
+
+### 2. Get a model
+
+Models are not bundled (they're tens of GB). Download one GGUF file from one of these two
+Hugging Face repos — both are named, with exact file hashes, in
+`bench/fair/weights/MANIFEST.sha256`:
+
+- **`huggingface.co/poisonxa/PXA-Fusion2-35B-GGUF`** — the flagship MoE model this fork is
+  tuned for. Start with the smallest tier, `PXA-Fusion2-35B-PXQ2.gguf` (~10 GB), if you have a
+  single 16 GB card; step up to `-PXQ3` or `-PXQ6` if you have more VRAM. This is the model
+  `docs/COOKBOOK.md`'s recipes are written against.
+- **`huggingface.co/poisonxa/Qwable-27B-GGUF`** — a smaller dense 27B model, useful if you want
+  something that fits on one card at higher quality per GB (`Qwable-27B-PXQ4core.gguf`).
+
+Verify what you downloaded against `bench/fair/weights/MANIFEST.sha256` before running it:
+
+```bash
+cd bench/fair/weights && sha256sum -c MANIFEST.sha256 --ignore-missing && cd -
+```
+
+### 3. Run
+
+```bash
+./pxa-launch -m /path/to/the/model/you/downloaded.gguf
+```
+
+`pxa-launch` looks at your GPU(s) and the model file and picks a working configuration,
+printing the exact command it runs before running it (see `docs/LAUNCHER.md` if present, or
+`tools/pxa-launch.py --help` / `--explain`). If you'd rather run `llama-server` directly with
+your own flags, use `./run-server.sh` instead — same wrapper, no auto-tuning:
+
+```bash
+./run-server.sh -m /path/to/model.gguf -c 4096 -ngl 99 --port 8080
+```
+
+A correct startup prints a line starting `PXA level=...` on stderr near the top of the log —
+that's this fork's engine identifying itself and its per-device configuration. If you don't see
+it, you're not running this fork's binary (check `LD_LIBRARY_PATH` / RPATH — see
+"libcuda not found" below).
+
+## Troubleshooting (five most likely failures)
+
+1. **"CUDA driver version is insufficient for CUDA runtime version" / server refuses to start
+   on GPU.** Your NVIDIA driver is older than @@DRIVER_FLOOR@@. Run `nvidia-smi` and check the
+   driver version; upgrade the driver (not CUDA — this package brings its own CUDA runtime).
+
+2. **Starts, but is very slow or crashes on a kernel.** Your card is not Pascal or Volta (see
+   Requirements). This build was not compiled for other architectures. `nvidia-smi
+   --query-gpu=name --format=csv` will tell you the card name; check it against
+   Pascal/Volta model lists if unsure.
+
+3. **"failed to allocate buffer" / out-of-memory / server dies while loading weights.** The
+   model tier doesn't fit your VRAM (+ context + compute buffer headroom, roughly the model
+   file size plus 2-3 GB). Pick a smaller quant tier (e.g. `-PXQ2` instead of `-PXQ6`), lower
+   `-c` (context size), or use `-ngl` less than 99 / `--n-cpu-moe` to offload part of the model
+   to CPU (see `docs/KNOWN-ISSUES.md` for which quant tiers have a fast CPU path).
+
+4. **"version GLIBC_x.y not found" (or similar) when even running `./run-server.sh --version`.**
+   Your Linux distro is older than glibc @@GLIBC_FLOOR@@ — see the requirement above (`ldd
+   --version` to check). This failure mode is real and confirmed by hand while packaging this
+   codebase, not a hypothetical: no flag or
+   env var fixes it, only a newer distro or a container with a new-enough userspace does.
+
+5. **"error while loading shared libraries: libcuda.so.1: cannot open shared object file"** (or
+   `libnvidia-ml.so`, etc.) **— this means the NVIDIA driver itself is not installed/visible**,
+   not a problem with this package. This package intentionally does NOT bundle driver
+   libraries (`libcuda.so*`, `libnvidia-*`) — those must come from your host's own NVIDIA driver
+   install (or be passed through into a container, e.g. `--runtime=nvidia` /
+   `--gpus all` with the NVIDIA Container Toolkit). Confirm the driver is visible with
+   `nvidia-smi` before reporting anything else as a bug.
+
+## Where things are
+
+```
+bin/            llama-server, llama-cli, llama-bench, llama-perplexity, llama-quantize,
+                (llama-gguf-split if this build included it), and three self-test binaries.
+lib/            this engine's shared libraries + the exact CUDA/OpenMP runtime libs it needs.
+                Driver libraries are deliberately NOT here (see troubleshooting #5).
+pxa-launch      run this. Auto-picks a config for your hardware+model, prints its reasoning.
+run-server.sh   thin wrapper: sets up ./lib, execs bin/llama-server with your own flags.
+tools/pxa-launch.py   what pxa-launch actually runs (kept here so --explain/--selftest work).
+bench/fair/     the fair-comparison benchmark harness + protocol.md + weights/MANIFEST.sha256.
+bench/gate/     the release gate (correctness/determinism checks) — see bench/gate/README.md.
+                Run it as: LD_LIBRARY_PATH=./lib MODEL=/path/to/model.gguf BIN=./bin
+                bench/gate/run-gate.sh   (bench/gate calls bin/llama-server directly, so it
+                needs ./lib on LD_LIBRARY_PATH itself — pxa-launch/run-server.sh do this for
+                you, run-gate.sh does not).
+docs/           README, this release's notes, COOKBOOK (per-card recipes), KNOWN-ISSUES,
+                LAUNCHER (if shipped with this build).
+VERSION         exactly what commit/flags/CUDA version/GPU architectures this build is.
+LICENSE, LICENSING.md   MIT-family licenses; LICENSING.md explains which files fall under which.
+```

@@ -1,0 +1,12 @@
+# before = last PUBLIC release v2026.09.02 (ac932d9e, built from the tag with the release recipe), after = v2026.09.05-rc1 (cd681b35); same box, same cards, bare command line, speculation off, both arms in one window; medians of n runs (2026-09-07)
+cardset,cards,model,cell,before,after,notes
+1080ti,1x GTX 1080 Ti 11 GB (GPU 3),PXA-Fusion2-35B PXQ2,cold_prefill,552.6,1333.5,-fa off; n=3 BEFORE 552.6/554.1/549.0 AFTER 1335.4/1333.5/1331.4
+1080ti,1x GTX 1080 Ti 11 GB (GPU 3),PXA-Fusion2-35B PXQ2,cold_decode,33.39,35.37,-fa off; n=3
+1080ti,1x GTX 1080 Ti 11 GB (GPU 3),PXA-Fusion2-35B PXQ2,chat_prefill,414.5,734.1,-fa on; n=3 BEFORE 410.4/415.2/414.5 AFTER 735.4/734.1/732.9
+1080ti,1x GTX 1080 Ti 11 GB (GPU 3),PXA-Fusion2-35B PXQ2,chat_decode,64.18,64.23,-fa on; n=3; old release gave 3 different greedy outputs over 3 identical runs, rc1 one
+v100,2x Tesla V100-PCIE-16GB (GPUs 2;4),Qwable-27B-PXQ4core,prefill_3k,797.24,1356.78,n=3; spread +/-0.03% / +/-0.06%; before auto -b 2048 -ub 2048 (DEFAULT level), after -b 8192 -ub 2048 (ENHANCE)
+v100,2x Tesla V100-PCIE-16GB (GPUs 2;4),Qwable-27B-PXQ4core,prefill_20k,575.58,1306.54,n=3; spread +/-0.23% / +/-0.11%
+v100,2x Tesla V100-PCIE-16GB (GPUs 2;4),Qwable-27B-PXQ4core,decode,34.61,39.58,low fill n=12; spread +/-0.15% / +/-0.13%; after reproduces the published RC row 1369/1300/39.5 within 1%
+p100,2x Tesla P100-PCIE-16GB (GPUs 1;5),Qwable-27B-PXQ4core,prefill_3k,222.87,337.75,n=3; before auto -b 2048 -ub 2048 (DEFAULT), after -b 8192 -ub 256 (ENHANCE); greedy output bit-identical before vs after
+p100,2x Tesla P100-PCIE-16GB (GPUs 1;5),Qwable-27B-PXQ4core,prefill_20k,200.77,315.35,n=3
+p100,2x Tesla P100-PCIE-16GB (GPUs 1;5),Qwable-27B-PXQ4core,decode,18.34,18.17,low fill n=12; -0.9% outside noise: the one cell where rc1 is slower; after reproduces the published RC row 337.6/315.3/18.1

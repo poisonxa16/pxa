@@ -1,0 +1,467 @@
+// pxq6-quantize.inc.cpp — PXQ6 native quantizer (E16-row scales; spec: ggml/include/ggml-pxq6-tables.h).
+//
+// SELF-CONTAINED functions; spliced into src/llama-quantize.cpp next to the PXQ5 block, and
+// compiled standalone by pxa-bench/pxq6_ref.cpp (the correctness / wrel-reproduction tool).
+//
+// FORMAT (frozen):
+//   values : 4-bit codes into the frozen PX16 book (identical to PXQ5; book[7]==0, absmax==1)
+//   scales : per-ROW fp16 anchor (64 anchors = 128 B header at the head of each 64-row panel)
+//            x one 4-bit sub-scale per 16-elem block through the frozen EW-Lloyd table SUB16
+//            (two nibbles pack into the one scale byte per 32 elems -> slab scale SoA stays 64 B)
+//   dequant: eff = fp32(anchor) * SUB16[s4]; w = eff * fp32(book[c])   (fp32 muls, parity-locked)
+//   layout : slab = 64 B scale SoA + 64 x 16 B nibble rows (sequential pairs)  [= PXQ5 slab]
+//            panel = 128 B anchor header + kslabs x 1088 B slabs; panels row-major; experts outer.
+//   HQ tier (PXQ6HQ): 4-bit sub per 8-elem block via SUB8 -> 128 B scale SoA, slab 1152 B.
+//
+// QUANTIZE ALGORITHM (deterministic; = what the reference measurement ran, E16-row-4bit-EW):
+//   per row   : anchor = fp16_rn(row absmax)  [optional weighted-MSE anchor fit, env-gated]
+//   per block : FULL search over all 16 sub-levels; codes = RTN against the sorted book
+//               (midpoint rule = numpy searchsorted 'left'); keep argmin sum w_i (x_i - w_hat_i)^2
+//               (double accumulation, imatrix column weights when present, per-expert slices).
+//   zero blocks (amax==0) -> s4=0, codes=7 (book zero); zero rows (anchor snaps to 0) -> whole
+//   row s4=0/codes=7. Reconstruction of both == 0, matching the lab reference bit-exactly.
+//
+// MEASURED GATES (Q-G1/Q-G2): byte-parity vs the numpy reference;
+// wrel on the frozen 36-slice rng-42 protocol reproduces the lab numbers.
+//
+// Env:
+//   PXA_PXQ6_ANCHOR_FIT=1  widen the row-anchor search (5 fp16 candidates around absmax,
+//                          weighted-MSE argmin over the full row; default OFF = lab recipe).
+//   PXA_PXQ6_BOOK / PXA_PXQ6_SUB / PXA_PXQ6_SUB_HQ  comma-separated table overrides
+//                          (fp16-snapped; MUST match the runtime kernels' tables).
+
+#include "../ggml/include/ggml-pxq6-tables.h"
+
+#include <cmath>
+#include <cstring>
+#include <cstdint>
+#include <cstdlib>
+#include <cstdio>
+
+static const float pxq6_book_q_[16]  = PXQ6_BOOK_INIT;
+static const float pxq6_sub16_q_[16] = PXQ6_SUB16_INIT;
+static const float pxq6_sub8_q_[16]  = PXQ6_SUB8_INIT;
+
+#ifndef PXQ_TIE_BREAK_DEFINED
+#define PXQ_TIE_BREAK_DEFINED
+// deterministic tie-break for reproducible quantization (shared by all PXQ-family quantizers;
+// applies ONLY when two candidates carry bit-identical weighted error — quality-neutral)
+static inline bool pxq_tie_take_hi(int64_t row, int64_t blk) {
+    uint64_t v = ((uint64_t)row ^ (uint64_t)blk) ^ 0x5Aull;
+    v ^= v >> 32; v ^= v >> 16; v ^= v >> 8; v ^= v >> 4; v ^= v >> 2; v ^= v >> 1;
+    return (v & 1) != 0;
+}
+#endif
+
+#ifndef PXQ_FIX_GATES_DEFINED
+#define PXQ_FIX_GATES_DEFINED
+// ---------------------------------------------------------------------------------------------
+// PXQ codec-fix gates (2026-08-09). ALL default OFF: with none of these env vars set every
+// quantizer below is byte-identical to the release tree. Shared by the whole PXQ family
+// (guarded like PXQ_TIE_BREAK_DEFINED so any single .inc still compiles standalone).
+//   PXA_PXQ_CEIL_V2=1  PXQ2/PXQ3 ceiling fix: quantize against the v2 books (the frozen LM4/LM8
+//                      rescaled so max|book| == 1.0), restoring the representable ceiling to
+//                      anchor*0.987793 = exact PXQ4/PXQ6 parity (v1: 0.697/0.896 * anchor).
+//                      Files bake pxa.pxq{2,3}.version=2 + the v2 values in pxa.pxq{2,3}.book;
+//                      decode needs the same env on the runtime (or PXA_PXQ2_BOOK/PXA_PXQ3_BOOK
+//                      on an older build -- the books are runtime-uploaded tables everywhere).
+//   PXA_PXQ_SMIN=1     hard representability floor in the sub-scale search: sub candidates that
+//                      cannot represent the block peak within half a top book step are excluded
+//                      (search [s_min,15] instead of [0,15]).
+//   PXA_PXQ_KQW        k-quant error weighting on the IMATRIX PATH ONLY (DEFAULT ON since
+//                      2026-08-24): w_i = imx_i * sqrt(mean(x_row^2) + x_i^2). Set =0 for the
+//                      legacy raw-imx weighting (measured ppl regression; A/B use only).
+//                      No imatrix => w = 1 exactly, so imatrix-free artifacts do not move.
+// ---------------------------------------------------------------------------------------------
+static inline bool pxq_fix_env_on(const char * name) {
+    const char * e = getenv(name);
+    return e && atoi(e) != 0;
+}
+static inline bool pxq_ceil_v2_enabled() {
+    static const bool on = [](){
+        const bool v = pxq_fix_env_on("PXA_PXQ_CEIL_V2");
+        if (v) fprintf(stderr, "PXA_PXQ_CEIL_V2 ARMED: PXQ2/PXQ3 v2 books (max|book|=1 ceiling restore); baking pxa.pxq{2,3}.version=2\n");
+        return v;
+    }();
+    return on;
+}
+static inline bool pxq_smin_enabled() {
+    static const bool on = [](){
+        const bool v = pxq_fix_env_on("PXA_PXQ_SMIN");
+        if (v) fprintf(stderr, "PXA_PXQ_SMIN ARMED: representability floor in the sub-scale search\n");
+        return v;
+    }();
+    return on;
+}
+// PXA_PXQ_IMX (DEFAULT OFF, 2026-08-24): whether PXQ tiers consume an offered imatrix AT ALL.
+// Measured on Ornith-9B (580 chunks, wiki.test, clean A/B, P100, cross-card-verified): EVERY
+// consumption path is net-negative for PXQ4 —
+//   no-imatrix 8.3076 | kqw+SMIN 8.3317 | kqw 8.3420 | kqw+anchor-fit 8.3491 | raw 8.3542
+// (and the MXFP4-backbone exponent-search path carries ~0.019 of that damage on its own),
+// while the SAME imatrix file improves Q4_K_M by -0.0766. The PXQ lattice (fixed absmax
+// anchor, 16-step sub-scale) cannot express per-column importance without clamping
+// cold-column outliers. Until a codec-level design exists, an offered imatrix is IGNORED
+// for PXQ tiers (loud notice, once) so --imatrix cannot silently degrade a PXQ artifact;
+// PXA_PXQ_IMX=1 re-enables consumption (KQW form by default; PXA_PXQ_KQW=0 for raw).
+static inline bool pxq_imx_optin_enabled() {
+    static const bool on = [](){
+        const char * e = getenv("PXA_PXQ_IMX");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+static inline const float * pxq_imx_gate(const float * imx) {
+    if (!imx || pxq_imx_optin_enabled()) return imx;
+    static const bool warned = [](){
+        fprintf(stderr, "PXQ tiers: imatrix IGNORED (measured net-negative on the PXQ lattice; PXA_PXQ_IMX=1 to consume it — see pxq6-quantize.inc.cpp)\n");
+        return true;
+    }();
+    (void)warned;
+    return nullptr;
+}
+static inline bool pxq_kqw_enabled() {
+    // DEFAULT ON since 2026-08-24. The prior default (raw imatrix values as MSE weights) was
+    // MEASURED to make PXQ4 WORSE than no imatrix at all (Ornith-9B, 580 chunks, clean A/B:
+    // no-imx 8.3076 vs raw-imx 8.3542), while the SAME imatrix file improves Q4_K_M by -0.0766
+    // under stock llama.cpp weighting w = imx * sqrt(sigma2_row + x^2). Mechanism: raw imatrix
+    // columns span orders of magnitude, so inside a 16/8-wide sub-block the weighted argmin fits
+    // only the hottest columns and the coarse 16-candidate sub-scale then clamps the block's
+    // large-|x| entries on cold columns; the sqrt(sigma2+x^2) factor keeps per-element magnitude
+    // in the objective so the block scale still respects outliers. PXA_PXQ_KQW=0 restores the
+    // raw-imx weighting for A/B archaeology. No-imatrix artifacts are unaffected either way
+    // (w = 1 exactly on that path).
+    static const bool on = [](){
+        const char * e = getenv("PXA_PXQ_KQW");
+        const bool v = !e || atoi(e) != 0;
+        if (v) fprintf(stderr, "PXQ imatrix weighting: k-quant form w = imx * sqrt(sigma2_row + x^2) (default; PXA_PXQ_KQW=0 for legacy raw-imx)\n");
+        else   fprintf(stderr, "PXA_PXQ_KQW=0: LEGACY raw-imatrix MSE weights (measured ppl REGRESSION vs no-imatrix on PXQ4; A/B use only)\n");
+        return v;
+    }();
+    return on;
+}
+// PXA_PXQ_SMIN: smallest sub index whose ceiling covers the block peak within half a top step,
+// sign-aware (the peak's own side of the book sets the cap and the top gap):
+//     anchor*sub[j]*(bcap + gap/2) >= |peak|
+// Returns 0 when the gate is off (search unchanged). If even sub[15] cannot satisfy it, the
+// floor clamps to 15 (the best available ceiling). Degenerates gracefully for the sign book
+// (nbook==2: bcap=1, gap=2 -> d >= |peak|/2, the natural sign-quantizer bound).
+static inline int pxq_sub_floor(const float * x, int bs, float anchor,
+                                const float * book, int nbook, const float * sub) {
+    if (!pxq_smin_enabled() || !(anchor > 0.f)) return 0;
+    float apk = 0.f, xpk = 0.f;
+    for (int i = 0; i < bs; ++i) { const float a = fabsf(x[i]); if (a > apk) { apk = a; xpk = x[i]; } }
+    if (!(apk > 0.f)) return 0;
+    const double bcap = xpk >= 0.f ?  (double)book[nbook-1] : -(double)book[0];
+    const double gap  = xpk >= 0.f ?  (double)book[nbook-1] - (double)book[nbook-2]
+                                   :  (double)book[1]       - (double)book[0];
+    if (!(bcap > 0.0)) return 0;   // degenerate book side: keep the full search
+    const double need = (double)apk / ((double)anchor * (bcap + 0.5*gap));
+    int j = 0;
+    while (j < 15 && (double)sub[j] < need) ++j;
+    return j;
+}
+// PXA_PXQ_KQW: build the k-quant row weights into buf and return them. Returns imx (or null)
+// unchanged when the gate is off or there is no imatrix -- the unweighted path NEVER moves.
+static inline const float * pxq_kqw_row_weights(const float * x, const float * imx, int64_t K,
+                                                std::vector<float> & buf) {
+    if (!imx || !pxq_kqw_enabled()) return imx;
+    double s2 = 0.0;
+    for (int64_t i = 0; i < K; ++i) s2 += (double)x[i]*(double)x[i];
+    s2 /= (double)K;
+    buf.resize((size_t)K);
+    for (int64_t i = 0; i < K; ++i) {
+        buf[(size_t)i] = (float)((double)imx[i] * sqrt(s2 + (double)x[i]*(double)x[i]));
+    }
+    return buf.data();
+}
+#endif
+
+static inline bool pxq6_parse16(const char * e, float * out) {
+    int n = 0; float v[16];
+    char * dup = strdup(e);
+    for (char * t = strtok(dup, ","); t && n < 16; t = strtok(nullptr, ",")) v[n++] = strtof(t, nullptr);
+    free(dup);
+    if (n != 16) return false;
+    for (int i = 0; i < 16; ++i) out[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(v[i]));  // fp16-snap (spec)
+    return true;
+}
+
+static inline const float * pxq6_book_q() {
+    static float book[16];
+    static bool init = false;
+    if (!init) {
+        init = true;
+        memcpy(book, pxq6_book_q_, sizeof(book));
+        if (const char * e = getenv("PXA_PXQ6_BOOK")) {
+            if (pxq6_parse16(e, book)) fprintf(stderr, "PXQ6 quantize: custom codebook from PXA_PXQ6_BOOK\n");
+            else fprintf(stderr, "PXA_PXQ6_BOOK: expected 16 floats — IGNORED\n");
+        }
+    }
+    return book;
+}
+
+// tier 0 = core (bs16, SUB16); tier 1 = HQ (bs8, SUB8)
+static inline const float * pxq6_sub_q(int tier) {
+    static float sub[2][16];
+    static bool init = false;
+    if (!init) {
+        init = true;
+        memcpy(sub[0], pxq6_sub16_q_, sizeof(sub[0]));
+        memcpy(sub[1], pxq6_sub8_q_,  sizeof(sub[1]));
+        if (const char * e = getenv("PXA_PXQ6_SUB"))    { if (pxq6_parse16(e, sub[0])) fprintf(stderr, "PXQ6 quantize: custom SUB16 from PXA_PXQ6_SUB\n"); }
+        if (const char * e = getenv("PXA_PXQ6_SUB_HQ")) { if (pxq6_parse16(e, sub[1])) fprintf(stderr, "PXQ6 quantize: custom SUB8 from PXA_PXQ6_SUB_HQ\n"); }
+    }
+    return sub[tier ? 1 : 0];
+}
+
+static inline const double * pxq6_mids_q() {
+    static double mids[15];
+    static bool init = false;
+    if (!init) {
+        init = true;
+        const float * b = pxq6_book_q();
+        for (int i = 0; i < 15; ++i) mids[i] = ((double)b[i] + (double)b[i+1]) * 0.5;
+    }
+    return mids;
+}
+
+static inline int pxq6_code(double xn, const double * mids) {
+    int c = 0;
+    for (int i = 0; i < 15; ++i) c += xn > mids[i];   // == numpy searchsorted(mids, xn, 'left')
+    return c;
+}
+
+// quantize one BS-elem sub-block against a fixed effective scale d (fp32), double-accum weighted err.
+// Returns err; writes BS codes.
+template <int BS>
+static inline double pxq6_block_err(const float * x, const float * w, float d,
+                                    const float * book, const double * mids, uint8_t * codes) {
+    const double d64 = (double)d > 1e-30 ? (double)d : 1e-30;
+    double err = 0.0;
+    for (int i = 0; i < BS; ++i) {
+        const int c = pxq6_code((double)x[i] / d64, mids);
+        codes[i] = (uint8_t)c;
+        const float rec = d * book[c];                    // fp32 product == kernel math
+        const double e = (double)x[i] - (double)rec;
+        err += (w ? (double)w[i] : 1.0) * e * e;
+    }
+    return err;
+}
+
+// pick the best 4-bit sub for one BS-elem block under a fixed row anchor (FULL 16-cand search).
+template <int BS>
+static inline double pxq6_quant_subblock(const float * x, const float * w, float anchor,
+                                         const float * book, const double * mids, const float * sub,
+                                         uint8_t * s4_out, uint8_t * codes_out, int64_t row, int64_t blk) {
+    float amax = 0.f;
+    for (int i = 0; i < BS; ++i) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    if (!(amax > 0.f) || !(anchor > 0.f)) {
+        *s4_out = 0;
+        for (int i = 0; i < BS; ++i) codes_out[i] = 7;    // book[7] == 0 -> exact zero
+        return 0.0;
+    }
+    double best = 1e300;
+    uint8_t codes[BS];
+    const int j0 = pxq_sub_floor(x, BS, anchor, book, 16, sub);   // PXA_PXQ_SMIN (0 when off)
+    for (int j = j0; j < 16; ++j) {
+        const float d = (float)((double)anchor * (double)sub[j]);   // == fp32 anchor*sub (exact-product, single round)
+        const double err = pxq6_block_err<BS>(x, w, d, book, mids, codes);
+        if (err < best || (err == best && pxq_tie_take_hi(row, blk))) {   // deterministic tie-break for reproducible quantization
+            best = err;
+            *s4_out = (uint8_t)j;
+            memcpy(codes_out, codes, BS);
+        }
+    }
+    return best;
+}
+
+// quantize one row (K elems) into slab-scattered scale bytes + codes for a given anchor.
+// sc_row: per-slab scale byte(s) for this row (stride = bytes per row in the scale SoA);
+// codes_row: 32 codes per slab. Layout is applied by the caller; this fills flat arrays.
+// Returns total weighted err of the row.
+template <int BS>
+static double pxq6_quant_row(const float * x, const float * w, int64_t K, float anchor,
+                             const float * book, const double * mids, const float * sub,
+                             uint8_t * s4_flat /*K/BS*/, uint8_t * codes_flat /*K*/, int64_t row) {
+    double err = 0.0;
+    for (int64_t b = 0; b < K/BS; ++b) {
+        err += pxq6_quant_subblock<BS>(x + b*BS, w ? w + b*BS : nullptr, anchor,
+                                       book, mids, sub, &s4_flat[b], &codes_flat[b*BS], row, b);
+    }
+    return err;
+}
+
+// row anchor selection. Default = fp16_rn(row absmax) (the measured lab recipe).
+// PXA_PXQ6_ANCHOR_FIT=1: try 5 fp16 candidates absmax*2^(k/16), k=-2..+2, keep weighted-MSE argmin.
+static inline bool pxq6_anchor_fit_enabled() {
+    static const bool on = [](){ const char * e = getenv("PXA_PXQ6_ANCHOR_FIT"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+template <int BS>
+static float pxq6_pick_anchor(const float * x, const float * w, int64_t K,
+                              const float * book, const double * mids, const float * sub,
+                              uint8_t * s4_tmp, uint8_t * codes_tmp, int64_t row) {
+    float amax = 0.f;
+    for (int64_t i = 0; i < K; ++i) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    if (amax > 65504.f) amax = 65504.f;                    // fp16 ceiling (hardening; sane weights never hit)
+    const float a0 = ggml_fp16_to_fp32(ggml_fp32_to_fp16(amax));
+    if (!pxq6_anchor_fit_enabled() || !(a0 > 0.f)) return a0;
+    float best_a = a0; double best_e = -1.0;
+    float prev[5]; int np = 0;
+    for (int k = -2; k <= 2; ++k) {
+        const float cand = ggml_fp16_to_fp32(ggml_fp32_to_fp16(amax * (float)exp2(k / 16.0)));
+        if (!(cand > 0.f)) continue;
+        bool dup = false;
+        for (int i = 0; i < np; ++i) if (prev[i] == cand) { dup = true; break; }
+        if (dup) continue;
+        prev[np++] = cand;
+        const double e = pxq6_quant_row<BS>(x, w, K, cand, book, mids, sub, s4_tmp, codes_tmp, row);
+        if (best_e < 0.0 || e < best_e) { best_e = e; best_a = cand; }
+    }
+    return best_a;
+}
+
+// one [R,K] expert -> PXQ6 panels. tier 0: bs16 subs, slab 1088; tier 1 (HQ): bs8 subs, slab 1152.
+static void pxq6_quantize_expert(const float * src, uint8_t * dst, int64_t R, int64_t K,
+                                 const float * imx /*K vals or null*/, int tier,
+                                 int64_t row0 /*absolute row of src's first row*/) {
+    const float  * book = pxq6_book_q();
+    const double * mids = pxq6_mids_q();
+    const float  * sub  = pxq6_sub_q(tier);
+    const int64_t KB = K/32, P = R/64;
+    const int     slab_bytes  = tier ? PXQ6HQ_SLAB_BYTES : PXQ6_SLAB_BYTES;
+    const int     sc_per_row  = tier ? 2 : 1;             // scale bytes per row per slab
+    const int64_t panel_bytes = PXQ6_HDR_BYTES + KB*slab_bytes;
+    const int     BS   = tier ? 8 : 16;
+    const int64_t nsub = K / BS;
+
+    std::vector<uint8_t> s4(nsub), codes(K);
+    std::vector<float> kqw;
+    for (int64_t p = 0; p < P; ++p) {
+        uint8_t * panel = dst + p*panel_bytes;
+        ggml_fp16_t * anchors = (ggml_fp16_t *)panel;      // 64 x fp16 header
+        for (int64_t r = 0; r < 64; ++r) {
+            const float * x = src + (p*64 + r)*K;
+            const int64_t row = row0 + p*64 + r;
+            const float * wq = pxq_kqw_row_weights(x, imx, K, kqw);   // PXA_PXQ_KQW (== imx when off)
+            const float anchor = tier
+                ? pxq6_pick_anchor<8> (x, wq, K, book, mids, sub, s4.data(), codes.data(), row)
+                : pxq6_pick_anchor<16>(x, wq, K, book, mids, sub, s4.data(), codes.data(), row);
+            anchors[r] = ggml_fp32_to_fp16(anchor);
+            if (tier) pxq6_quant_row<8> (x, wq, K, anchor, book, mids, sub, s4.data(), codes.data(), row);
+            else      pxq6_quant_row<16>(x, wq, K, anchor, book, mids, sub, s4.data(), codes.data(), row);
+            // scatter into slabs
+            for (int64_t kb = 0; kb < KB; ++kb) {
+                uint8_t * slab = panel + PXQ6_HDR_BYTES + kb*slab_bytes;
+                if (tier) {
+                    const uint8_t * s = &s4[kb*4];         // 4 subs per 32 elems
+                    slab[2*r]   = (uint8_t)(s[0] | (s[1] << 4));
+                    slab[2*r+1] = (uint8_t)(s[2] | (s[3] << 4));
+                } else {
+                    const uint8_t * s = &s4[kb*2];         // 2 subs per 32 elems: lo nibble = elems 0-15
+                    slab[r] = (uint8_t)(s[0] | (s[1] << 4));
+                }
+                uint8_t * out = slab + 64*sc_per_row + r*16;
+                const uint8_t * c = &codes[kb*32];
+                for (int b = 0; b < 16; ++b) out[b] = (uint8_t)(c[2*b] | (c[2*b+1] << 4));
+            }
+        }
+    }
+}
+
+// reference dequant (CPU) — the parity-locked contract. Used by pxq6_ref + golden tests.
+static void pxq6_dequant_expert(const uint8_t * src, float * dst, int64_t R, int64_t K, int tier) {
+    const float * book = pxq6_book_q();
+    const float * sub  = pxq6_sub_q(tier);
+    const int64_t KB = K/32, P = R/64;
+    const int     slab_bytes  = tier ? PXQ6HQ_SLAB_BYTES : PXQ6_SLAB_BYTES;
+    const int     sc_per_row  = tier ? 2 : 1;
+    const int64_t panel_bytes = PXQ6_HDR_BYTES + KB*slab_bytes;
+    for (int64_t p = 0; p < P; ++p) {
+        const uint8_t * panel = src + p*panel_bytes;
+        const ggml_fp16_t * anchors = (const ggml_fp16_t *)panel;
+        for (int64_t r = 0; r < 64; ++r) {
+            const float anchor = ggml_fp16_to_fp32(anchors[r]);
+            for (int64_t kb = 0; kb < KB; ++kb) {
+                const uint8_t * slab = panel + PXQ6_HDR_BYTES + kb*slab_bytes;
+                float eff[4];
+                if (tier) {
+                    eff[0] = anchor * sub[slab[2*r] & 0xf];
+                    eff[1] = anchor * sub[slab[2*r] >> 4];
+                    eff[2] = anchor * sub[slab[2*r+1] & 0xf];
+                    eff[3] = anchor * sub[slab[2*r+1] >> 4];
+                } else {
+                    eff[0] = eff[1] = anchor * sub[slab[r] & 0xf];
+                    eff[2] = eff[3] = anchor * sub[slab[r] >> 4];
+                }
+                const uint8_t * q = slab + 64*sc_per_row + r*16;
+                float * o = dst + (p*64 + r)*K + kb*32;
+                for (int b = 0; b < 16; ++b) {
+                    const int i0 = 2*b, i1 = 2*b + 1;
+                    o[i0] = eff[i0 >> 3] * book[q[b] & 0xf];
+                    o[i1] = eff[i1 >> 3] * book[q[b] >> 4];
+                }
+            }
+        }
+    }
+}
+
+// full 3D expert tensor, threaded across experts (same pattern as pxq5_quantize_tensor).
+// imatrix semantics: imx_size == K*E -> per-expert columns; == K -> shared; else ignored.
+static void pxq6_quantize_tensor(const float * src, uint8_t * dst, int64_t R, int64_t K, int64_t E,
+                                 const float * imx, int64_t imx_size, int nthread, int tier) {
+    const int64_t exp_elems = R*K;
+    const int64_t exp_bytes = (R/64)*(PXQ6_HDR_BYTES + (K/32)*(int64_t)(tier ? PXQ6HQ_SLAB_BYTES : PXQ6_SLAB_BYTES));
+    auto imx_for = [&](int64_t e) -> const float * {
+        if (!pxq_imx_gate(imx)) return nullptr;
+        // dead-column guard (llama-quantize.cpp): an all-zero / non-finite imatrix column
+        // makes every candidate score 0.0, degenerating the weighted argmin into a tie-break
+        const float * w = nullptr;
+        if      (imx_size == K*E) w = imx + e*K;
+        else if (imx_size == K)   w = imx;
+        return pxq_imatrix_column_usable(w, K) ? w : nullptr;
+    };
+    (void)pxq6_book_q(); (void)pxq6_sub_q(0); (void)pxq6_mids_q();   // init tables before threading
+    // P15 (2026-07-27): thread over (expert, panel-chunk) jobs, not experts alone. A DENSE
+    // tensor (E == 1) previously fell into the serial branch and ran its whole R x K on ONE
+    // thread (measured: 103% CPU at -t 32 quantizing the dense 27B, ~9.7 s/tensor). Panels
+    // are independent and panel-major with per-panel headers, so a 64-row slice at a panel
+    // boundary is self-contained. The chunk's ABSOLUTE row offset (row0) must be passed in:
+    // `row` seeds pxq_tie_take_hi, so a chunk-local row would flip the deterministic
+    // tie-break and make the artifact differ across thread counts.
+    const int64_t panels      = R/64;
+    const int64_t panel_bytes = panels > 0 ? exp_bytes/panels : 0;
+    // Job granularity: fixed CHUNK=8 leaves cores idle on wide-and-short tensors --
+    // a dense R=5120 gives 80 panels = 10 jobs, so 10 of 72 cores work. Size it so there
+    // are ~4 jobs per thread, clamped to [1,8] panels (a 64-row panel x K is already
+    // substantial work, so CHUNK=1 costs nothing in scheduling overhead).
+    const int64_t CHUNK       = std::max<int64_t>(1, std::min<int64_t>(8, (panels*E)/(4*(int64_t)std::max(1, nthread))));
+    const int64_t chunks_per_e = panels > 0 ? (panels + CHUNK - 1)/CHUNK : 1;
+    const int64_t n_jobs      = E*chunks_per_e;
+    if (nthread <= 1 || n_jobs <= 1) {
+        for (int64_t e = 0; e < E; ++e) {
+            pxq6_quantize_expert(src + e*exp_elems, dst + e*exp_bytes, R, K, imx_for(e), tier, 0);
+        }
+        return;
+    }
+    std::atomic<int64_t> counter{0};
+    auto compute = [&]() {
+        while (true) {
+            const int64_t j = counter.fetch_add(1);
+            if (j >= n_jobs) break;
+            const int64_t e  = j / chunks_per_e;
+            const int64_t c  = j % chunks_per_e;
+            const int64_t p0 = c*CHUNK;
+            const int64_t nr = std::min<int64_t>(CHUNK, panels - p0)*64;
+            pxq6_quantize_expert(src + e*exp_elems + p0*64*K,
+                 dst + e*exp_bytes + p0*panel_bytes,
+                 nr, K, imx_for(e), tier, p0*64);
+        }
+    };
+    std::vector<std::thread> th;
+    const int n = (int) std::min<int64_t>(nthread, n_jobs);
+    th.reserve(n);
+    for (int i = 0; i < n; ++i) th.emplace_back(compute);
+    for (auto & t : th) t.join();
+}

@@ -1,0 +1,24 @@
+*.o
+*.a
+*.md
+.cache/
+
+# Ensure .git is NOT ignored so it can be mounted/copied
+!.git
+.github/
+.gitignore
+.vs/
+.vscode/
+.DS_Store
+build*/
+
+models/*
+
+/llama-cli
+/llama-quantize
+
+arm_neon.h
+compile_commands.json
+Dockerfile
+
+**/*.md

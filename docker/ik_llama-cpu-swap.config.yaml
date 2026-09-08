@@ -1,0 +1,72 @@
+healthCheckTimeout: 1800
+logLevel: info
+metricsMaxInMemory: 1000
+sendLoadingState: true
+includeAliasesInList: true
+
+models:
+  "qwen3 (you need to download .gguf first)":
+    proxy: "http://127.0.0.1:9999"
+    cmd: >
+      /app/llama-server
+      --model /models/Qwen_Qwen3-0.6B-Q6_K.gguf
+      --alias qwen3
+      --port 9999
+      --parallel 1
+      --webui llamacpp
+      --jinja
+      --ctx-size 12288
+      -fa on
+
+  "qwen3-vl (you need to download .gguf and mmproj first)":
+    proxy: "http://127.0.0.1:9999"
+    cmd: >
+      /app/llama-server
+      --model /models/Qwen_Qwen3-VL-4B-Instruct-IQ4_NL.gguf
+      --mmproj /models/Qwen_Qwen3-VL-4B-Instruct-mmproj-f16.gguf
+      --alias qwen3-vl
+      --port 9999
+      --parallel 1
+      --webui llamacpp
+      --jinja
+      --ctx-size 12288
+      -fa on
+
+  "qwen3.5 (you need to download .gguf first)":
+    proxy: "http://127.0.0.1:9999"
+    cmd: >
+      /app/llama-server
+      --model /models/Qwen_Qwen3.5-35B-A3B-IQ4_NL.gguf
+      --alias qwen3.5
+      --port 9999
+      --parallel 1
+      --webui llamacpp
+      --jinja
+      --ctx-size 12288
+      -fa on
+      --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.5 --repeat-penalty 1
+    aliases:
+      - "qwen3.5"
+    filters:
+      setParamsByID:
+        "${MODEL_ID}:thinking-coding":
+          temperature: 0.6
+          presence_penalty: 0.0
+        "${MODEL_ID}:instruct":
+          temperature: 0.7
+          top_p: 0.8
+          chat_template_kwargs:
+            enable_thinking: false
+
+  "smollm2 (will be downloaded automatically from huggingface.co)":
+    proxy: "http://127.0.0.1:9999"
+    cmd: >
+      /app/llama-server
+      --hf-repo mradermacher/SmolLM2-135M-i1-GGUF --hf-file SmolLM2-135M.i1-IQ4_NL.gguf
+      --alias smollm2
+      --port 9999
+      --parallel 1
+      --webui llamacpp
+      --jinja
+      --ctx-size 12288
+      -fa on

@@ -1,0 +1,114 @@
+{
+ "gguf": "/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf",
+ "tensors": [
+  {
+   "label": "attn_gate",
+   "ggml_name": "blk.0.attn_gate.weight",
+   "N": 256,
+   "K": 5120,
+   "panel0": 1,
+   "panels": 4,
+   "bytes": 696832,
+   "full_rows": 6144,
+   "full_bytes": 16723968
+  },
+  {
+   "label": "attn_qkv",
+   "ggml_name": "blk.0.attn_qkv.weight",
+   "N": 256,
+   "K": 5120,
+   "panel0": 1,
+   "panels": 4,
+   "bytes": 696832,
+   "full_rows": 10240,
+   "full_bytes": 27873280
+  },
+  {
+   "label": "attn_q",
+   "ggml_name": "blk.3.attn_q.weight",
+   "N": 256,
+   "K": 5120,
+   "panel0": 1,
+   "panels": 4,
+   "bytes": 696832,
+   "full_rows": 12288,
+   "full_bytes": 33447936
+  },
+  {
+   "label": "attn_output",
+   "ggml_name": "blk.3.attn_output.weight",
+   "N": 256,
+   "K": 6144,
+   "panel0": 1,
+   "panels": 4,
+   "bytes": 836096,
+   "full_rows": 5120,
+   "full_bytes": 16721920
+  },
+  {
+   "label": "ffn_gate",
+   "ggml_name": "blk.0.ffn_gate.weight",
+   "N": 256,
+   "K": 5120,
+   "panel0": 1,
+   "panels": 4,
+   "bytes": 696832,
+   "full_rows": 17408,
+   "full_bytes": 47384576
+  },
+  {
+   "label": "ffn_down",
+   "ggml_name": "blk.0.ffn_down.weight",
+   "N": 256,
+   "K": 17408,
+   "panel0": 1,
+   "panels": 4,
+   "bytes": 2368000,
+   "full_rows": 5120,
+   "full_bytes": 47360000
+  }
+ ],
+ "kv": {
+  "general.architecture": "qwen35",
+  "pxa.pxq.backbone_rev": 2,
+  "pxa.pxq.backbone_map": "attn_q,attn_qkv,attn_output,attn_gate_ch,shexp,ffn_dense=tier+1;attn_k,attn_v=q8_0;attn_gate_head=f16;token_embd=q6_k;output=q8_0",
+  "pxa.pxq6.version": 1,
+  "pxa.pxq6.tier": "core",
+  "pxa.pxq6.book": [
+   -0.98779296875,
+   -0.7353515625,
+   -0.55859375,
+   -0.419677734375,
+   -0.301025390625,
+   -0.1944580078125,
+   -0.09552001953125,
+   0.0,
+   0.084716796875,
+   0.1712646484375,
+   0.261962890625,
+   0.360595703125,
+   0.47119140625,
+   0.6005859375,
+   0.765625,
+   1.0
+  ],
+  "pxa.pxq6.sub": [
+   0.2147216796875,
+   0.303466796875,
+   0.362060546875,
+   0.408935546875,
+   0.449951171875,
+   0.4873046875,
+   0.52294921875,
+   0.55859375,
+   0.59423828125,
+   0.6318359375,
+   0.671875,
+   0.71630859375,
+   0.7666015625,
+   0.82470703125,
+   0.89599609375,
+   0.98779296875
+  ]
+ }
+}

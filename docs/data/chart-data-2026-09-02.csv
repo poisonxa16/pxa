@@ -1,0 +1,77 @@
+# every row feeds the campaign charts; source = the measurement ledger / bench/fair-battle.md; t/s, median of 7 unless noted
+cardset,cards,model,engine,codec,prefill_3k,prefill_20k,decode,notes
+p100,2x P100 (1;5),Qwable-27B,upstream ik_llama.cpp 3c58ae37,MXFP4,134.2,84.0,14.27,two passes
+p100,2x P100 (1;5),Qwable-27B,mainline llama.cpp 9400c89,MXFP4,209.6,255.0,,two passes 209.46/209.69 - 254.96/254.95; decode not captured (harness n_past)
+p100,2x P100 (1;5),Qwable-27B,pxa shipped 45dded40d8,MXFP4,181.1,165.0,14.30,shipped build two passes 181.65/180.46 - 165.15/164.77 - 14.27/14.32
+p100,2x P100 (1;5),Qwable-27B,pxa shipped 45dded40d8,PXQ4,227.37,202.92,18.33,candidate build 07:46; shipped-build re-run pending
+v100,2x V100 (2;4),Qwable-27B,upstream ik_llama.cpp 3c58ae37,MXFP4,471.0,395.2,37.40,two passes 471.06/470.99 - 395.12/395.34 - 37.37/37.43
+v100,2x V100 (2;4),Qwable-27B,mainline llama.cpp 9400c89,MXFP4,941.1,1191.7,34.79,two passes 940.25/941.87 - 1195.03/1188.31 - 34.75/34.82; 20k rise = CUDA graph reuse
+v100,2x V100 (2;4),Qwable-27B,pxa shipped 45dded40d8,MXFP4,370.06,316.89,37.68,quiet pass 2 13:45; pass 1 363.4/314.9/35.70 (SGEMM fallthrough bug)
+v100,2x V100 (2;4),Qwable-27B,pxa + precision fix (539056649a),MXFP4,851.3,585.9,37.68,two passes 851.10/851.40 @3k
+v100,2x V100 (2;4),Qwable-27B,pxa shipped 45dded40d8,PXQ4 (MMVQ),807.37,589.03,34.58,pass 2 791.9/583.8/33.79; kernel fix in progress
+v100,2x V100 (2;4),Qwable-27B,pxa + fused-twin split default (57fdd9091c),PXQ4,831.4,577.4,38.65,no-env 38.65 / env 38.57; MXFP4 back-to-back 37.28
+1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,upstream ik_llama.cpp 3c58ae37,IQ2_KS,1156.0 (cold fa-off),721.9 (chat fa-on),52.23,published-tier session 18:45; July was 1154/739/52.2
+1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa shipped 45dded40d8,PXQ2,1013.0 (cold fa-off),624.7 (chat fa-on),65.19,PUBLISHED tier fusion2-35b-PXQ2 (c11b45ef); earlier 1346/747 was on the defective archive and is struck
+1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa + N14 LUT 52d3e7828d,PXQ2,1032.0 (cold fa-off),635.3 (chat fa-on),65.34,PUBLISHED tier; prefill LOSES to upstream (-11%/-12%); int8 prefill nondeterminism flagged; surgery reopened
+v100,2x V100 (2;4),Qwable-27B,pxa + Volta mma FA + f16 GEMM route (2a370b46a0),PXQ4,909.8,802.2,34.3,two passes 908.7/910.9 - 804.3/800.2; greedy identical @3k; PP + CUDA-graph + layer-major the measurement session
+v100,2x V100 (2;4),Qwable-27B,pxa + Volta mma FA + f16 GEMM route at -ub 512,PXQ4,1032.6,1006.0,34.05,STRUCK: measured on the unsafe in-place state path; safe path = 769 @20k; re-measure on rc/unified
+p100,2x P100 (1;5),Qwable-27B,pxa prefill branch at -ub 512,PXQ4,265.8,267.4,18.27,STRUCK pending re-measure on rc/unified (prefill branch lacks the np==1 fix)
+p100,2x P100 (1;5),Qwable-27B,pxa prefill branch at -ub 256,PXQ4,310.7,294.1,18.34,STRUCK pending re-measure on rc/unified (prefill branch lacks the np==1 fix)
+1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa + N15 joint-table loader + fusion guard (0a3ca95453),PXQ2,1069.1 (cold fa-off),649.7 (chat fa-on),65.03,published tier same hour: upstream 1141.4/727.8/52.34; still -6.3%/-10.7% prefill; phase 2 (MMQ tile occupancy) running
+1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa + N16 mmq-loop tile (e902f1cf07),PXQ2,1252.8 (cold fa-off),717.5 (chat fa-on),65.0,published tier same window: upstream 1123.5/712.5; +11.5% cold, chat tie; deterministic
+v100,2x V100 (2;4),Qwable-27B,pxa rc/unified-20260903 (safe path) ub 2048,PXQ4,915.0,807.4,35.10,unified build n=7 concurrent with a P100 arm; ub 512 = 831/745
+p100,2x P100 (1;5),Qwable-27B,pxa rc/unified-20260903 (safe path) ub 256,PXQ4,218.4,,,unified build; ub 2048 shipped-build 231/205 stands as the P100 row until the overlap lane
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 6163d43954,PXQ4,,,36.34,CANDIDATE 2026-09-03 01:46 decode @fill8 n=5 median; same-session base 35.12 (contended box); FUSE_DELTANET=7 graphs off; bit-exact to reference
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 3b0c99f817 ASYNC_INPUTS=1,PXQ4,,791.2,,CANDIDATE 2026-09-03 00:50 20801 ub2048 2 runs; base same session 776.1; async default off
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch all three levers (pre-guard),PXQ4,,1018.5,,STRUCK-PENDING-GUARD 20801 ub512 busy 1.24 vs base 745; SHARE_INPUTS exposed the DeltaNet fusion race; re-measure after PXA_FUSE_DELTANET_WAR
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch d7ad0ec73b shipping defaults ub512,PXQ4,1035.0,973.0,,CANDIDATE 2026-09-03 02:34 safe carry; 2 runs 1031.3/1038.6 - 968.1/979.1; busy 1.17-1.20; output-identical to reference; soak 80/80
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch d7ad0ec73b shipping defaults ub2048,PXQ4,996.8,859.8,,CANDIDATE 2026-09-03 02:34 2 runs 992.7/1000.8 - 856.7/862.9
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch V70=0 ub2048,PXQ4,876.18,781.55,35.53,LOSS baseline for V70 GEMM cell; n=2
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch V70=1 ub2048,PXQ4,416.76,397.82,35.50,LOSS -52.4%/-49.1% vs off-ub2048; ON confirmed in logs; parity+ppl clean
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch V70=0 ub512,PXQ4,623.03,602.61,35.60,LOSS baseline for V70 GEMM cell; n=2
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch V70=1 ub512,PXQ4,369.62,362.27,35.44,LOSS -40.7%/-39.9% vs off-ub512; ON confirmed in logs
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch V70=1 CFG=2 ub512,PXQ4,344.99,336.21,35.07,LOSS -44.6%/-44.2% vs off-ub512; worse than default CFG; env-gate stays default OFF
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 70029ee4ad SHIP defaults ub512,PXQ4,1034.9,964.5,,CANDIDATE 2026-09-03 04:55 safe carry ASYNC=0; 2 runs 1037.5/1032.3 - 961.0/967.9; busy 1.18-1.20; soak 80/80; supersedes the 02:34 rows
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 70029ee4ad SHIP defaults ub2048,PXQ4,948.1,849.6,,CANDIDATE 2026-09-03 04:55 2 runs 943.8/952.3 - 851.6/847.5
+v100,2x V100 (2;4),Qwen3.8-27B,pxa dev-branch PXA_DQC_MB=0 ub2048,PXQ4,910.46,804.31,35.31,baseline for dequant-prefetch cell; n=2
+v100,2x V100 (2;4),Qwen3.8-27B,pxa dev-branch PXA_DQC_MB=768 ub2048,PXQ4,853.36,765.97,35.48,LOSS -6.3%/-4.8% vs off-ub2048; engaged confirmed (arena log+VRAM+768MiB/dev); sha-identical to off
+v100,2x V100 (2;4),Qwen3.8-27B,pxa dev-branch PXA_DQC_MB=0 ub512,PXQ4,715.88,631.17,35.33,baseline for dequant-prefetch cell; n=2
+v100,2x V100 (2;4),Qwen3.8-27B,pxa dev-branch PXA_DQC_MB=768 ub512,PXQ4,713.86,620.50,35.40,LOSS -0.3%(noise)/-1.7% vs off-ub512; engaged confirmed (arena log+VRAM+768MiB/dev); sha-identical to off
+v100,2x V100 (2;4),Qwable-27B,pxa fold 9f72492c72 ub512,PXQ4,1119.96,1013.85,37.24,FINAL 2026-09-03 07:03 n=7 quiet box serialized; pass b 1106.89/1005.25/37.29
+v100,2x V100 (2;4),Qwable-27B,pxa fold 9f72492c72 ub2048,PXQ4,996.48,883.06,37.29,FINAL 2026-09-03 n=7
+v100,2x V100 (2;4),Qwable-27B,mainline llama.cpp 9400c89,MXFP4,937.01,1165.17,,FINAL 2026-09-03 n=7 in-session ub2048; ub512 933.59/1150.32; decode not captured by harness (earlier 34.8)
+v100,2x V100 (2;4),Qwable-27B,upstream ik_llama.cpp 3c58ae37,MXFP4,469.80,395.33,37.39,FINAL 2026-09-03 n=7 in-session
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 44e6eea632 FUSE_DELTANET=3 (off) pass a,PXQ4,,,36.93,FINAL-CANDIDATE base for the decode workstream decode2 cell; n=5 fill8; pass b 37.00
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 44e6eea632 FUSE_DELTANET=55 (bit2+4+5 on) pass a,PXQ4,,,39.43,FINAL-CANDIDATE 2026-09-03 decode @fill8 n=5; pass b 39.38; gated 12/12-equivalent clean at np=1 and np=2 slot-pinned (bit2,4,5 each 100% ref-sha match, 100% needle recall); +6.4-6.8% vs off; +5.6-5.7% vs same-session ik (37.30), non-overlapping intervals; beats 38.5 bar; closes the decode workstream (was 0.3% RED at 37.24/37.39)
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 44e6eea632 FUSE_DELTANET=55 fill20800 pass a,PXQ4,,,30.81,FINAL-CANDIDATE 2026-09-03 deep decode n=5; pass b 30.95; base 29.41/29.38; ik 30.55
+v100,2x V100 (2;4),Qwable-27B,upstream ik_llama.cpp 3c58ae37,MXFP4,,,37.30,FINAL-CANDIDATE 2026-09-03 in-session decode2 ik arm n=5 fill8; deep fill20800 30.55
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch ee4300bd4a PXA_SCHED_PIPELINE=0 (baseline) ub512,PXQ4,1112.33,1014.10,37.29,baseline for cross-ubatch pipelining cell; n=2; busy(sum util GPU2+4) 1.148
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch ee4300bd4a PXA_SCHED_PIPELINE=1 ub512,PXQ4,1102.53,1011.31,37.44,LOSS(wash) -0.9%/-0.3% vs off-ub512 (within noise spread 0.29%/0.02%); busy 1.088 (target >=1.35 NOT met, moved down); n_copies=2+ASYNC staging confirmed engaged; gates np1 12/12 np2 12/12 needle3121 6/6+6/6 soak 40/40 all clean
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch ee4300bd4a PXA_SCHED_PIPELINE=0 (baseline) ub2048,PXQ4,995.76,882.60,37.26,baseline for cross-ubatch pipelining cell; n=2; busy(sum util GPU2+4) 0.914
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch ee4300bd4a PXA_SCHED_PIPELINE=1 ub2048,PXQ4,933.15,844.60,37.41,LOSS -6.3%/-4.3% vs off-ub2048 (real, outside 0.88%/0.20% spread); busy 0.855 (down not up); default stays OFF; commit kept as documented negative (alias-collision guard is a real correctness fix); P100 pair skipped per main order (same recurrent glue predicts same loss, no GPU time on a known loss)
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch PXA_PIPELINE_PP=0 (baseline) -ts 45,55 ub512,PXQ4,1112.43,990.43,39.39,baseline for deeper-copies cell rebalanced -ts; n=2; busy(sum util GPU2+4) 1.086
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch PXA_PIPELINE_PP=1 n_copies=2 -ts 45,55 ub512,PXQ4,1043.22,976.42,39.82,LOSS -6.2%/-1.4% vs off-ub512; busy 1.087 (flat, target >=1.30 NOT met); gates np1 12/12 np2 12/12 needle3121 6/6+6/6 soak 40/40 all clean
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch PXA_PIPELINE_PP=1 n_copies=4 GGML_SCHED_MAX_COPIES=4 -ts 45,55 ub512,PXQ4,1040.69,981.73,39.35,LOSS -6.5%/-0.9% vs off-ub512; busy 1.037 (DOWN from copies=2, target >=1.30 NOT met, target t/s >=1165 missed by 15.7%); same gates all clean; default stays OFF
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch PXA_PIPELINE_PP=0 (baseline) -ts 45,55 ub2048,PXQ4,1002.33,860.41,39.52,baseline for deeper-copies cell rebalanced -ts; n=2; busy(sum util GPU2+4) 0.898
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch PXA_PIPELINE_PP=1 n_copies=2 -ts 45,55 ub2048,PXQ4,1005.89,866.52,39.65,LOSS(wash) +0.4%/+0.7% vs off-ub2048 (inside noise); busy 0.876 (down not up)
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch PXA_PIPELINE_PP=1 n_copies=4 -ts 45,55 ub2048,PXQ4,938.75,853.93,39.78,LOSS -6.3%/-0.8% vs off-ub2048; busy 0.890; deeper n_copies (2->4) does not raise busy-sum toward mainline's 1.29-1.37, refutes the diagnosis's "not deep enough" hypothesis; commit kept as documented negative, PXA_PIPELINE_PP_COPIES lever left in tree default-off
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 62b58fe462 checkpoint levers OFF (baseline) default -ts ub512,PXQ4,1042.65,971.49,39.50,baseline for the checkpoint-policy cell; n=2 (median of 2 after a discarded warmup); busy(sum util GPU2+4) 1.244; spread +/-0.02%/0.19%
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 62b58fe462 PXA_CKPT_PROMPT_POLICY=1 PXA_CKPT_LEAN_SYNC=1 PXA_PIPELINE_PP=1 copies=2 default -ts ub512,PXQ4,1151.23,1083.20,39.69,CANDIDATE +10.4%/+11.5% vs off-ub512; busy 1.330 (target >=1.30 MET); 20801 cell 83-87% -> 93.0% of mainline 1165 (target t/s NOT met); mainline's mid-prompt checkpoint policy (2 checkpoints per 20k prompt not 11) + 1 device drain per checkpoint instead of 3; host block per prefill 12377ms -> 2510ms; gates np1 12/12 np2 12/12 needle3121 6/6+6/6 soak 40/40 all identical to the lever-off reference (50320f65 / 82110639)
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 62b58fe462 checkpoint levers OFF (baseline) default -ts ub2048,PXQ4,939.26,848.56,39.42,baseline for the checkpoint-policy cell at ub2048; n=2; busy 0.866
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 62b58fe462 PXA_CKPT_PROMPT_POLICY=1 PXA_CKPT_LEAN_SYNC=1 PXA_PIPELINE_PP=1 copies=2 default -ts ub2048,PXQ4,1021.71,932.13,39.73,CANDIDATE +8.8%/+9.8% vs off-ub2048; busy 0.933; same gates
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 62b58fe462 PXA_SCHED_ASYNC_INPUTS=1 alone (with ckpt levers) -ts 45,55 ub512,PXQ4,,802.24,,LOSS -25% vs the same arm without it (1069.9); busy 0.990; at n_copies==1 it trips overlap2's own alloc_graph full-drain defence and serializes both devices; stays default OFF; n=2 probe not a full bench row
+v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 62b58fe462 reference --ctx-checkpoints 0 default -ts ub512,PXQ4,,1087.16,,ceiling reference for the checkpoint cell (checkpoints fully disabled); the shipped policy reaches 1083-1086 while KEEPING the 2 restorable checkpoints; n=2 probe
+p100,2x P100 (1;5),Qwable-27B,pxa fold+carry ed5c9998af ub256,PXQ4,321.81,296.51,17.69,CANDIDATE 2026-09-03 19:04 2 runs shipped defaults (SHARE auto, guards, ckpt policy, lean sync, PP copies=2); off arm 319.28/288.94/17.47
+p100,2x P100 (1;5),Qwable-27B,pxa fold+carry ed5c9998af ub512,PXQ4,295.48,274.98,17.74,CANDIDATE 2026-09-03 19:04 2 runs
+v100,2x V100 (2;4),Qwable-27B,pxa fold 24ebec4096 ub2048 b8192,PXQ4,1339.64,1281.87,39.67,FINAL 2026-09-03 20:45 n=7 serialized in-session; supersedes the 07:03 FINAL rows
+v100,2x V100 (2;4),Qwable-27B,pxa fold 24ebec4096 ub512 b8192,PXQ4,1251.73,1176.33,39.53,FINAL 2026-09-03 20:45 n=7; pass b 1237.82/1162.73/39.61
+v100,2x V100 (2;4),Qwable-27B,mainline llama.cpp 9400c89,MXFP4,939.55,1129.07,,FINAL 2026-09-03 20:45 n=7 in-session; best of ub2048 (1123.74) and ub512 (1129.07); -b 8192 probe 1167 (2 runs); decode not captured (34.8 earlier)
+v100,2x V100 (2;4),Qwable-27B,upstream ik_llama.cpp 3c58ae37,MXFP4,470.75,395.27,37.37,FINAL 2026-09-03 20:45 n=7 in-session
+p100,2x P100 (1;5),Qwable-27B,pxa fold 24ebec4096 ub256 b8192,PXQ4,340.16,316.84,17.83,FINAL 2026-09-03 21:11 n=7 serialized; pass b 339.11/316.57/17.79
+p100,2x P100 (1;5),Qwable-27B,mainline llama.cpp 9400c89,MXFP4,209.08,254.74,,FINAL 2026-09-03 21:35 n=7 in-session; decode not captured
+p100,2x P100 (1;5),Qwable-27B,pxa fold 24ebec4096 ub512 b8192,PXQ4,323.26,310.38,17.76,FINAL 2026-09-03 22:23 n=7
+p100,2x P100 (1;5),Qwable-27B,upstream ik_llama.cpp 3c58ae37,MXFP4,133.36,84.15,14.30,FINAL 2026-09-03 22:23 n=7 in-session
+1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,upstream ik_llama.cpp 3c58ae37,IQ2_KS,1132.1 (cold fa-off),740.0 (chat fa-on),53.33,FINAL 2026-09-03 22:26 n=3 published tier; cold decode 30.43; shas stable
+1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa fold 24ebec4096 int8-prefill,PXQ2,1306.0 (cold fa-off),729.3 (chat fa-on),59.22,FINAL 2026-09-03 23:00 n=3 published tier; PXA_PXQ_INT8_PREFILL=1 PXA_PXQ_I8_BLUT=1; cold decode 32.05; shas stable; chat prefill ties upstream (727-746)
+v100,2x V100 (2;4),Qwable-27B,pxa v2026.09.05-rc1 cd681b35 (auto -b 8192 -ub 2048),PXQ4,1356.78,1306.54,39.58,FINAL 2026-09-07 rel-ab AFTER arm: bare command line no env; prefill n=3 decode n=12; reproduces the RC notes row 1369/1300/39.5 within 1%
+p100,2x P100 (1;5),Qwable-27B,pxa v2026.09.05-rc1 cd681b35 (auto -b 8192 -ub 256),PXQ4,337.75,315.35,18.17,FINAL 2026-09-07 rel-ab AFTER arm: bare command line no env; prefill n=3 decode n=12
