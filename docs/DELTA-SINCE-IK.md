@@ -59,9 +59,14 @@ tool calls and 4000-token loops. The fix rolls the state back whenever it sits a
 re-entry point and matches checkpoints on `pos_max` instead of `pos_min`. The pre-fix mitigation
 (`--ctx-checkpoints 0`) and the proper fix are both documented, with the warning that any binary
 built before 2026-07-28 lacks it (`docs/LEVERS.md`, `--ctx-checkpoints` row). A related
-correctness-only guard blocks `-sm graph` on the same hybrid architectures after root-causing a
-cross-device all-reduce defect that produces degenerate output (`PXA_ALLOW_GRAPH_SPLIT_HYBRID`,
-`docs/LEVERS.md`).
+correctness-only guard blocks `-sm graph` on the same hybrid architectures, which were measured
+producing degenerate output (`PXA_ALLOW_GRAPH_SPLIT_HYBRID`, `docs/lab/LEVERS.md`). Bisecting that
+on hardware in September moved the root cause off the cross-device all-reduce it was first
+attributed to and onto the codec: graph split cuts the attention output and the expert down
+projections along `K`, and a PXQ tensor cannot be cut on that axis — one fp16 anchor per row sits
+in the 64-row panel header and covers all of `K` — so the slices were read at wrong byte offsets.
+`-sm graph` is now refused on a PXQ file whatever the architecture, and `-sm layer` is the
+supported split for PXQ files.
 
 **Hybrid context shift.** Companion-shift mirroring for MTP/hybrid architectures was replaced with
 `seq_rm` + rebuild (`PXA_HYBRID_CTX_SHIFT_v3`, `docs/LEVERS.md`, `PXA_MTP_DRAFT_RESERVE_CLAMP` row).

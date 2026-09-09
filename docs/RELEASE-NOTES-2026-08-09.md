@@ -136,6 +136,14 @@ experts and reads ~k× the expert bytes. `ngram-mod` drafts only on an n-gram ma
 - `-sm graph` on the DeltaNet hybrid arches falls back to `-sm layer` with a warning: it produces
   fully degenerate output there. Root cause is the cross-device all-reduce not reaching consumers,
   not the recurrent state. `PXA_ALLOW_GRAPH_SPLIT_HYBRID=1` bypasses the guard, for debugging only.
+  **Correction, 2026-09-08 — the root cause named above is wrong, the guard is not.** Bisected on
+  hardware one variable at a time: the degenerate output follows the *file*, not the architecture.
+  The same binary and the same model are clean under `-sm graph` on a stock GGUF quant and
+  degenerate on the PXQ quant of it, because graph split cuts the attention output and the expert
+  down projections along `K`, which the panel-addressed PXQ layout cannot express. `-sm graph` is
+  now refused on a PXQ file outright. The hybrid fallback described here stays: on a stock file
+  graph mode is not degenerate on these architectures, but it does not reproduce `-sm layer`
+  either.
 
 ## Documented dead ends (kept, default off, so nobody re-runs them)
 

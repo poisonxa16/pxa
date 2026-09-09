@@ -309,10 +309,15 @@ LLAMA_ONLY_PXQ = {"PXQ4-HQ", "PXQ6", "PXQ3", "PXQ2", "PXQ_UNIVERSAL"}
 # No CPU codec, GPU-only, open task #62 (PXQ-TYPE-MATRIX.md:67; RELEASE-GATE.md:177).
 NO_CPU_CODEC = {"PXQ1", "PXQ6"}
 
-# '-sm graph' is hard-guarded off for the DeltaNet hybrids: the cross-device
-# all-reduce never reaches its consumers, so each device computes a different
-# router top-8 -> degenerate output. Where graph split DOES work it is a phase
-# trade, not a win: +64% prefill / -17% decode on 4x P100. Never for decode.
+# '-sm graph' is hard-guarded off for the DeltaNet hybrids: it was measured
+# producing degenerate output. Root cause, bisected on hardware 2026-09-08: the
+# graph split cuts the attention output and the expert down projections along K
+# (dim 0), and a PXQ tensor cannot be cut on that axis - one fp16 anchor per row
+# lives in the 64-row panel header and covers all of K - so the slices are read
+# at wrong byte offsets. The engine refuses '-sm graph' on a PXQ file for that
+# reason, on any arch. On a stock GGUF file graph split runs and is not
+# degenerate, but on these architectures it does not reproduce '-sm layer', so
+# it stays outside the determinism gate and the guard here stays.
 # SPEC CORRECTION C5: the arch names are one of TWO triggers; the structural one
 # (linear_attn.* tensors) is the other, so an unnamed arch with the same tensors
 # is caught too.
@@ -1481,10 +1486,12 @@ R = {
           "equivalent and would be silently ignored."),
  "R-11": ("REFUSING: -sm {sm} with vLLM. vLLM's parallelism model has no -sm equivalent."),
  "R-12": ("REFUSING: -sm graph on a DeltaNet hybrid ({why}). It produces DEGENERATE output - the "
-          "cross-device all-reduce never reaches its consumers and each device computes a "
-          "different router top-8. Not fixable by an env: PXA_ALLOW_GRAPH_SPLIT_HYBRID only "
-          "removes the guard. Use -sm layer. Even where graph split works it is a phase trade, "
-          "not a win: +64% prefill / -17% decode on 4x P100."),
+          "graph split cuts the attention output and the expert down projections along K, and a "
+          "PXQ tensor cannot be cut on that axis, so the slices are read at wrong byte offsets. "
+          "The engine refuses -sm graph on a PXQ file for that reason on any arch. On a stock "
+          "GGUF file graph split runs, but on these architectures it does not reproduce -sm "
+          "layer, so it stays outside the determinism gate. Not fixable by an env: "
+          "PXA_ALLOW_GRAPH_SPLIT_HYBRID only removes the guard. Use -sm layer."),
  "R-13L": ("REFUSING: -ctk {k} / -ctv {v} has no compiled FA vec kernel at head 128 on this "
            "build - it does not fall back, it HARD-ABORTS at request time (on_no_fattn_vec_case, "
            "'Unsupported KV type combination for head_size 128'). Compiled asymmetric pairs "

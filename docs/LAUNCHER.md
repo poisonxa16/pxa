@@ -980,7 +980,7 @@ Everything else warns:
 |---|---|---|
 | `--ngl N` | 999 | Layers to offload. Below 99 on a GPU-only tier triggers R-16. |
 | `--ts A,B` | auto | Forces the tensor split; the automatic capacity split is then **not** used. Refused on vLLM (R-10). |
-| `--sm layer\|graph\|row` | `layer` | Split mode. `graph` on a DeltaNet hybrid is refused (R-12). Refused outright on vLLM (R-11). |
+| `--sm layer\|graph\|row` | `layer` | Split mode. `graph` on a DeltaNet hybrid is refused (R-12). Refused outright on vLLM (R-11). On any other architecture the launcher passes `graph` through, but the engine itself refuses it on a **PXQ file** at load — `layer` is the supported split there. |
 | `--ub N` | 0 = the matched recipe row's measured cell | Forces `-ub` (and `-b`, unless `--b` is given too). Where no row covers the topology nothing is passed and adaptive-ub probes each device. |
 | `--b N` | 0 | Forces the prefill chunk `-b`. Only meaningful together with `--ub`. |
 | `--ctk`, `--ctv` | `f16` | KV cache types. Checked against the compiled FA kernel pairs (R-13L). Refused on vLLM (R-13V). |
@@ -1075,7 +1075,7 @@ than enforced, because this process `exec`s the server and cannot observe it.
 |---|---|
 | **R-10** | `-ts` with vLLM. vLLM splits work evenly; a per-card ratio has no equivalent and would be silently ignored. |
 | **R-11** | `-sm` with vLLM. No equivalent in its parallelism model. |
-| **R-12** | `-sm graph` on a DeltaNet hybrid. Produces **degenerate output** — the cross-device all-reduce never reaches its consumers and each device computes a different router top-8. Not fixable by an env var. |
+| **R-12** | `-sm graph` on a DeltaNet hybrid. Produces **degenerate output**, measured. The cause was traced in 2026-09 to the codec rather than to the cross-device all-reduce it was first attributed to: graph split cuts the attention output and the expert down projections along `K`, and a PXQ tensor cannot be cut on that axis, so the engine now refuses `-sm graph` on a **PXQ file** on any architecture. This refusal stays keyed on the architecture as well, because on a stock GGUF file graph mode on these architectures is not degenerate but still does not reproduce `-sm layer`. Not fixable by an env var. |
 | **R-13L** | A `-ctk`/`-ctv` pair with no compiled FA vec kernel at head 128. It does **not** fall back — it hard-aborts at request time. Compiled asymmetric pairs: `q8_0/q6_0`, `q8_0/iq4_nl`, `q6_0/q5_0`. |
 | **R-13V** | `--ctk`/`--ctv` with vLLM — no equivalent, would be silently dropped. |
 | **R-14** | `--spec mtp` with vLLM. No MTP drafter there, and ngram will **not** be substituted: on this model class the two have opposite verdicts (ngram +23.0% code; MTP −8.6%). Substituting a lever's meaning is worse than dropping it. |
@@ -1454,7 +1454,9 @@ path is a machine's private detail.
 | `VLLM_SM70_QUANT_BACKEND=turbomind` | vLLM, sm_70 | From the sm_70 serving recipe. |
 
 `PXA_ALLOW_GRAPH_SPLIT_HYBRID` exists but only **removes the R-12 guard** — it
-does not make graph split correct on a DeltaNet hybrid.
+does not make graph split correct on a DeltaNet hybrid, and it does not touch the
+engine's separate refusal of `-sm graph` on a PXQ file, which is a property of the
+file's layout and not of the architecture.
 
 ---
 
