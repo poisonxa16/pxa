@@ -13,8 +13,17 @@
 # can get the same bytes.
 
 # ---------------------------------------------------------------------------------------------
-# PXA-Fusion2-35B tiers -- published at huggingface.co/poisonxa/PXA-Fusion2-35B-GGUF
+# PXA-Fusion2-35B tiers -- the measured artifacts are published at
+# huggingface.co/poisonxa/PXA-bench-files-GGUF, one file per published row:
+#   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/<filename below>
 # (also listed in bench/checksums.sha256, which is the model-card copy of these same hashes)
+#
+# NOTE on the old location: these tiers were listed under huggingface.co/poisonxa/PXA-Fusion2-35B-GGUF.
+# That repo name now redirects to poisonxa/PXA-Fusion4-35B-GGUF -- a DIFFERENT model, whose PXQ2
+# (11,243,296,832 B, sha 92d7c2533f034fc5548254d8f5a427456aec44c1160d95791e5221e985039fc5) and PXQ4
+# (19,296,360,576 B, sha 6fc30e1f9d3df634e6c97900ed04f5bd604b92786d351f72931120b00a814cf4) are real
+# published artifacts but back none of the Fusion2 rows. A Fusion2 number must be reproduced on a
+# Fusion2 file; the redirect is not a substitution.
 # ---------------------------------------------------------------------------------------------
 # 2-bit tier. NOTE: re-uploaded 2026-09-02 with the chat-template/tail fix; a copy downloaded
 # before that date hashes 4390c2efd43740fc612910e101b7410a4b7fece5eb8cefa9140ff28bffe42f1d and
@@ -31,6 +40,8 @@ f08dc102b38c4a23ae546d9e007b8dad30e043e848480d29809d2262d0b17531  PXA-Fusion2-35
 556ff9a8a0ffa3ff924e8c1b8aefb6e16a3551abc8c9b38643233f69592df14d  mmproj-fusion2-f16.gguf
 # PXQU-16 with the recommended q8_0 output head (--output-tensor-type q8_0): the artifact behind
 # the 62.4 t/s P100 and 101.3 t/s V100 decode rows and the PRODUCT arm of bench/fair/run.sh.
+# This is the file START-HERE.md sends a single-16 GB-card reader to:
+#   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/fusion2-35b-U16-q8head.gguf
 643e55b07faf8b9b359fcb050494ec9c56e51c2db8d81751b4120b97782c5779  fusion2-35b-U16-q8head.gguf
 
 # ---------------------------------------------------------------------------------------------

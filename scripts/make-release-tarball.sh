@@ -478,46 +478,24 @@ $BUILD_FLAGS
 EOF
 
 # ---------------------------------------------------------------------------------------------
-# START-HERE.md
+# START-HERE.md — rendered by scripts/gen-start-here.sh, the SAME renderer a maintainer runs to
+# refresh the START-HERE.md committed at the repo root. One template (scripts/START-HERE.md.in),
+# one renderer, so the tarball's copy and the repository's copy cannot drift. The driver-floor
+# and distro-hint tables live in that script; everything below is what only THIS build knows.
 # ---------------------------------------------------------------------------------------------
 NVIDIA_SMI_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
 NVIDIA_SMI_DRIVER=${NVIDIA_SMI_DRIVER:-"(could not read nvidia-smi on the packaging host)"}
-# CUDA 12.8 runtime documented minimum driver floor: Linux 570.x (per NVIDIA's CUDA toolkit
-# release notes minimum-driver table). Recompute the label generically off CUDA_MAJOR_MINOR
-# so a rerun on a different toolkit version doesn't silently ship a stale claim.
-case "$CUDA_MAJOR_MINOR" in
-  12.8*) DRIVER_FLOOR="570.00 (Linux)" ;;
-  12.6*) DRIVER_FLOOR="560.28.03 (Linux)" ;;
-  12.4*) DRIVER_FLOOR="550.54.14 (Linux)" ;;
-  12.2*) DRIVER_FLOOR="535.86.09 (Linux)" ;;
-  *)     DRIVER_FLOOR="see NVIDIA's CUDA $CUDA_MAJOR_MINOR toolkit release notes (minimum driver table)" ;;
-esac
 
-PATCHELF_NOTE=$([ "$PATCHELF_OK" = 1 ] \
-  && echo "Binaries carry an RPATH to ./lib; you do not need to set LD_LIBRARY_PATH by hand." \
-  || echo "This build has no RPATH patch (patchelf was not available when it was packaged) -- always launch through ./pxa-launch or ./run-server.sh, which set LD_LIBRARY_PATH for you. Running bin/llama-server directly will fail to find libggml.so etc.")
-
-# Best-effort "what distro is new enough" hint from the detected glibc floor. Approximate on
-# purpose (glibc-to-distro-release mapping is not exact across distro families) -- the
-# authoritative check is always `ldd --version` on the target box against GLIBC_FLOOR itself.
-case "$GLIBC_FLOOR" in
-  GLIBC_2.39*|GLIBC_2.38*) DISTRO_HINT="Ubuntu 24.04+, Debian 13+, Fedora 39+ (or any distro reporting glibc >= 2.38 via 'ldd --version')" ;;
-  GLIBC_2.35*|GLIBC_2.36*|GLIBC_2.37*) DISTRO_HINT="Ubuntu 22.04+, Debian 12+, RHEL 9+ (or Rocky/Alma Linux 9+), Fedora 36+ (or any distro reporting glibc >= 2.35 via 'ldd --version')" ;;
-  GLIBC_2.3*) DISTRO_HINT="Ubuntu 20.04+, Debian 11+ (or any distro reporting glibc >= 2.31 via 'ldd --version')" ;;
-  *) DISTRO_HINT="check with 'ldd --version' against this package's VERSION file (glibc_floor line)" ;;
-esac
-
-# "|" delimiter: the replacement text contains "/" (e.g. "./lib", "./pxa-launch") which would
-# break a "/"-delimited sed substitution.
-sed -e "s|@@TAG@@|$TAG|g" \
-    -e "s|@@CUDA_MAJOR_MINOR@@|$CUDA_MAJOR_MINOR|g" \
-    -e "s|@@DRIVER_FLOOR@@|$DRIVER_FLOOR|g" \
-    -e "s|@@GLIBC_FLOOR@@|${GLIBC_FLOOR#GLIBC_}|g" \
-    -e "s|@@GLIBCXX_FLOOR@@|${GLIBCXX_FLOOR#GLIBCXX_}|g" \
-    -e "s|@@DISTRO_HINT@@|$DISTRO_HINT|g" \
-    -e "s|@@BUILD_HOST_DRIVER@@|$NVIDIA_SMI_DRIVER|g" \
-    -e "s|@@PATCHELF_NOTE@@|$PATCHELF_NOTE|g" \
-    "$HERE/START-HERE.md.in" > "$STAGE/START-HERE.md"
+[ -x "$HERE/gen-start-here.sh" ] || die "missing renderer: $HERE/gen-start-here.sh"
+TAG="$TAG" \
+CUDA_MAJOR_MINOR="$CUDA_MAJOR_MINOR" \
+GLIBC_FLOOR="$GLIBC_FLOOR" \
+GLIBCXX_FLOOR="$GLIBCXX_FLOOR" \
+BUILD_HOST_DRIVER="$NVIDIA_SMI_DRIVER" \
+PATCHELF_OK="$PATCHELF_OK" \
+HEADER=0 \
+OUT="$STAGE/START-HERE.md" \
+  "$HERE/gen-start-here.sh" || die "START-HERE.md render failed"
 
 # ---------------------------------------------------------------------------------------------
 # archive
