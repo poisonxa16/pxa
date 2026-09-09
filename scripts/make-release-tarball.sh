@@ -445,6 +445,13 @@ cat > "$STAGE/run-server.sh" <<'WRAP'
 # run-server.sh — run llama-server directly (no auto-tuning) with this package's ./lib set up.
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Card numbers should mean the same thing here as they do in nvidia-smi. CUDA's own
+# default is CUDA_DEVICE_ORDER=FASTEST_FIRST, which sorts the cards by compute
+# capability, while nvidia-smi numbers them by PCI bus id — so on a box with mixed
+# cards, CUDA_VISIBLE_DEVICES=0 starts on a different GPU than the one `nvidia-smi -L`
+# calls 0, silently. PCI_BUS_ID makes the two numberings one numbering. Yours wins if
+# you set it: this only fills in a default.
+export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
 exec "$HERE/bin/llama-server" "$@"
 WRAP
 chmod +x "$STAGE/run-server.sh"
