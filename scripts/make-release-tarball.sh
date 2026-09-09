@@ -30,6 +30,19 @@
 # safe to run from a worktree that is itself the packaging target, and correct regardless of
 # what branch BUILD_DIR happens to have been built from).
 #
+# What lands in the tarball's bin/ (the asset list; the lists themselves are the four *_BIN
+# variables in the configuration block below, and `--list-targets` prints them):
+#   llama-server llama-cli llama-bench llama-perplexity   required, always shipped
+#   llama-pxq-export                                      required -- without it the "leaving
+#                                                         PXQ" recipe in README.md and
+#                                                         docs/COOKBOOK.md cannot be run from
+#                                                         this package at all
+#   llama-quantize llama-gguf-split                       shipped when they build
+#   three self-test binaries                              required
+#
+# Dry run: `scripts/make-release-tarball.sh --list-targets` prints the build targets and the bin
+# lists and exits, touching no git, no docker and no build directory.
+#
 # Idempotent: reruns overwrite the same-named output tar/sha in OUT_DIR, and skip the build step
 # entirely once BUILD_DIR/bin/llama-server exists. Safe with NVIDIA_VISIBLE_DEVICES=none —
 # nothing here, build included, touches a GPU.
@@ -52,11 +65,46 @@ DEV_IMAGE=${DEV_IMAGE:-}
 CUDA_MAJOR_MINOR=${CUDA_MAJOR_MINOR:-}
 ARCH_TAG=${ARCH_TAG:-sm60_61_70}
 CUDA_ARCHS=${CUDA_ARCHS:-60;61;70}
-BUILD_TARGETS="llama-server llama-cli llama-bench llama-perplexity llama-quantize llama-gguf-split test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
+BUILD_TARGETS="llama-server llama-cli llama-bench llama-perplexity llama-quantize llama-pxq-export llama-gguf-split test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
+
+# The tarball's bin/ manifest. Kept here, next to BUILD_TARGETS, so the thing that gets BUILT and
+# the thing that gets SHIPPED are read and changed together -- the v2026.09.07-rc1 tarball shipped
+# without llama-pxq-export because these two lists lived 160 lines apart and only one of them was
+# updated when the export tool landed.
+REQUIRED_BIN="llama-server llama-cli llama-bench llama-perplexity"
+# Required, but built on demand if an externally-supplied BUILD_DIR lacks it (a CPU-only link).
+# A package without it cannot run the documented "leave PXQ" recipe, so a still-missing binary
+# here is a hard error, not a warning.
+REQUIRED_ONDEMAND_BIN="llama-pxq-export"
+TEST_BIN="test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
+OPTIONAL_BIN="llama-quantize llama-gguf-split"
 
 err()  { echo "make-release-tarball.sh: $*" >&2; }
 die()  { err "$*"; exit 1; }
 info() { echo "make-release-tarball.sh: $*"; }
+
+# ---------------------------------------------------------------------------------------------
+# arguments. This script is configured by environment variables (above); the only flags it takes
+# are informational ones that run nothing.
+# ---------------------------------------------------------------------------------------------
+case "${1:-}" in
+  --list-targets)
+    echo "BUILD_TARGETS:          $BUILD_TARGETS"
+    echo "bin/ required:          $REQUIRED_BIN"
+    echo "bin/ required (on-demand build if BUILD_DIR lacks it): $REQUIRED_ONDEMAND_BIN"
+    echo "bin/ self-tests:        $TEST_BIN"
+    echo "bin/ optional:          $OPTIONAL_BIN"
+    echo "CUDA archs:             $CUDA_ARCHS"
+    exit 0
+    ;;
+  -h|--help)
+    sed -n '2,/^set -u$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
+    echo "flags: --list-targets   print the build targets and the bin/ manifest, then exit"
+    exit 0
+    ;;
+  "") ;;
+  *) die "unknown argument: $1 (this script is configured with the environment variables documented at the top of the file; the only flags are --list-targets and --help)" ;;
+esac
 
 # Run a bash script inside DEV_IMAGE, BYPASSING the image's nvidia_entrypoint.sh via
 # --entrypoint. That entrypoint prints an NVIDIA/CUDA banner to STDOUT (not stderr) even with
@@ -196,6 +244,7 @@ req bench/fair/protocol.md
 req bench/fair/weights/MANIFEST.sha256
 req bench/gate
 req docs/COOKBOOK.md
+req docs/PXQ-EXPORT.md
 req docs/KNOWN-ISSUES.md
 req bench/fair-battle.md
 req LICENSE
@@ -207,26 +256,24 @@ RELNOTES=$(ls "$EXPORT"/RELEASE-NOTES-*.md 2>/dev/null | sort | tail -1)
 info "using release notes: $(basename "$RELNOTES")"
 
 # ---------------------------------------------------------------------------------------------
-# bin/ — copy the binaries this order requires; llama-quantize/llama-gguf-split are built into
-# BUILD_DIR on demand (CPU-only link, no GPU needed) if BUILD_DIR doesn't already have them.
+# bin/ — copy the binaries this order requires (the four *_BIN lists are in the configuration
+# block at the top of this script). llama-pxq-export, llama-quantize and llama-gguf-split are
+# built into BUILD_DIR on demand (CPU-only link, no GPU needed) if BUILD_DIR doesn't already
+# have them; of those three only llama-pxq-export is then REQUIRED to be present.
 # ---------------------------------------------------------------------------------------------
-REQUIRED_BIN="llama-server llama-cli llama-bench llama-perplexity"
-TEST_BIN="test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
-OPTIONAL_BIN="llama-quantize llama-gguf-split"
-
-MISSING_OPTIONAL=""
-for b in $OPTIONAL_BIN; do
-  [ -x "$BUILD_DIR/bin/$b" ] || MISSING_OPTIONAL="$MISSING_OPTIONAL $b"
+MISSING_ONDEMAND=""
+for b in $REQUIRED_ONDEMAND_BIN $OPTIONAL_BIN; do
+  [ -x "$BUILD_DIR/bin/$b" ] || MISSING_ONDEMAND="$MISSING_ONDEMAND $b"
 done
-if [ -n "$MISSING_OPTIONAL" ]; then
-  info "building missing optional target(s) into BUILD_DIR:$MISSING_OPTIONAL (CPU link only, NVIDIA_VISIBLE_DEVICES=none)"
+if [ -n "$MISSING_ONDEMAND" ]; then
+  info "building missing target(s) into BUILD_DIR:$MISSING_ONDEMAND (CPU link only, NVIDIA_VISIBLE_DEVICES=none)"
   docker run --rm --name "pxq-pkg-extra-$$" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=none \
     -v "$BUILD_DIR/..":/work -w /work "$DEV_IMAGE" \
-    bash -c "nice -n 19 cmake --build $(basename "$BUILD_DIR") -j6 --target $MISSING_OPTIONAL" \
-    || err "optional target build failed for:$MISSING_OPTIONAL — packaging without them"
+    bash -c "nice -n 19 cmake --build $(basename "$BUILD_DIR") -j6 --target $MISSING_ONDEMAND" \
+    || err "on-demand target build failed for:$MISSING_ONDEMAND — a required one is checked below"
 fi
 
-for b in $REQUIRED_BIN $TEST_BIN; do
+for b in $REQUIRED_BIN $REQUIRED_ONDEMAND_BIN $TEST_BIN; do
   [ -x "$BUILD_DIR/bin/$b" ] || die "BUILD_DIR is missing required binary: bin/$b"
   cp -a "$BUILD_DIR/bin/$b" "$STAGE/bin/"
 done
@@ -238,6 +285,9 @@ for b in $OPTIONAL_BIN; do
   fi
 done
 [ -x "$STAGE/bin/llama-quantize" ] || err "WARNING: llama-quantize could not be included (not built, and the on-demand build failed or was skipped)"
+# Not a warning: the README's and docs/COOKBOOK.md's "leave PXQ" recipe is two commands, and this
+# is the first one. A package that cannot run it is not shippable.
+[ -x "$STAGE/bin/llama-pxq-export" ] || die "bin/llama-pxq-export is missing from the staged package — it is required (see the asset list at the top of this script). Build it with: cmake --build $BUILD_DIR --target llama-pxq-export"
 
 # ---------------------------------------------------------------------------------------------
 # lib/ — the engine's own shared libs, plus the CUDA/OpenMP runtime libs the binaries actually need.
@@ -414,6 +464,8 @@ cp -a "$EXPORT/README.md" "$STAGE/docs/README.md"
 cp -a "$RELNOTES" "$STAGE/docs/$(basename "$RELNOTES")"
 cp -a "$EXPORT/docs/COOKBOOK.md" "$STAGE/docs/COOKBOOK.md"
 [ -f "$EXPORT/docs/LAUNCHER.md" ] && cp -a "$EXPORT/docs/LAUNCHER.md" "$STAGE/docs/LAUNCHER.md"
+# The reference for bin/llama-pxq-export, shipped with the binary rather than left online-only.
+cp -a "$EXPORT/docs/PXQ-EXPORT.md" "$STAGE/docs/PXQ-EXPORT.md"
 cp -a "$EXPORT/docs/KNOWN-ISSUES.md" "$STAGE/docs/KNOWN-ISSUES.md"
 cp -a "$EXPORT/LICENSE" "$STAGE/LICENSE"
 cp -a "$EXPORT/LICENSING.md" "$STAGE/LICENSING.md"

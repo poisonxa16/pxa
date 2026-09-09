@@ -320,9 +320,12 @@ any PXQ tier offers:
 ./build/bin/llama-quantize --allow-requantize --i-know-this-is-double-lossy --imatrix m.imatrix out-f16.gguf out-Q4_K_M.gguf Q4_K_M
 ```
 
+From the release tarball the same two commands are `./bin/llama-pxq-export` and
+`./bin/llama-quantize` — both binaries are in the package, so leaving PXQ needs no build.
+
 `llama-pxq-export` decodes the PXQ GGUF tensor by tensor into plain F16 (add `--type f32` for
-F32, `--cpu` to decode without a GPU); everything that isn't a PXQ tensor copies through
-byte for byte. `llama-quantize` then requantizes that plain file the normal way — pass
+F32, `--cpu` to decode without a GPU, `--verify` to cross-check the chunked decode); everything
+that isn't a PXQ tensor copies through byte for byte. `llama-quantize` then requantizes that plain file the normal way — pass
 `--i-know-this-is-double-lossy` even here: most PXQ files carry a few non-PXQ tensors (an
 attention head or two, an embedding) already stored as `q8_0` or `mxfp4`, copied through
 verbatim by the export step, and `llama-quantize` refuses to requantize an already-quantized

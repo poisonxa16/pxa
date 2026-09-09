@@ -113,6 +113,8 @@ it, you're not running this fork's binary (check `LD_LIBRARY_PATH` / RPATH — s
 
 ```
 bin/            llama-server, llama-cli, llama-bench, llama-perplexity, llama-quantize,
+                llama-pxq-export (turns a PXQ file back into a plain GGUF any stock llama.cpp
+                reads -- docs/PXQ-EXPORT.md, and the two-command recipe in docs/COOKBOOK.md),
                 (llama-gguf-split if this build included it), and three self-test binaries.
 lib/            this engine's shared libraries + the exact CUDA/OpenMP runtime libs it needs.
                 Driver libraries are deliberately NOT here (see troubleshooting #5).
@@ -126,6 +128,7 @@ bench/gate/     the release gate (correctness/determinism checks) — see bench/
                 needs ./lib on LD_LIBRARY_PATH itself — pxa-launch/run-server.sh do this for
                 you, run-gate.sh does not).
 docs/           README, this release's notes, COOKBOOK (per-card recipes), KNOWN-ISSUES,
+                PXQ-EXPORT (leaving PXQ: what bin/llama-pxq-export does and its flags),
                 LAUNCHER (if shipped with this build).
 VERSION         exactly what commit/flags/CUDA version/GPU architectures this build is.
 LICENSE, LICENSING.md   MIT-family licenses; LICENSING.md explains which files fall under which.

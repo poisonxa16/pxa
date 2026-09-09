@@ -186,6 +186,11 @@ stock reader can open it:
 ./build/bin/llama-quantize --allow-requantize --i-know-this-is-double-lossy out-f16.gguf out-Q4_K_M.gguf Q4_K_M
 ```
 
+Drop `--cpu` to decode on the GPU; add `--imatrix your.imatrix` to the second command if you have
+one (that is the form [`docs/COOKBOOK.md`](docs/COOKBOOK.md#leave-pxq-export-and-requantize-to-a-stock-type)
+uses). Both binaries ship in the release tarball as `./bin/llama-pxq-export` and
+`./bin/llama-quantize` — you do not have to build anything to leave.
+
 Proved end to end on a 5.6 GB PXQ4 file, CPU only: export to F16 (109s) then requantize to
 Q4_K_M (87s) produced a file a stock `llama-cli` build loaded and generated from with no PXQ
 support compiled in. Details and the full recipe: [`docs/COOKBOOK.md`](docs/COOKBOOK.md#leave-pxq-export-and-requantize-to-a-stock-type).
