@@ -6,9 +6,12 @@
 #   DECODE  (short prompt, many gen tokens)  -> bandwidth/launch-bound op mix
 #   PREFILL (long prompt, 1 gen token)       -> compute-bound op mix
 #
-# Reproduce (public models on HF poisonxa/PXA-Fusion2-35B-GGUF):
+# Reproduce (public models on HF poisonxa/PXA-bench-files-GGUF -- first published under
+# poisonxa/PXA-Fusion2-35B-GGUF, a repository since renamed to poisonxa/PXA-Fusion4-35B-GGUF
+# that keeps the same bytes at revision 2d7d9e7e5f445b1ea38a5686b8cf9d6bc9aa29df):
 #   single 11-16 GB card:  MODEL=PXA-Fusion2-35B-PXQ2.gguf  (10.7 GB)  TS=""     NGL=99
-#   2x16 GB (V100 pair):   MODEL=PXA-Fusion2-35B-PXQ4.gguf  (18.7 GB)  TS="1,1"  NGL=99
+#   2x16 GB (V100 pair):   MODEL=PXA-Fusion2-35B-PXQ6.gguf  (18.7 GB)  TS="1,1"  NGL=99
+#     (PXQ6 is the published filename of the 4-bit PXQ4 tier -- docs/RENAME-MAP.md)
 #
 # Usage: GPUS=<uuid[,uuid]> MODEL=/path/to.gguf [TS=1,1] [BUILD=/path] ./pxa-profile.sh <tag>
 #   BUILD defaults to <repo>/build (the tree this script lives in); OUT defaults to ./profile-<tag>.txt.

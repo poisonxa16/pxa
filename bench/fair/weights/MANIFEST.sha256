@@ -18,25 +18,33 @@
 #   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/<filename below>
 # (also listed in bench/checksums.sha256, which is the model-card copy of these same hashes)
 #
-# NOTE on the old location: these tiers were listed under huggingface.co/poisonxa/PXA-Fusion2-35B-GGUF.
-# That repo name now redirects to poisonxa/PXA-Fusion4-35B-GGUF -- a DIFFERENT model, whose PXQ2
+# NOTE on the old location: these tiers were first listed under
+# huggingface.co/poisonxa/PXA-Fusion2-35B-GGUF. That repository was renamed to
+# poisonxa/PXA-Fusion4-35B-GGUF and keeps the same bytes at revision
+# 2d7d9e7e5f445b1ea38a5686b8cf9d6bc9aa29df, so nothing was lost -- but its main branch is now a
+# DIFFERENT model, whose PXQ2
 # (11,243,296,832 B, sha 92d7c2533f034fc5548254d8f5a427456aec44c1160d95791e5221e985039fc5) and PXQ4
 # (19,296,360,576 B, sha 6fc30e1f9d3df634e6c97900ed04f5bd604b92786d351f72931120b00a814cf4) are real
 # published artifacts but back none of the Fusion2 rows. A Fusion2 number must be reproduced on a
-# Fusion2 file; the redirect is not a substitution.
+# Fusion2 file; the renamed repo's main branch is not a substitution. Use the per-file URLs below.
 # ---------------------------------------------------------------------------------------------
 # 2-bit tier. NOTE: re-uploaded 2026-09-02 with the chat-template/tail fix; a copy downloaded
 # before that date hashes 4390c2efd43740fc612910e101b7410a4b7fece5eb8cefa9140ff28bffe42f1d and
 # is the superseded file. The hash below is the current published artifact.
+#   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/PXA-Fusion2-35B-PXQ2.gguf
 c11b45ef4b6c2301137f07d9039287e0b85e0c6eb26fd3cb736d1d0c8f0fee4d  PXA-Fusion2-35B-PXQ2.gguf
 # 3-bit tier.
+#   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/PXA-Fusion2-35B-PXQ3.gguf
 e3de17ac1e3b49fd0f7ed2cb252c13e996b66442fbc44d2a9c481b0426ec7fbb  PXA-Fusion2-35B-PXQ3.gguf
 # 4-bit flagship. The PXQ6 in the filename is the pre-rename display name -- these bytes ARE
 # the PXQ4 tier (docs/RENAME-MAP.md); the published filename is deliberately not renamed.
+#   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/PXA-Fusion2-35B-PXQ6.gguf
 4e63c3fd0349ef698ff919d3ef93ad40f6644c6acd87cd7efc969cfc064ddf98  PXA-Fusion2-35B-PXQ6.gguf
 # 4-bit flagship with the MTP head, for --spec-type mtp.
+#   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/PXA-Fusion2-35B-PXQ6-MTP.gguf
 f08dc102b38c4a23ae546d9e007b8dad30e043e848480d29809d2262d0b17531  PXA-Fusion2-35B-PXQ6-MTP.gguf
 # Vision projector for the Fusion2 tiers (--mmproj).
+#   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/mmproj-fusion2-f16.gguf
 556ff9a8a0ffa3ff924e8c1b8aefb6e16a3551abc8c9b38643233f69592df14d  mmproj-fusion2-f16.gguf
 # PXQU-16 with the recommended q8_0 output head (--output-tensor-type q8_0): the artifact behind
 # the 62.4 t/s P100 and 101.3 t/s V100 decode rows and the PRODUCT arm of bench/fair/run.sh.

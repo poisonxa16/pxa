@@ -97,9 +97,12 @@ Cells we didn't measure are absent, not implied. PRs with measured numbers welco
 
 ## Model files
 
-The tiers are published at `huggingface.co/poisonxa/PXA-Fusion2-35B-GGUF`
+The tiers are published at <https://huggingface.co/poisonxa/PXA-bench-files-GGUF>
 (`PXA-Fusion2-35B-{PXQ2,PXQ3,PXQ6,PXQ6-MTP}.gguf` + `mmproj-fusion2-f16.gguf`; the `PXQ6` files
-are the 4-bit PXQ4 tier under its pre-rename filename — see `docs/RENAME-MAP.md`).
+are the 4-bit PXQ4 tier under its pre-rename filename — see `docs/RENAME-MAP.md`). They were
+first published under `poisonxa/PXA-Fusion2-35B-GGUF`, a repository since renamed to
+`poisonxa/PXA-Fusion4-35B-GGUF` that keeps the same bytes at revision
+`2d7d9e7e5f445b1ea38a5686b8cf9d6bc9aa29df`.
 Verify integrity against `checksums.sha256` in this directory.
 
 ⚠ PXQ is a PXA-native format: **mainline llama.cpp cannot read these GGUFs** — build this fork.

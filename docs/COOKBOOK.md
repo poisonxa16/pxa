@@ -10,7 +10,10 @@ launcher has a measured row for.
 Copy-paste starting points for the cards this fork is tuned for. Every number is a measured
 median (protocol: `bench/speed-bench.sh` — server-reported `timings.predicted_per_second`,
 200-token temp-0 generations, median of ≥3, model fully GPU-resident; prefill = cold prompt at
-the stated `-ub`). Weights: `huggingface.co/poisonxa/PXA-Fusion2-35B-GGUF`.
+the stated `-ub`). Weights: <https://huggingface.co/poisonxa/PXA-bench-files-GGUF> — first
+published under `poisonxa/PXA-Fusion2-35B-GGUF`, a repository since renamed to
+`poisonxa/PXA-Fusion4-35B-GGUF` that keeps the same bytes at revision
+`2d7d9e7e5f445b1ea38a5686b8cf9d6bc9aa29df`.
 
 **Every recipe below assumes a fully GPU-resident model** because that's what's fast and
 what these numbers were measured on. PXQ itself no longer requires it: `-ngl < 99` and

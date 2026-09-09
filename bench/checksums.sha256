@@ -1,4 +1,7 @@
-# sha256 of the published PXA Fusion2-35B GGUF tiers (huggingface.co/poisonxa/PXA-Fusion2-35B-GGUF)
+# sha256 of the published PXA Fusion2-35B GGUF tiers
+# (https://huggingface.co/poisonxa/PXA-bench-files-GGUF -- first published under
+#  poisonxa/PXA-Fusion2-35B-GGUF, a repository since renamed to poisonxa/PXA-Fusion4-35B-GGUF
+#  that keeps the same bytes at revision 2d7d9e7e5f445b1ea38a5686b8cf9d6bc9aa29df)
 # verify:  sha256sum -c checksums.sha256   (rename downloads to these names, or edit to match)
 c11b45ef4b6c2301137f07d9039287e0b85e0c6eb26fd3cb736d1d0c8f0fee4d  PXA-Fusion2-35B-PXQ2.gguf
 e3de17ac1e3b49fd0f7ed2cb252c13e996b66442fbc44d2a9c481b0426ec7fbb  PXA-Fusion2-35B-PXQ3.gguf

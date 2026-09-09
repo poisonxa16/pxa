@@ -40,7 +40,10 @@ cd pxa
 
 The engine reads GGUF files. Any GGUF that llama.cpp can load will work; the PXQ tiers this
 fork adds are what it is actually for. PXA's own weights are at
-<https://huggingface.co/poisonxa> — e.g. `PXA-Fusion2-35B-GGUF`. Download the `.gguf` with
+<https://huggingface.co/poisonxa> — e.g. `PXA-bench-files-GGUF`, which holds the Fusion2 tiers
+(they were first published under `PXA-Fusion2-35B-GGUF`, a repository since renamed to
+`PXA-Fusion4-35B-GGUF` that keeps the same bytes at revision
+`2d7d9e7e5f445b1ea38a5686b8cf9d6bc9aa29df`). Download the `.gguf` with
 your browser, `wget`, or `huggingface-cli`, and note where it landed. The rest of this page
 calls it `your-model.gguf`.
 
