@@ -3551,16 +3551,16 @@ static __global__ void __launch_bounds__(128) k_pxa_gemv_f16(
 
 // =================================================================================================
 // PXA_GEMV_RPB / PXA_GEMV_NWARPS (2026-09-01) — rows-per-block and K-sized warp count for the
-// small-R F16 decode GEMV above. Technique translated from the shinbunbun sm_60 set
-// (`mmvq-rows-per-block-sm60`, `mmvq-moe-rows-sm60`, `mmvq-nwarps-small-k-sm60`), which target
-// stock MMVQ — a path this fork never executes on a PXQU model. The two mechanisms do map:
+// small-R F16 decode GEMV above. Both are the classic sm_60 GEMV geometry levers (rows per
+// block, and a warp count sized to K) that stock-MMVQ tuning reaches for — a path this fork
+// never executes on a PXQU model. The two mechanisms do map:
 //
 //  (a) ROWS PER BLOCK. k_pxa_gemv_f16 gives one 128-thread block to ONE output row, so the
 //      activation row x is re-read from L2 once per output row. At the live hc_down shape
 //      (K=10240, R=320) that is 320 x 40 KB = 12.8 MB of L2 reads against 6.55 MB of weight
 //      DRAM traffic: the activation, not the weight, is the majority of the load issue.  Giving
-//      one block RPB rows makes ONE x load feed RPB weight rows, exactly the reuse shinbunbun
-//      measured as +15%/+23% at rows_per_block 2/4 on GP100.
+//      one block RPB rows makes ONE x load feed RPB weight rows — the same reuse that stock
+//      MMVQ gets from rows_per_block 2/4 on GP100 (about +15%/+23% on that path).
 //
 //      BIT-IDENTICAL. Thread t still accumulates k = t, t+nthr, ... for every row it owns, and
 //      the warp butterfly plus the fixed (w0+w1)+(w2+w3) fold are unchanged, so each row's fp32
@@ -3568,7 +3568,7 @@ static __global__ void __launch_bounds__(128) k_pxa_gemv_f16(
 //
 //  (b) WARP COUNT vs K. The block is 4 warps wide whatever K is. A thread only enters the loop
 //      if its lane index is below ne00/2, so a row with K < 256 leaves warps completely idle for
-//      the life of the kernel — shinbunbun's `calc_nwarps` observation, and it applies verbatim
+//      the life of the kernel — the usual small-K warp-count observation, and it applies verbatim
 //      here because our block width is likewise a constant. NOT bit-identical: fewer warps means
 //      a different partition of K across threads and therefore a different partial-sum tree.
 //
@@ -5109,9 +5109,9 @@ static void pxa_pxq_gemm_2d_log(int device, bool fired, int R, int K, int ny, in
 // =================================================================================================
 // PXA_X_CACHE (2026-09-01) — hoist the shared activation conversion across the GEMMs of one block.
 //
-// Translated from shinbunbun `mmvq-q8-1-activation-cache`, which caches the q8_1 quantization of
-// the activation row across the many stock-MMVQ calls that share it in one layer. AUDIT of our
-// decode path first, because most of what that patch fixes does not exist here:
+// The idea: cache the q8_1 quantization of the activation row across the many stock-MMVQ calls
+// that share it in one layer instead of re-quantizing per call. AUDIT of our decode path first,
+// because most of what that mechanism fixes does not exist here:
 //
 //   * The PXQ decode mmv family (k_pxq6_mmv*, k_pxq6_mmv_ksplit_gen, the fused gateup) reads f32
 //     activations DIRECTLY and stages them in shared memory per block. There is no quantization
@@ -5119,7 +5119,7 @@ static void pxa_pxq_gemm_2d_log(int device, bool fired, int R, int K, int ny, in
 //   * pxa_pxq4_moe_fast_tg converts nothing and launches ONE grid over (R/BM) x n_ids x Ny, so the
 //     routed expert GEMVs of a layer already share a single pass over x by construction.
 //   * The stock q8_1 fast-TG MoE branch already quantizes dst once for all n_ids*Ny rows
-//     (ggml-cuda.cu ~:5894) — upstream had already done this hoist for the path shinbunbun patched.
+//     (ggml-cuda.cu ~:5894) — upstream had already done this hoist on that path.
 //   * The hc_* f16 GEMVs (ggml_cuda_small_gemv_f16 / ggml_cuda_wide_gemv_f16) consume f32 x with
 //     no conversion at all; only the cuBLAS chain they REPLACE converted per call.
 //

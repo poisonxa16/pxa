@@ -52,7 +52,6 @@ flags.
 
 - **ik_llama.cpp** — best CPU/hybrid/new-quant support on Turing and newer.
 - **llama.cpp** — broadest compatibility, the master CUDA backend.
-- **p100-patches** — makes llama.cpp master less bad on Pascal.
 - **pxa** — the codec + kernel pack for cards with HBM2 and no DP4A: **Pascal (P100)**, and Volta.
 
 The pitch in one sentence: **run real models fully in VRAM on a used Tesla P100** — kernels
