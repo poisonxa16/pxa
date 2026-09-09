@@ -141,6 +141,18 @@ else
     ENGINE_BIN_SHOW=$ENGINE_BIN
 fi
 
+# The release tarball is a flat bin/ + lib/ layout with no build tree around it,
+# and its binaries find libggml.so through LD_LIBRARY_PATH (the wrapper scripts
+# set it; this harness calls the binary directly, so it has to set it too).
+# Harmless anywhere else: the directory only exists in that layout.
+if [ "$ENGINE_BIN" != pending ]; then
+    ENGINE_ROOT=$(cd -- "$(dirname -- "$ENGINE_BIN")/.." && pwd)
+    if [ -d "$ENGINE_ROOT/lib" ]; then
+        export LD_LIBRARY_PATH="$ENGINE_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        say "   using $ENGINE_ROOT/lib for this engine's shared libraries"
+    fi
+fi
+
 # The comparison engine. The container image ships it at the default path; on a
 # bare box, point UPSTREAM_BIN at your own build of the SAME commit — the one in
 # the image's org.pxa.upstream.ik.sha label.
