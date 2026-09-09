@@ -984,7 +984,7 @@ the line the issue names.
 # UPSTREAM — low value, recorded so nobody re-chases
 - **`--split-mode row` does not exist in our fork.** `grep -rn "SPLIT_MODE_ROW|\"row\"" include/llama.h common/common.cpp` returns nothing; our parser accepts exactly `none|layer|attn|graph` (`common/common.cpp:1947-1965`). Answer recorded either way, as asked.
 - CUDA graphs: already default for batch-1; upstream's headline is H100-class small models. Not our bottleneck.
-- NCCL tensor-parallel needs NVLink; our topology is **PHB on every pair** (`nvidia-smi topo -m`, all 7 GPUs). This line used to cite "our own record of `-sm graph` losing decode" as corroboration; that record is void — it was measured on a PXQ file under graph split, which the engine now refuses — so the NVLink point stands on the topology alone. Build already initialises NCCL communicators.
+- NCCL tensor-parallel needs NVLink; the topology here is **PHB on every pair** (`nvidia-smi topo -m`, all 7 GPUs). This line used to cite the record of `-sm graph` losing decode as corroboration; that record is void — it was measured on a PXQ file under graph split, which the engine now refuses — so the NVLink point stands on the topology alone. Build already initialises NCCL communicators.
 - Community FA v2 WMMA for Pascal/Volta: <https://github.com/sirCamp/flash-attention-legacy> — a port, not a flag. Noted as a known option; NOT attempted.
 
 # 2026-08-16/17 — SWA-aware KV allocation lane (Rig-A / mgv-wt). Full record: `<local-path>`
