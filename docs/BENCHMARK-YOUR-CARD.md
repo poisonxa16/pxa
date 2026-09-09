@@ -92,6 +92,49 @@ gate:    <PASS / FAIL / the summary line from run-gate.sh>
 number that is *worse* than the fallback is more useful than another green row — the ladder only
 gets fixed where somebody shows it is wrong.
 
+## A filled-in example
+
+A first-time reader walked `START-HERE.md` on my own box on 2026-09-09 — card 0, a Tesla P100
+16 GB, driver and CUDA as printed below — and this is the report that came back. It is here as a
+worked example of the five parts, not as a published number: the published floors live in
+`START-HERE.md` and `docs/COOKBOOK.md`, and this row is one box on a build newer than the one
+those floors were taken on.
+
+````
+### Card
+Tesla P100-PCIE-16GB, 16384 MiB, 580.142
+
+### Banner
+version: build=5204 commit="d8b0def5"
+PXA config level: ENHANCE (default; PXA_ENHANCE=0 for DEFAULT, PXA_REFERENCE=1 for REFERENCE)
+PXA level=ENHANCE | dev0 Tesla P100-PCIE-16GB(sm_60): FP16_GEMM ON [2:1 hgemm] MASK_SKIP_TILE ON [bit-exact] | mode=balance [fa-on serving] | spec: SPEC_RELAXED ON [G3, spec lanes]
+PXA posture: mode=balance [fa-on serving, decode-first] fa=on (explicit) ub=2048 (adaptive: dev0 free-min 16006 MiB, min total 16269 MiB, model share 13492 MiB (uniform split) -> headroom 2513 MiB)
+PXA_AUTO: samplers arch=qwen35moe -> temp=0.70 top_k=20 top_p=0.80 min_p=0.00 (qwen no-think agent defaults; override: the CLI flag or PXA_AUTO_SAMPLERS=0)
+PXA_AUTO: spec arch=qwen35moe -> --spec-type ngram-mod:n_max=4,n_min=2 (measured +23.0% first-request decode on code traffic ...)
+PXA_SPEC_RELAXED: ON (pmin=0.050) -- relaxed draft acceptance is live for temp>0 sampling
+
+### Model
+fusion2-35b-U16-q8head.gguf — PXQU-16 with the q8_0 output head,
+sha256 643e55b07faf8b9b359fcb050494ec9c56e51c2db8d81751b4120b97782c5779
+
+### Command
+./run-server.sh -m fusion2-35b-U16-q8head.gguf -ngl 99 -c 8192 -fa on
+(the card was pinned by UUID — CUDA_VISIBLE_DEVICES=GPU-... — because at the time of this run the
+scripts did not pin the device order; they do now, so the nvidia-smi index works. --port was moved
+off 8080 only because this shared box already had that port bound.)
+
+### Numbers
+prefill: 1427.7 t/s @ prompt_n 5792, ub 2048   decode: 71.9 t/s   (median of 7, one warmup discarded, unique prompt and seed per repeat, temp 0, cache_prompt false)
+first token: 4054 ms for a 5792-token prompt
+gate: not run — this was a throughput pass only. Both numbers clear their published floors (>= 62
+t/s decode, >= 817 t/s prefill) by a wide margin, with no drafting detected (no draft_n in the
+timings) to account for the decode figure.
+````
+
+Two things worth copying from it: the prefill number is quoted **with** its `prompt_n` and `ub`,
+which is what makes it comparable to anything, and the report says plainly which parts were not
+run instead of leaving them blank.
+
 ## What happens to your report
 
 A confirmed card set gets its own row in the per-topology table, so the next person with your card
