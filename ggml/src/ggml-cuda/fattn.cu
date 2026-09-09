@@ -222,7 +222,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // cell indices while another sequence's long state raises K->ne[1]; once
     // first = K->ne[1] - nton > 0 the slice cuts the query's own cells OUT of the view, every
     // sliced mask row is all -inf, and the fully-masked flash-attention output is NaN -> ALL
-    // logits non-finite (the Alina NaN cascade). Lab repro: any truncating-reuse/short decode
+    // logits non-finite (the V100 seat's NaN cascade). Lab repro: any truncating-reuse/short decode
     // while any sequence holds more than n_swa+256 cells; single-ubatch vs multi-ubatch and
     // n_ctx are irrelevant. The slice is therefore DISABLED by default; PXA_FA_SWA_SLICE=1
     // restores the old behavior for single-sequence benchmarking only.

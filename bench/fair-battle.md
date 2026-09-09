@@ -301,7 +301,7 @@ Auto-picked `-b 8192 -ub 2048`, identical to the hand-tuned control's flags; gre
 | mainline `9400c89` | MXFP4 | 209.1 | 254.7 | not captured |
 | **pxa, bare command line** | PXQ4 | **337.6** | **315.3** | **18.1** |
 
-Measured 2026-09-05 21:22 EDT on the release binary (`2729f12060`), GPUs 1 and 5, quiet box (Alex
+Measured 2026-09-05 21:22 EDT on the release binary (`2729f12060`), GPUs 1 and 5, quiet box (the production seat
 paused, nothing else running), no `PXA_*` environment and no `-b`/`-ub` (the engine chose
 `-b 8192 -ub 256` itself): prefill n=3 (337.43–337.69 and 315.24–315.30), decode n=12 at fill 8
 (18.13–18.15), greedy sha `433a1c4516d83d77`. Harness `defaults-bench/run-final-cell.sh p100`.

@@ -4919,7 +4919,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             // PXA_SWA_TRUNCATE_GUARD_v1 (2026-08-16): on a masked-SWA arch, reusing
                             // a small prefix of a much larger restored/cached state hands llama_decode
                             // a KV state whose bookkeeping is inconsistent -> an all-non-finite logit
-                            // distribution on the very next decode (the Alina NaN cascade). -cram 0
+                            // distribution on the very next decode (the V100 seat's NaN cascade). -cram 0
                             // and cache_prompt:false do NOT prevent it: the slot's own cache_tokens
                             // feed the same near-total truncation. When the reuse would discard a
                             // large fraction of a large cached state, force a clean full re-process

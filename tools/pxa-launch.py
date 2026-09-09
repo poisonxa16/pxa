@@ -696,7 +696,7 @@ RECIPES = [
                "with a single-card cudaMalloc of the whole tensor.",
                "-ub 2048 is the best of 2048/1024/512/256 on this four-card split "
                "(495.07/413.36/28.23 against 305.00/275.69/27.12 at -ub 256) - the OPPOSITE of "
-               "the 2x P100 pair (the measurement ledger Alex "
+               "the 2x P100 pair (the measurement ledger, "
                "4x P100 seat ubatch sweep).",
                FLASHNEXT_SEAT_EXTRA_NOTE,
                PIPELINE_PP_NOTE,
