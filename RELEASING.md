@@ -9,6 +9,14 @@ assumptions, exits 0 only if every check passed. Read the gate's own README for 
 proves; this file is only about *when* I run it and what I have to show for it before a tag goes
 out.
 
+## 0. The package has to be complete before I gate it
+
+`scripts/make-release-tarball.sh --list-targets` prints the authoritative asset list for the
+release tarball. I run it and check the output against what's actually going in the archive
+before I package anything — `bin/llama-pxq-export` and `docs/PXQ-EXPORT.md` are on that list and
+have to be in the tarball, not just built locally. A tarball missing an asset the list names is
+not ready to gate, whatever the gate itself says about the binaries it did get.
+
 ## 1. The CPU arms run themselves
 
 Every push to `main`, and every tag, the CPU-runnable arms run automatically
@@ -40,6 +48,13 @@ separate runs, two separate logs, if the tag claims both) and keep every log —
 whichever one I'm about to tag against; the rest live wherever I keep prior release evidence, not
 in this file.
 
+**Also at tag time:** build `docker/Dockerfile`'s `build-upstream` stage on a quiet box — it pins
+`ikawrakow/ik_llama.cpp` at `3c58ae37` as `/opt/pxa/bin/upstream-ik-server`, the reference binary
+the head-to-head numbers in the README are measured against. I record the resulting image digest
+in the tag message alongside the gate citation, so anyone re-checking a head-to-head table later
+can pull the exact upstream binary it was measured against, not whatever `ik_llama.cpp` happens to
+be at `HEAD` by then.
+
 ## 3. The log is part of the tag, not a side note
 
 `bench/gate/LAST-RUN.md` — the captured output of the run in step 2, `GATE RESULT` line and all —
@@ -55,6 +70,7 @@ git tag -a v2026.MM.DD -m "$(cat <<'EOF'
 
 Gate: bench/gate/LAST-RUN.md, run on <card family>, GATE RESULT: PASS=N FAIL=0 SKIP=0.
 <if SKIP>0: name each skipped arm and why here.>
+Upstream reference image (build-upstream, ik_llama.cpp@3c58ae37): <digest>.
 EOF
 )"
 ```
