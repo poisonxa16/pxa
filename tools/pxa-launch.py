@@ -424,7 +424,7 @@ VLLM_IMAGES = {
 ATTN_BACKEND = {
     60: ("PASCAL_SDPA", "MEASURED - the arm that produced every MoE-crossover vLLM cell "
                         "(MOE-CROSSOVER.md:81)"),
-    70: ("FLASH_ATTN_V100", "[INFERRED] - from launch-v100b.sh / alina-launch.sh recipes; no "
+    70: ("FLASH_ATTN_V100", "[INFERRED] - from the V100 seat launch recipes; no "
                             "engine-vs-engine number was ever taken on sm_70, and as of "
                             "2026-08-25 no vLLM image in this table has a GATED sm_70 seat "
                             "at all (RELEASE-GATE.md 3.7)"),
