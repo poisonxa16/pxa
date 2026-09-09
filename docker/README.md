@@ -120,7 +120,7 @@ The image ships two engines:
 
 | path | what it is |
 |---|---|
-| `/usr/local/bin/llama-server` | this engine. The image's `ENTRYPOINT`, and what every recipe above runs. |
+| `/usr/local/bin/llama-server` | this engine. The image's `ENTRYPOINT`, and what every recipe above runs. `/opt/pxa/bin/llama-server` is a symlink to it — one binary, both documented paths. |
 | `/opt/pxa/bin/upstream-ik-server` | upstream `ik_llama.cpp`, pinned to commit `3c58ae37`, built in the same container for the same three architectures with the same CUDA toolkit. |
 
 That second binary is there for one reason: an *engine-only* number — same weight file,

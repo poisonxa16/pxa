@@ -169,6 +169,12 @@ RUN ldconfig
 COPY --from=build-upstream /upstream/build/bin/llama-server /opt/pxa/bin/upstream-ik-server
 COPY --from=build-upstream /upstream/UPSTREAM-REV           /opt/pxa/bin/upstream-ik-server.rev
 
+# One file, both documented names: the `docker run` lines and the release docs
+# say /usr/local/bin/llama-server, while everything that reasons about the two
+# engines together looks in /opt/pxa/bin. A symlink, so there is exactly one
+# binary and no chance of the two paths drifting to different builds.
+RUN ln -sf /usr/local/bin/llama-server /opt/pxa/bin/llama-server
+
 # Model directory mount point (empty in the image — models are never baked in).
 RUN mkdir -p /models && chown pxq:pxq /models /work
 
