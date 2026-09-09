@@ -4929,9 +4929,13 @@ def main():
                     "the flags and the env, tells you why, and starts the server. "
                     "Run it with no arguments the first time.")
     # ---- the two questions a user actually has an answer to ----------------
-    ap.add_argument("--model", default="",
-                    help="path to a .gguf (or a converted vLLM directory). Omit to pick from a "
-                         "numbered list of the models found under the search roots.")
+    # -m, because that is what llama-server and run-server.sh take and it is what
+    # every recipe on the README and START-HERE prints. A reader who types the
+    # documented line at the launcher should not be told the flag does not exist.
+    ap.add_argument("-m", "--model", default="",
+                    help="path to a .gguf (or a converted vLLM directory). -m is the same flag, "
+                         "spelled the way llama-server spells it. Omit to pick from a numbered "
+                         "list of the models found under the search roots.")
     ap.add_argument("--gpus", "--cards", dest="gpus", default="", metavar="N,N",
                     help="GPU INDEXES as nvidia-smi reports them, e.g. --gpus 2,4. Omit to pick "
                          "from a numbered list. (--cards is the old name and still works.)")

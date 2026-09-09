@@ -148,5 +148,17 @@ check("no call site sets CUDA_VISIBLE_DEVICES outside device_env()",
 check("device_env() is the function the launch paths call",
       sum(1 for ln in SRC if "device_env(" in ln and "def device_env" not in ln) >= 4)
 
+# 8. The flag a reader actually types. Every recipe on the README and in
+#    START-HERE prints `-m <model>`, because that is what llama-server takes; the
+#    launcher accepted only --model, so the documented line came back as
+#    "unrecognized arguments: -m". --help is asked here because it exercises the
+#    real parser and exits before anything touches a driver.
+help_out = subprocess.run([sys.executable, LAUNCHER, "--help"],
+                          capture_output=True, text=True)
+check("--help runs without a GPU", help_out.returncode == 0, help_out.stderr[-200:])
+check("-m is accepted as the spelling of --model",
+      "-m MODEL" in help_out.stdout or "-m, --model" in help_out.stdout,
+      "no -m alias in --help output")
+
 print(f"=== {'ALL PASS' if not FAILURES else 'FAILED: ' + ', '.join(FAILURES)} ===")
 sys.exit(1 if FAILURES else 0)
