@@ -99,6 +99,31 @@ It serves on **port 8080**, bound to **127.0.0.1** — from the same machine tha
 to reach it from another machine add `--host 0.0.0.0` and open the port yourself.
 <!-- common/common.h:493 port = 8080; common/common.h:499 hostname = "127.0.0.1" -->
 
+**More than one card in the box?** Then that line uses *all* of them — with `-ngl 99` the engine
+spreads the layers across every card it can see, and the numbers further down are one P100's. To
+hand it a single card, name the card in front of the command, using the index `nvidia-smi -L`
+prints:
+
+```bash
+nvidia-smi -L
+# GPU 0: Tesla P100-PCIE-16GB (UUID: GPU-aad5ef40-9b80-8fd0-4391-dfe595f42640)
+# GPU 1: Tesla V100-PCIE-16GB (UUID: GPU-9af9aaf0-3f5a-cca5-b0c1-0a5b04971db6)
+
+CUDA_VISIBLE_DEVICES=0 ./run-server.sh -m fusion2-35b-U16-q8head.gguf -ngl 99 -c 8192 -fa on
+```
+
+That index means what you think it means because `run-server.sh` and `./pxa-launch` pin
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` for you. CUDA's own default sorts cards fastest-first, so on a box
+mixing a P100 with a V100 a bare `CUDA_VISIBLE_DEVICES=0` starts on the V100 while `nvidia-smi`
+calls index 0 the P100 — I pin the order in both scripts so the two numberings are one numbering.
+The UUID form is immune to the question either way: `CUDA_VISIBLE_DEVICES=GPU-aad5ef40-...`. In a
+container it is `--gpus '"device=0"'` or `--gpus device=GPU-aad5ef40-...`; Docker counts the same
+way `nvidia-smi` does. Whichever you use, confirm what you got before you measure anything — the
+`pxa: dev 0 <card name>` line in the log below names the card the model is actually on.
+<!-- common/common.h:328 split_mode defaults to LLAMA_SPLIT_MODE_LAYER, i.e. every visible card;
+     scripts/make-release-tarball.sh (run-server.sh heredoc) and tools/pxa-launch.py device_env()
+     both set CUDA_DEVICE_ORDER=PCI_BUS_ID, and both keep an order the reader exported -->
+
 Wait for the weights to load, then prove it answers:
 
 ```bash
