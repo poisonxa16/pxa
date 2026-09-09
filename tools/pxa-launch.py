@@ -489,13 +489,13 @@ ENGINE_DEFAULTED_FLASHNEXT_LEVERS = {
     "PXA_SCHED_RESET_LAZY": "1",
     "PXA_MOE_DEVICE_MAP": "1",      # device-side expert-routing table
 }
-# The live seat script /usr/local/bin/pxa-seats-flashnext.sh exports a TWELFTH,
+# The seat script on my own box exports a TWELFTH lever,
 # PXA_FN_MTP_HNORM_GROUPED=1, which docs/COOKBOOK.md:181-223 does NOT list among
 # the shipped set. It is not emitted here: the published recipe is the measured
 # one, and adding a lever the recipe does not name would make this launcher's seat
 # a different seat from the documented one. Named rather than silently omitted.
 FLASHNEXT_SEAT_EXTRA_NOTE = (
-    "/usr/local/bin/pxa-seats-flashnext.sh also exports PXA_FN_MTP_HNORM_GROUPED=1, which "
+    "The seat script on my box also exports PXA_FN_MTP_HNORM_GROUPED=1, which "
     "docs/COOKBOOK.md:181-223 does not list in the shipped set. NOT emitted here - this "
     "launcher serves the published recipe. Add it by hand if you are reproducing the live seat.")
 
@@ -684,8 +684,8 @@ RECIPES = [
                 "2026-09-06)  |  seat-measured deep fill, hand flags: ~230 @~86,000 prefill, "
                 "~19.3 decode at ~86k  (n=7 median, 1 warmup discarded)",
         source="docs/COOKBOOK.md:181-223 (levers :189-194, command :195-200, table :211-215); "
-               "flags cross-checked verbatim against /usr/local/bin/pxa-seats-flashnext.sh "
-               "(start_alex); RELEASE-NOTES-2026-09-02.md for the arm-by-arm ladder",
+               "flags cross-checked verbatim against the production seat script; "
+               "RELEASE-NOTES-2026-09-02.md for the arm-by-arm ladder",
         arch="qwen4exp",
         notes=["THIS IS THE PRODUCTION SEAT'S OWN RECIPE, reproduced flag for flag. -ts "
                "5079,12612,12612,11897 is DELIBERATELY uneven: card 0 shares this box with "
@@ -3245,7 +3245,7 @@ def _now():
 # request carrying `tools` into an HTTP 500 while plain chat keeps working, so the
 # seat looks healthy while its main job is broken. That exact failure ran in
 # production on this box until it was found by hand
-# (/usr/local/bin/pxa-seats-flashnext.sh, the "WHY THIS EXISTS" header).
+# (the production seat script's "WHY THIS EXISTS" header).
 #
 # Everything here is READ from the model file where the model file knows, and
 # labelled with where it came from where it does not.
@@ -3359,11 +3359,11 @@ REASONING_DEFAULT_SRC = ("common/common.h:510 - the engine's own default is `dee
                          "(thinking-tag contents come back as message.reasoning_content). "
                          "The production Flash-Next seat passes NO --reasoning-format and so "
                          "inherits exactly this "
-                         "[/usr/local/bin/pxa-seats-flashnext.sh, start_alex]")
+                         "[the production seat script]")
 PRODUCTION_CHAT_SRC = (
     "MEASURED against production: the live Flash-Next seat runs `--jinja --no-context-shift` "
     "with NO --chat-template (the file's embedded one) and NO --reasoning-format "
-    "[/usr/local/bin/pxa-seats-flashnext.sh, start_alex]. The vLLM sm_70 seat runs "
+    "[the production seat script]. The vLLM sm_70 seat runs "
     "`--enable-auto-tool-choice --tool-call-parser qwen3_coder` and no reasoning parser "
     "[same file, start_alina]. --jinja is there because without it every request carrying "
     "`tools` returns HTTP 500 while plain chat keeps working - that seat shipped broken for "
