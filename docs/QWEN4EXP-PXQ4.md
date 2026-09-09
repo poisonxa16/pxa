@@ -159,5 +159,11 @@ llama-server -m Qwen3.8-Flash-Next-PXQ4.gguf \
 
 Expect the gather to cost a host round-trip per layer per token. On multi-GPU
 without NVLink, `-sm layer` additionally costs a host-bridge round-trip per
-token; `-sm graph` trades that for prefill throughput and is measurably worse
-for single-stream decode.
+token — and it is still the split mode to use here.
+
+`-sm graph` is not an alternative for this file. It splits the attention output
+and the expert down projections along `K`, which a PXQ tensor cannot be cut on:
+PXQ keeps one fp16 anchor per row in the 64-row panel header and that anchor
+covers all of `K`, so a `K`-split would have to duplicate it. The engine refuses
+`-sm graph` on a PXQ file at load, with an error naming the tensor. Graph mode is
+independently guarded off for this architecture, which is a DeltaNet hybrid.

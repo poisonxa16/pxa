@@ -229,7 +229,7 @@ As the GPUs (including their VRAM) are more powerful for LLM specific processing
 Beside the improved quants (better quality and performance at the same size; usable low BPW), superior performance (faster PP ang TG), ik_llama.cpp really shines at providing:
 - Detailed output log which e.g. includes layers and buffers sizes to support offload calculations.
 - A big collection of parameters to tweak offloading (what/where runs: processing, tensors, KV cache, operations, etc.).
-- Split mode `graph` when multiple GPUs are available, including mixes of different GPU types, various VRAM sizes.
+- Split mode `graph` when multiple GPUs are available, including mixes of different GPU types, various VRAM sizes — for **stock GGUF** files; on a PXQ file it is refused, see the `-sm` row below.
 - Many KV cache options, including Hadamard, which allows squeezing every GB of memory.
 - Highly optimized algorithm to automatically load as many tensors to the GPU(s) `--fit`.
 
@@ -345,7 +345,7 @@ WIP
 | `-ngld, --gpu-layers-draft N` | Number of layers to store in VRAM for the draft model | - | For draft model, see `--gpu-layers` |
 | `--cpu-moe` | Keep all MoE weights in CPU memory | - | Simple offload mode for MoE. [PR 841](https://github.com/ikawrakow/ik_llama.cpp/pull/841) |
 | `--n-cpu-moe N` | Keep MoE weights of the first N layers in CPU memory | - | Similar to `--cpu-moe` but when some GPU memory is available to store some layers. |
-| `-sm, --split-mode SPLIT_MODE` | How to split the model across multiple GPUs | none | When you have more than one GPU, how to split the model across multiple GPUs, one of: - `none` use one GPU only. - `graph` split model tensors and computation graph across GPUs. `graph` is exclusive here and extremely effective for dense and MoE [PR 1080](https://github.com/ikawrakow/ik_llama.cpp/pull/1080). - `layer` split layers and KV across GPUs Example: `-sm graph ` |
+| `-sm, --split-mode SPLIT_MODE` | How to split the model across multiple GPUs | none | When you have more than one GPU, how to split the model across multiple GPUs, one of: - `none` use one GPU only. - `graph` split model tensors and the computation graph across GPUs (tensor parallelism) [PR 1080](https://github.com/ikawrakow/ik_llama.cpp/pull/1080). **Stock GGUF files only.** `graph` splits the attention output and the expert down projections along `K`, and a PXQ tensor cannot be cut on that axis — PXQ keeps one fp16 anchor per row in the 64-row panel header and that anchor covers all of `K`, so a `K`-split would have to duplicate it. The engine refuses `-sm graph` on a PXQ file at load, with an error naming the tensor; before that check existed the same combination produced degenerate output (`$`, then `!!!!…`) rather than a wrong-but-plausible answer. `graph` is also guarded off on the DeltaNet hybrid architectures. - `layer` split layers and KV across GPUs — **the supported split mode for PXQ files**, and what every multi-GPU number in these docs was measured with. Example: `-sm layer` |
 | `-ts, --tensor-split SPLIT` | Fraction of the model to offload to each GPU (comma-separated) | - | Powerful for tweaking. Example: `-ts 3,1` |
 | `-dev, --device dev1,dev2` | Comma-separated list of devices to use for offloading | none | If there are many GPUs available on the system and only selected ones need to be used. Example: `-dev  CUDA0,CUDA1` |
 | `-devd, --device-draft dev1,dev2` | Comma-separated list of devices for draft model | none | For draft model, see `--device` |
@@ -358,7 +358,7 @@ WIP
 | `-smf16, --split-mode-f16` | Use f16 for data exchange between GPUs | 1 | [PR 1087](https://github.com/ikawrakow/ik_llama.cpp/pull/1087) |
 | `-smf32, --split-mode-f32` | Use f32 for data exchange between GPUs | 0 | [PR 1087](https://github.com/ikawrakow/ik_llama.cpp/pull/1087) |
 | `-grt, --graph-reduce-type` | Type for data exchange between GPUs | f32 | q8_0 / bf16 / f16 / f32 Reduce the data transferred between GPUs [PR 1154](https://github.com/ikawrakow/ik_llama.cpp/pull/1154) |
-| `-smgs, --split-mode-graph-scheduling` | Force Split Mode Graph Scheduling | 0 | [PR 1068](https://github.com/ikawrakow/ik_llama.cpp/pull/1068) |
+| `-smgs, --split-mode-graph-scheduling` | Force Split Mode Graph Scheduling | 0 | Only does anything where `-sm graph` itself is in use, so it has no effect on a PXQ file. [PR 1068](https://github.com/ikawrakow/ik_llama.cpp/pull/1068) |
 | `--max-gpu N` | Define (and use) a maximum number of GPUs per layer with split mode "graph" |  | This is of interest when there are more than 2 GPUs available, but using all of them leads to a lower performance than using just 2 (or using the default split mode "layer") [PR 1051](https://github.com/ikawrakow/ik_llama.cpp/pull/1051) |
 | `-cuda, --cuda-params` | Comma-separated list of cuda parameters | - | Powerful way to tweak Fusion, GPU offload threshold, and MMQ-ID threshold. [PR 910](https://github.com/ikawrakow/ik_llama.cpp/pull/910) |
 
@@ -522,6 +522,13 @@ WIP
 ## Graph parallel models
 
 Models architectures [supported](https://github.com/ikawrakow/ik_llama.cpp/blob/90de8e31db79fb3503da5e20db0d3e46726a2117/src/llama.cpp#L1986) by `--split-mode graph`
+
+> **Two qualifications on this engine.** The list below is the upstream one and this fork's own
+> list has since diverged (`is_model_split_supported()` in `src/llama.cpp`). More importantly, the
+> architecture list is not the only gate: `--split-mode graph` is **refused on a PXQ file**
+> whatever the architecture (see the `-sm` row above), and it is guarded off on the DeltaNet
+> hybrid architectures — `qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp` — which includes the two
+> `QWEN35*` entries below. For a PXQ file, use `-sm layer`.
 
 ```
 LLM_ARCH_LLAMA,
