@@ -40,9 +40,42 @@ Every `bench/fair/` report reduces to three numbers, matching the shapes in
 | **codec-only** | the PXQ codec | same engine, PXQ4 vs MXFP4 at matched bytes |
 | **product** | what you'd actually run | best documented recipe per side (own quant, own levers) |
 
-`run.sh` prints all three it can produce from the scripts that exist today
-(`../speed-bench.sh`, `../measure.py`) and prints **"not automated yet"** for any number those
-scripts cannot produce under this stricter protocol (in particular: neither script currently
-speaks raw `/completion`, discards a warmup rep, or enforces unique-prompt-per-repeat — see
-`run.sh`'s own comments for exactly which numbers that limits today). A missing number is
-reported as missing, never backfilled with a number measured under a looser protocol.
+`run.sh` measures all three itself, under the rules above — it does not hand off to
+`../speed-bench.sh` or `../measure.py`, neither of which speaks raw `/completion`, discards a
+warmup rep, or enforces a unique prompt per repeat. Any cell whose artifact or binary this repo
+cannot name prints **`pending`**, and the run then exits **2** rather than 0, so a partial run
+cannot be mistaken for a complete one. A missing number is reported as missing, never backfilled
+with a number measured under a looser protocol.
+
+Two shapes stay **out** of the three blocks, on purpose:
+
+- an expert-codec comparison whose two sides are not the same base weights (the MoE decode row
+  against MXFP4 in [`../fair-battle.md`](../fair-battle.md) is that: same architecture and size
+  class, a different model). A rig file declaring `PRODUCT_SAME_BASE_WEIGHTS=no` is refused as a
+  product row rather than printed with a footnote;
+- multi-box, NVLink and sidecar-speculation rows. Different hardware or a different serving stack
+  is a different table, not a fourth column in these three.
+
+## How to reproduce the three README blocks
+
+```bash
+cd bench/fair
+./run.sh --rig 2xv100 --plan     # exactly what it would run, starting nothing
+./run.sh --rig 2xv100            # the three blocks
+```
+
+`--rig <name>` reads `rigs/<name>.env`: the models, flags and card indices of one machine. Three
+ship — `4xp100`, `2xv100`, `1x1080ti` — and copying the closest one is how you add your own box.
+Every value in a rig file is either taken from a file in this repo (the comment beside it says
+which) or the literal word `pending`, which is what an unknown stays until someone measures it.
+
+The engine-only block needs a second engine binary. The container image carries one at
+`/opt/pxa/bin/upstream-ik-server`, built from the upstream commit every published comparison in
+this repo was measured against and labelled with it (`org.pxa.upstream.ik.sha`); `run.sh` looks
+there by default, and `UPSTREAM_BIN=/path/to/your/build` points it at your own build of that same
+commit. Without it the block prints `upstream binary not present: <path>` and the run exits 2.
+
+Stdout is the three blocks and nothing else — `./run.sh --rig <rig> > blocks.txt` gives you
+something a README can paste — while progress and the reason behind every missing cell go to
+stderr. Rule 5 is enforced rather than trusted: each arm's speculative-decode state is read from
+its own startup log and command line, and two arms that disagree void the block and exit 2.

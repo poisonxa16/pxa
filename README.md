@@ -378,6 +378,11 @@ measured*, never *zero*.
 | vs-1cat | [`dgx-h2h-2026-09-07.csv`](docs/data/dgx-h2h-2026-09-07.csv) | 1Cat vLLM's own harness on the same NVLink system: 16 GSM8K × 192 greedy tokens, sequential, `--max-num-seqs 1`, `--max-num-batched-tokens 512`, `--gpu-memory-utilization 0.8`, `--max-model-len 4096` |
 | context-vs-1cat | [`dgx-footprint-2026-09-07.csv`](docs/data/dgx-footprint-2026-09-07.csv) | quoted from both stacks' boot logs, same cards, same budget |
 
+**On your own cards:** `cd bench/fair && ./run.sh --rig <your rig>` prints the engine-only,
+codec-only and product blocks under [`bench/fair/protocol.md`](bench/fair/protocol.md), using the
+upstream engine the container image carries as its second binary
+(`/opt/pxa/bin/upstream-ik-server`, pinned to one commit and labelled with it).
+
 **Reproduce the headline table** — no `PXA_*` environment, no `-b`/`-ub`:
 
 ```bash
