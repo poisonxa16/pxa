@@ -10,7 +10,16 @@ MODEL=/path/to/model.gguf ./bench/gate/run-gate.sh
 It exits **0 only if every check passed**. Any failure, and any check that could not be run
 honestly, is printed as `FAIL` or `SKIP` with the reason. A `SKIP` does not fail the gate — but a
 gate with skips has not proved what a clean gate proves, so read the summary line, not just the
-exit code.
+exit code: the final line names every skipped check, and `SKIP=0` is the only summary that means
+"this proved everything it claims to prove."
+
+**SKIP is fail-closed.** An arm may only `SKIP` when the *hardware or build* genuinely cannot run
+it — no GPU for a GPU-only unit test, no `-np` flag, no slot-erase route, no
+`completion_probabilities`, no `/v1/chat/completions` route. It is never allowed to `SKIP` just
+because a knob quietly turned a required arm off: `LOGIT_REPS=0`, `GATE_NP2=0` and `GATE_TESTS=0`
+remain there for fast local iteration, but under `GATE_STRICT=1` — the mode the required-check CI
+workflow always runs in — using any of them turns that arm's `SKIP` into a `FAIL`. A tag-gating
+run of this script should always set `GATE_STRICT=1`.
 
 ## What it checks
 
@@ -18,10 +27,12 @@ exit code.
 |---|---|---|
 | 1 | **Greedy determinism, np=1.** The same prompt `REPS` times (default 12) at `temperature 0`, `top_k 1`, `cache_prompt false`. Every output must be **byte-identical**. | The engine is not deterministic at batch 1. Anything from an uninitialised buffer to a race in a fused kernel lands here first. This is the single most sensitive check in the gate. |
 | 2 | **Coherence.** A short factual completion (`prompts/coherence.txt`) must contain the expected answer. | The model is loaded and the dequant/GEMM path produces sense, not noise. Catches a codec or scale regression that determinism alone would happily reproduce identically. |
-| 3 | **Needle recall.** Both campaign prompts (3,121 and 20,801 tokens) must recall *both* planted identifiers, `NEEDLE_REPS` times each (default 4), with a stable sha across runs. | Long-context attention or KV handling is wrong. A model that answers fluently but has lost the first line of a 20k prompt fails here and passes check 2. |
-| 3b | **Logit reproducibility** (the primary determinism check). `LOGIT_REPS` runs (default 6) of the 3,121-token prompt at `n_predict 1`, `n_probs 2`, run once at np=1 and once pinned to slot 1 at np=2; every returned probability must be identical to the last digit. | The forward pass itself is nondeterministic. Checks 1, 3 and 4 compare the *argmax*; this one compares the numbers the argmax was taken over. A kernel race can wobble the logits on every single run and still produce a stable sha wherever the top-2 margin is wider than the wobble — which makes it look like a rare flake on long prompts and under load instead of what it is. Skipped, not failed, on a server that does not return `completion_probabilities`. |
-| 4 | **Greedy determinism, np=2, other slot erased first.** Boots with `-np 2`, erases every slot, then runs `REPS` requests pinned to slot 1. All must be byte-identical, and (unless `NP2_CROSS_CHECK=0`) must equal the np=1 reference. | A multi-slot defect: state leaking between slots, a shared scratch buffer, a graph outliving its call. Skipped, not failed, if the server has no `-np` or no slot-erase endpoint. |
-| 5 | **Unit tests.** `test-pxq-cpu-dot`, `test-kv-seq-shadow`, `test-narrow-kernel-parity`. | The CPU PXQ dot product, the KV sequence shadow, or a narrow-kernel lever has diverged from its reference. |
+| 3 | **Chat completions, the production template.** The same factual prompt through `/v1/chat/completions` — the OpenAI-compatible route every real client and every tool-calling agent actually talks to, never `/completion` — at `temperature 0`, with the model's own embedded chat template applied (`--jinja`). Must answer correctly and be `CHAT_REPS`-way byte-identical (default 4). | Checks 1, 2 and 4-5 all talk to `/completion` with a hand-built prompt string. A build can pass every one of them and still be a **failed build**: a broken or missing chat template, a stop-token mismatch, a route that errors — none of that is visible from `/completion`. Skipped, not failed, if this build serves no `/v1/chat/completions` route at all. |
+| 4 | **Needle recall.** Both campaign prompts (3,121 and 20,801 tokens) must recall *both* planted identifiers, `NEEDLE_REPS` times each (default 4), with a stable sha across runs. | Long-context attention or KV handling is wrong. A model that answers fluently but has lost the first line of a 20k prompt fails here and passes check 2. |
+| 4b | **Logit reproducibility** (the primary determinism check). `LOGIT_REPS` runs (default 6) of the 3,121-token prompt at `n_predict 1`, `n_probs 2`, run once at np=1 and once pinned to slot 1 at np=2; every returned probability must be identical to the last digit. | The forward pass itself is nondeterministic. Checks 1, 4 and 5 compare the *argmax*; this one compares the numbers the argmax was taken over. A kernel race can wobble the logits on every single run and still produce a stable sha wherever the top-2 margin is wider than the wobble — which makes it look like a rare flake on long prompts and under load instead of what it is. Skipped, not failed, on a server that does not return `completion_probabilities`. |
+| 5 | **Greedy determinism, np=2, other slot erased first.** Boots with `-np 2`, erases every slot, then runs `REPS` requests pinned to slot 1. All must be byte-identical, and (unless `NP2_CROSS_CHECK=0`) must equal the np=1 reference. | A multi-slot defect: state leaking between slots, a shared scratch buffer, a graph outliving its call. Skipped, not failed, if the server has no `-np` or no slot-erase endpoint. |
+| 5b | **Token-0 logit match, np=1 vs np=2.** Compares the *actual* top-2 probabilities check 4b captured at np=1 against the ones it captured at np=2 slot 1 (same KV placement) — not just each arm's own internal reproducibility, the two arms against **each other**, to the last digit. | The strongest determinism claim the gate makes, and the one that would have caught 2026-09-03 immediately: two runs can each be internally rock-stable and still silently disagree with each other. Skipped if either 4b run above was not itself stable/available. |
+| 6 | **Unit tests.** `test-pxq-cpu-dot`, `test-kv-seq-shadow` (both CPU), `test-narrow-kernel-parity` (GPU-only — not even a build target without CUDA). | The CPU PXQ dot product, the KV sequence shadow, or a narrow-kernel lever has diverged from its reference. The GPU-only test is skipped, not failed, on a box with no GPU present — and failed, not skipped, on a GPU box that simply never built it. |
 
 ## The two rules that make the multi-slot arm meaningful
 
@@ -97,14 +108,17 @@ Everything is an environment variable; every one has a default.
 | `HOST` / `PORT` | `127.0.0.1` / `18080` | The gate boots and kills its own server; pick a free port. |
 | `NGL` / `CTX` / `BATCH` / `UBATCH` / `THREADS` | `99` / `32768` / `2048` / `2048` / `nproc` | Standard server sizing. |
 | `FA` | `on` | Passed as `-fa $FA`. Set `FA=` (empty) to omit the flag on a build that has none. |
+| `CHAT_JINJA` | `on` | Passed as `--jinja` — use the model's own embedded chat template for `/v1/chat/completions`. Set `CHAT_JINJA=` (empty) to omit the flag on a server too old to have it. |
 | `SERVER_ARGS` | empty | Anything extra, verbatim: `-ts`, `-ot`, `--kv-unified`, tensor overrides. |
 | `REPS` | `12` | Determinism repetitions per arm. Do not lower it for a release gate — see rule 1. |
 | `NEEDLE_REPS` | `4` | Needle repetitions per prompt. |
-| `N_PREDICT` | `32` | Tokens generated per determinism/needle request. |
-| `GATE_NP2` | `auto` | `auto` runs the np=2 arm if the server has `-np`; `0` disables it; `1` forces it. |
-| `NP2_CROSS_CHECK` | `1` | Also require the np=2 slot to equal the np=1 reference. |
-| `GATE_TESTS` | `1` | `0` skips the unit tests (e.g. on a box where they were not built). |
-| `COHERENCE_EXPECT` | `paris` | Case-insensitive substring the coherence completion must contain. Change it with `prompts/coherence.txt`. |
+| `CHAT_REPS` | `4` | `/v1/chat/completions` determinism repetitions. |
+| `N_PREDICT` | `256` | Tokens generated per determinism/needle request — see the answer-budget note below. |
+| `GATE_NP2` | `auto` | `auto` runs the np=2 arm if the server has `-np`; `0` disables it (a `SKIP`, or a `FAIL` under `GATE_STRICT=1`); `1` forces it. |
+| `NP2_CROSS_CHECK` | `1` | Also require the np=2 slot, and its token-0 logits, to equal the np=1 reference. |
+| `GATE_TESTS` | `1` | `0` skips the unit tests (a `SKIP`, or a `FAIL` under `GATE_STRICT=1`; e.g. on a box where they were not built). |
+| `COHERENCE_EXPECT` | `paris` | Case-insensitive substring the coherence *and* chat-completions checks must contain. Change it with `prompts/coherence.txt`. |
+| `GATE_STRICT` | `0` | `1` turns every operator-disabled arm (`LOGIT_REPS=0`, `GATE_NP2=0`, `GATE_TESTS=0`) from a `SKIP` into a `FAIL` — SKIP is then reserved strictly for genuine hardware/build absence. Always `1` in the required-check CI workflow. |
 | `BOOT_TIMEOUT` / `REQ_TIMEOUT` | `900` / `900` | Seconds. Raise `BOOT_TIMEOUT` for a cold model on spinning disks. |
 | `PROMPTS` | `bench/gate/prompts` | Prompt directory. |
 | `WORKDIR` | a fresh `mktemp -d` | Server logs and per-test output land here; the path is printed in the summary. |
@@ -127,6 +141,13 @@ A CPU-only sanity pass:
 
 ```
 MODEL=/models/model.gguf NGL=0 FA= GATE_NP2=0 ./bench/gate/run-gate.sh
+```
+
+The required-check CI workflow's own invocation — CPU-only *and* strict, so a `SKIP` that isn't
+genuine hardware absence fails the run instead of quietly passing it (see `.github/workflows/`):
+
+```
+MODEL=/models/small.gguf NGL=0 FA= GATE_STRICT=1 ./bench/gate/run-gate.sh
 ```
 
 Tensor split and an override, passed straight through:
