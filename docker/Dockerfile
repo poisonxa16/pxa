@@ -5,6 +5,13 @@
 # libraries they need, and the CUDA 12.8 runtime libs (cudart/cublas/cublasLt) — no
 # compiler, no headers, no build tooling.
 #
+# The image carries TWO engines: this one, as /usr/local/bin/llama-server (the
+# ENTRYPOINT), and the upstream engine every published comparison was measured
+# against, as /opt/pxa/bin/upstream-ik-server, pinned to one commit and labelled
+# with it. An engine-only comparison is then one `docker run --entrypoint` away,
+# on the same card, the same driver, the same CUDA runtime and the same weight
+# file — see docker/README.md, "The second binary", and bench/fair/run.sh.
+#
 # Build:
 #   docker build -f docker/Dockerfile \
 #     --build-arg CUDA_ARCHS="60;61;70" \
@@ -17,6 +24,17 @@ ARG UBUNTU_VERSION=24.04
 ARG CUDA_VERSION=12.8.1
 ARG BASE_CUDA_DEV_CONTAINER=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 ARG BASE_CUDA_RUN_CONTAINER=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+
+# The upstream engine to ship alongside this one, pinned to ONE commit.
+# 3c58ae373a0081c884099f435fb16ca720852bf7 (2026-08-31) is the revision named in
+# every published upstream row: docs/ENGINE.md's three comparison tables,
+# bench/fair-battle.md's cross-engine sections, and the `upstream ik_llama.cpp
+# 3c58ae37` rows of docs/data/chart-data-2026-09-02.csv, which is the CSV behind
+# the README's own chart. The fork point (`1520eda98056`, docs/ENGINE.md
+# "Do they rebase?") is deliberately NOT used here: it is where this codebase
+# started, not what anything was measured against.
+ARG IK_SHA=3c58ae373a0081c884099f435fb16ca720852bf7
+ARG IK_URL=https://github.com/ikawrakow/ik_llama.cpp
 
 # ---------------------------------------------------------------------------
 # Build stage
@@ -55,6 +73,57 @@ RUN cmake -S . -B build \
         -j "$([ "${BUILD_JOBS}" != "0" ] && [ -n "${BUILD_JOBS}" ] && echo "${BUILD_JOBS}" || nproc)"
 
 # ---------------------------------------------------------------------------
+# Upstream engine stage — the second binary
+# ---------------------------------------------------------------------------
+# Same CUDA toolkit, same three architectures, same container as the engine
+# above, so an engine-only comparison differs in exactly one thing: the binary.
+# Nothing from this stage reaches the runtime image except the one executable.
+FROM ${BASE_CUDA_DEV_CONTAINER} AS build-upstream
+
+ARG CUDA_ARCHS="60;61;70"
+ARG BUILD_JOBS="0"
+ARG IK_SHA
+ARG IK_URL
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        build-essential cmake git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /upstream
+
+# Shallow fetch of exactly the pinned commit — no clone, no history, no tags,
+# no branch that could move. This layer's cache key is IK_SHA and nothing else:
+# editing this repo's own source never re-fetches it, and changing IK_SHA
+# re-fetches only this. The recorded revision line ships next to the binary so
+# an image can be asked what it is carrying without trusting its labels.
+RUN git init -q . && \
+    git remote add origin "${IK_URL}" && \
+    git fetch --depth 1 --no-tags origin "${IK_SHA}" && \
+    git checkout -q FETCH_HEAD && \
+    git --no-pager log -1 --format="ik_llama.cpp %H %ad %s" > /upstream/UPSTREAM-REV
+
+# BUILD_SHARED_LIBS=OFF is not a preference. The runtime image already carries
+# THIS engine's libllama.so/libggml.so in /usr/local/lib, and a dynamically
+# linked upstream server would load those at run time — benchmarking this
+# engine's kernels while wearing upstream's name. Static links it against its
+# own ggml/llama; the only shared libraries it then needs are the CUDA runtime
+# ones both engines share.
+# GGML_CUDA_F16=ON is the configuration the published upstream rows were
+# measured on (bench/fair-battle.md, "2026-09-03 cross-engine, same file, three
+# engines").
+RUN cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON \
+        -DGGML_CUDA_F16=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DLLAMA_CURL=OFF \
+        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+    && cmake --build build --target llama-server \
+        -j "$([ "${BUILD_JOBS}" != "0" ] && [ -n "${BUILD_JOBS}" ] && echo "${BUILD_JOBS}" || nproc)"
+
+# ---------------------------------------------------------------------------
 # Runtime stage
 # ---------------------------------------------------------------------------
 FROM ${BASE_CUDA_RUN_CONTAINER} AS runtime
@@ -65,13 +134,17 @@ FROM ${BASE_CUDA_RUN_CONTAINER} AS runtime
 # a wrong-but-plausible-looking value.
 ARG TAG=dev
 ARG GIT_SHA=unknown
+ARG IK_SHA
+ARG IK_URL
 
 LABEL org.opencontainers.image.source="https://github.com/poisonxa16/pxa" \
       org.opencontainers.image.title="PXA" \
       org.opencontainers.image.description="Pascal/Volta 4-bit codec + kernel pack for llama.cpp" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${TAG}" \
-      org.opencontainers.image.revision="${GIT_SHA}"
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.pxa.upstream.ik.sha="${IK_SHA}" \
+      org.pxa.upstream.ik.url="${IK_URL}"
 
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends curl ca-certificates libgomp1 && \
@@ -87,6 +160,14 @@ COPY --from=build /src/build/src/libllama.so           /usr/local/lib/
 COPY --from=build /src/build/ggml/src/libggml.so       /usr/local/lib/
 COPY --from=build /src/build/examples/mtmd/libmtmd.so  /usr/local/lib/
 RUN ldconfig
+
+# The second engine. Deliberately NOT on PATH and NOT in /usr/local/lib's
+# neighbourhood: it is a comparison instrument, not a way to serve. Run it with
+#   docker run --entrypoint /opt/pxa/bin/upstream-ik-server <image> -m ... -ngl 99 ...
+# Its revision is in the org.pxa.upstream.ik.sha label and, verbatim from its own
+# git log, in the .rev file next to it.
+COPY --from=build-upstream /upstream/build/bin/llama-server /opt/pxa/bin/upstream-ik-server
+COPY --from=build-upstream /upstream/UPSTREAM-REV           /opt/pxa/bin/upstream-ik-server.rev
 
 # Model directory mount point (empty in the image — models are never baked in).
 RUN mkdir -p /models && chown pxq:pxq /models /work

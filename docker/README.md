@@ -114,6 +114,63 @@ docker run -d --name pxa-1080ti \
     --port 8390 --host 0.0.0.0
 ```
 
+## The second binary — the upstream engine, for engine-only comparisons
+
+The image ships two engines:
+
+| path | what it is |
+|---|---|
+| `/usr/local/bin/llama-server` | this engine. The image's `ENTRYPOINT`, and what every recipe above runs. |
+| `/opt/pxa/bin/upstream-ik-server` | upstream `ik_llama.cpp`, pinned to commit `3c58ae37`, built in the same container for the same three architectures with the same CUDA toolkit. |
+
+That second binary is there for one reason: an *engine-only* number — same weight file,
+same card, same driver, same CUDA runtime, only the binary differs — is the one comparison
+that cannot be argued with, and it is also the one nobody can reproduce if they have to
+build the other engine themselves first. `3c58ae37` is the revision every published
+upstream row in this repo was measured against (`bench/fair-battle.md`, `docs/ENGINE.md`,
+`docs/data/chart-data-2026-09-02.csv`).
+
+Ask the image what it is carrying rather than trusting a doc:
+
+```bash
+docker inspect --format '{{index .Config.Labels "org.pxa.upstream.ik.sha"}}' ghcr.io/poisonxa16/pxa:latest
+docker run --rm --entrypoint cat ghcr.io/poisonxa16/pxa:latest /opt/pxa/bin/upstream-ik-server.rev
+```
+
+### Running the comparison
+
+Both arms, one after the other, same file and same flags. Use a file **both** engines can
+read — a stock quant such as MXFP4 or a `Q*_K` type. A PXQ file loads only in this engine,
+so a PXQ arm is a product comparison, not an engine-only one:
+
+```bash
+# this engine (the default entrypoint)
+docker run --rm --gpus '"device=0"' -p 8390:8390 -e LLAMA_ARG_PORT=8390 \
+    -v /path/to/your/models:/models:ro \
+    ghcr.io/poisonxa16/pxa:latest \
+    -m /models/your-stock-quant.gguf \
+    -ngl 99 -c 32768 -b 2048 -ub 2048 -fa on --port 8390 --host 0.0.0.0
+
+# upstream, same everything, one flag different
+docker run --rm --gpus '"device=0"' -p 8390:8390 -e LLAMA_ARG_PORT=8390 \
+    -v /path/to/your/models:/models:ro \
+    --entrypoint /opt/pxa/bin/upstream-ik-server \
+    ghcr.io/poisonxa16/pxa:latest \
+    -m /models/your-stock-quant.gguf \
+    -ngl 99 -c 32768 -b 2048 -ub 2048 -fa on --port 8390 --host 0.0.0.0
+```
+
+Measure each arm the same way — `temperature 0`, `/completion`, a unique prompt per repeat,
+median of 7 with one warmup discarded, speculative decode either on for both arms or off for
+both. That is `bench/fair/protocol.md`, and `bench/fair/run.sh --rig <your rig>` runs exactly
+these two arms for you and prints the block. It looks for the upstream binary at
+`/opt/pxa/bin/upstream-ik-server` by default, which is where this image puts it.
+
+The upstream binary is statically linked on purpose: the image carries this engine's
+`libllama.so`/`libggml.so` in `/usr/local/lib`, and a dynamically linked upstream server
+would load *those* at run time and quietly benchmark this engine's kernels under upstream's
+name.
+
 ## Flags that matter
 
 | flag | meaning | notes |
@@ -186,3 +243,21 @@ docker build -f docker/Dockerfile \
 
 `CUDA_ARCHS` controls which SM targets get compiled in (`60`=P100, `61`=1080 Ti/P40,
 `70`=V100). Narrow it to your exact card to shrink build time and binary size.
+
+This builds **two** CUDA engines — this one and the pinned upstream one — so it is a long
+build on a busy machine; the release image is built once, at tag time, on an idle box.
+`--build-arg BUILD_JOBS=6` caps the compile jobs if you need the cores for something else.
+
+Two more knobs, both for the second binary:
+
+| build arg | default | what it does |
+|---|---|---|
+| `IK_SHA` | `3c58ae373a0081c884099f435fb16ca720852bf7` | the upstream commit to build. Pinned, never a branch: a comparison against a moving target is not a comparison. Point it somewhere else and the numbers in this repo no longer describe what you built — say which revision you used. |
+| `IK_URL` | `https://github.com/ikawrakow/ik_llama.cpp` | where to fetch it from (a mirror, or a local bare repo). |
+
+The upstream stage does a shallow, single-commit fetch keyed only on `IK_SHA`, so editing
+this repo's source never refetches or rebuilds it. To build just that stage:
+
+```bash
+docker build -f docker/Dockerfile --target build-upstream --build-arg BUILD_JOBS=6 .
+```
