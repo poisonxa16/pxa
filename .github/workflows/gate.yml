@@ -1,0 +1,68 @@
+name: gate
+
+# The required check for a tag (see RELEASING.md). Runs everything in bench/gate/run-gate.sh that
+# does not need a GPU -- GitHub's own runners don't have one, so NGL=0 here, and the gate's own
+# hardware detection (see bench/gate/README.md's "SKIP is fail-closed" rule) SKIPs only the one
+# check that is structurally GPU-only (test-narrow-kernel-parity is not even a build target
+# without CUDA) instead of failing this job for hardware it was never going to have. Everything
+# else -- both determinism arms, the token-0 logit match between them, coherence, the chat-
+# completions arm through the production template, needle recall, the two CPU unit tests -- runs
+# for real, at GATE_STRICT=1, so a knob quietly disabling a required arm fails the job instead of
+# passing it. The GPU arms are self-hosted and manual; see RELEASING.md for exactly how I run them
+# and what I attach to a tag before it goes out. This workflow proves the CPU half only.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  gate-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake build-essential
+
+      - name: Configure (CPU, AVX2, with unit tests)
+        run: cmake --preset cpu-avx2-release -DLLAMA_BUILD_TESTS=ON
+
+      - name: Build llama-server and the CPU unit tests
+        run: |
+          cmake --build build_cpu_avx2_release \
+            --target llama-server test-pxq-cpu-dot test-kv-seq-shadow \
+            -j "$(nproc)"
+
+      # A small, real instruct model with its own embedded chat template -- required for the
+      # chat-completions arm to prove anything (a template-less model can't fail at rendering
+      # one). Pinned to a specific file so a re-upload upstream can't silently change what this
+      # job tests against.
+      - name: Fetch the CI test model
+        run: |
+          mkdir -p /tmp/gate-model
+          curl -fL --retry 3 -o /tmp/gate-model/model.gguf \
+            https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+          sha256sum /tmp/gate-model/model.gguf
+
+      - name: Run the gate (CPU arms, strict)
+        run: |
+          MODEL=/tmp/gate-model/model.gguf \
+          BIN=build_cpu_avx2_release/bin \
+          NGL=0 \
+          FA= \
+          GATE_STRICT=1 \
+          ./bench/gate/run-gate.sh
+
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-cpu-logs
+          path: /tmp/pxa-gate.*/**
+          if-no-files-found: ignore
+          retention-days: 14
