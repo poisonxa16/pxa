@@ -148,7 +148,7 @@ docker run --rm --runtime=nvidia --gpus '"device=0,1"' \
     --tensor-parallel-size 2 --host 0.0.0.0 --port 8000
 ```
 
-Use the `sm70` tag on V100s. See [`../docker/vllm-pxq4/README.md`](../docker/vllm-pxq4/README.md).
+Use the `sm70` tag on V100s. See [`tools/vllm-pxq4/README.md`](../tools/vllm-pxq4/README.md).
 
 ---
 
