@@ -157,12 +157,11 @@ pxa: engine | codec=PXQ3 (120 tensors; pxq2 41, pxq3 58, pxq4 21, pxq6 0)
 pxa: dev 0 Tesla P100-PCIE-16GB cc 6.0 -> path: sm_60 fp16-hfma2
 PXA posture: mode=balance [fa-on serving, decode-first] fa=on (explicit) ub=2048 (adaptive: dev0 free-min <N> MiB, min total 16384 MiB, model share <N> MiB (uniform split) -> headroom <N> MiB)
 PXA_AUTO: samplers arch=qwen35moe -> temp=0.70 top_k=20 top_p=0.80 min_p=0.00 (qwen no-think agent defaults (official Qwen no-think sampler set); override: the CLI flag or PXA_AUTO_SAMPLERS=0)
-PXA_AUTO: ROUTER_FUSE=0 (OFF: sm_60 present (+1.6% KILL measured on sm_60); override PXA_ROUTER_FUSE)
 PXA_AUTO: FUSE_DELTANET=53 (deltanet hybrid arch — cluster + row-absorb fusions active (bit-exact with eager; out-gate fusion off by default, guarded, see pxa/README.md); override PXA_FUSE_DELTANET)
 ```
 
 <!-- wording taken verbatim from the engine source in this release:
-     ggml/src/ggml-cuda/pxa/pxa-enhance.cuh (PXA config level / PXA level= / ROUTER_FUSE / FUSE_DELTANET),
+     ggml/src/ggml-cuda/pxa/pxa-enhance.cuh (PXA config level / PXA level= / FUSE_DELTANET),
      src/llama.cpp (pxa: engine | codec= ... and pxa: dev N ... -> path:),
      examples/server/server.cpp (PXA posture: ... and PXA_AUTO: samplers ...).
      Conditions checked for THIS cell (one sm_60 card, PXQU file, arch qwen35moe, ENHANCE default):
@@ -207,25 +206,26 @@ follows it, and completion responses then carry `draft_n` / `draft_n_accepted` i
 <!-- examples/server/server.cpp: the AUTO-SPEC block, its 2 GiB headroom gate and the qwen35moe row;
      examples/server/server-task.cpp: draft_n / draft_n_accepted appear in timings only when a stage is armed -->
 
-**The numbers.** These two are what this card is published at, and they are the acceptance test:
+**The numbers.** These two are the floor this card is published at — meet them or beat them:
 
-| | published for 1× Tesla P100 16 GB | how it was measured |
+| | floor for 1× Tesla P100 16 GB | how it was measured |
 |---|---|---|
-| **decode** | **62–63 t/s** (62.4 published; 63.0 with the residual-add fusion that now ships on) | server-reported `timings.predicted_per_second`, 200-token generations from a short prompt, model fully GPU-resident, median of 3 <!-- docs/COOKBOOK.md:96-97; bench/README.md:52-58; docs/LAUNCHER.md:174 --> |
-| **prefill** | **827–843 t/s** at `ub=2048` | one **cold ~5,800-token prompt**, same server, same geometry <!-- bench/README.md:58; docs/COOKBOOK.md:97; a separate session in bench/fair-battle.md:79 recorded 816.8 t/s on this same file at ub2048 --> |
+| **decode** | **62 t/s or better** | server-reported `timings.predicted_per_second`, 200-token generations from a short prompt, model fully GPU-resident, median of 3 <!-- published 62.4, and 63.0 with the residual-add fusion that now ships on: docs/COOKBOOK.md:96-97; bench/README.md:52-58; docs/LAUNCHER.md:174 --> |
+| **prefill** | **817 t/s or better** at `ub=2048` | one **cold ~5,800-token prompt**, same server, same geometry <!-- published 827-843: bench/README.md:58; docs/COOKBOOK.md:97. The floor is the lowest published reading on this file at ub2048, 816.8 t/s, from the session in bench/fair-battle.md:79 --> |
 | first token | *not a published number* | whatever `timings.prompt_ms` says for the prompt **you** sent; it scales with your prompt length, so it is reported here, never compared |
 
 **Prefill is measured on a long cold prompt on purpose.** A short prompt reports a much smaller
-prefill rate because the fixed per-request cost dominates — that is not a fault and it is not
-comparable to 827–843.
+prefill rate because the fixed per-request cost dominates — that is not a fault, and it is not
+comparable to the floor above.
 
-Measure decode with three runs and take the median:
+Measure decode with three runs and take the median. **Every run gets its own prompt**: the
+engine's n-gram drafter learns text it has already seen, so re-sending one prompt makes the rate
+climb run over run and measures the cache rather than the card (`bench/fair/protocol.md` rule 6):
 
 ```bash
 for i in 1 2 3; do
-  curl -s http://127.0.0.1:8080/completion -H 'Content-Type: application/json' \
-    -d '{"prompt":"Write a detailed technical summary of how a GPU executes a matrix multiply.",
-         "n_predict":200,"temperature":0,"cache_prompt":false}' \
+  python3 -c 'import json,random,sys; random.seed(int(sys.argv[1])); print(json.dumps({"prompt":"Write a detailed technical summary of how a GPU executes a matrix multiply. Reference case %d." % random.randrange(999999),"n_predict":200,"temperature":0,"cache_prompt":False}))' "$i" > /tmp/pxa-decode.json
+  curl -s http://127.0.0.1:8080/completion -H 'Content-Type: application/json' --data @/tmp/pxa-decode.json \
   | python3 -c 'import json,sys; t=json.load(sys.stdin)["timings"]; print("decode %.1f t/s   first token %.0f ms" % (t["predicted_per_second"], t["prompt_ms"]))'
 done
 ```
@@ -244,11 +244,11 @@ curl -s http://127.0.0.1:8080/completion -H 'Content-Type: application/json' --d
 **Did it reproduce?** The protocol these numbers are held to is in `bench/fair/protocol.md`:
 temperature 0 (rule 2), **one warmup run discarded and the median of 7 reported** (rule 3), a
 **unique prompt for every repeat** with `cache_prompt` false (rule 6). Do that, and your median
-decode should land inside **62–63 t/s** and your median prefill inside **827–843 t/s** — those
-ranges *are* the published spread for this row, not a tolerance I invented, and a session
-recorded in `bench/fair-battle.md:79` put the same file at 816.8 t/s prefill, so treat 817 and
-up as reproduced. A first request is always slower than the rest; that is what rule 3's
-discarded warmup is for. If your median sits outside its range, the next section is for you.
+decode should be **at least 62 t/s** and your median prefill **at least 817 t/s**. Higher is
+expected: those figures were taken on an earlier build, they are a floor rather than a band, and
+I re-measure them for each tag — beating them is the engine getting faster, not your run going
+wrong. A first request is always slower than the rest; that is what rule 3's discarded warmup is
+for. If a median lands *below* its floor, the next section is for you.
 
 ---
 
@@ -333,10 +333,11 @@ does not fit alongside its context and compute buffer. Confirm the card is other
 (`nvidia-smi`), lower `-c`, or step down a tier. On 16 GB, PXQU-16 is the tier that fits; the
 4-bit flagship (18.7 GB) does not fit one 16 GB card, whatever its filename suggests.
 
-**Everything works but the numbers are far off.** Re-read the `PXA posture:` line: if `ub` is
+**Everything works but a number is under its floor.** Re-read the `PXA posture:` line: if `ub` is
 not 2048, something else is resident on the card and the engine sized down to stay safe. And
-check what you measured — a short prompt cannot produce the 827–843 prefill figure, only a cold
-prompt of a few thousand tokens can.
+check what you measured — a short prompt cannot produce a four-figure prefill rate, only a cold
+prompt of a few thousand tokens can. A number *above* its floor needs no explanation and is not a
+fault: the floors come from an earlier build.
 
 ---
 
