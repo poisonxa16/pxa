@@ -67,8 +67,8 @@ what you can type yourself:
 | your cards | model to grab | the command |
 |---|---|---|
 | 1× GTX 1080 Ti 11 GB | `PXA-Fusion2-35B-PXQ2.gguf` | `./run-server.sh -m PXA-Fusion2-35B-PXQ2.gguf -ngl 99 -c 8192 --ctx-checkpoints 0` |
-| 1× Tesla P100 16 GB | `PXA-Fusion2-35B` PXQU-16 | `./run-server.sh -m <model>.gguf -ngl 99 -c 8192 -fa on` |
-| 1× Tesla V100 16 GB | `PXA-Fusion2-35B` PXQU-16 | `./run-server.sh -m <model>.gguf -ngl 99 -c 8192 -fa on` |
+| 1× Tesla P100 16 GB | `fusion2-35b-U16-q8head.gguf` | `./run-server.sh -m fusion2-35b-U16-q8head.gguf -ngl 99 -c 8192 -fa on` |
+| 1× Tesla V100 16 GB | `fusion2-35b-U16-q8head.gguf` | `./run-server.sh -m fusion2-35b-U16-q8head.gguf -ngl 99 -c 8192 -fa on` |
 | 2× Tesla P100 | `Qwable-27B-PXQ4core.gguf` | `./run-server.sh -m Qwable-27B-PXQ4core.gguf -ngl 99 -c 32768 -t 16 -fa on -sm layer` |
 | 2× Tesla V100 | `Qwable-27B-PXQ4core.gguf` | *the same line* — the engine picks `-b 8192 -ub 2048` here and `-b 8192 -ub 256` on the P100 pair |
 | 4× Tesla P100 | Flash-Next hybrid MoE, PXQU mixed tiers | `./run-server.sh -m <model>.gguf -ngl 99 -c 150016 -np 2 --kv-unified --no-context-shift` |

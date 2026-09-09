@@ -24,7 +24,7 @@ CUDA 12.8.
 ```bash
 tar xzf pxa-*-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
 cd pxa-*/
-cat START-HERE.md          # model links and their sha256
+cat START-HERE.md          # requirements, the model file and its sha256, three steps
 ```
 
 ### 2. Serve, with no flags
@@ -59,7 +59,7 @@ for i in 1 2 3; do
     -H 'Content-Type: application/json' \
     -d '{"prompt":"Write a detailed technical summary of how a GPU executes a matrix multiply.",
          "n_predict":192,"temperature":0,"top_k":1,"cache_prompt":false}' \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin)["timings"]; print(f"prefill {d[\"prompt_per_second\"]:.1f} t/s   decode {d[\"predicted_per_second\"]:.1f} t/s")'
+  | python3 -c 'import json,sys; d=json.load(sys.stdin)["timings"]; print("prefill %.1f t/s   decode %.1f t/s" % (d["prompt_per_second"], d["predicted_per_second"]))'
 done
 ```
 

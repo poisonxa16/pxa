@@ -1,4 +1,5 @@
-# START HERE — pxa @@TAG@@
+<!-- generated from scripts/START-HERE.md.in by scripts/gen-start-here.sh; edit the .in -->
+# START HERE — pxa v2026.09.07-rc1
 
 I wrote this page for one reader: you have a single **Tesla P100 16 GB**, a working NVIDIA
 driver, and either this tarball or the container image. Nothing is built, nothing is compiled,
@@ -21,13 +22,13 @@ Two ways in, same binaries, same one line: the **tarball** (below) or the **cont
 - **A Pascal or Volta NVIDIA card.** Tesla P100 (`sm_60`), GTX 10-series / 1080 Ti / P40
   (`sm_61`), Tesla V100 (`sm_70`). This build is compiled for exactly those three
   architectures and will not run GPU kernels on a Turing or newer card.
-- **An NVIDIA driver new enough for the bundled CUDA @@CUDA_MAJOR_MINOR@@ runtime** — driver
-  **@@DRIVER_FLOOR@@** or newer on Linux. Check with `nvidia-smi` (the driver version is in the
+- **An NVIDIA driver new enough for the bundled CUDA 12.8 runtime** — driver
+  **570.00 (Linux)** or newer on Linux. Check with `nvidia-smi` (the driver version is in the
   top-right of its banner). You do **not** need the CUDA *toolkit* installed: this package
   brings its own CUDA runtime in `lib/`. It deliberately does not bring the driver, which has
-  to match your kernel. This build was packaged on driver @@BUILD_HOST_DRIVER@@.
-- **glibc >= @@GLIBC_FLOOR@@** (and the package carries its own libstdc++ >= @@GLIBCXX_FLOOR@@
-  in `lib/`, so only the glibc floor is yours to satisfy). Concretely: @@DISTRO_HINT@@. Check
+  to match your kernel. This build was packaged on driver 580.142.
+- **glibc >= 2.34** (and the package carries its own libstdc++ >= 3.4.30
+  in `lib/`, so only the glibc floor is yours to satisfy). Concretely: Ubuntu 22.04+, Debian 12+, RHEL 9+ (or Rocky/Alma Linux 9+), Fedora 35+ (or any distro reporting glibc >= 2.34 via 'ldd --version'). Check
   with `ldd --version`. This is a hard floor, not a guess — an older host fails at exec with
   `version GLIBC_x.y not found` and no flag fixes it.
 - **For the container path only:** Docker plus the NVIDIA Container Toolkit (or the older
@@ -38,15 +39,15 @@ Two ways in, same binaries, same one line: the **tarball** (below) or the **cont
 - **`python3` on your PATH.** Used by the launcher and by the two measurement snippets below.
   There is nothing to install into it.
 
-@@PATCHELF_NOTE@@
+Binaries carry an RPATH to ./lib; you do not need to set LD_LIBRARY_PATH by hand.
 
 ---
 
 ## Step 1 — unpack
 
 ```bash
-tar xzf pxa-@@TAG@@-linux-x86_64-cuda@@CUDA_MAJOR_MINOR@@-*.tar.gz
-cd pxa-@@TAG@@
+tar xzf pxa-v2026.09.07-rc1-linux-x86_64-cuda12.8-*.tar.gz
+cd pxa-v2026.09.07-rc1
 ```
 
 ## Step 2 — get the model, and check what you got
@@ -237,7 +238,7 @@ docker run -d --name pxa \
     --gpus '"device=0"' \
     -p 8080:8080 \
     -v /path/to/your/models:/models:ro \
-    ghcr.io/poisonxa16/pxa:@@TAG@@ \
+    ghcr.io/poisonxa16/pxa:v2026.09.07-rc1 \
     -m /models/fusion2-35b-U16-q8head.gguf \
     -ngl 99 -c 8192 -fa on
 ```
@@ -262,7 +263,7 @@ the build you downloaded is in the `VERSION` file next to this page. There is no
 it is a newer distro, or a container with a newer userspace. Nothing is wrong with your card.
 
 **It starts, then: `CUDA driver version is insufficient for CUDA runtime version`.** The driver
-is older than @@DRIVER_FLOOR@@. Upgrade the *driver*; do not install a CUDA toolkit — this
+is older than 570.00 (Linux). Upgrade the *driver*; do not install a CUDA toolkit — this
 package already carries its own CUDA runtime.
 
 **In a container: `could not select device driver "" with capabilities: [[gpu]]`, or the server
@@ -318,8 +319,6 @@ prompt of a few thousand tokens can.
 
 ```
 bin/            llama-server, llama-cli, llama-bench, llama-perplexity, llama-quantize,
-                llama-pxq-export (turns a PXQ file back into a plain GGUF any stock llama.cpp
-                reads -- docs/PXQ-EXPORT.md, and the two-command recipe in docs/COOKBOOK.md),
                 (llama-gguf-split if this build included it), and three self-test binaries.
 lib/            this engine's shared libraries + the exact CUDA/OpenMP runtime libs it needs.
                 Driver libraries are deliberately NOT here — those come from your host.
@@ -332,7 +331,6 @@ bench/gate/     the release gate — determinism, coherence, needle recall, unit
                 (it calls bin/llama-server directly, so it needs ./lib on the path itself;
                 pxa-launch and run-server.sh do that for you, run-gate.sh does not).
 docs/           README, this release's notes, COOKBOOK (per-card recipes), KNOWN-ISSUES,
-                PXQ-EXPORT (leaving PXQ: what bin/llama-pxq-export does and its flags),
                 LAUNCHER (the decision table and worked examples).
 VERSION         the commit, build flags, CUDA version, GPU architectures and library floors
                 of the exact build you have.
