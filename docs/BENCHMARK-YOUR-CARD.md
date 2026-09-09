@@ -18,7 +18,7 @@ model is how a row stops being one person's box.
 ### 1. Untar
 
 Grab the tarball from [the latest release](https://github.com/poisonxa16/pxa/releases) — no
-Docker, no toolchain, no `pip install`. It needs glibc ≥ 2.35 and an NVIDIA driver new enough for
+Docker, no toolchain, no `pip install`. It needs glibc ≥ 2.34 (the floor printed in the tarball's `VERSION`) and an NVIDIA driver new enough for
 CUDA 12.8.
 
 ```bash

@@ -136,7 +136,7 @@ PXA's fp16 KV; that row is on the chart too.
 Three ways in. All three end at the same binaries.
 
 **Tarball — untar and run.** No Docker, no toolchain, no `pip install`. Built in a CUDA 12.8 /
-Ubuntu 22.04 image so the **glibc floor is 2.35**, and proven booting in a bare `ubuntu:22.04`
+Ubuntu 22.04 image; the **glibc floor measured from the shipped binaries is 2.34** (it is printed in the tarball's `VERSION` file), and proven booting in a bare `ubuntu:22.04`
 container with no `python3`, `curl`, `gcc`, `cmake` or CUDA toolkit present.
 
 ```bash
