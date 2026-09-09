@@ -48,6 +48,18 @@ DESIGN RULE - NEVER MAGIC
     --list-chat-templates  the template names THIS engine accepts, and where the
                          list came from
 
+CARD NUMBERS - ONE NUMBERING, PINNED (I-13)
+  --gpus takes the indexes nvidia-smi prints, and every child this launcher starts
+  is given CUDA_DEVICE_ORDER=PCI_BUS_ID next to CUDA_VISIBLE_DEVICES so that CUDA
+  agrees with them. CUDA's own default is FASTEST_FIRST: it sorts the cards by
+  compute capability, so on a box holding both a P100 and a V100 a plain
+  CUDA_VISIBLE_DEVICES=0 starts on the V100 while nvidia-smi calls index 0 the
+  P100. nvidia-smi enumerates in PCI bus order, which is what PCI_BUS_ID means, so
+  pinning it makes the two numberings ONE numbering and the card you ticked is the
+  card the model lands on. An order you exported yourself is kept, with a note -
+  never silently overwritten. Selecting by UUID (CUDA_VISIBLE_DEVICES=GPU-...)
+  names the card outright and does not depend on either order.
+
 TWO TABLES, TWO QUESTIONS, DELIBERATELY SEPARATE
   WHICH ENGINE wins is a llama.cpp-vs-vLLM comparison and lives in MOE_TABLE /
   DENSE_NUMBERS below. WHICH FLAGS to pass is a per-topology measurement on ONE
@@ -803,7 +815,16 @@ def _run(cmd, timeout=20):
 # HARDWARE INTROSPECTION (H1..H8)
 # ---------------------------------------------------------------------------
 def gpu_table():
-    """[(index, name, cc_int, mem_total_MiB, mem_used_MiB, uuid)] or (None, error)."""
+    """[(index, name, cc_int, mem_total_MiB, mem_used_MiB, uuid)] or (None, error).
+
+    THE INDEX IS nvidia-smi's, WHICH IS PCI BUS ORDER (I-13). NVML enumerates by PCI
+    bus id and ignores CUDA_VISIBLE_DEVICES, so this table is the box's own ordering
+    - the one the user reads off `nvidia-smi -L` before typing --gpus. It is only
+    the SAME ordering CUDA uses because device_env() pins CUDA_DEVICE_ORDER to
+    PCI_BUS_ID for the child; CUDA's default is FASTEST_FIRST and disagrees with
+    this table on any box with mixed cards. Enumerate here, pin there, or the
+    number the user ticked selects a different card than the one described to
+    them."""
     if not shutil.which("nvidia-smi"):
         return None, "nvidia-smi not found - cannot detect GPUs. Use --engine to force."
     out = _run(["nvidia-smi",
@@ -824,6 +845,63 @@ def gpu_table():
     if not rows:
         return None, "nvidia-smi returned no usable rows"
     return rows, None
+
+
+# ---------------------------------------------------------------------------
+# DEVICE SCOPING (I-13) - ONE place, so an index cannot mean two different cards
+# ---------------------------------------------------------------------------
+DEVICE_ORDER_DEFAULT = "PCI_BUS_ID"
+
+
+def _index_selection(cv):
+    """True when every entry of a CUDA_VISIBLE_DEVICES string is a bare index. A
+    UUID selection (CUDA_VISIBLE_DEVICES=GPU-aad5ef40-...) names the card outright
+    and cannot be re-pointed by an ordering, so it needs no pin."""
+    parts = [p.strip() for p in str(cv).split(",") if p.strip()]
+    return bool(parts) and all(p.isdigit() for p in parts)
+
+
+def resolve_device_order():
+    """(value, note) - the CUDA_DEVICE_ORDER a child will get, and the one line to
+    say about it, or None when there is nothing to say.
+
+    An order the caller exported themselves is RESPECTED. They may be reproducing
+    another box's numbering deliberately, and a launcher that silently overrides an
+    exported variable is the same class of bug as one that silently picks a
+    different card - which is exactly what this function exists to stop."""
+    user = os.environ.get("CUDA_DEVICE_ORDER", "").strip()
+    if not user:
+        return DEVICE_ORDER_DEFAULT, None
+    if user.upper() == DEVICE_ORDER_DEFAULT:
+        return user, (f"CUDA_DEVICE_ORDER={user} was already exported - kept, and it is "
+                      f"what this launcher would have set anyway.")
+    return user, (f"CUDA_DEVICE_ORDER={user} was already exported - KEPT AS YOU SET IT, not "
+                  f"overridden. The card numbers above are nvidia-smi's (PCI bus order) and "
+                  f"under this order CUDA will NOT number the cards the same way. Unset it, "
+                  f"or select by UUID, if you want the number you ticked to be the card you "
+                  f"get.")
+
+
+def device_env(cv):
+    """({env}, note) - THE device scoping handed to every child, built in one place.
+
+    CUDA_VISIBLE_DEVICES alone is not a card selection on a box with mixed cards: CUDA
+    defaults to CUDA_DEVICE_ORDER=FASTEST_FIRST, which sorts by compute capability,
+    while nvidia-smi (and therefore gpu_table(), and therefore --gpus) numbers by PCI
+    bus id. On this project's own box that makes `CUDA_VISIBLE_DEVICES=0` a Tesla V100
+    while `nvidia-smi -L` calls index 0 a Tesla P100 - the model silently lands on a
+    card the user did not pick and every number measured on it belongs to different
+    silicon. So the order goes wherever the index goes: the two variables are set
+    together, or the index is a guess."""
+    order, note = resolve_device_order()
+    env = {}
+    if _index_selection(cv):
+        env["CUDA_DEVICE_ORDER"] = order
+    else:
+        note = None            # a UUID selection is immune; do not editorialise
+    env["CUDA_VISIBLE_DEVICES"] = str(cv)
+    env["NVIDIA_VISIBLE_DEVICES"] = str(cv)
+    return env, note
 
 
 def resident_procs(gpus):
@@ -2659,6 +2737,11 @@ def print_post_boot_contract(engine, cv):
         print("       library path yields 0/N, correct output and ~50x slower")
         print("       (PERPLEXITY-RESULTS.md:41-55).")
     print(f"    3. device scoping: echo the child's CUDA_VISIBLE_DEVICES back; expect {cv!r}.")
+    print(f"       And check WHICH CARD that turned out to be: the log's 'pxa: dev 0 <name>'")
+    print(f"       line must name the card `nvidia-smi -L` lists at index "
+          f"{str(cv).split(',')[0]}. It does because")
+    print(f"       CUDA_DEVICE_ORDER=PCI_BUS_ID went with the index (I-13); an inherited")
+    print(f"       FASTEST_FIRST would put a different card there and say nothing.")
     print("    4. short-prompt correctness: a RAW, NON-chat-templated 1-token and 5-token")
     print("       completion BEFORE any number is trusted, exactly as all 11 crossover boots")
     print("       did (MOE-CROSSOVER.md section 4.3). Chat-templated traffic pads every prompt")
@@ -3111,8 +3194,13 @@ def write_serve_script(name, cmd, env, cv, serve_dir):
              '  done',
              'fi',
              "",
-             f"export CUDA_VISIBLE_DEVICES={q(cv)}",
-             f"export NVIDIA_VISIBLE_DEVICES={q(cv)}"]
+             "# Card numbers are nvidia-smi's, which are PCI bus order. CUDA's own default",
+             "# is FASTEST_FIRST - it sorts by compute capability - so without the order line",
+             "# below, card 0 here is not card 0 there on a box with mixed cards, and the seat",
+             "# comes back up on the wrong GPU (I-13)."]
+    dev_env, _dev_note = device_env(cv)
+    for k, v in dev_env.items():
+        lines.append(f"export {k}={q(str(v))}")
     for k, v in env.items():
         lines.append(f"export {k}={q(str(v))}")
     # The API key is NEVER written into the script. A restart script is the file
@@ -4037,8 +4125,7 @@ class LaunchTUI(object):
         plan, cmd, env, cv, _prof, _ctx = self.built
         e = dict(os.environ)
         e.update(env)
-        e["CUDA_VISIBLE_DEVICES"] = cv
-        e["NVIDIA_VISIBLE_DEVICES"] = cv
+        e.update(device_env(cv)[0])       # I-13: the order goes with the index
         log = _c.deque(maxlen=4000)
         state = {"phase": "starting the server process", "first_token": None}
         try:
@@ -4415,6 +4502,50 @@ def selftest(gpus):
     ok_all &= a9
     print(f"  A9 4xp100-flashnext emits no kernel-lever env (11 engine-defaulted levers documented): "
           f"{'PASS' if a9 else 'FAIL'}")
+    # A10: an index NEVER travels without its order (I-13). Every site that puts
+    #      CUDA_VISIBLE_DEVICES into a child environment or a generated script must
+    #      go through device_env(), which sets CUDA_DEVICE_ORDER beside it. A site
+    #      that assigns the variable by hand is how card 0 became a V100 on a box
+    #      whose nvidia-smi calls index 0 a P100, so it is caught here, not at boot.
+    #      Same shape as A2: emission markers on the line, so prose is not flagged.
+    #      Two spans are excluded BY POSITION, not by a pragma comment that could be
+    #      pasted anywhere: device_env's own body, which is the one authorised site,
+    #      and this function's, which holds the pattern list below and starts nothing.
+    DEVSET = ('e["CUDA_VISIBLE_DEVICES"]', "e['CUDA_VISIBLE_DEVICES']",
+              'env["CUDA_VISIBLE_DEVICES"]', "export CUDA_VISIBLE_DEVICES")
+
+    def _fn_span(fname):
+        lo = next((i for i, ln in enumerate(src) if ln.startswith(f"def {fname}(")), None)
+        if lo is None:
+            return range(0)
+        hi = next((i for i in range(lo + 1, len(src)) if src[i].startswith("def ")), len(src))
+        return range(lo, hi)
+    skip = set(_fn_span("device_env")) | set(_fn_span("selftest"))
+    a10bad = [i + 1 for i, ln in enumerate(src)
+              if any(m in ln for m in DEVSET) and i not in skip]
+    a10 = not a10bad and "CUDA_DEVICE_ORDER" in "".join(src)
+    ok_all &= a10
+    print(f"  A10 CUDA_VISIBLE_DEVICES is only ever set through device_env(), which pins "
+          f"CUDA_DEVICE_ORDER with it: {'PASS' if a10 else 'FAIL at lines ' + str(a10bad)}")
+    # A11: device_env() itself - an index selection carries the order, an exported
+    #      order is kept rather than overwritten, and a UUID selection needs neither.
+    _saved = os.environ.pop("CUDA_DEVICE_ORDER", None)
+    try:
+        d_idx, n_idx = device_env("2,4")
+        d_uuid, _ = device_env("GPU-aad5ef40-9b80-8fd0-4391-dfe595f42640")
+        os.environ["CUDA_DEVICE_ORDER"] = "FASTEST_FIRST"
+        d_user, n_user = device_env("2,4")
+    finally:
+        os.environ.pop("CUDA_DEVICE_ORDER", None)
+        if _saved is not None:
+            os.environ["CUDA_DEVICE_ORDER"] = _saved
+    a11 = (d_idx.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID"
+           and d_idx.get("CUDA_VISIBLE_DEVICES") == "2,4" and n_idx is None
+           and "CUDA_DEVICE_ORDER" not in d_uuid
+           and d_user.get("CUDA_DEVICE_ORDER") == "FASTEST_FIRST" and bool(n_user))
+    ok_all &= a11
+    print(f"  A11 device_env: index -> +PCI_BUS_ID, exported order kept with a note, UUID "
+          f"needs none: {'PASS' if a11 else 'FAIL ' + str((d_idx, d_uuid, d_user))}")
     print(f"  standing assertions: {'ALL PASS' if ok_all else 'FAILURES ABOVE'}")
 
 
@@ -4730,8 +4861,18 @@ def plan_and_build(a, gpus):
               "cards other agents are measuring on. (I-12)")
         print("=" * 78)
         sys.exit(3)
+    dev_env, dev_note = device_env(cv)
     envs = " ".join(f"{k}={v}" for k, v in env.items())
-    print(f"  env:     CUDA_VISIBLE_DEVICES={cv} {envs}")
+    print("  env:     " + " ".join(f"{k}={v}" for k, v in dev_env.items())
+          + (f" {envs}" if envs else ""))
+    # I-13. The order is printed as part of the env, not as a footnote, because the
+    # export line on this page is the thing people copy. A copied line that carries
+    # the index but not the order selects a different card on a mixed box.
+    if dev_note:
+        print(f"           {dev_note}")
+    elif "CUDA_DEVICE_ORDER" in dev_env:
+        print("           CUDA_DEVICE_ORDER=PCI_BUS_ID pins CUDA to nvidia-smi's numbering, "
+              "so the card numbers above are the ones nvidia-smi prints.")
     if plan.engine == "vllm":
         # THE IMAGE IS A PREMISE, NOT AN INSTRUCTION. The emitted command is a bare
         # `vllm serve` - there is no `docker run` in it and the image name appears
@@ -5007,8 +5148,7 @@ def main():
     _save_state(st)
     e = dict(os.environ)
     e.update(env)
-    e["CUDA_VISIBLE_DEVICES"] = cv
-    e["NVIDIA_VISIBLE_DEVICES"] = cv
+    e.update(device_env(cv)[0])           # I-13: the order goes with the index
     # FLUSH BEFORE EXEC, OR THE WHOLE POINT OF THIS FILE IS LOST.
     # execve replaces the process image and DISCARDS whatever is still sitting in
     # Python's stdout buffer. On a terminal that is invisible (line-buffered, so it
