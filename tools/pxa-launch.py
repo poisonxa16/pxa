@@ -1583,9 +1583,10 @@ R = {
           "+23.0% code / +4.6% prose; MTP -8.6% at n_max=1 and -29.8% at n_max=2, LEVERS.md:746). "
           "Substituting a lever's meaning is worse than dropping it. Ask for ngram explicitly if "
           "that is what you want."),
- "R-15A": ("REFUSING: --spec mtp:n_max={n}. n_max>=2 is a MEASURED LOSS on both arches: P100 "
-           "54.9 -> 47.4 (-14%, accept 0.42); V100 92.7 vs 94.1 (accept 0.960 -> 0.480) "
-           "(LEVERS.md:300-301). Use n_max=1."),
+ "R-15A": ("REFUSING: --spec mtp:n_max={n} on a sparse MoE file. n_max>=2 is unverified there "
+           "(dense qwen35 is a measured win; the MoE family has not been re-measured since -- "
+           "see docs/LEVERS.md's MTP rows for the last numbers on record, which move as the "
+           "engine does). Use n_max=1, or --accept-unmeasured to run it anyway."),
  "R-15B": ("REFUSING: --spec mtp but this file has NO nextn/mtp tensors. Its "
            "nextn_predict_layers KV says {kvn}; the tensor directory says 0. Two shipped f16 "
            "files carry exactly this lie (PXA-Agent-9B-f16.gguf, PXA-Coder-35B-v2-f16.gguf) - "
@@ -4464,10 +4465,18 @@ def selftest(gpus):
     ok_all &= a4
     print(f"  A4 PXQ1 tensors anywhere -> tier PXQ1 -> R-01 (uniform AND inside a UNIVERSAL "
           f"map): {'PASS' if a4 else 'FAIL ' + str((t_uni, t_pure))}")
-    # A5: a bare 'mtp' spec can never become n_max>=2.
-    a5 = parse_spec("mtp")[1].get("n_max") is None and "mtp:n_max=1" in "".join(src)
+    # A5 (2026-09-09): a bare 'mtp' spec passes through unchanged (no launcher-side n_max
+    #     rewrite survives in source), and the MoE-only refusal guard is wired to BOTH the
+    #     is_moe profile check and the --accept-unmeasured escape every other UNMEASURED gate
+    #     uses -- checked by source shape, the same style A2/A3/A10 already use for logic that
+    #     is not practically exercised through decide()'s synthetic profile sweep.
+    # (needles are built by concatenation so this test's own text cannot satisfy them)
+    a5_passthrough = ('a.spec = ' + '"mtp:n_max=1"') not in "".join(src)
+    a5_gate = (('nmax >= 2 and prof.get("is_moe")' + ' and not a.accept_unmeasured') in "".join(src))
+    a5 = a5_passthrough and a5_gate
     ok_all &= a5
-    print(f"  A5 bare --spec mtp expands to n_max=1 only: {'PASS' if a5 else 'FAIL'}")
+    print(f"  A5 bare --spec mtp passes through; n_max>=2 refused on MoE only, with the "
+          f"--accept-unmeasured escape: {'PASS' if a5 else 'FAIL ' + str((a5_passthrough, a5_gate))}")
     # A6: every row in the recipe table is REACHABLE through recipe_for, and an
     #     off-table topology returns no row at all rather than the nearest one.
     ok_all &= not row_fail and off_ok
@@ -4725,15 +4734,17 @@ def plan_and_build(a, gpus):
     if m == "mtp":
         nmax = int(params.get("n_max", 0) or 0)
         if nmax == 0:
-            # I-8: a bare 'mtp' used to expand to n_max=4,n_min=2 - a MEASURED loss
-            # on both arches, emitted by DEFAULT. It now expands to n_max=1 only.
-            a.spec = "mtp:n_max=1"
-            print("  --spec mtp expanded to mtp:n_max=1. MEASURED: n_max>=2 LOSES on both arches "
-                  "(P100 54.9->47.4 accept 0.42; V100 92.7 vs 94.1 accept 0.960->0.480, "
-                  "LEVERS.md:300-301). The previous version of this file expanded a bare 'mtp' to "
-                  "n_max=4,n_min=2 - a measured loss, by default.")
-            nmax = 1
-        if nmax >= 2:
+            # I-8 (2026-09-09): a bare 'mtp' now passes through to the engine UNCHANGED. It
+            # used to be rewritten here first to n_max=4,n_min=2 (a measured loss, emitted by
+            # default), then to a flat n_max=1 (over-conservative once depth>=2 was fixed on
+            # the dense family) -- both were this launcher pre-empting a decision the engine
+            # itself now makes per architecture. PXA_AUTO on the server prints what it picked.
+            print("  --spec mtp passed through unchanged; the engine's own PXA_AUTO line names "
+                  "the depth/p_min/zero-output-commit it resolved for this file's architecture.")
+        elif nmax >= 2 and prof.get("is_moe") and not a.accept_unmeasured:
+            # R-15A: dense qwen35 at n_max>=2 is now a measured WIN and is not refused here.
+            # The sparse MoE family has not been re-measured since the dense fixes landed, so
+            # it keeps a refusal -- with the escape hatch every other UNMEASURED gate uses.
             plan.refuse("R-15A", code=3, n=nmax)
         if prof.get("mtp_tensors") == 0:
             plan.refuse("R-15B", code=3, kvn=prof.get("mtp_kv"))
@@ -4743,9 +4754,10 @@ def plan_and_build(a, gpus):
                   "PXA_MOE_FASTTG_MAX_NY is left at its shipped 8; =1 with MTP verify measured "
                   "48.1 -> 30.3 on P100 (LEVERS.md:409).")
             if prof.get("is_moe"):
-                print("  MTP on a sparse MoE is a MEASURED LOSS even at n_max=1: -8.6% (n_max=1), "
-                      "-29.8% (n_max=2) despite 0.800 acceptance (LEVERS.md:746). You asked for "
-                      "it; it is emitted; the number is against you.")
+                print("  MTP on a sparse MoE: docs/LEVERS.md's MTP rows are the last measured "
+                      "numbers on record for this architecture and they move as the engine "
+                      "does -- check there rather than trusting a fixed number here. You asked "
+                      "for it (or passed --accept-unmeasured); it is emitted as asked.")
     if prof.get("tier") in NO_CPU_CODEC and a.ngl < 99:
         plan.refuse("R-16", code=3, tier=prof["tier"], ngl=a.ngl)
     if plan.engine == "vllm" and a.cudagraph_mode != "FULL_DECODE_ONLY":
