@@ -218,7 +218,8 @@ importance knapsack for a fixed VRAM budget (`docs/LEVERS.md`, `PXA_PXQ1`/`--pxq
 Against MXFP4 at matched engine and cards: PXQ4 wins dense prefill **+19.2%** and dense decode
 **+6.0%** on 2×P100, and MoE prefill **+18.9%** on 2×V100 (`README.md`, codec-only table). It also
 wins **6.0% lower perplexity** at the same 4.25 bpw file size (6.9704 → 6.5527, paired, same
-bytes). Against ikawrakow's own IQ_K quants, matched size/imatrix/corpus: PXQ wins speed
+bytes). Against ikawrakow's own IQ_K quants, matched size/imatrix/corpus (measured 2026-07-18, while the
+PXQ tiers still consumed an imatrix — they ignore one by default since 2026-08-24): PXQ wins speed
 everywhere — decode **+3–15%**, prefill **+20–28%** — but IQ_K wins fidelity-per-byte at 3-bit and
 4-bit (KLD 0.059 vs 0.076 at 3-bit; 0.028 vs 0.058 at 4-bit); PXQ2 flips that at 2-bit, beating
 IQ2_KS on both speed (**+3–28%**) and fidelity (KLD 0.205 vs 0.284) (`bench/HEAD-TO-HEAD.md`).

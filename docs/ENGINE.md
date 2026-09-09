@@ -344,11 +344,17 @@ time — building on a GPU-less CI host, and leaving the CUDA stub on `LD_LIBRAR
 
 ```bash
 # pure tier:
-./build/bin/llama-quantize --imatrix your.imatrix model-bf16.gguf out-PXQ3.gguf PXQ3
+./build/bin/llama-quantize model-bf16.gguf out-PXQ3.gguf PXQ3
 
 # PXQU (mixed tier, sized to fit one card):
-./build/bin/llama-quantize --imatrix your.imatrix --pxq-universal my-16gb.tiers model-bf16.gguf out-PXQU-16.gguf PXQ_UNIVERSAL
+./build/bin/llama-quantize --pxq-universal my-16gb.tiers model-bf16.gguf out-PXQU-16.gguf PXQ_UNIVERSAL
 ```
+
+No `--imatrix` in either command, deliberately: **the PXQ tiers ignore an importance matrix**
+(since 2026-08-24 — every way of consuming it measured *worse* than not consuming it on PXQ4,
+while the same matrix improved `Q4_K_M`). Pass one anyway and the quantizer says so once and
+records `quantize.imatrix.ignored_by` in the file instead of claiming it was used.
+[`docs/QUANTIZING.md`](QUANTIZING.md) has the measurement and the lab opt-in.
 
 **PXQ now runs on CPU and under partial offload**, dense and MoE files both, `-ngl 0` included.
 This was not true a release ago and the old "aborts" behavior is gone. What's fast versus merely
@@ -359,9 +365,10 @@ correct differs by tier: PXQ4 and PXQ4-HQ get an AVX2 integer dot product built 
 deployment, prefer a PXQ4-family tier if you have the choice. Tier by VRAM for a fully
 GPU-resident deploy: 16 GB → PXQU-16 or PXQ3; 12 GB → PXQU-12; 11 GB (1080 Ti) → PXQ2.
 Recommended: add `--output-tensor-type q8_0`
-(+123 MB, +5.2% P100 decode). Quantizing a merged model: recompute the imatrix **on the merge** —
-imatrix rows are activation statistics of the anchor model, not the weights, so a parent model's
-imatrix is off-distribution exactly on the tensors a merge changed. Full detail, the PXQU tier-map
+(+123 MB, +5.2% P100 decode). Quantizing a merged model **to a stock tier**: recompute the imatrix
+**on the merge** — imatrix rows are activation statistics of the anchor model, not the weights, so
+a parent model's imatrix is off-distribution exactly on the tensors a merge changed. (For a PXQ
+target the question does not arise: the tiers ignore the matrix either way.) Full detail, the PXQU tier-map
 format, and known traps: [`docs/PXQU-CONVERT.md`](PXQU-CONVERT.md), [`docs/QUANTIZING.md`](QUANTIZING.md), [`docs/KNOWN-ISSUES.md`](KNOWN-ISSUES.md).
 
 ## Changelog

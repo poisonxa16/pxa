@@ -95,9 +95,11 @@ from the build tree, point the loader at them:
 export LD_LIBRARY_PATH=/path/to/PXA/build/src:/path/to/PXA/build/ggml/src
 ```
 
-An imatrix is optional for PXQ4. If yours fails to load
-(`load_imatrix: failed reading name for entry N`) the file is unreadable by this
-build — drop the flag and the run still produces a valid artifact.
+Do not pass an imatrix. The PXQ tiers ignore one by default (since 2026-08-24 —
+consuming it measured *worse* than not consuming it on PXQ4), so `--imatrix` here
+buys nothing: the quantizer prints `PXQ tiers: imatrix IGNORED` and records
+`quantize.imatrix.ignored_by` in the file rather than claiming a consumption that
+did not happen. See [`QUANTIZING.md`](QUANTIZING.md) for the detail.
 
 ## Verifying before you spend hours
 

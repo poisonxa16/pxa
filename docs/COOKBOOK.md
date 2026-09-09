@@ -306,9 +306,11 @@ Full raw reps and the arm-by-arm NCCL/GMU ladder: `RELEASE-NOTES-2026-09-02.md`.
 See the README "Quantize your own" section — pure tiers (`PXQ4`, `PXQ3`, `PXQ2`) or a
 mixed-tier PXQU map (`--pxq-universal <map>.tiers`, `docs/PXQU-CONVERT.md`), plus:
 - **`--output-tensor-type q8_0`** (recommended): +5.2% decode on P100 for +123 MB.
-- **Imatrix doctrine:** quantizing a merged model? Recompute the imatrix ON the merge
-  (activation statistics are anchor-specific), full-GPU-resident (the CPU/partial-offload
-  capture path crashes — `docs/KNOWN-ISSUES.md`).
+- **Imatrix doctrine:** the PXQ tiers **ignore** an offered imatrix (since 2026-08-24;
+  consuming it measured worse than not consuming it — `docs/QUANTIZING.md`), so a calibration
+  run buys a PXQ target nothing. For a **stock** target it still pays: quantizing a merged
+  model, recompute the imatrix ON the merge (activation statistics are anchor-specific),
+  full-GPU-resident (the CPU/partial-offload capture path crashes — `docs/KNOWN-ISSUES.md`).
 
 ## Leave PXQ, export and requantize to a stock type
 

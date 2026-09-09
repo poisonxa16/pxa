@@ -262,7 +262,7 @@ Some tradeoffs are required.
  - IQ2_XXS
 
 Notes:
-- The `i` quants are a category, they are not related to imatrix. Use of imatrix is optional (but generally recommend) and is supported by *all quant types* (`legacy`, `k`, `i`, `iqk`) except bitnet.
+- The `i` quants are a category, they are not related to imatrix. Use of imatrix is optional (but generally recommend) and is supported by *all quant types* (`legacy`, `k`, `i`, `iqk`) except bitnet — **and except the PXQ tiers on this engine, which ignore an offered imatrix by default** (`docs/QUANTIZING.md`); a PXQ file records `quantize.imatrix.ignored_by` rather than the usual provenance keys.
 - Look in the logs to see the quant types used by the loaded model:
 ```
 llama_model_loader: - type  f32:  113 tensors

@@ -1,5 +1,11 @@
 # PXQ vs ik IQ_K — matched-size head-to-head (identical weights, imatrix, corpus, reference)
 
+> **Reproduction note (2026-09-08).** Both arms here consumed the same imatrix, which was true of
+> the PXQ tiers when this was measured on 2026-07-18. Since 2026-08-24 the PXQ tiers **ignore** an
+> offered imatrix by default (`docs/QUANTIZING.md`), so rebuilding the PXQ arm today produces a
+> file that never saw the matrix unless the lab opt-in is armed. The incumbents' arm is unchanged.
+> Nothing in the numbers below is restated by this; it says what a rebuild would differ by.
+
 > **2026-07-19 update:** since this document was measured, two recipe/env changes shipped and were
 > verified (median-of-3, same protocol): a **q8_0 output head** (`--output-tensor-type q8_0`,
 > +123 MB) and **`PXA_FUSE_DELTANET=3`**. Together they move PXQU-16 decode **57.2 → 62.4 t/s on

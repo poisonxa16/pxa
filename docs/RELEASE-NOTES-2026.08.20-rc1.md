@@ -182,7 +182,9 @@ Both configurations are gated in CI-equivalent form by the no-ik and AVX-default
 
 ## Not in this RC
 
-- A real imatrix for the shipped PXQ4 (current file has none).
+- A real imatrix for the shipped PXQ4 (current file has none). **Closed 2026-08-24, by measurement
+  rather than by shipping one: the PXQ tiers now ignore an offered imatrix, because every way of
+  consuming it measured worse than not consuming it (`docs/QUANTIZING.md`).**
 - The GET_ROWS quantizer guard.
 - `P100_FP16_GEMM` default-on — gains ~3–4% but fails the quality gate at 94.09%
   same-top-token. Left OFF pending a decision.

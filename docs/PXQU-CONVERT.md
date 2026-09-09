@@ -9,13 +9,16 @@ budget by spending bits where they matter (high-importance experts) and squeezin
 
 ```
 llama-quantize --allow-requantize \
-  --imatrix <model>.imatrix \
   --pxq-universal <map>.tiers \
   <source-q8>.gguf  <out>.gguf  PXQ_UNIVERSAL  <threads>
 ```
 
 - `--pxq-universal <map>.tiers` — path to the tier map (format below).
-- `--imatrix` — importance matrix for the source model; PXQU leans on it to place bits well.
+- **No `--imatrix`.** PXQU is built from the PXQ codecs, and those ignore an importance matrix
+  by default (since 2026-08-24; consuming it measured worse than not consuming it — see
+  [`QUANTIZING.md`](QUANTIZING.md)). Passing one prints `PXQ tiers: imatrix IGNORED` and stamps
+  `quantize.imatrix.ignored_by` into the output. Where an imatrix *does* help a PXQU build is
+  upstream of the quantizer: it is evidence for **you** when you write the tier map below.
 - Source should be a near-lossless **Q8_0** gguf.
 
 > ⚠ **Do not pass `--override-kv <arch>.expert_used_count=int:N` at quantize time.** Earlier
@@ -52,7 +55,8 @@ A tier map is a text file of `#`-commented lines, one `regex=type` rule per expe
   an absolute or relative path is used as-is.
 
 Write one for your own tensor names and VRAM budget: total the per-tensor byte cost at each tier
-(bpw × elements), then spend the budget on the tensors your imatrix says matter most. As reference
+(bpw × elements), then spend the budget on the tensors your imatrix says matter most — that is a
+decision *you* make in the map, not something the quantizer reads out of the matrix. As reference
 points, these are the budget/composition splits behind our published 122B-A5B (48 layers × 256
 experts) builds:
 

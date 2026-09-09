@@ -60,10 +60,9 @@ run stops at the first tensor that has to be converted out of `q8_0`:
 ./llama-quantize --allow-requantize model-q8.gguf model-pxq4.gguf PXQ4 $(nproc)
 ```
 
-For a split GGUF, pass the **first** shard — the rest are found automatically. An
-imatrix is optional for PXQ4; if yours reports
-`load_imatrix: failed reading name for entry N` it is unreadable by this build, and
-dropping the flag still produces a valid artifact.
+For a split GGUF, pass the **first** shard — the rest are found automatically. There is
+no `--imatrix` in that command on purpose: the PXQ tiers ignore an importance matrix
+(see below).
 
 That file runs on the llama.cpp engine as-is. Stop here if that is all you need.
 
@@ -81,11 +80,35 @@ That file runs on the llama.cpp engine as-is. Stop here if that is all you need.
 `PXQ_UNIVERSAL` (PXQU) is a per-tensor mixed-tier mode driven by a tier map you write
 yourself; see [`PXQU-CONVERT.md`](PXQU-CONVERT.md) for the flag and the map format.
 
-An imatrix is optional but helps the low tiers:
+### The imatrix: the PXQ tiers ignore it
+
+Do not spend a calibration run on a PXQ quantize. Since 2026-08-24 every PXQ tier —
+`PXQ1`, `PXQ2`, `PXQ3`, `PXQ4`, `PXQ4-HQ`, `PXQ6` and `PXQ_UNIVERSAL` — **drops an offered
+importance matrix instead of consuming it.** Pass `--imatrix` anyway and the quantizer prints
+
+```
+PXQ tiers: imatrix IGNORED (measured net-negative on the PXQ lattice; PXA_PXQ_IMX=1 to consume it)
+```
+
+once, and writes `quantize.imatrix.ignored_by` into the output file in place of the usual
+`quantize.imatrix.*` provenance keys — so a PXQ artifact can never claim a consumption that did
+not happen. (An auditor reading `quantize.imatrix.n_entries` gets `0`, which is the honest
+answer.)
+
+The reason is measured, not theoretical: on a clean paired A/B, **every** way of consuming the
+matrix made a PXQ4 file *worse* than the same file quantized with no imatrix at all, while the
+same matrix improved `Q4_K_M` from the same source. The PXQ lattice — one fp16 absmax anchor per
+row, a 16-step sub-scale — cannot express per-column importance without clamping the cold columns'
+outliers. `PXA_PXQ_IMX=1` restores the diagonal-weighted-SSE consumption path for lab work; it is
+not a quality setting to reach for. (`src/pxq6-quantize.inc.cpp`, `pxq_imx_optin_enabled` /
+`pxq_imx_gate`; the KV rewrite is in `examples/quantize/quantize.cpp`.)
+
+An imatrix remains correct and worth having for **stock** tiers — including the `Q4_K_M`-style
+requantize after `llama-pxq-export`, which is an ordinary k-quant and consumes it normally:
 
 ```bash
 ./llama-imatrix -m model-q8.gguf -f calibration.txt -o model.imatrix
-./llama-quantize --imatrix model.imatrix model-q8.gguf model-pxq4.gguf PXQ4 $(nproc)
+./llama-quantize --imatrix model.imatrix model-q8.gguf model-q4km.gguf Q4_K_M $(nproc)
 ```
 
 ---

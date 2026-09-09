@@ -64,7 +64,7 @@ main: invalid ftype '--pxq-universal'
 Correct order (flag first, then `in out PXQ_UNIVERSAL`):
 
 ```bash
-llama-quantize --imatrix model.imatrix --pxq-universal my-16gb.tiers \
+llama-quantize --pxq-universal my-16gb.tiers \
   model-bf16.gguf model-PXQU16.gguf PXQ_UNIVERSAL
 ```
 

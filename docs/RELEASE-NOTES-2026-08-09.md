@@ -37,6 +37,12 @@ llama-quantize --imatrix m.imatrix --pxq-universal 16g in.gguf out.gguf PXQ_UNIV
 llama-quantize --imatrix m.imatrix --pxq-universal my-16gb.tiers in.gguf out.gguf PXQ_UNIVERSAL
 ```
 
+> **Note added 2026-09-08:** drop the `--imatrix` from these two lines if you are running them
+> today. Since 2026-08-24 the PXQ tiers ignore an offered importance matrix — consuming it
+> measured worse than not consuming it — so the flag now prints `PXQ tiers: imatrix IGNORED` and
+> changes nothing about the output. `docs/QUANTIZING.md` has the measurement. Only the flag is
+> obsolete; the map-path change this section is about is unaffected.
+
 The mechanism is unchanged and the map format is deliberately trivial — `#`-commented lines of
 `regex=type`, one per expert tensor, types `pxq1|pxq2|pxq3|pxq4|pxq6`. `docs/PXQU-CONVERT.md` now
 documents the format in full, plus the budget/composition splits behind the published 122B-A5B
