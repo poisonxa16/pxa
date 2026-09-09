@@ -32,7 +32,7 @@ if [ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ]; then
 fi
 
 NAME=${NAME:-pxa-flashnext}
-PORT=${PORT:-8261}   # the hive expects Alex (id glimmer) here; see pxa-hive/brains.mjs
+PORT=${PORT:-8261}   # the port the docs and the launcher use for this seat
 CARDS=${CARDS:-0,1,3,5,6}
 MODEL=${MODEL:?set MODEL to the .gguf to serve}
 ENGINE_TREE=${ENGINE_TREE:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}

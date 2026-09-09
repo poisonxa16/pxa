@@ -718,8 +718,8 @@ static __global__ void flash_attn_combine_results(
 // 150000/7 ~= 21.4k keys SERIALLY, and the whole op is one long dependent chain per CTA. The
 // tensor allows up to ntiles_KQ = n_kv/256 = 586 splits.
 //
-// The idea is borrowed (mechanism only, no code) from the ninfer V100 decode launcher, which
-// sizes the split by KEYS PER CTA rather than by wave fill and clamps at the tensor ceiling:
+// The idea: size the split by KEYS PER CTA rather than by wave fill, and clamp at the tensor
+// ceiling. The rule this encodes:
 // past a certain n_kv, extra waves of short CTAs beat fewer waves of long ones, because the
 // per-CTA K/V walk is a latency chain that no amount of wave packing shortens.
 //
