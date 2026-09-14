@@ -26,6 +26,20 @@ and the two CPU unit tests. They run `GATE_STRICT=1`, so a skip that isn't genui
 absence fails the run instead of quietly passing it. If that workflow is red, I don't move on to
 step 2 — there is no GPU arm that fixes a build that fails on CPU.
 
+**The one budget that workflow gets, named rather than implied.** `REPS`, `LOGIT_REPS` and
+`CHAT_REPS` are the script's own defaults there, and `GATE_STRICT` is 1, so the determinism, logit,
+chat and unit arms run in full. The needle arm runs at `NEEDLE_REPS=2` instead of 4: four
+repetitions of a 20,801-token prompt at `NGL=0` on a two-core hosted runner do not fit inside the
+hosted job limit. The needle arm at its full defaults is one of the arms I run by hand on a GPU in
+step 2, so nothing is only ever checked at the reduced count.
+
+**And the thing that says was worth saying.** Until this release that workflow had never once
+completed. Ten runs, every one of them cut off at the 45-minute job timeout inside the needle arm —
+so checks 4b, 5, 5b and 6 had never run in CI at all, and the paragraph above was a description of
+what was supposed to happen rather than of what did. The timeout is now 360 minutes and the needle
+budget is written into the workflow; that is what made this promise checkable instead of merely
+stated.
+
 ## 2. The GPU arms are mine to run, by hand
 
 GitHub's own runners have no GPU, so the arms that need one — the full `REPS=12`/`NEEDLE_REPS=4`

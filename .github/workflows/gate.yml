@@ -55,12 +55,19 @@ jobs:
             https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
           sha256sum /tmp/gate-model/model.gguf
 
+      # NEEDLE_REPS=2 is the ONE budget this runner gets, and it is named here rather than left
+      # implicit. REPS, LOGIT_REPS and CHAT_REPS stay at the script's own defaults and GATE_STRICT
+      # stays 1, so every determinism, logit, chat and unit arm runs in full; only the needle arm
+      # is halved, because four repetitions of a 20,801-token prompt at NGL=0 on a two-core hosted
+      # runner do not fit in the hosted job limit. The needle arm at its full defaults is run by
+      # hand on a GPU before every tag -- see RELEASING.md section 2.
       - name: Run the gate (CPU arms, strict)
         run: |
           MODEL=/tmp/gate-model/model.gguf \
           BIN=build_cpu_avx2_release/bin \
           NGL=0 \
           FA= \
+          NEEDLE_REPS=2 \
           GATE_STRICT=1 \
           ./bench/gate/run-gate.sh
 
