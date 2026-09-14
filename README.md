@@ -3,15 +3,15 @@
 <h1 align="center">PXA — the set-and-forget LLM engine for Pascal and Volta</h1>
 
 <p align="center">
-<a href="https://github.com/poisonxa16/pxa/releases/tag/v2026.09.07-rc1"><b>v2026.09.07-rc1</b></a> ·
+<a href="https://github.com/poisonxa16/pxa/releases/tag/v2026.09.13-rc3"><b>v2026.09.13-rc3</b></a> ·
 <a href="https://discord.gg/EqazvV9tf"><b>Discord</b></a> ·
 <a href="https://huggingface.co/poisonxa"><b>Weights</b></a> ·
-<a href="RELEASE-NOTES-2026-09-07.md"><b>Release notes</b></a> ·
+<a href="RELEASE-NOTES-2026-09-13.md"><b>Release notes</b></a> ·
 <a href="docs/ENGINE.md"><b>Engine reference</b></a>
 </p>
 
 <p align="center">
-<a href="https://github.com/poisonxa16/pxa/releases/tag/v2026.09.07-rc1"><img alt="release" src="https://img.shields.io/badge/release-v2026.09.07--rc1-2a6df4"></a>
+<a href="https://github.com/poisonxa16/pxa/releases/tag/v2026.09.13-rc3"><img alt="release" src="https://img.shields.io/badge/release-v2026.09.13--rc3-2a6df4"></a>
 <a href="LICENSE"><img alt="engine licence" src="https://img.shields.io/badge/engine-MIT-3f8f3f"></a>
 <a href="tools/vllm-pxq4/LICENSE-NOTICE.md"><img alt="vLLM plugin licence" src="https://img.shields.io/badge/vLLM%20plugin-Apache--2.0-3f8f3f"></a>
 <img alt="cards" src="https://img.shields.io/badge/cards-P100%20%7C%20V100%20%7C%201080%20Ti-6b4fbb">
@@ -23,7 +23,8 @@
 <p align="center">
 <b><a href="#5-against-1cat-vllm-on-its-own-hardware">2.3× the long-prompt prefill of the next-best Volta engine — on that engine's own hardware</a></b><br>
 <b><a href="#models-and-cards">A 177B-class MoE with 150k of context, on four Tesla P100s</a></b><br>
-<b><a href="#3-against-our-own-last-public-release">Prefill roughly doubled since my last public release — with zero flags</a></b>
+<b><a href="#3-against-my-last-public-release">Prefill roughly doubled since my last public release — with zero flags</a></b><br>
+<b><a href="#this-releases-head-to-head-table">+18% / +27% / +69% decode against mainline llama.cpp on two V100s — on a bare command line</a></b>
 </p>
 
 ---
@@ -50,13 +51,13 @@ python3 tools/pxa-launch.py     # lists your cards, lists your models, asks noth
 
 ## Try it in five minutes
 
-Download the tarball from [the release](https://github.com/poisonxa16/pxa/releases/tag/v2026.09.07-rc1),
+Download the tarball from [the release](https://github.com/poisonxa16/pxa/releases/tag/v2026.09.13-rc3),
 untar it, get one GGUF, run one command. Model files and their sha256 are listed in
 `bench/fair/weights/MANIFEST.sha256` inside the package; the weights live at
 [huggingface.co/poisonxa](https://huggingface.co/poisonxa).
 
 ```bash
-tar xzf pxa-v2026.09.07-rc1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v2026.09.07-rc1
+tar xzf pxa-v2026.09.13-rc3-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v2026.09.13-rc3
 cat START-HERE.md                    # requirements, model links, three steps
 ./pxa-launch -m /path/to/model.gguf  # picks everything; --explain to decide and run nothing
 ```
@@ -85,6 +86,58 @@ table the launcher chooses from, with the measured result and the source for eve
 Six charts. Each one is generated from a CSV in [`docs/data/`](docs/data), so every bar is checkable;
 the protocol behind each is in [How these numbers were taken](#how-these-numbers-were-taken).
 Dark variants of every chart sit next to these in [`docs/assets/`](docs/assets).
+
+### This release's head-to-head table
+
+The six charts below are the campaign charts, each from the capture its CSV names. This table is
+**this release's own head-to-head**, cell for cell from
+[`bench/LEADERBOARD.md`](bench/LEADERBOARD.md); the rows and their captures are in
+[`release-ab-2026-09-13.csv`](docs/data/release-ab-2026-09-13.csv).
+
+Stock Qwen3.8-27B on all three sides — this engine on the stock PXQ4 (`11d6dd2a`), mainline
+`llama.cpp` and upstream `ik_llama.cpp` on the stock `UD-Q4_K_S` (`b3853896`) — both competitors at
+their **current heads** and armed at their own best, this engine on the **bare command line**, every
+file on NVMe, same client, same bracket. Speed in t/s.
+
+**Two Tesla V100 PCIe 16 GB (no NVLink, both cards on PCIe x4)**
+
+| class | this engine | mainline | upstream ik | vs best rival |
+|---|---|---|---|---|
+| prefill, 512 tok | **777.42** | 656.54 | 384.38 | +18.4% |
+| prefill, 3,121 tok | **1,332.21** | 891.87 | 447.29 | +49.4% |
+| prefill, 8,192 tok | **1,013.01** | 982.01 | 421.63 | +3.2% |
+| prefill, 20,801 tok | **946.96** | 929.03 | 371.82 | +1.9% |
+| decode, control — a synthetic repetitive prompt, the speculation ceiling | **147.89** | 125.07 | 54.39 | +18.2% |
+| decode, repetition — a real repetitive workload | **76.65** | 60.54 | 52.43 | +26.6% |
+| decode, prose — free generation | **141.02** | 83.27 | 43.64 | +69.4% |
+
+At **two concurrent clients** on the same pair, summed over both slots in one valid bracket: control
+**222.10** against mainline's 178.64 (+24.3%), repetition **144.17** against 115.55 (+24.8%), prose
+**184.33** against 77.38 (+138.2%).
+
+**Four Tesla P100 PCIe 16 GB**
+
+| class | this engine | mainline | upstream ik | vs best rival |
+|---|---|---|---|---|
+| prefill, 3,121 tok | **470.54** | 212.83 | 114.78 | +121.1% |
+| prefill, 20,801 tok | **420.23** | 266.28 | 74.72 | +57.8% |
+| decode, control — the speculation ceiling | **95.57** | 46.17 | 18.83 | +107.0% |
+| decode, prose | **39.26** | 14.33 | 14.06 | +174.0% |
+| decode, repetition | **21.25** | 19.54 | 18.43 | +8.8% |
+
+**And the row that goes the other way.** Run this engine on the competitors' own `UD-Q4_K_S` file on
+those four P100s and **mainline's prefill is faster** — 198.52 against 212.83 at 3,121 tokens and
+172.63 against 266.28 at 20,801, i.e. mainline by **7.2%** and **54.2%**. That is the only arm that
+isolates the *engine* from the codec, and on this card set it reverses the sign: the Pascal prefill
+lead above is the codec carrying an engine deficit, not the reverse. It is on the board in full
+rather than left out, and the same arm has not yet run on the V100 pair, so the pair's prefill rows
+are codec **and** engine together.
+
+**One thing the decode rows are not.** Speculative output is **not byte-reproducible at temperature
+0** — on any engine, not just this one — so the speculated rows are gated on fidelity (top-1
+agreement, KLD, logit spread) rather than on a checksum, and the drafter is verified not to change
+the output: the greedy hash of every speculated class matches its own unspeculated arm in the same
+bracket. Byte-reproducibility gates are kept for `--spec-type none`, where this engine is exact.
 
 ### 1. Against mainline llama.cpp and upstream ik_llama.cpp
 
@@ -140,8 +193,8 @@ Ubuntu 22.04 image; the **glibc floor measured from the shipped binaries is 2.34
 container with no `python3`, `curl`, `gcc`, `cmake` or CUDA toolkit present.
 
 ```bash
-tar xzf pxa-v2026.09.07-rc1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
-cd pxa-v2026.09.07-rc1
+tar xzf pxa-v2026.09.13-rc3-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+cd pxa-v2026.09.13-rc3
 cat START-HERE.md          # requirements, model links with hashes, three steps
 ./run-server.sh -m your-model.gguf -ngl 99 -c 8192
 ```
@@ -154,6 +207,9 @@ docker run -d --name pxa --gpus '"device=0"' -p 8080:8080 \
   ghcr.io/poisonxa16/pxa:v2026.09.07-rc1 \
   -m /models/your-model.gguf -ngl 99 -c 8192
 ```
+
+The published container image is still the `v2026.09.07-rc1` build; **this release ships as the
+tarball**, and the tarball is what the release gate below was run against.
 
 The vLLM sidecar images are `ghcr.io/poisonxa16/pxa-vllm:sm70` (Volta, with the speculative
 stack above) and `:sm60` (Pascal). See [`docs/VLLM.md`](docs/VLLM.md).
@@ -233,7 +289,9 @@ with no batch flags and no environment at all:
 
 **Ten levers were measured this cycle and ship OFF**, each one written up with the number that
 killed it, so nobody spends a session rediscovering them — see
-[Documented negatives](RELEASE-NOTES-2026-09-07.md#documented-negatives).
+[Levers whose default changed in this release](RELEASE-NOTES-2026-09-13.md#levers-whose-default-changed-in-this-release)
+and [`docs/lab/LEVERS.md`](docs/lab/LEVERS.md), which carries every lever, its default, the `getenv`
+site the default is decided at, the window its number came from and its gate class.
 
 **The release gate is 11/11** on both a hybrid MoE and a stock dense GGUF, including a
 token-0 logit-reproducibility arm at `np=1` and `np=2`. Determinism is gated, not asserted — and
@@ -312,7 +370,7 @@ Stated as plainly as the rest, so nobody is surprised:
   Single-stream output on the fast path is deterministic (12/12, one hash), and vLLM itself
   offers batch invariance only on `cc >= 9.0`.
 
-Full list: [Known limits](RELEASE-NOTES-2026-09-07.md#known-limits) and
+Full list: [Known behaviour, known issues, and what this release does not claim](RELEASE-NOTES-2026-09-13.md#known-behaviour-known-issues-and-what-this-release-does-not-claim) and
 [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md).
 
 ---
@@ -371,6 +429,7 @@ measured*, never *zero*.
 
 | chart | data | protocol |
 |---|---|---|
+| this release's head-to-head table | [`release-ab-2026-09-13.csv`](docs/data/release-ab-2026-09-13.csv) | [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md); one bracket per capture with a no-drafter arm at each end, a window whose two bracket readings differ by more than 1.50% is void; competitors at their current heads and at their own best, this engine bare |
 | us-vs-them | [`chart-data-2026-09-02.csv`](docs/data/chart-data-2026-09-02.csv) | [`bench/fair-battle.md`](bench/fair-battle.md), temp 0, median of 7, 1 warmup discarded, unique prompt per repeat, same session/weights for every arm |
 | gtx1080ti-vs-ik | [`gtx1080ti-vs-ik-2026-09-07.csv`](docs/data/gtx1080ti-vs-ik-2026-09-07.csv) | n=3, bare command line for PXA; upstream from its own published-tier session |
 | before-after | [`release-ab-2026-09-07.csv`](docs/data/release-ab-2026-09-07.csv) | both arms same compiler, same image, same architectures, same container, alternating in one lock hold; prefill n=3, decode n=12 |
@@ -394,10 +453,10 @@ upstream engine the container image carries as its second binary
 ```
 
 The server prints the `-b`/`-ub` it chose and why. If a number in
-[the release notes](RELEASE-NOTES-2026-09-07.md) does not reproduce from the same command on
+[the release notes](RELEASE-NOTES-2026-09-13.md) does not reproduce from the same command on
 the same file, that is a bug report — [Discord](https://discord.gg/EqazvV9tf) or an issue here.
 
-**Longer form:** [`RELEASE-NOTES-2026-09-07.md`](RELEASE-NOTES-2026-09-07.md) (the full release,
+**Longer form:** [`RELEASE-NOTES-2026-09-13.md`](RELEASE-NOTES-2026-09-13.md) (the full release,
 every table with its caveats), [`bench/fair-battle.md`](bench/fair-battle.md) (the comparison
 protocol), [`docs/ENGINE.md`](docs/ENGINE.md) (the engine reference and the codec-vs-MXFP4
 cell-by-cell, including the cell PXA loses), [`CHANGELOG.md`](CHANGELOG.md).

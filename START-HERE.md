@@ -1,5 +1,5 @@
 <!-- generated from scripts/START-HERE.md.in by scripts/gen-start-here.sh; edit the .in -->
-# START HERE — pxa v2026.09.07-rc1
+# START HERE — pxa v2026.09.13-rc3
 
 I wrote this page for one reader: you have a single **Tesla P100 16 GB**, a working NVIDIA
 driver, and either this tarball or the container image. Nothing is built, nothing is compiled,
@@ -46,8 +46,8 @@ Binaries carry an RPATH to ./lib; you do not need to set LD_LIBRARY_PATH by hand
 ## Step 1 — unpack
 
 ```bash
-tar xzf pxa-v2026.09.07-rc1-linux-x86_64-cuda12.8-*.tar.gz
-cd pxa-v2026.09.07-rc1
+tar xzf pxa-v2026.09.13-rc3-linux-x86_64-cuda12.8-*.tar.gz
+cd pxa-v2026.09.13-rc3
 ```
 
 ## Step 2 — get the model, and check what you got
@@ -199,7 +199,12 @@ PXA_AUTO: spec arch=qwen35moe -> --spec-type ngram-mod:n_max=4,n_min=2 (measured
 PXA_AUTO: spec DECLINED -- only dev0 free <N> MiB, model share <N> MiB (uniform split) -> headroom <N> MiB, under the 2048 MiB a draft context needs (override with --spec-type, or PXA_AUTO_SPEC=1 to force)
 ```
 
-Either is a healthy boot. On a card with nothing else on it, expect the first: a 14 GB file on a
+That first line is the architecture row for a sparse `qwen35moe` file, which keeps its short
+match-gated table on every card family. On a dense file such as Qwen3.8-27B the same slot prints the
+release's fleet default instead — `the n-gram stage ALONE, chain = ngram (--spec-type
+ngram:n_max=64,n_min=2,ngram_size_n=24 ...)` — followed by a `recurrent checkpoint budget` line that
+says how long a draft this card can afford. Either is a healthy boot. On a card with nothing else on
+it, expect the first: a 14 GB file on a
 16 GB card leaves a little over 2 GiB, so the drafter usually arms, a `PXA_SPEC_RELAXED:` line
 follows it, and completion responses then carry `draft_n` / `draft_n_accepted` in their
 `timings`. It drafts only when it can match an n-gram, so it costs nothing when it cannot.
@@ -263,7 +268,7 @@ docker run -d --name pxa \
     --gpus '"device=0"' \
     -p 8080:8080 \
     -v /path/to/your/models:/models:ro \
-    ghcr.io/poisonxa16/pxa:v2026.09.07-rc1 \
+    ghcr.io/poisonxa16/pxa:v2026.09.13-rc3 \
     -m /models/fusion2-35b-U16-q8head.gguf \
     -ngl 99 -c 8192 -fa on
 ```

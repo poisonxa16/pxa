@@ -6,7 +6,72 @@ history. The engine is the same tree; only the project name changed. **PXQ** rem
 the codec — the quantizer and its GGUF tensor types — and nothing about the codec, its file
 format or its tensor types changed with the rename.
 
-Full notes for the current release: [`RELEASE-NOTES-2026-09-07.md`](RELEASE-NOTES-2026-09-07.md).
+Full notes for the current release: [`RELEASE-NOTES-2026-09-13.md`](RELEASE-NOTES-2026-09-13.md).
+
+---
+
+## v2026.09.13-rc3 — 2026-09-14 (prerelease)
+
+Full notes: [`RELEASE-NOTES-2026-09-13.md`](RELEASE-NOTES-2026-09-13.md). Every figure below is a cell
+on [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md) of this release; nothing that is not on that page
+appears here. `v2026.09.09-rc3` is the last tag anyone outside this project has seen, so this entry
+covers everything since then — including the `v2026.09.11-rc3` candidate, which was cut and gated but
+never published.
+
+**The decode default changed on every card family, and it is the headline.** On every card from Pascal
+up, a bare command line now arms a **long n-gram stage on its own** — `n_max=64`, a two-token minimum,
+a 24-token lookback, never wiped between steps — instead of the n-gram → trained-head cascade. No flag,
+no environment variable.
+
+- **Two V100 PCIe 16 GB cards, against mainline `llama.cpp` at its current head running its own best
+  cascade, in one bracket at `REPS 6`**: decode **+18.2%** on a synthetic repetitive prompt, **+26.6%**
+  on a real repetitive workload, **+69.4%** on free prose. Prefill on the same pair leads by
+  **+18.4% / +49.4% / +3.2% / +1.9%** at 512 / 3,121 / 8,192 / 20,801 prompt tokens.
+- **At two concurrent clients on that pair it leads all three classes as well** — **+24.3%**,
+  **+24.8%**, **+138.2%** — after the fix below. The earlier two-client row is withdrawn on the board
+  rather than quietly replaced.
+- **Four Tesla P100s**: the table stage alone reads **+107%** on the repetitive control class against
+  mainline's best measured cascade; prefill leads **+121.1%** at 3,121 and **+57.8%** at 20,801 tokens.
+- **The drafter is not changing the output, only the rate**: the greedy hash of every speculated class
+  matches its own unspeculated arm in the same bracket.
+- `PXA_SPEC_AUTO_CHAIN=cascade` puts the old chain back.
+
+**Two defects had to be fixed before that default could ship.** A capped response was losing the last
+verified tokens of its final step — an early stop, not a wrong token, invisible at draft depth 1 and
+obvious at depth 64. And `slots?action=erase` did not reset the drafter's persistent n-gram table, so a
+reused slot kept predicting out of the previous conversation.
+
+**Two concurrent clients on 16 GB cards.** The shipped default could not serve a second slot on a 16 GB
+pair at all: the checkpoint budget priced one slot's snapshot rows while the allocator claimed a set per
+slot. The budget now prices every slot, keeps a **256 MiB** margin instead of 1024, and holds a quarter
+of the compute-buffer copy it used to hold whole, with a 512 MiB floor on the reserve. Two-slot draft
+length went 13 → 23 tokens.
+
+**Models.**
+
+- **Dense Gemma 4 is supported** — 12B / 31B / E2B / E4B. The architecture guard is now shape-aware and
+  refuses only the 128-expert MoE, which still has a heap defect. Six converter defects were fixed on
+  the way: Google's released dense weights could not be converted at all before. Its eight 512-wide
+  attention layers now run flash attention **on the card** instead of falling to the CPU backend — the
+  largest single speed change in this release on any model.
+- **GLM-5.3-Flash runs, as a beta.** Coherent on six cards and on all seven, with its limits written
+  down rather than discovered later (one slot per server among them). It is the first release in which
+  it runs at all, and no optimisation work has been done on it.
+- **Qwen3.8-Flash-Next loads again.** A per-layer hparam array was sized against the wrong block count.
+
+**What this release does not claim.** Run this engine on mainline's own `UD-Q4_K_S` file on four P100s
+and **mainline's prefill is faster** — 7.2% at 3,121 tokens and 54.2% at 20,801. That equal-codec arm is
+on the board in full rather than left out: the Pascal prefill lead is the codec carrying an engine
+deficit, not the reverse. And **speculative output is not byte-reproducible at temperature 0** on any
+engine, so speculative configurations are gated on fidelity — top-1 agreement, KLD, logit spread — and
+byte-reproducibility gates are kept for `--spec-type none`, where this engine is exact.
+
+**Packaging.** `bench/gate/LAST-RUN.md` is no longer shipped inside the tarball — it is a record of a
+gate run on the build machine — and the packager now refuses to tar a package that leaks build-machine
+paths at all.
+
+Artifacts: a self-contained Linux x86_64 tarball (CUDA 12.8, `sm_60;61;70`, proven booting in a bare
+`ubuntu:22.04` container with no toolkit, no `python3` and no `curl`).
 
 ---
 

@@ -1,0 +1,24 @@
+# This release's head-to-head. Every row is a cell on bench/LEADERBOARD.md of v2026.09.13-rc3; the
+# capture name is the bracket the cell was taken in. Three engines, stock Qwen3.8-27B on all three
+# sides: this engine on the stock PXQ4 (md5 11d6dd2a), mainline llama.cpp at its current head
+# (4a899373) and upstream ik_llama.cpp at its current head (3bb386eb) on the stock UD-Q4_K_S
+# (b3853896), every file on NVMe, same client, same bracket. Competitors are armed at their own best,
+# this engine on the bare command line. A blank means not measured, never zero. t/s.
+cardset,cards,class,pxa,mainline,upstream_ik,delta_vs_best_rival_pct,capture,notes
+v100,2x Tesla V100-PCIE-16GB (2;4),prefill 512 tok,777.42,656.54,384.38,18.4,lb-fresh-pair,"REPS 5, drift 0.52% against a 1.50% band, -ngl 99 -c 32768 -np 1 -t 16 -fa on -ts 1,1"
+v100,2x Tesla V100-PCIE-16GB (2;4),prefill 3121 tok,1332.21,891.87,447.29,49.4,lb-fresh-pair,
+v100,2x Tesla V100-PCIE-16GB (2;4),prefill 8192 tok,1013.01,982.01,421.63,3.2,lb-fresh-pair,
+v100,2x Tesla V100-PCIE-16GB (2;4),prefill 20801 tok,946.96,929.03,371.82,1.9,lb-fresh-pair,
+v100,2x Tesla V100-PCIE-16GB (2;4),decode control (synthetic repetitive; the speculation ceiling),147.89,125.07,54.39,18.2,pair-settle,"REPS 6, np 1, drift -0.63%; this engine bare (the new n-gram default arming itself), mainline at its own ngram-mod+MTP cascade, ik at its explicit mtp:n_max=3 arm; cold drafter state before every class cell"
+v100,2x Tesla V100-PCIE-16GB (2;4),decode repetition (a real repetitive workload),76.65,60.54,52.43,26.6,pair-settle,
+v100,2x Tesla V100-PCIE-16GB (2;4),decode prose (free generation),141.02,83.27,43.64,69.4,pair-settle,
+v100,2x Tesla V100-PCIE-16GB (2;4),decode control at 2 concurrent clients,222.10,178.64,,24.3,two-client,"sums over both slots in one valid bracket; the earlier two-client row is withdrawn on the board"
+v100,2x Tesla V100-PCIE-16GB (2;4),decode repetition at 2 concurrent clients,144.17,115.55,,24.8,two-client,
+v100,2x Tesla V100-PCIE-16GB (2;4),decode prose at 2 concurrent clients,184.33,77.38,,138.2,two-client,
+p100,4x Tesla P100-PCIE-16GB (0;1;5;6),prefill 3121 tok,470.54,212.83,114.78,121.1,lb4-quad-clean,"drift 0.53%; this engine's plain arm at -b 2048 -ub 256, its fastest valid configuration for the class"
+p100,4x Tesla P100-PCIE-16GB (0;1;5;6),prefill 20801 tok,420.23,266.28,74.72,57.8,lb4-quad-clean,
+p100,4x Tesla P100-PCIE-16GB (0;1;5;6),decode control (synthetic repetitive; the speculation ceiling),95.57,46.17,18.83,107.0,quad-default-pxq4,"cross-capture and labelled as such on the board: this engine's cell from quad-default-pxq4 (REPS 3, bracket valid), the competitor columns from lb-fresh-quad / lb-shake1. Mainline is quoted at its best measured cascade (46.17); against its current head the same cell is +166%"
+p100,4x Tesla P100-PCIE-16GB (0;1;5;6),decode prose (free generation),39.26,14.33,14.06,174.0,quadrep2-w1,"REPS 6, one continuous open/close bracket, this engine's bare-boot arm against mainline armed at its own best"
+p100,4x Tesla P100-PCIE-16GB (0;1;5;6),decode repetition (a real repetitive workload),21.25,19.54,18.43,8.8,quadrep2-w1,"REPS 6, same bracket; the earlier REPS 3 reading of 17.60 vs 19.62 is superseded. ik's column is from its own separate capture"
+p100,4x Tesla P100-PCIE-16GB (0;1;5;6),EQUAL CODEC prefill 3121 tok (this engine on the competitors' own UD-Q4_K_S),198.52,212.83,,,lb4-quad-clean,"the decomposition row: MAINLINE IS 7.2% FASTER here. Printed rather than left out - the Pascal prefill lead above is the codec carrying an engine deficit, not the reverse"
+p100,4x Tesla P100-PCIE-16GB (0;1;5;6),EQUAL CODEC prefill 20801 tok (this engine on the competitors' own UD-Q4_K_S),172.63,266.28,,,lb4-quad-clean,"MAINLINE IS 54.2% FASTER here"
