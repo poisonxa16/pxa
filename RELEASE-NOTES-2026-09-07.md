@@ -5,8 +5,7 @@ output on every card since `v2026.09.02`, a vLLM sidecar rebased onto a new upst
 ported speculative-decode engine that is **present but default-off and experimental in this
 build**, two new quant tiers in the vLLM plugin, and the first **measured** speculative
 rows — which were taken on the vLLM sidecar, not on this engine binary. Every number below
-traces to a named capture in the measurement ledger, and the harness, the sample count and
-the reproduce command are given alongside each table. Where a window did not run at all, the section says so and says what it
+comes from a recorded run. Where a window did not run at all, the section says so and says what it
 would have measured. See [How much faster than the last public
 release](#how-much-faster-than-the-last-public-release) and [Speculative decoding,
 measured](#speculative-decoding-measured-on-the-vllm-sidecar).
@@ -77,6 +76,7 @@ who reads no documentation gets.
 | 2x Tesla V100-PCIE-16GB | `Qwable-27B-PXQ4core` | **1,369** t/s | **1,300** t/s | **39.5** t/s | vs mainline llama.cpp 940 / 1,129; vs upstream ik decode 37.4 |
 | 2x Tesla P100-PCIE-16GB | `Qwable-27B-PXQ4core` | **337.6** t/s | **315.3** t/s | **18.1** t/s | vs mainline llama.cpp 209 / 255 (decode not captured); vs upstream ik 134.5 / 84.0 / 14.3 |
 | 1x GTX 1080 Ti 11 GB | `PXA-Fusion2-35B` PXQ2 | **1,363.5** t/s (cold, `-fa off`) | — | **65.3** t/s (chat decode) / 36.73 (cold decode) | vs upstream ik IQ2_KS 1,132 (cold) / 740 (chat prefill) / 53.3 (chat decode) |
+
 
 ![PXA against mainline llama.cpp and upstream ik, per card set](docs/assets/us-vs-them-2026-09-03-dark.png)
 
@@ -158,6 +158,8 @@ That is the DeltaNet out-gate fusion race this release root-caused and closed
 reproducing live on the last public release, on a card the fix was never demonstrated on.
 Six different answers to the same question, from the release people are running today.
 
+<!-- NOTE: the AFTER arm is the rc1 tarball binary, commit cd681b35. This tag adds documentation and citation commits only -- `git diff --stat cd681b35..v2026.09.07-rc1` touches no compiled source, only .md files and the launcher's citation strings -- so the AFTER rows are this tag's rows. Only the build banner differs (the build number and commit are injected from the tag). -->
+
 ## Engine
 
 ### Correctness: the DeltaNet out-gate fusion race, root-caused and closed
@@ -219,7 +221,6 @@ three unit tests (`test-pxq-cpu-dot`, `test-kv-seq-shadow`, `test-narrow-kernel-
 
 - **`Qwable-27B-PXQ4core`** (the campaign hybrid model), V100 pair: **PASS=11 FAIL=0
   SKIP=0**, including the logit-reproducibility arm at both `np` levels.
-  
 - **`Qwen3.8-27B-UD-Q4_K_S`** (a stock dense GGUF, no PXQ conversion), same binary:
   first attempt was `PASS=9 FAIL=8`, and every failure was the identical truncated
   needle-recall output — the gate's 32-token answer budget was too small for a
@@ -228,10 +229,8 @@ three unit tests (`test-pxq-cpu-dot`, `test-kv-seq-shadow`, `test-narrow-kernel-
   proof it was budget, not the engine. Re-run with `N_PREDICT=256`, nothing else
   changed: **PASS=11 FAIL=0**. The gate's default answer budget is raised 32 → 256
   accordingly.
-  
 - **Re-gate on the renamed, final release binary**: **PASS=11 FAIL=0 SKIP=0** on the
   V100 pair with no environment set.
-  
 
 The 12/12-at-`np=1`-AND-`np=2` rule from the previous release stands: a lever that
 touches the recurrent path does not ship default-on until it clears both.
@@ -266,6 +265,7 @@ environment at all**, against the same binary driven by hand-tuned flags:
 | previous automatic choice | 377.9 t/s | 284.9 t/s | 23.62 t/s |
 | hand-tuned flags (12 levers + explicit `-b`/`-ub`) | 485.7 t/s | 344.1 t/s | 23.74 t/s |
 | **this release, automatic** | **487.62 t/s** | **376.71 t/s** | **24.57 t/s** |
+
 
 That is +29% prefill @3k and +32% @20k over the old automatic choice, and it lands on top
 of what twelve hand-set environment levers used to buy — so the levers, and the hand
@@ -334,13 +334,11 @@ token soup from the first character; the documented mitigation was `CAR` off, at
 
 - **Gate:** 20/20 byte-identical completions, CAR on vs CAR off, same first token in all
   20; both arms pass the short-prefill probe.
-  
 - **Speed**, 35B MoE (`coder35-moe-pxq4-m1`), P100 pair, TP=2, median of 3: CAR on beats
   CAR off by **+28.8%** single-stream decode (29.80 vs 23.13 t/s) and **+6.6%** aggregate
   @8 (97.81 vs 91.73 t/s); both arms 20/20 byte-identical. The two mandatory mitigations
   this project carried for a year — CAR off, PP=2 — are retired; the fastest correct
   aggregate on record for this cell.
-  
 
 The exact upstream change that fixed it has not been bisected — the whole v1.5.0 range
 landed at once — but the leading candidate is the dtype guard that keeps a non-float
@@ -379,6 +377,7 @@ same harness, reproduced twice:
 | shipped `sm70` image | 1,010.0 t/s | 987.3 t/s | 52.41 | 189.2 |
 | candidate `sm70-v15`, eager | 905.0 t/s (**-10.4%**) | 857.2 t/s (**-13.2%**) | 52.66 (+0.5%) | 189.1 (flat) |
 
+
 An eager arm is a measurement, not a serving configuration: the seat runs compiled. Every
 attempt to boot the candidate compiled failed with `Constraints violated
 (inputs_embeds.size()[0], positions.size()[1])`, which read like a defect in the rebase.
@@ -393,6 +392,7 @@ Compiled, at the seat's own `--block-size 256`, the rebase is at parity:
 |---|---|---|---|---|
 | shipped `sm70` image | 1,010.0 t/s | 987.3 t/s | 49.71 | 178.33 |
 | `sm70-v15c`, compiled, `--block-size 256` | 1,002.85 t/s (-0.7%) | **993.84 t/s (+0.7%)** | 49.73 | 178.23 |
+
 
 Parity on rate is the weaker half of the claim. On the determinism gate the two images
 produce the **byte-identical** 256-token greedy continuation at `-np 1` (`sha
@@ -440,6 +440,7 @@ is its fp16-backbone control arm. Resident-weight totals, from the converter's o
 | PXQ3 | m2 | **15.98 GiB** |
 | PXQ3 | m2f | 17.64 GiB |
 
+
 A 16 GiB P100 or V100 has roughly 0.8 GiB spoken for by the CUDA context before a weight
 loads. **PXQ2 runs at TP=1 on one card** with `m2` (about 3 GiB left for KV). **PXQ3 does
 not fit one card in either policy — it runs at TP=2.** This is arithmetic, not a
@@ -478,6 +479,7 @@ sides, same cards, same 35B MoE PXQ4 checkpoint:
 |---|---|---|---|
 | llama engine | 901.87 t/s | 52.52 t/s | 99.88 t/s |
 | vLLM sidecar, TP=2 | 342.13 t/s | 32.86 t/s | 93.64 t/s |
+
 
 An earlier internal figure of **105.9 t/s** for the llama arm circulated during this
 cycle. It was measured with the engine's automatic n-gram speculation on, against a
@@ -526,6 +528,7 @@ DFlash2 drafter quantised to PXQ4, TP2, `--max-model-len 2048`, fp16 KV, single 
 | DFlash2 `k=5`, bf16 drafter | 51.87 t/s | 1.10x |
 | **DFlash2 `k=7`, PXQ4 drafter (incl. `fc`)** | **82.18** t/s | **1.75x** |
 | DFlash2 `k=7`, aggregate at 8 concurrent | 86.23 t/s | — |
+
 
 ![DFlash2 on our own V100 pair](docs/assets/home-spec-ladder-2026-09-07-dark.png)
 
@@ -636,6 +639,7 @@ parallelism at small per-rank panel counts, not an architecture and not the fabr
 persistent-CTA or multi-layer-batched variant is the next lever, and it is not in this
 release.
 
+
 ### The P100 verify floor: why the llama engine does not speculate here yet
 
 Measured rather than assumed, on the 2x P100 pair with the shipped binary
@@ -647,8 +651,8 @@ floor is the ~250 ms fp32 weight materialisation. Break-even for DFlash on this 
 would need an acceptance length above 1.75 at `k=1` and above 5.2 at `k=7`.
 
 **So Pascal speculation waits on an `sm_60` token-folded verify kernel, and that kernel is
-not in this build.** The measurement table and the kernel plan are written up internally; the
-llama-engine DFlash port stays default-off here for exactly this reason.
+not in this build.** The measurement table and the kernel plan are not published with this
+release; the llama-engine DFlash port stays default-off here for exactly this reason.
 
 ### Flash-Next under vLLM on Pascal: it works, and it is still not the fast path
 
@@ -675,7 +679,7 @@ Stated as plainly as the rest, so nobody is surprised:
 ## DFlash
 
 DFlash and DFlash2 speculative decoding are hand-ported into the llama-engine line from
-**`ik_llama.cpp @3c58ae37`** (three commits on a dedicated port branch: the port itself,
+**`ik_llama.cpp @3c58ae37`** (three commits: the port itself,
 a fix for two dropped-branch acceptance bugs, and two converter fixes). Two port bugs
 were making acceptance look like chance before the fix: `llm_build_context::init()`
 unconditionally cleared the token/position graph inputs, orphaning the draft graph's own
@@ -696,6 +700,7 @@ when pointed at our fine-tune, and the reason is lineage, not quantization:
 | `Qwable-27B-PXQ4core` (our fine-tune) | z-lab (stock-matched) | 4.68% (11/235) |
 | `Qwable MXFP4-lite` (our fine-tune) | z-lab (stock-matched), ik reference | 5.31% (12/226) |
 | `Qwable-27B-PXQ4core` | Heretic (lineage-matched) | **13.06%** (2.8x the z-lab drafter) |
+
 
 The 0.6-point gap between the PXQ4 and MXFP4 rows is inside noise — the collapse is
 lineage, not the quantizer — and a drafter distilled against the model actually served
@@ -727,16 +732,16 @@ incumbent path) and all are slower or a net loss on the shapes measured.
 
 | lever | env | result |
 |---|---|---|
-| Native Volta register-direct PXQ4 GEMM (V70) | `PXA_PXQ_GEMM_V70` | Correct (bit-identical decode, 0.0011 ppl delta), but **40–52% slower** than dequant+cuBLAS. 12.5–18.75% occupancy on Volta by construction (no `cp.async` on sm_70).  |
-| PXQ4 dp4a MMQ prefill tile | `PXA_PXQ4_MMQ` | Correct (176 checks, 0 failures), **-49%** on the one shape it claims (fused gate+up). A V100's dp4a rate is half its HMMA rate, so a dp4a GEMM starts at half the tensor-core ceiling.  |
-| Wide-store dequant kernel (K8) | `PXA_PXQ_DQ_WIDE` | Bit-exact, but **~2x slower** (294–322 vs 604–644 GB/s) — the incumbent kernel already runs at ~70% of HBM peak, so there was no gap to close.  |
-| Side-stream dequant prefetch arena (K8-C) | `PXA_DQC_MB` | Correct (499/512 rounds served, bit-identical), but **does not pay for itself** on this cell — a kernel already near peak bandwidth has little slack for overlap to exploit. Stays at its default of 0.  |
-| Cross-ubatch device pipelining | `PXA_SCHED_PIPELINE` | Correctness clean; **-6.3%/-4.3%** at `-ub 2048` (wash at `-ub 512`). The delta-net recurrent carry serializes each layer's output before the next layer's input, so a second copy slot has no independent work to overlap.  |
-| Async input staging | `PXA_SCHED_ASYNC_INPUTS` | A second, independent source of the same fusion-race corruption signature (a submitted graph outliving its call) **and** an **18% performance loss** on its own at `n_copies=1` (trips the scheduler's own full-drain defence). Ships off on both counts.  |
-| Deeper scheduler copy depth (n_copies=4) | `PXA_PIPELINE_PP_COPIES=4` | Correct — exactly as correct as `n_copies=2` — but **not the lever**: mainline's remaining prefill margin does not come from copy depth.  |
-| Explicit `-ts` layer-count rebalance | `PXA_LAYER_SPLIT` / `-ts 45,55` | Byte-identical output, but a **monotone loss** at 20,801 tokens (-4.4%, -7.1%, -12.7% as the rebalance deepens) even though summed device-busy rises — the rebalance adds device work at the tighter card faster than it recovers from better balance.  |
-| Pascal fused norm + SwiGLU pack (vLLM sidecar) | `PXA_OPS_FUSED=gemma,silu` | Correct and **+13.4% decode / +3.3% agg8** where it runs (fusion2-35b-pxq2-m2: decode1 36.49 -> 41.38, 20/20 byte-identical vs control at np1 and np2, decisive top-token 7/7), but it **crashes the worker on long prompts**: on the shipping coder35 m3 checkpoint a ~6.5k-token request returns HTTP 500 and drops the connection, while the same request on the same boot with `PXA_OPS_FUSED=0` answers correctly. Ships **off**, available opt-in, default pending a long-context fix. 
-| DeltaNet out-gate fusion bit (bit 1) | `PXA_FUSE_DELTANET=55` (bit 1 on) | The race described under [Correctness](#correctness-the-deltanet-out-gate-fusion-race-root-caused-and-closed), now guarded and safe to enable, but left off by default (mask 53) because the decode win it buys (1.6–3.7 t/s) is not worth re-litigating every release, and dropping it costs nothing measured.  |
+| Native Volta register-direct PXQ4 GEMM (V70) | `PXA_PXQ_GEMM_V70` | Correct (bit-identical decode, 0.0011 ppl delta), but **40–52% slower** than dequant+cuBLAS. 12.5–18.75% occupancy on Volta by construction (no `cp.async` on sm_70). |
+| PXQ4 dp4a MMQ prefill tile | `PXA_PXQ4_MMQ` | Correct (176 checks, 0 failures), **-49%** on the one shape it claims (fused gate+up). A V100's dp4a rate is half its HMMA rate, so a dp4a GEMM starts at half the tensor-core ceiling. |
+| Wide-store dequant kernel (K8) | `PXA_PXQ_DQ_WIDE` | Bit-exact, but **~2x slower** (294–322 vs 604–644 GB/s) — the incumbent kernel already runs at ~70% of HBM peak, so there was no gap to close. |
+| Side-stream dequant prefetch arena (K8-C) | `PXA_DQC_MB` | Correct (499/512 rounds served, bit-identical), but **does not pay for itself** on this cell — a kernel already near peak bandwidth has little slack for overlap to exploit. Stays at its default of 0. |
+| Cross-ubatch device pipelining | `PXA_SCHED_PIPELINE` | Correctness clean; **-6.3%/-4.3%** at `-ub 2048` (wash at `-ub 512`). The delta-net recurrent carry serializes each layer's output before the next layer's input, so a second copy slot has no independent work to overlap. |
+| Async input staging | `PXA_SCHED_ASYNC_INPUTS` | A second, independent source of the same fusion-race corruption signature (a submitted graph outliving its call) **and** an **18% performance loss** on its own at `n_copies=1` (trips the scheduler's own full-drain defence). Ships off on both counts. |
+| Deeper scheduler copy depth (n_copies=4) | `PXA_PIPELINE_PP_COPIES=4` | Correct — exactly as correct as `n_copies=2` — but **not the lever**: mainline's remaining prefill margin does not come from copy depth. |
+| Explicit `-ts` layer-count rebalance | `PXA_LAYER_SPLIT` / `-ts 45,55` | Byte-identical output, but a **monotone loss** at 20,801 tokens (-4.4%, -7.1%, -12.7% as the rebalance deepens) even though summed device-busy rises — the rebalance adds device work at the tighter card faster than it recovers from better balance. |
+| Pascal fused norm + SwiGLU pack (vLLM sidecar) | `PXA_OPS_FUSED=gemma,silu` | Correct and **+13.4% decode / +3.3% agg8** where it runs (fusion2-35b-pxq2-m2: decode1 36.49 -> 41.38, 20/20 byte-identical vs control at np1 and np2, decisive top-token 7/7), but it **crashes the worker on long prompts**: on the shipping coder35 m3 checkpoint a ~6.5k-token request returns HTTP 500 and drops the connection, while the same request on the same boot with `PXA_OPS_FUSED=0` answers correctly. Ships **off**, available opt-in, default pending a long-context fix.
+| DeltaNet out-gate fusion bit (bit 1) | `PXA_FUSE_DELTANET=55` (bit 1 on) | The race described under [Correctness](#correctness-the-deltanet-out-gate-fusion-race-root-caused-and-closed), now guarded and safe to enable, but left off by default (mask 53) because the decode win it buys (1.6–3.7 t/s) is not worth re-litigating every release, and dropping it costs nothing measured. |
 
 ## Known limits
 
@@ -753,7 +758,7 @@ incumbent path) and all are slower or a net loss on the shapes measured.
   and vLLM requires them resident (`--cpu-offload-gb` would stream weights over the bus
   every layer and be far slower than the seat it is meant to beat). Flash-Next stays on
   the llama.cpp seat, which is also where it is fastest.
-  
+  <!-- verbatim paragraph -->
 - **PXQ3 needs two cards.** By the arithmetic under [PXQ2/PXQ3 tiers](#pxq2--pxq3-tiers-in-the-vllm-sidecar),
   a PXQ3-tier 35B MoE does not fit one 16 GiB card in either converter policy; it serves
   at `TP=2`. PXQ2 fits one card.
@@ -764,7 +769,6 @@ incumbent path) and all are slower or a net loss on the shapes measured.
   above — it is a structural floor of the current chunk size, not the old defect
   returning, and getting below it needs a smaller `-ub` at deep fill or chunk
   pre-emption, not a scheduler fix.
-  
 - **DFlash on the vLLM sidecar leaves little room for context on a 16 GB card.** A
   drafter plus a 27B dense target together leave about 5.8k tokens of usable context at
   `--max-model-len 4096` on a 16 GB V100. This release's DFlash-on-vLLM window is
@@ -772,14 +776,12 @@ incumbent path) and all are slower or a net loss on the shapes measured.
   realistic context length; the llama-engine DFlash port (above) does not have this
   constraint, because it does not require the drafter and target to be resident under
   vLLM's KV/activation budget at once.
-  
 - **Batched output on Volta is not byte-invariant.** At `-np 2` the vLLM seat produces
   one of two greedy continuations depending on how requests batch. This is a property of
   vLLM on `cc 7.0` — batch invariance is offered only on `cc >= 9.0` — not of the rebase:
   the previously-shipped image splits into the same two shas in the same proportions.
   Single-stream output is deterministic (12/12, one sha). Anything that needs
   reproducible bytes should be served at `-np 1`.
-  
 
 ## Community and support
 

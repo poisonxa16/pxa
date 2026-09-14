@@ -1,11 +1,11 @@
-# The PXQ4 vLLM backend
+# The PXQ vLLM backend (PXQ2 / PXQ3 / PXQ4)
 
 PXA Network ships **two** runtimes for one quantization family.
 
 | runtime | what it is | hardware | PXQ tiers |
 |---|---|---|---|
 | `pxa` (this repo) | the GGUF-native llama.cpp engine | sm_60 Pascal, sm_61, sm_70 Volta, and newer | **all of them** |
-| `vllm-pxq4` (`tools/vllm-pxq4/`) | a vLLM quantization plugin | sm_70 Volta, sm_60 Pascal | **PXQ4 only** |
+| `vllm-pxq4` (`tools/vllm-pxq4/`) | a vLLM quantization plugin | sm_70 Volta, sm_60 Pascal | **PXQ2, PXQ3, PXQ4** — see the [truth table](#2-quant-tier-support--the-truth-table) |
 
 This document covers the second one: what it is, what it will and will not load, how
 to convert a model for it, how to start a server, which knobs actually move the
@@ -56,32 +56,259 @@ queue behind one another — which is the whole shape of the crossover in §3.
 
 ---
 
-## 2. Quant tier support — the matrix
+## 2. Quant tier support — the truth table
 
-**The vLLM backend implements three tiers: PXQ2, PXQ3 and PXQ4.** Everything else is a
-llama.cpp job.
+This table is the only place in this document that says which tier runs where. If anything
+else on this page disagrees with it, the table is right and the prose is a bug — tell me.
 
-> **PXQ2/PXQ3 GPU gate status, `v2026.09.05`: not gated on GPU.** Correctness of the
-> tiers themselves is CPU-gated green (`gpu_selftest.py` bit-exact against a host oracle;
-> the converter and TP-shard-placement gates pass on CPU), and the code ships. The on-GPU
-> window — same-top-token vs the llama engine (70/70 target), needle recall, and speed on
-> one P100 and one V100 — **did not run before the tag**: the tier arms were served at
-> `--max-model-len 8192` while the benchmark prompt is ~20k tokens, so the cells returned
-> HTTP 400 rather than numbers, and the re-run did not get a window. The tiers are
-> therefore available but **not a gated claim** in this release; the window is the first
-> item of the next tier release. Raise `--max-model-len` before benchmarking them.
-> 
-> 
+| tier | bpw | slab bytes | `pxa` (llama.cpp) | vLLM: **converts** | vLLM: **serves** | vLLM GPU gate, this release |
+|---|---|---|---|---|---|---|
+| **PXQ4** | 4.27 | 1088 | yes | yes | yes | **gated** — it is what the V100 seat serves today (2× V100, TP2) |
+| **PXQ3** | 3.27 | 832 | yes | yes | yes | <!--PXQ3-GATE-->**boots and serves**; tracks this engine's own `llama-server` on the same GGUF at **92.5% first-token / 87.5% exact-32** agreement over 40 greedy ~1k-token prompts (the three first-token disagreements are formatting forks on open-ended prompts, and the two engines then agree exactly on 35 of 40 32-token continuations). The `p2c` option measures 70.0% / 37.5% against the same reference. |
+| **PXQ2** | 2.27 | 576 | yes | yes | yes | <!--PXQ2-GATE-->**boots and serves**; tracks this engine's own `llama-server` on the same GGUF at **97.5% first-token / 92.5% exact-32** agreement over 40 greedy ~1k-token prompts — a single first-token disagreement in forty. The `p2c` option measures 82.5% / 45.0% against the same reference. |
+| PXQ4-HQ | 4.52 | 1152 | yes | no | no | — no vLLM kernel (bs8 sub-scales) |
+| PXQ6 | 5.27 | 1344 | yes | no | no | — no vLLM kernel |
+| PXQ1 | 1.26 | 320 | yes (GPU only) | no | no | — no dense path and no CPU codec |
+| PXQ_UNIVERSAL | mixed | — | yes | yes, when every tier in the file is a converting tier above | same | inherits the rows above |
+| *a file quantized before rc3* | — | — | yes | yes, **with `--books-from-defaults`** | same | the pre-rc3 quantizer stamped book/sub for the requested tier only, so a multi-tier file arrives with one tier's tables missing. Either convert with that flag (it records the assumption in the checkpoint) or re-stamp the file — see `QUANTIZING.md`. |
 
-| tier | bits | slab bytes | `pxa` (llama.cpp) | `vllm-pxq` | note |
-|---|---|---|---|---|---|
-| **PXQ4** | 4 | 1088 | yes | **yes** | the original vLLM tier; its kernels are unchanged |
-| **PXQ3** | 3 | 832 | yes | **yes** | bit-plane codes; added 2026-09-05 |
-| **PXQ2** | 2 | 576 | yes | **yes** | added 2026-09-05 |
-| PXQ4-HQ | 4 | 1152 | yes | no | bs8 sub-scales; no vLLM kernel |
-| PXQ6 | 6 | 1088 | yes | no | GPU-only; no CPU codec |
-| PXQ1 | 1 | 320 | yes (GPU only) | no | no dense path and no CPU codec |
-| PXQ_UNIVERSAL | mixed | — | yes | see below | a per-tensor mix; servable only if every tier it uses is |
+The three column verbs mean three different things, and mixing them up is how the earlier
+version of this page ended up contradicting itself:
+
+- **converts** — `python -m gguf_to_vllm.convert` decodes that ggml type and writes a
+  checkpoint. A type this converter cannot decode is a hard error at the header, never a
+  skipped tensor.
+- **serves** — the sidecar allocates that tier's slab stride, uploads that tier's book, and
+  dispatches its `pxq2_*` / `pxq3_*` / `pxq4_*` ops. `PXQ4LinearMethod` and `PXQ4MoEMethod`
+  both resolve a per-module tier; the shipped `libpxq_sm70_*.so` / `libpxq_sm60_*.so`
+  carry all three tiers' ops.
+- **GPU-gated** — a *claim* I have measured on hardware for this release: the same-top-token
+  gate against the llama-server reference on the same file, a greedy identity check, and a
+  speed number. Serving correctly and being gated are not the same sentence, and this page
+  will not print the second one for a tier that has only earned the first.
+
+> **PXQ3 / PXQ2 status, this release (measured 2026-09-09).** Both convert, both load, and
+> both serve on the sidecar's tiered path, on two 16 GB V100s at TP=2 with no CPU offload,
+> at a 65,536-token context. Both were compared against **this engine's own `llama-server`
+> reading the same GGUF on the same cards**, 40 greedy prompts of ~1k tokens: PXQ2's default
+> policy agrees on 39 of 40 first tokens and 37 of 40 full 32-token continuations; PXQ3's
+> agrees on 37 of 40 and 35 of 40, its three disagreements being formatting forks at token 1
+> on open-ended prompts. Speculative decoding on the PXQ2 path is **exactly** lossless —
+> 40/40 identical against its own non-speculative twin. What that is *not* is the campaign's
+> pre-registered determinism gate, which is a different instrument and has not been run on
+> these tiers; the numbers above are what was measured, and this page will not call them
+> anything more than that.
+
+**Measured, 2026-09-09, image `pxa-vllm:sm70-v2026.09.09-rc3`, two 16 GB V100s at TP=2,
+`--dtype float16 --attention-backend FLASH_ATTN_V100 --gpu-memory-utilization 0.88
+--max-model-len 65536 --max-num-seqs 1`, no CPU offload.** Decode is a 256-token forced-greedy
+median of 3; prefill is `prompt_tokens / wall seconds` at ~3.7k and ~22.9k tokens; the probe
+is 20 short-answer factual questions.
+
+| checkpoint | quantize profile | policy | bytes | KV cache at MML 65536 | concurrency | decode | prefill 3.7k / 22.9k | greedy identity | probe | agreement with its own GGUF |
+|---|---|---|---:|---:|---:|---:|---|---|---|---|
+| Qwen3.8-27B **PXQ3** | `uniform` | `p2a` (default) | 17,821,604,360 | 117,964 tok | 1.80x | **31.34 tok/s** | 901 / 968 tok/s | 3/3 | 18/20 | 92.5% / 87.5% |
+| Qwen3.8-27B **PXQ3** | `uniform` | `p2c` + `--fuse-uniform-pxq4` | 16,097,161,904 | 174,034 tok | 2.66x | **32.47 tok/s** | 899 / 963 tok/s | 3/3 | — | 70.0% / 37.5% |
+| Qwen3.8-27B **PXQ3** | `balanced` | `p2a` (default) | 18,576,579,376 | 102,673 tok | 1.57x | **36.29 tok/s** | 899.9 / 965.2 tok/s | 3/3 | 19/20 | 97.5% / 80.0% |
+| Qwen3.8-27B **PXQ2** | `uniform` | `p2a` (default) | 14,927,534,712 | 161,655 tok | 2.47x | **36.91 tok/s** | — | 3/3 | 17/20 | 97.5% / 92.5% |
+| Qwen3.8-27B **PXQ2** | `uniform` | `p2c` + `--fuse-uniform-pxq4` | 13,203,092,400 | 217,725 tok | 3.32x | **38.32 tok/s** | 892 / 962 tok/s | 3/3 | 17/20 | 82.5% / 45.0% |
+| Qwen3.8-27B **PXQ2** | `balanced` | `p2a` (default) | 15,745,423,800 | 149,276 tok | 2.28x | **35.70 tok/s** | 904.5 / 969.7 tok/s | 3/3 | 20/20 | 95.0% / 75.0% |
+| Qwen3.8-27B **PXQ2** | `attn4` | `p2a` (default) | 16,437,483,840 | 136,897 tok | 2.09x | **41.23 tok/s** | 901.4 / 966.0 tok/s | 3/3 | 20/20 | **100.0% / 92.5%** |
+
+The last column is first-token / exact-32 agreement against this engine's own `llama-server`
+reading **the same GGUF on the same two cards**, 40 greedy prompts of ~1k tokens. It measures
+the *engine pair*, not the file — see [the cross-engine caveat](#what-the-agreement-column-is-and-is-not)
+before comparing it to the campaign's 98% number.
+
+Prefill is flat across every tier, which is what a GEMM-bound prefill should do; decode is
+where the tier shows. Every arm was coherent and produced three byte-identical 256-token
+forced-greedy continuations.
+
+### The promoted profiles, and the rule that decides their decode speed
+
+`--pxq-policy` (see `QUANTIZING.md`) lets the level name the tier of the **bulk** — the FFN on
+a dense model — and buys the attention block up from there: `balanced` gives attention one
+notch and `attn_output` two, `attn4` puts the whole attention block at `pxq4`. Nothing
+promotes past `pxq4`. All three files above were converted with the **default** `p2a` policy,
+no flags; the converter passes an already-panelled tensor through at its own tier, so a
+promoted profile's served fidelity is the GGUF's own.
+
+They cost bytes. Every promoted profile is bigger than the uniform file at the same level:
+
+| level | profile | GGUF bytes | `p2a` checkpoint bytes | over uniform |
+|---|---|---:|---:|---:|
+| PXQ2 | `uniform` | 9,590,025,664 | 14,927,534,712 | — |
+| PXQ2 | `balanced` | 10,549,473,472 | 15,745,423,800 | +5.5% |
+| PXQ2 | `attn4` | 11,375,226,848 | 16,437,483,840 | +10.1% |
+| PXQ3 | `uniform` | 12,655,144,672 | 17,821,604,360 | — |
+| PXQ3 | `balanced` | 13,547,745,280 | 18,576,579,376 | +4.2% |
+
+At level `pxq3` and above `balanced` and `attn4` **converge** — `balanced`'s +1 and +2 both
+land on the `pxq4` cap — so there is one file, not two. `pxa-pxq-policy.h` says so, and the
+converted checkpoints prove it: PXQ3-`balanced` resolves to 192 bulk modules at `pxq3` and 160
+attention modules at `pxq4`, which is exactly the `attn4` shape.
+
+**And here is the part that surprised me: the bigger file is sometimes the faster one.**
+
+| level | profile | decode, vLLM | decode, `llama-server` | where attention lands |
+|---|---|---:|---:|---|
+| PXQ2 | `uniform` | 36.91 tok/s | 32.49 tok/s | `pxq2` |
+| PXQ2 | `balanced` | 35.70 tok/s | 30.84 tok/s | mostly `pxq3` |
+| PXQ2 | `attn4` | **41.23 tok/s** | **35.84 tok/s** | all `pxq4` |
+| PXQ3 | `uniform` | 31.34 tok/s | 26.74 tok/s | `pxq3` |
+| PXQ3 | `balanced` | **36.29 tok/s** | **30.56 tok/s** | all `pxq4` (the cap) |
+
+`llama-server` numbers are the same files on the same two cards at `-ngl 99 -c 16384 -np 1`,
+so the two columns are separate engines, not separate machines.
+
+The mechanism is in this codec, not in either engine's scheduler: **the fused single-kernel
+decode path (`pxa_pxq_mmvq_type`) admits `pxq4` and `pxq4hq` only.** So the tier the attention
+block lands on decides whether attention decodes on the fused path or on the per-operand
+divert — and that, not the bit width, is what moves the number. `attn4` puts attention on the
+fused path and gains 11.7% on vLLM and 10.3% on `llama-server` while being 10.1% *larger*;
+`balanced` at PXQ2 lands attention on `pxq3`, which the fused path does not admit, and *loses*
+3.3% and 5.1% for +5.5% of bytes. At PXQ3, `balanced` lands on the cap and gains 15.8% and
+14.3%. Two engines, five files, same sign every time.
+
+The PXQ3 row was a **pre-registered prediction**: before that arm ran, the rule said PXQ3-
+`balanced` had to decode *above* uniform PXQ3's 31.34 tok/s because its attention sits on the
+cap. It measured 36.29. The prediction had a way to be wrong and was not.
+
+**Scope, stated so nobody over-reads it.** This is measured on **sm_70, dense, both engines**.
+Whether it holds on sm_60 or on a mixture-of-experts model is **not measured** — the fused
+path's admission rule is the same code everywhere, but the balance of time between attention
+and the rest is not, and a rule that pays on a dense 27B may not pay where routed experts
+dominate. Until that runs, `uniform` remains the default and the profiles are options.
+
+<a id="what-the-agreement-column-is-and-is-not"></a>
+
+### What the agreement column is, and is not
+
+The campaign's **≥98% same-top-token bar** was pre-registered for a *same-engine*
+arm-versus-control, where the only difference is the lever under test and bit-identity is a
+reasonable expectation. The agreement column in the table above is **not that measurement**.
+It compares two independent implementations of the same codec — this sidecar and
+`llama-server` — with different kernels, different reduction orders and different attention
+paths, so **100% is not the expected value even for a perfect port**, and a number below 98%
+is not a failing gate. The numbers are printed with the bar named so the comparison is on the
+page rather than left for a reader to make wrongly; no pass/fail verdict is claimed on those
+cells, and nothing is rounded up. The campaign's 12/12 determinism gate is a different
+instrument again and **has not been run** on these tiers.
+
+Where the disagreements actually are is worth knowing, because the count alone misleads. On
+PXQ2-`balanced`, the worst of the five at 95.0% / 75.0%, both first-token forks are formatting:
+one engine opens an *empty* `<think></think>` block and the other starts the prose directly;
+the other fork is a bold markdown heading against "Here is a comprehensive tutorial…". The ten
+exact-32 misses diverge on synonym choices deep in the continuation — "shared state" against
+"shared decision" at word 24, "tutorial on" against "tutorial about" at word 5, "students."
+against "students:" — and the mean common word-prefix is **20.2 words of ~24, identical to
+uniform PXQ2's 20.2**. Not one of the ten is a factual divergence.
+
+### The fidelity question, closed by a per-token measurement
+
+The obvious way to ask whether a promoted profile is a *better file* — rather than a
+differently-shaped one — is to score every file against a common high-precision anchor on one
+engine, with the tier as the only variable. That was tried first as a 40-prompt, 32-token-
+continuation ladder: `llama-server` on the gated **PXQ4** file, same cards, same flags, every
+other file scored against it.
+
+| file scored against the PXQ4 anchor | first-token | exact-32 | mean common prefix |
+|---|---:|---:|---:|
+| PXQ2 `uniform` | 17/40 = 42.5% | 0/40 = 0.0% | 0.4 w |
+| PXQ3 `uniform` | 15/40 = 37.5% | 0/40 = 0.0% | 1.6 w |
+| PXQ2 `balanced` | 7/40 = 17.5% | 0/40 = 0.0% | 1.1 w |
+| PXQ2 `attn4` | 6/40 = 15.0% | 0/40 = 0.0% | 1.4 w |
+| PXQ3 `balanced` | 16/40 = 40.0% | 0/40 = 0.0% | 3.1 w |
+
+**Those numbers decided nothing, and this doc did not pretend otherwise.** Two reasons, either
+sufficient. First, exact-32 is **0.0% for all five files, including both uniform controls** —
+that is a floor, not a result. Thirty-two tokens of free continuation on an open-ended essay
+prompt is saturated the moment the two files are different *models* rather than the same model
+on two engines, and a criterion that requires beating a control on a metric pinned at zero for
+everyone cannot be satisfied by anything. Second, the first-token column ranks PXQ2 `uniform`
+(42.5%) **above** PXQ3 `uniform` (37.5%) — a strictly less precise tier scoring closer to PXQ4
+than a strictly more precise one, which cannot be true of a distance-to-truth measure. What
+the column ranks is stylistic collision: whether a file happens to open with a markdown
+heading or with prose. Three correct answers in three formats score as two disagreements. That
+instrument was retired rather than read as a verdict.
+
+What it left behind was a 20-question short-answer probe — a probe, not a gate, and twenty
+questions is a small instrument — run on both engines against the same questions:
+
+| file | probe, vLLM | probe, `llama-server` |
+|---|---:|---:|
+| PXQ2 `uniform` | 17/20 | 17/20 |
+| PXQ2 `balanced` | 20/20 | 20/20 |
+| PXQ2 `attn4` | 20/20 | 20/20 |
+| PXQ3 `uniform` | 18/20 | 18/20 |
+| PXQ3 `balanced` | 19/20 | 19/20 |
+| PXQ4 (the anchor itself) | — | 18/20 |
+
+Every promoted profile scored at or above its uniform control on both engines, and two of them
+above the PXQ4 anchor — suggestive, and still not a gate.
+
+**The measurement that actually closes the question is per-token:** KL divergence against a
+fixed PXQ4 anchor over a fixed corpus (wikitext-2-raw test split, `-c 2048`, the first 30
+chunks, identical `-ngl 99 -fa -t 16` for every file, no speculation), computed by
+`llama-perplexity --kl-divergence`. The anchor file writes its own logits once
+(`--kl-divergence-base`); every other file reads them back and is scored against that fixed
+reference, making the tier the only variable — what the 40-prompt ladder meant to do and
+could not.
+
+| file | PPL(Q) | PPL(Q)/PPL(base) | mean KLD | 99% KLD | mean Δp | Same-top-p |
+|---|---:|---:|---:|---:|---:|---:|
+| PXQ4 (anchor) | 6.2718 ± 0.0863 | — | — | — | — | — |
+| PXQ2 `uniform` | 30.0105 ± 0.5777 | 4.785x | 1.6538 | 7.8545 | -17.607% | 48.827% |
+| PXQ2 `balanced` | 9.8742 ± 0.1576 | 1.574x | 0.5177 | 3.4751 | -5.253% | 70.609% |
+| PXQ2 `attn4` | 9.3479 ± 0.1474 | 1.490x | 0.4527 | 3.4542 | -4.509% | 72.799% |
+| PXQ3 `uniform` | 6.5884 ± 0.0922 | 1.050x | 0.1056 | 1.0628 | -0.711% | 86.585% |
+| PXQ3 `balanced` | 6.6151 ± 0.0942 | 1.055x | 0.0758 | 0.7477 | -0.103% | 88.833% |
+
+**Measured 2026-09-09, wikitext-2-raw, 30 chunks of 2048 tokens.** PPL(base) is the anchor's own
+6.2718 in every row. Effect size shrinks sharply from PXQ2 to PXQ3: uniform PXQ2 runs at 4.8x
+the anchor's perplexity with under half its top-token agreement; both PXQ3 arms stay within 5.5%
+of the anchor's perplexity and above 86% Same-top-p.
+
+**The pre-registered rule:** a promoted profile is *recommended* over its uniform base tier iff
+its mean KLD to the anchor is lower than uniform's **and** its Same-top-p is not lower;
+otherwise it is a *measured option*. Applied:
+
+- PXQ2 `balanced` vs PXQ2 `uniform`: 0.5177 < 1.6538 and 70.609% > 48.827% → **recommended**
+- PXQ2 `attn4` vs PXQ2 `uniform`: 0.4527 < 1.6538 and 72.799% > 48.827% → **recommended** (and
+  beats `balanced` on both axes)
+- PXQ3 `balanced` vs PXQ3 `uniform`: 0.0758 < 0.1056 and 88.833% > 86.585% → **recommended**
+
+All three promoted profiles clear the bar. Because `attn4` wins its PXQ2 comparison, it becomes
+the quantizer's default policy for `pxq2` bases — `pxq3` and above already converge `balanced`
+and `attn4` to the same shape, so a `pxq3` base gets the same default. That is a one-line change
+in `src/pxa-pxq-policy.h`, pending the next rebuild; today's binaries still emit `uniform` by
+default until it ships.
+
+**The limitation, printed plainly:** the anchor here is PXQ4, itself a quantized file, so this
+measures closeness *to the PXQ4 file*, not to BF16. The unquantized 54 GB checkpoint does not
+fit the pair; that comparison waits for the next RC.
+
+**Speculation at 64k is a tier question, and here is the sum to do for your own cards.**
+On this model 65,536 tokens of KV costs **2.81 GiB**, so the plain `p2a` arm's 117,964 KV
+tokens is about 5.06 GiB. Adding the 1.3 GB DFlash drafter leaves **0.06 GiB** — the drafter
+costs about **5 GiB** of budget, not 1.3, because it brings its own KV and workspace. Measured:
+DFlash `k=7` on PXQ3 `p2a` at MML 65536 **does not fit** (the engine refuses at the KV check
+with exactly that arithmetic). Measured again at `k=3`: also refuses, and the engine
+volunteers the ceiling — *"Based on the available memory, the estimated maximum model length
+is 24800."* Two points give the cost model: the drafter itself is about **3.8 GiB** and each
+extra draft token about **0.3 GiB** on top, while the KV *requirement* moves with `k` too
+(2.48 GiB at k=3 against 2.81 GiB at k=7 for the same 65,536 tokens), because speculation
+holds slots for the draft tokens it is about to verify. So on two 16 GB V100s: **PXQ3 gives
+64k plain at 31.34 tok/s, and DFlash on PXQ3 gives about 24.8k of context at k=3.** Take your
+card's free budget after weights, allow 2.81 GiB per 64k of context, and subtract ~3.8 GiB
+plus ~0.3 GiB per draft token if you want a drafter — that is the whole sum, and it answers
+the question before you boot anything.
+
+**And the tier changes the answer.** The same `k=7` drafter against the **PXQ2** checkpoint at
+the same MML 65536 **fits**: `GPU KV cache size: 79,176 tokens`, 1.21x concurrency at
+65,536 tokens per request. So on two 16 GB V100s: PXQ3 gives 64k of context plain, and 64k
+*with* speculation is a PXQ2 configuration.
+
 
 The three served tiers are **one layout with three code widths**. All of them use 64-row
 panels, a 128 B fp16 row-anchor header per panel, 32-column slabs, a 64 B sub-scale SoA per
@@ -104,9 +331,10 @@ again against the checkpoint's own tensors at load.
 
 Two further properties that matter operationally:
 
-1. **The refusal is clean and early.** A non-PXQ4 tier is rejected at the conversion
-   gate, not at load time and never at generation time. There is no silent
-   wrong-output path on vLLM: you either get a converted checkpoint or an error.
+1. **The refusal is clean and early.** A tier this converter cannot decode is rejected at
+   the header, before a byte of tensor data is read — not at load time and never at
+   generation time. There is no silent wrong-output path on vLLM: you either get a
+   converted checkpoint or an error that names the tier and the engine that does serve it.
 2. **Mixed tiers ACROSS modules are supported; mixed tiers INSIDE one parameter are not.**
    This is the rule that makes a real artifact servable, so it is worth stating precisely.
    A vLLM *parameter* has one slab stride and one book, so everything that ends up inside one
@@ -208,7 +436,7 @@ allocator before a weight is loaded. So:
 ### A worked example of the tier limit: Qwen3.8 Flash-Next
 
 Flash-Next is the model most often asked about here, so the answer is written down
-rather than rediscovered. Written up the same day the PXQ2/PXQ3 tiers above landed, and quoted verbatim:
+rather than rediscovered. Posted the same day the PXQ2/PXQ3 tiers above landed:
 
 > Qwen3.8 Flash-Next is not served by the vLLM line in this release, and the reason is
 > the checkpoint, not the engine. The engine side is ready: the fork registers
@@ -422,7 +650,6 @@ filename proves nothing; that gate is why the arch claim in this table is a fact
 > sha pair at `-np 2`, logit spread 0.0 on both). `ghcr.io/poisonxa16/pxa-vllm:sm70` is
 > therefore the v1.5.0 image (`sm70-v15c`), served with `--block-size 256`. The
 > compile-safe guard shipped in the sidecar is hardening; it is not what fixed this.
-> 
 
 ### Picking the kernel library
 
@@ -504,6 +731,8 @@ python -m gguf_to_vllm.convert \
 | `--out` | output directory. Required unless `--dry-run`. |
 | `--policy` | which modules are served as PXQ4 — see below. Default `p1`. |
 | `--encoder` | path to `pxq4_encode.so`; required by the `p2*` policies, which re-encode tensors that are not PXQ4 on disk. |
+| `--fuse-uniform-pxq4` | re-encode a native pxq2/pxq3 shard of a **fused** parameter up to pxq4 when its sibling shards cannot be that tier, instead of dropping the whole parameter to fp16. Costs one extra quantization pass on the shards it promotes; every one is named and its `wrel` printed. Off by default. |
+| `--books-from-defaults` | substitute the engine's compiled-in v1 tables when the GGUF records no `pxa.<tier>.book` / `pxa.<tier>.sub` for a tier it contains. **Every PXQ file published before rc3 needs this** — that quantizer stamped only the *requested* tier's tables, so a file that also emitted a second tier arrives undocumented. Correct only for a file from the stock quantizer with no `PXA_PXQ*_BOOK` / `PXA_PXQ2_V3` / `PXA_PXQ_CEIL_V2` override; the run names every tier it assumed and stamps `assumed_books` into the output's `config.json`. Off by default: without it the conversion refuses. |
 | `--shard-size-gb` | safetensors shard size. Default 4.0. |
 | `--dry-run` | plan the entire conversion from the GGUF header alone and run every structural check, without reading tensor data. |
 | `--verify` / `--no-verify` | round-trip every native PXQ4 tensor and compare **bytes**. On by default. Leave it on. |
@@ -512,17 +741,52 @@ python -m gguf_to_vllm.convert \
 **Run `--dry-run` first.** It exercises everything except the byte-writing and will tell
 you, in seconds and off the header alone, whether the artifact is convertible.
 
+**Where the dev tooling looks for models.** The converter above takes `--gguf`/`--ref-hf`/
+`--out` explicitly, but the rest of this backend's tooling — the parity harness and its
+`extract*.py` fixture pullers, `dump_one_panel.py`, `pxq4_validate.py`, and the `bench/` and
+`build*.sh` scripts under `tools/vllm-pxq4/` and `pxa/pxq4/` — resolve real paths through one
+environment variable, `PXA_MODELS_DIR` (the same convention `tools/pxa-launch.py` uses),
+defaulting to `./models` when unset. Point it at wherever you keep GGUFs, reference
+checkpoints and build scratch space (e.g. `export PXA_MODELS_DIR=/data/models`) and every
+`$PXA_MODELS_DIR/...` example path in this backend's scripts and docstrings becomes real. The
+docker-based build and bench scripts additionally bind-mount `PXA_MODELS_DIR` into the
+container, so set it to an absolute path before using those.
+
 ### Policies
 
-| policy | serves as PXQ4 | needs `--encoder` |
-|---|---|---|
-| `p1` | what the dense artifact already carries as PXQ4 on disk | no |
-| `p2a` | p1 + the GDN output projection (`ssm_out`, MXFP4 on disk → re-encoded) | yes |
-| `p2c` | p2a + a uniformly PXQ4 fused QKV (re-encodes k/v) | yes |
-| `m1` | the MoE policy: expert stacks, shared experts, `o_proj`, fused GDN in-projection | no |
-| `m2` | the **tiered** MoE policy: routed experts stay at their on-disk tier (PXQ2 / PXQ3 / PXQ4) as a byte move; the MXFP4 backbone — shared experts, `o_proj`, fused GDN in-projection, `ssm_out` — is re-encoded to PXQ4 | yes |
-| `m2f` | `m2` with the backbone left fp16. No encoder, no new numerics; the **control arm** for the same-top-token gate, and roughly 1.7 GiB larger | no |
+The **fidelity** column is the one to read first. A policy that only moves bytes cannot change
+what the model says; a policy that re-encodes can, and by how much is a measurement, not an
+opinion.
+
+| policy | serves as PXQ4 | needs `--encoder` | fidelity vs the GGUF |
+|---|---|---|---|
+| `p1` | what the dense artifact already carries as PXQ4 on disk | no | **exact** — byte move for what it serves, exact dequant for the rest |
+| `p2a` | p1 + the GDN output projection (`ssm_out`, MXFP4 on disk → re-encoded) | yes | **exact except `ssm_out`**, which is re-encoded from MXFP4. The default. |
+| `p2c` | p2a + a uniformly PXQ4 fused QKV (re-encodes k/v; on a file whose `attn_q` is already a panel tier this needs `--fuse-uniform-pxq4` — see below) | yes | **changed**: measured 67.5% first-token agreement and 32.5% exact-32 against `p2a` on 40 greedy prompts (Qwen3.8-27B PXQ3, 2026-09-09). Buys +47.5% KV headroom and +3.6% decode. A named option, never the default. |
+| `m1` | the MoE policy: expert stacks, shared experts, `o_proj`, fused GDN in-projection | no | **exact** |
+| `m2` | the **tiered** MoE policy: routed experts stay at their on-disk tier (PXQ2 / PXQ3 / PXQ4) as a byte move; the MXFP4 backbone — shared experts, `o_proj`, fused GDN in-projection, `ssm_out` — is re-encoded to PXQ4 | yes | **exact for the experts**, re-encoded backbone |
+| `m2f` | `m2` with the backbone left fp16. No encoder, no new numerics; the **control arm** for the same-top-token gate, and roughly 1.7 GiB larger | no | **exact** |
 | `p2b` | **blocked at the CLI** — it was p2a plus a PXQ4 LM head, and a 4-bit head is not servable by the engine side. Rather than silently emitting a checkpoint byte-identical to p2a under a name that promises more, the converter refuses it by name. |
+
+**`p2c` and the fused QKV.** vLLM keeps q, k and v in one `self_attn.qkv_proj` parameter,
+and one parameter is one slab stride and one book. On a dense PXQ3 or PXQ2 27B the quantizer's
+rev-2 backbone table gives `attn_q` the named tier and holds `attn_k`/`attn_v` at q8_0, so the
+three shards disagree: q would be a native byte move at pxq3, k/v a re-encode at pxq4. That
+plan is unwritable, and without a flag `p2c` refuses it by name rather than mixing strides:
+
+```
+policy p2c violates the §3.1 uniformity invariant — these vLLM parameters would hold more
+than one type at once: {'...layers.3.self_attn.qkv_proj': ['pxq3', 'pxq4'], ...}
+```
+
+`--fuse-uniform-pxq4` is the way through. It re-encodes the native panel shard **up** to pxq4
+so the whole parameter is one tier, and it is off by default because that is a **second
+quantization pass** on a tensor that was already quantized — the run prints every promoted
+parameter and every promoted tensor's `wrel`, so the cost is on the record rather than
+implied. On the Qwen3.8-27B PXQ3 artifact the promoted `attn_q` measures `wrel=0.0532`
+against its own pxq3 values (the k/v shards, coming from q8_0, measure 0.072–0.079 the same
+way), and the alternative it replaces is not "keep pxq3" — it is the whole QKV parameter in
+fp16, which is what `p2a` leaves behind: 1.88 GiB of dense f16 that could have been 0.47 GiB.
 
 Start with `p1` (or `m1` for MoE). It needs no encoder and no re-encoding. For a 35B MoE
 whose routed experts are PXQ2 or PXQ3, `m2` is the serving policy and `m2f` is its control —
@@ -634,15 +898,15 @@ python, torch and vLLM live on the host and are bind-mounted in — `vllm` is no
 
 ### The exact container lines
 
-These are the two lines the seats run, with nothing elided. Substitute the model path;
+These are the two lines I run, with nothing elided. Substitute the model path;
 everything else is load-bearing and each value is explained in
 [Tuning](#7-tuning-what-moves-the-number-and-by-how-much).
 
 Volta, 2x Tesla V100, TP=2:
 
 ```bash
-docker run -d --name pxa-pxq4-v100 --runtime=nvidia --network bridge \
-  -p 127.0.0.1:8262:8262 --ipc=host --shm-size=16g \
+docker run -d --name pxq4-v100 --runtime=nvidia --network bridge \
+  -p 127.0.0.1:8000:8000 --ipc=host --shm-size=16g \
   -e NVIDIA_VISIBLE_DEVICES=2,4 -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e PYTHONPATH=/opt/pxa/pxq4/sidecar/site-union \
   -e PXQ4_LIB=/opt/pxa/pxq4/kernels/libpxq4_sm70_v12b.so \
@@ -659,7 +923,7 @@ docker run -d --name pxa-pxq4-v100 --runtime=nvidia --network bridge \
     --gpu-memory-utilization 0.88 --max-model-len 32768 \
     --max-num-seqs 16 --max-num-batched-tokens 4096 \
     --compilation-config '{"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,16]}' \
-    --host 0.0.0.0 --port 8262
+    --host 0.0.0.0 --port 8000
 ```
 
 `--block-size 256` is not decoration: it is the block size the parity above was measured at,
@@ -675,8 +939,8 @@ room for the larger NCCL buffers.
 Pascal, 2x Tesla P100, TP=2:
 
 ```bash
-docker run -d --name pxa-pxq4-p100 --runtime=nvidia --network bridge \
-  -p 127.0.0.1:8199:8199 --ipc=host --shm-size=16g \
+docker run -d --name pxq4-p100 --runtime=nvidia --network bridge \
+  -p 127.0.0.1:8001:8001 --ipc=host --shm-size=16g \
   -e NVIDIA_VISIBLE_DEVICES=1,5 -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e TORCHDYNAMO_DISABLE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
   -e PYTHONPATH=/opt/pxa/pxq4/sidecar/site-sm60 \
@@ -691,7 +955,7 @@ docker run -d --name pxa-pxq4-p100 --runtime=nvidia --network bridge \
     --trust-remote-code \
     --gpu-memory-utilization 0.90 --max-model-len 8192 --max-num-seqs 8 \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8]}' \
-    --host 0.0.0.0 --port 8199
+    --host 0.0.0.0 --port 8001
 ```
 
 **On a 16 GiB card carrying a large resident model, two of those values change**, and both
@@ -753,7 +1017,6 @@ divergence is a verifier bug, not a quality trade.
 > memory-budget limit of running drafter + target together under vLLM's resident-weight
 > model, not a defect in the DFlash integration itself; the llama-engine DFlash port
 > (`RELEASE-NOTES-2026-09-07.md`, "DFlash") does not share this constraint.
-> 
 
 ### Custom all-reduce
 

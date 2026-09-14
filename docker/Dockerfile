@@ -189,7 +189,7 @@ RUN mkdir -p /models && chown pxq:pxq /models /work
 ENV LLAMA_ARG_HOST=0.0.0.0 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    # PXA levers — these are the shipped rc/unified-final-20260903 defaults (see
+    # PXA levers — these are the shipped defaults of the unified build of 2026-09-03 (see
     # docker/README.md for what each does); left unset here so the binary's own
     # compiled-in defaults apply. Uncomment / pass -e to override:
     # PXA_PIPELINE_PP=1 \

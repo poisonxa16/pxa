@@ -742,6 +742,10 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_N_PARALLEL",       params.n_parallel);
     get_env("LLAMA_ARG_KV_UNIFIED",       params.kv_unified);
     get_env("PXA_KV_UNIFIED",             params.kv_unified); // PXA_KV_UNIFIED_v1: house lever alias (takes precedence)
+    // PXA_KV_UNIFIED_DEFAULT: either variable counts as the user having chosen, in whichever direction
+    if (std::getenv("LLAMA_ARG_KV_UNIFIED") || std::getenv("PXA_KV_UNIFIED")) {
+        params.kv_unified_set = true;
+    }
     get_env("LLAMA_ARG_BATCH",            params.n_batch);
     get_env("LLAMA_ARG_UBATCH",           params.n_ubatch);
     get_env("LLAMA_ARG_N_GPU_LAYERS",     params.n_gpu_layers);
@@ -1033,17 +1037,23 @@ common_speculative_stage_params common_speculative_stage_from_arg(const std::str
         throw std::invalid_argument("unknown speculative stage type: " + type_name);
     }
 
-    if (spec_pos == std::string::npos) {
-        return stage;
+    // PXA_SPEC_NGRAM_ALIAS_v1: remember whether the USER typed an alias before the keys are read,
+    // because the alias fills only the knobs the keys leave absent.
+    const bool is_alias = common_speculative_type_name_is_alias(type_name);
+
+    if (spec_pos != std::string::npos) {
+        for (const std::string & kv : common_speculative_stage_split_kvs(value.substr(spec_pos + 1))) {
+            const auto eq_pos = kv.find('=');
+            if (eq_pos == std::string::npos) {
+                throw std::invalid_argument("invalid speculative stage option: " + kv);
+            }
+
+            common_speculative_stage_apply_kv(stage, kv.substr(0, eq_pos), common_speculative_stage_unescape_value(kv.substr(eq_pos + 1)));
+        }
     }
 
-    for (const std::string & kv : common_speculative_stage_split_kvs(value.substr(spec_pos + 1))) {
-        const auto eq_pos = kv.find('=');
-        if (eq_pos == std::string::npos) {
-            throw std::invalid_argument("invalid speculative stage option: " + kv);
-        }
-
-        common_speculative_stage_apply_kv(stage, kv.substr(0, eq_pos), common_speculative_stage_unescape_value(kv.substr(eq_pos + 1)));
+    if (is_alias) {
+        common_speculative_apply_alias_defaults(stage);
     }
 
     return stage;
@@ -1535,10 +1545,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "-kvu" || arg == "--kv-unified") {
         params.kv_unified = true;
+        params.kv_unified_set = true; // PXA_KV_UNIFIED_DEFAULT: an explicit choice outranks any auto rule
         return true;
     }
     if (arg == "-no-kvu" || arg == "--no-kv-unified") {
         params.kv_unified = false;
+        params.kv_unified_set = true; // PXA_KV_UNIFIED_DEFAULT: "no" is an answer, not silence
         return true;
     }
     if (arg == "-ns" || arg == "--sequences") {
@@ -3019,7 +3031,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",         "-vhad,  --v-cache-hadamard,",     "Use Hadamard transform for V-cache (default: %d)", params.v_cache_hadamard});
     options.push_back({ "*",         "-smf16, --split-mode-f16,",       "Use f16 for data exchange between GPUs (default: %d)", true});
     options.push_back({ "*",         "-smf32, --split-mode-f32,",       "Use f32 for data exchange between GPUs (default: %d)", false});
-    options.push_back({ "*",         "-grt, --graph-reduce-type",       "Type for data exchange between GPUs (default: %s)", "f32"});
+    // Default is f16 (gpt_params::reduce_type in common/common.h); -grt changes which -sm graph
+    // shapes take the ggml_cast in the DeltaNet split path, so the help text must report the real
+    // default or a graph-split reproduction runs a different arm than the reader thinks.
+    options.push_back({ "*",         "-grt, --graph-reduce-type",       "Type for data exchange between GPUs (default: %s)", params.reduce_type.c_str()});
     options.push_back({ "*",         "-gap, --graph-attn-precision",    "Flash-attn precision under -sm graph (default: %s)", "f16"});
     options.push_back({ "*",         "-smgs, --split-mode-graph-scheduling,", "Force Split Mode Graph Scheduling (default: %d)", params.split_mode_graph_scheduling});
     options.push_back({ "*",         "-sas,  --scheduler_async,",       "Async evaluation of compute graphs: %d)", params.scheduler_async});
@@ -3287,10 +3302,14 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                               "  cpu          serialise state via llama_state_seq; re-decode on rejection" });
     options.push_back({ "*", "--spec-type SPEC[:k=v,...]",      "canonical speculative stage entry; repeat for a supported two-stage chain.\n"
                                                               "types: none, draft, mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n"
+                                                              "alias: ngram (also spelled prompt-lookup) = the measured-best n-gram variant with its measured\n"
+                                                              "       knobs pre-filled -- the one to reach for on a model WITHOUT an MTP head; keys you name win\n"
                                                               "canonical keys: n_max,n_min,p_min,ngram_size_n,ngram_size_m,ngram_min_hits,suffix_min_match_len,suffix_max_depth,suffix_corpus\n"
                                                               "for comma-bearing string values, quote the value inside the stage payload for normal shell use\n"
                                                               "if argv is passed directly without shell unescaping, the parser also accepts escaped commas as \\,\n"
-                                                              "examples: --spec-type mtp:n_max=1,p_min=0.0\n"
+                                                              "examples: --spec-type ngram\n"
+                                                              "          --spec-type mtp:n_max=1,p_min=0.0\n"
+                                                              "          --spec-type ngram --spec-type mtp   (cascade: n-gram on a match, MTP otherwise)\n"
                                                               "          --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0\n"
                                                               "          --spec-type \"suffix:n_max=16,n_min=2,suffix_min_match_len=5,suffix_max_depth=64,suffix_corpus='/tmp/spec,type-corpus.json'\"\n"
                                                               "legacy --spec-stage, --draft-*, --spec-ngram-*, --suffix-* and -mtp flags are rejected" });
@@ -4254,6 +4273,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
+    // PXA_RS_RING: the ring's depth is the MTP draft depth. Inert unless the lever is on.
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_batch           = n_batch;
     cparams.n_ubatch          = n_ubatch;
     cparams.n_threads         = params.n_threads;

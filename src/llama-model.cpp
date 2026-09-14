@@ -1783,6 +1783,75 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        // PXA_GLM5NEXT: GLM-5.3-Flash ("glm5next"). Names transcribed from the unsloth
+        // UD-Q2_K_XL GGUF header (verified against the real file, not from the converter),
+        // which agrees tensor-for-tensor with upstream PR #27773.
+        LLM_ARCH_GLM5NEXT,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,             "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,            "output_norm" },
+            { LLM_TENSOR_OUTPUT,                 "output" },
+            { LLM_TENSOR_ATTN_NORM,              "blk.%d.attn_norm" },
+            { LLM_TENSOR_FFN_NORM,               "blk.%d.ffn_norm" },
+            // --- mHC (manifold-constrained hyper-connections), DeepSeek-V4 spelling ---
+            { LLM_TENSOR_HC_ATTN_FN,             "blk.%d.hc_attn_fn" },
+            { LLM_TENSOR_HC_ATTN_BASE,           "blk.%d.hc_attn_base" },
+            { LLM_TENSOR_HC_ATTN_SCALE,          "blk.%d.hc_attn_scale" },
+            { LLM_TENSOR_HC_FFN_FN,              "blk.%d.hc_ffn_fn" },
+            { LLM_TENSOR_HC_FFN_BASE,            "blk.%d.hc_ffn_base" },
+            { LLM_TENSOR_HC_FFN_SCALE,           "blk.%d.hc_ffn_scale" },
+            // --- KDA (linear) layers ---
+            { LLM_TENSOR_ATTN_Q,                 "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,                 "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,                 "blk.%d.attn_v" },
+            { LLM_TENSOR_SSM_CONV1D_Q,           "blk.%d.ssm_conv1d_q" },
+            { LLM_TENSOR_SSM_CONV1D_K,           "blk.%d.ssm_conv1d_k" },
+            { LLM_TENSOR_SSM_CONV1D_V,           "blk.%d.ssm_conv1d_v" },
+            { LLM_TENSOR_SSM_A_NOSCAN,           "blk.%d.ssm_a" },
+            { LLM_TENSOR_SSM_DT,                 "blk.%d.ssm_dt" },
+            { LLM_TENSOR_SSM_BETA,               "blk.%d.ssm_beta" },
+            { LLM_TENSOR_SSM_F_A,                "blk.%d.ssm_f_a" },
+            { LLM_TENSOR_SSM_F_B,                "blk.%d.ssm_f_b" },
+            { LLM_TENSOR_SSM_G_A,                "blk.%d.ssm_g_a" },
+            { LLM_TENSOR_SSM_G_B,                "blk.%d.ssm_g_b" },
+            { LLM_TENSOR_SSM_NORM,               "blk.%d.ssm_norm" },
+            // --- MLA + DSA indexer layers ---
+            { LLM_TENSOR_ATTN_Q_A,               "blk.%d.attn_q_a" },
+            { LLM_TENSOR_ATTN_Q_A_NORM,          "blk.%d.attn_q_a_norm" },
+            { LLM_TENSOR_ATTN_Q_B,               "blk.%d.attn_q_b" },
+            { LLM_TENSOR_ATTN_KV_A_MQA,          "blk.%d.attn_kv_a_mqa" },
+            { LLM_TENSOR_ATTN_KV_A_NORM,         "blk.%d.attn_kv_a_norm" },
+            { LLM_TENSOR_ATTN_K_B,               "blk.%d.attn_k_b" },
+            { LLM_TENSOR_ATTN_V_B,               "blk.%d.attn_v_b" },
+            { LLM_TENSOR_ATTN_OUT,               "blk.%d.attn_output" },
+            { LLM_TENSOR_INDEXER_K_NORM,         "blk.%d.indexer.k_norm" },
+            { LLM_TENSOR_INDEXER_PROJ,           "blk.%d.indexer.proj" },
+            { LLM_TENSOR_INDEXER_ATTN_K,         "blk.%d.indexer.attn_k" },
+            { LLM_TENSOR_INDEXER_ATTN_Q_B,       "blk.%d.indexer.attn_q_b" },
+            { LLM_TENSOR_INDEXER_COMPRESSOR_APE, "blk.%d.indexer_compressor_ape" },
+            { LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,"blk.%d.indexer_compressor_gate" },
+            // --- MoE ---
+            { LLM_TENSOR_FFN_GATE,               "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_UP,                 "blk.%d.ffn_up" },
+            { LLM_TENSOR_FFN_DOWN,               "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_GATE_INP,           "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_EXP_PROBS_B,        "blk.%d.exp_probs_b" },
+            { LLM_TENSOR_FFN_GATE_EXPS,          "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,          "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,            "blk.%d.ffn_up_exps" },
+            { LLM_TENSOR_FFN_GATE_SHEXP,         "blk.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN_SHEXP,         "blk.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP,           "blk.%d.ffn_up_shexp" },
+            // --- NextN / MTP tail (block n_layer, loaded but not yet driven) ---
+            { LLM_TENSOR_NEXTN_EH_PROJ,          "blk.%d.nextn.eh_proj" },
+            { LLM_TENSOR_NEXTN_EMBED_TOKENS,     "blk.%d.nextn.embed_tokens" },
+            { LLM_TENSOR_NEXTN_ENORM,            "blk.%d.nextn.enorm" },
+            { LLM_TENSOR_NEXTN_HNORM,            "blk.%d.nextn.hnorm" },
+            { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "blk.%d.nextn.shared_head_head" },
+            { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "blk.%d.nextn.shared_head_norm" },
+        },
+    },
+    {
         LLM_ARCH_GLM_DSA,
         {
             { LLM_TENSOR_TOKEN_EMBD,             "token_embd" },
@@ -2187,6 +2256,7 @@ const char * llama_model_type_name(e_model type) {
         case MODEL_355B_A32B:     return "355B.A32B";
         case MODEL_397B_A17B:     return "397B.A17B";
         case MODEL_744B_A40B:     return "744B.A40B";
+        case MODEL_320B_A17B:     return "320B.A17B";
         case MODEL_E2B:           return "E2B";
         case MODEL_E4B:           return "E4B";
         default:                  return "?B";
@@ -2203,6 +2273,55 @@ bool llama_model_is_hybrid(const llama_model * model) {
 
 bool llama_model_has_recurrent(const llama_model * model) {
     return llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch);
+}
+
+// PXA_MTP_DRAFT_CACHE_ONLY: does this model's MTP head have a K/V-only refresh graph?
+// Only the architectures whose MTP builder implements the reduced graph, and only when the head is
+// a SINGLE grafted layer -- a multi-layer head can carry state its later layers read back, so
+// "only K/V matters" is not established for one.
+bool llama_model_supports_mtp_kv_only(const llama_model * model) {
+    if (model == nullptr) {
+        return false;
+    }
+    if (model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_QWEN35MOE) {
+        return false;
+    }
+    return model->hparams.nextn_predict_layers == 1;
+}
+
+// PXA_MTP_BATCH_SLOTS_ROWS_v1: does this model's MTP draft graph take one conditioning-hidden row
+// per BATCH TOKEN, rather than exactly one row per decode?
+//
+// The distinction only started to matter when a draft decode stopped being 1-row: the batched-slot
+// scheduler puts one row per drafting sequence into a single MTP_OP_DRAFT_GEN decode, and the MTP
+// block concatenates that input against the token embeddings, which are always [width, n_tokens].
+// A builder that allocates a single-row input therefore aborts inside ggml_concat while the graph is
+// still being assembled -- too early for any input-size check to turn it into a clean failure. So the
+// answer has to come from the architecture, before the batch is built.
+//
+// The list is every architecture whose MTP builder allocates inp_mtp_states as [width, n_tokens] for
+// every MTP op type (src/graphs/build_*.cpp). GEMMA4_MTP does too, but it is an external frozen-KV
+// drafter that holds all of its draft rows at one position and is excluded from batched drafting on
+// that ground instead. An architecture missing from this list is not broken -- it simply drafts
+// serially, which is what every architecture did before the batched scheduler existed.
+bool llama_model_supports_mtp_multi_row_draft(const llama_model * model) {
+    if (model == nullptr) {
+        return false;
+    }
+    switch (model->arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN4EXP:
+        case LLM_ARCH_GLM4_MOE:
+        case LLM_ARCH_BAILINGMOE2:
+        case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_MISTRAL4:
+            return true;
+        default:
+            return false;
+    }
 }
 
 bool llama_model_is_gemma4_mtp_assistant(const llama_model * model) {

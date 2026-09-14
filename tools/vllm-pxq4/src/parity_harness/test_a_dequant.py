@@ -2,7 +2,7 @@
 GATE G1 (+G2) -- bit-exact dequant parity.
 
 The plan calls G1 and G3 "the project": between them they retire >90% of the format risk
-with no GPU, no lease and no container.  This module is G1 and G2.
+with no GPU and no container.  This module is G1 and G2.
 
 What G1 actually proves, in order of how expensive the bug would have been:
   * the 128 B panel header is 64 fp16 anchors indexed by row, not by anything else
@@ -14,8 +14,8 @@ What G1 actually proves, in order of how expensive the bug would have been:
 Four implementations are compared pairwise:
   C     -- production ggml/src/pxq-cpu.c, compiled here (cref/)          [ground truth]
   O     -- this harness's independent numpy transcription (oracle.py)
-  A     -- agent A's src/pxq4_vllm/reference.py                          [skipped if absent]
-  CUDA  -- agent C's torch.ops.pxq4.dequant_out                          [needs a GPU]
+  A     -- the reference component’s src/pxq4_vllm/reference.py                          [skipped if absent]
+  CUDA  -- the CUDA kernel's torch.ops.pxq4.dequant_out                          [needs a GPU]
 
 C vs O is runnable right now and is the load-bearing link: it is the only comparison in
 the whole project that touches the shipping engine's own code.
@@ -60,7 +60,7 @@ def test_g1_c_vs_oracle(real=None):
 def test_g1_oracle_vs_agent_a(real=None):
     """Check EVERY importable reference implementation, not just the first.
 
-    Agent A ships one for the converter and agent C ships one as the kernel's numpy twin.
+    the reference (reference.py) ships one for the converter and the CUDA kernel (csrc/) ships one as the kernel's numpy twin.
     They are independent transcriptions of the same C, so checking all of them against the
     oracle (which is a third independent transcription, itself pinned to the production C
     by G1a) is strictly more evidence than checking one and calling it done."""
@@ -74,7 +74,7 @@ def test_g1_oracle_vs_agent_a(real=None):
         # ggml-pxq6-tables.h and the converter cross-checks them against the GGUF KVs.
         for name, ours in (("BOOK", O.BOOK), ("SUB", O.SUB)):
             theirs = getattr(ref, name, None)
-            assert theirs is not None, f"{modname}.{name} is missing (plan §6.3)"
+            assert theirs is not None, f"{modname}.{name} is missing"
             theirs = np.asarray(theirs, dtype=np.float32)
             assert compare.bitwise_equal(theirs, ours), (
                 f"{modname}.{name} differs from ggml-pxq6-tables.h\n"
@@ -96,7 +96,7 @@ def test_g1_oracle_vs_agent_a(real=None):
 # G2  split <-> join round-trip (converter layout)
 # ---------------------------------------------------------------------------------------
 def test_g2_split_join_roundtrip(real=None):
-    """The emitted-tensor contract (plan §5.3) is a PURE SPLIT: no byte is reordered, no
+    """The emitted-tensor contract is a PURE SPLIT: no byte is reordered, no
     value recomputed.  Therefore rejoining must reproduce the original bytes exactly, and
     that is a byte comparison, not a numeric one."""
     for label, N, K, slabs, anchor in _cases(real):
@@ -162,7 +162,7 @@ def test_g6_cuda_dequant(real=None):
         torch.cuda.synchronize()
         got = out.cpu().numpy()
 
-        # The op writes fp16 (plan §7.1) while the parity-locked contract is fp32
+        # The op writes fp16 while the parity-locked contract is fp32
         # (pxq-cpu.h:16-18).  The kernel computes the fp32 product then stores
         # (dst_t)(e*v) -- k_pxq6_dequant_matrix, pxq6.cuh:716-718 -- and CUDA's
         # float->half is round-to-nearest-even, identical to numpy's astype.  So the
@@ -175,8 +175,7 @@ def test_g6_cuda_dequant(real=None):
 
 
 def test_g6_cuda_dequant_abi(real=None):
-    """The op is declared `dequant_out(Tensor(a!) out, Tensor slabs, Tensor anchor) -> ()`
-    (plan §7.1): it must write into the caller's buffer and allocate nothing.  A version
+    """The op is declared `dequant_out(Tensor(a!) out, Tensor slabs, Tensor anchor) -> ()`: it must write into the caller's buffer and allocate nothing.  A version
     that returns a fresh tensor would work in eager mode and then fail under
     FULL_AND_PIECEWISE capture, which is the worst possible place to discover it."""
     ops = adapters.pxq4_ops()

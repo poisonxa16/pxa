@@ -82,7 +82,7 @@ Treat these shares as directional. **Never quote a profiled run as a speed resul
 
 ## 3. THE FINDING: the unnamed 27% is the hyper-connection mixer
 
-Two independent agent fleets converged on this from different directions.
+Two independent lines of work converged on this from different directions.
 
 - The `node_#` bucket is **22.96% of profiled GPU time**, 17,632 calls,
   **196.3 matmuls per decoded token** against 196 predicted from the graph

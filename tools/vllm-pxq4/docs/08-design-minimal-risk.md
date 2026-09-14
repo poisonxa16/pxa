@@ -1,6 +1,6 @@
 # 08 — PXQ4 as a vLLM quantization backend: minimal-risk design
 
-Target: `1Cat-vLLM` fork @ `2ceb15066` (`v0.1.dev1+g2ceb15066.cu128`), 4x V100-SXM2-32GB (sm_70),
+Target: the Volta vLLM fork @ `2ceb15066` (`v0.1.dev1+g2ceb15066.cu128`), 4x V100-SXM2-32GB (sm_70),
 TP=4, `dtype=float16`. Artifact: `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
 Slant: **minimal risk / fastest to first correct token.** No GPU runs were performed for this
 document; every throughput number is a labelled PROJECTION.
@@ -68,7 +68,7 @@ RUNTIME (in-container, out-of-tree pip package `pxq4-vllm`)
                                    vendored slice of ggml/src/ggml-cuda/pxa/pxq6.cuh)
 ```
 
-Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `/path/to/engine-repo` is modified.
+Nothing in `the vLLM fork checkout` is patched. Nothing in `/path/to/engine-repo` is modified.
 
 ---
 
@@ -110,8 +110,8 @@ Nothing in `/opt/1Cat-vLLM` is patched. Nothing in `/path/to/engine-repo` is mod
 
 ### 2.4 Existing files to patch
 
-**In `/opt/1Cat-vLLM` (Kewaii's fork): NONE.** This is a design requirement, not a preference —
-`site-packages/vllm` is a *copied* install, not an editable link to `/opt/1Cat-vLLM`, so edits
+**In `the vLLM fork checkout` (the upstream vLLM fork): NONE.** This is a design requirement, not a preference —
+`site-packages/vllm` is a *copied* install, not an editable link to `the vLLM fork checkout`, so edits
 there are inert at runtime anyway (FACT, 05 §A2).
 
 **In `/path/to/engine-repo` (our llama.cpp tree): NONE.** Read-only by rule. The vendored kernel
@@ -461,10 +461,10 @@ the runtime ABI exactly. The `_GLIBCXX_USE_CXX11_ABI` flag must agree with the p
 **Two operational blockers, both FACT (05 §A2), both with a fixed workaround:**
 
 1. The production container's overlay is `207G used, 0 avail, 100%`. **You cannot build in
-   `vllm-qwen38-27b-cyber-1`,** and you must not try — it is the box owner's production service.
+   the production vLLM container,** and you must not try — it is a production service.
    Build in a *fresh* container from the same image with a writable volume under `/path/to/models`,
    then `pip install` the resulting wheel into the deployment.
-2. The DGX root filesystem is 100% full. Everything — build tree, wheel, converted checkpoint —
+2. The build host root filesystem may be full. Everything — build tree, wheel, converted checkpoint —
    lives under `/path/to/models`. Never `/` and never host `/tmp`.
 
 No GPU lease is needed for any of the build steps or for stages S0-S2's offline gates.
@@ -488,7 +488,7 @@ blocks, which 64-row panel interleave violates — the same reason ggml's own `t
 are deliberately NULL for PXQ4 (`ggml.c:1407-1414`, `pxq-cpu.h:4-12`).
 
 **Offline converter → safetensors makes the problem disappear rather than solving it,** and it
-never touches Kewaii's tree.
+never touches the upstream vLLM tree.
 
 ### 5.2 The five types, and what the converter does with each
 
@@ -619,8 +619,8 @@ Build `tools/pxq4_gguf` with `--emit fp16`: every tensor dequantized to fp16/f32
   continuations against our llama.cpp engine on the same prompts. This proves the name map, the
   GDN split, `in_proj_qkvz` fusion order, `attn_q` interleave, and the whole model wiring —
   with **zero** new code in the inference path.
-  VRAM: 13.5 GiB/GPU at TP=4 (fits 32 GB with KV). **Does not fit 2×16 GB Unraid** — S0 is
-  DGX-only.
+  VRAM: 13.5 GiB/GPU at TP=4 (fits 32 GB with KV). **Does not fit 2×16 GB 2x V100 box** — S0 is
+  GPU host-only.
 
 ### Stage S1 — plugin, sharding, dequant-at-load. Still no CUDA.
 `--emit pxq4`, `runtime: "dequant"`. `PXQ4Config` + `PXQ4LinearMethod` registered; the two
@@ -717,8 +717,8 @@ drift immediately. Budget a periodic re-sync.
 INFERENCE from `ggml-cuda.cu:4262`). Must raise a clear error, not silently degrade. TP=2 and
 TP=4 both fit.
 
-**R9 — the Unraid deployment (2×16 GB, TP=2).** S0/S1/S2 need 27 GiB/GPU and simply do not fit;
-even S3 at 10.4 GiB/GPU leaves little KV headroom on 16 GB cards. Unraid is a phase-2 target
+**R9 — the 2x V100 box deployment (2×16 GB, TP=2).** S0/S1/S2 need 27 GiB/GPU and simply do not fit;
+even S3 at 10.4 GiB/GPU leaves little KV headroom on 16 GB cards. 2x V100 box is a phase-2 target
 (V2 policy = 6.8 GiB/GPU), and its cards are currently occupied by live seats anyway.
 
 **What would actually kill it:** nothing found. The three candidate killers were all checked and

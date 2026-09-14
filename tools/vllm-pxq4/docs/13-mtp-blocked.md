@@ -37,7 +37,7 @@ alongside any MTP tok/s number.
 
 Note the definition: acceptance rate is accepted / drafted **tokens**. Dividing
 by the number of draft *attempts* instead inflates it by the tokens-per-draft
-(4 here) and is not comparable to anything. Cross-check against the DGX
+(4 here) and is not comparable to anything. Cross-check against the GPU host
 reference: rate 0.5748 with mean accept length 3.30 implies
 accepted/drafts = 2.30 and 2.30/4 = 0.575. Consistent.
 
@@ -113,7 +113,7 @@ with `--max-num-seqs 1` and `VLLM_SM70_GEMMA_LONG_PREFILL_FUSED=0`.
 Two options.
 
 **A. Restore p2a-nf's missing shards** — if `model-00001/00002-of-00006` and
-`config.json` still exist somewhere (the DGX?), this is minutes rather than
+`config.json` still exist somewhere (the GPU host?), this is minutes rather than
 hours. But p2a-nf predates the gemma-norm fix commit, so its *main stack* norms
 need checking before trusting it, even though its MTP norms are correct (below).
 

@@ -2,7 +2,7 @@
 
 Release candidate. Supersedes **v2026.08.25-rc2**; **47 commits** — 19 on the
 distribution side and 28 carrying the Flash-Next architecture work, which until now
-lived on a separate branch. Branch `rc/unified`.
+lived on a separate branch. This is the unified build.
 
 **This is the first release cut from a single tree.** The engine and the Flash-Next
 work had unrelated git histories, so the architecture support, both correctness fixes

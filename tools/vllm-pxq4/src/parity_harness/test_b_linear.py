@@ -4,7 +4,7 @@ GATE (b) / G8 -- single-linear-layer parity:  y = x W^T.
 Three ways to compute the same linear, and the harness pins the relationship between all
 three so a regression can be attributed:
 
-  MMV      torch.ops.pxq4.mmv_out          -- decode path, M <= PXQ4_MMV_MAX_M (plan §6.6)
+  MMV      torch.ops.pxq4.mmv_out          -- decode path, M <= PXQ4_MMV_MAX_M
   DEQ+MM   dequant_out then torch.mm       -- prefill path, and the fallback for large M
   EXACT    float64 GEMM on the fp32 dequant -- the arbiter neither path can beat
 
@@ -102,7 +102,7 @@ def test_b_cpu_fold_is_deterministic(real=None):
 
 
 def test_b_cpu_fp16_output_headroom(real=None, report=None):
-    """The op returns fp16 (plan §7.1).  Check the fp32->fp16 store, not the arithmetic,
+    """The op returns fp16.  Check the fp32->fp16 store, not the arithmetic,
     is what dominates the error -- if it is not, something upstream is wrong."""
     for label, N, K, slabs, anchor in _cases(real):
         w = O.dequant(slabs, anchor)
@@ -121,7 +121,7 @@ def test_b_cpu_fp16_output_headroom(real=None, report=None):
             f"(fold {e_fold:.3e} vs stored {e_store:.3e}) -- if the fp32 fold has become "
             f"comparable to a whole fp16 ULP, the accumulation is drifting")
         assert not np.isinf(fold).any(), f"[{label}] mmv overflowed fp32"
-        # The op's output dtype is fp16 (plan §7.1).  With realistic per-row anchors and
+        # The op's output dtype is fp16.  With realistic per-row anchors and
         # normalized activations the product must sit far inside fp16 range; if it does
         # not, ffn_down (K=17408, the widest reduction in the model) is the tensor that
         # would silently produce inf in production, so this is checked rather than assumed.

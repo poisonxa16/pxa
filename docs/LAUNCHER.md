@@ -167,10 +167,10 @@ the launcher actually does.
 
 | cards | model | flags the launcher passes | measured result | source |
 |---|---|---|---|---|
-| 2× V100 (sm_70) | dense 27B, PXQ4 | `-b 8192 -ub 2048 -fa on -c 32768 -sm layer` | prefill **1,369** t/s @3,121 · **1,300** @20,801 · decode **39.5** @fill 8 (release binary, quiet box, no env) | `RELEASE-NOTES-2026-09-07.md:77`; the measurement ledger |
-| 2× P100 (sm_60) | dense 27B, PXQ4 | `-b 8192 -ub 256 -fa on -c 32768 -sm layer` | prefill **337.6** t/s @3,121 · **315.3** @20,801 · decode **18.1** @fill 8 (release binary, quiet box, no env; fold n=7 reference 340.16 / 316.84 / 17.83) | `RELEASE-NOTES-2026-09-07.md:78`; bench/fair-battle.md:303; P100 final-binary capture, 2026-09-05 |
-| 1× GTX 1080 Ti (sm_61, 11 GB) | 35B MoE, PXQ2 | `-b 2048 -ub 768 -c 8192 --ctx-checkpoints 0`, `-fa on` for chat / `-fa off` for long documents, `PXA_AUTO_SPEC=0` | cold prefill **1,363.5** t/s (fa off) · chat prefill **746.6** (fa on) · decode **36.73** cold / **65.3** chat (release binary, no env) | `RELEASE-NOTES-2026-09-07.md:79`; the measurement ledger |
-| 4× P100 (sm_60) | Qwen3.8 Flash-Next hybrid MoE @150k | `-c 150016 -np 2 --kv-unified -t 16 -wgt 8 -ts 5079,12612,12612,11897 -ot per_layer_token_embd\.weight=CPU --no-context-shift` — **no `PXA_*` levers and no `-b`/`-ub`**: the engine's `4x sm_60` row picks `-b 2048 -ub 2048` and ENHANCE sets all eleven published levers itself | prefill **487.6** t/s @3,121 · **376.7** @20,801 · decode **24.57** at low fill (release binary, auto, no env; n=3, worst half-spread 1.55%) | `RELEASE-NOTES-2026-09-07.md`, "Config default"; four-card automatic-defaults probe, 2026-09-06 |
+| 2× V100 (sm_70) | dense 27B, PXQ4 | `-b 8192 -ub 2048 -fa on -c 32768 -sm layer` | prefill **1,369** t/s @3,121 · **1,300** @20,801 · decode **39.5** @fill 8 (release binary, quiet box, no env) | `RELEASE-NOTES-2026-09-07.md:77` (measured 2026-09-05) |
+| 2× P100 (sm_60) | dense 27B, PXQ4 | `-b 8192 -ub 256 -fa on -c 32768 -sm layer` | prefill **337.6** t/s @3,121 · **315.3** @20,801 · decode **18.1** @fill 8 (release binary, quiet box, no env; fold n=7 reference 340.16 / 316.84 / 17.83) | `RELEASE-NOTES-2026-09-07.md:78`; `bench/fair-battle.md:303` (measured 2026-09-05) |
+| 1× GTX 1080 Ti (sm_61, 11 GB) | 35B MoE, PXQ2 | `-b 2048 -ub 768 -c 8192 --ctx-checkpoints 0`, `-fa on` for chat / `-fa off` for long documents, `PXA_AUTO_SPEC=0` | cold prefill **1,363.5** t/s (fa off) · chat prefill **746.6** (fa on) · decode **36.73** cold / **65.3** chat (release binary, no env) | `RELEASE-NOTES-2026-09-07.md:79` (measured 2026-09-04) |
+| 4× P100 (sm_60) | Qwen3.8 Flash-Next hybrid MoE @150k | `-c 150016 -np 2 --kv-unified -t 16 -wgt 8 -ts 5079,12612,12612,11897 -ot per_layer_token_embd\.weight=CPU --no-context-shift` — **no `PXA_*` levers and no `-b`/`-ub`**: the engine's `4x sm_60` row picks `-b 2048 -ub 2048` and ENHANCE sets all eleven published levers itself | prefill **487.6** t/s @3,121 · **376.7** @20,801 · decode **24.57** at low fill (release binary, auto, no env; n=3, worst half-spread 1.55%) | `RELEASE-NOTES-2026-09-07.md`, "Config default" (measured 2026-09-06) |
 | 1× P100 (sm_60) | 35B MoE, PXQU-16 + q8_0 head | `-b 2048 -ub 2048 -c 8192 -fa on` | decode 62.4 t/s · prefill 827-843 t/s | `docs/COOKBOOK.md:65-73` |
 | 1× V100 (sm_70) | 35B MoE, PXQU-16 + q8_0 head | `-b 2048 -ub 2048 -c 8192 -fa on` | decode ~101-102 t/s · prefill ~1,800-1,900 t/s | `docs/COOKBOOK.md:75-78` |
 | 2× P100 (sm_60) | 35B MoE flagship PXQ4/PXQ6 | `-b 8192 -ub 2048 -c 8192 -ts 1,1 -fa on` | decode 55.7 t/s · prefill ~843 t/s | `docs/COOKBOOK.md:80-89` |
@@ -284,7 +284,27 @@ model, chat workload.
     1x sm_70    1x Tesla V100 16 GB (sm_70), 35B MoE, PXQU-16 + q8_0 head
     2x sm_60    2x P100 or 2x V100, 35B MoE flagship PXQ4/PXQ6 (18.7 GB)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   selection: 0, 1   -> MEASURED for this shape: dense|hybrid PXQ4; hybrid-moe|moe PXQ4|PXQ4-HQ|PXQ6
+
 
  up/down (or j/k) move   space tick   a all   n none   m model first   enter next   q quit
 ```
@@ -299,8 +319,35 @@ model, chat workload.
     Qwable-27B-PXQ4core.gguf                  14.6 GiB  hybrid (SSM)  PXQ4      yes
     Qwable-27B-MXFP4-lite.gguf                14.6 GiB  hybrid (SSM)  -         yes
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   /models/Qwable-27B-PXQ4HQ.gguf
   arch qwen35   trained ctx 262144
+
 
  up/down (or j/k) move   enter pick   d change directory   c back to cards   q quit
 ```
@@ -329,6 +376,22 @@ model, chat workload.
   --slot-save-path     not set                                  [INFERRED]
   --host / --port      127.0.0.1:8405                           YOURS
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
  t template   j jinja   r reasoning   b budget   s sampling   k key/host/port   enter next   c back   q quit
 ```
 
@@ -341,17 +404,36 @@ model, chat workload.
         model is a raw GGUF (Qwable-27B-PXQ4core.gguf); vLLM needs a converted artifact
         (tools/vllm-pxq4/tools/gguf_to_vllm.py). Cards: 0:Tesla P100-PCIE-16GB sm_60, 1:Tesla P100-PCIE-16GB sm_60
 
+
      vllm-pxq4 - the sm_70 serving sidecar
         cannot be used here: model is a raw GGUF (Qwable-27B-PXQ4core.gguf); vLLM needs a converted artifact
         (tools/vllm-pxq4/tools/gguf_to_vllm.py). Cards: 0:Tesla P100-PCIE-16GB sm_60, 1:Tesla P100-PCIE-16GB sm_60
+
 
   evidence
     MEASURED topology row '2xp100-dense-pxq4' (2x Tesla P100 (sm_60), dense 27B, PXQ4): prefill 340.16 t/s @3,121
     tok | 316.84 @20,801 | decode 17.83 @fill 8 (n=7, two passes, GPUs 1;5, fold 24ebec4096)
     MEASURED FA regime: -fa on for workload 'chat' - the interactive/serving setting, and what every recipe row
     above was measured at. Switch with --workload longdoc if you are ingesting rather than chatting.
-    MEASURED envelope: exactly 2 cards, both sm_60 - the table applies as measured (SCOREBOARD.md:6,
-    MOE-CROSSOVER.md:3)
+    MEASURED envelope: exactly 2 cards, both sm_60 - the table applies as measured (the measurement record,
+    the MoE crossover analysis)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
  up/down (or j/k) move   enter accept   c back   q quit
 ```
@@ -381,19 +463,19 @@ model, chat workload.
   ev: MEASURED topology row '2xp100-dense-pxq4' (2x Tesla P100 (sm_60), dense 27B, PXQ4): prefill 340.16 t/s @3,121
   tok | 316.84 @20,801 | decode 17.83 @fill 8 (n=7, two passes, GPUs 1;5, fold 24ebec4096)
   [RELEASE-NOTES-2026-09-07.md:78 (P100 headline row, carries this fold reference);
-  bench/fair-battle.md:217 (full fold n=7 table); the measurement ledger
+  bench/fair-battle.md:217 (full fold n=7 table); RESULTS-2026-09-01-session2.md 2026-09-03 21:11
   FINAL TABLE]
   ev: MEASURED FA regime: -fa on for workload 'chat' - the interactive/serving setting, and what every recipe row
   above was measured at. Switch with --workload longdoc if you are ingesting rather than chatting.
   [docs/COOKBOOK.md:41-63 (Two FA regimes); bench/fair-battle.md:35-50]
-  ev: MEASURED envelope: exactly 2 cards, both sm_60 - the table applies as measured (SCOREBOARD.md:6,
-  MOE-CROSSOVER.md:3)
+  ev: MEASURED envelope: exactly 2 cards, both sm_60 - the table applies as measured (the measurement record,
+  the MoE crossover analysis)
   ** -ub does NOT transfer between pairs: 2,048 is best on the V100 pair and 256 on this one (-ub 256 gives 218.4
   t/s @3,121 against 231 at -ub 2048 on the DEFAULT chunk; at -b 8192 the 256 cell is the 340.16 above).
-  the measurement ledger (HONEST numbers, UNIFIED build #2/#3:
+  RESULTS-2026-09-01-session2.md 2026-09-02 23:00 (HONEST numbers, UNIFIED build #2/#3:
   P100 ub256 218.4 vs ub2048 231); docs/COOKBOOK.md:103-106.
   ** -ub 512 at the same -b 8192 measured 323.26 / 310.38 / 17.76 (n=7) - about 5% behind
-  (the measurement ledger).
+  (RESULTS-2026-09-01-session2.md 2026-09-03 22:27).
   ** PXA_PIPELINE_PP is ON by ENGINE default for arch 'qwen35' (qwen35/qwen35moe only). This launcher does not set
   or unset it; the seat inherits the engine's default. PXA_PIPELINE_PP is an ENGINE default for the qwen35/qwen35moe
   ctx (from the recipe)   np 1   scroll 1/101
@@ -410,7 +492,7 @@ model, chat workload.
   first token OK - 4 chars back, prefill 18.5 t/s, decode 23.0 t/s
   cards 0,1   pid 85   running
   ------------------------------------------------------------------------------------------------------------------
-  llama_iGQA_PACK: NH=0 (OFF — stock one-block-per-head vec kernel)
+  PXA_FA_GQA_PACK: NH=0 (OFF — stock one-block-per-head vec kernel)
   PXA_FA_GQA_QSMEM: OFF (Q staged in shared for NH=4/8)
   PXA_FA_VEC_ILP: ON (D=256 decode V-pass 4-way ILP; PXA_FA_VEC_ILP=0 reverts)
   PXA_PXQ4_2D_SPLIT dev1: FIRING (S=4 panels=160 ny=1 R=10240 K=5120, target 448 blocks)
@@ -453,7 +535,7 @@ The same screen a few minutes later, serving.
   first token OK - 4 chars back, prefill 18.5 t/s, decode 23.0 t/s
   cards 0,1   pid 85   running
   ------------------------------------------------------------------------------------------------------------------
-  llama_iGQA_PACK: NH=0 (OFF — stock one-block-per-head vec kernel)
+  PXA_FA_GQA_PACK: NH=0 (OFF — stock one-block-per-head vec kernel)
   PXA_FA_GQA_QSMEM: OFF (Q staged in shared for NH=4/8)
   PXA_FA_VEC_ILP: ON (D=256 decode V-pass 4-way ILP; PXA_FA_VEC_ILP=0 reverts)
   PXA_PXQ4_2D_SPLIT dev1: FIRING (S=4 panels=160 ny=1 R=10240 K=5120, target 448 blocks)
@@ -512,19 +594,19 @@ The same screen a few minutes later, serving.
   ev: MEASURED topology row '2xp100-dense-pxq4' (2x Tesla P100 (sm_60), dense 27B, PXQ4): prefill 340.16 t/s @3,121
   tok | 316.84 @20,801 | decode 17.83 @fill 8 (n=7, two passes, GPUs 1;5, fold 24ebec4096)
   [RELEASE-NOTES-2026-09-07.md:78 (P100 headline row, carries this fold reference);
-  bench/fair-battle.md:217 (full fold n=7 table); the measurement ledger
+  bench/fair-battle.md:217 (full fold n=7 table); RESULTS-2026-09-01-session2.md 2026-09-03 21:11
   FINAL TABLE]
   ev: MEASURED FA regime: -fa on for workload 'chat' - the interactive/serving setting, and what every recipe row
   above was measured at. Switch with --workload longdoc if you are ingesting rather than chatting.
   [docs/COOKBOOK.md:41-63 (Two FA regimes); bench/fair-battle.md:35-50]
-  ev: MEASURED envelope: exactly 2 cards, both sm_60 - the table applies as measured (SCOREBOARD.md:6,
-  MOE-CROSSOVER.md:3)
+  ev: MEASURED envelope: exactly 2 cards, both sm_60 - the table applies as measured (the measurement record,
+  the MoE crossover analysis)
   ** -ub does NOT transfer between pairs: 2,048 is best on the V100 pair and 256 on this one (-ub 256 gives 218.4
   t/s @3,121 against 231 at -ub 2048 on the DEFAULT chunk; at -b 8192 the 256 cell is the 340.16 above).
-  the measurement ledger (HONEST numbers, UNIFIED build #2/#3:
+  RESULTS-2026-09-01-session2.md 2026-09-02 23:00 (HONEST numbers, UNIFIED build #2/#3:
   P100 ub256 218.4 vs ub2048 231); docs/COOKBOOK.md:103-106.
   ** -ub 512 at the same -b 8192 measured 323.26 / 310.38 / 17.76 (n=7) - about 5% behind
-  (the measurement ledger).odec=PXQ4 bpw=4.59 backbone_rev=2 tier=core source=n/a | tid="225
+  (RESULTS-2026-09-01-session2.md 2026-09-03 22:27).odec=PXQ4 bpw=4.59 backbone_rev=2 tier=core source=n/a | tid="225
   ** PXA_PIPELINE_PP is ON by ENGINE default for arch 'qwen35' (qwen35/qwen35moe only). This launcher does not set
   or unset it; the seat inherits the engine's default. PXA_PIPELINE_PP is an ENGINE default for the qwen35/qwen35moe
   ctx (from the recipe)   np 1   scroll 1/100
@@ -865,7 +947,7 @@ Precedence, in order, and the reason for each step:
    2× P100 pair is **256** — and it never sets `-b` at all, because the prefill
    *chunk* is not its job. On both card pairs `-b 8192` is worth about **+10%**
    long-prompt prefill over the engine default `-b 2048`
-   (the measurement ledger chunk-size PROBE). On an `[INFERRED]` row only, a `-ub`
+   (RESULTS-2026-09-01-session2.md 2026-09-03 20:09 chunk-size PROBE). On an `[INFERRED]` row only, a `-ub`
    the smallest selected card cannot hold is lowered to the card-type value and
    the lowering is printed; a `MEASURED` row is emitted exactly as measured.
 3. **The `qwen4exp` `-ub 1024` rule**, where no row covers the topology: ub1024 is
@@ -1174,7 +1256,7 @@ pxa-launch: ENGINE = llama
   ** PXQ_UNIVERSAL: this is a MIXED per-tensor tier map. PXQ-TYPE-MATRIX.md:119 Finding 8 records a UNIVERSAL MoE that loads PASS and generates INCOHERENT - with the doc's own caution that the incoherence is traceable to that build recipe (Q3_K_M source, no imatrix) rather than to the codecs. Nothing verifies a coherence check ran on THIS file. llama.cpp only, and you must acknowledge it.
   ** Decode is ub-insensitive on this row - drop to -b/-ub 512 if you want a smaller compute buffer (docs/COOKBOOK.md:72-73).
   ** PXQ_UNIVERSAL acknowledgement WAIVED by recipe row '1xp100-pxqu16': that row was measured on this tier, with output-gated boots, which is the coherence evidence the general PXQ_UNIVERSAL warning asks for. The warning above still stands for any OTHER UNIVERSAL file - it is waived for this cell, not for the tier.
-  ** PXA_PIPELINE_PP is ON by ENGINE default for arch 'qwen35moe' (qwen35/qwen35moe only). This launcher does not set or unset it; the seat inherits the engine's default. PXA_PIPELINE_PP is an ENGINE default for the qwen35/qwen35moe families only. It is NOT on for qwen4exp: at -c 150016 across four cards the n_copies=2 compute buffers OOM (the measurement ledger, the 1080 Ti no-boot has the same cause). This launcher does not set it either way.
+  ** PXA_PIPELINE_PP is ON by ENGINE default for arch 'qwen35moe' (qwen35/qwen35moe only). This launcher does not set or unset it; the seat inherits the engine's default. PXA_PIPELINE_PP is an ENGINE default for the qwen35/qwen35moe families only. It is NOT on for qwen4exp: at -c 150016 across four cards the n_copies=2 compute buffers OOM (RESULTS-2026-09-01-session2.md 2026-09-03 22:27, the 1080 Ti no-boot has the same cause). This launcher does not set it either way.
   ** model is not the MoE anchor (PXA-Coder-35B-v2): the crossover is a property of a model x hardware PAIR, not of the engines. qwen3next (MoE-512), qwen3moe (MoE-128) and deepseek4 (MoE-6) have NO engine-vs-engine data at any np. [INFERRED]
   --- chat / serving settings (the ones people forget) ---
   chat template in the file: 7764 chars, looks like 'chatml'
@@ -1222,7 +1304,7 @@ pxa-launch: ENGINE = llama
     3. device scoping: echo the child's CUDA_VISIBLE_DEVICES back; expect '6'.
     4. short-prompt correctness: a RAW, NON-chat-templated 1-token and 5-token
        completion BEFORE any number is trusted, exactly as all 11 crossover boots
-       did (MOE-CROSSOVER.md section 4.3). Chat-templated traffic pads every prompt
+       did (the MoE crossover analysis section 4.3). Chat-templated traffic pads every prompt
        past the captured sizes, which is precisely why the FAP corruption survived
        arithmetic gating.
     5. speculation: if you armed one, the acceptance-rate line must be present and
@@ -1236,6 +1318,7 @@ attached, and the general PXQ_UNIVERSAL acknowledgement is waived **for this cel
 only**, with the reason printed. The projector sitting beside the model is named
 and deliberately not attached. The sampling values came out of the file's own
 `general.sampling.*` keys, not out of this launcher.
+
 
 ### B. Two identical cards
 

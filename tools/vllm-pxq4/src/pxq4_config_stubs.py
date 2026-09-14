@@ -6,7 +6,7 @@ machine with neither installed.
 DESTINATION IN THE REPO OF PLAN 09: ``tests/_stubs.py``.
 
 This is a test fixture, not shipped code.  It reproduces only the *contracts*
-that were read in /opt/1Cat-vLLM (git 2ceb15066):
+that were read in the vLLM fork checkout (git 2ceb15066):
 
   * ``QuantizationConfig.__init__`` seeds ``packed_modules_mapping``
     (base_config.py:72-76).

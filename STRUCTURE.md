@@ -18,10 +18,11 @@ from this one build. Build with `--runtime=nvidia` (needs libcuda for the CUDA-d
 
 ## The private mirror
 
-**`poisonxa16/pxa-private`** (private) — same code + the secret universal-quant recipe
-files (`.tiers`, `tier-maps.json`, `pxqu_wrel.py`, `pxqu_golden.py`, `pxa-bench/pxq-universal/`).
-The recipes are `.gitignore`d so they never reach the public repo; on the private remote they are
-force-added. One tree -> two remotes: `origin` = public clean, `private` = dirty backup.
+A private backup remote carries the same code plus the generator internals that are not
+published (`pxqu_wrel.py`, `pxqu_golden.py`, the bulk generated artifacts). The documented
+reference budgets under `pxa-bench/pxq-universal/` — the `.tiers` files, `tier-maps.json` and
+the determinism-gate scripts — DO ship here; see `.gitignore` for exactly what stays out.
+One tree -> two remotes: `origin` = public clean, the other = dirty backup.
 
 ## Upstream
 
@@ -33,9 +34,9 @@ force-added. One tree -> two remotes: `origin` = public clean, `private` = dirty
 - **`poisonxa16/ik_llama.cpp` (the old fork) — DELETED 2026-07-24.** Content fully folded into
   `pxa`. Its campaign branches are bundled at
   `ik_llama-campaign-branches.bundle` in the offline archive.
-- **A local legacy ik_llama tree** — kept ONLY because the live brains still
-  run its `build-mmfast`. It retires the day the brains move onto the `pxa` unified build
-  (a validated brain-engine swap; owner go required). After that, one engine, period.
+- **A local legacy ik_llama tree** — kept ONLY because one resident service still
+  runs its `build-mmfast`. It retires the day that service moves onto the `pxa` unified build
+  (a validated engine swap, done deliberately). After that, one engine, period.
 - **Historical builds** live on the array: `<archive>/`
   (old worktrees, experiment binaries, the campaign bundle, MANIFEST.md). Never on the cards' cache.
 

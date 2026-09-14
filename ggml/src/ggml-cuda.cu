@@ -42,6 +42,8 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mask_to_idx.cuh"
+#include "ggml-cuda/kpool-score.cuh"
+#include "ggml-cuda/qsa-topk.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/pxa/pxq-mmvq.cuh"
@@ -1068,7 +1070,30 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
         }
     }
     if (!tensor->extra) return;
+    // Types whose rows are stored in 64-row PANEL-SoA groups. A K-slice of such a tensor cannot be
+    // read row-contiguously: the per-row anchors live ONCE in a header at the head of each panel and
+    // span all of K, and the code values live in whole K/32 slabs that follow it. n_interleave is
+    // the panel row count, which makes the dim-0 arm below step in panels --
+    //   header  = row_meta_size * n_interleave            = 2 * 64            = 128 B
+    //   offset  = n_interleave*(row_meta_size + (ne/bs)*ts) = 128 + (ne/32)*ts  <- slab ne/32
+    //   body    = n_interleave*(split_row_size - row_meta_size) = (Ksplit/32)*64*ts
+    // -- i.e. the 128 B panel header once, then (Ksplit/32) whole slabs, contiguous. That is
+    // byte-exactly the panel the kernel addresses at W + grp*pstride + HDR + kb*SLAB
+    // (pxa/pxq4-v70.cuh:162,168), so the arm is a correct panel-aware K-slicer once told the type is
+    // panel-interleaved. The identity that makes it land on slab boundaries is n_interleave*ts ==
+    // split_row_size - row_meta_size for the panel's own geometry.
+    //
+    // VERIFIED FOR PXQ4 ONLY (bs 32, ts 17, row_meta_size 2, panel 64 rows, slab 1088 B): the
+    // per-tensor byte totals match the real GGUF 325/325, and the consumer kernels take K from
+    // src0->ne[0] (mmvq.cu:137), so a split tensor addresses its own smaller panel with no kernel
+    // change. PXQ4HQ/PXQ2/PXQ3/PXQ1/PXQ6 share the same geometry (bs 32, row_meta_size 2, 64-row
+    // panel, 128 B header -- the slider is type-generic because ts/bs/row_meta_size come from the
+    // type traits at runtime), but each needs its own load-and-produce check before it is listed
+    // here. A panel type NOT in this table keeps REFUSING a dim-0 split
+    // (src/llama-load-tensors.cpp: pxa_type_pxq_k_split_ok), because a wrong n_interleave produces
+    // a slice that is wrong without being detectably wrong.
     static std::map<ggml_type, int> k_map = {
+        { GGML_TYPE_PXQ4, 64 },   // rows per panel == PXQ4_BM (pxa/pxq4.cuh:27)
     };
 
     // split tensors must always be set in their entirety at once
@@ -1106,7 +1131,16 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
             auto & ranges = *(const std::vector<std::vector<std::pair<int,int>>> *)extra_ptr;
             GGML_ASSERT(extra->n_device == int(ranges.size()));
             GGML_ASSERT(tensor->ne[2]*tensor->ne[3] == 1);
-            GGML_ASSERT(n_interleave == 1);
+            if (n_interleave != 1) {
+                // The row-range uploader below copies whole rows and cannot land on a panel slab, so
+                // a panel type must never arrive here. Name the tensor: a bare "n_interleave == 1"
+                // abort is unattributable without a rebuild, and this is the one path where a wrong
+                // slice would be wrong WITHOUT being detectably wrong.
+                GGML_ABORT("split_dim 0: tensor '%s' (type %s) is panel-interleaved (n_interleave %d) but "
+                           "reached the row-range uploader. This panel type cannot be K-split by ranges; "
+                           "see the k_map comment above.",
+                           tensor->name, ggml_type_name(tensor->type), n_interleave);
+            }
             GGML_ASSERT(tt.row_meta_size == 0);
             for (int i = 0; i < extra->n_device; ++i) {
                 auto split = extra->splits[i];
@@ -1192,8 +1226,15 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
                 ne1 += split->ne[1];
             }
         } else {
-            int n_interleave = 1;
-            if (auto it = k_map.find(tensor->type); it != k_map.end()) n_interleave = it->second;
+            // A dim-1 (row) cut NEVER interleaves, whatever the type. k_map describes the K-slice
+            // (dim-0) panel read; a row cut copies whole rows and has no slab boundary to land on.
+            // For a panel type those rows are still byte-exact -- 64 consecutive rows ARE one panel
+            // and ggml_row_size*64 == the panel stride -- but only while every range is 64-aligned.
+            // prepare_split_tensors() enforces that for panel types; the delta-net armer (e.g.
+            // layer.wqkv_gate, whose tensor IS PXQ4 on this model) only achieves it by accident of
+            // head_v_dim being a multiple of 64. Consulting k_map here would set the PANEL COUNT and
+            // abort a valid row split, which is exactly what it did before this comment existed.
+            const int n_interleave = 1;
             if (extra_ptr) {
                 auto & ranges = *(const std::vector<std::vector<std::pair<int,int>>> *)extra_ptr;
                 GGML_ASSERT(extra->n_device == int(ranges.size()));
@@ -2058,6 +2099,72 @@ static const half * pxa_dq_zero_buf(int device, size_t ne, cudaStream_t stream) 
     return (const half *) g_pxa_dq_zero[device];
 }
 
+// PXA_VOLTA_CUBLAS_TILE (2026-09-08, default OFF, ENHANCE-neutral).
+//
+// The quantized-weight prefill matmul on Volta is "dequantize src0 to f16 once, then one
+// cublasGemmEx at the full batch width". The weight conversion is per call and independent of the
+// batch, but N is not: cuBLAS picks its internal kernel and its accumulation blocking from the
+// shape it is handed, so growing -ub can silently move this call onto a different cuBLAS kernel
+// with a different summation order. That is the same drift PXA_KPOOL_SCORE_TILE already pins for
+// the one k-pool GEMM; this is the general form of it for the dense quantized path.
+//
+// With the lever set to T, a batch wider than T is issued as a run of GEMMs of exactly T columns
+// (plus whatever remains in the tail), all against the SAME already-converted weight buffer --
+// only the activation and output column pointers advance. So a bigger nominal batch still pays
+// for exactly one dequant, while the shape cuBLAS actually sees stays pinned at the width that
+// was validated. It is a throughput/drift trade, not a free win: more launches, less work per
+// launch, and the tail tile is by construction narrower than T.
+//
+// NOT bit-identical to the untiled call whenever it actually splits (that is the point -- the
+// GEMM shape changes), so it wants the logit-spread gate, not a hash comparison. Unset or 0 is
+// the shipped behaviour: the single call below, byte-for-byte.
+static inline int pxa_volta_cublas_tile() {
+    static const int tile = [](){
+        const char * e = getenv("PXA_VOLTA_CUBLAS_TILE");
+        int v = e ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v) {
+            fprintf(stderr, "PXA_VOLTA_CUBLAS_TILE: %d — Volta quantized-weight GEMMs are issued "
+                            "as fixed %d-column tiles against one dequantized weight buffer "
+                            "(shape pinned; NOT bit-exact vs the untiled call)\n", v, v);
+        }
+        return v;
+    }();
+    return tile;
+}
+
+// One f16-operand GemmEx, optionally split along N into fixed-width column tiles over the same A.
+// tile <= 0, or a batch that fits in one tile, issues exactly the single call it replaces.
+static void pxa_cublas_gemm_ex_f16_tiled(
+        cublasHandle_t handle, int tile,
+        int64_t m, int64_t n, int64_t k,
+        const void * alpha, const half * A, int64_t lda, const half * B, int64_t ldb,
+        const void * beta,  void * C, cudaDataType_t Ctype, int64_t ldc, size_t c_elem_size,
+        cublasComputeType_t compute_type) {
+
+    if (tile <= 0 || n <= (int64_t) tile) {
+        CUBLAS_CHECK(
+            cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    m, n, k,
+                    alpha, A, CUDA_R_16F, lda,
+                           B, CUDA_R_16F, ldb,
+                    beta,  C, Ctype, ldc,
+                    compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        return;
+    }
+
+    for (int64_t c0 = 0; c0 < n; c0 += tile) {
+        const int64_t nc = (n - c0) < (int64_t) tile ? (n - c0) : (int64_t) tile;
+        CUBLAS_CHECK(
+            cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    m, nc, k,
+                    alpha, A,            CUDA_R_16F, lda,
+                           B + c0*ldb,   CUDA_R_16F, ldb,
+                    beta,  (char *) C + (size_t) c0*ldc*c_elem_size, Ctype, ldc,
+                    compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+}
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -2265,6 +2372,11 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
 
+        // PXA_VOLTA_CUBLAS_TILE: Volta + quantized weights only, and only when the lever is set.
+        // 0 everywhere else, which is the single untiled call this path has always issued.
+        const int pxa_cublas_tile = (compute_capability == CC_VOLTA && ggml_is_quantized(src0->type))
+                                  ? pxa_volta_cublas_tile() : 0;
+
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
         if (pxa_f32prec_take || pxa_volta_f32out) {
             // PREC_F32, armed: fp32 accumulate + F32 output straight into dst (no round-trip).
@@ -2272,14 +2384,12 @@ static void ggml_cuda_op_mul_mat_cublas(
             // PXA_VOLTA_F16_GEMM above.
             const float alpha_f32 = 1.0f;
             const float beta_f32  = 0.0f;
-            CUBLAS_CHECK(
-                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                        row_diff, src1_ncols, ne10,
-                        &alpha_f32, src0_ptr, CUDA_R_16F, ne00,
-                                    src1_ptr, CUDA_R_16F, ne10,
-                        &beta_f32,  dst_dd_i, CUDA_R_32F, ldc,
-                        CUBLAS_COMPUTE_32F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            pxa_cublas_gemm_ex_f16_tiled(ctx.cublas_handle(id), pxa_cublas_tile,
+                    row_diff, src1_ncols, ne10,
+                    &alpha_f32, src0_ptr, ne00,
+                                src1_ptr, ne10,
+                    &beta_f32,  dst_dd_i, CUDA_R_32F, ldc, sizeof(float),
+                    CUBLAS_COMPUTE_32F);
             GGML_UNUSED(dst);
             GGML_UNUSED(src1_ddq_i);
             return;
@@ -2289,14 +2399,12 @@ static void ggml_cuda_op_mul_mat_cublas(
         const half alpha_f16 = 1.0f;
         const half beta_f16 = 0.0f;
 
-        CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha_f16, src0_ptr,       CUDA_R_16F, ne00,
-                                src1_ptr,       CUDA_R_16F, ne10,
-                    &beta_f16,   dst_f16.get(), CUDA_R_16F, ldc,
-                    CUBLAS_COMPUTE_16F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        pxa_cublas_gemm_ex_f16_tiled(ctx.cublas_handle(id), pxa_cublas_tile,
+                row_diff, src1_ncols, ne10,
+                &alpha_f16, src0_ptr,      ne00,
+                            src1_ptr,      ne10,
+                &beta_f16,  dst_f16.get(), CUDA_R_16F, ldc, sizeof(half),
+                CUBLAS_COMPUTE_16F);
 
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
         to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff, src1_ncols, stream);
@@ -3096,8 +3204,9 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         }
         if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || !ggml_is_quantized(dst->src[0]->type) ||
                 !ggml_cuda_should_use_mmq(dst->src[0]->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) break;
-        // the GEMV arm below dispatches straight into mmvq; a quantized type without an mmvq
-        // kernel (PXQ6/PXQ2/... tiers) would GGML_ABORT there. Stop the chain instead.
+        // the GEMV arm below dispatches straight into mmvq; a quantized type with no mmvq kernel
+        // for this run (PXQ6 always, PXQ2/PXQ3 whenever PXA_PXQ23_MMVQ leaves them on their own
+        // fused decode) would GGML_ABORT there. Stop the chain instead.
         if (is_gemv && !ggml_cuda_mmvq_type_supported(dst->src[0]->type)) break;
         if (!is_gemv && mmq_get_q8_1_ds_layout(src0->type) != mmq_get_q8_1_ds_layout(dst->src[0]->type)) break;
         if (is_gemv) {
@@ -3994,6 +4103,8 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                           const ggml_tensor * src1, ggml_tensor * dst);
 static int pxa_pxq_gemm_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                            const ggml_tensor * src1, ggml_tensor * dst);
+// standalone routed-expert decode mmv for an UNFUSED MUL_MAT_ID over a PXQ expert stack
+static int pxa_pxq_moe_mmv_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
@@ -4124,7 +4235,14 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // to the generic paths exactly as before. Note this also retires the old GGML_ABORT for a
     // 1-row quantized src0 that missed mmvq/mmq — those now fall through to the cuBLAS dequant
     // path instead of aborting.
-    static const bool pxa_spec_1row = !(getenv("PXA_SPEC_1ROW") && atoi(getenv("PXA_SPEC_1ROW")) == 0);
+    // Bug 74: this read the env inline and level-blind, so a REFERENCE boot ran the lever while
+    // the boot census -- which reads pxa_spec_1row_resolve() -- reported it OFF. The census and
+    // the dispatch disagreed, and the census is the half a reader sees. It now calls the resolver
+    // whose comment has named this dispatch as its consumer all along, the same INT8_PREFILL /
+    // PXA 0a hygiene pattern already used in this TU at :2233 and :4002. Identical at
+    // DEFAULT/ENHANCE (the resolver returns true when unset); REFERENCE now really does take the
+    // ne11==1-only path its own comment documents.
+    static const bool pxa_spec_1row = pxa_spec_1row_resolve();
     if (ggml_nrows(src0) == 1 && (src1->ne[1] == 1 || (pxa_spec_1row && src1->ne[1] <= 8)) && src1->ne[2]*src1->ne[3] == 1
         && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
@@ -4328,6 +4446,15 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 
     CUDA_CHECK(cudaMemsetAsync((char *)dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+
+    // PXQ routed-expert decode, one launch over (panels, n_ids, ny) with the ids read on the
+    // device. Serves architectures whose up/gate do NOT fuse (glm5next clamps its SwiGLU halves,
+    // so llm_build_moe_ffn takes the unfused branch) and which therefore reach none of the fused
+    // PXQ MoE drivers. Declines (-1) fall through to everything below, unchanged.
+    // Definition + rationale: pxa_pxq_moe_mmv_id, next to the other PXQ MoE drivers.
+    if (pxa_pxq_moe_mmv_id(ctx, dst) == 0) {
+        return false;
+    }
 
     if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         ggml_is_quantized(src0->type) &&
@@ -4538,6 +4665,21 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 // up+gate+swiglu / down mmv straight from f32 activations (no q8_1 stage, no host syncs).
 // Both return -1 to decline (shape/type/arch not handled) -> the stock fallback paths run,
 // which for PXQ4 means dequant(convert.cu)->cublas: functionally correct on every arch.
+
+// GGML_OP_MOE_FUSED_UP_GATE GLU epilogue selector. op_params[0] is the unary op and op_params[1]
+// the (step35 / SWIGLU_OAI) limit; op_params[2] is the PXA clamp mode added for the DeepSeek-V4 /
+// GLM-5.3-Flash asymmetric clamp (see ggml_moe_up_gate_clamped in ggml.c). Every pre-existing
+// caller leaves op_params[2] zero, so this returns exactly what the call sites computed before.
+// The returned code is the `unary` argument of pxq4_glu_apply: 0 silu-swiglu, 1 SWIGLU_OAI,
+// 2 clamp-then-silu.
+static inline int pxa_fmoe_clamp_mode(const ggml_tensor * dst) {
+    return ((const int32_t *)dst->op_params)[2];
+}
+
+static inline int pxa_fmoe_unary_code(const ggml_tensor * dst) {
+    if (pxa_fmoe_clamp_mode(dst) == 1) return 2;
+    return ((ggml_unary_op)dst->op_params[0]) == GGML_UNARY_OP_SWIGLU_OAI ? 1 : 0;
+}
 
 static bool pxa_pxq4_bufs_on_device(ggml_backend_cuda_context & ctx, std::initializer_list<const ggml_tensor *> ts) {
     for (const ggml_tensor * t : ts) {
@@ -4778,7 +4920,7 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     // is what routes it -- ggml_cuda_mul_mat tries this driver first. Only the MMVQ batch window
     // (ny <= 8) is handed over; prefill keeps the bespoke 2D drivers untouched.
     if (pxa_pxq_mmvq_type(src0->type)
-        && pxa_pxq_mmvq_on(ggml_cuda_info().devices[ctx.device].cc)
+        && pxa_pxq_mmvq_on_type(ggml_cuda_info().devices[ctx.device].cc, src0->type)
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE
         && src1->ne[2] == 1 && src1->ne[3] == 1
         && src0->ne[2] == 1 && src0->ne[3] == 1
@@ -4848,18 +4990,40 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     const int  pair = pxa_pxq6_decode_mode();
     const bool vecx = pxa_pxq6_vecx();
+    // PXA_PXQ_MMV_H2 (2026-09-10): the half2 pair-LUT decode twins for PXQ2/PXQ3 on cc == 600.
+    // Resolved once, here, and it takes precedence over the R2/Q1/TOK experimental twins, none of
+    // which has an h2 form -- otherwise an armed lever would be silently displaced by a
+    // default-off one and the A/B would measure nothing. Dense only; the MoE grouped drivers
+    // never see this flag.
+    const int  h2_cc = ggml_cuda_info().devices[ctx.device].cc;
+    const char * h2_why = pxa_pxq_mmv_h2_why(h2_cc, fmt);
+    const bool h2 = (h2_why == nullptr);
     auto * kern = pxq6_pick_mmv(fmt, pair, vecx);
     if (!kern) return -1;                           // no instantiation for this format
     int nthr_mmv = 256;
-    if (pxa_pxq6_rowx2()) {
-        auto * k2 = pxq6_pick_mmv_x2(fmt, pair, vecx);
-        pxa_pxq6_rowx2_log(0, k2 != nullptr);
-        if (k2) { kern = k2; nthr_mmv = 128; }
-    }
-    if (nthr_mmv == 256 && (pxa_pxq6_qpf() & 1)) {   // Q1 yields to an engaged R2 twin
-        auto * kq = pxq6_pick_mmv_qp(fmt, pair, vecx);
-        pxa_pxq6_qpf_log(0, kq != nullptr);
-        if (kq) kern = kq;
+    if (h2) {
+        auto * kh = pxq6_pick_mmv_h2(fmt);
+        pxa_pxq_mmv_h2_log(ctx.device, h2_cc, 0, kh != nullptr,
+                           kh ? nullptr : "no-kernel-instantiation-for-this-tier", fmt, (int)R, (int)K, 1);
+        if (kh) kern = kh;
+    } else {
+        // Report the gate that stopped it -- but ONLY when someone armed the lever. An unarmed
+        // lever is not a phantom, and a decline line for the default configuration would land on
+        // every shipped server's stderr; an ARMED lever that stays silent is the real phantom, and
+        // that is what this log exists to catch. Once per device per arm, so it cannot spam.
+        if (pxa_pxq_mmv_h2_mask()) {
+            pxa_pxq_mmv_h2_log(ctx.device, h2_cc, 0, false, h2_why, fmt, (int)R, (int)K, 1);
+        }
+        if (pxa_pxq6_rowx2()) {
+            auto * k2 = pxq6_pick_mmv_x2(fmt, pair, vecx);
+            pxa_pxq6_rowx2_log(0, k2 != nullptr);
+            if (k2) { kern = k2; nthr_mmv = 128; }
+        }
+        if (nthr_mmv == 256 && (pxa_pxq6_qpf() & 1)) {   // Q1 yields to an engaged R2 twin
+            auto * kq = pxq6_pick_mmv_qp(fmt, pair, vecx);
+            pxa_pxq6_qpf_log(0, kq != nullptr);
+            if (kq) kern = kq;
+        }
     }
 
     cudaStream_t stream = ctx.stream();
@@ -4892,7 +5056,7 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         // higher (fill) than the per-token S. Declines (lever off, ny==1, no instantiation,
         // smem cap unmeetable) fall through to the per-token launches unchanged.
         const int tok_req = pxa_pxq_mmv_tok();
-        if (tok_req >= 2 && ny >= 2) {
+        if (tok_req >= 2 && ny >= 2 && !h2) {   // no h2 form of the TOK twin: the armed lever wins
             const int tok = ny < (int64_t)tok_req ? (int)ny : tok_req;
             auto * kt = pxq6_pick_mmv_ksplit_gen_tok(fmt, pair, vecx, tok);
             auto smem_tok = [&](int Sx) {
@@ -4937,15 +5101,26 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         if (S > 1) {
             auto * ksg = pxq6_pick_mmv_ksplit_gen(fmt, pair, vecx);
             int nthr_ksg = 256;
-            if (ksg && pxa_pxq6_rowx2()) {
-                auto * k2 = pxq6_pick_mmv_ksplit_gen_x2(fmt, pair, vecx);
-                pxa_pxq6_rowx2_log(1, k2 != nullptr);
-                if (k2) { ksg = k2; nthr_ksg = 128; }
-            }
-            if (ksg && nthr_ksg == 256 && (pxa_pxq6_qpf() & 1)) {   // Q1 yields to an engaged R2 twin
-                auto * kq = pxq6_pick_mmv_ksplit_gen_qp(fmt, pair, vecx);
-                pxa_pxq6_qpf_log(1, kq != nullptr);
-                if (kq) ksg = kq;
+            if (h2) {
+                auto * kh = pxq6_pick_mmv_ksplit_gen_h2(fmt);
+                pxa_pxq_mmv_h2_log(ctx.device, h2_cc, 1, kh != nullptr,
+                                   kh ? nullptr : "no-kernel-instantiation-for-this-tier", fmt, (int)R, (int)K, S);
+                if (kh) ksg = kh;
+            } else {
+                // Same rule as the plain arm above: only an ARMED lever owes an explanation.
+                if (pxa_pxq_mmv_h2_mask()) {
+                    pxa_pxq_mmv_h2_log(ctx.device, h2_cc, 1, false, h2_why, fmt, (int)R, (int)K, S);
+                }
+                if (ksg && pxa_pxq6_rowx2()) {
+                    auto * k2 = pxq6_pick_mmv_ksplit_gen_x2(fmt, pair, vecx);
+                    pxa_pxq6_rowx2_log(1, k2 != nullptr);
+                    if (k2) { ksg = k2; nthr_ksg = 128; }
+                }
+                if (ksg && nthr_ksg == 256 && (pxa_pxq6_qpf() & 1)) {   // Q1 yields to an engaged R2 twin
+                    auto * kq = pxq6_pick_mmv_ksplit_gen_qp(fmt, pair, vecx);
+                    pxa_pxq6_qpf_log(1, kq != nullptr);
+                    if (kq) ksg = kq;
+                }
             }
             if (ksg) {
                 // PXQ_CANON_v1 workspace: raw per-(fixed-chunk, lane) partials
@@ -4991,6 +5166,10 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     if (pxa_pxq4_2d_ksplit() && (int64_t)panels*ny < (int64_t)pxa_pxq4_2d_ksplit_minblk(ctx.device)) {
         auto * ks = pxq6_pick_mmv_ksplit(fmt, pair, vecx);
+        if (h2) {
+            auto * kh = pxq6_pick_mmv_ksplit_h2(fmt);
+            if (kh) ks = kh;
+        }
         if (ks) {
             const size_t need = (size_t)ny*PXQ4_MMV_KSEG*(size_t)R;
             float * ws = pxq6_ksplit_workspace(ctx.device, stream, need);
@@ -5205,7 +5384,7 @@ static inline void pxa_x_cache_log(int device, bool hit, int64_t ny, int64_t K) 
 // Stock MMQ quantizes the ubatch's activations ONCE (quantize_mmq_q8_1 on src1) and every weight
 // in the graph then reads that one buffer; our driver is per-MUL_MAT, so without this the q, k and
 // v projections would each re-quantize the identical `cur`, and gate/up would do it twice more.
-// That is pure overhead against the dequant saving the tile exists to collect (main #282 note 2).
+// That is pure overhead against the dequant saving the tile exists to collect.
 //
 // Same key and same safety argument as PXA_X_CACHE: the src1 tensor OBJECT, its data pointer,
 // ny/K, AND the requirement that the previous stage ran on the IMMEDIATELY preceding executed
@@ -5223,6 +5402,15 @@ struct pxa_aq_cache_t {
     uint64_t key_seq = 0;
 };
 
+// INERT UNLESS ITS PARENT IS SET -- read this before concluding anything from this gate's value.
+// PXA_PXQ4_MMQ_ACACHE defaults ON (unset => on), so it reads as an armed lever in any env-presence
+// scan, but its ONLY call site (pxa_pxq_gemm_2d) reaches it inside `if (use_mmq)`, and use_mmq
+// requires PXA_PXQ4_MMQ (mmq_env != 0) plus an arch and a shape class that pass their own gates.
+// PXA_PXQ4_MMQ is DEFAULT OFF and is a MEASURED LOSS on sm_70 (-49.5% prefill, 2026-09-03, see
+// pxq4-mmq.cuh:44-56), so on a default run this cache cannot fire and its default-ON state is NOT
+// evidence that it ran. Do NOT "fix" this by flipping the default: that default is what lets the
+// mmq arm be re-measured in the same configuration it was rejected in. This is a stage-reuse CACHE
+// belonging to a rejected arm -- not a speed lever, and no row claims it is one.
 static inline bool pxa_aq_cache_on() {
     static const bool v = [] {
         const char * e = getenv("PXA_PXQ4_MMQ_ACACHE");
@@ -5535,7 +5723,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
     const int64_t n_ids = ids->ne[0];
     const int64_t Ny    = src1->ne[2];
-    const int   unary = (uop == GGML_UNARY_OP_SWIGLU_OAI) ? 1 : 0;
+    const int   unary = pxa_fmoe_unary_code(dst);
     const float limit = (uop == GGML_UNARY_OP_SWIGLU_OAI) ? 7.0f : *(const float *)(dst->op_params + 1);
 
     const ggml_tensor * bu = dst->src[4], * bg = dst->src[5];
@@ -5853,6 +6041,172 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
     return i;
 }
 
+// ===================== STANDALONE routed-expert decode mmv (PXA_PXQ_MOE_MMV_ID) =====================
+//
+// WHY THIS EXISTS (2026-09-08). Every PXQ MoE driver above is reachable only
+// from GGML_OP_MOE_FUSED_UP_GATE. An architecture whose routed experts do NOT fuse up+gate
+// therefore reaches none of them: its three MUL_MAT_ID nodes (up, gate, down) fall into the
+// generic ggml_cuda_mul_mat_id per-expert loop, and that loop's prepare_row_mappigs does a
+// D2H memcpy + cudaStreamSynchronize INSIDE graph compute for every node, then launches
+// copy_src / mmv / copy_dst per routed expert.
+//
+// GLM-5.3-Flash (glm5next) is exactly that architecture: llm_build_moe_ffn sets dsv4_clamp for
+// LLM_ARCH_GLM5NEXT (the routed experts clamp up to [-limit,limit] and gate to [-inf,limit]
+// BEFORE the SwiGLU), which forces can_use_fmoe = false. The cost at 42 MoE blocks x 3 nodes is
+// 126 full device syncs and ~3000 kernel launches PER DECODE TOKEN -- which is what the op
+// profile reported as "MUL_MAT_ID = 41% of device time" (ffn_moe_down/up/gate ~13% each; those
+// cb() names exist only on the UNFUSED branch, and are the fingerprint of this path).
+//
+// THE FIX IS NOT A NEW KERNEL. k_pxq6_mmv is already expert-stacked and already reads its expert
+// id from a device ids tensor -- the MoE fused-down fusion launches it over (panels, n_ids, ny)
+// exactly like this. pxa_pxq_mmv_2d reuses the same kernel with a one-entry {0} ids for the E==1
+// case. This driver is the third and last member of that family: the real ids, one launch, no
+// host readback, no per-expert loop, no contiguous staging buffers.
+//
+// NUMERICS. The per-expert loop already ends up in this same k_pxq6_mmv (through
+// pxa_pxq_mmv_2d), with the same panel base address, the same PXQ_CANON_v1 chunk fold and the
+// same red[] reduction; only the grid changes. Output is bit-identical, and the only reason the
+// lever exists is to make that A/B runnable from one binary (PXA_PXQ_MOE_MMV_ID=0 = old path).
+//
+// SCOPE. Decode / small verify batches only (ny <= PXA_MOE_FASTTG_MAX_NY, default 8). At larger
+// ny a per-(token, slot) mmv re-reads each expert panel once per token, which is strictly worse
+// than the prefill loop's read-each-expert-once; prefill is left untouched.
+static inline bool pxa_pxq_moe_mmv_id_on() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_PXQ_MOE_MMV_ID");
+        return !(e && atoi(e) == 0);
+    }();
+    return v;
+}
+
+// The tracer gate is cached like every other lever in this file, because with the declines logging
+// it now sits on a path taken once per unfused MUL_MAT_ID node rather than only on the taken path.
+static inline bool pxa_pxq_moe_mmv_id_trace() {
+    static const bool v = (getenv("PXA_PXQ_MOE_MMV_ID_LOG") != nullptr);
+    return v;
+}
+
+// TRACER FOR BOTH OUTCOMES, deliberately (bug pxq-moe-mmv-id-decision-behind-log-gate).
+// Before this it was reachable from exactly ONE of the eighteen exits of pxa_pxq_moe_mmv_id -- the
+// success path -- so an operator who set PXA_PXQ_MOE_MMV_ID_LOG=1 to find out why the routed path was
+// NOT being taken got nothing at all: the "declined" arm of the format string was dead code, and a
+// silence indistinguishable from "the path was fine" is this campaign's failure class. All seventeen
+// declines below now name their own reason. The env gate stays -- a default-ON lever must not write
+// to every server's stderr -- but it now gates the TRACER, not one of its two outcomes.
+static void pxa_pxq_moe_mmv_id_log(int device, const char * reason, bool fired, int R, int K,
+                                   int n_as, int n_ids, int ny, int panels, int xslot) {
+    if (!pxa_pxq_moe_mmv_id_trace()) return;
+    // One line per DISTINCT reason, NOT the first N lines. The dispatch below runs once per unfused
+    // MUL_MAT_ID node, so a plain counter is exhausted by the same reason repeating across nodes and
+    // the operator never reaches the reason that actually applies to their case -- the same
+    // "silence indistinguishable from a pass" that this tracer exists to remove, one level up. The
+    // reasons are all string literals with static storage duration, so comparing the POINTERS is
+    // both correct and cheap, and the cap now bounds distinct reasons rather than lines. A benign
+    // race between backends can at worst duplicate a line. 24 > the 17 decline reasons + "fired",
+    // so every reason is reachable.
+    static const char * seen[32];
+    static std::atomic<int> n_seen{0};
+    const int have = n_seen.load(std::memory_order_relaxed);
+    for (int i = 0; i < have && i < 32; ++i) {
+        if (seen[i] == reason) return;
+    }
+    const int slot = n_seen.fetch_add(1);
+    if (slot < 32) seen[slot] = reason;
+    if (slot >= 24) return;
+    fprintf(stderr, "PXA_PXQ_MOE_MMV_ID dev%d %s (%s) R=%d K=%d n_as=%d n_ids=%d ny=%d grid=(%d,%d,%d) xslot=%d\n",
+            device, fired ? "FIRED" : "declined", reason, R, K, n_as, n_ids, ny, panels, n_ids, ny, xslot);
+}
+
+static int pxa_pxq_moe_mmv_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Every exit below names itself. The shape fields live in locals declared up here so a decline
+    // that fires BEFORE the shape is established still reports the shape it has (-1 = not yet
+    // known) instead of nothing. See the tracer's comment for why this matters.
+    int tr_R = -1, tr_K = -1, tr_nas = -1, tr_nids = -1, tr_ny = -1, tr_panels = -1, tr_xslot = -1;
+    #define PXA_MMV_ID_DECLINE(why)                                                       \
+        do {                                                                              \
+            pxa_pxq_moe_mmv_id_log(ctx.device, (why), false, tr_R, tr_K, tr_nas, tr_nids,  \
+                                   tr_ny, tr_panels, tr_xslot);                           \
+            return -1;                                                                    \
+        } while (0)
+
+    if (!pxa_pxq_moe_mmv_id_on()) PXA_MMV_ID_DECLINE("lever-off");
+
+    const ggml_tensor * src0 = dst->src[0];   // [K, R, n_as]  expert-stacked PXQ slabs
+    const ggml_tensor * src1 = dst->src[1];   // [K, ne11, ny] activations (ne11 = 1 or n_ids)
+    const ggml_tensor * ids  = dst->src[2];   // [n_ids, ny]   i32 expert ids
+    if (!src0 || !src1 || !ids) PXA_MMV_ID_DECLINE("missing-src");
+
+    const int fmt = pxa_pxq_fmt(src0->type);
+    if (fmt == PXA_PXQ_FMT_NONE) PXA_MMV_ID_DECLINE("src0-not-a-pxq-format");
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) PXA_MMV_ID_DECLINE("src1-or-dst-not-f32");
+    if (ids->type != GGML_TYPE_I32) PXA_MMV_ID_DECLINE("ids-not-i32");
+
+    const int64_t K = src0->ne[0], R = src0->ne[1], n_as = src0->ne[2];
+    const int64_t n_ids = ids->ne[0];
+    const int64_t Ny    = dst->ne[2];
+    tr_R = (int)R; tr_K = (int)K; tr_nas = (int)n_as; tr_nids = (int)n_ids; tr_ny = (int)Ny;
+    if (src0->ne[3] != 1 || !ggml_is_contiguous(src0)) PXA_MMV_ID_DECLINE("src0-not-3d-contiguous");
+    if (dst->ne[0] != R || dst->ne[1] != n_ids || dst->ne[3] != 1) PXA_MMV_ID_DECLINE("dst-shape-mismatch");
+    if (src1->ne[0] != K || src1->ne[2] != Ny || src1->ne[3] != 1) PXA_MMV_ID_DECLINE("src1-shape-mismatch");
+    if (ids->ne[1] != Ny) PXA_MMV_ID_DECLINE("ids-ne1-ne-ny");
+
+    // decode / small verify window only (see SCOPE above); shares the fast-TG lever so the two
+    // decode paths can never disagree about what "a decode batch" is.
+    static const int max_ny = getenv("PXA_MOE_FASTTG_MAX_NY") ? atoi(getenv("PXA_MOE_FASTTG_MAX_NY")) : 8;
+    if (Ny < 1 || Ny > max_ny) PXA_MMV_ID_DECLINE("ny-outside-decode-window");
+
+    // x broadcast: ne11 == 1 (one activation row shared by every slot, the up/gate case) or
+    // ne11 == n_ids (one row per routed slot, the down case). ggml_mul_mat_id only guarantees
+    // ids->ne[0] % b->ne[1] == 0; anything else is declined rather than mis-strided.
+    tr_xslot = (int)src1->ne[1];
+    size_t x_slot_stride;
+    if (src1->ne[1] == 1)          x_slot_stride = 0;
+    else if (src1->ne[1] == n_ids) x_slot_stride = src1->nb[1];
+    else PXA_MMV_ID_DECLINE("ne11-neither-1-nor-n_ids");
+
+    // row-contiguous f32 on both sides (the kernel indexes x[0..K) and out[0..R) directly)
+    if (src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) PXA_MMV_ID_DECLINE("x-or-out-not-row-contig-f32");
+    if (ids->nb[0] != sizeof(int32_t)) PXA_MMV_ID_DECLINE("ids-not-row-contig-i32");
+
+    if (K % PXQ6_QK || R % PXQ6_BM) PXA_MMV_ID_DECLINE("K-mod-QK-or-R-mod-BM");  // slab width / 64-row panel height
+    if (!pxa_pxq4_bufs_on_device(ctx, {src0, src1, ids, dst})) PXA_MMV_ID_DECLINE("bufs-not-on-device");
+
+    // plain (unsplit) form stages the whole x vector: same cap as pxa_pxq_mmv_2d's S == 1 arm.
+    const size_t smem = (size_t)K*sizeof(float) + PXQ4_MMV_KSEG*64*sizeof(float);
+    if (smem > 46*1024) PXA_MMV_ID_DECLINE("smem-over-46KiB-cap");
+
+    if (fmt >= PXA_PXQ_FMT_P6) pxq6_maybe_upload_tables(ctx.device);
+    if (fmt >= PXA_PXQ_FMT_P2) pxq23_maybe_upload_books(ctx.device);
+
+    const int  pair = pxa_pxq6_decode_mode();
+    const bool vecx = pxa_pxq6_vecx();
+    auto * kern = pxq6_pick_mmv(fmt, pair, vecx);
+    if (!kern) PXA_MMV_ID_DECLINE("no-kernel-instantiation");  // no instantiation for this format
+    const int nthr = 256;
+    // The R2 (PXA_PXQ6_ROWX2) and Q1 (PXA_PXQ6_QPF) twins are deliberately NOT wired here: both
+    // are default-off, and their phantom-lever log tables in pxq6.cuh only carry ids for the six
+    // existing dispatch sites. Adding a seventh belongs with a measurement of that twin, not
+    // with this driver.
+
+    const int panels = (int)(R/PXQ6_BM);
+    tr_panels = panels;
+    pxa_pxq_moe_mmv_id_log(ctx.device, "fired", true, tr_R, tr_K, tr_nas, tr_nids, tr_ny,
+                           tr_panels, tr_xslot);
+
+    // dst was zeroed by the caller, so a block whose id is out of range (SER) simply returns and
+    // leaves the zero row -- the same result the per-expert loop produces for an unrouted slot.
+    dim3 grid((unsigned)panels, (unsigned)n_ids, (unsigned)Ny);
+    kern<<<grid, nthr, smem, ctx.stream()>>>(
+        (const uint8_t *)src0->data,
+        (const char *)src1->data, src1->nb[2], x_slot_stride,
+        (char *)dst->data, dst->nb[2], dst->nb[1],
+        (const char *)ids->data, ids->nb[0], ids->nb[1],
+        (int)R, (int)K, (int)n_as);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+#undef PXA_MMV_ID_DECLINE
+
 // prefill: grouped fused GEMMs over ALL routed experts in one launch per projection
 static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_cgraph * graph, int i) {
@@ -5881,7 +6235,7 @@ static int pxa_pxq4_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * d
     cudaStream_t stream = ctx.stream();
     const int64_t n_as  = src0_1->ne[2];
     const int64_t n_ids = ids->ne[0];
-    const int   unary = (uop == GGML_UNARY_OP_SWIGLU_OAI) ? 1 : 0;
+    const int   unary = pxa_fmoe_unary_code(dst);
     const float glu_limit = (uop == GGML_UNARY_OP_SWIGLU_OAI) ? 7.0f : *(const float *)(dst->op_params + 1);
 
     const bool fuse_down = next && next->op == GGML_OP_MUL_MAT_ID &&
@@ -6096,7 +6450,7 @@ static int pxa_pxq_moe_prefill_i8(ggml_backend_cuda_context & ctx, ggml_tensor *
     cudaStream_t stream = ctx.stream();
     const int64_t n_as  = src0_1->ne[2];
     const int64_t n_ids = ids->ne[0];
-    const int   unary = (uop == GGML_UNARY_OP_SWIGLU_OAI) ? 1 : 0;
+    const int   unary = pxa_fmoe_unary_code(dst);
     const float glu_limit = (uop == GGML_UNARY_OP_SWIGLU_OAI) ? 7.0f : *(const float *)(dst->op_params + 1);
 
     const int fmt_d = (next && next->op == GGML_OP_MUL_MAT_ID) ? pxa_pxq_fmt(next->src[0]->type) : PXA_PXQ_FMT_NONE;
@@ -6477,6 +6831,14 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         if (r < 0) r = pxa_pxq4_moe_prefill(ctx, dst, graph, i);
         if (r >= 0) return r;
     }
+
+    // Past every PXQ MoE driver. The DSV4/GLM asymmetric clamp (op_params[2] == 1) lives ONLY in
+    // their pxq4_glu_apply epilogue: nothing below can express it, and the q8_1 / cuBLAS
+    // fallbacks would silently compute the UNCLAMPED function. Fail loudly instead. A graph that
+    // cannot be served here should never have been built as a clamped fused node --
+    // ggml_moe_up_gate_clamped emits the explicit clamped decomposition in that case.
+    GGML_ASSERT(pxa_fmoe_clamp_mode(dst) == 0 &&
+                "MOE_FUSED_UP_GATE asymmetric clamp: no PXQ MoE driver took this node");
 
     // The heuristics src1->ne[2] <= 32*src0->ne[2] to use the mul_mat_id implementation instead of the original version
     // is derived from
@@ -7054,7 +7416,7 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
     // ONE kernel that walks the activation once for up and gate together (the fusion MXFP4 gets
     // and the per-operand divert below throws away).
     const bool pxq_mmvq_fug = pxa_pxq_mmvq_type(src0_1->type) && src0_1->type == src0_2->type
-        && pxa_pxq_mmvq_on(ggml_cuda_info().devices[ctx.device].cc)
+        && pxa_pxq_mmvq_on_type(ggml_cuda_info().devices[ctx.device].cc, src0_1->type)
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1
         && src0_1->ne[2] == 1 && src0_1->ne[3] == 1 && src1->type == GGML_TYPE_F32;
     // PXA_PXQ_MMVQ_FUGSPLIT (2026-08-10, default OFF): run the dense PXQ up/gate decode as TWO
@@ -7245,19 +7607,85 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
 
 }
 
-static inline bool ops_are_same_device(const ggml_cgraph * cgraph, int first, int last) {
+// PXA_FUSE_DEVGUARD_LOG=1: a per-call-site census of the cross-device guard below -- calls,
+// declines, and how many windows contained a tensor that is not on a CUDA buffer at all. That last
+// column is the interesting one: before 2026-09-09 such a window was decided by reading host bytes
+// as a device id, so every fusion whose window happens to span a host-side input VIEW was being
+// admitted or refused at random (in practice refused). The census says which fusions those were.
+// Single-threaded by construction: the scheduler computes one split at a time.
+struct pxa_devguard_row { int line; long calls; long reject; long host_seen; };
+static pxa_devguard_row pxa_devguard_rows[48];
+static int pxa_devguard_n = 0;
+
+static inline bool pxa_devguard_log_on() {
+    static const bool on = getenv("PXA_FUSE_DEVGUARD_LOG") != nullptr;
+    return on;
+}
+
+static void pxa_devguard_dump(void) {
+    if (pxa_devguard_n == 0) return;
+    fprintf(stderr, "==== PXA cross-device fusion guard census (call site = source line) ====\n");
+    fprintf(stderr, "  %-9s %-12s %-12s %-12s\n", "site", "calls", "declined", "host-buf");
+    for (int k = 0; k < pxa_devguard_n; ++k) {
+        const pxa_devguard_row & r = pxa_devguard_rows[k];
+        fprintf(stderr, "  L%-8d %-12ld %-12ld %-12ld\n", r.line, r.calls, r.reject, r.host_seen);
+    }
+    fprintf(stderr, "  host-buf = windows holding a tensor on a NON-CUDA buffer. Every one of those\n"
+                    "  was an undefined accept/decline before the 2026-09-09 buffer-type check.\n");
+    fflush(stderr);
+}
+
+static void pxa_devguard_tally(int line, bool reject, bool host_seen) {
+    static const bool armed = [] { atexit(pxa_devguard_dump); return true; }();
+    (void) armed;
+    pxa_devguard_row * r = nullptr;
+    for (int k = 0; k < pxa_devguard_n; ++k) {
+        if (pxa_devguard_rows[k].line == line) { r = &pxa_devguard_rows[k]; break; }
+    }
+    if (!r) {
+        if (pxa_devguard_n >= (int) (sizeof(pxa_devguard_rows)/sizeof(pxa_devguard_rows[0]))) return;
+        r = &pxa_devguard_rows[pxa_devguard_n++];
+        r->line = line; r->calls = 0; r->reject = 0; r->host_seen = 0;
+    }
+    r->calls++;
+    if (reject)    r->reject++;
+    if (host_seen) r->host_seen++;
+}
+
+// A fusion window straddles two devices only when two tensors in it sit on two DIFFERENT CUDA
+// buffers. A tensor that is not on a CUDA buffer carries no device and is skipped: that is the
+// host-side graph inputs and -- the case that mattered -- the VIEW nodes of those inputs, which the
+// scheduler leaves on the host buffer (it skips view ops before rewriting a split's srcs to device
+// copies) while handing the backend a plain range view of the full graph that still contains them.
+//
+// Until 2026-09-09 this predicate cast every buffer's context to a CUDA buffer context and read
+// ->device out of it, so for those host tensors it read the first bytes of host DATA as a device
+// id: undefined behaviour, and in practice a decline. That is why the DeltaNet state-row gather +
+// reset-mask fusion (PXA_FUSE_DELTANET bit2) never fired on any real decode graph -- the state
+// mask's VIEW node sits between its GET_ROWS and its MUL. Any other fusion whose window spans a
+// host-side input view was decided the same way; PXA_FUSE_DEVGUARD_LOG=1 counts them.
+static inline bool pxa_ops_same_device_impl(const ggml_cgraph * cgraph, int first, int last, int line) {
     if (last <= first) return true;
-    int device = ((const ggml_backend_cuda_buffer_context *)cgraph->nodes[first]->buffer->context)->device;
-    for (int i = first; i <= last; ++i) {
-        auto node = cgraph->nodes[i];
-        if (((const ggml_backend_cuda_buffer_context *)node->buffer->context)->device != device) return false;
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (!node->src[j] || !node->src[j]->buffer) continue;
-            if (((const ggml_backend_cuda_buffer_context *)node->src[j]->buffer->context)->device != device) return false;
+    int  device    = -1;
+    bool host_seen = false;
+    bool same      = true;
+    for (int i = first; i <= last && i < cgraph->n_nodes && same; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int j = -1; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * t = j < 0 ? node : node->src[j];
+            if (!t || !t->buffer) continue;
+            if (!ggml_backend_buffer_is_cuda(t->buffer)) { host_seen = true; continue; }
+            const int d = ((const ggml_backend_cuda_buffer_context *) t->buffer->context)->device;
+            if (device < 0) { device = d; continue; }
+            if (d != device) { same = false; break; }
         }
     }
-    return true;
+    if (pxa_devguard_log_on()) pxa_devguard_tally(line, !same, host_seen);
+    return same;
 }
+
+// Every call site keeps the old spelling and gets its source line into the census for free.
+#define ops_are_same_device(cgraph, first, last) pxa_ops_same_device_impl((cgraph), (first), (last), __LINE__)
 
 // G2-F3: does the FUSED_RMS_NORM output `dst` feed at least one q8_1-quantized GEMV consumer
 // (a quantized mmvq MUL_MAT, or a FUSED_UP_GATE, on this device) within the lookahead window?
@@ -7363,6 +7791,16 @@ static inline void pxa_g2_addfuse_dbg(const ggml_tensor * norm, const ggml_tenso
             ggml_nbytes(norm), ggml_nbytes(a), ggml_nbytes(b));
 }
 
+// PXA_RMS_SCALE_FUSE: env-only (not LEVEL-defaulted) until it has an A/B on the seat it is
+// meant for. Set PXA_RMS_SCALE_FUSE=1 to enable.
+static inline bool pxa_rms_scale_fuse() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_RMS_SCALE_FUSE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
 static bool pxa_g2_sole_consumer(const ggml_cgraph * cgraph, int i, const ggml_tensor * t, const ggml_tensor * except) {
     for (int j = i + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
@@ -7378,6 +7816,7 @@ static bool pxa_g2_sole_consumer(const ggml_cgraph * cgraph, int i, const ggml_t
 
 #include "ggml-cuda/pxa/pxa-deltanet-fuse.cuh"
 #include "ggml-cuda/pxa/pxa-ew-fuse.cuh"
+#include "ggml-cuda/pxa/pxa-sibling-fuse.cuh"
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst, const ggml_cgraph * cgraph, int & i) {
 
@@ -7397,6 +7836,16 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     // makes "nothing wrote through an alias of src1 in between" true rather than hoped for.
     pxa_op_seq.fetch_add(1, std::memory_order_relaxed);
 
+    // PXA_FUSE_DELTANET bit2 with PXA_DN_GM_WINDOW>1: this node's work was already done by the
+    // fused gather+mask launch that consumed it a few nodes back. Placed AFTER the clock tick on
+    // purpose: the node is a real one that really executed, just earlier, so the tick count stays
+    // exactly what the eager sequence would have produced and the activation cache's "immediately
+    // preceding tick" rule is unchanged. Not reachable at the default window, where the fused pair
+    // is always adjacent and the caller simply advances past it.
+    if (pxa_dn_gm_absorbed_n && pxa_dn_gm_absorb_take(dst)) {
+        return true;
+    }
+
     auto next = i < cgraph->n_nodes - 1 ? cgraph->nodes[i+1] : nullptr;
 
     auto fusion = ctx.fusion;
@@ -7408,6 +7857,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         const int pxa_ew_n = pxa_try_ew_chain(ctx, cgraph, i);
         if (pxa_ew_n > 0) {
             i += pxa_ew_n - 1;
+            return true;
+        }
+    }
+
+    // PXA_FUSE_SIBLINGS: merge a run of consecutive same-op same-shape INDEPENDENT nodes into one
+    // launch (bit-identical; see pxa-sibling-fuse.cuh). The census arm counts the runs without
+    // merging anything, so "does this pattern occur on our graphs" can be answered on the OFF arm.
+    if (pxa_fuse_siblings_census()) {
+        pxa_sib_census_node(cgraph, i);
+    }
+    if (fusion && pxa_fuse_siblings_enabled()) {
+        const int pxa_sib_n = pxa_try_sibling_fuse(ctx, cgraph, i);
+        if (pxa_sib_n > 0) {
+            i += pxa_sib_n - 1;
             return true;
         }
     }
@@ -7764,7 +8227,22 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_leaky_relu(ctx, dst);
             break;
         case GGML_OP_RMS_NORM:
-            ggml_cuda_op_rms_norm(ctx, dst);
+            // PXA_RMS_SCALE_FUSE: RMS_NORM -> SCALE in one launch. glm5next writes FLA's L2 norm
+            // as scale(rms_norm(x, eps/S), 1/sqrt(S)) rather than ggml_l2_norm so it stays
+            // bit-comparable with the reference build (build_glm5next.cpp:227-236); that costs
+            // two extra full-tensor passes per KDA block, 34 blocks deep. The fused kernel writes
+            // scale_f32's own expression applied to rms_norm's own value, so folding them is
+            // bit-identical rather than an approximation.
+            if (pxa_rms_scale_fuse() && fusion && next && next->op == GGML_OP_SCALE &&
+                next->src[0] == dst && next->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(dst, next) && ggml_is_contiguous(next) &&
+                ops_are_same_device(cgraph, i, i+1) &&
+                pxa_g2_sole_consumer(cgraph, i, dst, next)) {
+                ggml_cuda_op_rms_norm_scale_fused(ctx, dst, next);
+                ++i;
+            } else {
+                ggml_cuda_op_rms_norm(ctx, dst);
+            }
             break;
         case GGML_OP_FUSED_RMS_NORM:
             if (fusion && pxa_try_deltanet_outgate(ctx, cgraph, i)) {
@@ -8028,6 +8506,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MASK_TO_IDX:
             ggml_cuda_op_mask_to_idx(ctx, dst);
+            break;
+        case GGML_OP_QSA_TOPK:
+            ggml_cuda_op_qsa_topk(ctx, dst);
+            break;
+        case GGML_OP_KPOOL_SCORE:
+            ggml_cuda_op_kpool_score(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
@@ -9245,6 +9729,10 @@ extern "C" void ggml_cuda_timeline_epoch(void) {
 }
 
 GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // PXA_FUSE_DELTANET bit2: nothing may be carried across graph-compute calls. An entry is only
+    // ever registered for a node ahead of the current one in THIS pass, so an aborted pass is the
+    // only way one could survive; clear here so it cannot.
+    pxa_dn_gm_absorb_reset();
     // PXA_SCHED_TIMELINE: bracket this split's enqueue on the split device's own stream
     ggml_backend_cuda_context * pxa_tl_ctx = (ggml_backend_cuda_context *)backend->context;
     const bool pxa_tl_rec_on = pxa_tl_path() && !pxa_tl_done && pxa_tl_epoch >= 0 && pxa_tl_recs.size() < 4096;
@@ -9623,6 +10111,11 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
+                    // PXA_GLM5NEXT: I32 -> I32 is a pure row copy and is what the DSA indexer's
+                    // pool-to-cell expansion needs; without it that node fell back to the CPU
+                    // backend and split the graph once per MLA block.
+                    case GGML_TYPE_I32:
+                        return op->type == GGML_TYPE_I32;
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_Q4_0:
@@ -9630,7 +10123,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
-                        return true;
+                        return op->type == GGML_TYPE_F32;
                     default:
                         return false;
                 }
@@ -9845,6 +10338,31 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_QSA_TOPK:
+            // the gate and the implementation must agree: one block per row, F32 in, I32 out,
+            // contiguous rows, and the k survivors are sorted in shared memory so k is capped
+            {
+                const int k = ggml_get_op_params_i32(op, 0);
+                return op->type == GGML_TYPE_I32 &&
+                       op->src[0]->type == GGML_TYPE_F32 &&
+                       ggml_is_contiguous(op->src[0]) &&
+                       k > 0 && k <= 2048 && (int64_t) k <= op->src[0]->ne[0];
+            }
+        case GGML_OP_KPOOL_SCORE:
+            // the gate and the implementation must agree: the kernel is all-F32,
+            // reads contiguous [n_pool, n_tokens, n_head] / [n_head, n_tokens] and an
+            // optional contiguous [n_pool, n_tokens] mask, and is instantiated for
+            // power-of-two head counts up to 32 only.
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                   (!op->src[2] || op->src[2]->type == GGML_TYPE_F32) &&
+                   ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   (!op->src[2] || ggml_is_contiguous(op->src[2])) &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[0]->ne[2] >= 4 && op->src[0]->ne[2] <= 32 &&
+                   (op->src[0]->ne[2] & (op->src[0]->ne[2] - 1)) == 0;
         case GGML_OP_MASK_TO_IDX:
             // the gate and the implementation must agree (the I32->I32 cpy lesson):
             // k_mask_to_idx handles F16/F32 masks only, writes I32, and indexes both
@@ -10211,26 +10729,58 @@ GGML_CALL const char * ggml_backend_cuda_get_device_pxa_path(int device) {
 // the campaign chart numbers are all at the values below, and a P100 pair served at the generic
 // ub-2048 default gives up a third of its prefill.
 //
-// The table is exactly the measured cells and nothing more (the measurement ledger,
-// entries 2026-09-03 19:00-23:00, Qwable-27B-PXQ4core / PXQ2 on the 1080 Ti):
+// The table is exactly the measured cells and nothing more (measured 2026-09-03, PXQ4core / PXQ2
+// on a 1080 Ti):
 //
 //   2x sm_70   -b 8192 -ub 2048   prefill 1340 t/s @3k, 1282 @20k, decode 39.7 t/s
 //   2x sm_60   -b 8192 -ub  256   prefill  340 t/s @3k,  317 @20k, decode 17.8 t/s
 //   1x sm_61   -b 2048 -ub  768   prefill 1306 t/s cold (fa-off), 729 chat, decode 59.2 t/s
-//   4x sm_60   -b 2048 -ub 2048   Flash-Next 177B hybrid MoE seat, quiet 2026-09-04: prefill 478.27 t/s
-//                                 @3121, 400.44 @20801 (BRAG-BOARD-2026-09-05.md:75-76, docs/COOKBOOK.md
-//                                 181-223). Added 2026-09-06 (AUTO-DEFAULTS-AUDIT gap b, order #1400a):
+//   4x sm_60   -b 2048 -ub 2048   Flash-Next 177B hybrid MoE, quiet box 2026-09-04: prefill 478.27 t/s
+//                                 @3121, 400.44 @20801 (see docs/COOKBOOK.md). Added 2026-09-06:
 //                                 a stock 4x P100 boot fell through to the VRAM ladder, whose uniform-
-//                                 split estimate is wrong for the seat's deliberately uneven -ts and
-//                                 floored -ub to 512 -> 377.67 t/s @3121 (Phase P alex-ref, #1317).
-//                                 -wgt has no auto path; the seat still passes -wgt 8 by hand.
+//                                 split estimate is wrong for a deliberately uneven -ts and
+//                                 floored -ub to 512 -> 377.67 t/s @3121 (measured on the 4x P100
+//                                 reference boot). -wgt has no auto path; that recipe still passes
+//                                 -wgt 8 by hand.
+//              -b 2048 -ub  256   ON A DENSE FILE (2026-09-13, bracketed prefill windows on the same
+//                                 four cards). The 2026-09-04 cell above was measured on
+//                                 ONE model, a 177B hybrid MoE, and does not hold for the dense class
+//                                 on the same four cards: Qwen3.8-27B-PXQ4, -sm layer, -c 32768,
+//                                 medians of 3 inside bracketed windows (drift 0.19% and 0.30%),
+//                                 fills 505/3121/8223/20801 in tok/s ->
+//                                   -ub 2048  197.28 / 234.31 / 226.08 / 198.80
+//                                   -ub 1024  197.52 / 287.62 / 319.91 / 284.51
+//                                   -ub  512  196.24 / 388.24 / 399.80 / 354.67
+//                                   -ub  256  287.86 / 470.70 / 470.11 / 420.11   <- the knee
+//                                   -ub  128  303.21 / 274.86 / 259.54 / 228.88
+//                                 so 256 is +45.9/+100.9/+108.0/+111.3% over the old cell and the
+//                                 curve turns below it: 128 wins the short fill and collapses on the
+//                                 long ones. Time to first token at 20801 falls 104.8 s -> 49.7 s.
+//                                 Greedy output is byte-identical at every ubatch and prompt_n is
+//                                 unchanged, so this is a rate change and nothing else; decode does
+//                                 not move either (A-B-A with the shipping cascade: 17.04/18.14/18.40
+//                                 t/s at 2048 against 17.03/18.15/18.42 at 256, with identical draft
+//                                 accounting). The rate at -ub 2048 FALLS with prompt length and at
+//                                 -ub 256 it does not, which is the whole of the Pascal length-fall.
+//                                 The 2x sm_60 row two lines up already says 256; this makes the two
+//                                 Pascal cells agree instead of contradict.
+//
+// So the fourth row is the one place where the topology does not settle the answer and the FILE
+// does: the expert model wants the large ubatch and the dense model is crippled by it. The caller
+// therefore passes the expert count read from the file header before the model is loaded, and an
+// UNKNOWN (n_expert < 0) keeps the older, larger value -- a resolver that cannot ask the question
+// must not act as though it had, and 2048 is the value that recipe has been running.
+//
+// PXA_AUTO_UB_LONG is the lever: 0 = the pre-2026-09-13 behaviour exactly (2048 for every 4x sm_60
+// boot, so the rollback is one variable), 1 = force the small ubatch on this cell whatever the file
+// says, unset = the rule above.
 //
 // Every other shape returns 0 and keeps whatever the caller had. The mixed V100+P100 cell keeps the
 // stock value (its measured lever is -ts, handled separately).
 //
 // The caller must only apply this to flags the user left unset. REFERENCE stands it down and so
 // does PXA_ENHANCE=0, so the level-1 rollback really is the old behaviour end to end.
-GGML_CALL int ggml_backend_cuda_pxa_suggest_batch(int * n_batch, int * n_ubatch, const char ** why) {
+GGML_CALL int ggml_backend_cuda_pxa_suggest_batch(int n_expert, int * n_batch, int * n_ubatch, const char ** why) {
     if (ggml_pxa_config_level() < 2) {
         return 0;
     }
@@ -10254,7 +10804,25 @@ GGML_CALL int ggml_backend_cuda_pxa_suggest_batch(int * n_batch, int * n_ubatch,
     } else if (ndev == 1 && cc0 == 610) {
         b = 2048; ub =  768; name = "1x 1080 Ti (sm_61)";
     } else if (ndev == 4 && cc0 == 600) {
-        b = 2048; ub = 2048; name = "4x P100 (sm_60)";
+        // the one cell whose answer depends on the FILE -- see the block above.
+        const char * lv = getenv("PXA_AUTO_UB_LONG");
+        const int    lever = lv ? atoi(lv) : -1;   // -1 = unset = the measured rule
+        b = 2048;
+        if (lever == 0) {
+            ub = 2048; name = "4x P100 (sm_60), PXA_AUTO_UB_LONG=0 (pre-2026-09-13 flat cell)";
+        } else if (lever == 1) {
+            ub =  256; name = "4x P100 (sm_60), PXA_AUTO_UB_LONG=1 (small ubatch forced)";
+        } else if (n_expert > 0) {
+            ub = 2048; name = "4x P100 (sm_60), expert file (measured 2026-09-04 on the 177B hybrid MoE seat: "
+                              "478.27 t/s @3121 at -ub 2048 against 377.67 at -ub 512)";
+        } else if (n_expert == 0) {
+            ub =  256; name = "4x P100 (sm_60), dense file (measured 2026-09-13, windows prefill-p100-w2 "
+                              "and prefill2-p100-knee, record 5166: +45.9/+100.9/+108.0/+111.3% at fills "
+                              "505/3121/8223/20801 over -ub 2048, greedy output byte-identical)";
+        } else {
+            ub = 2048; name = "4x P100 (sm_60), expert count UNREADABLE - keeping the larger ubatch "
+                              "(pass -ub 512 by hand on a dense file; see PXA_AUTO_UB_LONG)";
+        }
     } else {
         return 0;
     }

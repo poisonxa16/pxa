@@ -11,6 +11,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cstdint>
 
 #define FATTN_KQ_STRIDE       256
@@ -707,6 +708,178 @@ static __global__ void flash_attn_combine_results(
     dst[blockIdx.y*Dv + tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// =================================================================================================
+// PXA_FA_F16_KV_CHUNK (2026-09-09): bound the F16 K/V conversion scratch on the no-tensor-core
+// prefill path.
+//
+// WHY. On a card with no fp16 matrix-multiply hardware the flash-attention dispatcher routes
+// prefill to the *tile* f16 kernel, which reads K and V as F16. With a QUANTIZED KV cache
+// (-ctk/-ctv q8_0 and friends) `launch_fattn` below therefore has to materialise an F16 copy of
+// the cache before it can launch, and it does that as ONE whole-tensor conversion into a single
+// scratch buffer. That buffer is 2 bytes per element of the *entire* K and V extent the graph is
+// running over, so it scales with context depth: at 150k context on a 4-card split it is the
+// single largest transient in the compute buffer, and it is charged to every layer's attention.
+//
+// Moving it to the pool does not fix it. The pool is grow-only: the first deep-context request
+// raises the high-water mark for the life of the process, so the ceiling is the same, just
+// reached lazily instead of at reservation time. On a seat configured for a deep context, a deep
+// request is a normal event, not an edge case.
+//
+// WHAT. Convert the cache in bounded chunks of `PXA_FA_F16_KV_CHUNK` KV tokens instead. Each
+// chunk runs the same FA kernel over its own slice of K/V/mask, emitting UNNORMALISED partial
+// outputs plus the per-row (max, sum) pair the kernel already knows how to write; a fold kernel
+// merges each chunk into a running accumulator with the online-softmax rescale. The conversion
+// scratch is then a fixed `chunk * n_head_kv * head_dim` halves regardless of how deep the
+// context runs, and the extra state is one output-sized accumulator plus one float2 per output
+// row -- both independent of context depth.
+//
+// WE ALREADY HAD HALF OF THIS. `flash_attn_combine_results` (above) is the engine's existing
+// online-softmax merge: it reduces `parallel_blocks` partials carrying exactly the same
+// float2(kqmax, kqsum) meta convention, and PXA_FA_KEYS_PER_SPLIT already drives that split count
+// on the decode vec path. It cannot be reused verbatim -- it is a one-shot reduction over a
+// compile-time split count that writes the *normalised* result and has no running-accumulator
+// input -- so the fold kernel below is new, but its arithmetic (max, ftz-masked expf rescale,
+// numerator/denominator accumulation) is that kernel's, term for term. There is one merge
+// convention in this backend, not two.
+//
+// SCOPE. Engages only where every one of these holds, and silently takes the old path otherwise:
+// the lever is armed; the caller supplied a chunk-capable kernel variant (only the tile f16
+// prefill kernel does); parallel_blocks == 1; there are no attention sinks (the kernel folds the
+// sink into the single-pass epilogue and a per-chunk fold would count it once per chunk); the
+// batch dimension is 1; K/V are laid out token-major and densely, so a token range is a byte
+// range; and the cache is DEEPER than one chunk. That last condition is what makes the lever
+// bit-identical at and below the chunk size: it is not a "chunked path that happens to agree",
+// it is the same code, unentered.
+//
+// NOT BIT-IDENTICAL ABOVE THE CHUNK SIZE, by construction. Splitting the key range changes the
+// order in which softmax partials are combined. The values are equivalent to fp32 round-off --
+// the same class of claim as PXA_FA_KEYS_PER_SPLIT -- not identical. Gate it with the
+// logit-spread determinism check at depth, not a greedy-sha comparison.
+//
+// DEFAULT OFF for this RC. `PXA_FA_F16_KV_CHUNK=0` (default) is today's whole-tensor conversion.
+// =================================================================================================
+#define PXA_FA_KV_CHUNK_GRAN FATTN_KQ_STRIDE // KV tile granularity a chunk boundary must respect
+
+static inline int pxa_fa_f16_kv_chunk() {
+    static const int v = [](){
+        const char * e = getenv("PXA_FA_F16_KV_CHUNK");
+        int n = e ? atoi(e) : 0;
+        if (n < 0) {
+            fprintf(stderr, "PXA_FA_F16_KV_CHUNK: %d is negative -- treated as 0 (whole-tensor conversion)\n", n);
+            return 0;
+        }
+        if (n) {
+            const int req = n;
+            n = (n / PXA_FA_KV_CHUNK_GRAN) * PXA_FA_KV_CHUNK_GRAN; // round DOWN to the KV tile grain
+            if (n == 0) {
+                n = PXA_FA_KV_CHUNK_GRAN;
+            }
+            fprintf(stderr, "PXA_FA_F16_KV_CHUNK: armed, %d KV tokens per conversion chunk "
+                            "(requested %d, rounded to a multiple of %d). Caps the F16 K/V "
+                            "conversion scratch on the tile-f16 prefill path; the softmax merge "
+                            "order CHANGES past one chunk -- not bit-identical; "
+                            "PXA_FA_F16_KV_CHUNK=0 reverts.\n", n, req, PXA_FA_KV_CHUNK_GRAN);
+        }
+        return n;
+    }();
+    return v;
+}
+
+// Fires once per (n_kv bucket) so an A/B can prove engagement rather than assume it; an arm
+// without this banner in the run log is void.
+static inline void pxa_fa_f16_kv_chunk_log(int n_kv, int chunk, int n_chunks, size_t scratch_bytes) {
+    static std::atomic<int> fired{0};
+    const int f = fired.fetch_add(1);
+    if (f < 4 || (f % 4096) == 0) {
+        fprintf(stderr, "PXA_FA_F16_KV_CHUNK: ENGAGED n_kv=%d chunk=%d -> %d chunks, "
+                        "K+V conversion scratch %.1f MiB (was %.1f MiB whole-tensor) [fire #%d]\n",
+                n_kv, chunk, n_chunks, scratch_bytes/1048576.0,
+                (scratch_bytes*(double)n_chunks)/1048576.0, f + 1);
+    }
+}
+
+// Fold one chunk's unnormalised partial into the running accumulator with the online-softmax
+// rescale, and -- on the last chunk -- normalise straight into the destination.
+//
+// The rescale is `flash_attn_combine_results`' inner loop, unrolled across launches instead of
+// across `parallel_blocks`: take the running max against the chunk's max, scale both numerators
+// and both denominators by exp(own_max - new_max), and flush a scale to zero when the exponent
+// is below SOFTMAX_FTZ_THRESHOLD. The FTZ mask is what makes an entirely-masked chunk free: the
+// tile kernel leaves such a chunk at its initial kqmax (-FLT_MAX/2, or -HALF_MAX_HALF) with a
+// zero denominator, the difference against any real max lands far below the threshold, and the
+// mask zeroes the scale before it can multiply anything. It also disarms the one NaN this
+// arithmetic can produce -- two initial maxima subtracted from each other -- because a NaN
+// difference fails the `>` test and is masked to zero too.
+//
+// One thread per output element; grid is (query column, head). Row index (j*n_head + h) matches
+// the FA kernel's own dst/dst_meta layout at parallel_blocks == 1.
+template<int Dv>
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+__launch_bounds__(Dv, 1)
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+static __global__ void pxa_flash_attn_chunk_fold(
+        const float  * __restrict__ part,
+        const float2 * __restrict__ part_meta,
+        float        * __restrict__ acc,
+        float2       * __restrict__ acc_meta,
+        float        * __restrict__ dst,   // non-null on the last chunk: normalise into it
+        const int      first) {
+    const int tid = threadIdx.x;
+    __builtin_assume(tid < Dv);
+
+    const size_t row = (size_t) blockIdx.x*gridDim.y + blockIdx.y; // (query column, head)
+    const size_t off = row*Dv + tid;
+
+    const float2 mc = part_meta[row];
+    const float  pv = part[off];
+
+    float2 ma;
+    float  av;
+
+    if (first) {
+        // First chunk: adopt it. Numerator and denominator are exactly what the kernel produced,
+        // so a single-chunk run reduces to the unchunked division element for element.
+        ma = mc;
+        av = pv;
+    } else {
+        ma = acc_meta[row];
+        av = acc[off];
+
+        const float m_new = fmaxf(ma.x, mc.x);
+
+        const float diff_a = ma.x - m_new;
+        const float diff_c = mc.x - m_new;
+
+        float scale_a = expf(diff_a);
+        float scale_c = expf(diff_c);
+
+        const uint32_t ftz_a = 0xFFFFFFFF * (diff_a > SOFTMAX_FTZ_THRESHOLD);
+        const uint32_t ftz_c = 0xFFFFFFFF * (diff_c > SOFTMAX_FTZ_THRESHOLD);
+        *((uint32_t *) &scale_a) &= ftz_a;
+        *((uint32_t *) &scale_c) &= ftz_c;
+
+        av   = scale_a*av   + scale_c*pv;
+        ma.y = scale_a*ma.y + scale_c*mc.y;
+        ma.x = m_new;
+    }
+
+    // acc_meta[row] is read by every thread in the block and rewritten by one of them, so the
+    // whole block has to be past its read before that write lands. Without this, warp 0 can
+    // overwrite the running (max, sum) while a later warp is still using the old one and that
+    // warp then rescales against the wrong maximum. Unconditional, and `dst` is a kernel
+    // argument, so the branch below is block-uniform either way.
+    __syncthreads();
+
+    if (dst) {
+        dst[off] = av / ma.y;
+    } else {
+        acc[off] = av;
+        if (tid == 0) {
+            acc_meta[row] = ma;
+        }
+    }
+}
+
 static void on_no_fattn_vec_case(const int Dk, const int Dv) {
     if (Dk == 64 && Dv == 64) {
         fprintf(stderr, "Unsupported KV type combination for head_size 64.\n");
@@ -743,7 +916,11 @@ static void on_no_fattn_vec_case(const int Dk, const int Dv) {
 template <int Dk, int Dv, int parallel_blocks>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel,
-    const int nwarps, const int cols_per_block, const bool need_f16_K, const bool need_f16_V
+    const int nwarps, const int cols_per_block, const bool need_f16_K, const bool need_f16_V,
+    // PXA_FA_F16_KV_CHUNK: the same kernel instantiated to emit UNNORMALISED partials plus the
+    // per-row (max, sum) meta at parallel_blocks == 1. Callers that do not supply one (all of
+    // them but the tile f16 prefill path) can never take the chunked route.
+    fattn_kernel_t fattn_kernel_chunked = nullptr
 ) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -780,7 +957,50 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    // PXA_FA_F16_KV_CHUNK: decide once, up front, whether this call takes the chunked route.
+    // Every condition here is a reason the chunked route would be wrong or pointless, so failing
+    // any of them leaves the call on the untouched whole-tensor path below.
+    ggml_cuda_pool_alloc<float>  pxa_acc(pool);
+    ggml_cuda_pool_alloc<float2> pxa_acc_meta(pool);
+
+    const int  pxa_chunk_req = pxa_fa_f16_kv_chunk();
+    bool       pxa_chunked   = false;
+    int64_t    pxa_chunk     = 0;
+
+    if (pxa_chunk_req > 0 && fattn_kernel_chunked != nullptr && parallel_blocks == 1 && !sinks) {
+        const size_t tsK = ggml_type_size(K->type), bsK = ggml_blck_size(K->type);
+        const size_t tsV = ggml_type_size(V->type), bsV = ggml_blck_size(V->type);
+        const size_t row_K = (size_t) K->ne[0]*tsK/bsK; // one head's key   row, in bytes
+        const size_t row_V = (size_t) V->ne[0]*tsV/bsV; // one head's value row, in bytes
+
+        // Something to convert -- otherwise there is no scratch to bound.
+        const bool convert = (need_f16_K && K->type != GGML_TYPE_F16) ||
+                             (need_f16_V && V->type != GGML_TYPE_F16);
+
+        // Token-major and dense: the heads tile one token's row exactly, so a token range is a
+        // contiguous byte range and a chunk can be converted with one call. A plain contiguous
+        // K/V, or any permuted view, fails this and falls back.
+        const bool dense   = nb12 == row_K && nb11 == row_K*(size_t) K->ne[2] &&
+                             nb22 == row_V && nb21 == row_V*(size_t) V->ne[2];
+
+        // The tile kernel indexes V with K's strides, so the two have to agree.
+        const bool same_kv = nb11 == nb21 && nb12 == nb22 && K->ne[1] == V->ne[1];
+
+        pxa_chunked = convert && dense && same_kv &&
+                      Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+                      K->ne[1] > (int64_t) pxa_chunk_req &&
+                      (!mask || mask->ne[0] >= K->ne[1]);
+
+        if (pxa_chunked) {
+            pxa_chunk = pxa_chunk_req;
+            pxa_fa_f16_kv_chunk_log((int) K->ne[1], (int) pxa_chunk,
+                                    (int) ((K->ne[1] + pxa_chunk - 1)/pxa_chunk),
+                                    (size_t) pxa_chunk*((size_t) K->ne[0]*K->ne[2] +
+                                                        (size_t) V->ne[0]*V->ne[2])*sizeof(half));
+        }
+    }
+
+    if (need_f16_K && !pxa_chunked && K->type != GGML_TYPE_F16) {
         K_f16.alloc(ggml_nelements(K));
         to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
         to_fp16(K_data, K_f16.ptr, 1, ggml_nelements(K), main_stream);
@@ -794,7 +1014,7 @@ void launch_fattn(
         nb13 = nb13*bs*sizeof(half)/ts;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && !pxa_chunked && V->type != GGML_TYPE_F16) {
         V_f16.alloc(ggml_nelements(V));
         to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
         to_fp16(V_data, V_f16.ptr, 1, ggml_nelements(V), main_stream);
@@ -811,6 +1031,15 @@ void launch_fattn(
     if (parallel_blocks > 1) {
         dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
         dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+    }
+
+    if (pxa_chunked) {
+        // One chunk's partials plus the running accumulator: four output-sized buffers in total,
+        // none of which depend on context depth.
+        dst_tmp.alloc(ggml_nelements(KQV));
+        dst_tmp_meta.alloc(ggml_nrows(KQV));
+        pxa_acc.alloc(ggml_nelements(KQV));
+        pxa_acc_meta.alloc(ggml_nrows(KQV));
     }
 
     const dim3 block_dim(WARP_SIZE, nwarps, 1);
@@ -834,6 +1063,101 @@ void launch_fattn(
 
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    if (pxa_chunked) {
+        // PXA_FA_F16_KV_CHUNK: walk the key range in bounded chunks. Each pass converts only its
+        // own slice of the cache, runs the FA kernel over that slice, and folds the unnormalised
+        // result into the accumulator; the last pass normalises straight into the destination.
+        const int64_t n_kv = K->ne[1];
+
+        const size_t elems_tok_K = (size_t) K->ne[0]*K->ne[2]; // elements per KV token, K side
+        const size_t elems_tok_V = (size_t) V->ne[0]*V->ne[2]; // ...and V side
+
+        const bool conv_K = need_f16_K && K->type != GGML_TYPE_F16;
+        const bool conv_V = need_f16_V && V->type != GGML_TYPE_F16;
+
+        if (conv_K) {
+            K_f16.alloc(pxa_chunk*elems_tok_K);
+        }
+        if (conv_V) {
+            V_f16.alloc(pxa_chunk*elems_tok_V);
+        }
+
+        const dim3 fold_blocks(Q->ne[1], Q->ne[2], 1);
+        const dim3 fold_block_dim(Dv, 1, 1);
+
+        for (int64_t kv0 = 0; kv0 < n_kv; kv0 += pxa_chunk) {
+            const int64_t cur = pxa_chunk < n_kv - kv0 ? pxa_chunk : n_kv - kv0;
+
+            // Token-major and dense (checked above), so the chunk is a byte offset.
+            char * K_cur = (char *) K->data + (size_t) kv0*nb11;
+            char * V_cur = (char *) V->data + (size_t) kv0*nb21;
+
+            size_t nb11_c = nb11, nb12_c = nb12, nb13_c = nb13;
+            size_t nb21_c = nb21, nb22_c = nb22, nb23_c = nb23;
+
+            if (conv_K) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+                to_fp16(K_cur, K_f16.ptr, 1, cur*elems_tok_K, main_stream);
+                K_cur = (char *) K_f16.ptr;
+
+                const size_t bs = ggml_blck_size(K->type);
+                const size_t ts = ggml_type_size(K->type);
+
+                nb11_c = nb11_c*bs*sizeof(half)/ts;
+                nb12_c = nb12_c*bs*sizeof(half)/ts;
+                nb13_c = nb13_c*bs*sizeof(half)/ts;
+            }
+
+            if (conv_V) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                to_fp16(V_cur, V_f16.ptr, 1, cur*elems_tok_V, main_stream);
+                V_cur = (char *) V_f16.ptr;
+
+                const size_t bs = ggml_blck_size(V->type);
+                const size_t ts = ggml_type_size(V->type);
+
+                nb21_c = nb21_c*bs*sizeof(half)/ts;
+                nb22_c = nb22_c*bs*sizeof(half)/ts;
+                nb23_c = nb23_c*bs*sizeof(half)/ts;
+            }
+
+            // The mask's fastest axis is the key index, so the chunk's mask is the same tensor
+            // read from a shifted origin with an unchanged query-row stride. kv0 is a multiple of
+            // the KV tile grain, so the shifted pointer keeps the half2 alignment the kernel's
+            // fully-masked-tile scan relies on.
+            const char * mask_cur = mask ? ((const char *) mask->data + (size_t) kv0*sizeof(half)) : nullptr;
+
+            fattn_kernel_chunked<<<blocks_num, block_dim, shmem, main_stream>>>(
+                (const char *) Q->data,
+                K_cur,
+                V_cur,
+                mask_cur,
+                nullptr, // sinks: the chunked route never engages for a model that has them
+                dst_tmp.ptr, dst_tmp_meta.ptr,
+                scale, max_bias, m0, m1, softcap, n_head_log2,
+                Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+                K->ne[0], cur,      K->ne[2], K->ne[3],
+                mask ? mask->ne[1] : 0, mask ?  mask->nb[1] : 0,
+                Q->nb[1], Q->nb[2], Q->nb[3],
+                nb11_c, nb12_c, nb13_c,
+                nb21_c, nb22_c, nb23_c,
+                KQV->ne[0], KQV->ne[1], KQV->ne[2], KQV->ne[3]
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            const bool first = kv0 == 0;
+            const bool last  = kv0 + cur >= n_kv;
+
+            pxa_flash_attn_chunk_fold<Dv>
+                <<<fold_blocks, fold_block_dim, 0, main_stream>>>
+                (dst_tmp.ptr, dst_tmp_meta.ptr, pxa_acc.ptr, pxa_acc_meta.ptr,
+                 last ? (float *) KQV->data : nullptr, first);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        return;
+    }
 
     fattn_kernel<<<blocks_num, block_dim, shmem, main_stream>>>(
         (const char *) Q->data,

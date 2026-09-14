@@ -22,6 +22,10 @@ json result_timings::to_json() const {
         base["draft_n_accepted"] = draft_n_accepted;
     }
 
+    if (forked_n > 0) {
+        base["forked_n"] = forked_n; // PXA_SLOT_FORK_v1
+    }
+
     return base;
 }
 

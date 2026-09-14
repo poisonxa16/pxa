@@ -86,6 +86,7 @@ enum llm_arch {
     LLM_ARCH_MUSE_GLIMMER,
     LLM_ARCH_DEEPSEEK4,
     LLM_ARCH_DEEPSEEK4_DSPARK,
+    LLM_ARCH_GLM5NEXT,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -189,6 +190,12 @@ enum llm_kv {
     LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,
     LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
     LLM_KV_ATTENTION_INDEXER_TOP_K,
+    // PXA_GLM5NEXT: GLM-5.3-Flash pools `kpool` consecutive tokens before scoring them.
+    LLM_KV_ATTENTION_INDEXER_KPOOL,
+    LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL,
+    // PXA_GLM5NEXT: Kimi Delta Attention geometry.
+    LLM_KV_KDA_HEAD_DIM,
+    LLM_KV_KDA_GATE_LOWER_BOUND,
     LLM_KV_FULL_ATTENTION_INTERVAL,
     LLM_KV_ATTENTION_SHARED_KV_LAYERS,
     LLM_KV_ATTENTION_KEY_LENGTH_SWA,
@@ -346,6 +353,15 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA_ALPHA,
     LLM_TENSOR_SSM_ALPHA,
     LLM_TENSOR_SSM_BETA,                    // 50
+    // PXA_GLM5NEXT: KDA projects q/k/v with three separate short convolutions and drives the
+    // forget gate and the output gate through two low-rank pairs.
+    LLM_TENSOR_SSM_CONV1D_Q,
+    LLM_TENSOR_SSM_CONV1D_K,
+    LLM_TENSOR_SSM_CONV1D_V,
+    LLM_TENSOR_SSM_F_A,
+    LLM_TENSOR_SSM_F_B,
+    LLM_TENSOR_SSM_G_A,
+    LLM_TENSOR_SSM_G_B,
     LLM_TENSOR_ATTN_Q_A,
     LLM_TENSOR_ATTN_Q_B,
     LLM_TENSOR_ATTN_KV_A_MQA,

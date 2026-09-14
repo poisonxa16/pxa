@@ -65,12 +65,17 @@ GGML_API GGML_CALL const char * ggml_backend_cuda_get_device_pxa_path(int device
 //
 // Returns 1 and writes *n_batch / *n_ubatch when the detected topology is a measured cell:
 //   2x sm_70 (V100 pair)   -> -b 8192 -ub 2048
-//   2x sm_60 (P100 pair)   -> -b 8192 -ub 256
-//   1x sm_61 (1080 Ti)     -> -b 2048 -ub 768
-// Returns 0 and touches nothing for every other topology (including the 4x P100 seat, which
-// passes -b/-ub explicitly), at PXA_REFERENCE=1, and at PXA_ENHANCE=0. *why, if non-NULL, is
-// pointed at a short static string naming the cell.
-GGML_API GGML_CALL int ggml_backend_cuda_pxa_suggest_batch(int * n_batch, int * n_ubatch, const char ** why);
+//   2x sm_60 (P100 pair)   -> -b 8192 -ub  256
+//   1x sm_61 (1080 Ti)     -> -b 2048 -ub  768
+//   4x sm_60 (P100 quad)   -> -b 2048 -ub  256 on a dense file, -ub 2048 on an expert file
+// Returns 0 and touches nothing for every other topology, at PXA_REFERENCE=1, and at
+// PXA_ENHANCE=0. *why, if non-NULL, is pointed at a short static string naming the cell and,
+// where the answer depends on the file, the branch taken and the measurement behind it.
+//
+// n_expert is the model's expert count read from the file header BEFORE the model is loaded:
+// >0 an expert (MoE) file, 0 a dense file, <0 "could not be asked" (the caller must pass -1
+// rather than 0 when it does not know, because the two answers differ).
+GGML_API GGML_CALL int ggml_backend_cuda_pxa_suggest_batch(int n_expert, int * n_batch, int * n_ubatch, const char ** why);
 
 // Offline PXQ slab dequant (llama-pxq-export). Decodes a contiguous run of 64-row PXQ panels
 // from HOST memory to HOST memory with the SAME device kernels the runtime uses

@@ -9,7 +9,7 @@ GPU-free load (`-ngl 0`) all sit on.
 
 ## Why there is still no `.vec_dot`
 
-Unchanged from the export lane's finding, and it is structural. ggml hands `.vec_dot` and
+Unchanged from the earlier finding, and it is structural. ggml hands `.vec_dot` and
 `.to_float` a single **row pointer**; a PXQ row's bytes are scattered across the slabs of its
 64-row panel, and the panel base is not recoverable from a row pointer. So the type traits for
 the PXQ types keep `.to_float` / `.from_float` / `.vec_dot` NULL, with the `PXA_NO_CPU_VEC_DOT`
@@ -120,7 +120,7 @@ divergence is dominated by the CUDA GEMM snapping products to fp16 inside the MM
 | PXQ3    | 255 | yes | no — bit-plane packing |
 | PXQ6    | 256 | yes | no — 32-entry book |
 
-`pxa_pxq_is_cpu_supported` is true for all six tiers now — the export lane's PXQ1/PXQ6 decode
+`pxa_pxq_is_cpu_supported` is true for all six tiers now — the PXQ1/PXQ6 decode
 commit merged. Every tier the host can decode runs, on `-ngl 0`, a partial offload, and the
 fused CPU MoE op alike; the ones without an integer dot (PXQ1, PXQ2, PXQ3, PXQ6) run at
 phase-1 (dequant) speed instead of phase-2 speed.

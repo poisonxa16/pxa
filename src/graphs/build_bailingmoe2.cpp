@@ -25,12 +25,12 @@ ggml_cgraph * llm_build_context::build_bailingmoe2() {
     // PXA_BAILING_MTP: when running an MTP op (draft / warmup / update-accepted), build the
     // NextN tail-only graph and return early — mirrors build_glm4_moe()/build_qwen35moe().
     if (cparams.mtp_op_type != MTP_OP_NONE) {
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
+        // PXA_MTP_BATCH_SLOTS_ROWS_v1: one hidden row per BATCH token, for every MTP op type.
+        // The draft-gen graph used to allocate a single [n_embd] row here because every draft decode
+        // was a 1-row batch; a multi-row draft step then concatenated it against [n_embd, n_tokens]
+        // token embeddings and aborted. See common/pxa-mtp-batch-slots.h. No-op at n_tokens == 1.
+        ggml_tensor * hidden_states_from_main_model =
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
         lctx.inp_mtp_states = hidden_states_from_main_model;
@@ -243,6 +243,15 @@ struct ggml_tensor * llm_build_context::build_bailingmoe2_mtp(
     cb(cur, "ffn_out", il);
 
     cb(cur, "result_norm", -1);
+    // PXA_MTP_READBACK_v1: the MTP head's own feature row. mtp_accept_batch() and the draft loop
+    // read it back with llama_get_embeddings_ith() and feed it to the next MTP_OP_DRAFT_GEN decode
+    // as the conditioning hidden, and llama_decode() picks this node by name as the embeddings
+    // source for an MTP op. Without the output flag ggml-alloc may reuse its buffer once the head's
+    // lm_head has consumed it, and the D2H copy then reads a later node's data -- logits right,
+    // hidden wrong. See build_qwen35.cpp for the measurement.
+    if (llama_pxa_mtp_head_output()) { // PXA_MTP_HEAD_OUTPUT=0 reproduces the stale read-back (debug only)
+        ggml_set_output(cur);
+    }
 
     // NextN output head: shared_head_norm -> shared_head_head (falls back to the main LM head when
     // the GGUF ties them, like GLM-4.6 / some Ring exports).

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include "llama.h"
 
 #include "sampling.h"
@@ -206,6 +207,21 @@ struct common_speculative_stage_params;
 // rather than constructing a stage by hand and drifting from the parser.
 common_speculative_stage_params common_speculative_stage_from_arg(const std::string & value);
 
+// PXA_SPEC_NGRAM_ALIAS_v1: `--spec-type ngram` (and `prompt-lookup`) are friendly spellings that
+// resolve to the concrete self-speculation variant this campaign measured best, and carry that
+// variant's measured knobs for every key the user did not name. An alias is never printed back --
+// common_speculative_type_to_str() always names the concrete variant that actually ran.
+bool common_speculative_type_name_is_alias(const std::string & name);
+void common_speculative_apply_alias_defaults(common_speculative_stage_params & stage);
+
+// PXA_MTP_PMIN_v1 (2026-09-08): the stock draft confidence floor, named so the value
+// can be cited rather than repeated. It truncates a draft chain at the first token whose top-1
+// probability falls under it. The MTP self-speculation stage inherits it -- MEASURED best on
+// 2026-09-09 (dropping the floor to 0.0 made every depth above 1 slower, see
+// pxa_mtp_stage_p_min() in common/speculative.cpp) -- and PXA_MTP_PMIN=0 is the lab value that
+// re-runs that experiment.
+static constexpr float COMMON_SPEC_P_MIN_DEFAULT = 0.75f;
+
 struct common_params_speculative {
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE; // type of speculative decoding
 
@@ -222,7 +238,7 @@ struct common_params_speculative {
     std::vector<common_speculative_stage_params> stages; // explicit stage chain for single-spec or self-spec + model fallback
 
     float   p_split = 0.1f; // speculative decoding split probability
-    float   p_min = 0.75f; // minimum speculative decoding probability (greedy)
+    float   p_min = COMMON_SPEC_P_MIN_DEFAULT; // minimum speculative decoding probability (greedy)
 
     // ngram-based speculative decoding
 
@@ -231,6 +247,25 @@ struct common_params_speculative {
     uint16_t ngram_min_hits = 1; // minimum hits at ngram/mgram lookup for mgram to be proposed
 
     std::shared_ptr<common_ngram_mod> ngram_mod;
+
+    // PXA_RS_RING: how many recurrent-state snapshot planes the engine must keep per sequence for
+    // a speculative rollback -- the MTP stage's draft depth, because a verify batch is
+    // 1 + n_draft <= 1 + n_max rows and the deepest rollback is to its first row. 0 when no MTP
+    // stage is configured. Only honoured when the PXA_RS_RING lever is on (src/llama.cpp);
+    // mainline computes the same quantity in common_params_speculative::need_n_rs_seq().
+    uint32_t need_n_rs_seq() const {
+        int32_t depth = 0;
+        for (const auto & st : stages) {
+            if (st.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                depth = std::max(depth, st.n_max > 0 ? st.n_max : n_max);
+            }
+        }
+        if (depth == 0 && type == COMMON_SPECULATIVE_TYPE_MTP) {
+            depth = n_max;
+        }
+        // one plane per snapshot; keep it sane -- each plane costs a whole recurrent state per seq
+        return (uint32_t) std::min<int32_t>(std::max<int32_t>(depth, 0), 8);
+    }
 
     // suffix-decoding specific
     int32_t     suffix_min_match_len = 5;  // minimum context match length
@@ -296,6 +331,11 @@ struct gpt_params {
     // The per-sequence recurrent (GDN/delta-net) state is a separate, non-unifiable allocation whose
     // cost still scales with n_parallel -- see server_context::kv_unified_* for the accounting.
     bool    kv_unified            =   false; // share one KV ring across all slots (default: off)
+    // PXA_KV_UNIFIED_DEFAULT (2026-09-13): true once a flag or an environment variable has SAID
+    // something about kv_unified, either way. An auto rule may only choose for a run that made no
+    // choice of its own; --no-kv-unified has to stay a real answer, not a value indistinguishable
+    // from silence.
+    bool    kv_unified_set        =   false; // the user selected --kv-unified / --no-kv-unified
     float   p_split               =    0.1f; // speculative decoding split probability
     int32_t n_gpu_layers          =      -1; // number of layers to store in VRAM (-1 - use default)
     int32_t main_gpu              =       0; // the GPU that is used for scratch and small tensors

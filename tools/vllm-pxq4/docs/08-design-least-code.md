@@ -1,6 +1,6 @@
 # 08 — PXQ4 in vLLM: least-code / maximum-leverage design
 
-Target: `github.com/KewaiiGamer/1Cat-vLLM` @ `2ceb15066` (`v0.1.dev1+g2ceb15066`), 4x V100-SXM2 (sm_70), TP=4,
+Target: the Volta vLLM fork @ `2ceb15066` (`v0.1.dev1+g2ceb15066`), 4x V100-SXM2 (sm_70), TP=4,
 model Qwen3.8-27B (`qwen35`, dense hybrid, **no MoE**), artifact
 `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
 
@@ -8,7 +8,7 @@ model Qwen3.8-27B (`qwen35`, dense hybrid, **no MoE**), artifact
 
 ## 0. Read this first — the engineering works, the *stated goal* does not follow from it
 
-The port is feasible with ~1,600 hand-written LOC, zero patches to Kewaii's tree, and two CUDA kernels.
+The port is feasible with ~1,600 hand-written LOC, zero patches to the upstream vLLM tree, and two CUDA kernels.
 **But the brief's throughput premise is arithmetically wrong, and I can show it from the two checkpoints
 on disk.**
 
@@ -187,7 +187,7 @@ MTP spec-decode model — is inherited untouched.
 
 ### 3.4 Existing files to patch
 
-**None in `/opt/1Cat-vLLM`. None in `/path/to/engine-repo`.** Both trees are read-only in this design.
+**None in `the vLLM fork checkout`. None in `/path/to/engine-repo`.** Both trees are read-only in this design.
 The only "patch" is deployment-side: the serving container must `pip install pxq4-vllm` (or mount it on
 `PYTHONPATH`) and pass `--quantization pxq4` is *not even needed* — `override_quantization_method`
 self-selects from `config.json`.
@@ -358,7 +358,7 @@ kernels take `const uint8_t* W, const half* A, float* C`, plain ints, and a call
 Shared-memory check against real TP=4 shapes (INFERENCE from shape arithmetic, not measured): the mmv
 path stages `x` in dynamic smem capped at 46 KB (`ggml-cuda.cu:4262`). `ffn_down` K=4352 → 17.4 KB;
 `ffn_gate`/`up` K=5120 → 20.5 KB. Fits. TP=2 also fits (`ffn_down` 34.8 KB). TP=1 (69.6 KB) does not and
-would need the S-split path — irrelevant for the DGX, **relevant for the 2x V100 Unraid box only if
+would need the S-split path — irrelevant for the GPU host, **relevant for the 2x V100 2x V100 box only if
 someone tries TP=1 there.**
 
 ### 5.2 The vendored slice
@@ -418,10 +418,10 @@ inside a piecewise region is captured normally.
 
 Build environment, from this session's recon: `nvcc` 12.8, gcc, cmake, ninja and `torch 2.10.0+cu128`
 are present in the container, and `site-packages/vllm` is a **copied** install (not editable-linked to
-`/opt/1Cat-vLLM`, so edits there are inert at runtime — another reason the plugin is the right seam).
+`the vLLM fork checkout`, so edits there are inert at runtime — another reason the plugin is the right seam).
 Two operational constraints: the production container's overlay is **100% full, 0 bytes available**, so
 build in a *fresh* container with a volume under `/path/to/models`; and never write to `/` or host `/tmp` on
-the DGX.
+the GPU host.
 
 ---
 
@@ -550,8 +550,8 @@ should be ported directly.
 
 ## 8. Staged plan — every stage has an offline correctness gate
 
-A scheduling reality first: **stages S2+ need a GPU for unit tests.** The DGX lease is held by other
-jobs and the Unraid V100s are serving live seats. S0/S1 gates are CPU-only and can start immediately;
+A scheduling reality first: **stages S2+ need a GPU for unit tests.** The GPU host lease is held by other
+jobs and the 2x V100 box V100s are serving live seats. S0/S1 gates are CPU-only and can start immediately;
 S2-S5 need a small window (tens of MB, seconds) — not a benchmark, but not free either.
 
 **S0 — fp16 reference checkpoint. No plugin, no CUDA, no PXQ4 at runtime.**
@@ -663,7 +663,7 @@ and `apply` is `F.linear`. Runtime footprint identical to S0; the *checkpoint* i
    `create_qkvz_proj` are private implementation detail; a rename breaks the converter's name map, not
    the kernels. Pin the fork commit in the package metadata and re-run gate 0b on every bump.
 10. **Volta smem ceiling at TP=1** (§5.1): 69.6 KB needed vs 46 KB cap for `ffn_down` — TP=1 is
-    unsupported without the S-split path. Document it; the 2x V100 Unraid box must use TP=2.
+    unsupported without the S-split path. Document it; the 2x V100 2x V100 box must use TP=2.
 
 **Option T (phase 2, performance only, not in the LOC estimate).** Compile a variant of
 `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu` with the PX16 book substituted into the register-side
@@ -688,7 +688,7 @@ makes prefill competitive. Scope it separately after S6 gives a real measurement
 Policy A alone (drop `pxq4_encode.py`, `mxfp4_repack.py`, `mxfp4.py`) is ~1,600 total / ~1,150
 hand-written — and ships a 15% regression. The extra ~690 LOC *is* the project.
 
-Patches to `/opt/1Cat-vLLM`: **0 files.** Patches to `/path/to/engine-repo`: **0 files.**
+Patches to `the vLLM fork checkout`: **0 files.** Patches to `/path/to/engine-repo`: **0 files.**
 
 ---
 

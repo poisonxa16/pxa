@@ -132,9 +132,15 @@ bool llama_spec_get_hidden_feature_view_for_seq(
     return !view.rows.empty();
 }
 
-bool llama_spec_get_hidden_feature_view_from_output_index(
+// PXA_MTP_HIDDEN_BY_BATCH_ROW_v1: see the block above llama_spec_hidden_row_for_batch_row() in
+// llama-spec-features.h for why these take a BATCH ROW and refuse when the buffer is not dense.
+bool llama_spec_hidden_rows_are_batch_dense(const struct llama_context * ctx) {
+    return ctx != nullptr && ctx->n_embd_rows_batch_dense > 0;
+}
+
+bool llama_spec_get_hidden_feature_view_from_batch_row(
         struct llama_context   * ctx,
-        int32_t                  output_index,
+        int32_t                  batch_row,
         llama_seq_id             seq_id,
         llama_pos                pos,
         llama_spec_feature_view & view) {
@@ -142,10 +148,9 @@ bool llama_spec_get_hidden_feature_view_from_output_index(
         return false;
     }
 
-    if (output_index < 0) {
-        output_index += ctx->n_outputs_embd;
-    }
-    if (output_index < 0 || output_index >= ctx->n_outputs_embd) {
+    const int32_t row = llama_spec_hidden_row_for_batch_row(
+        batch_row, ctx->n_embd_rows_batch_dense, ctx->n_outputs_embd);
+    if (row < 0 || row >= ctx->n_outputs_embd) {
         view.rows.clear();
         return false;
     }
@@ -153,38 +158,37 @@ bool llama_spec_get_hidden_feature_view_from_output_index(
     view.rows.push_back({
         /* .seq_id = */ seq_id,
         /* .pos    = */ pos,
-        /* .data   = */ ctx->embd + (size_t) output_index * view.width,
+        /* .data   = */ ctx->embd + (size_t) row * view.width,
     });
     return true;
 }
 
-bool llama_spec_copy_hidden_rows_from_output_indices(
+bool llama_spec_copy_hidden_rows_from_batch_rows(
         struct llama_context * ctx,
-        const std::vector<int32_t> & output_indices,
+        const std::vector<int32_t> & batch_rows,
         std::vector<float> & hidden_rows) {
     hidden_rows.clear();
-    if (output_indices.empty()) {
+    if (batch_rows.empty()) {
         return false;
     }
 
     llama_spec_feature_view view;
-    if (!llama_spec_prepare_hidden_feature_view(ctx, (int32_t) output_indices.size(), view)) {
+    if (!llama_spec_prepare_hidden_feature_view(ctx, (int32_t) batch_rows.size(), view)) {
         return false;
     }
 
-    hidden_rows.reserve((size_t) output_indices.size() * view.width);
-    for (int32_t output_index : output_indices) {
-        if (output_index < 0) {
-            output_index += ctx->n_outputs_embd;
-        }
-        if (output_index < 0 || output_index >= ctx->n_outputs_embd) {
+    hidden_rows.reserve((size_t) batch_rows.size() * view.width);
+    for (int32_t batch_row : batch_rows) {
+        const int32_t row = llama_spec_hidden_row_for_batch_row(
+            batch_row, ctx->n_embd_rows_batch_dense, ctx->n_outputs_embd);
+        if (row < 0 || row >= ctx->n_outputs_embd) {
             hidden_rows.clear();
             return false;
         }
 
-        const float * row = ctx->embd + (size_t) output_index * view.width;
-        hidden_rows.insert(hidden_rows.end(), row, row + view.width);
+        const float * src = ctx->embd + (size_t) row * view.width;
+        hidden_rows.insert(hidden_rows.end(), src, src + view.width);
     }
 
-    return hidden_rows.size() == (size_t) output_indices.size() * view.width;
+    return hidden_rows.size() == (size_t) batch_rows.size() * view.width;
 }

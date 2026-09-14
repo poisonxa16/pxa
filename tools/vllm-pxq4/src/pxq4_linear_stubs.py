@@ -6,9 +6,9 @@ DESTINATION IN THE REPO OF PLAN 09: ``tests/_stubs_linear.py``.
 
 This is a TEST FIXTURE, not shipped code.  It exists so component B can be
 exercised on a machine with neither torch nor vLLM installed (this workflow
-runs no GPU and the DGX container must not be restarted).
+runs no GPU and the GPU host container must not be restarted).
 
-Everything here is a transcription of code that was READ in /opt/1Cat-vLLM
+Everything here is a transcription of code that was READ in the vLLM fork checkout
 (git 2ceb15066); every class carries the file:line it mirrors.  If the real
 packages are importable the stubs are skipped, so the same test file runs
 unchanged inside the container against the real vLLM -- which is the only way

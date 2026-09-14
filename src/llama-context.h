@@ -5,13 +5,16 @@
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
+#include "llama-kv-index.h"
 
 struct llama_model;
 
 #include <vector>
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <set>
+#include <string>
 #include <memory>
 
 struct llama_kv_cell {
@@ -42,9 +45,31 @@ private:
     }
 
 public:
-    void add_seq(llama_seq_id id)   { seq_id.insert(id); sync_shadow(); }
-    void erase_seq(llama_seq_id id) { seq_id.erase(id);  sync_shadow(); }
-    void clear_seq()                { seq_id.clear();    seq0 = SEQ_NONE; }
+    // PXA_KV_SEQ_RM_INDEX: every change to the set, and every whole-cell copy, bumps the tag epoch
+    // (llama-kv-index.h). The sequence index answers only while it has accounted for the current
+    // value, so a cell edited by a path that does not mirror it into the index -- or a cell vector
+    // replaced wholesale by one that forgets to invalidate -- costs a rebuild instead of producing
+    // a stale answer. That is the whole reason the counter is here and not next to the index: the
+    // cell is the one place every such edit has to pass through.
+    llama_kv_cell() = default;
+    llama_kv_cell(const llama_kv_cell & o)
+        : pos(o.pos), delta(o.delta), src(o.src), seq0(o.seq0), seq_id(o.seq_id) { llama_kv_tag_epoch()++; }
+    llama_kv_cell(llama_kv_cell && o) noexcept
+        : pos(o.pos), delta(o.delta), src(o.src), seq0(o.seq0), seq_id(std::move(o.seq_id)) { llama_kv_tag_epoch()++; }
+    llama_kv_cell & operator=(const llama_kv_cell & o) {
+        pos = o.pos; delta = o.delta; src = o.src; seq0 = o.seq0; seq_id = o.seq_id;
+        llama_kv_tag_epoch()++;
+        return *this;
+    }
+    llama_kv_cell & operator=(llama_kv_cell && o) noexcept {
+        pos = o.pos; delta = o.delta; src = o.src; seq0 = o.seq0; seq_id = std::move(o.seq_id);
+        llama_kv_tag_epoch()++;
+        return *this;
+    }
+
+    void add_seq(llama_seq_id id)   { seq_id.insert(id); sync_shadow(); llama_kv_tag_epoch()++; }
+    void erase_seq(llama_seq_id id) { seq_id.erase(id);  sync_shadow(); llama_kv_tag_epoch()++; }
+    void clear_seq()                { seq_id.clear();    seq0 = SEQ_NONE; llama_kv_tag_epoch()++; }
 
     // read-only views of the set
     const std::set<llama_seq_id> & seqs() const { return seq_id; }
@@ -94,12 +119,55 @@ struct llama_kv_cache {
 
     std::vector<llama_kv_cell> cells;
 
+    // PXA_KV_SEQ_RM_INDEX: per-sequence ordered (pos -> cell) index over `cells`, so a range
+    // removal for one sequence costs O(#cells removed) instead of O(size). Lazy: starts invalid,
+    // is rebuilt on first indexed use, and every bulk mutation invalidates it again. Never
+    // consulted for a recurrent cache (there a cell index IS a sequence id). See llama-kv-index.h.
+    llama_kv_seq_index seq_index;
+
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)
+    // PXA_GLM5NEXT: the DSA indexer's side cache, one row per token per MLA layer:
+    // [ key(n_embd_indexer) | gate(n_embd_indexer) | pooled(n_embd_indexer) ], F32.
+    // It is indexed by the SAME cell index as k_l -- a side buffer, not a second cache -- so a
+    // cell is one token in both by construction and every seq_*/defrag edit that moves a cell
+    // must move this row with it (see llama_kpool_mark_stale()).
+    std::vector<struct ggml_tensor *> idx_l;
 
     // When true, the delta_net graph builder will enable per-step SSM state saves
     bool save_per_step_ssm = false;
+
+    // ---- PXA_RS_RING -------------------------------------------------------------------------
+    // Recurrent-state rollback as an INDEX instead of a device copy (P3 of
+    // the 2026-09-08 mainline comparison, mainline's n_rs_seq / set_rs_idx).
+    //
+    // When armed, s_l[il] holds rs_plane_rows*(1 + n_rs_seq) rows, PLANE-MAJOR:
+    //     row(plane p, seq s) = p*rs_plane_rows + s
+    // plane 0 is live (the scatter always writes it) and plane 1+t holds the state after batch
+    // row t -- which is exactly what the delta-net / ssm_conv per-step capture already computes,
+    // so arming the ring only changes the STORE ADDRESS (ggml_op_set_save_strides).
+    // A rollback of `r` accepted steps is then `set_rs_idx(seq, r)`: the next decode's state
+    // gather reads plane r and its scatter writes plane 0. No copies, no syncs, no rebuilds.
+    uint32_t rs_plane_rows = 0;        // rows per plane (== the per-seq slot count); 0 = ring off
+    uint32_t n_rs_seq      = 0;        // history planes; 0 = ring off
+    std::vector<uint32_t> rs_idx;      // per-seq PENDING rollback distance, single-use
+    // v1 requires the capture's batch position to equal the absolute seq_id (the kernels index
+    // the destination row by batch position). Recorded per decode; false -> the rollback falls
+    // back to the copy path, loudly, instead of reading a row that was never written.
+    bool rs_capture_ok = false;
+
+    bool rs_ring_armed() const { return n_rs_seq > 0 && rs_plane_rows > 0; }
+
+    void set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+        if (seq_id < 0) {
+            std::fill(rs_idx.begin(), rs_idx.end(), 0u);
+            return;
+        }
+        if ((size_t) seq_id < rs_idx.size() && idx <= n_rs_seq) {
+            rs_idx[seq_id] = idx;
+        }
+    }
 
     std::vector<llama_split_tensor> split_k_l;
     std::vector<llama_split_tensor> split_v_l;
@@ -305,7 +373,7 @@ static inline bool pxa_sched_pipeline_enabled() {
 //   checkpoint levers on, PP off        1074.3 t/s   busy 1.340
 //   checkpoint levers on, PP copies=2   1085.3 t/s   busy 1.330
 // and in the final bench rows 1083.20 t/s at ub512 / 932.13 at ub2048 against 971.49 / 848.56
-// with everything off. The reason it measured flat for three previous lanes is that the host
+// with everything off. The reason it measured flat in three earlier benchmark passes is that the host
 // was blocked 4-5 times per ubatch by the checkpoint drains and the compute_splits input
 // syncs; at n_copies > 1 with those gone, BOTH compute_splits blockers disappear entirely
 // (they become a slot-event wait costing 1.5 ms in total across 41 ubatches).
@@ -411,6 +479,12 @@ struct llama_context {
     size_t  output_size = 0; // capacity (of tokens positions) for the output buffers
     int32_t n_outputs   = 0; // number of actually-used outputs in the current ubatch or last logical batch
     int32_t n_outputs_embd = 0; // number of embedding rows produced for the current logical batch
+    // PXA_MTP_HIDDEN_BY_BATCH_ROW_v1: how many LEADING rows of `embd` the last decode filled densely
+    // by RAW BATCH ROW rather than by output id. Non-zero only for an MTP target context whose
+    // embedding reserve covered the whole batch; 0 means the buffer is output-indexed and a
+    // batch-row read must be refused rather than answered from a different token's row. See
+    // llama_spec_hidden_row_for_batch_row() in llama-spec-features.h.
+    int32_t n_embd_rows_batch_dense = 0;
 
     bool logits_all = false;
 
@@ -584,6 +658,34 @@ struct llama_context {
     int  pxa_reserved_width   =  0;
     int  pxa_reserved_replans = -1;
     bool pxa_reserve_sizes_logged = false;
+
+    // PXA_RESERVE_SHAPE: the reserve used to synthesise a TOKEN batch with n_outputs == n_tokens,
+    // which is not the batch kind or the output count the MTP head context actually decodes; the
+    // reserved plan therefore never matched the real graph and the decode loop re-reserved on
+    // every speculative cycle. These carry the shape of the ubatch that triggered the reserve so
+    // the reserve builds the same graph shape (same batch kind, same n_outputs < n_tokens
+    // relation) - see pxa_reserve_real_graph.
+    bool    pxa_reserve_hint_valid   = false;
+    bool    pxa_reserve_hint_embd    = false;  // the real ubatch carried embeddings, not tokens
+    bool    pxa_reserve_hint_all_out = false;  // the real ubatch had n_outputs == n_tokens
+    int32_t pxa_reserve_hint_outputs = 0;      // the real ubatch's n_outputs
+    int32_t pxa_reserve_hint_tokens  = 0;      // the real ubatch's n_tokens
+    // a valid, never-read address to stand in for an embeddings batch: graph building only tests
+    // whether batch.embd is null (the values are set by llama_set_inputs, which a reserve never
+    // runs), exactly as the existing reserve passes the address of one llama_token for n_tokens.
+    float   pxa_reserve_embd_dummy   = 0.0f;
+    void *  pxa_reserve_embd_scratch() { return (void *) &pxa_reserve_embd_dummy; }
+
+    // PXA_RESERVE_DEBUG: node signature of the reserved graph, so a coverage failure can print
+    // WHICH nodes differ instead of only how many.
+    std::vector<std::string> pxa_reserved_sig;
+
+    // thrash guard: shapes (ubatch width, node count) a re-reserve provably cannot cover, plus a
+    // hard cap on how many times this context may re-reserve at all. Without it a context whose
+    // graph shape alternates re-reserves forever, two compute-buffer reallocations per token.
+    std::set<uint64_t> pxa_reserve_dead_shapes;
+    int  pxa_reserve_count     = 0;
+    bool pxa_reserve_latched_off = false;
 
     struct CacheCopy {
         ggml_tensor * cpy = nullptr;

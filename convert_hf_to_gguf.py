@@ -348,7 +348,14 @@ class Model:
                     bid = int(part)
                     break
 
-            for new_name, data in ((n, d.squeeze().numpy()) for n, d in self.modify_tensors(data_torch, name, bid)):
+            # squeeze() collapses a shape-[1] weight (Gemma 4's per-block layer_output_scale)
+            # to a 0-d array and the writer then records n_dims = 0, which no reference file
+            # for this model carries. Keep the single element 1-D. The reshape is done on the
+            # TORCH side on purpose: these tensors are lazy, and forcing them through a numpy
+            # helper here evaluates the placeholder instead of the data and silently writes
+            # zeros -- which is exactly what a first attempt with np.atleast_1d did to every
+            # F32 norm in the file.
+            for new_name, data in ((n, (d.squeeze() if d.numel() > 1 else d.reshape(1)).numpy()) for n, d in self.modify_tensors(data_torch, name, bid)):
                 data: np.ndarray  # type hint
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
@@ -3411,6 +3418,27 @@ class Gemma4BaseModel(Model):
     def _arch_name(self) -> str:
         return gguf.MODEL_ARCH_NAMES[self.model_arch]
 
+    # Gemma 4 does not follow the llama-hf naming convention that the shared tensor-name table
+    # assumes for the two block norms: "post_attention_layernorm" here really is the norm applied
+    # AFTER attention (llama-hf uses that name for the FFN norm), and the FFN norm is called
+    # "pre_feedforward_layernorm". The shared table resolves both to blk.{bid}.ffn_norm, which
+    # loses the post-attention norm and drops the FFN norm entirely. Resolving them here keeps the
+    # fix inside this architecture: the shared table is read by every other model in this file.
+    _norm_overrides = {
+        "post_attention_layernorm":  gguf.MODEL_TENSOR.ATTN_POST_NORM,   # blk.{bid}.post_attention_norm
+        "pre_feedforward_layernorm": gguf.MODEL_TENSOR.FFN_NORM,         # blk.{bid}.ffn_norm
+        "post_feedforward_layernorm": gguf.MODEL_TENSOR.FFN_POST_NORM,   # blk.{bid}.post_ffw_norm
+    }
+
+    def _norm_override_name(self, name: str, bid: int | None) -> str | None:
+        if bid is None:
+            return None
+        base = name[: -len(".weight")] if name.endswith(".weight") else name
+        for suffix, tensor in self._norm_overrides.items():
+            if base.endswith("." + suffix):
+                return self.format_tensor_name(tensor, bid)
+        return None
+
     def find_hparam(self, keys: Iterable[str], optional: bool = False) -> Any:
         text_hparams = self.hparams.get("text_config")
         if isinstance(text_hparams, dict):
@@ -3457,7 +3485,15 @@ class Gemma4BaseModel(Model):
         self.gguf_writer.add_add_bos_token(True)
 
 
-@Model.register("Gemma4ForConditionalGeneration")
+# Google's released dense Gemma 4 checkpoints (gemma-4-12B-it, gemma-4-31B-it) declare
+# architectures: ["Gemma4UnifiedForConditionalGeneration"] and model_type "gemma4_unified":
+# one checkpoint carrying the text tower next to a vision tower and an audio tower. The text
+# tower is exactly the model this class already writes -- same text_config layout
+# (layer_types, global_head_dim, num_global_key_value_heads, rope_parameters), and
+# modify_tensors() already returns [] for every tensor whose name does not start with
+# "language_model.", so the extra towers are skipped rather than mis-mapped. Without the
+# second name the converter refuses the only weights Google actually ships.
+@Model.register("Gemma4ForConditionalGeneration", "Gemma4UnifiedForConditionalGeneration")
 class Gemma4Model(Gemma4BaseModel):
     model_arch = gguf.MODEL_ARCH.GEMMA4
 
@@ -3472,6 +3508,16 @@ class Gemma4Model(Gemma4BaseModel):
         self.gguf_writer.add_head_count(hparams["num_attention_heads"])
         self.gguf_writer.add_layer_norm_rms_eps(hparams["rms_norm_eps"])
         self.gguf_writer.add_file_type(self.ftype)
+
+        # Gemma 4 softcaps its final logits (config: final_logit_softcapping = 30). Leaving the key
+        # out makes the runtime skip the cap, so a file converted here would produce a different
+        # distribution from Google's own GGUF of the same weights. Written whenever declared.
+        final_softcap = hparams.get("final_logit_softcapping")
+        if final_softcap is not None:
+            self.gguf_writer.add_final_logit_softcapping(float(final_softcap))
+        attn_softcap = hparams.get("attn_logit_softcapping")
+        if attn_softcap is not None:
+            self.gguf_writer.add_attn_logit_softcapping(float(attn_softcap))
 
         swa_layers = [layer_type == "sliding_attention" for layer_type in hparams["layer_types"]]
         self.gguf_writer.add_sliding_window(hparams["sliding_window"])
@@ -3554,10 +3600,19 @@ class Gemma4Model(Gemma4BaseModel):
         if ".experts." in name and not name.endswith(".weight"):
             name += ".weight"
 
+        override = self._norm_override_name(name, bid)
+        if override is not None:
+            return [(override, data_torch)]
+
         return [(self.map_tensor_name(name), data_torch)]
 
 
-@Model.register("Gemma4AssistantForCausalLM")
+# The assistant/MTP drafter checkpoints ship under two architecture names: the plain
+# "Gemma4AssistantForCausalLM" and, for the unified (text+vision backbone) release,
+# "Gemma4UnifiedAssistantForCausalLM". The tensor layout and the text_config are the same
+# in both, so one converter serves them (2026-09-13: the 12B assistant on disk is the
+# unified name, and without this line it converts as "unknown architecture").
+@Model.register("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
 class Gemma4AssistantModel(Gemma4BaseModel):
     model_arch = gguf.MODEL_ARCH.GEMMA4_MTP
 

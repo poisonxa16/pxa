@@ -1,5 +1,8 @@
 #pragma warning(disable : 4996)
 #include "server-context.h"
+#include "pxa-ckpt-evict.h"
+#include "pxa-spec-load.h"
+#include "pxa-mtp-cache-only.h"
 #include "server-common.h"
 #include "server-chat.h"
 #include "server-cors-proxy.h"
@@ -471,7 +474,7 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
 
 // ---------------------------------------------------------------------------
 // PXA POSTURE LAYER (2026-07-22): PXA_MODE=balance|max + ADAPTIVE-UB.
-// The two owner-facing postures (the PRODUCT; the kernel levers are the means):
+// The two user-facing postures (the PRODUCT; the kernel levers are the means):
 //   BALANCE (default, the daily): -fa on, ub 2048-class. Best decode AND best-possible
 //     prefill IN the fa-on regime — carried by PXA_FA_PREFILL_SPLIT + PXA_FA_MASK_SKIP_TILE
 //     (see ggml/src/ggml-cuda/pxa/pxa-enhance.cuh); fa-on decode is byte-untouched by construction.
@@ -491,6 +494,7 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
 #   include "ggml-cuda.h"
 #endif
 #include <cstring>
+#include <regex>
 #include <initializer_list>
 
 // read general.architecture from the gguf header (metadata only, no tensor data) — the
@@ -504,6 +508,105 @@ static std::string pxa_gguf_arch(const std::string & fname) {
     if (i >= 0) arch = gguf_get_val_str(g, i);
     gguf_free(g);
     return arch;
+}
+
+// PXA_AUTO_UB_LONG (2026-09-13): is this an expert (MoE) file or a dense one?
+//
+// The 4x P100 batch cell is the one auto default whose right answer depends on the MODEL rather
+// than on the cards (see ggml_backend_cuda_pxa_suggest_batch): the 177B hybrid MoE seat it was
+// measured on wants -ub 2048 and a dense file of the same size class loses 40-44% of its prefill
+// at length to that same value. The question has to be answered BEFORE the context is created,
+// so it is answered the way pxa_gguf_arch above answers its own -- a metadata-only gguf open, no
+// tensor data, nothing on a card yet.
+//
+// Return: >0 the file declares experts, 0 it does not, -1 the question could not be asked. The
+// caller must pass -1 through rather than flattening it to 0: "dense" and "unknown" take
+// different branches on purpose.
+static int pxa_gguf_expert_count(const std::string & fname) {
+    struct gguf_init_params ip = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    struct gguf_context * g = gguf_init_from_file(fname.c_str(), ip);
+    if (!g) return -1;
+
+    int res = -1;
+
+    const int ia = gguf_find_key(g, "general.architecture");
+    if (ia >= 0) {
+        const std::string arch = gguf_get_val_str(g, ia);
+        const std::string key  = arch + ".expert_count";   // LLM_KV_EXPERT_COUNT, src/llama-arch.cpp
+        const int ik = gguf_find_key(g, key.c_str());
+        if (ik < 0) {
+            // only an expert architecture writes the key; its absence on a file whose arch we
+            // could read is the answer "dense", not "unknown".
+            res = 0;
+        } else {
+            switch (gguf_get_kv_type(g, ik)) {
+                case GGUF_TYPE_UINT32: res = (int) gguf_get_val_u32(g, ik); break;
+                case GGUF_TYPE_INT32:  res = (int) gguf_get_val_i32(g, ik); break;
+                case GGUF_TYPE_UINT64: res = (int) gguf_get_val_u64(g, ik); break;
+                case GGUF_TYPE_INT64:  res = (int) gguf_get_val_i64(g, ik); break;
+                default:               res = -1; break;
+            }
+        }
+    }
+
+    gguf_free(g);
+    return res;
+}
+
+// PXA_SPEC_NGRAM_POLICY_v1 (2026-09-09): does this file carry an MTP head?
+//
+// Read <arch>.nextn_predict_layers from the gguf header (metadata only, no tensor data, same
+// pattern and same pre-model-load position as pxa_gguf_arch above). It is the key the loader
+// itself uses -- LLM_KV_NEXTN_PREDICT_LAYERS, "%s.nextn_predict_layers" in src/llama-arch.cpp --
+// so this answers exactly the question the loader will answer later, before anything is on a card.
+//
+// Return: >0 the file has an MTP/NextN head, 0 it does not, -1 the question could not be asked
+// (file unreadable, no arch key). The caller must treat -1 as "do not decide" rather than as 0.
+static int pxa_gguf_nextn_predict_layers(const std::string & fname) {
+    struct gguf_init_params ip = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    struct gguf_context * g = gguf_init_from_file(fname.c_str(), ip);
+    if (!g) return -1;
+
+    int res = -1;
+
+    const int ia = gguf_find_key(g, "general.architecture");
+    if (ia >= 0) {
+        const std::string arch = gguf_get_val_str(g, ia);
+        const std::string key  = arch + ".nextn_predict_layers";
+        const int ik = gguf_find_key(g, key.c_str());
+        if (ik < 0) {
+            // the key is written only by architectures that HAVE the head; its absence on a file
+            // whose arch we could read is the answer "no head", not "unknown".
+            res = 0;
+        } else {
+            switch (gguf_get_kv_type(g, ik)) {
+                case GGUF_TYPE_UINT32: res = (int) gguf_get_val_u32(g, ik); break;
+                case GGUF_TYPE_INT32:  res = (int) gguf_get_val_i32(g, ik); break;
+                case GGUF_TYPE_UINT64: res = (int) gguf_get_val_u64(g, ik); break;
+                case GGUF_TYPE_INT64:  res = (int) gguf_get_val_i64(g, ik); break;
+                default:               res = -1; break;
+            }
+        }
+    }
+
+    gguf_free(g);
+    return res;
+}
+
+// PXA_SPEC_NGRAM_POLICY_v1: is the "no MTP head -> arm the n-gram drafter" rule default ON?
+//
+// The default lives in ONE named constant because it is a pre-registered decision, not a taste:
+// the rule ships default ON only if the measured miss cost on fresh prose is within noise AND the
+// measured win on repetition-heavy traffic is real. Until that pair of numbers exists the rule is
+// available and OFF, and the constant below is what a measurement moves.
+//
+//   PXA_SPEC_NGRAM_POLICY=1  force the rule on   (still under the auto block's own gates)
+//   PXA_SPEC_NGRAM_POLICY=0  force the rule off  -- --spec-type ngram still works by hand
+static constexpr bool PXA_SPEC_NGRAM_POLICY_DEFAULT = false;
+
+static bool pxa_spec_ngram_policy_on() {
+    const char * e = getenv("PXA_SPEC_NGRAM_POLICY");
+    return e ? (atoi(e) != 0) : PXA_SPEC_NGRAM_POLICY_DEFAULT;
 }
 
 // 0 = balance, 1 = max, -1 = reference (posture layer stands down)
@@ -679,6 +782,26 @@ static bool pxa_all_devices_sm61() {
 #endif
 }
 
+// true only if EVERY visible CUDA device is cc >= 600 (sm_60/Pascal and newer -- P100, 1080 Ti/P40,
+// Volta, and anything since). The n-gram-alone chain below was measured on two disjoint HOMOGENEOUS
+// fleets -- a V100 pair (quadspec-w2, cc 700) and a 4x P100 quad (quad-default-pxq4, cc 600) -- so it
+// asks about every device rather than about device 0: a MIXED fleet with any device BELOW cc 600
+// (the 1.4/0.6 tensor-split cell this same file special-cases above is exactly one) is an unmeasured
+// cell and keeps today's behaviour. A P100+1080 Ti fleet IS covered here, because the 1080 Ti is cc
+// 610.
+static bool pxa_all_devices_pascal_plus() {
+#if defined(GGML_USE_CUDA)
+    const int ndev = ggml_backend_cuda_get_device_count();
+    if (ndev <= 0) return false;
+    for (int i = 0; i < ndev; ++i) {
+        if (ggml_backend_cuda_get_device_cc(i) < 600) return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 // returns the chosen ubatch (>0) or 0 = leave params.n_ubatch untouched; fills *why
 // Smallest per-device VRAM headroom, in bytes, that will be left after the weights land: the
 // minimum free VRAM across the visible CUDA devices minus this model's uniform-split share.
@@ -686,11 +809,162 @@ static bool pxa_all_devices_sm61() {
 // caveat: it runs BEFORE the model loads, so it is an estimate, deliberately used only to DECLINE
 // things -- never to claim something fits. Returns -1 when it cannot tell (no CUDA, unreadable
 // model file), which every caller must treat as "do not arm".
-// Per-device share of the model file honouring an explicit -ts (2026-09-06, AUTO-DEFAULTS-AUDIT gap b,
-// order #1400a). Before this the estimators divided the file evenly across devices; on the Flash-Next
-// seat (-ts 5079,12612,12612,11897, card 0 shared with another server) that reported a negative
-// headroom for a model that had been serving for days, floored -ub to 512 (377.67 t/s @3121 vs the
-// seat's 478.27) and declined speculation for a reason that was arithmetic, not memory. With -ts the
+// A MIRROR of tensor_overridden_to_host() in src/llama.cpp, and deliberately a mirror rather than
+// a reimplementation: same std::regex_search on the tensor NAME, same first-match-wins, same
+// "is the winning buffer type a host one" answer. The two must stay in step, because the moment
+// they disagree the estimate stops describing the placement the loader will perform. The loader's
+// copy is static, so it cannot be called from here; if it ever becomes callable, call it.
+static bool pxa_tensor_pinned_to_host(const std::vector<std::pair<std::regex, bool>> & ot,
+                                      const char * name) {
+    if (ot.empty()) return false;
+    const std::string n = name;
+    for (const auto & o : ot) {
+        if (std::regex_search(n, o.first)) return o.second;
+    }
+    return false;
+}
+
+// -- SIZE THE MODEL BY WHAT IS OFFLOADED, NOT BY THE FILE (2026-09-13) -------------------------
+// Both estimators below took the gguf's FILE SIZE as "the bytes that land on the cards". That is
+// true only when every block is offloaded. The Flash-Next PXQU-MTP seat runs -ngl 20 of a 49-block
+// 109 GB file on four 16 GB P100s: the file-size share is ~26 GiB per card against ~16 GiB free,
+// so the arithmetic reported a NEGATIVE headroom for a server that had been answering requests for
+// days. Speculation was not declined for a memory reason; it was declined by construction, and
+// could not have armed on that seat at any -ngl. The -ub picker took its "estimate unreliable"
+// exit on the same input. Same shape as the compress_ratios count that refused this same
+// file: an arithmetic that quietly assumes a configuration nobody checked.
+//
+// This reads the TENSOR TABLE out of the gguf header -- metadata only, no tensor data, the same
+// pre-model-load position as pxa_gguf_arch above -- and sums the bytes of the blocks that will
+// actually sit on a device, following the loader's own rule (src/llama.cpp):
+//
+//     i_gpu_start = max(n_layer - n_gpu_layers, 0)   ->  the LAST n_gpu_layers blocks are offloaded
+//     the non-block tensors (embedding, output) reach a device only when n_gpu_layers > n_layer
+//
+// n_layer is taken from the tensor names themselves (the highest blk.<i>. index + 1) rather than
+// from <arch>.block_count, because the names are what the loader will allocate and a count key is
+// one more thing that can disagree with the file -- which is exactly how the compress_ratios
+// refusal happened.
+// ggml_nbytes is exact for our own PXQ tiers: their row_meta_size headers are inside
+// ggml_row_size (ggml.c, the PXQ4 traits comment says so), so a panel-addressed codec does not
+// need a special case here.
+//
+// NO-REGRESSION PROPERTY, stated so it can be CHECKED rather than believed: when
+// n_gpu_layers > n_layer -- every full-offload seat, i.e. -ngl 99 -- this returns the file size
+// unchanged, so every cell measured before today reads the number it read before. Only a
+// partially offloaded model sees a different figure, and on those the old figure was wrong.
+//
+// A grafted NextN/MTP block IS counted, and that is a decision rather than an oversight. The
+// loader reads its blk.<last>.nextn.* tensors and SKIPS them unless an MTP stage is armed, so on
+// a boot that ends up not arming one the figure here is high by that block. But the question this
+// number is asked in order to answer is "would arming a drafter fit", and if the MTP head arms,
+// that block is exactly what arms it. Modelling the state the decision would CREATE is the point;
+// modelling the state before the decision would let the gate wave through the one case it exists
+// to catch. Measured on the Flash-Next PXQU-MTP seat at -ngl 20: the sum of the resident blocks
+// EXCLUDING the NextN block is 19775 MiB against the loader's own CUDA buffer sizes totalling
+// 19774.9 MiB -- agreement to 0.1 MiB -- and the NextN block adds 4972 MiB on top of that.
+//
+// -ot / --override-tensor IS honoured, by the same rule the loader uses (see
+// pxa_tensor_pinned_to_host above). This is not a refinement: the 4x P100 Flash-Next seat runs
+// -ngl 99 -ot 'per_layer_token_embd\.weight=CPU', so its whole offload question is the override
+// and not the layer count. Without this, -ngl 99 would take the full-offload path and the estimate
+// would charge every card for a share of a 50 GiB table that is pinned to the host by the seat's
+// own command line.
+//
+// What it still cannot see, and says so rather than pretending: -ncmoe moves expert tensors the
+// other way too and is not modelled, so under it the answer remains an OVERestimate. Overestimating
+// is the safe direction for a gate whose only job is to DECLINE. Nor does any of this count the KV
+// cache or the compute buffers, which is unchanged and is why the gate keeps a 2 GiB margin.
+//
+// Returns the device-resident byte estimate and writes into `how` a short phrase naming the rule
+// that produced it, for the banner. Falls back to file_bytes -- today's number -- and says so when
+// the header cannot be read.
+static size_t pxa_model_device_bytes(const gpt_params & params, size_t file_bytes, std::string & how) {
+    char buf[220];
+    const int ngl = params.n_gpu_layers;  // -1 = not given; the loader's own default is then 0
+
+    // compile the -ot patterns ONCE; std::regex construction is not cheap and there are ~1250 names
+    std::vector<std::pair<std::regex, bool>> ot;
+    for (const auto & o : params.tensor_buft_overrides) {
+        if (!o.pattern) break;                 // the terminating sentinel, when it is already there
+        try {
+            ot.emplace_back(std::regex(o.pattern), o.buft && ggml_backend_buft_is_host(o.buft));
+        } catch (const std::regex_error &) {
+            // an unparseable pattern is the loader's problem to report, not ours to guess at
+            how = "whole file (an -ot pattern did not compile)";
+            return file_bytes;
+        }
+    }
+    struct ggml_context * meta = nullptr;
+    struct gguf_init_params ip = { /*no_alloc =*/ true, /*ctx =*/ &meta };
+    struct gguf_context * g = gguf_init_from_file(params.model.c_str(), ip);
+    if (!g || !meta) {
+        if (g)    gguf_free(g);
+        if (meta) ggml_free(meta);
+        how = "whole file (tensor table unreadable)";
+        return file_bytes;
+    }
+
+    std::vector<size_t> block_bytes;   // indexed by the blk.<i>. prefix the loader uses
+    size_t other_bytes = 0;            // embedding / output / norms
+    size_t pinned_bytes = 0;           // what -ot sends to the host, wherever it lives
+    int    pinned_n = 0;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t)) {
+        const size_t nb = ggml_nbytes(t);
+        if (pxa_tensor_pinned_to_host(ot, t->name)) { pinned_bytes += nb; ++pinned_n; continue; }
+        int idx = -1;
+        if (strncmp(t->name, "blk.", 4) == 0) {
+            const char * q = t->name + 4;
+            int v = 0; bool any = false;
+            while (*q >= '0' && *q <= '9' && v < 1000000) { v = v*10 + (*q - '0'); ++q; any = true; }
+            if (any && *q == '.') idx = v;
+        }
+        if (idx < 0) { other_bytes += nb; continue; }
+        if ((int) block_bytes.size() <= idx) block_bytes.resize((size_t) idx + 1, 0);
+        block_bytes[idx] += nb;
+    }
+    const int n_layer = (int) block_bytes.size();
+    gguf_free(g);
+    ggml_free(meta);
+
+    if (n_layer <= 0) {
+        how = "whole file (no blk.* tensors in the header)";
+        return file_bytes;
+    }
+    char pin[64] = "";
+    if (pinned_n > 0) {
+        snprintf(pin, sizeof(pin), "; %d tensor(s) pinned to the host by -ot, %zu MiB",
+                 pinned_n, pinned_bytes>>20);
+    }
+    if (ngl > n_layer) {
+        // Full offload. With no -ot this must return the file size UNCHANGED, so that every cell
+        // ever measured on a -ngl 99 seat reads exactly the number it read before.
+        if (pinned_n == 0) {
+            snprintf(buf, sizeof(buf), "whole file (-ngl %d covers all %d blocks)", ngl, n_layer);
+            how = buf;
+            return file_bytes;
+        }
+        snprintf(buf, sizeof(buf), "-ngl %d covers all %d blocks%s", ngl, n_layer, pin);
+        how = buf;
+        size_t dev = other_bytes;
+        for (int i = 0; i < n_layer; ++i) dev += block_bytes[i];
+        return dev;
+    }
+    const int ngl_eff     = ngl < 0 ? 0 : ngl;
+    const int i_gpu_start = n_layer - ngl_eff;
+    size_t dev = 0;
+    for (int i = i_gpu_start; i < n_layer; ++i) dev += block_bytes[i];
+    snprintf(buf, sizeof(buf), "%d of %d blocks offloaded%s%s", ngl_eff, n_layer,
+             ngl < 0 ? " (no -ngl; loader default 0)" : "", pin);
+    how = buf;
+    return dev;
+}
+
+// Per-device share of the model file honouring an explicit -ts (2026-09-06). Before this the
+// estimators divided the file evenly across devices; on a Flash-Next boot
+// (-ts 5079,12612,12612,11897, card 0 shared with another process) that reported a negative
+// headroom for a model that had been serving for days, floored -ub to 512 (377.67 t/s @3121 vs
+// 478.27) and declined speculation for a reason that was arithmetic, not memory. With -ts the
 // share is model_bytes * ts[i] / sum(ts). Returns false when no -ts was given (uniform split).
 static bool pxa_device_shares(const gpt_params & params, int ndev, size_t model_bytes, std::vector<size_t> & share) {
     share.assign(ndev, model_bytes / (size_t) std::max(1, ndev));
@@ -715,15 +989,17 @@ static bool pxa_has_cpu_override(const gpt_params & params) {
 
 static long long pxa_min_vram_headroom(const gpt_params & params, std::string & why) {
 #if defined(GGML_USE_CUDA)
-    char buf[320];
+    char buf[512];
     const int ndev = ggml_backend_cuda_get_device_count();
     if (ndev <= 0) { why = "no CUDA devices"; return -1; }
-    size_t model_bytes = 0;
+    size_t file_bytes = 0;
     {
         std::ifstream f(params.model, std::ios::binary | std::ios::ate);
-        if (f.good()) model_bytes = (size_t) f.tellg();
+        if (f.good()) file_bytes = (size_t) f.tellg();
     }
-    if (model_bytes == 0) { why = "model size unknown"; return -1; }
+    if (file_bytes == 0) { why = "model size unknown"; return -1; }
+    std::string offl;   // the bytes this -ngl actually puts on the cards, not the file's
+    const size_t model_bytes = pxa_model_device_bytes(params, file_bytes, offl);
     std::vector<size_t> share;
     const bool ts = pxa_device_shares(params, ndev, model_bytes, share);
     long long head = LLONG_MAX; int worst = 0; size_t worst_free = 0;
@@ -733,8 +1009,8 @@ static long long pxa_min_vram_headroom(const gpt_params & params, std::string & 
         const long long h = (long long) free - (long long) share[i];
         if (h < head) { head = h; worst = i; worst_free = free; }
     }
-    snprintf(buf, sizeof(buf), "dev%d free %zu MiB, model share %zu MiB (%s) -> headroom %lld MiB%s",
-             worst, worst_free>>20, share[worst]>>20, ts ? "per -ts" : "uniform split", head>>20,
+    snprintf(buf, sizeof(buf), "dev%d free %zu MiB, model share %zu MiB (%s; %s) -> headroom %lld MiB%s",
+             worst, worst_free>>20, share[worst]>>20, ts ? "per -ts" : "uniform split", offl.c_str(), head>>20,
              pxa_has_cpu_override(params) ? "; -ot pins tensors to CPU, so the file overstates device bytes" : "");
     why = buf;
     return head;
@@ -770,17 +1046,37 @@ static int pxa_adaptive_ubatch(const gpt_params & params, std::string & why) {
     // card-type default (the safe fallback + the cap): 16 GB class -> 2048, 11 GB class -> 768
     const int card_default = min_total >= 15*GiB ? 2048 : min_total >= 10*GiB ? 768 : 512;
     // model per-device share (uniform-split estimate; tensor-split refinement not modeled)
-    size_t model_bytes = 0;
+    size_t file_bytes = 0;
     {
         std::ifstream f(params.model, std::ios::binary | std::ios::ate);
-        if (f.good()) model_bytes = (size_t) f.tellg();
+        if (f.good()) file_bytes = (size_t) f.tellg();
     }
-    char buf[256];
-    if (model_bytes == 0) {
+    char buf[512];
+    if (file_bytes == 0) {
         snprintf(buf, sizeof(buf), "card-type default (model size unknown; min total %zu MiB)", min_total>>20);
         why = buf;
         return card_default;
     }
+    // THE UBATCH DECISION DELIBERATELY STILL USES THE FILE SIZE, and this is the one place in
+    // this change where the more accurate number is computed and NOT acted on. Reason, stated so
+    // the next reader can close it rather than rediscover it:
+    //
+    // On the 4x P100 Flash-Next seat the file-size share is larger than free VRAM, so today this
+    // function takes its "estimate unreliable" exit and returns the card-type default, 2048 --
+    // the right rung, reached by the wrong route. Feeding it the accurate share instead makes the
+    // headroom a small positive number, and a small positive headroom sends the ladder DOWN, to
+    // 512. That is the same rung this seat was floored to once before, and it cost 21% of its
+    // prefill (377.67 t/s at 3121 against 478.27). An estimate that has never been checked against
+    // that seat's real placement must not be the thing that moves a measured cell.
+    //
+    // So: the accurate share is computed, and PRINTED, and the decision waits for one boot that
+    // shows the loader's own per-device buffer sizes at the seat's real flags. If the real headroom
+    // supports 2048, this becomes one line - model_bytes = dev_bytes - and the ladder is honest
+    // end to end. The speculation gate does not wait, because it can only ever DECLINE, so a more
+    // accurate number there cannot cost anything.
+    std::string offl;
+    const size_t dev_bytes   = pxa_model_device_bytes(params, file_bytes, offl);
+    const size_t model_bytes = file_bytes;
     // per-device share honouring -ts (2026-09-06); the binding device is the one with the least headroom
     std::vector<size_t> shares;
     const bool ts = pxa_device_shares(params, ndev, model_bytes, shares);
@@ -796,9 +1092,9 @@ static int pxa_adaptive_ubatch(const gpt_params & params, std::string & why) {
         // the seats this runs on (an -ot=CPU override, or a shared card, made the file-size share
         // wrong). An estimator that is provably wrong must not pick the slowest rung: fall back to
         // the card-type default and say why (2026-09-06; the old floor cost the 4x P100 seat 21 %
-        // of its prefill, AUTO-DEFAULTS-AUDIT gap b).
-        snprintf(buf, sizeof(buf), "card-type default (estimate unreliable: dev%d share %zu MiB (%s) exceeds its free VRAM%s)",
-                 worst, share>>20, ts ? "per -ts" : "uniform split",
+        // of its prefill).
+        snprintf(buf, sizeof(buf), "card-type default (estimate unreliable: dev%d share %zu MiB (%s) exceeds its free VRAM; the offload-aware share would be %zu MiB [%s], not yet acted on%s)",
+                 worst, share>>20, ts ? "per -ts" : "uniform split", (dev_bytes/(size_t)ndev)>>20, offl.c_str(),
                  pxa_has_cpu_override(params) ? "; -ot pins tensors to CPU" : "");
         why = buf;
         return card_default;
@@ -809,13 +1105,13 @@ static int pxa_adaptive_ubatch(const gpt_params & params, std::string & why) {
         if (ub > card_default) continue;
         const size_t need = (size_t) ub * 512ull * 1024ull; // ~0.5 MiB per ub token (optimistic)
         if (need <= headroom) {
-            snprintf(buf, sizeof(buf), "adaptive: dev%d free-min %zu MiB, min total %zu MiB, model share %zu MiB (%s) -> headroom %zu MiB",
-                     worst, min_free>>20, min_total>>20, share>>20, ts ? "per -ts" : "uniform split", headroom>>20);
+            snprintf(buf, sizeof(buf), "adaptive: dev%d free-min %zu MiB, min total %zu MiB, model share %zu MiB (%s) -> headroom %zu MiB; offload-aware share would be %zu MiB [%s]",
+                     worst, min_free>>20, min_total>>20, share>>20, ts ? "per -ts" : "uniform split", headroom>>20, (dev_bytes/(size_t)ndev)>>20, offl.c_str());
             why = buf;
             return ub;
         }
     }
-    snprintf(buf, sizeof(buf), "adaptive floor (dev%d headroom %zu MiB too tight, %s)", worst, headroom>>20, ts ? "per -ts" : "uniform split");
+    snprintf(buf, sizeof(buf), "adaptive floor (dev%d headroom %zu MiB too tight, %s; offload-aware share would be %zu MiB [%s])", worst, headroom>>20, ts ? "per -ts" : "uniform split", (dev_bytes/(size_t)ndev)>>20, offl.c_str());
     why = buf;
     return 512;
 #else
@@ -927,7 +1223,10 @@ int main(int argc, char ** argv) {
             if (!ub_explicit || !b_explicit) {
                 int         sb = 0, sub = 0;
                 const char * cell = nullptr;
-                if (ggml_backend_cuda_pxa_suggest_batch(&sb, &sub, &cell)) {
+                // the 4x P100 cell answers differently for a dense file than for an expert one,
+                // so the resolver is told which this is -- read from the header, before load.
+                const int n_expert = pxa_gguf_expert_count(params.model);
+                if (ggml_backend_cuda_pxa_suggest_batch(n_expert, &sb, &sub, &cell)) {
                     if (!b_explicit)  { params.n_batch  = sb;  card_b  = true; }
                     if (!ub_explicit) { params.n_ubatch = sub; card_ub = true; }
                     fprintf(stderr,
@@ -974,6 +1273,31 @@ int main(int argc, char ** argv) {
         // real regression, whether the user set it explicitly or it's a mixed-fleet default.
         if (is_mla_arch && !params.flash_attn && !mla_fa_off_arch) {
             fprintf(stderr, "WARNING: deepseek2/MLA with -fa off degrades severely with context; use -fa on -mla 3\n");
+        }
+    }
+
+    // PXA_KV_UNIFIED_DEFAULT (2026-09-13) -- one ring for multi-slot serving, when asked for.
+    //
+    // With the ring split n_ctx/n_parallel, a four-slot server gives every request a quarter of the
+    // context whether or not the other three slots hold anything, and two slots serving the same
+    // client stack keep two physical copies of the same system prompt. One shared ring removes both:
+    // every slot can address the whole ring, and an exact prefix another slot already holds becomes
+    // a tag instead of a prefill (PXA_SLOT_FORK / PXA_SLOT_PREFIX_SHARE).
+    //
+    // It is a LEVER and it is OFF by default, deliberately. Sharing one ring changes WHERE a
+    // request's band is placed, and placement is a thing this project measures before it ships it
+    // (a misplaced band was a real, measured wrong answer on the long-context seat). So the default
+    // here flips only on a measured win at np1 AND np2 on the target cards, and until then the
+    // behaviour of a run that passes nothing is byte-for-byte what it was. PXA_KV_UNIFIED_DEFAULT=1
+    // engages the rule; an explicit --kv-unified / --no-kv-unified (or either environment variable)
+    // always wins, including "no".
+    {
+        const char * kvud = getenv("PXA_KV_UNIFIED_DEFAULT");
+        if (kvud != nullptr && atoi(kvud) != 0 && params.n_parallel > 1 && !params.kv_unified_set) {
+            params.kv_unified = true;
+            fprintf(stderr, "PXA_AUTO: -np %d with no explicit choice -> --kv-unified "
+                            "(PXA_KV_UNIFIED_DEFAULT=1; pass --no-kv-unified to keep the split ring)\n",
+                    params.n_parallel);
         }
     }
 
@@ -1041,10 +1365,9 @@ int main(int argc, char ** argv) {
                 { "qwen3next", 0.7f,  20, 0.80f, 0.00f, "qwen no-think agent defaults (official Qwen no-think sampler set)" },
                 { "qwen35",    0.7f,  20, 0.80f, 0.00f, "qwen no-think agent defaults (official Qwen no-think sampler set)" },
                 { "laguna",    0.7f,  20, 0.80f, 0.00f, "qwen-family hybrid — qwen no-think defaults (HEURISTIC: no per-model sampler sweep yet)" },
-                // qwen4exp = Flash-Next (Qwen3.8 hybrid MoE), the flagship seat's arch; it had no row and
-                // booted on stock llama.cpp samplers ("no family row", Phase P alex-ref boot.txt:5).
-                // Same official Qwen no-think set as the other qwen arches (AUTO-DEFAULTS-AUDIT gap e,
-                // order #1400b); HEURISTIC until a per-model sweep exists.
+                // qwen4exp = Flash-Next (Qwen3.8 hybrid MoE); it had no row and booted on stock
+                // llama.cpp samplers ("no family row" in the boot log). Same official Qwen
+                // no-think set as the other qwen arches; HEURISTIC until a per-model sweep exists.
                 { "qwen4exp",  0.7f,  20, 0.80f, 0.00f, "qwen-family hybrid MoE (Flash-Next) — qwen no-think defaults (HEURISTIC: no per-model sampler sweep yet)" },
             };
             const pxa_sampler_row * row = nullptr;
@@ -1150,6 +1473,13 @@ int main(int argc, char ** argv) {
             if (!spec_vram_ok) {
                 fprintf(stderr, "PXA_AUTO: spec DECLINED -- %s (override with --spec-type, or "
                                 "PXA_AUTO_SPEC=1 to force)\n", spec_vram_why.c_str());
+            } else {
+                // Print the arithmetic when the gate AGREES with you, not only when it
+                // refuses. The declined path always showed its share and the armed path never
+                // did, so a share that was wrong by construction sat on a live seat unnoticed --
+                // it was visible only in the one message nobody expected to read.
+                fprintf(stderr, "PXA_AUTO: spec VRAM gate OK -- %s (at or above the 2048 MiB a "
+                                "draft context needs)\n", spec_vram_why.c_str());
             }
         }
 
@@ -1162,6 +1492,11 @@ int main(int argc, char ** argv) {
                   "PXQU48-core), +4.6% on prose, prefill-neutral; drafts only on an n-gram match so it "
                   "costs ~nothing when it cannot predict, unlike mtp which drafts unconditionally and "
                   "measured -8.6% on this model" },
+                { "qwen4exp", "ngram-mod:n_max=4,n_min=2",
+                  "measured on the seat 2026-09-14: wash on code traffic, drafts only on a match "
+                  "(23.4-24.1 vs no speculation 24.3 t/s, drafts 16 accepts 10); the fleet-wide bare "
+                  "n64 chain LOSES 13% on this seat's real code traffic (drafts 128, accepts 2), so "
+                  "this row keeps the cc >= 600 branch below from ever reaching this arch" },
             };
             const pxa_spec_row * srow = nullptr;
             for (const auto & r : spec_tab) {
@@ -1177,26 +1512,512 @@ int main(int argc, char ** argv) {
                                 "repetitive the OUTPUT is -- high on code/tool traffic, much lower on "
                                 "prose; override --spec-type or PXA_AUTO_SPEC=0)\n",
                         arch.c_str(), srow->stage, srow->why);
-            } else if (!arch.empty()) {
-                fprintf(stderr, "PXA_AUTO: spec arch=%s -> no measured row, speculation left off "
-                                "(only families with a measured win are armed; --spec-type to force)\n",
-                        arch.c_str());
+            } else {
+                // ── PXA_SPEC_NGRAM_POLICY_v1 (2026-09-09) ────────────────────────────────────
+                // The whitelist above arms a drafter only for a family somebody measured. Every
+                // other model -- which is most of what a user actually loads -- fell through to
+                // "speculation left off", and for a model with NO MTP head that meant no
+                // speculation was reachable at all without knowing the name of one of six
+                // self-spec variants.
+                //
+                // So underneath the whitelist there is now a RULE rather than a row, and the rule
+                // is the one fact that decides which drafter a model can use:
+                //
+                //   nextn_predict_layers == 0  -> no MTP head. The n-gram drafter is the only
+                //                                 zero-cost speculation this model has, and it
+                //                                 costs ~nothing when it cannot predict, because
+                //                                 it drafts ONLY on a table match. Arm it.
+                //   nextn_predict_layers  > 0  -> the model HAS an MTP head. Do NOT arm the n-gram
+                //                                 drafter over it: the head is a trained predictor
+                //                                 and the auto layer has no measured basis to
+                //                                 prefer a table lookup to it on this family. Say
+                //                                 so and leave the MTP path alone.
+                //   unreadable (-1)            -> do not decide. Silence beats a guess.
+                //
+                // This is the AUTO layer, so it still fills only ABSENCE: an explicit --spec-type,
+                // a -md draft model, PXA_AUTO_SPEC=0 and PXA_REFERENCE=1 all still win, and the
+                // VRAM headroom / single-card sm_61 declines above have already run and can still
+                // have turned the whole block off before this point is reached.
+                const int nextn = pxa_gguf_nextn_predict_layers(params.model);
+
+                // The cascade does NOT consult PXA_SPEC_NGRAM_POLICY_DEFAULT. That constant governs
+                // whether a NON-MTP file gets a bare n-gram drafter, which is a separate question
+                // that ngram-draft deliberately left off; gating the cascade on it made this
+                // default unreachable -- a boot with nothing set printed "off because
+                // PXA_SPEC_NGRAM_POLICY=0". An explicit PXA_SPEC_NGRAM_POLICY=0 still turns the
+                // cascade off, which is the guard below.
+                const char * ngram_pol_env = getenv("PXA_SPEC_NGRAM_POLICY");
+                const bool   ngram_pol_off = ngram_pol_env && atoi(ngram_pol_env) == 0;
+
+                // ── PXA_SPEC_AUTO_CHAIN_v1 (2026-09-13) ──────────────────────────────────────
+                // THE VOLTA DEFAULT IS THE N-GRAM STAGE ALONE, LONG AND NEVER WIPED.
+                //
+                // MEASURED on the 2x V100-16GB PCIe pair, Qwen3.8-27B PXQ4 arch=qwen35, -ngl 99
+                // -sm layer -fa on, np1, 6 reps per cell, three output classes, and a no-speculation
+                // bracket either side of the run whose drift was 0.18% against a 1.50% band
+                // (38.26 -> 38.19 t/s on control). One binary for every one of our arms. tok/s,
+                // control / repetition / prose:
+                //
+                //   no speculation                            38.26 /  36.94 /  38.02
+                //   ngram alone n_max=64 n_min=2 lookback 24  148.12 /  75.70 / 140.97   <- this
+                //   ngram alone n_max=16 n_min=2               89.57 /  55.29 /  82.02
+                //   the same 64/2/24 WITH an MTP stage        163.83 /  51.80 / 140.61
+                //   mainline's ngram-mod + MTP cascade        137.16 /  62.57 /  74.99
+                //
+                // vs mainline: control +8.0%, repetition +21.0%, prose +88.0%. It is the only arm in
+                // two windows that wins ALL THREE classes. The MTP stage behind it buys control
+                // (+10.6%) and LOSES repetition by 46% -- the class where it also loses to mainline
+                // -- because the head drafts unconditionally wherever the table declines and pays a
+                // sequential companion decode plus an lm_head sample for each such token: its
+                // repetition acceptance is 0.572 against this chain's 0.898, on more than twice the
+                // proposals. The table drafts ONLY on a match, so a long draft is only ever spent
+                // where the table has already been proved right; that is why the depth is affordable
+                // in front of nothing and not behind a head. Acceptance 1.000 / 0.898 / 0.996.
+                //
+                // TWO THINGS THE NUMBERS ARE NOT. (1) They are not an n_max=64 measurement: the
+                // per-slot checkpoint budget clamped this chain's draft capacity to 38 in that
+                // window (the MTP arm got 47), so it won all three classes from a ceiling 20%
+                // TIGHTER than its rival's. The budget is deliberately left alone here -- the
+                // measurement was taken with the clamp live, so raising it would invalidate the row
+                // that justifies this default. (2) No byte-identity claim comes with them: every
+                // speculating arm returned more than one sha across its reps on a deterministic
+                // prompt. PXA_REFERENCE=1 and PXA_AUTO_SPEC=0 are the ways to ask for none of it.
+                //
+                // nextn_predict_layers does not enter this decision. It exists to choose BETWEEN a
+                // table and a trained head, and this chain uses no head, so the rule holds whatever
+                // the answer is -- including the unreadable -1 that leaves the branches below silent.
+                // It is still printed, because a reader deserves to see which head was declined.
+                //
+                // SCOPE. cc >= 600 on EVERY device (2026-09-14, widened from cc >= 700 Volta-only).
+                // The "speculation was inert on the 4x P100 quad" line this comment used to carry is
+                // now itself measured and withdrawn: quad-default-pxq4, this exact chain on the 4x
+                // P100 quad (cards 0,1,5,6), reads control 95.57 vs the shipped cascade's 17.89
+                // (mainline's ngram-mod+MTP cascade 46.17 -- that cell turns GREEN), repetition 21.25 vs 19.54 at REPS 6 (was 17.60 at REPS 3)
+                // vs cascade 10.40, prefill cost zero where the cascade used to halve it (thread
+                // 5723). So this branch now fires on every card family that has been measured -- the
+                // V100 pair (quadspec-w2, cc 700) and the P100 quad (quad-default-pxq4, cc 600) -- and
+                // cc >= 600 is the floor that covers both without reaching into a still-unmeasured
+                // fleet. A device below cc 600 keeps today's behaviour, and so does a MIXED fleet with
+                // one device below cc 600; a P100+1080 Ti fleet IS covered, because the 1080 Ti is cc
+                // 610. The arch whitelist above still wins where it has a row: its constants are
+                // Pascal-measured and this window was a dense qwen35, so a whitelisted arch is a cell
+                // nobody has measured either way, and a default does not get to change an unmeasured
+                // cell.
+                //
+                // LEVER. PXA_SPEC_AUTO_CHAIN=cascade restores the previous auto chain on every card;
+                // =ngram asks for this chain on ANY card regardless of cc, which is how a
+                // still-unmeasured fleet gets measured; unset or =auto is the per-card default
+                // resolved here. An explicit --spec-type, a -md draft model, PXA_AUTO_SPEC=0 and
+                // PXA_REFERENCE=1 all still win outright, PXA_ENHANCE=0 means nothing is auto-armed at
+                // all, and the VRAM headroom and single-card sm_61 declines above have already had
+                // their say.
+                const char * auto_chain_env   = getenv("PXA_SPEC_AUTO_CHAIN");
+                const std::string auto_chain  = auto_chain_env ? auto_chain_env : "auto";
+                const bool chain_force_casc   = auto_chain == "cascade";
+                const bool chain_force_ngram  = auto_chain == "ngram";
+                const bool ngram_alone_chain  = !chain_force_casc && !ngram_pol_off &&
+                                                (chain_force_ngram || pxa_all_devices_pascal_plus());
+
+                if (ngram_alone_chain) {
+                    // The measured spelling, key for key: the alias resolves to ngram_mod and every
+                    // knob it would have filled is named here, so this stage is byte for byte the
+                    // --spec-type the winning arm ran.
+                    static const char * const ngram_alone_stage = "ngram:n_max=64,n_min=2,ngram_size_n=24";
+                    // The fourth constant has no stage knob. The streak-3 full-map wipe lives in
+                    // common/speculative.cpp and reads PXA_NGRAM_RESET_STREAK once, from the
+                    // environment; every arm in the table above ran with it at 0, and turning it off
+                    // is worth 36% of the repetition class on its own. overwrite=0, so an operator
+                    // who exported their own value still gets their own value -- and the banner
+                    // prints which of the two happened rather than asserting the default.
+                    const char * reset_streak_env = getenv("PXA_NGRAM_RESET_STREAK");
+                    setenv("PXA_NGRAM_RESET_STREAK", "0", 0);
+                    params.speculative.stages.push_back(common_speculative_stage_from_arg(ngram_alone_stage));
+                    const auto resolved = params.speculative.get_resolved_stages();
+                    params.speculative.type = resolved.empty()
+                                            ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+                    params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+                    fprintf(stderr, "PXA_AUTO: spec arch=%s -> the n-gram stage ALONE, chain = %s "
+                                    "(--spec-type %s, PXA_NGRAM_RESET_STREAK=%s; "
+                                    "%s.nextn_predict_layers=%d and no MTP stage is armed even where "
+                                    "the file has a head; %s). MEASURED 2026-09-13 on a 2x V100 pair "
+                                    "(quadspec-w2), Qwen3.8-27B PXQ4, np1, 6 reps, bracket drift 0.18%%: "
+                                    "148.1 / 75.7 / 141.0 t/s on control / repetition / prose against "
+                                    "mainline's n-gram+MTP cascade at 137.2 / 62.6 / 75.0 -- +8.0%% / "
+                                    "+21.0%% / +88.0%%, the only arm that wins all three classes; an "
+                                    "MTP stage behind this one buys control and loses repetition by "
+                                    "46%% there. MEASURED AGAIN 2026-09-13 on the 4x P100 quad "
+                                    "(quad-default-pxq4, cards 0,1,5,6): control 95.57 vs the shipped "
+                                    "cascade's 17.89 (mainline 46.17), repetition 21.25 vs mainline's 19.54 at "
+                                    "REPS 6 (quadrep2-w1; the cascade read 10.40), prefill cost zero where the cascade used to halve it. The "
+                                    "gain is workload-dependent: the table drafts only on a match, so "
+                                    "it costs ~nothing when it cannot predict and pays most where the "
+                                    "output repeats the prompt. Override with --spec-type, "
+                                    "PXA_AUTO_SPEC=0, or PXA_SPEC_AUTO_CHAIN=cascade for the previous "
+                                    "auto chain\n",
+                            arch.empty() ? "?" : arch.c_str(),
+                            common_speculative_stage_chain_to_str(params.speculative).c_str(),
+                            ngram_alone_stage,
+                            reset_streak_env ? reset_streak_env : "0 (this default set it)",
+                            arch.empty() ? "<arch>" : arch.c_str(), nextn,
+                            chain_force_ngram ? "asked for by PXA_SPEC_AUTO_CHAIN=ngram"
+                                              : "every CUDA device is cc >= 600, the two fleets this was measured on");
+                } else if (nextn > 0 && !ngram_pol_off) {
+                    // THE CASCADE IS THE DEFAULT FOR AN MTP FILE (2026-09-10). The n-gram stage sits
+                    // IN FRONT of the shipped MTP stage, with the MTP stage's own knobs untouched.
+                    //
+                    // This used to decline, on the reasoning that a trained predictor beats a table
+                    // lookup. That is true per proposal and false per second: the table costs almost
+                    // nothing when it cannot predict, and when it CAN -- the model quoting the
+                    // prompt, tool JSON, a code edit -- it answers before the head is asked. The two
+                    // drafters are good at different things, so running them in series beats picking
+                    // one. Still the AUTO layer: an explicit --spec-type, a -md draft model,
+                    // PXA_AUTO_SPEC=0 and PXA_REFERENCE=1 all still win.
+                    //
+                    // 2026-09-13: this branch used to INSERT the n-gram stage in front of an MTP
+                    // stage that nobody had built. On a bare command line
+                    // params.speculative.stages is EMPTY -- the measured whitelist above fires only
+                    // for arch qwen35moe, and no other code path puts an MTP stage there unless the
+                    // user types --spec-type mtp. So for every other MTP architecture the resolved
+                    // chain was the single stage ngram_mod, has_mtp came out false two lines later,
+                    // the MTP companion context was never created, and this banner described a
+                    // cascade that did not exist. The boot log said it in one line all along:
+                    // "CASCADE ... + the MTP head" immediately followed by
+                    // "PXA_SPEC: stage chain = ngram_mod".
+                    //
+                    // Build the MTP stage when the file has a head and no MTP stage is configured,
+                    // THEN put the n-gram stage in front of it -- and print the chain that was
+                    // actually resolved rather than a hardcoded sentence, so this class of defect
+                    // cannot come back silently. The MTP stage is built BARE, with no knob of its own:
+                    // the measured MTP auto layer below already fills n_max and p_min for this arch
+                    // and prints the numbers with their provenance, and a stage that carried its own
+                    // n_max would make that line report the value as "named on the CLI" when nobody
+                    // named it.
+                    static const char * const ngram_stage = "ngram";
+                    static const char * const mtp_stage   = "mtp";
+                    if (!params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
+                        params.speculative.stages.push_back(common_speculative_stage_from_arg(mtp_stage));
+                    }
+                    auto stage = common_speculative_stage_from_arg(ngram_stage);
+                    params.speculative.stages.insert(params.speculative.stages.begin(), stage);
+                    const auto resolved = params.speculative.get_resolved_stages();
+                    params.speculative.type = resolved.empty()
+                                            ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+                    params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+                    fprintf(stderr, "PXA_AUTO: spec arch=%s -> CASCADE, chain = %s "
+                                    "(%s.nextn_predict_layers=%d): the n-gram table drafts "
+                                    "first and the trained head answers whatever it cannot. Measured "
+                                    "at temperature 0 and sampled; the gain is workload-dependent and "
+                                    "largest where output repeats the prompt. NOTE at -np 2 on the "
+                                    "measured workload the n-gram stage ALONE was faster than the "
+                                    "cascade (91.0 vs 81.4 t/s aggregate), so if you serve two busy "
+                                    "slots, measure before assuming the cascade is the best shape. "
+                                    "Override with --spec-type, PXA_AUTO_SPEC=0, or "
+                                    "PXA_SPEC_NGRAM_POLICY=0 to keep the MTP head alone\n",
+                            arch.empty() ? "?" : arch.c_str(),
+                            common_speculative_stage_chain_to_str(params.speculative).c_str(),
+                            arch.empty() ? "<arch>" : arch.c_str(), nextn);
+                } else if (nextn > 0) {
+                    // Same defect, same fix: this branch claimed "the MTP head alone" and built no
+                    // stage at all, so PXA_SPEC_NGRAM_POLICY=0 on an MTP file turned speculation
+                    // OFF entirely rather than dropping the n-gram stage from the front of it.
+                    static const char * const mtp_stage = "mtp";
+                    if (!params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
+                        params.speculative.stages.push_back(common_speculative_stage_from_arg(mtp_stage));
+                    }
+                    const auto resolved = params.speculative.get_resolved_stages();
+                    params.speculative.type = resolved.empty()
+                                            ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+                    params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+                    fprintf(stderr, "PXA_AUTO: spec arch=%s -> the MTP head alone, chain = %s "
+                                    "(%s.nextn_predict_layers=%d); the n-gram cascade in front of it "
+                                    "is off because you set PXA_SPEC_NGRAM_POLICY=0\n",
+                            arch.empty() ? "?" : arch.c_str(),
+                            common_speculative_stage_chain_to_str(params.speculative).c_str(),
+                            arch.empty() ? "<arch>" : arch.c_str(), nextn);
+                } else if (nextn == 0 && pxa_spec_ngram_policy_on()) {
+                    static const char * const ngram_stage = "ngram";
+                    params.speculative.stages.push_back(common_speculative_stage_from_arg(ngram_stage));
+                    const auto resolved = params.speculative.get_resolved_stages();
+                    params.speculative.type = resolved.empty()
+                                            ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+                    params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+                    fprintf(stderr, "PXA_AUTO: spec arch=%s -> --spec-type ngram (no MTP head in this "
+                                    "file, so the n-gram drafter is the only speculation available to "
+                                    "it; it drafts only on a match, which is why arming it cannot cost "
+                                    "much when it cannot predict. The GAIN IS WORKLOAD-DEPENDENT: high "
+                                    "on repetitive output -- code edits, tool JSON, answers that quote "
+                                    "the prompt -- and small on fresh prose. Override --spec-type or "
+                                    "PXA_AUTO_SPEC=0; PXA_SPEC_NGRAM_POLICY=0 turns just this rule "
+                                    "off)\n",
+                            arch.empty() ? "?" : arch.c_str());
+                } else if (nextn == 0) {
+                    fprintf(stderr, "PXA_AUTO: spec arch=%s -> n-gram available but not armed "
+                                    "(PXA_SPEC_NGRAM_POLICY=0); --spec-type ngram to use it\n",
+                            arch.empty() ? "?" : arch.c_str());
+                } else if (!arch.empty()) {
+                    fprintf(stderr, "PXA_AUTO: spec arch=%s -> no measured row and the file's MTP-head "
+                                    "state could not be read, speculation left off (--spec-type to "
+                                    "force)\n", arch.c_str());
+                }
             }
         }
     }
 
-    // PXA_SPEC_RELAXED truth line (2026-09-06, plan X4 / Board B9): when a speculative stage is
+    // PXA AUTO-SPEC MTP CONFIG (2026-09-09): when an MTP stage is armed but its
+    // knobs were never named, fill the three this family MEASURED best at -- draft depth, the
+    // confidence floor, and whether the accepted-token catch-up decode asks for outputs.
+    //
+    // A `--spec-type mtp` (or `--mtp`) with no `n_max=` inherits the GLOBAL draft default, which is
+    // 16, and the global confidence floor of 0.75 -- and at that floor the chain collapses to ONE
+    // token whatever n_max says (measured: the drafter's full-vocab top-1 probability has mean 0.036
+    // and clears 0.75 in 0.0% of steps on this 248320-token vocabulary). The three knobs are not
+    // independent, which is why they are filled together.
+    //
+    // MEASURED on the 2x V100-16GB PCIe pair, Qwen3.8-27B PXQ4 arch=qwen35, -ngl 99 -c 32768 -np 2
+    // -t 16 -fa on -sm layer, decode 256, median of 3. TWO ROUNDS, and the second overturned the
+    // first, which is the whole reason the numbers are written here rather than remembered:
+    //
+    // Round 1 (2026-09-09, before the MTP head's feature row was marked a graph output):
+    //   plain                                    37.22 t/s
+    //   n_max=1, floor 0.75                      44.85 t/s   accept 0.954
+    //   n_max=2/3/4, floor 0     (no split)      34.55 / 29.49 / 28.58 -- proposed and rejected
+    //   n_max=2, floor 0, split                  48.43 t/s   accept 0.856
+    //   n_max=4, floor 0, split                  50.55 t/s   accept 0.644
+    // and the conclusion drawn was that the split (PXA_MTP_ZERO_OUTPUT_COMMIT) is what makes depth
+    // pay. It was not. The split was WORKING AROUND a defect: the row the next draft step conditions
+    // on was being read back after the allocator had reused it, so chains built on it collapsed to
+    // noise (top-1 0.045 at depth 2, i.e. uniform), and re-decoding the row hid that at ~2.9 ms a
+    // cycle. Marking the row a graph output fixed the cause -- free-n4 53.61 t/s against 28.53 with
+    // the guard deliberately off, which is the fix measuring itself.
+    //
+    // Round 2 (2026-09-09, on the fixed binary, np1 AND a two-client np2 column):
+    //                                np1        np2 aggregate
+    //   plain                        37.31          --
+    //   n_max=3, no split            54.42        71.89     <- the default
+    //   n_max=4, no split            54.11        35.54     <- collapses under concurrency
+    //   n_max=3, split               52.52        63.63     <- the workaround now costs
+    //
+    // Depth 4 buys nothing at one client and loses half the throughput at two, so the default is the
+    // depth that holds on BOTH columns. The split loses on both. Note for anyone re-running this: the
+    // two-client figures are partly serialised throughput on the arms whose overlap fell below 0.9 --
+    // the ranking stands, and n3+split's own np2 had overlap 0.93.
+    //
+    // This is the AUTO layer: it fills ABSENT knobs, it never overrides one. An explicit
+    // `--spec-type mtp:n_max=N,p_min=X`, an explicit PXA_MTP_PMIN / PXA_MTP_ZERO_OUTPUT_COMMIT, and a
+    // per-request `speculative.n_max` / `speculative.p_min` all still win. Every other model family
+    // keeps today's defaults, and PXA_REFERENCE=1 stands the whole thing down.
+    {
+        const bool ref_level = ggml_pxa_config_level() == 0;
+        bool mtp_stage_present = false;
+        for (const auto & stage : params.speculative.stages) {
+            if (stage.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                mtp_stage_present = true;
+            }
+        }
+
+        if (mtp_stage_present) {
+            struct pxa_mtp_cfg_row { const char * arch; int n_max; float p_min; bool zero_output; const char * why; };
+            static const pxa_mtp_cfg_row mtp_cfg_tab[] = {
+                { "qwen35",    3, 0.0f, false,
+                  "depth 3, no zero-output commit: 54.42 t/s at np1 against 37.31 plain, and 71.89 "
+                  "aggregate at np2 -- where depth 4 COLLAPSES to 35.54. Depth 4 wins np1 by nothing "
+                  "(54.11) and loses np2 by half, so the default is the depth that holds on both. "
+                  "Zero-output commit loses on both too (52.52 / 63.63); it only led the earlier "
+                  "matrix because it discarded a read-back row that was poisoned -- that row is fixed "
+                  "now, so the trick it paid for is gone. Qwen3.8-27B PXQ4, 2x V100, 2026-09-09" },
+                { "qwen35moe", 3, 0.0f, false,
+                  "depth 3, no zero-output commit: carried to the sparse sibling on the dense result "
+                  "(54.42 np1 / 71.89 np2 vs 37.31 plain, Qwen3.8-27B PXQ4, 2x V100, 2026-09-09). "
+                  "MTP was a tax at every depth on the MoE model last measured (LEVERS.md: -8.6% at "
+                  "n_max=1), so measure before trusting this row there" },
+            };
+
+            const std::string arch = pxa_gguf_arch(params.model);
+            const pxa_mtp_cfg_row * crow = nullptr;
+            for (const auto & r : mtp_cfg_tab) {
+                if (arch == r.arch) { crow = &r; break; }
+            }
+
+            if (crow == nullptr) {
+                fprintf(stderr, "PXA_AUTO: spec mtp arch=%s -> no measured row, the global n_max=%d / "
+                                "p_min=%.3f are used (name them with --spec-type mtp:n_max=N,p_min=X)\n",
+                        arch.empty() ? "?" : arch.c_str(), params.speculative.n_max, params.speculative.p_min);
+            } else if (ref_level) {
+                fprintf(stderr, "PXA_AUTO: spec mtp arch=%s -> stand-down (PXA_REFERENCE=1), the global "
+                                "n_max=%d / p_min=%.3f are used\n",
+                        arch.c_str(), params.speculative.n_max, params.speculative.p_min);
+            } else {
+                bool    set_n_max = false, set_p_min = false;
+                int32_t eff_n_max = crow->n_max;    // what the stage ends up running with
+                float   eff_p_min = crow->p_min;
+                for (auto & stage : params.speculative.stages) {
+                    if (stage.type != COMMON_SPECULATIVE_TYPE_MTP) {
+                        continue;
+                    }
+                    if (!stage.has_n_max_override()) { stage.n_max = crow->n_max; set_n_max = true; }
+                    if (!stage.has_p_min_override()) { stage.p_min = crow->p_min; set_p_min = true; }
+                    eff_n_max = stage.n_max;
+                    eff_p_min = stage.p_min;
+                }
+                // env still wins inside this call
+                common_speculative_mtp_zero_output_commit_set_default(crow->zero_output);
+                const bool zero_on = common_speculative_mtp_zero_output_commit();
+
+                fprintf(stderr, "PXA_AUTO: spec mtp arch=%s -> n_max=%d%s, p_min=%.3f%s, "
+                                "zero-output commit %s%s (%s; override --spec-type mtp:n_max=N,p_min=X "
+                                "or PXA_MTP_PMIN / PXA_MTP_ZERO_OUTPUT_COMMIT)\n",
+                        arch.c_str(),
+                        eff_n_max,  set_n_max ? "" : " (yours: named on the CLI)",
+                        (double) eff_p_min, set_p_min ? "" : " (yours: named on the CLI)",
+                        zero_on ? "ON" : "OFF",
+                        (zero_on == crow->zero_output) ? "" : " (yours: PXA_MTP_ZERO_OUTPUT_COMMIT set)",
+                        crow->why);
+            }
+        }
+    }
+
+    // PXA_SPEC_RELAXED truth line (2026-09-06): when a speculative stage is
     // armed AND relaxed acceptance is live, say so with the floor. It changes the OUTPUT at temp>0
     // (a draft token inside the target's post-filter candidate set is kept instead of the target's
-    // own sample); at temperature 0 the exact-match path runs regardless, so greedy gates and the
-    // "with speculation" rows measured at temp 0 are exact-verify either way.
+    // own sample); at temperature 0 the exact-match path runs regardless, so the ACCEPT RULE is the
+    // same with this switch either way.
+    //
+    // CORRECTED 2026-09-14: this comment used to end "so greedy gates and the 'with speculation'
+    // rows measured at temp 0 are exact-verify either way", and the second half of that was read as
+    // a promise that a temp-0 speculative run reproduces a drafter-off run byte for byte. It does
+    // not, for a reason that has nothing to do with this switch -- see PXA_SPEC_BATCH_FIDELITY
+    // below. Exact-match acceptance is a property of the COMPARISON, not of the text.
     if (!params.speculative.get_resolved_stages().empty()) {
+        // PXA_SPEC_NGRAM_ALIAS_v1 truth line: say which stages are actually armed and, for a
+        // self-speculation stage, the two knobs that decide whether it pays -- the draft depth and
+        // the fall-through floor. The MTP stage already prints its own line above; a self-spec
+        // stage printed nothing at all, so a number measured against "--spec-type ngram" could not
+        // be tied back to the depth it ran at. The chain is printed with the CONCRETE variant
+        // names, never the alias, so a log line and a ledger row can always be lined up.
+        {
+            const auto resolved = params.speculative.get_resolved_stages();
+            fprintf(stderr, "PXA_SPEC: stage chain = %s\n",
+                    common_speculative_stage_chain_to_str(params.speculative).c_str());
+            for (const auto & st : resolved) {
+                if (!common_speculative_type_is_self_spec(st.type)) {
+                    continue;
+                }
+                const auto eff = params.speculative.with_stage_overrides(st);
+                fprintf(stderr, "PXA_SPEC: self-spec stage %s: n_max=%d, n_min=%d, ngram_size_n=%d, "
+                                "ngram_size_m=%d, ngram_min_hits=%d -- it drafts ONLY on a match, and "
+                                "n_min is the floor below which a weak match falls through to the next "
+                                "stage instead of being verified\n",
+                        common_speculative_type_to_str(st.type).c_str(),
+                        eff.n_max, eff.n_min, (int) eff.ngram_size_n,
+                        (int) eff.ngram_size_m, (int) eff.ngram_min_hits);
+            }
+        }
+
         if (common_sampler_spec_relaxed_active()) {
             fprintf(stderr, "PXA_SPEC_RELAXED: ON (pmin=%.3f) -- relaxed draft acceptance is live for temp>0 "
-                            "sampling (level default at ENHANCE); exact verification at temp 0, or set "
+                            "sampling (level default at ENHANCE); exact-MATCH acceptance at temp 0, or set "
                             "PXA_SPEC_RELAXED=0\n", common_sampler_spec_relaxed_pmin());
         } else {
             fprintf(stderr, "PXA_SPEC_RELAXED: OFF -- exact-match draft acceptance at every temperature\n");
+        }
+
+        // What "exact-match acceptance" does and does not promise, said once at boot so nobody has
+        // to spend a card window rediscovering it (2026-09-14, measured on 2x and 4x P100).
+        //
+        // Exact-match means the accept loop compares the drafted token against the ARGMAX OF THE
+        // VERIFY STEP. It does not mean the emitted text equals the text a drafter-off run would
+        // produce. A verify step decodes M = 1 + n_draft rows in ONE forward pass while plain
+        // decode always decodes one, and every matmul in the backend picks its kernel from the row
+        // count: below a small-batch boundary a token takes the single-row decode kernel, above it
+        // the wide-batch one, and even inside one kernel family the K-split shape and the attention
+        // tile change with M. Those are different summation orders, so the same position's logits
+        // differ slightly between a width-M verify and a width-1 decode. Wherever the top two
+        // candidates sit within that difference the argmax flips and the run takes the other,
+        // equally valid, greedy continuation. How often that happens is a property of the text,
+        // not of the engine: on the campaign's open-ended prose prompt the first flip landed at
+        // generated token 81 of 512, on two candidates at p=0.62 / p=0.38; on a prompt the drafter
+        // predicts perfectly (acceptance 1.000) there were no flips at all in 512 tokens, because
+        // such text has no near-ties to flip.
+        //
+        // Two consequences worth printing:
+        //   * a byte-for-byte reproducibility check (same prompt, temp 0, same server, N times)
+        //     is NOT a valid gate for a speculative configuration. It cannot pass, the failure is
+        //     not a defect, and the draft state carried between requests makes it look erratic.
+        //     Gate speculation on FIDELITY -- per-position top-1 agreement, KLD, logit spread --
+        //     and keep byte-reproducibility gates on a drafter-off run, which is exact.
+        //   * if you need byte-identical output across runs, turn speculation off.
+        fprintf(stderr, "PXA_SPEC_BATCH_FIDELITY: a verify step computes its logits at batch "
+                        "width M = 1 + n_draft, a plain decode at width 1, and the two use "
+                        "different kernels and summation orders -- so at a near-tie the greedy "
+                        "pick can differ from a drafter-off run. Speculative output is NOT "
+                        "byte-reproducible at temperature 0: gate it on fidelity (top-1 "
+                        "agreement / KLD), not on a repeated-output checksum, and run a "
+                        "drafter-off server when you need byte-identical results\n");
+
+        // PXA_SPEC_ADAPTIVE_LOAD truth line: whether the draft DEPTH follows the current load.
+        // Depth only -- the ACCEPT RULE stays exact-match at every temperature. Note (2026-09-14)
+        // that this does not make it output-neutral: depth is M, and M is what PXA_SPEC_BATCH_FIDELITY
+        // above is about, so changing depth changes which near-ties flip.
+        // Neither branch quotes a speed number: the +37% four-client figure that the 2026-09-10
+        // default was flipped on failed to reproduce on 2026-09-11 and is withdrawn, so printing it
+        // here -- in EITHER direction -- would be publishing a number we no longer stand behind.
+        if (pxa_spec_load_enabled()) {
+            fprintf(stderr, "PXA_SPEC_ADAPTIVE_LOAD: ON (you set it) -- draft depth follows load: "
+                            "full at 1 active slot, ~n_max/S at S active slots (also capped by the "
+                            "acceptance-implied expected run), and 0 at %d or more active slots "
+                            "(PXA_SPEC_ADAPTIVE_LOAD_OFF_AT moves the cutoff). Depth only, so it "
+                            "cannot move a token; the speed claim that made this the default was "
+                            "withdrawn 2026-09-11 for failing to reproduce\n",
+                    pxa_spec_load_off_at());
+        } else {
+            fprintf(stderr, "PXA_SPEC_ADAPTIVE_LOAD: OFF (default) -- the configured draft depth is "
+                            "used at every concurrency level. This was ON by default on 2026-09-10 "
+                            "and reverted 2026-09-11: the +37%% four-client number it was flipped on "
+                            "did not reproduce, and the arms' own controls drift 17-20%%, so a delta "
+                            "that size is not resolvable at n=5. PXA_SPEC_ADAPTIVE_LOAD=1 re-arms it "
+                            "(the mechanism is intact and depth-only)\n");
+        }
+
+        // PXA_MTP_DRAFT_CACHE_ONLY truth line: whether the MTP head's prompt catch-up builds the
+        // reduced K/V-only graph. Only taken where the caller reads nothing back, so the proposed
+        // and the accepted tokens are unchanged either way.
+        if (pxa_mtp_cache_only_enabled()) {
+            fprintf(stderr, "PXA_MTP_DRAFT_CACHE_ONLY: ON -- the MTP prompt catch-up builds K/V "
+                            "projection + rotation + cache write only (no query, attention, output "
+                            "projection, FFN or LM head) on a single-layer MTP head; unset it for "
+                            "the full graph\n");
+        } else {
+            fprintf(stderr, "PXA_MTP_DRAFT_CACHE_ONLY: OFF (default) -- the MTP prompt catch-up runs "
+                            "the full draft graph (PXA_MTP_DRAFT_CACHE_ONLY=1 for the K/V-only one)\n");
+        }
+
+        // PXA_MTP_ZERO_OUTPUT_COMMIT truth line: which decode produces the first draft token of a
+        // cycle. It moves work, never results -- the K/V the drafter attends to is identical either
+        // way (same hidden row, same token, same position).
+        if (params.has_mtp) {
+            if (common_speculative_mtp_zero_output_commit()) {
+                fprintf(stderr, "PXA_MTP_ZERO_OUTPUT_COMMIT: ON -- the accepted-token catch-up decode asks "
+                                "for NO outputs (no FFN, no 248k-row LM head over rows nobody reads) and the "
+                                "next draft re-decodes the last position as its own step 0; unset it for the "
+                                "free carried token\n");
+            } else {
+                fprintf(stderr, "PXA_MTP_ZERO_OUTPUT_COMMIT: OFF (default) -- the commit decode also samples "
+                                "the next cycle's first draft token, so it runs the full head for every row "
+                                "(PXA_MTP_ZERO_OUTPUT_COMMIT=1 to split them)\n");
+            }
+        }
+    }
+
+    // PXA_CKPT_EVICT truth line: which checkpoint the ring drops when it is full. Eviction only
+    // changes what has to be re-prefilled, never a computed value, so this is a TTFT lever.
+    if (params.ctx_checkpoints_n > 0) {
+        if (pxa_ckpt_evict_mode_from_env() == PXA_CKPT_EVICT_VALUE) {
+            fprintf(stderr, "PXA_CKPT_EVICT: value -- checkpoint eviction weights each candidate's "
+                            "spacing score by (1 + 4*replay_hits) and protects replay-boundary "
+                            "checkpoints (unset the variable for the stock spacing-only policy)\n");
+        } else {
+            fprintf(stderr, "PXA_CKPT_EVICT: structural (default) -- spacing-only eviction; replay "
+                            "hits are counted but not used (PXA_CKPT_EVICT=value to weight by them)\n");
         }
     }
 
@@ -1604,6 +2425,19 @@ int main(int argc, char ** argv) {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},
                     {"value",  (uint64_t) data.at("t_tokens_generation_total") / 1.e3}
+            }, {
+                    // PXA_SLOT_FORK_v1
+                    {"name",  "slot_forks_total"},
+                    {"help",  "Number of requests that started from another slot's live KV prefix."},
+                    {"value",  (uint64_t) data.at("n_slot_forks")}
+            }, {
+                    {"name",  "slot_fork_prompt_tokens_saved_total"},
+                    {"help",  "Prompt tokens not prefilled thanks to exact-prefix slot forks."},
+                    {"value",  (uint64_t) data.at("n_slot_fork_tokens_saved")}
+            }, {
+                    {"name",  "slot_forks_refused_total"},
+                    {"help",  "Slot-fork candidates refused after inspection (see the server log for the reason)."},
+                    {"value",  (uint64_t) data.at("n_slot_fork_refused")}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -1736,7 +2570,15 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_slots_action = [&handle_slots_save, &handle_slots_restore, &handle_slots_erase](const httplib::Request & req, httplib::Response & res) {
+    // Erasing a slot has nothing to do with slot FILES: it drops the slot's cached prompt and KV in
+    // memory. Gating the whole route on --slot-save-path meant a caller could not erase a slot
+    // without pretending to want slot files -- and the caller that hit this hardest was our own
+    // determinism gate, whose stated premise is that every request lands at the same KV offset as
+    // the np1 reference. Its erase calls had been 404ing for the whole campaign, silently, so an
+    // unknown share of every reported np2 divergence was really the documented KV-placement coin
+    // flip. The route is registered unconditionally now; only save and restore need the path, and
+    // they say so instead of vanishing.
+    const auto handle_slots_action = [&params, &handle_slots_save, &handle_slots_restore, &handle_slots_erase](const httplib::Request & req, httplib::Response & res) {
         std::string id_slot_str = req.path_params.at("id_slot");
         int id_slot;
 
@@ -1748,6 +2590,15 @@ int main(int argc, char ** argv) {
         }
 
         std::string action = req.get_param_value("action");
+
+        if (action == "save" || action == "restore") {
+            if (params.slot_save_path.empty()) {
+                res_err(res, format_error_response(
+                    "slot save/restore needs --slot-save-path; slot erase does not and is always available",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+        }
 
         if (action == "save") {
             handle_slots_save(req, res, id_slot);
@@ -2854,9 +3705,11 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get ("/slots",               handle_slots);
     svr->Get ("/slots/list",          list_slot_prompts);
+    // action=erase needs no save path, so the route is always registered; handle_slots_action
+    // refuses save/restore with a clear message when --slot-save-path is unset.
+    svr->Post("/slots/:id_slot",  handle_slots_action);
     if (!params.slot_save_path.empty()) {
-        // these endpoints rely on slot_save_path existing
-        svr->Post("/slots/:id_slot",  handle_slots_action);
+        // these endpoints genuinely rely on slot_save_path existing
         svr->Get ("/list",            list_saved_prompts);
         svr->Post("/delete_prompt",   delete_saved_prompt);
         svr->Post("/rename_prompt",   rename_saved_prompt);

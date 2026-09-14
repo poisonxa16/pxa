@@ -9,6 +9,10 @@ static __global__ void ssm_conv_single_seq_f32(
         const float * src2,
         float * dst_x,
         [[maybe_unused]] float * saved,
+        // PXA_RS_RING: per-step capture strides in ELEMENTS; <=0 = derive from the dense
+        // [step][batch_pos][conv_state] layout (bit-identical to before).
+        long long sv_row_stride_in,
+        long long sv_step_stride_in,
         int nc,
         int nr,
         int n_t,
@@ -29,8 +33,15 @@ static __global__ void ssm_conv_single_seq_f32(
     const float * c_row = src2 + (size_t) row * nc;
 
     [[maybe_unused]] float * y;
+    [[maybe_unused]] const long long sv_step = sv_step_stride_in > 0 ? sv_step_stride_in : (long long)(nc - 1)*nr;
+    // PXA_RS_RING: with the ring on there is no plane for the LAST step's conv snapshot (it is
+    // dead data -- the final state lives in the live row), so match the delta-net capture bound.
+    [[maybe_unused]] const bool sv_ring = sv_step_stride_in > 0;
     if constexpr (save_steps) {
-        y = saved + t0*(nc - 1)*nr;
+        // PXA_RS_RING: strided step advance. The `row` term was MISSING here (every thread wrote
+        // the same (nc-1) floats); the CPU reference has it (ggml.c, `ir0*(nc-1)`) and the nc==4
+        // sibling below has it. Our models are all d_conv==4, so this path never ran a capture.
+        y = saved + (size_t) t0*sv_step + (size_t) row*(nc - 1);
     }
 
 #pragma unroll
@@ -49,7 +60,7 @@ static __global__ void ssm_conv_single_seq_f32(
 
             sumf += x * c_row[j];
             if constexpr (save_steps) {
-                if (j > 0) {
+                if (j > 0 && !(sv_ring && t + 1 >= n_t)) {
                     y[j-1] = x;
                 }
             }
@@ -58,7 +69,7 @@ static __global__ void ssm_conv_single_seq_f32(
         dst_x[row + (size_t) t * nr] = sumf;
 
         if constexpr (save_steps) {
-            y += (nc - 1)*nr;
+            y += sv_step;
         }
     }
 }
@@ -70,6 +81,10 @@ static __global__ void ssm_conv_single_seq_f32_nc4(
         const float * src2,
         float * dst_x,
         [[maybe_unused]] float * saved,
+        // PXA_RS_RING: per-step capture strides in ELEMENTS; <=0 = derive from the dense
+        // [step][batch_pos][conv_state] layout (bit-identical to before).
+        long long sv_row_stride_in,
+        long long sv_step_stride_in,
         int nr,
         int n_t,
         int src0_s0,
@@ -86,8 +101,10 @@ static __global__ void ssm_conv_single_seq_f32_nc4(
     }
 
     [[maybe_unused]] float * y;
+    [[maybe_unused]] const long long sv_step = sv_step_stride_in > 0 ? sv_step_stride_in : (long long)3*nr;
+    [[maybe_unused]] const bool sv_ring = sv_step_stride_in > 0;   // PXA_RS_RING, see the sibling above
     if constexpr (save_steps) {
-        y = saved + 3*(t0*nr + row);
+        y = saved + (size_t) t0*sv_step + (size_t) 3*row;   // PXA_RS_RING
     }
 
     const float * state_row = src0 + (size_t) row * src0_s1;
@@ -117,10 +134,12 @@ static __global__ void ssm_conv_single_seq_f32_nc4(
         dst_x[row + (size_t) t * nr] = x0 * c0 + x1 * c1 + x2 * c2 + x3 * c3;
 
         if constexpr (save_steps) {
-            y[0] = x1;
-            y[1] = x2;
-            y[2] = x3;
-            y += 3*nr;
+            if (!(sv_ring && t + 1 >= n_t)) {
+                y[0] = x1;
+                y[1] = x2;
+                y[2] = x3;
+            }
+            y += sv_step;   // PXA_RS_RING
         }
     }
 }
@@ -237,6 +256,10 @@ static __global__ void ssm_conv_multi_seq_unique_f32_kernel(
         float * dst_x,
         float * dst_state,
         float * saved, // PXA_MULTISEQ_CKPT: per-step capture, layout [step][batch_pos][conv_state]
+        // PXA_RS_RING: per-step capture strides in ELEMENTS; <=0 = derive from the dense
+        // [step][batch_pos][conv_state] layout (bit-identical to before).
+        long long sv_row_stride_in,
+        long long sv_step_stride_in,
         int nc,
         int nr,
         int n_t,
@@ -271,7 +294,9 @@ static __global__ void ssm_conv_multi_seq_unique_f32_kernel(
 
     if (saved) {
         // PXA_MULTISEQ_CKPT: this fast path is one-token-per-sequence -> step 0, batch_pos = seq.
-        float * y = saved + ((size_t) seq * nr + (size_t) row) * (nc - 1);
+        const long long sv_row = sv_row_stride_in > 0 ? sv_row_stride_in : (long long)(nc - 1)*nr;   // PXA_RS_RING
+        if (sv_step_stride_in > 0) return;   // PXA_RS_RING: 1 token per seq -> no intermediate step
+        float * y = saved + (size_t) seq*sv_row + (size_t) row*(nc - 1);
         for (int i0 = 0; i0 < nc - 1; ++i0) {
             y[i0] = state_row[i0 + 1];
         }
@@ -287,6 +312,10 @@ static __global__ void ssm_conv_multi_seq_unique_f32_kernel_nc4(
         float * dst_x,
         float * dst_state,
         float * saved, // PXA_MULTISEQ_CKPT: per-step capture, layout [step][batch_pos][conv_state]
+        // PXA_RS_RING: per-step capture strides in ELEMENTS; <=0 = derive from the dense
+        // [step][batch_pos][conv_state] layout (bit-identical to before).
+        long long sv_row_stride_in,
+        long long sv_step_stride_in,
         int nr,
         int n_t,
         int src1_nb1) {
@@ -320,7 +349,9 @@ static __global__ void ssm_conv_multi_seq_unique_f32_kernel_nc4(
 
     if (saved) {
         // PXA_MULTISEQ_CKPT: one token per sequence here -> step 0, batch_pos = seq.
-        float * y = saved + 3 * ((size_t) seq * nr + (size_t) row);
+        const long long sv_row = sv_row_stride_in > 0 ? sv_row_stride_in : (long long)3*nr;   // PXA_RS_RING
+        if (sv_step_stride_in > 0) return;   // PXA_RS_RING: 1 token per seq -> no intermediate step
+        float * y = saved + (size_t) seq*sv_row + (size_t) 3*row;
         y[0] = s1;
         y[1] = s2;
         y[2] = x;
@@ -336,6 +367,10 @@ static __global__ void ssm_conv_f32_kernel(
         float * dst_x,
         float * dst_state,
         float * saved, // PXA_MULTISEQ_CKPT: per-step capture, layout [step][batch_pos][conv_state]
+        // PXA_RS_RING: per-step capture strides in ELEMENTS; <=0 = derive from the dense
+        // [step][batch_pos][conv_state] layout (bit-identical to before).
+        long long sv_row_stride_in,
+        long long sv_step_stride_in,
         int nc,
         int nr,
         int n_t,
@@ -383,9 +418,16 @@ static __global__ void ssm_conv_f32_kernel(
             // PXA_MULTISEQ_CKPT: step = within-seq token index, batch_pos = seq0.
             pxa_step = (seq0 == pxa_prev_seq) ? pxa_step + 1 : 0;
             pxa_prev_seq = seq0;
-            float * y = saved + ((size_t) pxa_step * n_kv + seq0) * (size_t)(nc - 1) * nr + (size_t) row * (nc - 1);
-            for (int i0 = 0; i0 < nc - 1; ++i0) {
-                y[i0] = state_row[i0 + 1];
+            const long long sv_row  = sv_row_stride_in  > 0 ? sv_row_stride_in  : (long long)(nc - 1)*nr;        // PXA_RS_RING
+            const long long sv_step = sv_step_stride_in > 0 ? sv_step_stride_in : (long long)n_kv*(nc - 1)*nr;
+            const int sv_seq_tokens = n_kv > 0 ? n_t / n_kv : n_t;
+            // PXA_RS_RING: no plane for the last step's snapshot (dead data; the final state is
+            // the live row). Guard only the STORE -- the rest of this token's work must still run.
+            if (!(sv_step_stride_in > 0 && pxa_step + 1 >= sv_seq_tokens)) {
+                float * y = saved + (size_t) pxa_step*sv_step + (size_t) seq0*sv_row + (size_t) row*(nc - 1);
+                for (int i0 = 0; i0 < nc - 1; ++i0) {
+                    y[i0] = state_row[i0 + 1];
+                }
             }
         }
 
@@ -419,6 +461,10 @@ static __global__ void ssm_conv_f32_kernel_nc4(
         float * dst_x,
         float * dst_state,
         float * saved, // PXA_MULTISEQ_CKPT: per-step capture, layout [step][batch_pos][conv_state]
+        // PXA_RS_RING: per-step capture strides in ELEMENTS; <=0 = derive from the dense
+        // [step][batch_pos][conv_state] layout (bit-identical to before).
+        long long sv_row_stride_in,
+        long long sv_step_stride_in,
         int nr,
         int n_t,
         int n_kv,
@@ -474,10 +520,15 @@ static __global__ void ssm_conv_f32_kernel_nc4(
             // PXA_MULTISEQ_CKPT: step = within-seq token index, batch_pos = seq0.
             pxa_step = (seq0 == pxa_prev_seq) ? pxa_step + 1 : 0;
             pxa_prev_seq = seq0;
-            float * y = saved + ((size_t) pxa_step * n_kv + seq0) * (size_t) 3 * nr + (size_t) row * 3;
-            y[0] = s1;
-            y[1] = s2;
-            y[2] = x;
+            const long long sv_row  = sv_row_stride_in  > 0 ? sv_row_stride_in  : (long long)3*nr;        // PXA_RS_RING
+            const long long sv_step = sv_step_stride_in > 0 ? sv_step_stride_in : (long long)n_kv*3*nr;
+            const int sv_seq_tokens = n_kv > 0 ? n_t / n_kv : n_t;
+            if (!(sv_step_stride_in > 0 && pxa_step + 1 >= sv_seq_tokens)) {   // PXA_RS_RING, see above
+                float * y = saved + (size_t) pxa_step*sv_step + (size_t) seq0*sv_row + (size_t) row*3;
+                y[0] = s1;
+                y[1] = s2;
+                y[2] = x;
+            }
         }
 
         if constexpr (has_multi_seq) {
@@ -543,6 +594,10 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float * dst_data = (float *) dst->data;
     float * dst_x = dst_data;
     float * dst_state = dst_data + (size_t) nr * n_t;
+    // PXA_RS_RING: op_params[2]/[3] retarget the per-step capture into a strided window of a
+    // taller state tensor (the recurrent ring). 0 = the dense layout, i.e. today's arithmetic.
+    const long long sv_row_stride  = (long long) dst->op_params[2];
+    const long long sv_step_stride = (long long) dst->op_params[3];
 
     const dim3 block_dims(CUDA_SSM_CONV_BLOCK_SIZE, 1, 1);
     const dim3 row_grid((nr + CUDA_SSM_CONV_BLOCK_SIZE - 1) / CUDA_SSM_CONV_BLOCK_SIZE, 1, 1);
@@ -568,6 +623,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                         (const float *) src1->data,
                         (const float *) src2->data,
                         dst_x, (float *)src4->data,
+                        sv_row_stride, sv_step_stride,   // PXA_RS_RING
                         nr, n_t,
                         src0_s0, src0_s1, src1_s1);
             } else {
@@ -576,6 +632,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                         (const float *) src1->data,
                         (const float *) src2->data,
                         dst_x, (float *)src4->data,
+                        sv_row_stride, sv_step_stride,   // PXA_RS_RING
                         nc, nr, n_t,
                         src0_s0, src0_s1, src1_s1);
             }
@@ -586,6 +643,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                         (const float *) src1->data,
                         (const float *) src2->data,
                         dst_x, nullptr,
+                        0, 0,   // PXA_RS_RING (no capture)
                         nr, n_t,
                         src0_s0, src0_s1, src1_s1);
             } else {
@@ -594,6 +652,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                         (const float *) src1->data,
                         (const float *) src2->data,
                         dst_x, nullptr,
+                        0, 0,   // PXA_RS_RING (no capture)
                         nc, nr, n_t,
                         src0_s0, src0_s1, src1_s1);
             }
@@ -661,6 +720,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 dst_x,
                 dst_state,
                 src4 ? (float *) src4->data : nullptr, // PXA_MULTISEQ_CKPT
+                sv_row_stride, sv_step_stride,   // PXA_RS_RING
                 nr, n_t,
                 src1->nb[1] / sizeof(float));
         } else {
@@ -673,6 +733,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 dst_x,
                 dst_state,
                 src4 ? (float *) src4->data : nullptr, // PXA_MULTISEQ_CKPT
+                sv_row_stride, sv_step_stride,   // PXA_RS_RING
                 nc, nr, n_t,
                 src1->nb[1] / sizeof(float));
         }
@@ -689,6 +750,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 dst_x,
                 dst_state,
                 src4 ? (float *) src4->data : nullptr, // PXA_MULTISEQ_CKPT
+                sv_row_stride, sv_step_stride,   // PXA_RS_RING
                 nr, n_t, n_kv,
                 src1->nb[1] / sizeof(float),
                 src3->nb[1] / sizeof(int32_t));
@@ -702,6 +764,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 dst_x,
                 dst_state,
                 src4 ? (float *) src4->data : nullptr, // PXA_MULTISEQ_CKPT
+                sv_row_stride, sv_step_stride,   // PXA_RS_RING
                 nr, n_t, n_kv,
                 src1->nb[1] / sizeof(float),
                 src3->nb[1] / sizeof(int32_t));
@@ -716,6 +779,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             dst_x,
             dst_state,
             src4 ? (float *) src4->data : nullptr, // PXA_MULTISEQ_CKPT
+            sv_row_stride, sv_step_stride,   // PXA_RS_RING
             nc, nr, n_t, n_kv,
             src1->nb[1] / sizeof(float),
             src3->nb[1] / sizeof(int32_t));

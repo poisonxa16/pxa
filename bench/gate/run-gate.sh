@@ -354,6 +354,16 @@ body = {
     "seed":         0,
     "n_predict":    int(os.environ["PXA_NPRED"]),
     "cache_prompt": False,
+    # FIX (gate2, 2026-09-09, per main's #3632 order): this check hardcodes a small n_predict
+    # (32 at the only call site, arm 3/6) and never asked the template to skip reasoning, so a
+    # thinking model can exhaust the whole budget inside <think> and never reach "content" --
+    # not a template-rendering defect, a check-harness gap. Confirmed empirically on the Pascal
+    # Flash-Next seat (gate2 forensics, #3632): content is empty at n_predict=32 with no kwargs,
+    # but reads "Paris" both with n_predict=512 (budget covers the think block) AND with
+    # chat_template_kwargs.enable_thinking=false at the ORIGINAL n_predict=32 (Qwen-family
+    # templates honour it). Taking the no-think route per main's stated preference ("request
+    # no-think where the template supports it, else a budget that covers the think block").
+    "chat_template_kwargs": {"enable_thinking": False},
 }
 print(json.dumps(body))
 PY
@@ -434,7 +444,11 @@ else
     # mismatch, a route that 500s -- none of which the checks above can see. Route absent (this
     # build has no OpenAI-compatible endpoint) -> SKIP; route present and wrong -> FAIL.
     say "=== 3/6  chat completions (/v1/chat/completions, production template) ==="
-    chat_complete "You are a helpful, concise assistant." "$(cat "$PROMPTS/coherence.txt")" 32
+    # FIX part 2 (gate2, 2026-09-09, main's #3637): this call hardcoded 32 tokens, not the
+    # $N_PREDICT=256 budget the header says was raised for exactly this truncation class
+    # elsewhere (needle recall). Belt and braces with the chat_template_kwargs fix above: a
+    # template that ignores enable_thinking still gets a budget that can clear a think block.
+    chat_complete "You are a helpful, concise assistant." "$(cat "$PROMPTS/coherence.txt")" "$N_PREDICT"
     chat_status=$(cat "$WORKDIR/chat-status" 2>/dev/null || echo 0)
     if [ "$chat_status" = 404 ] || [ "$chat_status" = 501 ]; then
         sk "chat completions: /v1/chat/completions is not served by this build (status $chat_status) -- an OpenAI-compatible chat-template pass cannot be proved on it"
@@ -449,7 +463,7 @@ else
         else
             chat_shas=$(sha "$co1") chat_bad=0
             for r in $(seq 2 "$CHAT_REPS"); do
-                chat_complete "You are a helpful, concise assistant." "$(cat "$PROMPTS/coherence.txt")" 32
+                chat_complete "You are a helpful, concise assistant." "$(cat "$PROMPTS/coherence.txt")" "$N_PREDICT"
                 [ "$(cat "$WORKDIR/chat-status" 2>/dev/null)" = 200 ] || { chat_bad=1; break; }
                 chat_shas="$chat_shas $(sha "$(chat_content)")"
             done

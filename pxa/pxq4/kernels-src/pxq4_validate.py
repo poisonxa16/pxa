@@ -1,11 +1,11 @@
 import sys, ctypes, time
 import numpy as np
-sys.path.insert(0, "/mnt/models/pxa-p2a/src")
+sys.path.insert(0, "$PXA_MODELS_DIR/pxa-p2a/src")
 from gguf_to_vllm import gguf_raw, layout as L, reference as R
 from gguf_to_vllm.encoder import NativeEncoder, encode_and_check
 
-SO = "/mnt/models/pxa-p2a/libpxq4_encode.so"
-GGUF = "/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf"
+SO = "$PXA_MODELS_DIR/pxa-p2a/libpxq4_encode.so"
+GGUF = "$PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4.gguf"
 
 lib = ctypes.CDLL(SO)
 lib.pxq4_decode.restype = ctypes.c_int

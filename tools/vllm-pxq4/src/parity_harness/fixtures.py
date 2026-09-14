@@ -77,7 +77,7 @@ _ANCHOR_RANGE = {"extreme": (1e-3, 2.0), "realistic": (5e-3, 8e-2)}
 
 
 def synth_parts(N: int, K: int, seed: int = 0, profile: str = "extreme"):
-    """Deterministic synthetic PXQ4 tensor in EMITTED form (plan §5.3).
+    """Deterministic synthetic PXQ4 tensor in EMITTED form.
 
     Returns (slabs uint8[P,S,1088], anchor float16[P,64]).
 

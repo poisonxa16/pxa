@@ -141,6 +141,12 @@ static void usage(const char * executable) {
     printf("  --ffn-gate-inp-type ggml_type: use this ggml_type for the ffn_gate_inp tensors.\n\n");
     printf("  --custom-q regex1=type1,regex2=type2...: use this to specify custom quantization type rules.\n\n");
     printf("  --pxq-universal /path/to/map.tiers: PXQ-UNIVERSAL per-tensor tier map.\n");
+    printf("  --pxq-policy uniform|balanced|attn4: which TIER MIX the level name means (default uniform).\n");
+    printf("        uniform  = the recipe every file published before 2026-09-09 was built with.\n");
+    printf("        balanced = the level names the FFN (dense) / routed-expert (MoE) tier, and the attention\n");
+    printf("                   block is bought up from it: +1 notch, +2 on attn_output, capped at pxq4hq.\n");
+    printf("        attn4    = same, but attention lands at pxq4 / attn_output pxq4hq regardless of level.\n");
+    printf("        --pxq-uniform is the explicit spelling of the default. See docs/QUANTIZING.md.\n\n");
     printf("  --pxq-composition-override: keep a PXQ-target output that FAILS the composition assertion\n");
     printf("        (PXQ family < 50%% of bytes, or zero bytes of the named tier). Default: abort + remove.\n");
     printf("        A bare <name> resolves to $PXA_PXQU_DIR/<name>.tiers (default pxa-bench/pxq-universal/ next to CWD).\n");
@@ -380,7 +386,29 @@ int main(int argc, char ** argv) {
     bool pxq_name_guard_override = false;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
-        if (strcmp(argv[arg_idx], "--pxq-composition-override") == 0) {
+        if (strcmp(argv[arg_idx], "--pxq-policy") == 0) {
+            // POLICY_REV 3 (src/pxa-pxq-policy.h). Carried as an environment variable rather
+            // than a new llama_model_quantize_params field on purpose: the params struct is on
+            // the public ABI and every other PXQ recipe switch in this tree (PXA_PXQ_BACKBONE,
+            // PXA_PXQ_KV, PXA_PXQ_HEAD) already lives there. Validated HERE so a typo fails
+            // before the quantize rather than warning in the middle of it.
+            if (arg_idx >= argc-1) {
+                fprintf(stderr, "--pxq-policy needs a profile name (uniform|balanced|attn4)\n");
+                return 1;
+            }
+            const char * v = argv[++arg_idx];
+            if (strcmp(v, "uniform")  != 0 && strcmp(v, "balanced") != 0 &&
+                strcmp(v, "attn4")    != 0) {
+                fprintf(stderr, "--pxq-policy: unknown profile '%s' (want uniform|balanced|attn4)\n", v);
+                return 1;
+            }
+            setenv("PXA_PXQ_POLICY", v, 1);
+        } else if (strcmp(argv[arg_idx], "--pxq-uniform") == 0) {
+            // The explicit spelling of the default: no profile, BACKBONE_REV 2 as published.
+            // Worth having as a flag so a build script can state the intent instead of relying
+            // on a default staying put, and so the environment cannot smuggle a profile in.
+            setenv("PXA_PXQ_POLICY", "uniform", 1);
+        } else if (strcmp(argv[arg_idx], "--pxq-composition-override") == 0) {
             // explicit opt-out of the PXQ composition assertion (see src/llama-quantize.cpp):
             // keeps an output whose PXQ byte-share is below the 50% floor / missing its named tier.
             setenv("PXA_PXQ_COMPOSITION_OVERRIDE", "1", 1);

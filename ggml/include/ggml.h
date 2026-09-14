@@ -697,6 +697,12 @@ extern "C" {
 
         GGML_OP_MASK_TO_IDX,
 
+        // PXA_GLM5NEXT: the k-pool indexer score reduction, fused
+        GGML_OP_KPOOL_SCORE,
+
+        // PXA_QSA: the block top-k as a SELECTION rather than a sort
+        GGML_OP_QSA_TOPK,
+
         GGML_OP_COUNT,
     };
 
@@ -1648,6 +1654,18 @@ extern "C" {
             struct ggml_tensor  * a_gate_b,
             enum ggml_unary_op    op);
 
+    // MoE up/gate carrying the DeepSeek-V4 / GLM-5.3-Flash asymmetric SwiGLU clamp
+    // (up -> [-limit, limit], gate -> [-inf, limit], THEN silu(gate)*up). Fuses when the
+    // backend kernels can take it (mode in op_params[2], limit in op_params[1]); otherwise
+    // builds the explicit clamped decomposition. See the definition in ggml.c.
+    GGML_API struct ggml_tensor * ggml_moe_up_gate_clamped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as_up,
+            struct ggml_tensor  * as_gate,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            float                 limit);
+
     GGML_API struct ggml_tensor * ggml_fused_up_gate(
             struct ggml_context * ctx,
             struct ggml_tensor  * up,
@@ -2481,6 +2499,23 @@ extern "C" {
             struct ggml_tensor  * sq,
             struct ggml_tensor  * saved_steps);
 
+    // PXA_RS_RING -- retarget the per-step state capture of GGML_OP_SSM_CONV / GGML_OP_DELTA_NET.
+    //
+    // Both ops already write every intermediate step's state into `saved_steps` at
+    //     saved_steps + batch_pos*ROW_STRIDE + step*STEP_STRIDE + <within-row offset>
+    // with ROW_STRIDE / STEP_STRIDE derived from the capture buffer's own dense layout
+    // ([step][batch_pos][state]). The recurrent-state ring needs the SAME stores to land in a
+    // taller state tensor whose rows are (conv|ssm) pairs and whose planes are n_slots rows
+    // apart, which is purely a change of those two strides.
+    //
+    // Both strides are in ELEMENTS and land in op_params[2] / op_params[3]. **0 = derive exactly
+    // as before**, so every existing caller, every other backend and every non-ring build is
+    // bit-identical. Call after constructing the op.
+    GGML_API void ggml_op_set_save_strides(
+            struct ggml_tensor  * a,
+            int64_t               row_stride,
+            int64_t               step_stride);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2550,6 +2585,15 @@ extern "C" {
             bool                  lower,
             bool                  uni);
 
+    // Gated DeltaNet / delta-rule recurrence (Qwen3-Next and friends).
+    //
+    // CONTRACT (PXA_KERNFIX 2026-09-09, defect B): q and k must be handed in ALREADY
+    // L2-NORMALISED. The op does not normalise them on any backend -- the CUDA kernel
+    // (ggml-cuda/pxa/delta-net.cu) never has, and as of this fix the CPU kernel does not
+    // either, so the two agree exactly. Normalise in the graph with the reference formula
+    // x / sqrt(sum(x^2) + eps): ggml_l2_norm(ctx, x, 1e-12f) computes exactly that (see
+    // src/llama-delta-net.cpp build_qkv), or write it out by hand as
+    // scale(rms_norm(x, eps/S), 1/sqrt(S)) (see src/graphs/build_glm5next.cpp:228).
     GGML_API struct ggml_tensor * ggml_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2559,6 +2603,30 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             struct ggml_tensor  * saved_steps);
+
+    // PXA_GLM5NEXT: Kimi Delta Attention variant of the delta rule.
+    //
+    // Identical recurrence to ggml_delta_net (same pre-normalised-q/k contract as above, same
+    // sigmoid on beta, same clamped state) except that the forget gate is PER VALUE CHANNEL
+    // instead of
+    // one scalar per head. That is the whole difference between Qwen3-Next's Gated DeltaNet
+    // and GLM-5.3-Flash / Kimi-Linear's KDA, so it rides the same op rather than a new one.
+    //
+    //   g_per_channel == 0  ->  g is [n_tokens,     1, H_v, n_seqs]  (GDN, the default)
+    //   g_per_channel == 1  ->  g is [S_v,   n_tokens, H_v, n_seqs]  (KDA)
+    //
+    // The flag lands in op_params[1], which every existing caller leaves at 0, so the fused
+    // Qwen3-Next/Qwen4Exp CUDA kernel keeps taking exactly the path it took before.
+    GGML_API struct ggml_tensor * ggml_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * saved_steps,
+            int                   g_per_channel);
 
     // DeepSeek-V4 fused hyper-connection ops (used by src/graphs/build_deepseek4.cpp;
     // semantics transcribed from upstream llama.cpp @ 44c7b01de).
@@ -2608,6 +2676,58 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,
             int64_t               max_row_size);
+
+    // PXA_GLM5NEXT: the k-pool indexer's per-pool score, in one node.
+    //
+    // Replaces this exact chain from the glm5next graph:
+    //
+    //   kq    = mul_mat(pooled_k, indexer_q)      [n_pool, n_tokens, n_head]
+    //   kq    = cont(permute(kq, 2,1,0,3))        [n_head, n_tokens, n_pool]   <-- a full copy
+    //   score = relu(kq)
+    //   score = mul(score, weights)               weights broadcast over ne2
+    //   score = sum_rows(score)                   [1, n_tokens, n_pool]
+    //   score = cont(permute(score, 2,1,0,3))     [n_pool, n_tokens, 1]
+    //   score = add(score, mask)
+    //
+    // with
+    //
+    //   dst[p,t] = sum_h relu(kq[p,t,h]) * weights[h,t]  (+ mask[p,t])
+    //
+    // The reduction is performed in the SAME order the CUDA sum_rows warp
+    // butterfly uses, so the result is bit-identical to the chain above.
+    //
+    //   kq      F32 [n_pool, n_tokens, n_head], contiguous
+    //   weights F32 [n_head, n_tokens],         contiguous
+    //   mask    F32 [n_pool, n_tokens] or NULL, contiguous
+    //   dst     F32 [n_pool, n_tokens]
+    // PXA_QSA: the top `k` of each row, as a radix SELECTION instead of a full sort.
+    //
+    //   a   : F32 [n, ne1, ne2, ne3]      one row of scores per token
+    //   -> dst I32 [k, ne1, ne2, ne3]     the k highest-scoring column indices of each row
+    //
+    // Produces EXACTLY what ggml_top_k(a, k) produces -- the same set, in descending score
+    // order, with equal scores in ascending column index -- and is a drop-in for it. It exists
+    // because ggml_top_k is ggml_argsort viewed to k, and above 1024 columns that argsort is a
+    // full CUB radix sort of the whole row: at this seat's 86k fill, 21,632 keys sorted per
+    // token per layer to keep 512, in a dozen-plus kernel launches, on a decode step that is
+    // bound by per-launch host work. A radix select finds the k-th largest value in four
+    // histogram passes and sorts only the k survivors, in ONE launch.
+    //
+    // k must be <= 2048 (the survivors are sorted in shared memory).
+    GGML_API struct ggml_tensor * ggml_qsa_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k);
+
+    // The op's per-row kernel, exposed so the unit test and the CUDA kernel's reference read
+    // ONE algorithm rather than three that are meant to agree. Writes min(k, n) indices.
+    GGML_API void ggml_qsa_topk_row_f32(const float * src, int n, int k, int32_t * dst);
+
+    GGML_API struct ggml_tensor * ggml_kpool_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kq,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * mask);
 
     // custom operators
 
@@ -3276,6 +3396,13 @@ extern "C" {
         int  has_mtp_head;        // model carries an MTP/nextn head
         int  mtp_active;          // MTP requested for this run
         int  n_pxq_mmvq_tensors;  // tensors of an MMVQ-eligible PXQ type (PXQ4/PXQ4HQ)
+        // The two LOW tiers are counted SEPARATELY, not folded into the line above, because
+        // n_pxq_mmvq_tensors is an input to levers that have nothing to do with this one (the
+        // sm_60 2D prefill GEMM arm among them) and their measured behaviour must not move
+        // when a PXQ2/PXQ3 file is loaded. Only pxa_pxq_mmvq_auto_default() adds these in, and
+        // only for the tiers PXA_PXQ23_MMVQ actually admits.
+        int  n_pxq2_tensors;      // tensors of type PXQ2
+        int  n_pxq3_tensors;      // tensors of type PXQ3
         char arch_name[32];       // gguf general.architecture
     };
 

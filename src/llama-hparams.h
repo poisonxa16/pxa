@@ -18,6 +18,27 @@ enum llm_expert_gating_func_type {
     LLM_EXPERT_GATING_FUNC_SQRT_SOFTPLUS       = 4,
 };
 
+// PXA_QSA: qwen4exp's query-time sparse attention. Default OFF -- with the lever unset the
+// graph, the node count and the KV allocation are what they were before this work, so the
+// shipping path is unchanged and PXA_QSA=0 is the control the three-arm gate compares against.
+bool llama_qsa_enabled();
+
+// PXA_QSA_GATHER: within QSA, 1 (the default) physically gathers the selected cells into a
+// compact buffer and attends over that; 0 unmasks the selection into an n_kv-wide mask and
+// attends densely, which is the architecture's own reference algorithm and therefore the
+// correctness control. The A/B between the two is what isolates the gather from the selection.
+bool llama_qsa_gather_enabled();
+
+// PXA_QSA_MIN_FILL: the occupied-cell count below which QSA does not engage at all and the
+// layer takes the untouched dense path. The selection's cost is roughly FLAT in context depth
+// (it is per-token launches plus a read of the pooled cache) while the dense KV read it
+// replaces is LINEAR, so there is a depth below which sparse attention cannot win however
+// cheap the selection gets -- measured on the P100 quad at 20,801 fill, where dense is 22.21
+// t/s and the gather arm 18.70. Default 65536, provisional: no fill has yet been measured at
+// which QSA WINS, so this number's job today is to keep the loss off the short-chat traffic,
+// and the first window that finds the crossover replaces it with the measured value.
+uint32_t llama_qsa_min_fill();
+
 struct llama_hparams {
     bool vocab_only;
     bool rope_finetuned;
@@ -130,6 +151,18 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    // PXA_GLM5NEXT: GLM-5.3-Flash scores POOLS of `indexer_kpool` consecutive tokens instead of
+    // single tokens, so the indexer cache is kpool times shorter than the KV cache. The
+    // incomplete tail (the newest < kpool tokens, not yet part of a pool) is always selected
+    // when indexer_kpool_select_tail is set.
+    uint32_t indexer_kpool             = 0;
+    bool     indexer_kpool_select_tail = false;
+
+    // PXA_GLM5NEXT: Kimi Delta Attention. n_embd_head_kda is the KDA head width (128 here);
+    // kda_gate_lower_bound, when finite, switches the forget gate from softplus to the bounded
+    // form lower_bound * sigmoid(-(dt_bias + f_b(f_a(x))) * A).
+    uint32_t n_embd_head_kda    = 0;
+    float    kda_gate_lower_bound = -INFINITY;
 
     // DeepSeek-V4 (mirrors llama.cpp src/llama-hparams.h:241-248 @ upstream 82dbc4f01).
     // NOTE: DS4's swiglu clamp limits live in swiglu_limits / swiglu_limits_shared

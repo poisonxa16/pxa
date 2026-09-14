@@ -4,7 +4,7 @@ The correctness gate for the port. Everything here is either **runnable right no
 machine with numpy alone**, or clearly marked as needing a GPU.
 
 **Status as of writing: 31 gates PASS, 0 fail, ~20 s, no GPU.** Real tensors pulled from
-`/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`; agent A's converter reference, agent C's
+`$PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4.gguf`; agent A's converter reference, agent C's
 numpy twin, AND agent C's real CUDA kernel (host-simulated) all bit-exact against the
 production `ggml/src/pxq-cpu.c`. No container was touched. `/path/to/engine-repo` was
 read, never written. No GPU was run, and no number in this harness is a throughput claim.
@@ -71,7 +71,7 @@ python3 -m parity_harness.run_gates
 python3 -m parity_harness.run_gates --real-dir fixtures_real
 
 # add the CUDA gates (needs a GPU + agent C's .so)
-PXQ4_LIB=/mnt/models/pxa-vllm-pxq4/build/libpxq4_sm70.so \
+PXQ4_LIB=$PXA_MODELS_DIR/pxa-vllm-pxq4/build/libpxq4_sm70.so \
   python3 -m parity_harness.run_gates --real-dir fixtures_real --gpu
 
 # a single gate, with the skip reasons spelled out
@@ -90,9 +90,9 @@ The 14.64 GiB artifact lives on the DGX, which has no numpy. `extract_raw.py` is
 stdlib-only and self-contained — scp it anywhere:
 
 ```bash
-# on the DGX (writes only under /mnt/models)
-python3 extract_raw.py --gguf /mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
-                       --out  /mnt/models/pxa-parity/raw --panels 4 --panel0 1
+# on the DGX (writes only under $PXA_MODELS_DIR)
+python3 extract_raw.py --gguf $PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4.gguf \
+                       --out  $PXA_MODELS_DIR/pxa-parity/raw --panels 4 --panel0 1
 # ~6 MB total; copy the directory back and point --real-dir at it
 ```
 

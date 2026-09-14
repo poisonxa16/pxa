@@ -14,7 +14,7 @@ How the hook works (all read in /opt/1Cat-vLLM, git 2ceb15066):
     ``importlib.metadata.entry_points(group=...)``.  Because that API scans
     ``.dist-info`` directories found on ``sys.path``, a hand-written
     ``pxq4_vllm-0.1.0.dist-info/entry_points.txt`` under
-    ``/mnt/models/pxa-vllm-pxq4/site`` plus ``PYTHONPATH`` is enough -- nothing
+    ``$PXA_MODELS_DIR/pxa-vllm-pxq4/site`` plus ``PYTHONPATH`` is enough -- nothing
     needs to be pip-installed into the container image, whose ``/`` is 100%
     full.
   * ``load_general_plugins()`` runs in every process that builds a config or a

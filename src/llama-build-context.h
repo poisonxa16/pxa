@@ -180,7 +180,10 @@ struct llm_build_context {
             ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il, bool add_graph_split = false) const;
 
     std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_mul_mat_qkv_gated(ggml_cgraph * gf, ggml_tensor * cur,
-            ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il) const;
+            ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il,
+            // PXA_MTP_DRAFT_CACHE_ONLY: skip the query projection and the gate entirely (returns
+            // {nullptr, K, V, nullptr}); only legal when nothing downstream of the K/V store is built.
+            bool store_only = false) const;
 
     ggml_cgraph * build_llama();
 
@@ -246,6 +249,23 @@ struct llm_build_context {
 
     // PLE n-gram side path; runs only on the layers named by <arch>.ple.layers
     ggml_tensor * build_qwen4exp_ple(ggml_cgraph * gf, ggml_tensor * hidden, int il);
+
+    // PXA_QSA. The trunk's k-pool inputs plus qwen4exp's own per-block rope positions; called
+    // once per graph, before any layer, and only when llama_qsa_enabled().
+    void          build_qwen4exp_inp_qsa(ggml_cgraph * gf);
+
+    // The indexer's selection for one full-attention layer: writes this ubatch's raw indexer
+    // keys into the side cache, pools+norms+rotates the blocks this ubatch completed, scores
+    // every block against the layer's indexer query, and returns EITHER the selected cell
+    // indices (I32 [n_sel, n_tokens], gather) OR an additive n_kv-wide mask (F32 [n_kv,
+    // n_tokens], already causal) -- which one is `llama_kpool_get_dims(lctx).gather`.
+    ggml_tensor * build_qwen4exp_qsa_select(ggml_cgraph * gf, ggml_tensor * cur,
+            ggml_tensor * inp_pos, ggml_tensor * KQ_mask, bool gather, int il);
+
+    // The full-attention block on a QSA layer: the same gated Q projection, q/k norms and
+    // IMRoPE build_std_attention applies, then attention restricted to the selection.
+    ggml_tensor * build_qwen4exp_qsa_attention(ggml_cgraph * gf, ggml_tensor * cur,
+            ggml_tensor * inp_pos, ggml_tensor * KQ_mask, float KQ_scale, int il);
 
     ggml_cgraph * build_qwen35();
 
@@ -369,6 +389,18 @@ struct llm_build_context {
     void build_dsv4_inputs();
 
     // hyper-connections
+    // PXA_GLM5NEXT: GLM-5.3-Flash. src/graphs/build_glm5next.cpp
+    ggml_cgraph * build_glm5next();
+    void          build_kpool_inputs(ggml_cgraph * gf);
+    ggml_tensor * build_glm5next_kda(ggml_cgraph * gf, ggml_tensor * cur,
+            ggml_tensor * state_row_idx, ggml_tensor * conv_seq_map, ggml_tensor * state_mask,
+            int il);
+    // returns the additive DSA mask (scatter path) or the I32 selected-cell table (gather path)
+    ggml_tensor * build_glm5next_kpool_select(ggml_cgraph * gf, ggml_tensor * cur,
+            ggml_tensor * qr, ggml_tensor * kq_mask, int il);
+    ggml_tensor * build_glm5next_dsa(ggml_cgraph * gf, ggml_tensor * cur,
+            ggml_tensor * kq_mask, int il);
+
     ggml_tensor * build_dsv4_hc_pre(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
             ggml_tensor * hc_base, ggml_tensor ** post, ggml_tensor ** comb, int il) const;
     ggml_tensor * build_dsv4_hc_post(ggml_tensor * x, ggml_tensor * residual,
@@ -562,7 +594,17 @@ llm_expert_gating_func_type   gating_op,
             ggml_tensor * inp_pos, ggml_tensor * inp_out_ids, ggml_tensor * rope_factors,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
-            bool is_multi = false, ggml_tensor * post_norm = nullptr);
+            bool is_multi = false, ggml_tensor * post_norm = nullptr,
+            // PXA_MTP_DRAFT_CACHE_ONLY: build the K/V projection, rotation and cache write and STOP.
+            // No query, no attention, no output projection, no residual. Returns nullptr -- the
+            // caller must not use the result, and must not build anything downstream of it.
+            bool store_only = false,
+            // PXA_GEMMA4_ISWA: serve this layer from a DIFFERENT cache object than kv_self.
+            // Defaulted off, and every existing caller leaves it that way, so the graph this
+            // function emits for every other architecture is unchanged down to the tensor.
+            // When it is passed, n_kv_use and kv_head_use are that cache's own extent and write
+            // head -- they are a different index space, not an offset into kv_self's.
+            const llama_kv_cache * kv_use = nullptr, int32_t n_kv_use = 0, int32_t kv_head_use = 0);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 

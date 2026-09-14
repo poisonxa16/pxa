@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """pxq4_moe.py -- PXQ4 FusedMoE quantization method.
 
-This is the engine half of blocker C in FABLE-122B-VLLM-FINDINGS.md. Before it,
+Before this class existed,
 ``PXQ4Config.get_quant_method`` returned ``None`` for every ``FusedMoE`` layer, which
 ``fused_moe/layer.py:357-358`` turns into ``UnquantizedFusedMoEMethod`` -- i.e. fp16 expert
 weights. For the 122B that is 216.0 GiB of expert weight against 63.55 GiB of P100 VRAM, a

@@ -1,7 +1,7 @@
 #!/bin/bash
 # buildv60.sh — sm_60 (Tesla P100) build of the PXQ4 torch extension.
 #
-# The kewaii/vllm image CANNOT be used here: its torch 2.10+cu128 ships no sm_60 kernel
+# The the vLLM image CANNOT be used here: its torch 2.10+cu128 ships no sm_60 kernel
 # image (arch list sm_70..sm_120), so nothing built against it can even allocate on a P100.
 # The last official torch with Pascal support is 2.7.1+cu126; a venv holding it lives at
 # /path/to/build-sm60/venv (rebuild: python3 -m venv + pip install torch==2.7.1

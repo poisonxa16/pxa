@@ -1,7 +1,7 @@
 # 06 — Actual type composition of Qwen3.8-27B-PXQ4.gguf
 
 Source of truth: struct-parsed GGUF header of `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`
-on the DGX (script: `/path/to/models/pxa-build-cache/tc.py`, local copy
+on the GPU host (script: `/path/to/models/pxa-build-cache/tc.py`, local copy
 `<scratch>/pxq-vllm/tc.py`,
 raw JSON `.../pxq-vllm/out.json`). Only the header + tensor directory were read
 (first 10,997,184 bytes); no tensor data was touched.

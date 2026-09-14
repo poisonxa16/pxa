@@ -1,8 +1,8 @@
 # Pull ONE 64-row panel of one PXQ4 tensor out of the artifact and print it base64.
-# Read-only; touches nothing but the file. Runs on the DGX (python3 + stdlib only).
-import base64, struct, sys
+# Read-only; touches nothing but the file. Runs on the GPU host (python3 + stdlib only).
+import base64, os, struct, sys
 
-PATH = "/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf"
+PATH = os.environ.get("PXA_MODELS_DIR", "./models") + "/pxa-models/Qwen3.8-27B-PXQ4.gguf"
 WANT = sys.argv[1] if len(sys.argv) > 1 else "blk.0.attn_gate.weight"
 
 f = open(PATH, "rb")

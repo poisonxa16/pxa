@@ -133,7 +133,7 @@ def dequant_scalar(slabs: np.ndarray, anchor: np.ndarray, *, book: np.ndarray = 
                    sub: np.ndarray = SUB) -> np.ndarray:
     """Deliberately independent scalar transcription of pxa_deq_row_pxq6, written from the C
     control flow rather than from ``dequant``'s index algebra. Slow; used by the tests only.
-    Two implementations that disagree localise a transcription bug without a GPU or a DGX."""
+    Two implementations that disagree localise a transcription bug without a GPU or a GPU host."""
     P, S, _ = slabs.shape
     book = np.asarray(book, dtype=np.float32)
     sub = np.asarray(sub, dtype=np.float32)

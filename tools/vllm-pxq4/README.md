@@ -1,4 +1,4 @@
-# vllm-pxq4 — PXQ4 quantization backend for vLLM on Volta (sm_70)
+# vllm-pxq4 — PXQ quantization backend for vLLM (PXQ2 / PXQ3 / PXQ4)
 
 Serve PXQ-quantized models on vLLM, with tensor parallelism, CUDA-graph capture and
 paged KV — on V100-class hardware.
@@ -9,11 +9,18 @@ quant family:
 | runtime | hardware | why |
 |---|---|---|
 | `pxa` (this repo) | sm_60 Pascal, sm_61, sm_70 Volta, newer | GGUF-native, runs everywhere, the universal engine |
-| `vllm-pxq4` (this package) | **sm_70 only** | tensor parallelism + CUDA graphs, which llama.cpp does not have on Volta |
+| `vllm-pxq4` (this package) | sm_70 Volta, and sm_60 Pascal through the sm60 sidecar | tensor parallelism + CUDA graphs, which llama.cpp does not have on Volta |
 
-**Pascal cannot run this.** vLLM's compiled kernels target compute capability 7.0 and up
-(`CUDA_SUPPORTED_ARCHS = "7.0;7.5;8.0;..."`). P100 (sm_60) and 1080 Ti (sm_61) are out.
-For those cards use `pxa`, which is the reason it stays the primary engine.
+**Which tier runs where** is one table, in
+[`docs/VLLM.md`](../../docs/VLLM.md#2-quant-tier-support--the-truth-table) — PXQ2, PXQ3 and
+PXQ4 convert and serve here; PXQ1, PXQ4-HQ and PXQ6 are llama.cpp-only and the converter
+refuses them by name rather than skipping their tensors.
+
+**Pascal needs the sidecar, and it is not the primary path.** Stock vLLM's compiled kernels
+target compute capability 7.0 and up (`CUDA_SUPPORTED_ARCHS = "7.0;7.5;8.0;..."`), so P100
+(sm_60) reaches this backend only through the sm60 sidecar tree and the sm60 image, and
+1080 Ti (sm_61) is not served here at all. On those cards `pxa` is the engine to use, which
+is the reason it stays the primary one.
 
 ## Standing on other people's work
 
@@ -21,9 +28,10 @@ This package exists because two pieces of work happened first, and it would be d
 to present it without them:
 
 - **vLLM** (Apache 2.0) — the serving engine, tensor parallelism, paged attention,
-  continuous batching, CUDA-graph capture. We patch **zero lines** of it; this plugs in
+  continuous batching, CUDA-graph capture. I patch **zero lines** of it; this plugs in
   through the documented `register_quantization_config` hook.
-- **[KewaiiGamer/1Cat-vLLM](https://github.com/KewaiiGamer/1Cat-vLLM)** — the Volta port.
+- **A community Volta port of vLLM** — it carries the TurboMind sm_70 W4A16 GEMM, the
+  `FLASH_ATTN_V100` backend and the Gated-DeltaNet sm_70 kernels.
   Upstream vLLM dropped sm_70; that fork carries the TurboMind sm_70 W4A16 GEMM, the
   `FLASH_ATTN_V100` attention backend, and the Qwen Gated-DeltaNet kernels
   (`FlashQLA-SM70`) without which none of this runs on a V100. **PXA Network contributed
@@ -31,7 +39,7 @@ to present it without them:
   not a fork of it.
 - **PXQ4** — the quantization format, its CUDA kernels, and this backend: PXA Network.
 
-If you only want faster inference on Volta and do not need PXQ, use 1Cat-vLLM directly.
+If you only want faster inference on Volta and do not need PXQ, use the Volta vLLM port directly.
 This package is for people who have PXQ artifacts.
 
 ## Honest performance
@@ -59,7 +67,7 @@ essentially the same footprint.
 
 ### A free win for any vLLM deployment, PXQ or not
 
-Profiling the incumbent turned up something unrelated to our format: `lm_head` is served
+Profiling the incumbent turned up something unrelated to my format: `lm_head` is served
 **BF16 (2.37 GiB)** and sits in the 311-entry `ignore` list. It is read on every decode
 step on every rank — roughly 12% of all decode traffic. Quantizing it is likely the
 cheapest speedup available on that deployment and needs nothing from this package.
@@ -92,7 +100,7 @@ Everything under `src/` is a FLAT directory on purpose: `build_hostsim.sh`, `set
 `csrc/ tests/ vllm_pxq4/` broke every entry point, so the layout that works is the one
 that ships.
 
-### GPU-free gates (run these first - they need no CUDA, no GPU, no lease)
+### GPU-free gates (run these first - they need no CUDA, no GPU)
 
 ```bash
 cd src
@@ -109,7 +117,7 @@ could drift from it.
 
 **A compiler is required.** Without `libpxq4_hostsim.so` the 8 simulator-backed tests
 FAIL rather than skip, and the failure text tells you to build it. On a box with no
-`g++` (our Unraid host has none) you will see `9/17` — that is a missing toolchain,
+`g++` (my host has none) you will see `9/17` — that is a missing toolchain,
 not a kernel defect. Build on a dev host or inside the CUDA container.
 
 ### CUDA extension (needs the CUDA toolkit; no GPU needed to compile)

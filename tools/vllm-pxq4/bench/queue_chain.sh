@@ -1,6 +1,7 @@
 #!/bin/bash
 # Serial arm chain; waits for foreign experiment containers to clear, retries refusals.
-D=/mnt/models/pxa-hth
+MODELS_DIR="${PXA_MODELS_DIR:-./models}"
+D=$MODELS_DIR/bench
 wait_free() {
   while docker ps --format '{{.Names}}' | grep -qE 'pxa-(step|mtp|hth|awq-base)'; do sleep 30; done
 }

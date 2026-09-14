@@ -88,6 +88,12 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MUSE_GLIMMER,    "muse-glimmer" },
     { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
     { LLM_ARCH_DEEPSEEK4_DSPARK, "deepseek4-dspark" },
+    // PXA_GLM5NEXT: GLM-5.3-Flash. Upstream PR #27773 registers the string "glm5-next", but
+    // the GGUFs people actually have (unsloth/GLM-5.3-Flash-GGUF, and Unsloth's own branch)
+    // write "glm5next" with no hyphen, and the KV prefix follows the arch string, so the two
+    // spellings are two different key namespaces. Ours is the unhyphenated one because that is
+    // what the weights on disk say; llama_model_loader maps the hyphenated alias onto it.
+    { LLM_ARCH_GLM5NEXT,        "glm5next"     },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -211,6 +217,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,     "%s.attention.indexer.head_count"     },
     { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,     "%s.attention.indexer.key_length"     },
     { LLM_KV_ATTENTION_INDEXER_TOP_K,          "%s.attention.indexer.top_k"          },
+    { LLM_KV_ATTENTION_INDEXER_KPOOL,          "%s.attention.indexer.kpool"          },
+    { LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, "%s.attention.indexer.kpool_select_tail" },
+    { LLM_KV_KDA_HEAD_DIM,                     "%s.kda.head_dim"                     },
+    { LLM_KV_KDA_GATE_LOWER_BOUND,             "%s.kda.gate_lower_bound"             },
     { LLM_KV_FULL_ATTENTION_INTERVAL,          "%s.full_attention_interval"          },
     { LLM_KV_ATTENTION_SHARED_KV_LAYERS,       "%s.attention.shared_kv_layers"       },
     { LLM_KV_ATTENTION_KEY_LENGTH_SWA,         "%s.attention.key_length_swa"         },
@@ -321,6 +331,8 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
     case LLM_ARCH_QWEN35MOE:
     case LLM_ARCH_QWEN35:
     case LLM_ARCH_QWEN4EXP:
+    // PXA_GLM5NEXT: 34 KDA (recurrent) + 11 MLA blocks in one trunk
+    case LLM_ARCH_GLM5NEXT:
         return true;
     default:
         return false;

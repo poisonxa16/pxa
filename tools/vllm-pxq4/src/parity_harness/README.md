@@ -1,11 +1,11 @@
-# PXQ4-in-vLLM parity harness (agent D, plan §9)
+# PXQ4-in-vLLM parity harness
 
 The correctness gate for the port. Everything here is either **runnable right now on this
 machine with numpy alone**, or clearly marked as needing a GPU.
 
 **Status as of writing: 31 gates PASS, 0 fail, ~20 s, no GPU.** Real tensors pulled from
-`/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`; agent A's converter reference, agent C's
-numpy twin, AND agent C's real CUDA kernel (host-simulated) all bit-exact against the
+`/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`; the reference component’s converter reference, the CUDA kernel's
+numpy twin, AND the CUDA kernel's real CUDA kernel (host-simulated) all bit-exact against the
 production `ggml/src/pxq-cpu.c`. No container was touched. `/path/to/engine-repo` was
 read, never written. No GPU was run, and no number in this harness is a throughput claim.
 
@@ -26,7 +26,7 @@ are written and ready; they need a card, not more code.
 
 ## Why four implementations and not two
 
-A harness that compares agent A's reference against agent C's kernel proves they agree,
+A harness that compares the Python reference against the CUDA kernel proves they agree,
 not that either is right. This one closes the loop to the shipping engine:
 
 ```
@@ -34,18 +34,18 @@ not that either is right. This one closes the loop to the shipping engine:
         |  G1a  (bit-exact)               <- CPU, runs today
  oracle.py                                 independent numpy transcription (this harness)
         |  G1b  (bit-exact)               <- CPU, runs today, checks EVERY sibling ref
- gguf_to_vllm.reference        agent A     what the converter calls
- pxq4_kernel_ref               agent C     the kernel's numpy twin
+ gguf_to_vllm.reference        the reference (reference.py)     what the converter calls
+ pxq4_kernel_ref               the CUDA kernel (csrc/)     the kernel's numpy twin
         |  H1-H7 (bit-exact)              <- CPU, runs today, via libpxq4_hostsim.so
- k_pxq4_dequant_matrix / k_pxq4_mmv        agent C's REAL device code, host-simulated
+ k_pxq4_dequant_matrix / k_pxq4_mmv        the CUDA kernel's REAL device code, host-simulated
         |  G6/G8 (bit-exact, fp16)        <- needs a GPU
- torch.ops.pxq4.*              agent C     the same code, on sm_70
+ torch.ops.pxq4.*              the CUDA kernel (csrc/)     the same code, on sm_70
 ```
 
 **The hostsim leg is the reason most of this runs without a lease.**
 `pxq4_kernel_hostsim.cpp` compiles the real `k_pxq4_dequant_matrix` / `k_pxq4_mmv`
 against a host shim for `blockIdx`/`threadIdx`/`__syncthreads`, and `hostsim_bridge.py`
-drives it through ctypes. So gates H1-H7 test agent C's actual kernel source -- layout
+drives it through ctypes. So gates H1-H7 test the CUDA kernel's actual kernel source -- layout
 addressing, table values, accumulation order, the fp16 store, and the whole shard
 invariant -- on this machine, in a second.
 
@@ -70,7 +70,7 @@ python3 -m parity_harness.run_gates
 # CPU gates against real tensors from the artifact
 python3 -m parity_harness.run_gates --real-dir fixtures_real
 
-# add the CUDA gates (needs a GPU + agent C's .so)
+# add the CUDA gates (needs a GPU + the CUDA kernel's .so)
 PXQ4_LIB=/path/to/models/pxa-vllm-pxq4/build/libpxq4_sm70.so \
   python3 -m parity_harness.run_gates --real-dir fixtures_real --gpu
 
@@ -86,11 +86,11 @@ summary lists every skipped gate with its reason.
 
 ## Getting real fixtures
 
-The 14.64 GiB artifact lives on the DGX, which has no numpy. `extract_raw.py` is
+The 14.64 GiB artifact lives on the GPU host, which has no numpy. `extract_raw.py` is
 stdlib-only and self-contained — scp it anywhere:
 
 ```bash
-# on the DGX (writes only under /path/to/models)
+# on the GPU host (writes only under /path/to/models)
 python3 extract_raw.py --gguf /path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
                        --out  /path/to/models/pxa-parity/raw --panels 4 --panel0 1
 # ~6 MB total; copy the directory back and point --real-dir at it
@@ -111,7 +111,7 @@ The extractor hard-fails if any tensor's on-disk byte count disagrees with
 | id | what it proves | needs |
 |---|---|---|
 | **G1a** | `oracle.dequant` == production `pxa_deq_row_pxq6`, **bitwise** | cc |
-| G1b | agent A's `reference.dequant` == oracle, bitwise; and A's BOOK/SUB == `ggml-pxq6-tables.h` | agent A |
+| G1b | the reference component’s `reference.dequant` == oracle, bitwise; and A's BOOK/SUB == `ggml-pxq6-tables.h` | the reference (reference.py) |
 | G2a | split→join round-trips to the original bytes | — |
 | G2b | the geometry gate refuses what vLLM would truncate | — |
 | G2c | all six real shapes reproduce their on-disk sizes and 4.25+16/K bpw | — |
@@ -174,7 +174,7 @@ gates (G6/G8).
 
 **The mmv gates (H5/H6) must NOT use that trim, and no longer do.** `k_pxq4_mmv` is
 *entirely* a fold: `nfix = pxq4_canon_nfix(kslabs)` chunks, chunk `c` spanning
-`[(kslabs*c)/nfix, (kslabs*(c+1))/nfix)`, with agent C's EDIT 3 staging only that chunk's
+`[(kslabs*c)/nfix, (kslabs*(c+1))/nfix)`, with the CUDA kernel's EDIT 3 staging only that chunk's
 activations into smem and re-basing the read as `pxq4_xs + (kb - b0)*PXQ4_QK`
 (`pxq4_kernel.cuh:315`). At `kslabs = 4`, `lim = 4/PXQ4_MMV_KSEG = 1`, so `canon_nfix == 1`:
 one chunk, `b0 == 0`, and the re-basing is the identity. A 4-slab trim therefore made EDIT
@@ -229,7 +229,7 @@ product needs ≤22 significand bits and is *exact* in fp32; both associations a
 correctly-rounded rounding of the same exact triple product. Gate **N2** verifies this by
 exhaustion — 40 009 anchors (including every fp16 edge case) × all 256 (sub, book) pairs,
 **zero** bit mismatches — and additionally checks that `sub[i]*book[j]` is exact in fp32
-for all 256 pairs. Agent C may fold `anchor*sub` into `eff` with no bit-exactness risk,
+for all 256 pairs. the CUDA kernel (csrc/) may fold `anchor*sub` into `eff` with no bit-exactness risk,
 which is what `pxq6_pol_p6::row_effs` (pxq6.cuh:337-341) already does. The test is kept
 because the property depends on the tables staying fp16-snapped; if a future regeneration
 breaks that, N2 fires and the plan's warning becomes live again.
@@ -250,8 +250,8 @@ Search for `ASSUMPTION:`. There are four:
    will match no variant and the message says so rather than blaming the layout.
 2. `logprob_parity.py` — the NOISE/SUSPICIOUS/BUG thresholds (1e-3 and 0.1 nats of top-1
    margin) are judgement calls, not measurements. The raw margins are always printed.
-3. `test_d_ops_abi.py` — `assert_no_sm70_fastpath` assumes agent B's class is named
-   `PXQ4LinearMethod` (plan §6.6). It matches on the type name, so a rename makes it
+3. `test_d_ops_abi.py` — `assert_no_sm70_fastpath` assumes the vLLM plugin's class is named
+   `PXQ4LinearMethod`. It matches on the type name, so a rename makes it
    silently vacuous; `assert_pxq4_module_coverage` is the paired positive check.
 4. `hostsim_bridge.py` — assumes the hostsim TU is built from the same headers as the
    CUDA TU, so a divergence is a build problem rather than a semantic one. H1 checks the
@@ -288,10 +288,10 @@ compare.py           bitwise comparison + ULP-aware diff reports + error stats
 fixtures.py          synthetic (extreme / realistic anchor profiles) + real loaders
 gguf_raw.py          struct+mmap GGUF reader that does not care about type ids
 extract.py           GGUF -> .npz fixtures (needs numpy)
-extract_raw.py       GGUF -> .bin + manifest.json (stdlib only; runs on the DGX)
+extract_raw.py       GGUF -> .bin + manifest.json (stdlib only; runs on the GPU host)
 cref/                the production pxq-cpu.c, vendored read-only, + a CLI + build.sh
 cref_bridge.py       builds and drives cref/pxq4_cref
-adapters.py          runtime discovery of agents A/B/C; absence downgrades to SKIP
+adapters.py          runtime discovery of the other components; absence downgrades to SKIP
 test_a_dequant.py    G1, G2, G6
 test_b_linear.py     (b) single-linear parity, Gb1-3, G8a-c
 test_c_shard.py      (c) G3a-j  <- the important one

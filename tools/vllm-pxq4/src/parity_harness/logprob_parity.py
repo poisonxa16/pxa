@@ -23,14 +23,14 @@ never needs the production container's python and cannot perturb it.
 
 USAGE
   # side A -- our engine, already the way the fleet runs it
-  llama-server -m /mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf -ngl 99 -c 4096 \
+  llama-server -m $PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4.gguf -ngl 99 -c 4096 \
                --host 127.0.0.1 --port 8081
 
   # side B -- vLLM with the plugin, on FREE cards (never take the lease for this)
-  PYTHONPATH=/mnt/models/pxa-vllm-pxq4/site \
+  PYTHONPATH=$PXA_MODELS_DIR/pxa-vllm-pxq4/site \
   VLLM_SM70_QUANT_BACKEND=turbomind \
   python -m vllm.entrypoints.openai.api_server \
-      --model /mnt/models/pxa-models/Qwen3.8-27B-PXQ4-vllm \
+      --model $PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4-vllm \
       --tensor-parallel-size 4 --dtype float16 --port 8082
 
   python -m parity_harness.logprob_parity \

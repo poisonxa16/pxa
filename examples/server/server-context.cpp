@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "pxa-spec-timings.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-task.h"
@@ -13,6 +14,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "pxa-expert-log.hpp"
+#include "pxa-ckpt-evict.h"
+#include "pxa-mtp-batch-slots.h"   // PXA_MTP_BATCH_SLOTS: the lever the deferred draft path reads
+#include "pxa-spec-load.h"
 
 #include <algorithm> // PXA_KV_UNIFIED_v1: std::sort over reclaim victims
 #include <fstream>
@@ -749,6 +753,11 @@ void server_context::init() {
     {
         common_chat_templates_ptr chat_templates;
 
+        // PXA_AUTO_JINJA_v1: some architectures ship a chat template the built-in map has no row
+        // for, and no near-enough row to substitute. Decide before the templates are built so the
+        // whole block (example_format, thinking support, chat_params) sees one consistent answer.
+        common_chat_auto_jinja(model, params_base.use_jinja, params_base.chat_template);
+
         try {
             chat_templates = common_chat_templates_init(model, params_base.chat_template);
 
@@ -826,6 +835,7 @@ void server_slot::reset() {
     n_past_prompt = 0;
     n_discarded_prompt = 0;
     n_kept_prompt = 0;
+    n_prompt_tokens_forked = 0; // PXA_SLOT_FORK_v1
     n_sent_text = 0;
     drafted.clear();
     drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
@@ -990,7 +1000,7 @@ void server_slot::release() {
 
 
 json server_slot::get_formated_timings() const {
-    return json{
+    json timings = json{
         {"prompt_n",               n_prompt_tokens_processed},
         {"prompt_ms",              t_prompt_processing},
         {"prompt_per_token_ms",    t_prompt_processing / n_prompt_tokens_processed},
@@ -1004,6 +1014,25 @@ json server_slot::get_formated_timings() const {
         {"n_ctx",           n_ctx},
         {"n_past",           n_past},
     };
+
+    // PXA_SLOT_FORK_v1: present only when this request actually forked, so the field's absence
+    // stays the historical shape for every existing consumer of this object.
+    if (n_prompt_tokens_forked > 0) {
+        timings["forked_n"] = n_prompt_tokens_forked;
+    }
+
+    // PXA_SPEC_TIMINGS_v1: this is the object the legacy /completion response actually carries
+    // (send_final_response stores it in res->data["timings"], and to_json_non_oaicompat_final()
+    // returns res->data verbatim) -- so without these two fields a /completion client got NO draft
+    // accounting for any stage type, while the OAI endpoints, which serialise result_timings, got
+    // it. Same rule, same two fields, one predicate (examples/server/pxa-spec-timings.h).
+    const pxa_spec_draft_counters draft_counters{ n_draft_total, n_draft_accepted };
+    if (pxa_spec_draft_reported(draft_counters)) {
+        timings["draft_n"]          = draft_counters.proposed;
+        timings["draft_n_accepted"] = draft_counters.accepted;
+    }
+
+    return timings;
 }
 
 result_timings server_slot::get_timings() const {
@@ -1022,11 +1051,16 @@ result_timings server_slot::get_timings() const {
     timings.n_past = n_past;
 
 
-    // Add speculative metrics
-    if (n_draft_total > 0) {
-        timings.draft_n = n_draft_total;
-        timings.draft_n_accepted = n_draft_accepted;
+    // Add speculative metrics. PXA_SPEC_TIMINGS_v1: same predicate as get_formated_timings(), so
+    // the OAI endpoints and the legacy /completion response agree on when the pair is reported.
+    const pxa_spec_draft_counters draft_counters{ n_draft_total, n_draft_accepted };
+    if (pxa_spec_draft_reported(draft_counters)) {
+        timings.draft_n = draft_counters.proposed;
+        timings.draft_n_accepted = draft_counters.accepted;
     }
+
+    // PXA_SLOT_FORK_v1
+    timings.forked_n = n_prompt_tokens_forked;
 
     return timings;
 }
@@ -3091,6 +3125,80 @@ void server_context::split_multiprompt_task(int id_multi, server_task& multiprom
 
 
 
+// PXA_SLOT_SPEC_STATE_v1 (2026-09-13) -- the speculative half of a slot file.
+//
+// A slot save writes the target sequence's state; that is all a non-speculative slot has. A
+// speculative slot has two more pieces, and neither is inside that blob: the companion context's
+// KV for this sequence id, and the drafter's per-sequence carry (the target hidden row the next
+// draft conditions on, plus the last drafted embedding). Saving without them and restoring into a
+// slot whose companion still holds the PREVIOUS occupant's tokens is the failure worth naming: the
+// restore is reported as a success, the target answers from the restored prefix, and the drafter
+// proposes tokens computed from somebody else's context - so the first generations after a restore
+// are drafted blind and every draft is rejected, at full verify cost.
+//
+// Two companions travel beside the slot file: "<file>.draft" (companion KV, a llama sequence state
+// in its own right) and "<file>.spec" (the carry, opaque bytes from the drafter). Both are
+// OPTIONAL by design - a slot file written by a build without them, or by a non-speculative run,
+// stays loadable - and the restore side clears the sequence's speculative state FIRST, so a file
+// with no companions leaves a clean drafter rather than a stale one.
+// The two levers below exist so the fixes can be A/B'd against their own pre-fix behaviour on one
+// binary. Both default ON: they are correctness fixes, not tuning. =0 restores the old conduct.
+static bool pxa_slot_erase_spec() {
+    static const bool v = []() {
+        const char * e = getenv("PXA_SLOT_ERASE_SPEC");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
+static bool pxa_slot_spec_state() {
+    static const bool v = []() {
+        const char * e = getenv("PXA_SLOT_SPEC_STATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
+static size_t save_spec_carry_to_file(const std::string & filename, const std::vector<uint8_t> & data) {
+    if (data.empty()) {
+        ::remove(filename.c_str()); // never leave an older save's carry beside a newer slot file
+        return 0;
+    }
+    std::ofstream file(filename, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        return 0;
+    }
+    file.write(reinterpret_cast<const char *>(data.data()), (std::streamsize) data.size());
+    if (!file.good()) {
+        file.close();
+        ::remove(filename.c_str());
+        return 0;
+    }
+    const size_t pos = (size_t) file.tellp();
+    file.close();
+    return pos;
+}
+
+static bool load_spec_carry_from_file(const std::string & filename, std::vector<uint8_t> & data) {
+    data.clear();
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return false;
+    }
+    const std::streampos size = file.tellg();
+    if (size <= 0 || size > (std::streampos) (64 * 1024 * 1024)) {
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+    data.resize((size_t) size);
+    file.read(reinterpret_cast<char *>(data.data()), size);
+    if (!file.good()) {
+        data.clear();
+        return false;
+    }
+    return true;
+}
+
 static size_t save_checkpoints_to_file(const std::string & filename, const std::list<server_prompt_checkpoint> & checkpoints) {
     if (checkpoints.size() == 0) {
         return 0;
@@ -3381,6 +3489,11 @@ void server_context::process_single_task(server_task&& task) {
             { "kv_cache_tokens_count",           llama_get_kv_cache_token_count(ctx)},
             { "kv_cache_used_cells",             llama_get_kv_cache_used_cells(ctx)},
 
+            // PXA_SLOT_FORK_v1
+            { "n_slot_forks",                    n_slot_forks},
+            { "n_slot_fork_tokens_saved",        n_slot_fork_tokens_saved},
+            { "n_slot_fork_refused",             n_slot_fork_refused},
+
             { "slots",                           slots_data },
         };
 
@@ -3414,6 +3527,29 @@ void server_context::process_single_task(server_task&& task) {
 
         const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
 
+        // PXA_SLOT_SPEC_STATE_v1: the speculative companions (see the helpers above). Written after
+        // the target state so a failure here can never corrupt the slot file itself, and both are
+        // removed when this slot has nothing to save, so a stale companion from an earlier save can
+        // never be paired with a newer slot file.
+        size_t nwrite_spec = 0;
+        {
+            auto * ctx_companion = (slot->spec && pxa_slot_spec_state())
+                                   ? common_speculative_get_companion_ctx(slot->spec) : nullptr;
+            const std::string filepath_dft = filepath + ".draft";
+            if (ctx_companion != nullptr) {
+                llama_synchronize(ctx_companion);
+                nwrite_spec += llama_state_seq_save_file(ctx_companion, filepath_dft.c_str(), slot->id, nullptr, 0);
+            } else {
+                ::remove(filepath_dft.c_str());
+            }
+
+            std::vector<uint8_t> carry;
+            if (slot->spec && pxa_slot_spec_state()) {
+                common_speculative_get_seq_state(slot->spec, slot->id, carry);
+            }
+            nwrite_spec += save_spec_carry_to_file(filepath + ".spec", carry);
+        }
+
         const int64_t t_end = ggml_time_us();
         const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -3425,7 +3561,8 @@ void server_context::process_single_task(server_task&& task) {
             { "id_slot",   id_slot },
             { "filename",  filename },
             { "n_saved",   token_count }, // tokens saved
-            { "n_written", nwrite + saved },      // bytes written
+            { "n_written", nwrite + saved + nwrite_spec },      // bytes written
+            { "n_written_spec", nwrite_spec },    // of which the speculative companions
             { "timings", {
                 { "save_ms", t_save_ms }
             } }
@@ -3462,6 +3599,104 @@ void server_context::process_single_task(server_task&& task) {
         load_server_tokens_from_file(filepath+".tokens.json", slot->cache_tokens);
         size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
 
+        // PXA_SLOT_SPEC_STATE_v1: the speculative half of the restore. The CLEAR is unconditional
+        // and comes first - a slot file written without companions, or with companions this build
+        // cannot read, must leave the drafter empty rather than holding the previous occupant's
+        // context. An empty drafter is a known, self-healing state (it re-seeds from the target on
+        // the next draft); a stale one is silently wrong.
+        size_t nread_spec = 0;
+        {
+            auto * ctx_companion = (slot->spec && pxa_slot_spec_state())
+                                   ? common_speculative_get_companion_ctx(slot->spec) : nullptr;
+            if (ctx_companion != nullptr) {
+                llama_synchronize(ctx_companion);
+                llama_kv_cache_seq_rm(ctx_companion, slot->id, -1, -1);
+            }
+            if (slot->spec && pxa_slot_spec_state()) {
+                common_speculative_clear_sequence_hidden(slot->spec, slot->id);
+            }
+
+            if (ctx_companion != nullptr) {
+                const std::string filepath_dft = filepath + ".draft";
+                size_t n_dft_tokens = 0;
+                const size_t n_dft = llama_state_seq_load_file(ctx_companion, filepath_dft.c_str(), slot->id,
+                                                               nullptr, 0, &n_dft_tokens);
+                if (n_dft == 0) {
+                    // Not an error: an older slot file has no companion, and the companion KV is an
+                    // accelerator cache that fills forward again from the accepted tokens.
+                    llama_kv_cache_seq_rm(ctx_companion, slot->id, -1, -1);
+                } else {
+                    nread_spec += n_dft;
+                }
+            }
+
+            std::vector<uint8_t> carry;
+            if (slot->spec && pxa_slot_spec_state() && load_spec_carry_from_file(filepath + ".spec", carry)) {
+                if (common_speculative_set_seq_state(slot->spec, slot->id, carry.data(), carry.size())) {
+                    nread_spec += carry.size();
+                }
+            }
+        }
+
+        // PXA_SLOT_RESTORE_SHARE_v1 (2026-09-13) -- collapse a restored duplicate prefix.
+        //
+        // A slot file is self-contained, so restoring N sessions that begin with the same system
+        // prompt and tool block puts N physical copies of it in the ring. Under one unified ring
+        // those cells are addressable by every sequence, so a restored slot whose prompt begins
+        // with tokens an idle slot already holds can simply be tagged onto them: the duplicate
+        // cells it just filled are released and the ring gets that space back. This is the
+        // placement half of the live exact-prefix fork and uses the same cell primitive; what it
+        // does NOT do is touch the recurrent/PLE state, which the restore has just set correctly
+        // from the file and which no prefix tag can reconstruct.
+        //
+        // Lever PXA_SLOT_PREFIX_SHARE=1, default OFF: it changes where a restored band sits in the
+        // ring, and this project measures placement before it ships placement changes. Needs
+        // --kv-unified; the exact-token match is the only admissible one (a detokenised match can
+        // differ by a boundary shift, which would attend the wrong key).
+        static const bool prefix_share = []() {
+            const char * e = getenv("PXA_SLOT_PREFIX_SHARE");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (prefix_share && params_base.kv_unified && !slot->cache_tokens.has_mtmd_data()) {
+            server_slot * donor = nullptr;
+            size_t        best_p = 0;
+
+            for (auto & cand : slots) {
+                if (&cand == slot || !cand.available() || cand.cache_tokens.size() == 0 ||
+                        cand.cache_tokens.has_mtmd_data()) {
+                    continue;
+                }
+                const size_t p = cand.cache_tokens.get_common_prefix_exact(slot->cache_tokens);
+                if (p > best_p) {
+                    donor  = &cand;
+                    best_p = p;
+                }
+            }
+
+            if (donor != nullptr && best_p >= (size_t) slot_fork_min_gain()) {
+                llama_synchronize(ctx);
+                const int32_t n_shared =
+                    llama_kv_cache_seq_share_prefix(ctx, donor->id, slot->id, (llama_pos) best_p);
+                if (n_shared == (int32_t) best_p) {
+                    LOG_INFO("PXA_SLOT_PREFIX_SHARE: restored prefix shared with a live slot", {
+                        {"id_slot", slot->id}, {"id_donor", donor->id}, {"prefix", (int) best_p},
+                        });
+                } else {
+                    // The donor's prefix is not complete in the ring at those positions. The cells
+                    // the destination owned for [0, p) are gone either way, so the only correct
+                    // answer is a clean re-prefill from zero rather than a half-shared band.
+                    LOG_WARNING("PXA_SLOT_PREFIX_SHARE: refused - donor prefix incomplete, dropping the restored cache", {
+                        {"id_slot", slot->id}, {"id_donor", donor->id}, {"prefix", (int) best_p},
+                        {"n_shared", n_shared},
+                        });
+                    llama_kv_cache_seq_rm(ctx, slot->id, -1, -1);
+                    slot->cache_tokens.keep_first(0);
+                    slot->server_cached_prompt.checkpoints.clear();
+                    token_count = 0;
+                }
+            }
+        }
+
         const int64_t t_end = ggml_time_us();
         const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -3473,7 +3708,8 @@ void server_context::process_single_task(server_task&& task) {
             { "id_slot",    id_slot },
             { "filename",   filename },
             { "n_restored", token_count }, // tokens restored
-            { "n_read",     nread },       // bytes read
+            { "n_read",     nread + nread_spec }, // bytes read
+            { "n_read_spec", nread_spec },        // of which the speculative companions
             { "timings", {
                 { "restore_ms", t_restore_ms }
             } }
@@ -3496,8 +3732,38 @@ void server_context::process_single_task(server_task&& task) {
         }
         // Erase token cache
         const size_t n_erased = slot->cache_tokens.size();
+
+        // PXA_SLOT_ERASE_SPEC_v1 (2026-09-13): an erase must empty EVERY memory that carries this
+        // sequence, not only the target's attention ring. A speculative slot has two more: the
+        // companion context's KV for this sequence id, and the per-sequence draft carry the
+        // drafter keeps outside any llama memory object. Leaving either behind is not a leak, it
+        // is a correctness hole - the next occupant of the slot drafts against the previous
+        // occupant's tokens, and a placement-controlled determinism run ("erase both slots, then
+        // ask") silently measures a server that was never actually cleared. The unified-KV reclaim
+        // path already tears down both contexts for exactly this reason; this site did not.
+        auto * ctx_companion = (slot->spec && pxa_slot_erase_spec())
+                               ? common_speculative_get_companion_ctx(slot->spec) : nullptr;
         llama_synchronize(ctx); // PXA_WAVE4_FIX_v1: no full-seq wipe with kernels in flight
+        if (ctx_companion != nullptr) {
+            llama_synchronize(ctx_companion);
+        }
         llama_kv_cache_seq_rm(ctx, slot->id, -1, -1);
+        if (ctx_companion != nullptr) {
+            llama_kv_cache_seq_rm(ctx_companion, slot->id, -1, -1);
+        }
+        if (slot->spec && pxa_slot_erase_spec()) {
+            common_speculative_clear_sequence_hidden(slot->spec, slot->id);
+            // PXA_SLOT_ERASE_SPEC_HARD_v1 (2026-09-14): the hidden-carry clear above only covers
+            // the MTP companion's per-sequence state. A non-MTP drafter (the shipped sm_70+ auto
+            // default: the n-gram stage alone) keeps its learned map OUTSIDE that path -- begin()
+            // deliberately leaves it warm across a slot's own follow-up turns -- so without this
+            // call an erased slot still drafted against the previous occupant's n-gram table --
+            // measured directly: a second identical request after an erase was byte-identical to
+            // a second identical request with NO erase in between, same draft/accept counts.
+            // Non-MTP specs are per-slot/unshared (server-context.cpp:690), so a whole-spec hard
+            // reset is scoped to this slot already.
+            common_speculative_hard_reset(slot->spec);
+        }
         slot->cache_tokens.keep_first(0);
         //slot->cache_tokens.clear();
         slot->server_cached_prompt.checkpoints.clear();
@@ -4096,6 +4362,290 @@ server_context::kv_admission server_context::kv_unified_admit(int32_t n_prompt_t
 }
 // ============================================================================================
 
+// ---- PXA_SLOT_FORK_v1: exact-prefix slot fork ------------------------------------------------
+//
+// The shape of the win. Run -np 4 against one client stack and all four slots carry the same
+// system prompt, the same tool schemas, the same few-shot block: the ring holds four byte-identical
+// copies of it and three of the four paid full prefill to produce theirs. When the request that
+// lands on slot 1 begins with the exact tokens slot 0 is already holding, slot 1 does not need
+// those cells computed, or even copied - it needs them tagged. That is all this is.
+//
+// Why it is exact-prefix and nothing looser. The reuse the slot can already do against its OWN
+// cache (server_tokens::get_common_prefix) deliberately falls back to a detokenized-text match so a
+// re-tokenization boundary shift still reuses; that is right for a cache the slot owns, where a
+// mismatch costs a re-decode. It is NOT right here. Forked cells are the donor's actual K/V, at the
+// donor's actual positions - if the token at position i differs by so much as a boundary shift the
+// fork is silently attending the wrong key. So the gate is get_common_prefix_exact() and nothing
+// else, and the fork depth never exceeds it.
+//
+// The donor is not disturbed. Forking adds a second sequence id to cells the donor keeps; a cell is
+// released only when its LAST id is erased. The donor can keep decoding, be trimmed, be context-
+// shifted or be handed a new request afterwards and the fork still holds what it took.
+//
+// Recurrent/hybrid models. A prefix tag covers the attention ring and nothing else. The DeltaNet /
+// SSM state row is not addressed by position - it is a single row that has been advanced by every
+// token the donor ever decoded, so the donor's CURRENT row is the state after the donor's whole
+// generation, not the state at the prefix boundary. Copying it would hand the fork state from
+// another request's future: exactly the contamination class PXA_CKPT_HYBRID_ROLLBACK_v1 documents.
+// So on a hybrid arch the fork depth is not chosen by the token match alone; it snaps back to a
+// boundary where an exact state actually exists - one of the donor's own context checkpoints, whose
+// recurrent row is by construction the state after the tokens up to its pos_max. No such
+// checkpoint, no fork: we log the reason and fall through to an ordinary prefill.
+
+bool server_context::slot_fork_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("PXA_SLOT_FORK");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
+int32_t server_context::slot_fork_min_gain() {
+    static const int32_t v = []() {
+        const char * e = getenv("PXA_SLOT_FORK_MIN_GAIN");
+        const int32_t n = e ? atoi(e) : 64;
+        return n > 0 ? n : 64;
+    }();
+    return v;
+}
+
+// Put the destination back to "nothing cached, prefill from zero". Used on every refusal that
+// happened after we had already started editing the destination's KV, so a failed fork can never
+// leave a slot decoding against half-shared cells.
+void server_context::slot_fork_reset_dst(server_slot & dst, llama_context * ctx_companion) {
+    llama_kv_cache_seq_rm(ctx, dst.id, -1, -1);
+    if (ctx_companion != nullptr) {
+        llama_kv_cache_seq_rm(ctx_companion, dst.id, -1, -1);
+    }
+    dst.cache_tokens.keep_first(0);
+    dst.n_past = 0;
+    dst.n_past_prompt = 0;
+    dst.n_past_offset = 0;
+    dst.n_past_se = 0;
+    dst.ga_i = 0;
+    dst.n_discarded_prompt = 0;
+    dst.n_kept_prompt = 0;
+    dst.n_prompt_tokens_cache = 0;
+    dst.n_prompt_tokens_forked = 0;
+    dst.server_cached_prompt.checkpoints.clear();
+    common_sampler_reset(dst.ctx_sampling);
+}
+
+int32_t server_context::slot_fork_try(server_slot & dst) {
+    if (!slot_fork_enabled()) {
+        return 0;
+    }
+
+    // ---- eligibility of the destination ------------------------------------------------------
+    if (!params_base.kv_unified) {
+        // With the ring statically partitioned each slot addresses its own arithmetic slice; a
+        // donor's cells are not something this slot may point at. Nothing to do, and not an error.
+        return 0;
+    }
+    if (dst.embedding || !dst.params.cache_prompt || dst.ga_n != 1) {
+        return 0;
+    }
+    if (dst.n_prompt_tokens < 2) {
+        return 0;
+    }
+    // Media: the gate is "does THIS request carry media chunks", never "is the loaded model
+    // multimodal-capable". A text-only session must not lose prefix sharing because a projector
+    // happens to be loaded. A chunked prompt also breaks the index==position identity this
+    // routine relies on, so those we do skip.
+    if (dst.prompt_tokens.has_mtmd_data()) {
+        return 0;
+    }
+    // Sliding-window arches: a donor's early cells may already have aged out of the window, so a
+    // "complete" prefix by token match can be an incomplete prefix by cells - the restore-then-
+    // truncate failure PXA_SWA_TRUNCATE_GUARD_v1 exists for. Not worth the risk for this lever.
+    if (llama_model_n_swa(model) > 0) {
+        return 0;
+    }
+    // A pure-recurrent cache has no positional prefix to share at all.
+    if (llama_model_is_recurrent(model)) {
+        return 0;
+    }
+
+    const bool is_hybrid = llama_model_is_hybrid(model);
+
+    auto * ctx_companion = dst.spec ? common_speculative_get_companion_ctx(dst.spec) : nullptr;
+
+    const int32_t n_past_own = std::max(0, dst.n_past);
+    // The fork must leave at least one token to decode, or the caller's "evaluate at least 1
+    // token to generate logits" walk-back would immediately undo it (and on a hybrid arch send us
+    // hunting for a rollback checkpoint the fresh slot does not have).
+    const int32_t p_max = dst.n_prompt_tokens - 1;
+
+    // ---- pick a donor -------------------------------------------------------------------------
+    server_slot * donor = nullptr;
+    const server_prompt_checkpoint * donor_ckpt = nullptr;
+    int32_t best_p = 0;
+
+    for (server_slot & cand : slots) {
+        if (cand.id == dst.id || cand.cache_tokens.empty()) {
+            continue;
+        }
+        if (cand.ga_n != 1) {
+            continue;
+        }
+        // Same reasoning as above, on the donor's side, and the same per-session (not per-model)
+        // gate: a chunked cache breaks the index==position identity, a text-only cache does not.
+        if (cand.cache_tokens.has_mtmd_data()) {
+            continue;
+        }
+        // The two slots must share one draft context for a companion fork to mean anything.
+        if (ctx_companion != nullptr && cand.spec != dst.spec) {
+            continue;
+        }
+
+        int32_t p = (int32_t) cand.cache_tokens.get_common_prefix_exact(dst.prompt_tokens);
+        p = std::min(p, p_max);
+        if (p <= best_p) {
+            continue;
+        }
+
+        // The donor's cells must actually cover [0, p): the token match only says the donor once
+        // held these tokens, not that it still holds the cells. NOTE the asymmetry - on a hybrid
+        // cache llama_kv_cache_seq_pos_min() deliberately reports the RECURRENT state's position
+        // (it is what the rollback logic needs), not the oldest attention cell, so it says nothing
+        // about prefix coverage there. The exact coverage answer for both cases is the count the
+        // share itself returns, which is checked below and refused on a short count.
+        if (llama_kv_cache_seq_pos_max(ctx, cand.id) < (llama_pos) p - 1) {
+            continue;
+        }
+        if (!is_hybrid && llama_kv_cache_seq_pos_min(ctx, cand.id) != 0) {
+            continue;
+        }
+
+        const server_prompt_checkpoint * ckpt = nullptr;
+        if (is_hybrid) {
+            // Snap the depth back to the deepest checkpoint that ends inside the matched range,
+            // so its recurrent row is the state after tokens the fork is actually taking. That
+            // row, and not the donor's live row, is what the fork will start from - the live row
+            // has been advanced by everything the donor decoded since.
+            for (const auto & cur : cand.server_cached_prompt.checkpoints) {
+                if (cur.data.empty() || cur.pos_max + 1 > p) {
+                    continue;
+                }
+                if (ckpt == nullptr || cur.pos_max > ckpt->pos_max) {
+                    ckpt = &cur;
+                }
+            }
+            if (ckpt == nullptr) {
+                continue;
+            }
+            p = (int32_t) ckpt->pos_max + 1;
+            if (p <= best_p) {
+                continue;
+            }
+        }
+
+        best_p = p;
+        donor = &cand;
+        donor_ckpt = ckpt;
+    }
+
+    if (donor == nullptr) {
+        return 0;
+    }
+    if (best_p - n_past_own < slot_fork_min_gain()) {
+        // The slot's own cache already gets us (nearly) as far; the fork would be churn.
+        return 0;
+    }
+
+    // ---- take it ------------------------------------------------------------------------------
+    // Same drain discipline as the prompt-admission teardown (PXA_WAVE4_FIX_v1): never edit cell
+    // ownership or write bulk state while a previous decode's kernels may still be in flight.
+    llama_synchronize(ctx);
+    if (ctx_companion != nullptr) {
+        llama_synchronize(ctx_companion);
+    }
+
+    const int32_t donor_id = donor->id;
+    const int32_t p        = best_p;
+
+    if (is_hybrid) {
+        // The boundary state first. This also re-establishes the destination's cell metadata (with
+        // no K/V bytes, which is exactly why it is cheap) - those cells are transient and the share
+        // below replaces them with the donor's real ones.
+        const size_t want = donor_ckpt->data.size();
+        const size_t got  = llama_state_seq_set_data(ctx, donor_ckpt->data.data(), want, dst.id,
+                                                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (got != want) {
+            LOG_WARNING("PXA_SLOT_FORK: refused - boundary state restore failed", {
+                {"id_slot", dst.id}, {"id_donor", donor_id}, {"prefix", p},
+                });
+            n_slot_fork_refused++;
+            slot_fork_reset_dst(dst, ctx_companion);
+            return 0;
+        }
+    }
+
+    // n_shared == p is the exact coverage proof: one cell per position per sequence, so p cells
+    // tagged inside [0, p) can only be positions 0..p-1.
+    const int32_t n_shared = llama_kv_cache_seq_share_prefix(ctx, donor_id, dst.id, (llama_pos) p);
+    if (n_shared != p ||
+        llama_kv_cache_seq_pos_max(ctx, dst.id) != (llama_pos) p - 1) {
+        LOG_WARNING("PXA_SLOT_FORK: refused - donor prefix incomplete in the ring", {
+            {"id_slot", dst.id}, {"id_donor", donor_id}, {"prefix", p}, {"n_shared", n_shared},
+            });
+        n_slot_fork_refused++;
+        slot_fork_reset_dst(dst, ctx_companion);
+        return 0;
+    }
+
+    if (ctx_companion != nullptr) {
+        const int32_t n_shared_dft =
+            llama_kv_cache_seq_share_prefix(ctx_companion, donor_id, dst.id, (llama_pos) p);
+        if (n_shared_dft != p) {
+            // The draft context lags or leads the target for this donor; without a matching draft
+            // prefix the slot's own trim would leave the two contexts disagreeing about p0.
+            LOG_WARNING("PXA_SLOT_FORK: refused - draft context prefix does not match", {
+                {"id_slot", dst.id}, {"id_donor", donor_id}, {"prefix", p}, {"n_shared", n_shared_dft},
+                });
+            n_slot_fork_refused++;
+            slot_fork_reset_dst(dst, ctx_companion);
+            return 0;
+        }
+    }
+
+    // ---- adopt it -----------------------------------------------------------------------------
+    const int32_t saved = p - n_past_own;
+
+    dst.cache_tokens = donor->cache_tokens.clone();
+    dst.cache_tokens.keep_first((size_t) p);
+    dst.n_past             = p;
+    dst.n_past_prompt      = p; // exact token match, so cache index and prompt index agree
+    dst.n_past_offset      = 0;
+    dst.n_past_se          = 0;
+    dst.ga_i               = 0;
+    dst.n_discarded_prompt = 0;
+    dst.n_kept_prompt      = 0;
+    dst.n_prompt_tokens_cache = p;
+    dst.n_prompt_tokens_forked = saved;
+    // The destination's own checkpoint list described a state it no longer has.
+    dst.server_cached_prompt.checkpoints.clear();
+    dst.checkpoint_pos = p;
+    common_sampler_reset(dst.ctx_sampling);
+
+    n_slot_forks++;
+    n_slot_fork_tokens_saved += (uint64_t) saved;
+
+    LOG_INFO("PXA_SLOT_FORK: forked prefix from a live slot", {
+        {"id_slot",          dst.id},
+        {"id_donor",         donor_id},
+        {"prefix",           p},
+        {"n_past_own",       n_past_own},
+        {"tokens_saved",     saved},
+        {"n_prompt_tokens",  dst.n_prompt_tokens},
+        {"hybrid",           is_hybrid},
+        {"boundary_pos_max", is_hybrid ? (int) donor_ckpt->pos_max : -1},
+        });
+
+    return saved;
+}
+// ============================================================================================
+
 void server_context::context_shift() {
     // PXA_KV_UNIFIED_v1: runtime half of admission control.
     //
@@ -4217,9 +4767,18 @@ void server_context::add_sampled_tokens() {
         bool          do_spec   = false;  // n_draft_max_pre > 0 (this slot drafted)
         llama_tokens  draft;              // the generated (and n_draft_max-capped) draft
         int           min_usable = 0;     // this slot's min usable draft length
+        int32_t       batch_req = -1;     // PXA_MTP_BATCH_SLOTS: index into pxa_draft_reqs
     };
     std::vector<pxa_pending_slot> pending;
     pending.reserve(slots.size());
+
+    // PXA_MTP_BATCH_SLOTS (default OFF): with the lever
+    // on, the MTP slots' drafts are DEFERRED here and run as ONE companion decode per draft STEP
+    // (one batch row per still-running slot) instead of one serial chain of decodes per slot --
+    // mainline's shape. Everything else in this function is unchanged, and with the lever off
+    // nothing is deferred at all.
+    std::vector<common_speculative_draft_req> pxa_draft_reqs;
+    common_speculative * pxa_draft_spec = nullptr;
 
     // PXA_NP_SPEC_GATE_v1 (alias PXA_GRAMMAR_CONCURRENCY_v1, PXA_KERNEL_FIX_20260611): when 2+
     // slots co-decode on a recurrent/hybrid model, speculation is a pure tax: the uniform-batch
@@ -4309,6 +4868,38 @@ void server_context::add_sampled_tokens() {
             }
         }
 
+        // PXA_SPEC_ADAPTIVE_LOAD (default OFF): narrow the draft depth as concurrency rises, and
+        // stop drafting entirely once it is high enough that speculation is a wash. The static
+        // configured depth is chosen for a solo request, where the verify batch's extra rows are
+        // nearly free; with S slots co-decoding those rows are no longer free and every drafting
+        // slot still pays its own draft forwards, checkpoint save and rollback each step. See
+        // pxa-spec-load.h for the two ceilings (1/S concurrency share, and the acceptance-implied
+        // expected run length). Depth only, never acceptance -- the accepted text cannot move.
+        if (pxa_spec_load_enabled() && n_draft_max_pre > 0 && pxa_draft_cap != 0) {
+            pxa_spec_load_state pxa_ls;
+            pxa_ls.n_active_slots = pxa_n_active_slots;
+            pxa_ls.n_draft_max    = n_draft_max_pre;
+            pxa_ls.n_min_usable   = slot.params.speculative.get_min_usable_stage_n_min();
+            pxa_ls.accept_ema     = slot.spec_accept_ema;
+            pxa_ls.off_at         = pxa_spec_load_off_at();
+
+            const int pxa_load_depth = pxa_spec_load_depth(pxa_ls);
+
+            if (pxa_load_depth <= 0) {
+                pxa_draft_cap = 0;
+            } else if (pxa_load_depth < n_draft_max_pre) {
+                // take the tighter of this and any cap the acceptance-EMA tier already set
+                pxa_draft_cap = pxa_draft_cap > 0 ? std::min(pxa_draft_cap, pxa_load_depth)
+                                                  : pxa_load_depth;
+            }
+
+            if (pxa_load_depth != n_draft_max_pre && pxa_load_depth != slot.spec_load_depth_last) {
+                SLT_DBG(slot, "PXA_SPEC_ADAPTIVE_LOAD: %d active slots, accept ema %.3f -> draft depth %d (of %d)\n",
+                        pxa_n_active_slots, slot.spec_accept_ema, pxa_load_depth, n_draft_max_pre);
+            }
+            slot.spec_load_depth_last = pxa_load_depth;
+        }
+
         if (n_draft_max_pre > 0 && pxa_draft_cap != 0 && !pxa_skip_spec_this_tick) { // PXA_NP_SPEC_GATE_v1
             if (mctx && !slot.has_mtp) {
                 // we should never reach this, as speculative is automatically disabled if mmproj is loaded
@@ -4348,15 +4939,38 @@ void server_context::add_sampled_tokens() {
                 }
             }
 
-            const int64_t pxa_sptr_t0 = pxa_sptr.on ? ggml_time_us() : 0; // PXA_SPEC_TRACE
-            llama_tokens draft = common_speculative_draft(
-                slot.spec,
-                params_spec,
-                cached_text_tokens,
-                slot.sampled,
-                draft_base_pos,
-                slot.id);
-            if (pxa_sptr.on) pxa_sptr_add(PXA_SPTR_DRAFT, pxa_sptr_t0); // PXA_SPEC_TRACE
+            // PXA_MTP_BATCH_SLOTS: defer this slot's draft when the lever is on and it is a plain
+            // (non-composite) MTP slot on the shared companion. The deferred requests carry the
+            // ALREADY-CAPPED params, so the adaptive-K / load caps above apply unchanged.
+            const bool pxa_defer_draft =
+                pxa_mtp_batch_slots_enabled()
+                && slot.has_mtp
+                && slot.spec != nullptr
+                && draft_base_pos >= 0
+                && !slot.params.speculative.has_composite_stage_chain()
+                && (pxa_draft_spec == nullptr || pxa_draft_spec == slot.spec);
+
+            llama_tokens draft;
+            if (pxa_defer_draft) {
+                pxa_draft_spec = slot.spec;
+                common_speculative_draft_req req;
+                req.seq_id         = slot.id;
+                req.draft_base_pos = draft_base_pos;
+                req.id_last        = slot.sampled;
+                req.params         = params_spec;   // the capped copy; restored below for the slot
+                ps.batch_req       = (int32_t) pxa_draft_reqs.size();
+                pxa_draft_reqs.push_back(std::move(req));
+            } else {
+                const int64_t pxa_sptr_t0 = pxa_sptr.on ? ggml_time_us() : 0; // PXA_SPEC_TRACE
+                draft = common_speculative_draft(
+                    slot.spec,
+                    params_spec,
+                    cached_text_tokens,
+                    slot.sampled,
+                    draft_base_pos,
+                    slot.id);
+                if (pxa_sptr.on) pxa_sptr_add(PXA_SPTR_DRAFT, pxa_sptr_t0); // PXA_SPEC_TRACE
+            }
 
             // PXA_MTP_ADAPTIVE: restore the request's speculative params after the capped draft call
             if (pxa_draft_cap > 0) {
@@ -4366,13 +4980,67 @@ void server_context::add_sampled_tokens() {
                 }
             }
 
+            if (ps.batch_req < 0) {
+                slot.drafted_spec_type = common_speculative_current_type(slot.spec);
+
+                const int n_draft_max = slot.get_n_draft_max();
+
+                if (draft.size() > (size_t)n_draft_max) {
+                    if (slot.params.speculative.autotune) {
+                        // expected near end-of-response when autotune shrinks n_max
+                        SLT_DBG(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                    } else {
+                        SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                    }
+                    draft.resize(n_draft_max);
+                }
+
+                ps.draft = std::move(draft);
+            }
+
+            ps.do_spec    = true;
+            ps.min_usable = slot.params.speculative.get_min_usable_stage_n_min();
+        } else {
+            ps.do_spec = false;
+        }
+
+        pending.push_back(std::move(ps));
+    }
+
+    // ---- PXA_MTP_BATCH_SLOTS: run the deferred MTP drafts ----
+    // One llama_decode(ctx_mtp) per draft STEP with one row per still-running slot, instead of one
+    // chain of decodes per slot. common_speculative_draft_batched() returns false whenever the
+    // regrouping does not apply (a single deferred slot, a single-seq companion, autotune, ...), and
+    // then every deferred request is run through the ordinary serial call, which is what would have
+    // happened above with the lever off.
+    if (!pxa_draft_reqs.empty()) {
+        const int64_t pxa_sptr_t0 = pxa_sptr.on ? ggml_time_us() : 0; // PXA_SPEC_TRACE
+        if (!common_speculative_draft_batched(pxa_draft_spec, pxa_draft_reqs)) {
+            static const llama_tokens pxa_empty_prompt;
+            for (auto & req : pxa_draft_reqs) {
+                req.result = common_speculative_draft(
+                    pxa_draft_spec,
+                    req.params,
+                    pxa_empty_prompt,
+                    req.id_last,
+                    req.draft_base_pos,
+                    req.seq_id);
+            }
+        }
+        if (pxa_sptr.on) pxa_sptr_add(PXA_SPTR_DRAFT, pxa_sptr_t0); // PXA_SPEC_TRACE
+
+        for (auto & ps : pending) {
+            if (ps.batch_req < 0) {
+                continue;
+            }
+            server_slot & slot = *ps.slot;
+            llama_tokens draft = std::move(pxa_draft_reqs[ps.batch_req].result);
+
             slot.drafted_spec_type = common_speculative_current_type(slot.spec);
 
             const int n_draft_max = slot.get_n_draft_max();
-
-            if (draft.size() > (size_t)n_draft_max) {
+            if (draft.size() > (size_t) n_draft_max) {
                 if (slot.params.speculative.autotune) {
-                    // expected near end-of-response when autotune shrinks n_max
                     SLT_DBG(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
                 } else {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
@@ -4380,14 +5048,8 @@ void server_context::add_sampled_tokens() {
                 draft.resize(n_draft_max);
             }
 
-            ps.do_spec    = true;
-            ps.draft      = std::move(draft);
-            ps.min_usable = slot.params.speculative.get_min_usable_stage_n_min();
-        } else {
-            ps.do_spec = false;
+            ps.draft = std::move(draft);
         }
-
-        pending.push_back(std::move(ps));
     }
 
     // ---- equalize: cap all co-decoding drafting slots to a COMMON draft length (uniform verify batch) ----
@@ -4581,6 +5243,13 @@ void server_context::apply_checkpoint(server_slot & slot) {
                     do_reset = true;
                     //printf("[DEBUG] `do_reset` was set to `true` after failing to restore a checkpoint");
                 } else if (is_hybrid) {
+                    // PXA_CKPT_EVICT: this exact checkpoint has now proven itself as a re-entry
+                    // point. Counting is unconditional; only PXA_CKPT_EVICT=value reads it back.
+                    if (it->replay_hits > 0) { slot.ckpt_restores_repeat++; }
+                    it->replay_hits++;
+                    slot.ckpt_restores++;
+                    slot.ckpt_mark_boundary = true;
+
                     // resume EXCLUSIVE of the snapshot position: the restored recurrent state
                     // already contains the token at pos_max — re-decoding it would double-apply
                     // it to the linear-attention state.
@@ -4592,6 +5261,12 @@ void server_context::apply_checkpoint(server_slot & slot) {
                     slot.n_past_prompt = slot.prompt_tokens.size_up_to_pos(pos_next);
                     SLT_WRN(slot, "restored HYBRID context checkpoint took %.2f ms (state_pos %d -> %d, n_past = %d, size = %.3f MiB)\n", (ggml_time_us() - t_start) / 1000.0, (int)state_pos, it->pos_max, slot.n_past, (float)checkpoint_size / 1024 / 1024);
                 } else {
+                    // PXA_CKPT_EVICT: see the hybrid branch above
+                    if (it->replay_hits > 0) { slot.ckpt_restores_repeat++; }
+                    it->replay_hits++;
+                    slot.ckpt_restores++;
+                    slot.ckpt_mark_boundary = true;
+
                     pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                     slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
 
@@ -4634,41 +5309,29 @@ void server_context::apply_checkpoint(server_slot & slot) {
 // whose removal keeps the remaining checkpoints most uniformly spaced (lowest resulting gap
 // variance) instead of always dropping the oldest. Preserves long-range re-entry coverage for
 // our long multi-turn Discord/agent conversations. First and last checkpoints are never evicted.
+//
+// PXA_CKPT_EVICT: the scoring itself now lives in pxa-ckpt-evict.h so it can be unit-tested
+// without a server. The default mode there is byte-for-byte this function's original arithmetic;
+// PXA_CKPT_EVICT=value additionally weights each candidate by how many restores it has actually
+// served and protects replay-boundary checkpoints.
 static std::list<server_prompt_checkpoint>::iterator evict_checkpoint_by_variance(server_slot & slot, std::list<server_prompt_checkpoint> & ckpts) {
     (void) slot;
-    auto it = ckpts.begin();
-    if (ckpts.size() < 3) {
-        return it;
-    } else if (ckpts.size() == 3) {
-        std::advance(it, 1);
-        return it;
-    }
-    std::vector<int64_t> tokens;
-    tokens.reserve(ckpts.size());
+
+    std::vector<pxa_ckpt_evict_entry> entries;
+    entries.reserve(ckpts.size());
     for (const auto & ckpt : ckpts) {
-        tokens.push_back(int64_t(ckpt.pos_max));
+        pxa_ckpt_evict_entry e;
+        e.pos_max     = int64_t(ckpt.pos_max);
+        e.replay_hits = ckpt.replay_hits;
+        e.boundary    = ckpt.boundary;
+        entries.push_back(e);
     }
-    // For each interior checkpoint, the gap variance after removing it is minimised by the
-    // smallest product of its two adjacent gaps (first/last are fixed, so the mean is constant):
-    // minimise { (x_i - x_{i-1}) * (x_{i+1} - x_i) }.
-    size_t best_idx = 1;
-    const size_t n = tokens.size();
-    const size_t start = 1;     // never remove the first
-    const size_t end = n - 1;   // never remove the last
-    double max_pos = tokens[n - 1];
-    double diff  = (tokens[start] - tokens[start - 1]);
-    double diff2 = (tokens[start + 1] - tokens[start]);
-    double best_variance = diff * (diff2 / max_pos);
-    for (size_t i = start + 1; i < end; i++) {
-        diff  = tokens[i] - tokens[i - 1];
-        diff2 = tokens[i + 1] - tokens[i];
-        double variance = diff * (diff2 / max_pos);
-        if (variance < best_variance) {
-            best_variance = variance;
-            best_idx = i;
-        }
+
+    auto it = ckpts.begin();
+    if (entries.empty()) {
+        return it;
     }
-    std::advance(it, best_idx);
+    std::advance(it, pxa_ckpt_evict_pick(entries, pxa_ckpt_evict_mode_from_env()));
     return it;
 }
 
@@ -4694,14 +5357,23 @@ bool server_context::create_checkpoint(server_slot & slot) {
             }
             const auto & cur = *it;
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024);
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, replay_hits = %u%s)\n",
+                cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024,
+                cur.replay_hits, cur.boundary ? ", boundary" : "");
 
             slot.server_cached_prompt.checkpoints.erase(it);
         }
 
         auto & cur = slot.server_cached_prompt.checkpoints.emplace_back();
         server_prompt_checkpoint_update(cur, ctx, slot.id, slot.cache_tokens.n_tokens(), pos_min, pos_max, slot.n_past_offset);
+
+        // PXA_CKPT_EVICT: the first checkpoint written after this slot re-entered its cached
+        // prompt sits at the boundary the traffic came back to, which is where the NEXT turn of
+        // the same conversation will re-enter as well. Protect it from spacing-only eviction.
+        if (slot.ckpt_mark_boundary) {
+            cur.boundary = true;
+            slot.ckpt_mark_boundary = false;
+        }
 
         SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
             (int)slot.server_cached_prompt.checkpoints.size(), params_base.ctx_checkpoints_n, cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024,
@@ -4968,6 +5640,14 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                                     print_tokens(slot.prompt_tokens, slot.cache_tokens, prefix.second - back, prefix.first - back, 30);
                                 }
                             }
+
+                            // PXA_SLOT_FORK_v1: the slot has now worked out how far it can get on
+                            // its OWN cache. Everything past that is a cold prefill unless some
+                            // other slot is already holding the same tokens - so this is the point
+                            // to ask. On success slot.n_past / slot.cache_tokens describe the
+                            // forked prefix instead, and the accept loop below (and the trim and
+                            // batch build that follow) carry on with no idea anything happened.
+                            slot_fork_try(slot);
 
                             // push the prompt into the sampling context (do not apply grammar)
                             for (int i = 0; i < slot.n_past; ++i) {
@@ -5341,10 +6021,21 @@ void server_context::speculative_decoding_accept() {
     // output_ids mapping. At np>1 the verify batch is shared across slots, so a
     // decode triggered while accepting slot A clobbers the verify logits mapping that
     // slot B still needs, causing `llama_get_logits_ith: invalid logits id N`.
-    // Fix: do ALL output_ids-dependent reads (sample+accept and accepted-hidden-row
+    // Fix: do ALL reads of this decode's outputs (sample+accept and accepted-hidden-row
     // copy) for every slot FIRST, while the verify mapping is intact, then run the
     // decoding restore/commit work from the stashed results. Each slot has its own
     // sampler, so pre-sampling per slot is equivalent to the original interleaving.
+    //
+    // PXA_MTP_HIDDEN_BY_BATCH_ROW_v1 (2026-09-09, P7): the HIDDEN-ROW half of that is not
+    // about the output-id map at all, and calling it that has misled every reader of this
+    // block. The target's MTP hidden rows are stored densely by RAW BATCH ROW
+    // (llama_decode reserves n_outputs_embd = n_tokens_all for an MTP context), which is
+    // why passing slot.i_batch_dft entries works. What forces the pre-pass is simpler and
+    // harder: ctx->embd is ONE buffer and the next decode on THIS context overwrites it.
+    // The MTP commit decodes cannot do that -- they run on the companion context, which
+    // has its own buffer -- but the checkpoint-restore re-decodes run here and do. So the
+    // pre-pass stays; what changed is that the readers now say "batch row" and refuse a
+    // row they cannot address, rather than quietly returning a different token's hidden.
     std::unordered_map<int, std::vector<llama_token>> pxa_pre_ids;
     std::unordered_map<int, std::vector<float>>       pxa_pre_hidden;
     std::unordered_map<int, bool>                     pxa_pre_sample_failed;
@@ -5381,9 +6072,10 @@ void server_context::speculative_decoding_accept() {
             continue;
         }
         pxa_pre_sample_failed[slot.id] = false;
-        // Capture accepted-prefix hidden rows now (output_ids-dependent) for BOTH the
-        // any-rejected rollback path AND the accepted-output MTP commit path. Both read
-        // output hidden rows by index and must do so before any other slot decodes.
+        // Capture accepted-prefix hidden rows now, for BOTH the any-rejected rollback path
+        // AND the accepted-output MTP commit path. Both read this decode's hidden rows by
+        // BATCH ROW (PXA_MTP_HIDDEN_BY_BATCH_ROW_v1) out of a buffer the next decode on this
+        // context overwrites, so it has to happen before any restore re-decode runs.
         if (slot.has_mtp && !ids_pp.empty()) {
             std::vector<int32_t> acc_idx(slot.i_batch_dft.begin(), slot.i_batch_dft.begin() + ids_pp.size());
             std::vector<float> hidden_pp;
@@ -5458,7 +6150,17 @@ void server_context::speculative_decoding_accept() {
         slot.drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
 
         slot.n_past += ids.size();
-        slot.n_decoded += ids.size();
+        // PXA_SPEC_NPREDICT_TRUNC_v1 (2026-09-14): n_decoded is charged ONE PER EMITTED TOKEN in
+        // the emit loop below, not in bulk here. process_token() ends the generation as soon as
+        // has_budget() reports n_predict - n_decoded <= 0, and it is called once per token of this
+        // step; charging the whole verified run up front made the FIRST token of the step that
+        // lands on the n_predict boundary already over budget, so the slot was released after
+        // emitting one token and every remaining ACCEPTED token of that run was dropped. A request
+        // for n_predict=512 then returned 512 - (n_remaining_at_that_step - 1) tokens - the text
+        // was correct up to the stop, it was simply cut short. The non-speculative path has always
+        // done it per token (see slot.n_decoded += 1 in update_slots), and this makes the two
+        // paths agree. get_n_draft_max() already clamps the draft to n_remaining - 1, so the run
+        // can never overshoot the budget either.
         const int64_t t_current = ggml_time_us();
         slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
@@ -5537,6 +6239,10 @@ void server_context::speculative_decoding_accept() {
 
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;
+
+            // PXA_SPEC_NPREDICT_TRUNC_v1: charge the budget for THIS token only, immediately
+            // before it is handed to process_token() - the same order the non-speculative path uses.
+            slot.n_decoded += 1;
 
             result.tok = ids[i];
             result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));

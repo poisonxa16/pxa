@@ -1,7 +1,7 @@
 # 09 — PXQ4-in-vLLM: THE implementation plan
 
 Status: definitive. Supersedes `08-design-minimal-risk.md`, `08-design-max-performance.md`,
-`08-design-least-code.md`. Implementation agents build from this file.
+`08-design-least-code.md`. Implementation proceeds from this file.
 No GPU was run. No container was restarted. Nothing under `/path/to/engine-repo` was modified.
 
 ---
@@ -62,7 +62,7 @@ to build it are:
 3. Their deployment structurally cannot take the `lm_head` win (`lm_head` is in their 311-entry
    `ignore` list). We can.
 
-**GATE G0 (owner decision, no code, do it first): does PXQ4 beat the AWQ twin on quality at
+**GATE G0 (a deliberate choice, no code, do it first): does PXQ4 beat the AWQ twin on quality at
 parity bytes?** If it does not, stop — a ~+9% ceiling does not pay for ~2,500 LOC. This gate
 needs no new code: llama.cpp PXQ4 is already running, their vLLM is already serving.
 
@@ -121,7 +121,7 @@ Everything below was read in source **this session** unless marked otherwise.
   stores in `_CUSTOMIZED_METHOD_TO_QUANT_CONFIG` (`:54`), which **overrides built-ins** at
   lookup. Entry point group `vllm.general_plugins`, loaded in every engine-core and worker
   process (`arg_utils.py:749`, `v1/engine/core.py:108`, `v1/worker/worker_base.py:247`
-  — per `03-vllm-plugin-surface.md`). **Zero patches to `/opt/1Cat-vLLM`.**
+  — per `03-vllm-plugin-surface.md`). **Zero patches to `the vLLM fork checkout`.**
 
 ### 2.2 TP sharding is free, on both axes, with stock loaders
 - `_ColumnvLLMParameter.load_column_parallel_weight` (`parameter.py:145-151`) narrows dim
@@ -193,7 +193,7 @@ but set the forbid flag anyway.
 ### 2.7 Toolchain (read this session, inside the running container)
 Python 3.12.3 · torch **2.10.0+cu128** · nvcc **12.8** V12.8.93 · gcc 12.4.0 ·
 vllm `0.1.dev1+g2ceb15066` at `/opt/vllm-venv/lib/python3.12/site-packages/vllm`, source at
-`/opt/1Cat-vLLM`. **Container `/` is 100% full (207 G used, 0 avail); `/path/to/models` has 567 G.**
+`the vLLM fork checkout`. **Container `/` is 100% full (207 G used, 0 avail); `/path/to/models` has 567 G.**
 Nothing may be installed into the image. Everything we ship lives under `/path/to/models` and is
 reached by `PYTHONPATH` + a hand-written `.dist-info` (see §7.4).
 
@@ -264,7 +264,7 @@ problem instead of coding around it. Cost of the deferral: 0.366 GiB/GPU during 
 
 One git repo, **on this machine** at
 `<scratch>/pxq-vllm/pxq4-vllm/`,
-deployed to the DGX at `/path/to/models/pxa-vllm-pxq4/` (never to `/`, never to container `/`).
+deployed to the GPU host at `/path/to/models/pxa-vllm-pxq4/` (never to `/`, never to container `/`).
 
 ```
 pxq4-vllm/
@@ -722,7 +722,7 @@ fold, and the reduction must be untouched** — that is the entire bit-exactness
 
 ### 7.4 Build and deploy
 Standalone `.so` linked against libtorch only; **no vLLM headers, no vLLM rebuild, no patch to
-`/opt/1Cat-vLLM`.**
+`the vLLM fork checkout`.**
 ```
 nvcc -O3 -std=c++17 -gencode arch=compute_70,code=sm_70 \
      --expt-relaxed-constexpr -Xcompiler -fPIC -shared
@@ -752,7 +752,7 @@ for the current workflow.
 
 | # | gate | needs | what it retires |
 |---|---|---|---|
-| **G0** | PXQ4 beats AWQ on quality at parity bytes | owner decision, no code | the project's reason to exist |
+| **G0** | PXQ4 beats AWQ on quality at parity bytes | a deliberate choice, no code | the project's reason to exist |
 | **G1** | `reference.dequant()` == `pxa_deq_row_pxq6` (`pxq-cpu.c`), `np.array_equal` in **fp32**, on ≥3 real tensors of distinct shapes | CPU | >90% of format risk: panel math, slab offsets, nibble order, table values, multiply order |
 | **G2** | split→join round-trips to the original GGUF bytes for all 325 PXQ4 tensors | CPU | converter layout |
 | **G3** | `dequant(narrow(x)) == narrow(dequant(x))` bit-exact, **both axes**, TP∈{2,4}, on `gate_up`, `down`, `o_proj`, `in_proj_qkvz` | CPU | that the TP repack is a permutation; the silent-truncation class of bug |
@@ -764,12 +764,12 @@ for the current workflow.
 | **G9** | first throughput measurement. **Nothing before G9 may quote tok/s.** | GPU + lease | — |
 | **G10** | P2 only: 4-bit `lm_head` and 4-bit `attn_k/v` each clear the seats' quality bar *before* they ship | GPU | that P2 buys speed without buying a quality regression |
 
-**G1 and G3 together are the project.** They are pure numpy, they need no GPU, no lease, and
+**G1 and G3 together are the project.** They are pure numpy, they need no GPU, and
 no container, and they retire the failure mode that the rest of the design cannot detect.
 
 ---
 
-## 9. Parallel work split (four agents, four contracts)
+## 9. Parallel work split (four components, four contracts)
 
 | agent | owns | must not touch | blocked on |
 |---|---|---|---|
@@ -779,12 +779,12 @@ no container, and they retire the failure mode that the rest of the design canno
 | **D — gates** | `tests/**` | all of the above | §5.3 + §6.3 + §7.1 (all frozen here) |
 
 The three frozen contracts are: **§5.3** (what the converter emits), **§6.3** (`reference.dequant`
-semantics), **§7.1** (the op ABI). Nothing else crosses a boundary. Agent A can reach G1–G4
-with no input from B or C. Agent C can reach G6 against A's `reference.dequant` alone.
+semantics), **§7.1** (the op ABI). Nothing else crosses a boundary. the reference (reference.py) can reach G1–G4
+with no input from B or C. the CUDA kernel (csrc/) can reach G6 against A's `reference.dequant` alone.
 
 Estimated LOC: converter 850 · runtime python 420 · CUDA 900 (of which ~500 vendored verbatim)
 · tests 350 · encoder shim (P2) 180. **≈2,700 total, ≈2,200 hand-written.
-Files modified in `/opt/1Cat-vLLM` or `/path/to/engine-repo`: 0.**
+Files modified in `the vLLM fork checkout` or `/path/to/engine-repo`: 0.**
 
 ---
 

@@ -1,10 +1,10 @@
 """
-GATES H1-H6 -- run agent C's ACTUAL kernel, on the CPU, with no GPU and no lease.
+GATES H1-H6 -- run the ACTUAL CUDA kernel, on the CPU, with no GPU and no GPU.
 
 `pxq4_kernel_hostsim.cpp` compiles the real `k_pxq4_dequant_matrix` / `k_pxq4_mmv` device
 code against a host shim for blockIdx/threadIdx/__syncthreads.  That moves the substance
 of G6 and G8a -- layout addressing, table values, accumulation order, the fp16 store, and
-the shard invariant, all inside the kernel's own source -- from "blocked on borrowed
+the shard invariant, all inside the kernel's own source -- from "blocked on shared
 hardware" to "runs in a second, here".
 
 A hostsim PASS is NECESSARY, NOT SUFFICIENT.  Still owed to real sm_70 hardware:
@@ -52,7 +52,7 @@ HOSTSIM_MAX_SLABS = 4        # K=128:    still splits cleanly at TP=4 on the row
 #
 # The MMV kernel is the opposite.  Its whole structure is the canonical fold
 # (pxq4_kernel.cuh:297-318): nfix = pxq4_canon_nfix(kslabs) chunks, chunk c spanning
-# [b0, b1) = [(kslabs*c)/nfix, (kslabs*(c+1))/nfix), with agent C's EDIT 3 staging ONLY that
+# [b0, b1) = [(kslabs*c)/nfix, (kslabs*(c+1))/nfix), with the CUDA kernel's EDIT 3 staging ONLY that
 # chunk's activations into smem and re-basing the read as `pxq4_xs + (kb - b0)*PXQ4_QK`
 # (pxq4_kernel.cuh:315).  At kslabs = 4, `lim = 4/PXQ4_MMV_KSEG = 1` so canon_nfix == 1: one
 # chunk, b0 == 0, `kb - b0 == kb`.  Trimming the mmv cases to 4 slabs makes the entire fold
@@ -153,7 +153,7 @@ def test_h2_hostsim_dequant_f32_bitexact(real=None):
 
 
 def test_h3_hostsim_dequant_f16_rounding(real=None):
-    """The op writes fp16 (plan §7.1).  Confirm it is exactly the fp32 result with one
+    """The op writes fp16.  Confirm it is exactly the fp32 result with one
     round-to-nearest-even, i.e. that the kernel is not accumulating in fp16 anywhere."""
     _need()
     for label, N, K, slabs, anchor in _cases(real):
@@ -168,7 +168,7 @@ def test_h4_hostsim_shard_invariant(real=None):
     """G3, executed through the KERNEL rather than through the oracle.
 
     This is the strongest single statement the harness can make without hardware:
-    dequantizing a shard with agent C's own code gives bit-identical values to the
+    dequantizing a shard with the CUDA kernel's own code gives bit-identical values to the
     corresponding slice of the unsharded result, on both axes, at TP 1/2/4.
     """
     _need()

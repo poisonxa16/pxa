@@ -39,7 +39,7 @@ if(Git_FOUND)
     endif()
 endif()
 
-# 2026-09-06 (release packaging): a release tarball is built from a `git archive` extract,
+# 2026-09-06 (release): a release tarball is built from a `git archive` extract,
 # which by construction has no `.git`, so the discovery above cannot run and every packaged binary
 # reported `version: 0 (unknown)` -- the one banner a user is most likely to quote in a bug report.
 # The packaging script now passes the real values in, and an explicit value always wins over

@@ -226,6 +226,10 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // PXA_AUTO_JINJA_v1: see common_chat_auto_jinja() -- an architecture whose own chat template
+    // the built-in map cannot render gets the jinja path by default, and says so.
+    common_chat_auto_jinja(model, params.use_jinja, params.chat_template);
+
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
 
     const int n_ctx_train = llama_n_ctx_train(model);

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Offline bench + profile harness. Runs inside the kewaii/vllm container.
+"""Offline bench + profile harness. Runs inside the the vLLM container.
 usage: harness.py --tag T --model PATH [--quant pxq4] [--nrep 1] [--profile 1]
-Writes results to /mnt/models/pxa-step/results/<tag>.json and traces to
-/mnt/models/pxa-step/traces/<tag>/
+Writes results to $MODELS_DIR/step/results/<tag>.json and traces to
+$MODELS_DIR/step/traces/<tag>/
 """
 import argparse, json, os, statistics, time
 
@@ -21,8 +21,9 @@ def main():
     p.add_argument("--tp", type=int, default=4)
     args = p.parse_args()
 
-    OUT = "/mnt/models/pxa-step/results"
-    TRACED = f"/mnt/models/pxa-step/traces/{args.tag}"
+    MODELS_DIR = os.environ.get("PXA_MODELS_DIR", "./models")
+    OUT = f"{MODELS_DIR}/step/results"
+    TRACED = f"{MODELS_DIR}/step/traces/{args.tag}"
     os.makedirs(OUT, exist_ok=True)
     os.makedirs(TRACED, exist_ok=True)
 

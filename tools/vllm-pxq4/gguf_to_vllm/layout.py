@@ -2,7 +2,7 @@
 
 SHARED CONTRACT SURFACE. This module is imported by the converter, by the runtime package's
 parameter shaping, and by the tests. It must never import torch, vllm or CUDA — gates G1-G4
-run on a laptop, before the GPU lease is ever taken.
+run on a laptop, before any GPU is needed.
 
 THE LAYOUT, and why every function here is index arithmetic and never a value computation:
 

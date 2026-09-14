@@ -1,6 +1,6 @@
-# vLLM quantization plugin surface — 1Cat-vLLM fork (as installed in `vllm-qwen38-27b-cyber-1`)
+# vLLM quantization plugin surface — Volta vLLM fork (as installed in the production vLLM container)
 
-Source read at `/opt/1Cat-vLLM` inside the running container, git HEAD `2ceb15066518e7241cf3c57a71ddd39168cbc675` (Sat Aug 15 15:39:26 2026 +0100) — matches the reported `v0.1.dev1+g2ceb15066`. All line numbers below are from that tree. Nothing was modified, no container was restarted, no GPU was touched.
+Source read at `the vLLM fork checkout` inside the running container, git HEAD `2ceb15066518e7241cf3c57a71ddd39168cbc675` (Sat Aug 15 15:39:26 2026 +0100) — matches the reported `v0.1.dev1+g2ceb15066`. All line numbers below are from that tree. Nothing was modified, no container was restarted, no GPU was touched.
 
 ## 0. Verdict up front
 

@@ -3,6 +3,8 @@
 #include "llama-model-loader.h"
 #include "llama-model.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <map>
 
 #define LLAMA_MAX_EXPERTS 512  // Qwen3 Next
@@ -21,6 +23,32 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
     }
 
     return LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
+}
+
+// PXA_QSA levers. Read once; see the contract comments on the declarations in llama-hparams.h.
+bool llama_qsa_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_QSA");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
+bool llama_qsa_gather_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_QSA_GATHER");
+        return e == nullptr || atoi(e) != 0;   // default ON, once PXA_QSA is on
+    }();
+    return v;
+}
+
+uint32_t llama_qsa_min_fill() {
+    static const uint32_t v = [] {
+        const char * e = getenv("PXA_QSA_MIN_FILL");
+        const long n = e != nullptr ? atol(e) : -1;
+        return n >= 0 ? (uint32_t) n : 65536u;
+    }();
+    return v;
 }
 
 const char * llama_hparams::rope_scaling_type_name(llama_rope_scaling_type type) {
@@ -789,7 +817,7 @@ void llm_load_hparams(
                     hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
                 }
 
-                // QSA lightning indexer geometry (shapes only; top_k is a graph concern)
+                // QSA lightning indexer geometry.
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
 
@@ -861,6 +889,87 @@ void llm_load_hparams(
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                         hparams.recurrent_layer_arr[i] = i < n_main_layers && ((i + 1) % full_attn_interval != 0);
                     }
+                }
+
+                // The QSA budget, in TOKENS, and the block size. The indexer scores whole
+                // blocks of `compress_ratio` consecutive positions of one sequence, so the
+                // budget covers indexer_top_k/ratio complete blocks; the shipped file carries
+                // 2048 and 4. compress_ratios is per layer and is 0 on the recurrent ones --
+                // the block grid takes ONE ratio, so a file whose full-attention layers
+                // disagree is refused rather than silently mis-blocked.
+                //
+                // Both are read unconditionally, not behind the PXA_QSA lever: hparams
+                // describe the FILE, and a lever that changed what the loader believes the
+                // file says would make the two arms of the gate incomparable.
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K, hparams.indexer_top_k, false);
+                {
+                    std::vector<uint32_t> ratios;
+                    ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios, false);
+                    if (hparams.n_layer > hparams.dsv4_compress_ratios.size()) {
+                        throw std::runtime_error(format("qwen4exp: n_layer=%u exceeds LLAMA_MAX_LAYERS", hparams.n_layer));
+                    }
+                    uint32_t ratio = 0;
+                    if (!ratios.empty()) {
+                        // compress_ratios is ONE ENTRY PER TRANSFORMER LAYER, and n_layer counts
+                        // the grafted NextN/MTP tail as well (block_count; see the `case 49` just
+                        // below and n_main_layers above). Sizing this against n_layer therefore
+                        // demanded a ratio for the MTP head and refused the correct file:
+                        // Qwen3.8-Flash-Next PXQU-MTP carries block_count=49,
+                        // nextn_predict_layers=1 and 48 ratios, one per transformer layer.
+                        // The head is never a QSA layer -- it is plain full attention, and its
+                        // dsv4_compress_ratios entry stays at the 0 the array is filled with --
+                        // so the requirement is the TRANSFORMER count.
+                        //
+                        // A file that does carry an entry for the head (or any longer padding a
+                        // converter chooses to emit) still loads and still has that entry
+                        // honoured: the copy is bounded by what the file actually provides.
+                        // For a file with no MTP head this is byte-for-byte today's arithmetic.
+                        //
+                        // NOTE: this is a DELIBERATE DIVERGENCE FROM MAINLINE, not a port of it.
+                        // Mainline keeps two fields, n_layer_all (block_count) and n_layer_nextn,
+                        // and sizes the same array against n_layer_all -- i.e. it demands an
+                        // entry for the head too (src/models/deepseek4.cpp, "compress_ratios is
+                        // shorter than block_count"). That constraint simply never fires upstream
+                        // because no shipped mainline file of this family has a grafted head.
+                        const uint32_t n_qsa_layers = hparams.n_layer - hparams.nextn_predict_layers;
+                        if (ratios.size() < n_qsa_layers) {
+                            throw std::runtime_error(format(
+                                        "qwen4exp: attention.compress_ratios has %u entries, need at least one per "
+                                        "transformer layer (%u = n_layer %u - nextn_predict_layers %u)",
+                                        (uint32_t) ratios.size(), n_qsa_layers,
+                                        hparams.n_layer, hparams.nextn_predict_layers));
+                        }
+                        const uint32_t n_read = std::min((uint32_t) ratios.size(), hparams.n_layer);
+                        for (uint32_t il = 0; il < n_read; ++il) {
+                            hparams.dsv4_compress_ratios[il] = ratios[il];
+
+                            // A ratio on a recurrent layer, or none on a full-attention layer,
+                            // means the file and the layer-type rule disagree; that is a bad
+                            // file, not something to paper over.
+                            const bool full = !hparams.is_recurrent(il);
+                            if (full && ratios[il] > 1) {
+                                if (ratio == 0) {
+                                    ratio = ratios[il];
+                                } else if (ratio != ratios[il]) {
+                                    throw std::runtime_error(format(
+                                                "qwen4exp: non-uniform QSA block size (layer %u has %u, an earlier layer has %u)",
+                                                il, ratios[il], ratio));
+                                }
+                            } else if (!full && ratios[il] != 0) {
+                                throw std::runtime_error(format(
+                                            "qwen4exp: recurrent layer %u carries a compress ratio (%u)", il, ratios[il]));
+                            }
+                        }
+                    }
+
+                    // indexer_kpool is the engine-wide name for "the block size the pooled
+                    // indexer grid uses"; QSA and the GLM k-pool indexer share that grid.
+                    hparams.indexer_kpool = ratio;
+
+                    // The newest < ratio tokens of a sequence belong to no complete block yet,
+                    // and one of them is always the token doing the attending, so the tail is
+                    // never optional for this architecture.
+                    hparams.indexer_kpool_select_tail = ratio > 1;
                 }
 
                 switch (hparams.n_layer) {
@@ -1918,6 +2027,122 @@ void llm_load_hparams(
                     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v_full);
                 }
             } break;
+        case LLM_ARCH_GLM5NEXT:
+            {
+                // PXA_GLM5NEXT: GLM-5.3-Flash. Key set verified against the real
+                // unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL header, and cross-checked against
+                // upstream PR #27773 (src/models/glm5-next.cpp::load_arch_hparams).
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,     hparams.f_norm_eps, false);
+
+                // --- MLA ---
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
+                // This tree keeps the real per-head MLA dims in n_embd_head_{k,v}_full (the
+                // ik/DEEPSEEK2 convention), not upstream's separate *_mla_impl pair. The GGUF's
+                // attention.key_length / value_length are 512 = kv_lora_rank, which is the width
+                // of the ABSORBED latent, not of a head; the head widths are the _mla keys (256).
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_full);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_full);
+                // The MLA cache holds the compressed latent only (kv_lora_rank wide), and the
+                // GGUF says rope.dimension_count == 0: this MLA is NoPE, there is no rope half.
+                if (hparams.n_rot != 0) {
+                    throw std::runtime_error("glm5next: MLA is nope-only, expected rope.dimension_count == 0");
+                }
+
+                // --- KDA ---
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
+                ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound, false);
+
+                // Layer regime comes straight from the per-layer attention.head_count_kv array:
+                // 0 = KDA (recurrent), 1 = MLA + DSA indexer. n_head_kv_arr was already filled
+                // by the generic loader above.
+                std::fill(hparams.recurrent_layer_arr.begin(), hparams.recurrent_layer_arr.end(), false);
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+                }
+
+                // The KDA recurrent row reuses this tree's qwen3next state layout verbatim, so
+                // the four ssm_* fields are derived (not read from the GGUF, which has no
+                // qwen3next keys) such that n_embd_v_s() comes out as exactly
+                //   [ (d_conv-1) * (2*key_dim + value_dim) | head_v_dim^2 * num_v_heads ]
+                //   = [ 3*(d_conv-1)*d_inner                | head_dim^2 * n_head ]
+                // which is the [q|k|v conv window | delta state] KDA needs. Asserted again in
+                // build_glm5next_kda() so a future edit to n_embd_v_s() cannot drift silently.
+                {
+                    const uint32_t head_dim = hparams.n_embd_head_kda;   // 128
+                    const uint32_t n_h      = hparams.n_head();          // 64
+                    hparams.ssm_dt_rank  = n_h;               // num_v_heads
+                    hparams.ssm_n_group  = n_h;               // num_k_heads
+                    hparams.ssm_d_state  = head_dim;          // head_k_dim
+                    hparams.ssm_d_inner  = head_dim * n_h;    // value_dim == key_dim
+                }
+
+                // --- MoE ---
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm,  false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func,   false);
+                if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SIGMOID;
+                }
+
+                // The clamped SwiGLU. This tree keeps the limits in swiglu_limits /
+                // swiglu_limits_shared (the DEEPSEEK4 convention), and glm5next writes the same
+                // two GGUF keys; both are all-10.0 per-layer arrays in the released weights.
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_limits, hparams.n_layer, false);
+                if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_limits_shared, hparams.n_layer, false)) {
+                    hparams.swiglu_limits_shared = hparams.swiglu_limits;
+                }
+
+                // --- DSA indexer with k-pool compression ---
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,        hparams.indexer_n_head);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,        hparams.indexer_head_size);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,             hparams.indexer_top_k);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,             hparams.indexer_kpool);
+                // The newest < kpool tokens of a sequence belong to no complete pool yet, and one
+                // of them is always the token doing the attending, so the tail is not optional for
+                // this architecture: the default is ON and the GGUF key OVERRIDES it rather than
+                // being what enables it. This is the rule the QSA k-pool grid above already uses.
+                //
+                // Read off the reference implementation with the real weights: with the tail left
+                // out, the LAST token of a prompt whose length is not a multiple of kpool cannot
+                // attend to its own cell, and the attention it does place is renormalised over the
+                // keys that remain. Measured on the first MLA block of GLM-5.3-Flash against
+                // llama.cpp PR#27773 on the same GGUF, five-token prompt, every earlier token
+                // agreeing to 1e-3: the last token's softmax was the reference's scaled by a
+                // constant 1.13 in head 0 and 1.63 in head 1, i.e. 0.12 and 0.39 of the
+                // distribution's mass was the self key we had dropped.
+                hparams.indexer_kpool_select_tail = hparams.indexer_kpool > 1;
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, hparams.indexer_kpool_select_tail, false);
+                if (hparams.indexer_kpool <= 1 || hparams.indexer_top_k % hparams.indexer_kpool != 0) {
+                    throw std::runtime_error("glm5next: indexer.kpool must be > 1 and divide indexer.top_k");
+                }
+
+                // --- mHC ---
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+                if (hparams.dsv4_hc_mult != 4) {
+                    throw std::runtime_error("glm5next: only hyper_connection.count == 4 is implemented");
+                }
+
+                // --- NextN / MTP tail ---
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                if (model.mtp) {
+                    hparams.n_layer_kv_from_start = hparams.n_layer;
+                } else {
+                    hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                }
+
+                switch (hparams.n_layer - hparams.nextn_predict_layers) {
+                    case 45: model.type = MODEL_320B_A17B; break;
+                    default: model.type = MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_DEEPSEEK4:
             {
                 // Adapted from llama.cpp src/models/deepseek4.cpp
@@ -1937,7 +2162,7 @@ void llm_load_hparams(
                 // already maps the very same GGUF keys onto swiglu_limits /
                 // swiglu_limits_shared (see LLM_ARCH_STEP35 above), so reuse those.
                 // NOTE the DS4 semantics: the GATE is clamped to [-inf, limit] BEFORE
-                // swiglu_split - it is NOT silu-then-clamp (graph lane, chunk D).
+                // swiglu_split - it is NOT silu-then-clamp (graph split work, chunk D).
                 ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_limits, hparams.n_layer, true);
                 if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_limits_shared, hparams.n_layer, false)) {
                     hparams.swiglu_limits_shared = hparams.swiglu_limits;
@@ -1978,15 +2203,27 @@ void llm_load_hparams(
                     //     val  0, 0, 4, 128, 4, 128 ...  4 |  0 ...
                     std::vector<uint32_t> ratios;
                     ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios, true);
-                    if (ratios.size() < hparams.n_layer) {
+                    // ... and a SHORT array is judged against the TRANSFORMER layer count, not
+                    // against n_layer, for the same reason as qwen4exp above: n_layer is
+                    // block_count and counts a grafted NextN/MTP tail, which is not a QSA layer
+                    // and needs no ratio. No DS4 file in hand has such a graft
+                    // (nextn_predict_layers is 0 for this arch today, so the two counts are
+                    // equal and this is a strict no-op), but the line is the twin of the one
+                    // that stopped Qwen3.8-Flash-Next PXQU-MTP from loading, and leaving one of
+                    // two identical mistakes in place is how that one survived.
+                    const uint32_t n_qsa_layers = hparams.n_layer - hparams.nextn_predict_layers;
+                    if (ratios.size() < n_qsa_layers) {
                         throw std::runtime_error(format(
-                                    "DeepSeek-V4: attention.compress_ratios has %u entries, need at least n_layer=%u",
-                                    (uint32_t) ratios.size(), hparams.n_layer));
+                                    "DeepSeek-V4: attention.compress_ratios has %u entries, need at least one per "
+                                    "transformer layer (%u = n_layer %u - nextn_predict_layers %u)",
+                                    (uint32_t) ratios.size(), n_qsa_layers,
+                                    hparams.n_layer, hparams.nextn_predict_layers));
                     }
                     if (hparams.n_layer > hparams.dsv4_compress_ratios.size()) {
                         throw std::runtime_error(format("DeepSeek-V4: n_layer=%u exceeds LLAMA_MAX_LAYERS", hparams.n_layer));
                     }
-                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    const uint32_t n_read = std::min((uint32_t) ratios.size(), hparams.n_layer);
+                    for (uint32_t il = 0; il < n_read; ++il) {
                         hparams.dsv4_compress_ratios[il] = ratios[il];
                     }
                 }

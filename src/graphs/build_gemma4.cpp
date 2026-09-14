@@ -2,6 +2,8 @@
 #include "../llama-model.h"
 #include "../llama-context.h"
 
+#include <stdexcept>
+
 static int gemma4_mtp_target_kv_layer(const llama_hparams & mtp_hparams, const llama_hparams & target_hparams, int mtp_il) {
     GGML_ASSERT(mtp_il >= 0 && mtp_il < (int) mtp_hparams.n_layer);
 
@@ -563,6 +565,18 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
     cb(lctx.inp_tokens, "inp_tokens", -1);
     ggml_set_input(lctx.inp_tokens);
 
+    // The frozen KV views below address the TARGET's kv_self directly, one view per target layer.
+    // If the target is running the sliding-window cache, its sliding layers have no K/V in kv_self
+    // at all (they live in kv_swa, a different index space with a different extent), so those views
+    // would be built on a null tensor. Refuse in words rather than crash in a view: the two levers
+    // are exclusive until the frozen-view builder learns to pick a cache per layer the way the
+    // dense graph now does.
+    if (lctx.mtp_target_ctx->swa_kv_active) {
+        throw std::runtime_error("the Gemma 4 assistant drafter reads the target's K/V through frozen views "
+                "into its single cache, so it cannot run against a target using the sliding-window cache "
+                "(PXA_GEMMA4_ISWA); run one or the other");
+    }
+
     const llama_model   & target_model   = lctx.mtp_target_ctx->model;
     const llama_hparams & target_hparams = target_model.hparams;
     const llama_cparams & target_cparams = lctx.mtp_target_ctx->cparams;
@@ -778,11 +792,28 @@ ggml_cgraph * llm_build_context::build_gemma4() {
 
         auto freq_factors = !is_sliding ? model.layers[il].rope_freqs : nullptr;
 
+        // PXA_GEMMA4_ISWA: when the sliding-window cache is armed, layer il's K/V live in
+        // lctx.kv_swa -- a separate cache object with its own cells, head and size, sized to the
+        // window rather than to n_ctx. kv_self then holds nothing for this layer at all
+        // (llama_kv_cache_init was called with the sliding layers excluded), so routing here is
+        // not an optimisation: an unrouted sliding layer would dereference a null k_l.
+        // With the lever off, swa_kv_active is false, kv_swa aliases kv_self, and the override is
+        // not passed at all -- the call below is byte-for-byte the one that shipped.
+        const llama_kv_cache * kv_ovr      = nullptr;
+        int32_t                n_kv_ovr    = 0;
+        int32_t                kv_head_ovr = 0;
+        if (is_sliding && lctx.swa_kv_active) {
+            kv_ovr      = &kv_swa;
+            n_kv_ovr    = n_kv_swa;
+            kv_head_ovr = kv_head_swa;
+        }
+
         ggml_tensor * attn_out;
 
         if (hparams.has_kv(il) && model.layers[il].wv) {
             attn_out = build_std_attention(gf, model.layers[il].attn_norm, inpL, inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, freq_factors,
-                    KQ_mask_l, nullptr, nullptr, hparams.f_attention_scale, 0.0f, n_swa, il, true, false, true, false, false, model.layers[il].attn_post_norm);
+                    KQ_mask_l, nullptr, nullptr, hparams.f_attention_scale, 0.0f, n_swa, il, true, false, true, false, false, model.layers[il].attn_post_norm,
+                    false, kv_ovr, n_kv_ovr, kv_head_ovr);
         } else {
             cur = llm_build_norm(ctx0, inpL, hparams, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, cb, il);
             cb(cur, "attn_norm", il);
@@ -818,8 +849,9 @@ ggml_cgraph * llm_build_context::build_gemma4() {
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Kcur, "Kcur_rope", il);
             }
-            cur = llm_build_kv(ctx0, lctx, kv_self, gf, model.layers[il].wo, model.layers[il].bo,
-                Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv, hparams.f_attention_scale, cb, il, nullptr, n_swa);
+            cur = llm_build_kv(ctx0, lctx, kv_ovr ? *kv_ovr : kv_self, gf, model.layers[il].wo, model.layers[il].bo,
+                Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_ovr ? kv_head_ovr : kv_head, kv_ovr ? n_kv_ovr : n_kv,
+                hparams.f_attention_scale, cb, il, nullptr, n_swa);
 
 
             if (il == n_layer - 1 && inp_out_ids) {

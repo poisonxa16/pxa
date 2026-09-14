@@ -1,6 +1,6 @@
 # docker/Dockerfile.release-build — the OLDER-glibc build environment for release tarballs.
 #
-# WHY THIS EXISTS: the campaign's day-to-day dev image (pxa-sm60-dev) is built on
+# WHY THIS EXISTS: my day-to-day dev image (pxa-sm60-dev) is built on
 # nvidia/cuda:12.8.1-devel-ubuntu24.04 (glibc 2.39). Binaries linked there refuse to even start
 # on an older host ("version GLIBC_2.38 not found") -- confirmed by hand, packaging the first
 # release tarball. Building the RELEASE binaries here instead, on Ubuntu 22.04 (glibc 2.35,
@@ -14,7 +14,7 @@
 #
 # This is a BUILD SHELL, not a multi-stage app image: no COPY of source, no baked-in build. Bind-
 # mount the repo and run cmake/cmake --build inside it, same pattern as every other build
-# container this campaign uses (pxa-sm60-dev included). scripts/make-release-tarball.sh builds
+# container I build in (pxa-sm60-dev included). scripts/make-release-tarball.sh builds
 # this image itself (image tag pxa-release-build:cu128-u2204) and runs the build inside it when
 # BUILD_DIR is not already populated -- see BUILD_IMAGE / --build in that script's usage.
 #

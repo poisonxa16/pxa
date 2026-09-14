@@ -421,6 +421,52 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
                 LLAMA_LOG_WARN("%s: %s = %u but this runtime's env selects v%u tables -- these tensors WILL DECODE WRONG. %s, then reload.\n", __func__, pxq_vkeys[vi], fv, rt_v[vi], pxq_fix[vi]);
             }
         }
+
+        // MISSING-CODEBOOK CHECK (2026-09-09). The loop above skips a tier whose version key is
+        // ABSENT, which is the hole this check closes: until today the quantizer wrote the
+        // book/sub KVs from the requested ftype rather than from the tiers it actually emitted,
+        // so a mixed-tier file could contain pxq3 tensors and carry no pxa.pxq3.book at all.
+        //
+        // WHY WARN AND NOT REFUSE. Two reasons, and both had to hold.
+        //   * This engine does not read the book KV. The CUDA side initialises pxq2_book_g /
+        //     pxq3_book_g from the compiled-in PXQ2_BOOK_INIT / PXQ3_BOOK_INIT tables and only
+        //     overrides them from the environment (pxq23.cuh). So a missing book changes
+        //     nothing HERE — the file decodes correctly — and refusing would be refusing a file
+        //     we can read perfectly well.
+        //   * It is not this file's fault. EVERY PXQ artifact published before today has the
+        //     gap for its promoted backbone tier (a PXQ2 MoE file emits a pxq4 backbone and
+        //     stamps only pxa.pxq2.*), including the artifacts behind the live seats. Refusing
+        //     would brick the published fleet to punish a quantizer bug.
+        // What a missing book DOES break is every honest external reader — the vLLM converter
+        // builds its decode tables from these KVs — so the warning says exactly that, because
+        // "this file will not convert" is the actionable half.
+        {
+            bool have[3] = { false, false, false };   // pxq2, pxq3, 4-bit/5-bit family (pxq6.*)
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                switch (cur->type) {
+                    case GGML_TYPE_PXQ2:   have[0] = true; break;
+                    case GGML_TYPE_PXQ3:   have[1] = true; break;
+                    case GGML_TYPE_PXQ4:
+                    case GGML_TYPE_PXQ4HQ:
+                    case GGML_TYPE_PXQ6:   have[2] = true; break;
+                    default: break;
+                }
+            }
+            static const char * bkeys[3] = { "pxa.pxq2.book", "pxa.pxq3.book", "pxa.pxq6.book" };
+            static const char * bwhat[3] = { "pxq2", "pxq3", "pxq4/pxq4hq/pxq6" };
+            for (int bi = 0; bi < 3; ++bi) {
+                if (!have[bi] || gguf_find_key(meta, bkeys[bi]) >= 0) {
+                    continue;
+                }
+                LLAMA_LOG_WARN("%s: ===================== PXQ CODEBOOK KV MISSING =====================\n", __func__);
+                LLAMA_LOG_WARN("%s: this file contains %s tensors but carries no %s. It loads and decodes "
+                               "correctly HERE (this engine uses its compiled-in tables), but any reader "
+                               "that takes the KVs at their word -- the vLLM converter above all -- cannot "
+                               "decode it. Re-quantize with a build dated 2026-09-09 or later to stamp the "
+                               "codebook for every tier the file actually contains.\n",
+                               __func__, bwhat[bi], bkeys[bi]);
+            }
+        }
     }
 
     files.emplace_back(new llama_file(fname.c_str(), "rb"));

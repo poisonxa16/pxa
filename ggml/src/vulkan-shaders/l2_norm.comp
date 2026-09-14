@@ -33,7 +33,11 @@ void main() {
         barrier();
     }
 
-    const FLOAT_TYPE scale = inversesqrt(max(sum[0], FLOAT_TYPE(p.param1)));
+    // PXA_KERNFIX 2026-09-09 (defect B): reference GDN L2 norm, eps added under the sqrt,
+    // matching ggml.c / ggml-cuda norm.cu. (L2_NORM is not dispatched on the Vulkan backend in
+    // this tree -- ggml-vulkan.cpp:6681 and :9399 are commented out -- but the formula is kept
+    // in step so the backend cannot be re-enabled onto a stale one.)
+    const FLOAT_TYPE scale = inversesqrt(sum[0] + FLOAT_TYPE(p.param1));
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
         data_d[row*p.KX + col] = D_TYPE(scale * FLOAT_TYPE(data_a[row*p.KX + col]));

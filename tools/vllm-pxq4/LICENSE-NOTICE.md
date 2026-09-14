@@ -18,8 +18,8 @@ and inductor does not lower matmuls to Triton unless max_autotune is on.
 It is OPT-IN and only needed to get torch.compile / CUDA graphs working on Pascal (P100).
 Nothing on sm_70 or newer requires it, and PXQ4 itself does not depend on it.
 
-## 1Cat-vLLM (Volta / sm_70 support)
-https://github.com/KewaiiGamer/1Cat-vLLM
+## The Volta vLLM port (Volta / sm_70 support)
+the Volta vLLM port
 
 Upstream vLLM does not target compute capability 7.0. That fork carries the
 sm_70 work this package depends on entirely:

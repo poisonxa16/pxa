@@ -52,26 +52,73 @@ from . import dequant_ref as D
 from . import gguf_raw as G
 from . import layout as L
 from . import namemap as NM
+from . import tiers as TT
 from . import reference as R
 
 
 def _tables_from_file(gg) -> tuple[np.ndarray, np.ndarray]:
+    """The PXQ4 (SUB16) tables this file was quantized with.
+
+    ``pxa.pxq6.sub`` IS NOT UNCONDITIONALLY SUB16. The 4-bit family records one pair of KVs
+    whose meaning is switched by ``pxa.pxq6.tier``: "core" means the sub is SUB16, "hq" means
+    it is pxq4hq's bs8 table -- and on a MIXED pxq4 + pxq4hq file the hq table is the one that
+    gets written, so the pxq4 tensors' own SUB16 is not in the file at all. Handing SUB8 to a
+    PXQ4 oracle would flag every pxq4 tensor in such a file as a decode failure. The frozen
+    SUB16 is the right answer there, and it is the only answer available.
+    """
     book = gg.kv.get("pxa.pxq6.book")
     sub = gg.kv.get("pxa.pxq6.sub")
+    if str(gg.kv.get("pxa.pxq6.tier", "core")) == "hq":
+        # The frozen SUB16 is not merely the fallback here, it is the ANSWER: convert.py
+        # refuses any file whose pxq4 tables differ from the frozen ones, so a pxq4 tensor in a
+        # file this package will convert is always a frozen-SUB16 tensor.
+        sub = R.SUB.tolist()
     if book is None or sub is None:
         return R.BOOK, R.SUB
     return (np.asarray(book, dtype=np.float32), np.asarray(sub, dtype=np.float32))
 
 
+def _tables_for_tier(gg, type_id: int) -> tuple[np.ndarray, np.ndarray]:
+    """The (book, sub) THIS TIER's tensors were quantized with, from the file where it says so.
+
+    Not the same question ``_tables_from_file`` answers: that one is specifically about the
+    PXQ4/SUB16 pair. A file can hold several tiers and each records its own book, and pxq4hq
+    records its own SUB8 as well -- decoding one tier's bytes with another's tables is the
+    silent, uniform weight error this whole package is arranged to prevent.
+    """
+    t = TT.tier_of(type_id)
+    if type_id == TT.PXQ4HQ:
+        book = gg.kv.get("pxa.pxq4hq.book")
+        sub = gg.kv.get("pxa.pxq4hq.sub")
+        if sub is None and str(gg.kv.get("pxa.pxq6.tier", "")) == "hq":
+            sub = gg.kv.get("pxa.pxq6.sub")
+        book = R.BOOK if book is None else np.asarray(book, dtype=np.float32)
+        sub = TT.sub_of(TT.PXQ4HQ) if sub is None else np.asarray(sub, dtype=np.float32)
+        return np.asarray(book, dtype=np.float32), np.asarray(sub, dtype=np.float32)
+    if type_id == G.GGML_PXQ4:
+        return _tables_from_file(gg)
+    book = gg.kv.get(f"pxa.{t.name}.book")
+    sub = gg.kv.get(f"pxa.{t.name}.sub")
+    book = TT.book_of(type_id) if book is None else np.asarray(book, dtype=np.float32)
+    sub = R.SUB if sub is None else np.asarray(sub, dtype=np.float32)
+    return np.asarray(book, dtype=np.float32), np.asarray(sub, dtype=np.float32)
+
+
 def gate_g2(gg, names: list[str]) -> tuple[int, list[str]]:
-    """split -> join must reproduce the original bytes, exactly."""
+    """split -> join must reproduce the original bytes, exactly.
+
+    TIER-GENERIC, and it has to be: L.split_blob is the PXQ4-only entry point with SLAB_BYTES
+    hardcoded to 1088, so running it over a pxq2/pxq3/pxq4hq tensor either raises or -- worse
+    -- silently checks the wrong byte count. TT.split_blob infers nothing: it is told the tier
+    and validates the blob length against it.
+    """
     fails = []
     for n in names:
         ti = gg.tensors[n]
         N, K = ti.ne1, ti.ne0
         raw = bytes(gg.raw(n))
-        slabs, anchor = L.split_blob(raw, N, K)
-        if L.join_blob(slabs, anchor) != raw:
+        slabs, anchor = TT.split_blob(raw, ti.type_id, N, K)
+        if TT.join_blob(slabs, anchor) != raw:
             fails.append(n)
     return len(names), fails
 
@@ -81,7 +128,7 @@ def gate_g1(gg, names: list[str], oracle: str, book, sub) -> tuple[int, list[str
 
     Only the first two panels of each tensor are compared: the oracle decodes row by row with
     no cross-panel state, so panel 0 and panel 1 exercise every code path (including the p>0
-    panel-stride term), and comparing 12 GB of tensors would take longer than the lease.
+    panel-stride term), and comparing 12 GB of tensors would take longer than the gate allows.
     """
     if not np.array_equal(book, R.BOOK) or not np.array_equal(sub, R.SUB):
         raise SystemExit("G1: the file's tables differ from the compiled-in ones; the oracle "
@@ -89,6 +136,12 @@ def gate_g1(gg, names: list[str], oracle: str, book, sub) -> tuple[int, list[str
     fails = []
     for n in names:
         ti = gg.tensors[n]
+        if ti.type_id != G.GGML_PXQ4:
+            # gguf_to_vllm_oracle.c decodes the PXQ4 slab layout and nothing else. The other
+            # tiers have their own extracted-C oracles (tests_pxq23/, tests_pxq4hq/), which is
+            # where their bit-exactness against the engine is proved; silently feeding them to
+            # this binary would compare two different formats.
+            continue
         N, K = ti.ne1, ti.ne0
         p = min(2, N // 64)
         nrows = p * 64
@@ -106,18 +159,30 @@ def gate_g1(gg, names: list[str], oracle: str, book, sub) -> tuple[int, list[str
 
 
 def gate_g3(gg, names: list[str], tps: list[int], book, sub) -> tuple[int, list[str]]:
-    """dequant(shard(x)) == shard(dequant(x)), bit-exact, both axes."""
+    """dequant(shard(x)) == shard(dequant(x)), bit-exact, both axes.
+
+    TIER-GENERIC for the same reason gate_g2 is. ``book``/``sub`` are the PXQ4 pair the caller
+    resolved; for any other tier this asks the file for THAT tier's tables instead, because a
+    shard-commutation check run with the wrong sub table still commutes -- it would pass while
+    proving nothing about the tensor it was pointed at.
+
+    The shard helpers themselves are stride-agnostic (they slice whole panels on dim 0 and
+    whole slabs on dim 1, which is exactly what the vLLM parameter classes do), so they are
+    shared across tiers unchanged.
+    """
     checked, fails = 0, []
     for n in names:
         ti = gg.tensors[n]
         N, K = ti.ne1, ti.ne0
+        t = TT.tier_of(ti.type_id)
+        bk, sb = (book, sub) if ti.type_id == G.GGML_PXQ4 else _tables_for_tier(gg, ti.type_id)
         # Only the first two panels are needed: the column split is a panel-boundary property
         # and the K split is identical for every panel, so more panels add cost, not coverage.
         p = min(2, N // 64)
         nrows = p * 64
-        blob = bytes(gg.raw(n))[: p * L.panel_bytes(K)]
-        slabs, anchor = L.split_blob(blob, nrows, K)
-        full = R.dequant(slabs, anchor, book=book, sub=sub)
+        blob = bytes(gg.raw(n))[: p * TT.panel_bytes(ti.type_id, K)]
+        slabs, anchor = TT.split_blob(blob, ti.type_id, nrows, K)
+        full = TT.dequant(slabs, anchor, ti.type_id, bk, sb)
 
         for tp in tps:
             # column-parallel: split the output rows
@@ -125,7 +190,7 @@ def gate_g3(gg, names: list[str], tps: list[int], book, sub) -> tuple[int, list[
                 per = nrows // tp
                 for r in range(tp):
                     s, a = L.shard_columns(slabs, anchor, r * per, (r + 1) * per)
-                    got = R.dequant(s, a, book=book, sub=sub)
+                    got = TT.dequant(s, a, ti.type_id, bk, sb)
                     want = full[r * per:(r + 1) * per]
                     checked += 1
                     if not np.array_equal(got.view(np.uint32), want.view(np.uint32)):
@@ -135,7 +200,7 @@ def gate_g3(gg, names: list[str], tps: list[int], book, sub) -> tuple[int, list[
                 per = K // tp
                 for r in range(tp):
                     s, a = L.shard_k(slabs, anchor, r * per, (r + 1) * per)
-                    got = R.dequant(s, a, book=book, sub=sub)
+                    got = TT.dequant(s, a, ti.type_id, bk, sb)
                     want = full[:, r * per:(r + 1) * per]
                     checked += 1
                     if not np.array_equal(got.view(np.uint32), want.view(np.uint32)):
@@ -178,7 +243,13 @@ def gate_real_shards(gg, policy: str) -> list[str]:
 
 
 def gate_dense(gg, names: list[str]) -> list[str]:
-    """Every non-PXQ4 tensor must decode to finite values of the right shape."""
+    """Every non-PXQ4 tensor must decode to finite values of the right shape.
+
+    Goes through ``dequant_any`` (never a direct ``DECODERS[ti.type_id]`` lookup) so a type
+    this dispatch can't decode raises dequant_any's own clear error, not a bare ``KeyError`` --
+    this is the third place that bypass was found (2026-09-08, see PXQ23-VLLM-2026-09-08.md;
+    the first two were dequant_any itself and convert.py's chunked dense-decode path).
+    """
     bad = []
     for n in names:
         ti = gg.tensors[n]
@@ -187,11 +258,16 @@ def gate_dense(gg, names: list[str]) -> list[str]:
         for d in ti.dims[1:]:
             N *= d
         rows = min(N, 64)
-        if ti.type_id == G.GGML_F32:
+        if TT.is_pxq(ti.type_id):
+            # A PXQ panel packs all K columns of a 64-row PANEL into one panel block, not a
+            # row-contiguous byte range, so the "first `rows` bytes" truncation the other two
+            # branches use is not valid here. Decode the whole tensor, then sample rows after.
+            w = D.dequant_any(gg.raw(n), ti.type_id, ti.dims).reshape(N, K)[:rows]
+        elif ti.type_id == G.GGML_F32:
             w = D.dequant_f32(bytes(gg.raw(n))[: rows * K * 4], rows, K)
         else:
             rowb = G.row_size(ti.type_id, K)
-            w = D.DECODERS[ti.type_id](bytes(gg.raw(n))[: rows * rowb], rows, K)
+            w = D.dequant_any(bytes(gg.raw(n))[: rows * rowb], ti.type_id, (K, rows))
         if not np.all(np.isfinite(w)):
             bad.append(f"{n}: non-finite values")
         if np.abs(w).max() > 1e4:
@@ -260,10 +336,30 @@ def check_output(gguf_path: str, out_dir: str, ref_hf: str | None, sample: int,
                                                    key + ".pxq4_anchor")
                 slabs = np.frombuffer(sb, np.uint8).reshape(ssh_)
                 anchor = np.frombuffer(ab, "<f2").reshape(ash)
-                if ti.type_id == G.GGML_PXQ4:
+                # Byte-move check applies whenever the SOURCE was already a panel tier on disk
+                # (pxq2/pxq3/pxq4 alike -- TT.is_pxq, the same predicate convert.py's own
+                # want_pxq4 branch uses to choose passthrough over re-encode). It is NOT
+                # `ti.type_id == G.GGML_PXQ4` specifically: that misrouted every native pxq2/
+                # pxq3 tensor (a pure byte split, nothing re-encoded) into the "re-encoded"
+                # branch below, which hands pxq3's 832-byte slabs to R.dequant (PXQ4-only,
+                # hardcoded SLAB_BYTES=1088) and crashes -- ValueError: "slabs must be uint8
+                # [P,S,1088], got uint8 (272, 160, 832)" (2026-09-08, this checkpoint's
+                # linear_attn/self_attn modules, all native pxq3). Only a genuinely re-encoded
+                # tensor is pxq4 by construction (the encoder's only output format), so the
+                # `else` arm below is still correctly PXQ4-only.
+                #
+                # SECOND bug of the same shape, found immediately after fixing the first: this
+                # join must be TT.join_blob (tiers.py, tier-generic -- infers the slab stride
+                # from the array's own shape and validates it against the known tier table),
+                # not L.join_blob (layout.py's PXQ4-only join, SLAB_BYTES hardcoded to 1088 --
+                # the exact same crash as above, one call further in). convert.py's own writer
+                # already uses TT.split_blob/TT.join_blob for every tier (see its lines ~944,
+                # ~1394); only this read-back check was still calling the PXQ4-only layout.py
+                # entry point.
+                if TT.is_pxq(ti.type_id):
                     un_s, un_a = ((slabs, anchor) if perm is None else
                                   _C._unapply_perm_pxq4(slabs, anchor, perm))
-                    if L.join_blob(un_s, un_a) == bytes(gg.raw(ggml_name)):
+                    if TT.join_blob(un_s, un_a) == bytes(gg.raw(ggml_name)):
                         ok += 1
                     else:
                         bad += 1
@@ -337,9 +433,20 @@ def main(argv: list[str] | None = None) -> int:
         book, sub = _tables_from_file(gg)
         R.check_tables(book, sub)
 
-        pxq4 = [n for n, t in gg.tensors.items() if t.type_id == G.GGML_PXQ4]
-        dense = [n for n, t in gg.tensors.items() if t.type_id != G.GGML_PXQ4]
-        print(f"{len(gg.tensors)} tensors: {len(pxq4)} pxq4, {len(dense)} other")
+        # EVERY PXQ PANEL TIER, not just pxq4. Selecting on `type_id == GGML_PXQ4` made G2 and
+        # G3 VACUOUS on a file with no native pxq4 tensors: a uniform pxq4hq artifact reported
+        # "0 pxq4" and then printed "0/0 PASS" twice, which reads exactly like a pass. It is
+        # the same bug class the --check-output path was fixed for on 2026-09-08, one function
+        # further out.
+        pxq4 = [n for n, t in gg.tensors.items() if TT.is_pxq(t.type_id)]
+        dense = [n for n, t in gg.tensors.items() if not TT.is_pxq(t.type_id)]
+        by_tier: dict[str, int] = {}
+        for n in pxq4:
+            by_tier[TT.tier_of(gg.tensors[n].type_id).name] = \
+                by_tier.get(TT.tier_of(gg.tensors[n].type_id).name, 0) + 1
+        print(f"{len(gg.tensors)} tensors: {len(pxq4)} PXQ panel "
+              f"({', '.join(f'{v} {k}' for k, v in sorted(by_tier.items())) or 'none'}), "
+              f"{len(dense)} other")
         print(f"tables: book/sub match compiled-in = "
               f"{np.array_equal(book, R.BOOK) and np.array_equal(sub, R.SUB)}")
 
@@ -354,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
         rest = [n for n in pxq4 if n not in set(sample)]
         rng.shuffle(rest)
         sample += rest[: max(0, args.sample - len(sample))]
-        print(f"distinct pxq4 shapes: {sorted(by_shape)}")
+        print(f"distinct PXQ panel shapes: {sorted(by_shape)}")
 
         rc = 0
 

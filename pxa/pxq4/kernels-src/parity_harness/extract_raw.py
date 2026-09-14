@@ -11,8 +11,8 @@ Writes a directory:
 
 Load it back with parity_harness.fixtures.load_raw_dir().
 
-    python3 extract_raw.py --gguf /mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
-                          --out  /mnt/models/pxa-fixtures/raw --panels 4
+    python3 extract_raw.py --gguf $PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4.gguf \
+                          --out  $PXA_MODELS_DIR/pxa-fixtures/raw --panels 4
 
 Run it with `python3 extract_raw.py` directly (no package import needed): it inlines the
 GGUF parse so the file can be scp'd anywhere on its own.

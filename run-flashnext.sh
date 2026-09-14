@@ -3,7 +3,7 @@
 #
 # CARD MAP, in PCI_BUS_ID order (CUDA_VISIBLE_DEVICES orders FASTEST-FIRST otherwise, which
 # would silently renumber everything):
-#   0 P100  <- also carries a production granite seat, ~8.4 GiB already resident
+#   0 P100  <- shared with another resident model on my box; ~8.4 GiB already in use
 #   1 P100
 #   2 V100
 #   3 GTX 1080 Ti  <- PRODUCTION VLM + embeddings. NEVER included.

@@ -48,7 +48,7 @@
 // ---------------------------------------------------------------------------
 // INTERFACE CONTRACT — declarations this file requires from
 // `src/llama-kv-cache-dsv4.h` (owned by the memory chunk).
-// Reproduced verbatim so the owner can paste it; if any name changes, this file
+// Reproduced verbatim so it can be pasted as-is; if any name changes, this file
 // must change with it.
 // ---------------------------------------------------------------------------
 //
@@ -672,9 +672,21 @@ ggml_tensor * llm_build_context::build_dsv4_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
         if (selected) {
-            // Backends that do not implement the sparse path ignore src[5] and compute
-            // the dense result, so this stays correct everywhere; it only ever changes
-            // which kernel runs.
+            // src[5] is a REQUEST for the sparse path, not a hint a backend may ignore.
+            //
+            // This used to say that a backend without the sparse path ignores src[5] and computes
+            // the dense result, "so this stays correct everywhere". Both halves were wrong, and
+            // measuring it is what showed that: a dense kernel handed a too-narrow index list
+            // produced an answer 73.2% off in RMS from the dense result -- it was not computing
+            // the dense question, it was computing a different one. The CUDA backend now DECLINES
+            // a node carrying an index list it cannot honour rather than silently doing that
+            // (ggml_cuda_dsa_attn_requested(), and the two gates at ggml-cuda/fattn.cu).
+            //
+            // So the contract is: set src[5] only where the sparse path is actually wanted. The
+            // gate above already mirrors the backend's own predicate, which is why no shipping
+            // model reaches the declining branch today -- but that is two places agreeing, not a
+            // guarantee, and a backend that declines is now the defined behaviour rather than an
+            // assumption about what a dense kernel would do with an argument it does not read.
             cur->src[5] = selected;
         }
 

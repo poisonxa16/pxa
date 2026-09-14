@@ -7,7 +7,7 @@ Still CPU-only -- no GPU, no model, no engine.  Run it inside a *throwaway*
 container from the serving image (never the production container):
 
   docker run --rm --network none -e CUDA_VISIBLE_DEVICES= \
-    -v /mnt/models/pxa-vllm-pxq4/impl:/work -w /work kewaii/vllm:latest \
+    -v $PXA_MODELS_DIR/pxa-vllm-pxq4/impl:/work -w /work kewaii/vllm:latest \
     /opt/vllm-venv/bin/python test_pxq4_config_integration.py
 
 Every check here is one that a stub cannot honestly make:

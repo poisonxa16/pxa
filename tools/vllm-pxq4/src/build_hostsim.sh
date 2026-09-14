@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build_hostsim.sh — build the CPU simulator and run the GPU-free gates.
-# Needs nothing but g++ and numpy. No CUDA, no GPU, no container, no lease.
+# Needs nothing but g++ and numpy. No CUDA, no GPU, no container.
 set -euo pipefail
 cd "$(dirname "$0")"
 g++ -O2 -std=c++17 -shared -fPIC -Ihostsim -I. -pthread -Wno-unknown-pragmas \

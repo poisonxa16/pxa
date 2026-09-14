@@ -91,7 +91,14 @@ TRAITS: dict[int, tuple[int, int, int]] = {
 
 #: Types this converter can decode. Anything else in a file is a hard error, not a warning:
 #: silently dropping a tensor produces a model that loads and is wrong.
-SUPPORTED = frozenset({GGML_F32, GGML_F16, GGML_Q8_0, GGML_Q6_K, GGML_MXFP4, GGML_PXQ4})
+# Types this converter can either move as bytes (the PXQ panel tiers) or decode to fp16.
+# PXQ2 (254) and PXQ3 (255) joined on 2026-09-05: their panel layout is the PXQ4 layout with a
+# different code width, so they are byte-movable, and tiers.dequant decodes them when a module
+# has to go dense. PXQ1 (248) and PXQ6 (256) are deliberately NOT here: no shipped artifact
+# uses them for a module this sidecar serves, and adding a type without a decoder and a gate
+# is how a tensor gets silently skipped.
+SUPPORTED = frozenset({GGML_F32, GGML_F16, GGML_Q8_0, GGML_Q6_K, GGML_MXFP4,
+                       GGML_PXQ4, GGML_PXQ4HQ, GGML_PXQ2, GGML_PXQ3})
 
 
 def type_name(t: int) -> str:
@@ -292,16 +299,27 @@ class GGUFFile:
     def assert_all_supported(self) -> None:
         bad = sorted({t.type for t in self.tensors.values() if t.type_id not in SUPPORTED})
         if bad:
+            n = sum(1 for t in self.tensors.values() if t.type_id not in SUPPORTED)
             raise ValueError(
-                f"{self.path}: contains ggml types this converter cannot decode: {bad}. "
-                f"Add a decoder in dequant_ref.py — do NOT skip the tensors.")
+                f"{self.path}: {n} tensor(s) use ggml types this converter cannot decode: "
+                f"{bad}.\n"
+                f"This is the vLLM converter. It decodes f32, f16, q8_0, q6_K, mxfp4 and the "
+                f"panel tiers pxq2 / pxq3 / pxq4 / pxq4hq.\n"
+                f"The llama.cpp engine in this repo (llama-server / llama-cli) serves EVERY "
+                f"PXQ tier -- pxq1, pxq2, pxq3, pxq4, pxq4-hq, pxq6 and PXQ_UNIVERSAL -- on "
+                f"P100 (sm_60), 1080 Ti (sm_61) and V100 (sm_70), so this file is servable "
+                f"today with `llama-server -m {self.path}`; see docs/VLLM.md for which tier "
+                f"runs on which backend.\n"
+                f"If you are adding a tier to the vLLM path: give it a decoder in "
+                f"dequant_ref.py and a row in tiers.py, and add it to SUPPORTED here -- do "
+                f"NOT skip the tensors. A skipped tensor is a model that loads and is wrong.")
 
 
 class GGUFHeaderOnly(GGUFFile):
     """Parses the header of a file whose data section is absent or truncated.
 
     Used by the offline tests, which carry a real 10.5 MB header slice of the 15.7 GB
-    artifact so name/shape/type/geometry checks run on this machine with no DGX access. The
+    artifact so name/shape/type/geometry checks run on this machine with no GPU access. The
     derived-size cross-check is skipped for the final tensor only, since its length depends
     on a file tail we do not have.
     """

@@ -1554,7 +1554,54 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+// PXA_REDUCE_PINNED_v1 (2026-09-13). Set by the CUDA backend when its pinned-host reduce route is
+// armed; asked per node at the drain site in ggml_backend_sched_compute_splits(). A plain function
+// pointer in static storage, so it is null long before any dynamic initialiser can run and a build
+// without that route keeps the drain unconditionally.
+static bool (*g_pxa_reduce_pinned_pred)(const struct ggml_tensor * node) = nullptr;
+
+void ggml_backend_set_reduce_pinned_predicate(bool (*fn)(const struct ggml_tensor * node)) {
+    g_pxa_reduce_pinned_pred = fn;
+}
+
+// True when the reduce exchanges through pinned host memory and synchronises inside its own
+// kernel, which makes the backend drain below unnecessary.
+static inline bool ggml_pxa_reduce_is_self_synchronising(const struct ggml_tensor * node) {
+    return g_pxa_reduce_pinned_pred != nullptr && g_pxa_reduce_pinned_pred(node);
+}
+
+// PXA_REDUCE_TIME_v1: the host cost of the per-reduce drain, under the same env as the per-route
+// timing in reduce.cu. Printed with the reduce table's <n>-sample cadence.
+struct ggml_pxa_drain_stats { long long n = 0; double us = 0, mx = 0; long long skipped = 0; };
+static ggml_pxa_drain_stats g_pxa_drain;
+static long long ggml_pxa_reduce_time_every() {
+    static const long long v = [](){ const char * e = getenv("PXA_REDUCE_TIME"); return e ? atoll(e) : 0LL; }();
+    return v;
+}
+static void ggml_pxa_drain_note(double us) {
+    const long long every = ggml_pxa_reduce_time_every();
+    if (every <= 0) return;
+    g_pxa_drain.n++;
+    g_pxa_drain.us += us;
+    if (us > g_pxa_drain.mx) g_pxa_drain.mx = us;
+    if (g_pxa_drain.n % every == 0) {
+        fprintf(stderr, "PXA_REDUCE_TIME  %-12s %-5s %9lld %10s %10s %10.2f %10.2f   (skipped %lld)\n",
+                "sched-drain", "-", g_pxa_drain.n, "-", "-",
+                g_pxa_drain.us / g_pxa_drain.n, g_pxa_drain.mx, g_pxa_drain.skipped);
+    }
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// PXA 2026-09-08. See the use site below: this gates the REDUCE-consumer
+// robustness fix so the pre-fix behaviour is reachable without a rebuild. Default ON.
+static bool ggml_pxa_sm_graph_reduce_consumer(void) {
+    static const bool v = [](){
+        const char * e = getenv("PXA_SM_GRAPH_REDUCE_CONSUMER");
+        return !e || atoi(e) != 0;
+    }();
+    return v;
+}
+
 static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1590,7 +1637,8 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         int * node_backend_id = &tensor_backend_id(node);
         if (node->op == GGML_OP_REDUCE) {
             auto view_src = node->view_src;
-            int src_id = -1;
+            int src_id  = -1;
+            int last_id = -1;
             for (int j = 0; j < node->op_params[1]; ++j) {
                 if (node->src[j]) {
                     int * this_node_backend_id = &tensor_backend_id(node->src[j]);
@@ -1602,12 +1650,36 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                     if (view_src == node->src[j]) {
                         src_id = j;
                     }
+                    last_id = j;
                 }
             }
+            // PXA 2026-09-08. This used to key ONLY on `view_src == node->src[j]`.
+            // ggml_reduce() builds its result as ggml_view_tensor(last), so that identity holds
+            // -- unless `last` is itself a view, because ggml_new_tensor_impl collapses one level
+            // of view and lands view_src on the BASE instead. Then src_id stayed -1, the reduce
+            // node was never pinned here, and it fell through to be assigned by adjacency in
+            // pass 2. The DeltaNet split path hit exactly this (its partial is a bare
+            // ggml_reshape_2d at n_tokens <= 32, i.e. every decode step).
+            //
+            // The node aliases the LAST non-null source by construction, whether or not the view
+            // chain was collapsed, so fall back to that slot. Identical behaviour when the
+            // identity holds (src_id == last_id there), and correct when it does not.
+            //
+            // PXA 2026-09-08. PXA_SM_GRAPH_REDUCE_CONSUMER=0 restores the
+            // old pointer-identity-only behaviour at this site and at both copies of
+            // get_input_tensor_sm_graph. DEFAULT ON; the lever exists so the V100 window can run
+            // the old and the fixed consumer path from ONE binary. Without it the two DeltaNet
+            // levers (PXA_DN_REDUCE_VIEWFIX, PXA_DN_SPLIT_INPUT_FIX) do NOT reproduce the old
+            // engine -- this fix alone repairs the delivery defect -- so the separating
+            // experiment would compare a fixed binary against itself.
+            if (src_id < 0 && ggml_pxa_sm_graph_reduce_consumer()) {
+                src_id = last_id;
+            }
             if (src_id >= 0) {
-                int * this_node_backend_id = &tensor_backend_id(view_src);
-                *this_node_backend_id = tensor_backend_id(node->src[src_id]);
-                *node_backend_id = *this_node_backend_id;
+                *node_backend_id = tensor_backend_id(node->src[src_id]);
+                if (view_src) {
+                    tensor_backend_id(view_src) = *node_backend_id;
+                }
             }
         }
         else if (node->op == GGML_OP_MUL && node->src[0]->op == GGML_OP_NORM) {
@@ -2302,7 +2374,7 @@ extern "C" void ggml_cuda_timeline_epoch(void);
 // 1 in 12. On its own ASYNC was worth +2.0% at -ub 2048 and 0.0% at -ub 512, so nothing
 // material is lost by leaving it off until the remaining site is found.
 //
-// 2026-09-03, overlap2 lane. Three sites were found by auditing everything that touches a
+// 2026-09-03. Three sites were found by auditing everything that touches a
 // split input, a compute buffer or the recurrent state between graph_compute_async and the
 // next synchronize. They are fixed in the three places named below, not here.
 //
@@ -2771,9 +2843,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // reads each peer partial; drain every producer backend (each thread syncs its own
                 // backend, in parallel) before the reduce so the partials are valid. True data
                 // dependency, cannot overlap anyway, so async compute overlap is preserved.
-                if (split->graph.nodes[0]->op == GGML_OP_REDUCE) {
+                if (split->graph.nodes[0]->op == GGML_OP_REDUCE &&
+                    !ggml_pxa_reduce_is_self_synchronising(split->graph.nodes[0])) {
+                    // PXA_REDUCE_TIME_v1
+                    const int64_t _pxa_t0 = ggml_pxa_reduce_time_every() > 0 ? ggml_time_us() : 0;
                     ggml_backend_synchronize(sched->backends[ith]);
+                    if (_pxa_t0) ggml_pxa_drain_note((double)(ggml_time_us() - _pxa_t0));
                     #pragma omp barrier
+                } else if (split->graph.nodes[0]->op == GGML_OP_REDUCE && ith == 0) {
+                    g_pxa_drain.skipped++;
                 }
 
                 if (split->n_inputs > 0) {
@@ -2852,9 +2930,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // PXA_SAS_REDUCE_SYNC (std::thread path): see OMP-path note above.
-                if (split->graph.nodes[0]->op == GGML_OP_REDUCE) {
+                if (split->graph.nodes[0]->op == GGML_OP_REDUCE &&
+                    !ggml_pxa_reduce_is_self_synchronising(split->graph.nodes[0])) {
+                    // PXA_REDUCE_TIME_v1
+                    const int64_t _pxa_t0 = ggml_pxa_reduce_time_every() > 0 ? ggml_time_us() : 0;
                     ggml_backend_synchronize(sched->backends[ith]);
+                    if (_pxa_t0) ggml_pxa_drain_note((double)(ggml_time_us() - _pxa_t0));
                     barrier.arrive_and_wait();
+                } else if (split->graph.nodes[0]->op == GGML_OP_REDUCE && ith == 0) {
+                    g_pxa_drain.skipped++;
                 }
 
                 if (split->n_inputs > 0) {

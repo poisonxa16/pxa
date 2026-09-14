@@ -119,6 +119,11 @@ Shipped and tagged. The ship list and full measurements are in
   GQA-packed decode" above) measured as noise at low context fill; re-measured at 86,401 tokens
   it is **+40% decode**, output-identical — the mechanism (one key/value read per query group
   instead of per head) only pays for itself once the re-read volume is large.
+  ⚠ **CORRECTED 2026-09-12: do not quote that +40%.** A later re-measure on a reviewer cell did
+  **not** reproduce it and records the arm `VOID — engagement not proven` (the kernel was never
+  proven to fire at that shape; the firing counter that would settle it is not in the shipped
+  build). `docs/COOKBOOK.md` states the rule as "**Do not quote a throughput number for either.**"
+  See `docs/LEVERS.md`, row `PXA_FA_GQA_PACK`. Output identity is the part that holds.
 - **Host-overhead cuts.** Bounded top-k sampling off raw logits, a struct-of-arrays KV-sequence
   mask, a trimmed KQ-mask host upload, and four more bit-identical prefill micro-fixes together
   cut measured per-token host time at deep fill from 6.0 ms to 1.6 ms.

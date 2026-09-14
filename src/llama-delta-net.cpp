@@ -7,6 +7,35 @@
 #include "ggml.h"
 
 #include <cstdlib> // PXA_REPLICATE_RECURRENT: getenv
+#include <cstdio>
+
+// PXA 2026-09-08. Two independent fixes to the -sm graph DeltaNet split path,
+// both DEFAULT ON, each disablable so the pair can be A/B'd from ONE binary (the discipline
+// that kept the glm53-kern det_gate comparison unconfounded by a rebuild). See the block
+// comments at each use site for what they do and why.
+//   PXA_DN_REDUCE_VIEWFIX=0    -> leave the delta partial a view (restores the old, broken shape)
+//   PXA_DN_SPLIT_INPUT_FIX=0   -> omit the per-device 0xff split-boundary marker
+static bool pxa_dn_reduce_viewfix() {
+    static const bool v = [](){ const char * e = getenv("PXA_DN_REDUCE_VIEWFIX"); return !e || atoi(e) != 0; }();
+    return v;
+}
+static bool pxa_dn_split_input_fix() {
+    static const bool v = [](){ const char * e = getenv("PXA_DN_SPLIT_INPUT_FIX"); return !e || atoi(e) != 0; }();
+    return v;
+}
+// PXA 2026-09-08.
+//   PXA_SM_GRAPH_REDUCE_CONSUMER=0 -> restore the pre-802554a19c pointer-identity-only test in
+//                                     get_input_tensor_sm_graph (and its twin in
+//                                     llama-build-context.cpp, and the REDUCE pinning in
+//                                     ggml-backend.cpp, which read the same variable).
+// DEFAULT ON. Reason it exists: the two levers above gate only the DELTA CALL SITE, but the
+// consumer-side fix is what actually repairs the delivery defect, so without this lever a
+// both-levers-off run is still a FIXED engine and the window's separating experiment would
+// compare the fixed binary against itself. One binary, three isolable hypotheses.
+static bool pxa_sm_graph_reduce_consumer() {
+    static const bool v = [](){ const char * e = getenv("PXA_SM_GRAPH_REDUCE_CONSUMER"); return !e || atoi(e) != 0; }();
+    return v;
+}
 
 #include <algorithm>
 #include <unordered_set>
@@ -102,7 +131,7 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
         ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
         ggml_tensor * g, ggml_tensor * beta, ggml_tensor * state,
         int il, const llm_build_cb & cb, int repeat_type,
-        ggml_tensor * per_step_ckpt) {
+        ggml_tensor * per_step_ckpt, int64_t sv_row_stride, int64_t sv_step_stride) {
 
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[2];
@@ -147,6 +176,10 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     ggml_tensor * fused_result = ggml_delta_net(ctx0, q, k, v, g, beta, state_flat, per_step_ckpt);
     cb(fused_result, "delta_net_fused_raw", il);
     fused_result->op_params[0] = repeat_type;
+    // PXA_RS_RING: retarget the per-step capture into the state ring's planes (0,0 = unchanged).
+    if (per_step_ckpt && (sv_row_stride > 0 || sv_step_stride > 0)) {
+        ggml_op_set_save_strides(fused_result, sv_row_stride, sv_step_stride);
+    }
 
     const int64_t output_size = S_v * H_v * n_tokens * n_seqs;
     const int64_t state_size  = S_v * S_v * H_v * n_seqs;
@@ -439,7 +472,8 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
         int64_t n_seqs_in, uint32_t qnext_state_slots, bool reset_state_local,
         float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
-        ggml_tensor * per_step_ckpt, ggml_tensor * per_step_conv, int64_t pxa_static_slot) {
+        ggml_tensor * per_step_ckpt, ggml_tensor * per_step_conv, int64_t pxa_static_slot,
+        uint32_t rs_plane_rows, ggml_tensor * state_row_idx_w) {
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t conv_dim       = key_dim * 2 + value_dim;
@@ -468,12 +502,45 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
 
     state_all = ggml_view_2d(ctx0, state_storage, state_dim, qnext_state_slots, state_row_size, 0);
 
+    // ---- PXA_RS_RING ------------------------------------------------------------------------
+    // With the ring armed, state_storage is (1 + n_rs_seq) planes of rs_plane_rows rows and the
+    // per-step capture writes straight into planes 1.. instead of a separate shadow buffer:
+    // plane 1+t = the state after batch row t, which is exactly what the kernels already compute.
+    // The only thing that changes is the store ADDRESS -- row stride state_dim, step stride one
+    // whole plane -- so rolling back is a read index, never a copy.
+    int64_t rs_sv_row_stride  = 0;
+    int64_t rs_sv_step_stride = 0;
+    // Arm the ring capture ONLY when this batch would have captured anyway (per_step_ckpt armed by
+    // the caller's save_per_step_states gate) and its within-seq token count fits the planes.
+    // Otherwise leave the dense buffers in place: the rollback then uses the copy path, which is
+    // exactly what llama_set_inputs records in rs_capture_ok.
+    const int64_t rs_n_seq_tokens = n_seq_tokens;
+    if (rs_plane_rows > 0 && per_step_ckpt != nullptr &&
+        rs_n_seq_tokens > 1 && rs_n_seq_tokens <= (int64_t)(qnext_state_slots / rs_plane_rows)) {
+        GGML_ASSERT(qnext_state_slots % rs_plane_rows == 0);
+        const int64_t n_planes = qnext_state_slots / rs_plane_rows;   // 1 + n_rs_seq
+        GGML_ASSERT(n_planes >= 2);
+        const size_t  es          = ggml_element_size(state_storage);
+        const int64_t plane_elems = state_dim * (int64_t) rs_plane_rows;
+        const int64_t hist_elems  = plane_elems * (n_planes - 1);
+        rs_sv_row_stride  = state_dim;
+        rs_sv_step_stride = plane_elems;
+        // conv half at row offset 0, ssm half at conv_state_dim; both start at plane 1.
+        per_step_conv = ggml_view_1d(ctx0, state_storage, hist_elems, (size_t) plane_elems * es);
+        per_step_ckpt = ggml_view_1d(ctx0, state_storage, hist_elems - conv_state_dim,
+                (size_t)(plane_elems + conv_state_dim) * es);
+    }
+
     // PXA_LLAMA_FIX_v4: gather ALL participating sequences' recurrent rows ONCE, in token order, via state_row_idx
     // (absolute seq_id per seq). all_same -> [n_seqs=1]; mixed -> [n_seqs=n_tok]. ONE get_rows -> [state_dim, n_seqs],
     // ONE set_rows at the end => a SINGLE subgraph (the per-token N-subgraph interleave was the allocator-corruption bug).
     GGML_ASSERT(state_row_idx != nullptr);
     GGML_ASSERT(state_row_idx->ne[0] == n_seqs);
     ggml_tensor * pxa_row_idx = state_row_idx;
+    // PXA_RS_RING: the scatter always writes plane 0 (row == absolute seq_id); the gather may read
+    // a history plane. Ring off -> the caller passes the same tensor and nothing changes.
+    ggml_tensor * pxa_row_idx_w = state_row_idx_w ? state_row_idx_w : state_row_idx;
+    GGML_ASSERT(pxa_row_idx_w->ne[0] == n_seqs);
 
     // PXA_PERF_NP1_FASTPATH: for a single sequence (n_seqs==1) whose state row is known at graph-build time
     // (pxa_static_slot>=0), access the recurrent row IN PLACE via a static-offset view -- the pre-PR (main)
@@ -563,6 +630,10 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     // order so it is identity in row 0 (sq[0][t]=t) with rows>=1 out-of-range -> hits ik's multi-seq-UNIQUE conv fast
     // path. all_same passes a [1,n_tok] view (n_kv=1 -> single-seq fast path, content ignored).
     ggml_tensor * conv_output_raw = ggml_ssm_conv(ctx0, conv_states, qkv_mixed, ssm_conv1d, conv_seq_map, per_step_conv);
+    // PXA_RS_RING: same retarget for the conv half of the state row (0,0 = unchanged).
+    if (per_step_conv && (rs_sv_row_stride > 0 || rs_sv_step_stride > 0)) {
+        ggml_op_set_save_strides(conv_output_raw, rs_sv_row_stride, rs_sv_step_stride);
+    }
     cb(conv_output_raw, "conv_output_raw", il);
 
     ggml_tensor * conv_output = ggml_view_2d(ctx0, conv_output_raw, conv_dim, n_tok, conv_dim * ggml_element_size(conv_output_raw), 0);
@@ -594,14 +665,25 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
+    // PXA_KERNFIX 2026-09-09 (defect B): these two nodes are the ONLY q/k normalisation in the
+    // graph -- GGML_OP_DELTA_NET consumes them as-is on both backends (see ggml.c
+    // ggml_compute_forward_delta_net_f32 and ggml-cuda/pxa/delta-net.cu, and the same
+    // convention spelled out at build_glm5next.cpp:228, "PORT spec S2 note 2"). The epsilon is
+    // therefore the DeltaNet reference's own 1e-12, not hparams.f_norm_rms_eps: an RMSNorm-scale
+    // epsilon (1e-5..1e-6) here would damp a degenerate q/k row at a length scale six orders of
+    // magnitude away from what the reference formula intends. f_norm_rms_eps stays in eps_norm
+    // for the RMSNorms that actually want it -- which leaves it with no consumer in this
+    // function today; the parameter is kept so callers and the sibling builders stay uniform.
+    (void) eps_norm;
+    const float eps_qk_l2 = 1e-12f;
     if (n_seq_tokens > 1) {
         q_conv = ggml_permute(ctx0, q_conv, 0, 2, 1, 3);
         k_conv = ggml_permute(ctx0, k_conv, 0, 2, 1, 3);
-        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_qk_l2);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_qk_l2);
     } else {
-        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_qk_l2);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_qk_l2);
         q_conv = ggml_permute(ctx0, q_conv, 0, 2, 1, 3);
         k_conv = ggml_permute(ctx0, k_conv, 0, 2, 1, 3);
     }
@@ -609,7 +691,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(k_conv, "k_conv_normed", il);
 
     auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type,
-            per_step_ckpt);
+            per_step_ckpt, rs_sv_row_stride, rs_sv_step_stride);
 
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
@@ -645,7 +727,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         // PXA_LLAMA_FIX_v4: pack the new rows [state_dim, n_seqs] and SCATTER them back to their absolute seq rows with ONE
         // ggml_set_rows. Single producer + single scatter => no per-token in-place aliasing => allocator-safe at any np.
         ggml_tensor * pxa_new_row = ggml_concat(ctx0, new_conv_flat, new_ssm_flat, 0); // [state_dim, n_seqs]
-        state_cpy = ggml_set_rows(ctx0, state_storage, pxa_new_row, pxa_row_idx);
+        state_cpy = ggml_set_rows(ctx0, state_storage, pxa_new_row, pxa_row_idx_w);   // PXA_RS_RING
     }
     cb(state_cpy, "state_cpy", il);
     ggml_build_forward_expand(gf, state_cpy);
@@ -680,6 +762,22 @@ static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor *
     if (input->op == GGML_OP_REDUCE) {
         auto view_src = input->view_src;
         GGML_ASSERT(view_src);
+        // PXA 2026-09-08. The HOME device -- the one whose partial the reduce node
+        // aliases -- must be handed the REDUCE NODE itself, so that something in the graph
+        // actually reads the reduce. This used to be detected as `cur == view_src`, which relies
+        // on ggml_reduce's result having view_src == its last source. That identity silently
+        // fails when the last source is itself a view, because ggml_new_tensor_impl collapses one
+        // level of view onto the base (the DeltaNet partial is a bare ggml_reshape_2d at
+        // n_tokens <= 32, i.e. every decode step). When it failed, EVERY device was handed
+        // src[id] and the reduce node ended up with NO consumer at all -- its result survived
+        // only as an in-place side effect the DAG does not model.
+        //
+        // ggml_reduce always aliases the LAST non-null source, so identify the home device by
+        // that slot instead of by pointer identity. Same answer whenever the old test worked.
+        int last_id = -1;
+        for (int j = 0; j < input->op_params[1]; ++j) {
+            if (input->src[j]) last_id = j;
+        }
         cur = input->src[id];
         if (!cur) {
             GGML_ASSERT((input->op_params[4] & (1u << id)) == 0);
@@ -687,7 +785,7 @@ static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor *
             input->src[id] = cur;
             input->op_params[4] |= (1u << id);
         }
-        else if (cur == view_src) {
+        else if (cur == view_src || (id == last_id && pxa_sm_graph_reduce_consumer())) {
             cur = input;
         }
     }
@@ -697,7 +795,7 @@ static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor *
 ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * delta_input, ggml_tensor * state_row_idx, ggml_tensor * conv_seq_map, ggml_tensor * state_mask, ggml_tensor * inp_out_ids,
             int64_t n_seqs, bool reset_state_local, int il, const llm_build_cb & cb, int64_t pxa_static_slot,
-            bool hc_mode) const {
+            bool hc_mode, ggml_tensor * state_row_idx_w) const {
 
     const int64_t n_tok = delta_input->ne[1];
     GGML_ASSERT(n_seqs > 0 && n_tok % n_seqs == 0);
@@ -706,6 +804,10 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     auto & model   = lctx.model;
     auto & hparams = model.hparams;
     auto & kv_self = lctx.kv_self;
+
+    // PXA_RS_RING: rows per plane (0 = ring off) -> build_qkv retargets the per-step capture into
+    // the history planes and scatters the new state through state_row_idx_w (plane 0).
+    const uint32_t rs_plane_rows = kv_self.rs_ring_armed() ? kv_self.rs_plane_rows : 0u;
 
     int64_t head_k_dim  = hparams.ssm_d_state;
     int64_t num_k_heads = hparams.ssm_n_group;
@@ -751,6 +853,22 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             auto split_norm = (ggml_split_tensor_t *)l.attn_norm->extra;
             GGML_ASSERT(split_norm && split_norm->splits[id]);
             auto cur = llm_build_context::llm_build_norm(ctx0, input, hparams, split_norm->splits[id], nullptr, LLM_NORM_RMS, cb, il);
+            // PXA 2026-09-08 -- PXA_DN_SPLIT_INPUT_FIX, mirroring
+            // PXA_MTP_SPLIT_INPUT_FIX in build_std_attention (llama-build-context.cpp:2862-2872)
+            // and the same marker in the MoE and FFN split paths.
+            //
+            // When the layer input is NOT a per-device REDUCE output -- layer 0, where inpL is
+            // the single-device token embedding, and every layer under PXA_REPLICATE_RECURRENT
+            // (which sets op_params[3]=1 so the reduce is a no-op container) -- each device's
+            // split chain would otherwise read that one single-device tensor directly, i.e. a
+            // cross-device read. The 0xff marker makes the scheduler start a new split per
+            // device so it inserts the per-device input copy. This was the ONLY split builder
+            // in the tree missing it: build_std_attention, llm_build_std_moe_ffn and the FFN
+            // path all set it. For an ordinary layer input->op == REDUCE and this is skipped,
+            // so the existing per-device src[id] path is used unchanged.
+            if (pxa_dn_split_input_fix() && input->op != GGML_OP_REDUCE) {
+                cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
+            }
             int qnext_state_slots = split_s_l->splits[id]->ne[1];
             int il_cb = 1000*il + id;
             int64_t num_k_heads_id, num_v_heads_id;
@@ -802,7 +920,8 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             auto output = build_qkv(ctx0, split_s_l->splits[id], split_ssm_conv1d->splits[id], qkv_mixed, state_row_idx, conv_seq_map, state_mask, beta, gate,
                                head_k_dim, num_k_heads_id, head_v_dim, num_v_heads_id, hparams.ssm_d_conv,
                                n_seqs, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
-                               l.ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv, pxa_static_slot);
+                               l.ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv, pxa_static_slot,
+                               rs_plane_rows, state_row_idx_w);
             split_norm = (ggml_split_tensor_t *)l.ssm_norm->extra;
             GGML_ASSERT(split_norm && split_norm->splits[id]);
             auto split_ssm_out = (ggml_split_tensor_t *)l.ssm_out->extra;
@@ -823,6 +942,26 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             }
             if (gated_output->ne[1] > 32 && lctx.cparams.reduce_type != GGML_TYPE_F32) {
                 gated_output = ggml_cast(ctx0, gated_output, lctx.cparams.reduce_type);
+            }
+            // PXA 2026-09-08 -- PXA_DN_REDUCE_VIEWFIX.
+            //
+            // build_gated_output() ends in ggml_reshape_2d, so this partial is a VIEW. The cast
+            // above happens to de-view it, but only when ne[1] > 32 AND the reduce type is not
+            // f32 -- i.e. never at decode (ne[1] == 1) and never under `-grt f32`. ggml_reduce's
+            // result is a view of its last source, and ggml_new_tensor_impl collapses one level
+            // of view, so a view-valued partial makes the reduce node's view_src point at the
+            // BASE instead of at the source. That breaks the two invariants documented in
+            // ggml_reduce(): the scheduler never pins the reduce's backend, and
+            // get_input_tensor_sm_graph()'s `cur == view_src` branch never fires, so the REDUCE
+            // NODE ENDS UP WITH NO CONSUMER AT ALL. This is the only ggml_reduce call site in
+            // the tree whose last partial can be a view -- build_std_attention (mul_mat + bias +
+            // residual), llm_build_std_moe_ffn and llm_build_ffn all end in real ops.
+            //
+            // Making it non-view unconditionally costs one CONT per device per delta layer, and
+            // only in the shapes where the cast did not already do it.
+            if (pxa_dn_reduce_viewfix() && gated_output->view_src) {
+                gated_output = ggml_cont(ctx0, gated_output);
+                cb(gated_output, "linear_attn_out_cont", il);
             }
             ggml_build_forward_expand(gf, gated_output);
             results[id] = gated_output;
@@ -880,7 +1019,8 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         qkv_mixed, state_row_idx, conv_seq_map, state_mask, beta, gate,
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         n_seqs, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
-        model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv, pxa_static_slot);
+        model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv, pxa_static_slot,
+        rs_plane_rows, state_row_idx_w);
 
     auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb, hc_mode);
     if (inp_out_ids) {
@@ -925,6 +1065,10 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
         // (n_kv=1 -> conv single-seq fast path). One batched call over all n_tok tokens (unchanged prompt/decode path).
         if (!pxa_dn_share_inputs(lctx) || shared_view_ctx != ctx0 || shared_view_n_seqs != 1 || shared_view_n_tok != n_tok) {
             shared_state_row  = ggml_view_1d(ctx0, lctx.inp_s_seq_qnext, 1, 0);
+            // PXA_RS_RING: read rows live in the second half of the (widened) index tensor.
+            shared_state_row_rd = lctx.kv_self.rs_ring_armed()
+                ? ggml_view_1d(ctx0, lctx.inp_s_seq_qnext, 1, (size_t) n_tok * lctx.inp_s_seq_qnext->nb[1])
+                : shared_state_row;
             shared_conv_map   = ggml_view_2d(ctx0, lctx.inp_conv_seq_map, 1, n_tok,
                     lctx.inp_conv_seq_map->nb[1], 0);
             shared_state_mask = make_state_mask(1);
@@ -932,7 +1076,7 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
             shared_view_n_seqs = 1;
             shared_view_n_tok  = n_tok;
         }
-        ggml_tensor * state_row_idx = shared_state_row;
+        ggml_tensor * state_row_idx = shared_state_row_rd ? shared_state_row_rd : shared_state_row; // PXA_RS_RING read
         ggml_tensor * conv_seq_map  = shared_conv_map;
         ggml_tensor * state_mask    = shared_state_mask;
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
@@ -948,7 +1092,18 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
         if (!pxa_dn_np1_fastpath() && pxa_dn_carry() != 2) {
             pxa_static_slot = -1;
         }
-        return build_layer_attn_linear_core(ctx0, gf, cur, state_row_idx, conv_seq_map, state_mask, inp_out_ids, 1, reset_state, il, cb, pxa_static_slot, hc_mode);
+        // PXA_RS_RING: both static-view carries bake the state row offset into the graph, which a
+        // moving read plane makes wrong. They are default-off and recorded UNSAFE; refuse them.
+        if (lctx.kv_self.rs_ring_armed() && pxa_static_slot >= 0) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "PXA_RS_RING is armed: forcing the safe gather/scatter carry "
+                        "(PXA_DN_NP1_FASTPATH / PXA_DN_CARRY=2 are incompatible with a ring read plane)\n");
+            }
+            pxa_static_slot = -1;
+        }
+        return build_layer_attn_linear_core(ctx0, gf, cur, state_row_idx, conv_seq_map, state_mask, inp_out_ids, 1, reset_state, il, cb, pxa_static_slot, hc_mode, shared_state_row);
     }
 
     // PXA_LLAMA_MTP_FIX: generalized mixed/MTP path. The batch is decomposed into n_seqs DISTINCT
@@ -967,6 +1122,9 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     // state_row_idx: first n_seqs entries of inp_s_seq_qnext hold the DISTINCT absolute seq rows.
     if (!pxa_dn_share_inputs(lctx) || shared_view_ctx != ctx0 || shared_view_n_seqs != n_seqs || shared_view_n_tok != n_tok) {
         shared_state_row = ggml_view_1d(ctx0, lctx.inp_s_seq_qnext, n_seqs, 0);
+        shared_state_row_rd = lctx.kv_self.rs_ring_armed()   // PXA_RS_RING, see the all_same branch
+            ? ggml_view_1d(ctx0, lctx.inp_s_seq_qnext, n_seqs, (size_t) n_tok * lctx.inp_s_seq_qnext->nb[1])
+            : shared_state_row;
         // conv_seq_map: view the first n_seqs rows (n_kv) of the full [n_tok, n_tok] map, keeping the
         // full per-token row stride (nb[1]) so the host-filled rows line up. -> [n_kv=n_seqs, n_tok].
         shared_conv_map  = ggml_view_2d(ctx0, lctx.inp_conv_seq_map, n_seqs, n_tok,
@@ -976,11 +1134,11 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
         shared_view_n_seqs = n_seqs;
         shared_view_n_tok  = n_tok;
     }
-    ggml_tensor * state_row_idx = shared_state_row;
+    ggml_tensor * state_row_idx = shared_state_row_rd ? shared_state_row_rd : shared_state_row; // PXA_RS_RING read
     ggml_tensor * conv_seq_map  = shared_conv_map;
     ggml_tensor * state_mask    = shared_state_mask;
     GGML_ASSERT(conv_seq_map->ne[0] == n_seqs && conv_seq_map->ne[1] == n_tok);
 
-    return build_layer_attn_linear_core(ctx0, gf, cur, state_row_idx, conv_seq_map, state_mask, inp_out_ids, n_seqs, /*reset_state_local*/ false, il, cb, -1, hc_mode);
+    return build_layer_attn_linear_core(ctx0, gf, cur, state_row_idx, conv_seq_map, state_mask, inp_out_ids, n_seqs, /*reset_state_local*/ false, il, cb, -1, hc_mode, shared_state_row);
 }
 

@@ -30,7 +30,7 @@
 //   6. abort probes (argv-selected, run as separate processes by the runner):
 //      mrope+flipped, vision+flipped and f16-CPU+flipped must all die.
 //
-// Tiny on purpose: a few hundred MB, one card. The DGX is on loan.
+// Tiny on purpose: a few hundred MB, one card, so it runs anywhere a single GPU is available.
 //
 
 #include "ggml.h"

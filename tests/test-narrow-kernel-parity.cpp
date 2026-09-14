@@ -5,6 +5,10 @@
 //   PXA_CPY_FASTDIV      multiply-shift index math in the float cpy kernel
 //   PXA_CONCAT_FLAT      one-thread-per-element non-contiguous concat
 //   PXA_NORM_REGCACHE    register-cached rms/l2 norm
+//   PXA_FUSE_DELTANET&4  the DeltaNet recurrent-state gather folded into the
+//                        reset-mask multiply that consumes it
+//   PXA_CPY_ROWS         one thread (=1) or one warp (=2) per ROW in the float cpy kernel
+//   PXA_FUSE_SIBLINGS    N consecutive same-op same-shape nodes merged into one launch
 //
 // Each of those claims to be bit-identical to the path it replaces, so the test
 // is an EQUALITY test, not a tolerance test. Two things are checked per case:
@@ -25,6 +29,17 @@
 //
 //      -- and an empty diff is the bit-identity proof. A PASS in one run alone
 //      only proves the arm that ran is correct, not that the two agree.
+//
+//      The DeltaNet gather+mask case has its own A/B, because its gate is a bit
+//      in a mask rather than a boolean and it is OFF in the compiled-in default:
+//
+//        PXA_FUSE_DELTANET=3 ./test-narrow-kernel-parity              > dn_off.txt
+//        PXA_FUSE_DELTANET=7 ./test-narrow-kernel-parity              > dn_on.txt
+//        diff dn_off.txt dn_on.txt   # must be empty
+//
+//      The case reads BOTH tensors the fused kernel writes -- the gather's own
+//      destination and the multiply's -- so an empty diff covers the whole fold
+//      and not just the value that happens to be the graph's output.
 //
 //      NOTE (2026-09-03): all four gates now default ON at the ENHANCE config
 //      level, which is itself the default, so the BARE run is the ON arm and
@@ -83,6 +98,11 @@ static bool exact_equal(const std::vector<float> & a, const std::vector<float> &
 }
 
 enum case_kind {
+    CASE_CPY_ROWS_DENSE,// contiguous f32 -> f32: the per-row kernel's one-multiply arm
+    CASE_CPY_ROWS_3D,   // same, with ne2 > 1 so the row decode has to resolve i02/i03
+    CASE_CPY_ROWS_VIEW, // strided source, contiguous dest: the per-row kernel's fastdiv arm
+    CASE_SIB_CPY,       // two independent same-shape CPY nodes side by side
+    CASE_SIB_L2,        // two independent same-shape L2_NORM nodes side by side
     CASE_GET_ROWS,      // ne00 = 1 gather over many rows
     CASE_GET_ROWS_WIDE, // control: the wide path the gate must not touch
     CASE_CPY,           // transposed f32 -> f32 copy
@@ -90,6 +110,7 @@ enum case_kind {
     CASE_CONCAT_NC,     // narrow non-contiguous concat on dim 0
     CASE_RMS_NORM,      // 2048-wide rms norm
     CASE_L2_NORM,       // 4096-wide l2 norm
+    CASE_DN_GATHER_MASK,// recurrent-state get_rows folded into its reset-mask multiply
 };
 
 struct kcase {
@@ -111,6 +132,22 @@ static const kcase g_cases[] = {
     { "rms_norm 2048 x 3",             CASE_RMS_NORM,      2048,    3 },
     { "rms_norm 4096 x 1",             CASE_RMS_NORM,      4096,    1 },
     { "l2_norm  2048 x 2",             CASE_L2_NORM,       2048,    2 },
+    // ne0 is the recurrent state row width, ne1 the sequence count. 4864 is the tiny
+    // hybrid fixture's row (conv tail + ssm state); the shipped seat's is far wider,
+    // and both are above the 4096-column floor the fusion refuses to fire below.
+    { "dn gather+mask 4864 x 1",       CASE_DN_GATHER_MASK, 4864,    1 },
+    { "dn gather+mask 4864 x 2",       CASE_DN_GATHER_MASK, 4864,    2 },
+    // control: below the floor, so the eager pair must run and the two arms are
+    // identical for a different reason. A hash change here means the floor moved.
+    { "dn gather+mask 2048 x 1",       CASE_DN_GATHER_MASK, 2048,    1 },
+    { "cpy rows dense f32 128x97",     CASE_CPY_ROWS_DENSE, 128,    97 },
+    { "cpy rows dense f32 4096x3",     CASE_CPY_ROWS_DENSE, 4096,    3 },
+    { "cpy rows dense f32 1x513",      CASE_CPY_ROWS_DENSE,   1,   513 },
+    { "cpy rows 3d f32 64x5(x7)",      CASE_CPY_ROWS_3D,     64,     5 },
+    { "cpy rows strided-src 96x257",   CASE_CPY_ROWS_VIEW,   96,   257 },
+    { "cpy rows strided-src 7x1025",   CASE_CPY_ROWS_VIEW,    7,  1025 },
+    { "siblings cpy x2 f32 256x33",    CASE_SIB_CPY,        256,    33 },
+    { "siblings l2_norm x2 2048x2",    CASE_SIB_L2,        2048,     2 },
 };
 
 // Builds and runs one case on `be`, returning the result rows as f32.
@@ -124,6 +161,8 @@ static bool run_case(ggml_backend_t be, const kcase & c, std::mt19937 & rng, std
     std::vector<float>   src_h;
     std::vector<int32_t> idx_h;
     std::vector<float>   src1_h;
+    std::vector<float>   src2_h;
+    ggml_tensor * a2 = nullptr;
 
     std::uniform_real_distribution<float> uni(-3.0f, 3.0f);
 
@@ -178,6 +217,90 @@ static bool run_case(ggml_backend_t be, const kcase & c, std::mt19937 & rng, std
             for (auto & v : src1_h) v = uni(rng);
         } break;
 
+        case CASE_DN_GATHER_MASK: {
+            // The delta-net state read: one recurrent row per sequence gathered out of the
+            // state cache, then multiplied by the [1, n_seqs] per-sequence reset mask that
+            // zeroes a sequence starting at position 0. The fused kernel writes the gather's
+            // destination as well as the multiply's, so the graph is built to READ BOTH --
+            // add them -- and a bit-exact result therefore covers both stores.
+            const int64_t n_src_rows = 8;             // state cache slots
+            a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, n_src_rows);
+            idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.ne1);
+            b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, c.ne1);
+            ggml_tensor * g = ggml_get_rows(ctx, a, idx);
+            ggml_tensor * m = ggml_mul(ctx, g, b);
+            result = ggml_add(ctx, m, g);
+
+            src_h.resize(c.ne0*n_src_rows);
+            for (auto & v : src_h) v = uni(rng);
+            idx_h.resize(c.ne1);
+            std::uniform_int_distribution<int> ui(0, (int) n_src_rows - 1);
+            for (auto & v : idx_h) v = ui(rng);
+            // both mask states matter: 1 carries the row, 0 is a sequence starting fresh
+            src1_h.resize(c.ne1);
+            for (size_t k = 0; k < src1_h.size(); ++k) src1_h[k] = (k % 2) ? 0.0f : 1.0f;
+        } break;
+
+        case CASE_CPY_ROWS_DENSE: {
+            // both sides fully contiguous and the same shape: this is the copy whose higher dims
+            // are dense on both sides, so the per-row kernel's row offset is one multiply.
+            a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            result = ggml_cpy(ctx, a, b);
+            src_h.resize(c.ne0*c.ne1);
+            for (auto & v : src_h) v = uni(rng);
+        } break;
+
+        case CASE_CPY_ROWS_3D: {
+            const int64_t ne2 = 7;
+            a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.ne0, c.ne1, ne2);
+            b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.ne0, c.ne1, ne2);
+            result = ggml_cpy(ctx, a, b);
+            src_h.resize(c.ne0*c.ne1*ne2);
+            for (auto & v : src_h) v = uni(rng);
+        } break;
+
+        case CASE_CPY_ROWS_VIEW: {
+            // dim 0 contiguous but the row pitch padded, so the higher dims are NOT dense on the
+            // source: the per-row kernel has to recover (i01,i02,i03) with multiply-shift.
+            const int64_t pad = 5;
+            a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0 + pad, c.ne1);
+            ggml_tensor * a_nc = ggml_view_2d(ctx, a, c.ne0, c.ne1, a->nb[1], 0);
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            result = ggml_cpy(ctx, a_nc, b);
+            src_h.resize((c.ne0 + pad)*c.ne1);
+            for (auto & v : src_h) v = uni(rng);
+        } break;
+
+        case CASE_SIB_CPY: {
+            // two copies of the same shape, back to back, into disjoint destinations -- the run
+            // the sibling pass merges. The trailing add is only there to give the graph one root
+            // whose value depends on both copies.
+            a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            a2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            ggml_tensor * b2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            ggml_tensor * r1 = ggml_cpy(ctx, a,  b);
+            ggml_tensor * r2 = ggml_cpy(ctx, a2, b2);
+            result = ggml_add(ctx, r1, r2);
+            src_h.resize(c.ne0*c.ne1);
+            for (auto & v : src_h) v = uni(rng);
+            src2_h.resize(c.ne0*c.ne1);
+            for (auto & v : src2_h) v = uni(rng);
+        } break;
+
+        case CASE_SIB_L2: {
+            a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            a2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
+            ggml_tensor * r1 = ggml_l2_norm(ctx, a,  1e-12f);
+            ggml_tensor * r2 = ggml_l2_norm(ctx, a2, 1e-12f);
+            result = ggml_add(ctx, r1, r2);
+            src_h.resize(c.ne0*c.ne1);
+            for (auto & v : src_h) v = uni(rng);
+            src2_h.resize(c.ne0*c.ne1);
+            for (auto & v : src2_h) v = uni(rng);
+        } break;
+
         case CASE_RMS_NORM:
         case CASE_L2_NORM: {
             a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.ne0, c.ne1);
@@ -194,6 +317,7 @@ static bool run_case(ggml_backend_t be, const kcase & c, std::mt19937 & rng, std
     ggml_backend_tensor_set(a, src_h.data(), 0, src_h.size()*sizeof(float));
     if (idx) ggml_backend_tensor_set(idx, idx_h.data(), 0, idx_h.size()*sizeof(int32_t));
     if (b && !src1_h.empty()) ggml_backend_tensor_set(b, src1_h.data(), 0, src1_h.size()*sizeof(float));
+    if (a2 && !src2_h.empty()) ggml_backend_tensor_set(a2, src2_h.data(), 0, src2_h.size()*sizeof(float));
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, result);
@@ -223,6 +347,12 @@ int main(int argc, char ** argv) {
            getenv("PXA_CPY_FASTDIV")    ? getenv("PXA_CPY_FASTDIV")    : "(unset)",
            getenv("PXA_CONCAT_FLAT")    ? getenv("PXA_CONCAT_FLAT")    : "(unset)",
            getenv("PXA_NORM_REGCACHE")  ? getenv("PXA_NORM_REGCACHE")  : "(unset)");
+    printf("# PXA_FUSE_DELTANET=%s (bit2 = 4 arms the gather+mask fold)\n",
+           getenv("PXA_FUSE_DELTANET")  ? getenv("PXA_FUSE_DELTANET")  : "(unset)");
+    // These two default OFF at every level, so the bare run is their OFF arm.
+    printf("# default-off levers: CPY_ROWS=%s FUSE_SIBLINGS=%s\n",
+           getenv("PXA_CPY_ROWS")       ? getenv("PXA_CPY_ROWS")       : "(unset)",
+           getenv("PXA_FUSE_SIBLINGS")  ? getenv("PXA_FUSE_SIBLINGS")  : "(unset)");
 
     ggml_backend_t cpu  = ggml_backend_cpu_init();
     ggml_backend_t cuda = ggml_backend_cuda_init(0, nullptr);
@@ -254,7 +384,7 @@ int main(int argc, char ** argv) {
         size_t bad = 0;
         char detail[192];
 
-        const bool is_norm = c.kind == CASE_RMS_NORM || c.kind == CASE_L2_NORM;
+        const bool is_norm = c.kind == CASE_RMS_NORM || c.kind == CASE_L2_NORM || c.kind == CASE_SIB_L2;
         if (is_norm) {
             // A norm sums the row on both backends but not necessarily in the same
             // association, so CPU/CUDA equality is not the claim here. The claim is that

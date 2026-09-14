@@ -8,8 +8,8 @@
 #   cmake -B build -S . -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')"
 #   cmake --build build -j
 #
-# The production container's / is 100% full and must never be written to. build.sh keeps every
-# byte of the build tree under /mnt/models.
+# The production container's filesystem must never be written to. build.sh keeps every
+# byte of the build tree under $PXA_MODELS_DIR (default ./models; see build.sh).
 
 cmake_minimum_required(VERSION 3.18)
 project(pxq4_sm70 LANGUAGES CXX CUDA)
@@ -57,5 +57,5 @@ if(PXQ4_CANON_V2)
   target_compile_definitions(pxq4_sm70 PRIVATE PXQ4_CANON_V2=1)
 endif()
 
-# The runtime package loads exactly this name: src/pxq4_vllm/_lib/libpxq4_sm70.so (plan §4).
+# The runtime package loads exactly this name: src/pxq4_vllm/_lib/libpxq4_sm70.so.
 set_target_properties(pxq4_sm70 PROPERTIES OUTPUT_NAME "pxq4_sm70" PREFIX "lib")

@@ -165,6 +165,11 @@ PXA_PXQ6_GATE(pxa_g2_sumrowsfuse,  "PXA_G2_SUMROWSFUSE",  true, "G2-F5d CONT + S
 PXA_PXQ6_GATE(pxa_pxq6_prmt,     "PXA_PXQ6_PRMT",     false, "K2c prmt register-LUT book decode (4-bit tiers, decode mmv), bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_ldcs,     "PXA_PXQ6_LDCS",     false, "K7 streaming (evict-last-priority) weight code loads in decode mmv, bit-exact")
 PXA_PXQ6_GATE(pxa_pxq3_pairlut,  "PXA_PXQ3_PAIRLUT",  false, "K2b3 P3 64-entry bit-plane pair LUT, decode mmv family, bit-exact")
+// Separate from PXA_PXQ3_PAIRLUT above ON PURPOSE. That lever governs the DECODE mmv family; this
+// one governs the PREFILL full-matrix dequant (k_pxq6_dequant_matrix), a different kernel on a
+// different graph shape with a different safety argument. One env var for both would make either
+// A/B unreadable -- the same discipline the G2-F5 fusions are split under.
+PXA_PXQ6_GATE(pxa_pxq3_pairlut_dq, "PXA_PXQ3_PAIRLUT_DQ", false, "P3 64-entry bit-plane pair LUT in the PREFILL full-matrix dequant, bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_shfl,     "PXA_PXQ6_SHFL",     false, "K2d register-book __shfl decode: book gathers ride the shuffle pipe, not the LSU; bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_rowx2,    "PXA_PXQ6_ROWX2",    false, "R2 two-rows-per-thread 128-thr decode mmv twins (halve warp-uniform x LDS writeback), bit-exact")
 
@@ -580,6 +585,12 @@ static __device__ __forceinline__ void pxq6_stage_pairlut3(float2 * plut, int ti
 #define PXQ6_MODE_PRMT_CS 4
 #define PXQ6_MODE_PAIRL3  5   // P3-only (PXA_PXQ3_PAIRLUT): 64-entry bit-plane pair-LUT
 #define PXQ6_MODE_SHFL    6   // K2d (PXA_PXQ6_SHFL): register-book __shfl decode, every tier
+// H2 (PXA_PXQ_MMV_H2, sm_60 only): half2 pair-LUT + HFMA2 inner loop for P2/P3 dense decode.
+// Unlike modes 0-6 this one changes ARITHMETIC WIDTH, not just operand sourcing, so it is NOT
+// bit-exact against the fp32 arm and it does not ride the shared kernels — it has its own twins
+// (k_pxq6_mmv_h2 / _ksplit_h2 / _ksplit_gen_h2) because it also changes the x-stage smem layout.
+// The id exists so the pickers, the banner and the logs can name the sourcing like every other mode.
+#define PXQ6_MODE_H2      7
 
 template <int MODE> struct pxq6_mode {
     static constexpr bool cs   = (MODE == PXQ6_MODE_TAB_CS) || (MODE == PXQ6_MODE_PRMT_CS);
@@ -587,6 +598,7 @@ template <int MODE> struct pxq6_mode {
     static constexpr bool pairl = (MODE == PXQ6_MODE_PAIRL);
     static constexpr bool pairl3 = (MODE == PXQ6_MODE_PAIRL3);
     static constexpr bool shfl = (MODE == PXQ6_MODE_SHFL);
+    static constexpr bool h2   = (MODE == PXQ6_MODE_H2);
 };
 
 // PXQ_CANON_v2 (2026-08-04) - accumulation SHAPE, not sourcing.
@@ -689,15 +701,152 @@ static __device__ __forceinline__ float pxq6_dot32(const uint8_t * __restrict__ 
     return (eff[0]*t[0] + eff[1]*t[1]) + (eff[2]*t[2] + eff[3]*t[3]);
 }
 
+
+// =============================================================================================
+// H2 (PXA_PXQ_MMV_H2, 2026-09-10) — the half2 inner loop for the PXQ2/PXQ3 dense decode mmv on
+// GP100. Everything the mode needs that is not a whole kernel lives here.
+//
+// WHY. The fused decode mmv is the same 16-pair loop for every tier — 2 smem book gathers plus
+// FMUL + FFMA + FADD per pair, 48 fp32 ops and 32 gathers per dot32 — so the 2-bit tier moves 39%
+// fewer bytes than the 4-bit tier and decodes at exactly the same speed on a P100 (18.50 vs 18.01
+// t/s, 27B, 2 cards, tg32 medians of 7). At 177 GB/s per active card against ~550 achievable the
+// loop is ALU-bound, not memory-bound, and the fix has to be instructions.
+//
+// GP100 has no dp4a, so the int8 route that bought +36% on sm_70 is unavailable. It does have
+// full-rate HFMA2, and the LM4/LM8 books are fp16-EXACT (pxa_pxq23_book_ok enforces
+// __half2float(__float2half_rn(b[i])) == b[i]), so a half2 pair LUT carries no book error at all.
+// Per pair: 1 LDS.32 + 1 HFMA2, against 2 LDS + 3 fp32 ops.
+//
+// WHAT IS AND IS NOT EXACT. The book is exact; x is not — it is rounded to fp16 once at stage
+// time — and the 8-step accumulation inside each 16-element eff group runs in fp16. Everything
+// above that group is untouched fp32: the eff scales, the eff[0]*t[0] + eff[1]*t[1] fold, the
+// per-lane chain, the canonical per-chunk fold and the reducer. So this mode is NOT bit-exact
+// against the fp32 arm by construction (an A/B that shows identical logits means it never fired),
+// and it IS bit-identical between split and unsplit at any S — see the scale note below.
+// =============================================================================================
+
+// H2 LUT staging: hlut[key] = (half)book[c0(key)], (half)book[c1(key)] — from the SAME per-TU
+// global book bookv() reads, fp16-exact, so the halves are the book values and not roundings of
+// them. 16 entries (PXQ2, 64 B) / 64 entries (PXQ3, 256 B).
+template <class POL>
+static __device__ __forceinline__ void pxq6_stage_h2lut(__half2 * hlut, int tid, int nthr) {
+    for (int i = tid; i < POL::H2LUT; i += nthr) {
+        int c0, c1;
+        POL::h2codes(i, c0, c1);
+        hlut[i] = __halves2half2(__float2half_rn(POL::bookv(c0)), __float2half_rn(POL::bookv(c1)));
+    }
+}
+
+// x STAGE, PER-SLAB POWER-OF-TWO SCALE (design correction 2026-09-10, approved before any number
+// existed). fp16 tops out at 65504 and a 16-element group accumulates 8 hfma2 steps, so |acc| <=
+// 8 * max|x_scaled| * max|book|; scaling max|x| into [512,1024) leaves ~8x headroom above and
+// ~1.7e7 of dynamic range below before fp16 denormals matter. The scale is a power of two, so
+// applying it and undoing it are both EXACT and add no rounding beyond the fp16 convert itself.
+//
+// The scale is per SLAB (32 elements), not per block. Chunk boundaries are slab-aligned, so a
+// slab is never split across blocks: its 32 x values, and therefore its scale, are identical in
+// every block that stages it at every S. That keeps the PXQ_CANON_v1 split == unsplit property
+// bit-identical inside the mode — a block-wide max would make the scale a function of S, i.e. the
+// same model would return different logits at a different launch geometry. It is also better
+// fidelity: a quiet slab gets its own scale instead of being flushed toward zero by a loud slab
+// elsewhere in the same vector.
+//
+// Degenerate inputs are handled inside the scale, so there is no second arm to keep in sync:
+//   max == 0        -> sh = 0; every product is zero and the slab contributes exactly 0.0f.
+//   max non-finite  -> sh = 0; the value converts to inf/nan and propagates through the hfma2
+//                      chain exactly as it does in fp32 (fmaxf drops NaN, so an inf reaches the
+//                      test and a NaN reaches the convert — both end up in the result either way).
+//   sh clamped +/-100 so 2^sh and 2^-sh both stay well inside fp32 normals.
+// One warp owns one slab: 32 lanes, 5 __shfl_xor steps, one 2-byte store each.
+static __device__ __forceinline__ void pxq6_stage_x_h2(const float * __restrict__ x, int Kc,
+                                                       __half * __restrict__ xh,
+                                                       float * __restrict__ xiv) {
+    const int lane  = threadIdx.x & 31;
+    const int warp  = threadIdx.x >> 5;
+    const int nwarp = blockDim.x  >> 5;
+    const int nslab = Kc >> 5;                       // Kc is a whole number of 32-elem slabs
+    for (int sl = warp; sl < nslab; sl += nwarp) {
+        const int  idx = (sl << 5) + lane;
+        const float v  = x[idx];
+        float a = fabsf(v);
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+        int sh = 0;
+        if (a > 0.0f && a < __int_as_float(0x7f800000)) {     // finite and non-zero
+            sh = 9 - ilogbf(a);
+            sh = sh >  100 ?  100 : sh;
+            sh = sh < -100 ? -100 : sh;
+        }
+        if (lane == 0) xiv[sl] = __int_as_float((127 - sh) << 23);      // 2^-sh, exact
+        xh[idx] = __float2half_rn(v * __int_as_float((127 + sh) << 23));  // v * 2^sh, exact scale
+    }
+}
+
+// the h2 twin of pxq6_dot32: same (row, 32-element slab) contract, same eff computation, same
+// fp32 epilogue shape — only the 16 pair decodes and the 16-element group accumulation move to
+// half2. xk2 is the slab's 16 scaled x pairs; xiv is the slab's exact 2^-sh descale.
+template <class POL>
+static __device__ __forceinline__ float pxq6_dot32_h2_core(const uint32_t * __restrict__ q,
+                                                           const float * eff,
+                                                           const __half2 * __restrict__ xk2,
+                                                           const float xiv,
+                                                           const __half2 * __restrict__ hlut) {
+    __half2 th[POL::NEFF];
+    #pragma unroll
+    for (int i = 0; i < POL::NEFF; ++i) th[i] = __float2half2_rn(0.0f);
+    #pragma unroll
+    for (int b = 0; b < 16; ++b) {
+        const __half2 pv = POL::pairh2(q, b, hlut);
+        th[(b*POL::NEFF) >> 4] = __hfma2(pv, xk2[b], th[(b*POL::NEFF) >> 4]);
+    }
+    float t[POL::NEFF];
+    #pragma unroll
+    for (int i = 0; i < POL::NEFF; ++i) t[i] = __low2float(th[i]) + __high2float(th[i]);
+    // fp32 from here down, in the incumbent's shape; the descale is one exact power-of-two multiply.
+    if (POL::NEFF == 1) return (eff[0]*t[0]) * xiv;
+    if (POL::NEFF == 2) return (eff[0]*t[0] + eff[1]*t[1]) * xiv;
+    return ((eff[0]*t[0] + eff[1]*t[1]) + (eff[2]*t[2] + eff[3]*t[3])) * xiv;
+}
+
+template <class POL>
+static __device__ __forceinline__ float pxq6_dot32_h2(const uint8_t * __restrict__ slab, int row,
+                                                      float anch,
+                                                      const __half2 * __restrict__ xk2, const float xiv,
+                                                      const float * __restrict__ sub,
+                                                      const __half2 * __restrict__ hlut) {
+    float eff[POL::NEFF];
+    POL::row_effs(slab, row, anch, sub, eff);
+    uint32_t q[POL::CODE_WORDS];
+    pxq6_ldcodes<POL, false>(slab + POL::CODE_OFF + row*POL::CODE_BYTES, q);
+    return pxq6_dot32_h2_core<POL>(q, eff, xk2, xiv, hlut);
+}
+
+// smem carve for an h2 x stage of Kc elements: Kc/2 __half2 then Kc/32 floats. The 2D driver
+// hands these kernels the fp32 request (Kc*4 B) unchanged and this uses Kc*2 + Kc/8 of it —
+// deliberately, so the OFF and ON arms share one launch geometry and the A/B is the inner loop
+// and nothing else. Halving the request would move S_min / S / must_split between the arms.
+#define PXQ6_H2_XIV(smem, Kc) ((float *)((__half2 *)(smem) + ((Kc) >> 1)))
+
 // ---------------------------------------------------------------------------------------------
 // full-matrix dequant (convert.cu fallback hook — dequant->cublas keeps PXQ6 functional on
 // every arch, incl. the 1080Ti/sm_61). One block per slab, 64 threads (one row each).
 // ---------------------------------------------------------------------------------------------
-template <class POL, typename dst_t>
+//
+// PAIRL3 (2026-09-09): the P3 bit-plane reassembly in pxq6_pol_p3::pair() is ~7 integer ops per
+// pair that the nibble tiers do not pay, and it shows up as a 9-10% wall-time excess for PXQ3
+// over PXQ4 on this kernel even though PXQ3 READS 24% FEWER BYTES (tests/test-pxq-dq-wide
+// phase 4: 0.106/0.166/0.505 ms against PXQ4's 0.098/0.152/0.460). The decode mmv family already
+// carries the fix -- a 64-entry smem LUT keyed on the pair's packed planes, staged from the same
+// book through POL::bookv, so it is a SOURCING change and bit-exact against pair() -- and this
+// kernel simply never saw it. The template flag (not a runtime branch) keeps the incumbent
+// instantiation byte-for-byte what it was for every other tier, and phase 5 of that test is a
+// device-side zero-tolerance memcmp of the two instantiations rather than a tolerance check.
+template <class POL, typename dst_t, bool PAIRL3 = false>
 static __global__ void k_pxq6_dequant_matrix(const uint8_t * __restrict__ wq, dst_t * __restrict__ y,
                                              const int kslabs, const int64_t K) {
     __shared__ float tab[32];   // 32 for the P6R LM32 book; 16-entry policies leave 16..31 unstaged
     __shared__ float sub[16];
+    __shared__ float2 plut[PAIRL3 ? 64 : 1];   // 512 B when armed, one dead float2 when not
     // STORE COALESCING (2026-07-27). Decoding is naturally row-major -- one thread owns one row
     // and produces its PXQ6_QK consecutive outputs -- but writing that straight to y has 32
     // threads storing addresses K elements apart, so each store instruction touches 32 sectors
@@ -711,6 +860,7 @@ static __global__ void k_pxq6_dequant_matrix(const uint8_t * __restrict__ wq, ds
     // which is not worth a second layout -- the f16 path is the one cuBLAS takes.
     __shared__ dst_t tile[PXQ6_BM][PXQ6_QK + 2];
     POL::stage_tabs(tab, sub, threadIdx.x);
+    if constexpr (PAIRL3) pxq6_stage_pairlut3<POL>(plut, threadIdx.x, 64);
     __syncthreads();
     const int64_t slab_id = blockIdx.x;
     const int64_t p  = slab_id / kslabs;
@@ -726,7 +876,11 @@ static __global__ void k_pxq6_dequant_matrix(const uint8_t * __restrict__ wq, ds
     #pragma unroll
     for (int b = 0; b < 16; ++b) {                 // b = element-pair index
         const float e = eff[(b*POL::NEFF) >> 4];
-        const float2 v = POL::pair(q, b, tab);
+        // Sourcing only: pairl3() reads the SAME book values through the SAME bookv() the LUT was
+        // staged from, and the two multiplies below are unchanged, so the fp16 result is identical.
+        float2 v;
+        if constexpr (PAIRL3) v = POL::pairl3(q, b, plut);
+        else                  v = POL::pair(q, b, tab);
         tile[row][2*b]   = (dst_t)(e * v.x);
         tile[row][2*b+1] = (dst_t)(e * v.y);
     }
@@ -1601,6 +1755,214 @@ static __global__ void k_pxq_mmv_reduce_s(const float * __restrict__ ws,
     out[grow] = u;
 }
 
+// =============================================================================================
+// H2 TWINS (PXA_PXQ_MMV_H2, 2026-09-10) — the three dense decode kernels the 2D driver can fire,
+// rebuilt around the half2 inner loop. Twins rather than a mode branch inside the incumbents,
+// for two reasons: the x stage changes its SMEM LAYOUT (scaled __half2 plus a per-slab descale)
+// and that lives in the kernel, not in dot32; and a dead __half2 lut[1] inside the shared
+// kernels would land in the static smem of every other tier and arch. Written this way, "the
+// fp32 arm and every other arch are byte-identical" is true by inspection.
+//
+// Everything except the pair decode and the 16-element group accumulation is the incumbent's,
+// unchanged and in the same order: the eff scales, the eff[0]*t[0]+eff[1]*t[1] fold, the per-lane
+// chain, the PXQ_CANON_v1 two-level fixed-chunk fold, the ws slot layout and the canonical
+// reducers (k_pxq_mmv_reduce / k_pxq_mmv_reduce_s are reused verbatim). So split == unsplit stays
+// bit-identical INSIDE the mode and the h2 arm's own S is free to move exactly as the fp32 arm's.
+//
+// The 2D driver's shared-memory arithmetic is left alone: these kernels are handed the fp32
+// request (Kc*4 B) and use Kc*2 + Kc/8 of it. That is deliberate — a smaller request would change
+// S_min, S and must_split between the OFF and ON arms, and then the A/B would not be the loop.
+// The unused tail is recorded as the next lever, not taken here.
+// =============================================================================================
+
+// twin of k_pxq6_mmv: same grid, same 256 threads, same red[] epilogue at the same smem offset.
+template <class POL>
+static __global__ void __launch_bounds__(256)
+k_pxq6_mmv_h2(const uint8_t * __restrict__ W,
+              const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
+              char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+              const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+              const int R, const int K, const int n_as) {
+    const int p  = blockIdx.x;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    extern __shared__ float pxq6_smem[];
+    __half2 * xh2 = (__half2 *)pxq6_smem;              // K/2 scaled pairs
+    float   * xiv = PXQ6_H2_XIV(pxq6_smem, K);         // K/32 per-slab descales
+    float   * red = pxq6_smem + K;                     // same offset as the fp32 arm
+
+    const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride);
+    pxq6_stage_x_h2(x, K, (__half *)xh2, xiv);
+
+    __shared__ float sub[16];
+    __shared__ float tab[32];                          // stage_tabs writes both; tab is unused here
+    __shared__ __half2 hlut[POL::H2LUT];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    pxq6_stage_h2lut<POL>(hlut, threadIdx.x, 256);
+    __syncthreads();
+
+    const int row  = threadIdx.x & 63;
+    const int kseg = threadIdx.x >> 6;
+    const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
+    const uint8_t * pan = pxq6_panel<POL>(W, e, panels, p, kslabs);
+    const float anch = POL::HDR ? POL::anchor(pan, row) : 0.f;
+
+    const int nfix = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX);
+    float su = 0.f;
+    for (int c = 0; c < nfix; ++c) {
+        const int b0 = (kslabs*c)/nfix, b1 = (kslabs*(c+1))/nfix;
+        float t = 0.f;
+        for (int kb = b0 + kseg; kb < b1; kb += PXQ4_MMV_KSEG) {
+            t += pxq6_dot32_h2<POL>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                    xh2 + kb*(PXQ6_QK/2), xiv[kb], sub, hlut);
+        }
+        su += t;
+    }
+    red[kseg*64 + row] = su;
+    __syncthreads();
+    if (kseg == 0) {
+        float u = 0.f;
+        #pragma unroll
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) u += red[s*64 + row];
+        float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+        out[p*PXQ6_BM + row] = u;
+    }
+}
+
+// twin of k_pxq6_mmv_ksplit (K1 KSPLIT, 64 threads, one block per (panel, lane)); k_pxq_mmv_reduce
+// reads the same ws slots and is reused unchanged.
+template <class POL>
+static __global__ void __launch_bounds__(64)
+k_pxq6_mmv_ksplit_h2(const uint8_t * __restrict__ W,
+                     const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
+                     float * __restrict__ ws,
+                     const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+                     const int R, const int K, const int n_as, const int n_ids) {
+    const int pk = blockIdx.x;
+    const int p    = pk / PXQ4_MMV_KSEG;
+    const int kseg = pk % PXQ4_MMV_KSEG;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    extern __shared__ float pxq6_smem[];
+    __half2 * xh2 = (__half2 *)pxq6_smem;
+    float   * xiv = PXQ6_H2_XIV(pxq6_smem, K);
+
+    const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride);
+    pxq6_stage_x_h2(x, K, (__half *)xh2, xiv);
+
+    __shared__ float sub[16];
+    __shared__ float tab[32];
+    __shared__ __half2 hlut[POL::H2LUT];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    pxq6_stage_h2lut<POL>(hlut, threadIdx.x, 64);
+    __syncthreads();
+
+    const int row = threadIdx.x;
+    const int panels = R / PXQ6_BM, kslabs = K / PXQ6_QK;
+    const uint8_t * pan = pxq6_panel<POL>(W, e, panels, p, kslabs);
+    const float anch = POL::HDR ? POL::anchor(pan, row) : 0.f;
+
+    const int nfix = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX);
+    float su = 0.f;
+    for (int c = 0; c < nfix; ++c) {
+        const int b0 = (kslabs*c)/nfix, b1 = (kslabs*(c+1))/nfix;
+        float t = 0.f;
+        for (int kb = b0 + kseg; kb < b1; kb += PXQ4_MMV_KSEG) {
+            t += pxq6_dot32_h2<POL>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                    xh2 + kb*(PXQ6_QK/2), xiv[kb], sub, hlut);
+        }
+        su += t;
+    }
+    float * wsj = ws + ((size_t)iy*n_ids + j)*PXQ4_MMV_KSEG*R;
+    wsj[(size_t)kseg*R + p*PXQ6_BM + row] = su;
+}
+
+// twin of k_pxq6_mmv_ksplit_gen — the arm the shipped decode actually takes (S > 1). Same block
+// decomposition, same raw-partial ws slots, same FUSERED tail; k_pxq_mmv_reduce_s is reused.
+template <class POL>
+static __global__ void __launch_bounds__(256)
+k_pxq6_mmv_ksplit_gen_h2(const uint8_t * __restrict__ W,
+                         const char * __restrict__ x_base, const size_t x_tok_stride, const size_t x_slot_stride,
+                         float * __restrict__ ws,
+                         const char * __restrict__ ids, const size_t ids_nb0, const size_t ids_nb1,
+                         char * __restrict__ dst_base, const size_t dst_tok_stride, const size_t dst_slot_stride,
+                         int * __restrict__ counters,
+                         const int R, const int K, const int n_as, const int n_ids, const int S) {
+    const int pk = blockIdx.x;
+    const int p     = pk / S;
+    const int chunk = pk % S;
+    const int j  = blockIdx.y;
+    const int iy = blockIdx.z;
+    const int e  = *(const int32_t *)(ids + (size_t)iy*ids_nb1 + (size_t)j*ids_nb0);
+    if (e < 0 || e >= n_as) return;
+
+    const int kslabs = K / PXQ6_QK;
+    const int nfix = pxq6_canon_nfix(kslabs, PXQ6_MMV_SPLIT_MAX);   // S divides nfix (driver-guaranteed)
+    const int cpb  = nfix/S;
+    const int c0 = chunk*cpb, c1 = c0 + cpb;
+    const int kb0 = (kslabs*c0)/nfix, kb1 = (kslabs*c1)/nfix;
+    const int Kc  = (kb1 - kb0)*PXQ6_QK;
+
+    extern __shared__ float pxq6_smem[];
+    __half2 * xh2 = (__half2 *)pxq6_smem;              // Kc/2 scaled pairs (chunk slice only)
+    float   * xiv = PXQ6_H2_XIV(pxq6_smem, Kc);        // Kc/32 per-slab descales
+
+    const float * x = (const float *)(x_base + (size_t)iy*x_tok_stride + (size_t)j*x_slot_stride) + kb0*PXQ6_QK;
+    pxq6_stage_x_h2(x, Kc, (__half *)xh2, xiv);
+
+    __shared__ float sub[16];
+    __shared__ float tab[32];
+    __shared__ __half2 hlut[POL::H2LUT];
+    POL::stage_tabs(tab, sub, threadIdx.x);
+    pxq6_stage_h2lut<POL>(hlut, threadIdx.x, 256);
+    __syncthreads();
+
+    const int row  = threadIdx.x & 63;
+    const int kseg = threadIdx.x >> 6;
+    const int panels = R / PXQ6_BM;
+    const uint8_t * pan = pxq6_panel<POL>(W, e, panels, p, kslabs);
+    const float anch = POL::HDR ? POL::anchor(pan, row) : 0.f;
+
+    float * wsj = ws + ((size_t)iy*n_ids + j)*(size_t)(PXQ6_MMV_SPLIT_MAX*PXQ4_MMV_KSEG)*R;
+    for (int c = c0; c < c1; ++c) {
+        const int b0 = (kslabs*c)/nfix, b1 = (kslabs*(c+1))/nfix;
+        float t = 0.f;
+        for (int kb = b0 + kseg; kb < b1; kb += PXQ4_MMV_KSEG) {
+            t += pxq6_dot32_h2<POL>(pan + POL::HDR + (size_t)kb*POL::SLAB, row, anch,
+                                    xh2 + (kb - kb0)*(PXQ6_QK/2), xiv[kb - kb0], sub, hlut);
+        }
+        wsj[(size_t)(c*PXQ4_MMV_KSEG + kseg)*R + p*PXQ6_BM + row] = t;
+    }
+    if (counters == nullptr) return;                 // driver launches k_pxq_mmv_reduce_s instead
+    __threadfence();
+    __syncthreads();
+    __shared__ int lastblk;
+    if (threadIdx.x == 0) {
+        const int done = atomicAdd(&counters[iy*n_ids + j], 1) + 1;
+        lastblk = (done == (int)gridDim.x);
+        if (lastblk) counters[iy*n_ids + j] = 0;
+    }
+    __syncthreads();
+    if (!lastblk) return;
+    const float * wsj2 = wsj;
+    float * out = (float *)(dst_base + (size_t)iy*dst_tok_stride + (size_t)j*dst_slot_stride);
+    for (int grow = threadIdx.x; grow < R; grow += blockDim.x) {
+        float u = 0.f;
+        for (int s = 0; s < PXQ4_MMV_KSEG; ++s) {
+            float sus = 0.f;
+            for (int c = 0; c < nfix; ++c) sus += wsj2[(size_t)(c*PXQ4_MMV_KSEG + s)*R + grow];
+            u += sus;
+        }
+        out[grow] = u;
+    }
+}
+
 // PXA_PXQ_MMV_TOK (2026-08-30): TOK-batched twin of k_pxq6_mmv_ksplit_gen — the dense-2D /
 // MoE-down mmv arm of the PXA_PXQ_TOKBATCH recipe (gateup twin below at pxq6_gu_tok_pass).
 // The per-token kernel carries the token on blockIdx.z, so an ny-token verify batch or an
@@ -1713,7 +2075,7 @@ k_pxq6_mmv_ksplit_gen_tok(const uint8_t * __restrict__ W,
 // them 64 -> 74/75 regs, crossing the 65-reg cliff (65536/(256*4) = 64 exactly) and costing
 // 25% of resident warps on 40 of 48 layers. Asking for min 4 blocks brings them back to <=64.
 // NOT the killed cap-forcing experiment: that forced 36/32 regs (10-45 below natural) and
-// spilled (-27.7%). This asks -10 from 74, and any LOCAL>0 in res-usage aborts the change.
+// spilled (-27.7%). This asks -10 from 74, and any LOCAL>0 in res-usage aborts this variant.
 // Only the fired shape is pinned; REFERENCE-only VECX=0 variants keep their natural allocation.
 #ifndef PXQ_GU_MINBLK
 #define PXQ_GU_MINBLK 0   // MEASURED NULL 2026-08-04: +0.14% median. Default OFF.
@@ -2220,7 +2582,7 @@ k_pxq6_gateup_mmv_ksplit_gen_qp(const uint8_t * __restrict__ Wu, const uint8_t *
 // Sourcing rides pxq6_pairx UNCHANGED (composes with any MODE / codebook rework).
 // Register expectation: ~+8..16 over the 256-thr twins (2x accumulators/q/eff live); at 128
 // threads the 4-blocks-per-SM point is 128 regs, so the 256-thr shapes' 64-reg cliff does not
-// bind here. GATE with cuobjdump -res-usage: LOCAL > 0 aborts the change.
+// bind here. GATE with cuobjdump -res-usage: LOCAL > 0 aborts this variant.
 // __launch_bounds__(128) deliberately has NO second argument (the (256,1) trap: a minBlocks
 // hint lifts the register ceiling; these are NEW kernels, the incumbents keep their exact
 // declarations and the env-off binary path is byte-identical).
@@ -2581,7 +2943,7 @@ k_pxq6_gateup_mmv_ksplit_gen_x2(const uint8_t * __restrict__ Wu, const uint8_t *
 // 2-independent-chain shape the per-token kernel schedules (its U+G pair).
 // __launch_bounds__(256, PXA_PXQ_TOK_MINBLK) with the default minblk 4 pins the 64-reg /
 // 4-blocks-per-SM point (65536/(256*4) = 64 exactly). GATE every fired instantiation with
-// cuobjdump -res-usage: REG > 64 or LOCAL > 0 aborts the change (documented fallback:
+// cuobjdump -res-usage: REG > 64 or LOCAL > 0 aborts this variant (documented fallback:
 // -DPXA_PXQ_TOK_MINBLK=3 = the incumbent per-token kernel's own 85-reg/3-block point).
 // TOK is capped at 3: ~4 live regs per extra token per pass on top of a ~50+ reg shared hot
 // set puts TOK=4 past the ceiling. A TOK=2 that fits beats a TOK=5 that spills.
@@ -3837,6 +4199,101 @@ PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen_x2, k_pxq6_gat
 PXQ6_PICKM_FMT(pxq6_mmv_fn,        pxq6_pick_mmv_qp,               k_pxq6_mmv_qp)
 PXQ6_PICKM_FMT(pxq6_mmv_ksg_fn,    pxq6_pick_mmv_ksplit_gen_qp,    k_pxq6_mmv_ksplit_gen_qp)
 PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen_qp, k_pxq6_gateup_mmv_ksplit_gen_qp)
+
+// ---------------------------------------------------------------------------------------------
+// H2 pickers (PXA_PXQ_MMV_H2). Deliberately NOT folded into PXQ6_PICKM23 / PXQ6_PICKM_FMT: those
+// macros serve the MoE grouped drivers as well as the dense one, and this mode is dense-only (the
+// same exclusion the MMVQ path uses). A separate picker also means the mode cannot reach a tier,
+// an arch or a driver it was not measured on by way of a demotion arm.
+//
+// Returns nullptr for everything except PXQ2/PXQ3 on cc == 600 with the lever bit set, and the
+// 2D driver treats nullptr as "keep the incumbent kernel".
+// ---------------------------------------------------------------------------------------------
+
+// arch + tier + book gate. cc == 600 EXACTLY: sm_61 runs fp16 at 1/64 rate, so a >= gate would
+// ship consumer Pascal a kernel far slower than the one it already has, and sm_70's 2x fp16 is a
+// separate measurement, not an assumption. The fp16-exactness of the book is the whole basis of
+// the "zero book error" claim, so it is re-checked here (once) rather than trusted — an override
+// or a re-fit that broke it would otherwise turn a documented property into a silent one.
+// Returns nullptr when the lever is ON, and otherwise names the gate that stopped it. The bool
+// predicate below is a view of THIS function's return value and the driver reports the string it
+// returns here, so the decision taken and the reason reported cannot drift apart -- a second copy
+// of this control flow is exactly how a lever comes to be reported as armed while behaving as off.
+// `cc` is reported alongside the reason because three of the four gates are arch- or tier-specific
+// and the line is otherwise unreadable on a mixed fleet.
+static inline const char * pxa_pxq_mmv_h2_why(int cc, int fmt) {
+    const int m = pxa_pxq_mmv_h2_mask();
+    if (!m) return "lever-not-armed";
+    if (cc != 600) return "cc-not-600";
+    if (fmt == PXA_PXQ_FMT_P2) {
+        if (!(m & 1)) return "tier-bit-not-set-for-pxq2";
+        static const bool ok = [](){
+            static const float b[4] = PXQ2_BOOK_INIT;
+            const bool v = pxa_pxq23_book_ok(b, 4);
+            if (!v) fprintf(stderr, "PXA_PXQ_MMV_H2: PXQ2 DISABLED — the LM4 book is not fp16-exact, "
+                                    "so the half2 pair LUT would carry book error it must not carry\n");
+            return v;
+        }();
+        return ok ? nullptr : "pxq2-book-not-fp16-exact";
+    }
+    if (fmt == PXA_PXQ_FMT_P3) {
+        if (!(m & 2)) return "tier-bit-not-set-for-pxq3";
+        static const bool ok = [](){
+            static const float b[8] = PXQ3_BOOK_INIT;
+            const bool v = pxa_pxq23_book_ok(b, 8);
+            if (!v) fprintf(stderr, "PXA_PXQ_MMV_H2: PXQ3 DISABLED — the LM8 book is not fp16-exact, "
+                                    "so the half2 pair LUT would carry book error it must not carry\n");
+            return v;
+        }();
+        return ok ? nullptr : "pxq3-book-not-fp16-exact";
+    }
+    return "fmt-not-pxq2-or-pxq3";
+}
+
+// The bool view, for a caller that only needs the decision and not the reason. The one driver that
+// uses this lever (pxa_pxq_mmv_2d) reports why it declined, so it reads pxa_pxq_mmv_h2_why directly;
+// both go through the same control flow, so they cannot disagree.
+static inline bool pxa_pxq_mmv_h2_on(int cc, int fmt) {
+    return pxa_pxq_mmv_h2_why(cc, fmt) == nullptr;
+}
+
+#define PXQ6_PICK_H2(RET, NAME, K) \
+    static inline RET NAME(int fmt) { \
+        switch (fmt) { \
+            case PXA_PXQ_FMT_P2: return K<pxq6_pol_p2>; \
+            case PXA_PXQ_FMT_P3: return K<pxq6_pol_p3>; \
+            default:             return nullptr; \
+        } \
+    }
+PXQ6_PICK_H2(pxq6_mmv_fn,     pxq6_pick_mmv_h2,            k_pxq6_mmv_h2)
+PXQ6_PICK_H2(pxq6_mmv_ks_fn,  pxq6_pick_mmv_ksplit_h2,     k_pxq6_mmv_ksplit_h2)
+PXQ6_PICK_H2(pxq6_mmv_ksg_fn, pxq6_pick_mmv_ksplit_gen_h2, k_pxq6_mmv_ksplit_gen_h2)
+
+// first-fire / first-decline banner per device (phantom-lever discipline, the same shape the
+// split and TOK logs use): an armed lever that never prints ENGAGED did not run, and an A/B
+// against a lever that never ran is void, not null.
+// `cc` is printed on BOTH outcomes (bug pxq-mmv-h2-log-names-no-cc): the lever is arch-gated
+// to cc == 600 exactly, so a line that does not say which cc it was decided at cannot be checked
+// against the gate it claims to have passed. `why` names the gate that declined and is ignored on
+// the ENGAGED line -- the reason string is the only thing that separates "the lever was off" from
+// "the lever was on and this tier/arch has no kernel", which used to be one hardcoded sentence.
+static inline void pxa_pxq_mmv_h2_log(int device, int cc, int arm, bool fired, const char * why,
+                                      int fmt, int R, int K, int S) {
+    static std::atomic<uint32_t> seen{0};
+    if (device < 0 || device >= 8) return;
+    const uint32_t bit = 1u << (4*device + 2*(arm & 1) + (fired ? 0 : 1));
+    if (seen.fetch_or(bit) & bit) return;
+    static const char * arm_name[2] = { "plain/ksplit", "ksplit_gen" };
+    if (fired) {
+        fprintf(stderr, "PXA_PXQ_MMV_H2 dev%d: ENGAGED %s cc=%d fmt=%d (5=PXQ2 6=PXQ3) R=%d K=%d S=%d "
+                        "mode=%d — half2 pair-LUT decode, sm_60\n",
+                device, arm_name[arm & 1], cc, fmt, R, K, S, PXQ6_MODE_H2);
+    } else {
+        fprintf(stderr, "PXA_PXQ_MMV_H2 dev%d: DECLINED %s cc=%d fmt=%d R=%d K=%d S=%d -> exact fp32 "
+                        "decode (%s)\n",
+                device, arm_name[arm & 1], cc, fmt, R, K, S, why ? why : "unspecified");
+    }
+}
 
 // TOK-batched gateup gen-split picker (PXA_PXQ_TOKBATCH). Offered for the SHIPPED decode
 // sourcing only -- VECX=1 with MODE TAB, plus the P3-P3 PAIRL3 promotion (mirroring

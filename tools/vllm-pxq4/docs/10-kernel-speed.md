@@ -1,6 +1,6 @@
 # 10 — Decode kernel speed: diagnosis, K-chunk-split fix, measurements
 
-Date: 2026-08-18. Hardware: DGX-1V, V100-SXM2-32GB (sm_70, 80 SMs, ~900 GB/s HBM2).
+Date: 2026-08-18. Hardware: a 4x V100 host, V100-SXM2-32GB (sm_70, 80 SMs, ~900 GB/s HBM2).
 Artifact for serving numbers: `Qwen3.8-27B-PXQ4-vllm-p2a-nf` (norm-fixed, policy p2a,
 4.018 GiB/GPU/token at TP=4). Kernel change: commit `9916ea69`.
 

@@ -70,6 +70,9 @@ struct server_slot {
     int32_t n_prompt_tokens = 0;
     int32_t n_prompt_tokens_cache = 0;
     int32_t n_prompt_tokens_processed = 0;
+    // PXA_SLOT_FORK_v1: prompt tokens this request did NOT have to prefill because its prefix was
+    // forked off another slot's live KV. 0 whenever no fork happened.
+    int32_t n_prompt_tokens_forked = 0;
 
     json prompt; // can be either a string, array of strings or array of token ids
 
@@ -135,6 +138,17 @@ struct server_slot {
     bool do_checkpoint = false;
     bool image_just_processed = false;
 
+    // PXA_CKPT_EVICT: armed when this slot re-enters its cached prompt (a checkpoint restore or a
+    // prefix-reuse rewind), consumed by the next checkpoint this slot creates, which is therefore
+    // sitting at the turn boundary the traffic just came back to. Flag only; it changes which
+    // checkpoint is evicted under PXA_CKPT_EVICT=value and nothing else.
+    bool ckpt_mark_boundary = false;
+
+    // PXA_CKPT_EVICT instrumentation: restores served, and restores that came from a checkpoint
+    // this slot had already restored from at least once.
+    uint64_t ckpt_restores = 0;
+    uint64_t ckpt_restores_repeat = 0;
+
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
@@ -189,6 +203,7 @@ struct server_slot {
 
     // PXA_MTP_ADAPTIVE: acceptance-EMA-gated draft-length controller (np=1 only; see add_sampled_tokens)
     float spec_accept_ema      = 0.70f; // EMA of per-step draft acceptance ratio (optimistic cold start -> full drafts)
+    int   spec_load_depth_last = -1;   // PXA_SPEC_ADAPTIVE_LOAD: last depth this slot was given (log de-dup only)
     int   spec_probe_countdown = 0;     // skip-tier steps left until the next full-length probe draft
     int   spec_adaptive_tier   = 2;     // last applied tier (2 = full, 1 = cap-to-1, 0 = skip) for change logging
 
@@ -333,6 +348,34 @@ struct server_context {
     // Admission gate. Decides whether a prompt of n_prompt_tokens may enter the shared ring now.
     enum kv_admission { KV_ADMIT_OK, KV_ADMIT_DEFER, KV_ADMIT_REJECT };
     kv_admission kv_unified_admit(int32_t n_prompt_tokens, const server_slot * except, int32_t & n_free_out);
+    // ------------------------------------------------------------------------------------------
+
+    // ---- PXA_SLOT_FORK_v1 ---------------------------------------------------------------------
+    // Exact-prefix slot fork. With several slots sharing one ring, a request whose prompt begins
+    // with the exact tokens another slot is ALREADY holding does not need those K/V bytes computed
+    // again - the cells are there and correct. This forks them (metadata only), so the new request
+    // starts prefilling at the divergence point instead of at zero, and the ring stops carrying N
+    // copies of the same system/tool preamble.
+    //
+    // Lever PXA_SLOT_FORK=1, default OFF until measured on a real seat. Requires --kv-unified: with
+    // the ring statically partitioned a donor's cells are not addressable from another slot anyway.
+    // PXA_SLOT_FORK_MIN_GAIN (default 64) is the number of tokens the fork must beat the slot's own
+    // cache reuse by before it is worth the churn.
+    //
+    // The donor is never modified: forking only adds a second sequence id to cells it keeps, and a
+    // cell is not released until its last id is erased, so the donor keeps generating throughout.
+    static bool slot_fork_enabled();
+    static int32_t slot_fork_min_gain();
+
+    // Try to fork slot `dst`'s prompt prefix off another slot. Returns the number of prompt tokens
+    // saved (0 if no fork was made). On success dst.n_past / dst.cache_tokens describe the forked
+    // prefix; on any failure the destination is left in a clean cold-prefill state.
+    int32_t slot_fork_try(server_slot & dst);
+    void    slot_fork_reset_dst(server_slot & dst, llama_context * ctx_companion);
+
+    uint64_t n_slot_forks               = 0; // forks granted
+    uint64_t n_slot_fork_tokens_saved   = 0; // prompt tokens not prefilled thanks to them
+    uint64_t n_slot_fork_refused        = 0; // eligible-looking candidates refused (see the log line)
     // ------------------------------------------------------------------------------------------
 
     // system prompt

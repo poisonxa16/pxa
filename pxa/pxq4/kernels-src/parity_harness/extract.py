@@ -7,8 +7,8 @@ exactly the column-shard argument -- so `--panels 4` gives a real fixture at 1/2
 size of ffn_gate with no loss of test coverage.
 
     python -m parity_harness.extract \
-        --gguf /mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf \
-        --out  /mnt/models/pxa-fixtures/pxq4_real.npz \
+        --gguf $PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4.gguf \
+        --out  $PXA_MODELS_DIR/pxa-fixtures/pxq4_real.npz \
         --panels 4
 
 By default it takes one tensor of each of the six distinct PXQ4 shapes, plus the FULL

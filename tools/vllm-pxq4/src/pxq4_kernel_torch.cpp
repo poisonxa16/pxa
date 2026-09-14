@@ -1,10 +1,10 @@
 // pxq4_kernel_torch.cpp — torch operator bindings for the PXQ4 sm_70 kernels.
 //
 // NAMESPACE. The library is `pxq4`, deliberately NOT `_C`: the host vLLM fork
-// (github.com/KewaiiGamer/1Cat-vLLM) already owns `torch.ops._C` with 54 registered sm70 ops,
+// (the Volta vLLM port) already owns `torch.ops._C` with 54 registered sm70 ops,
 // and a second TORCH_LIBRARY(_C, ...) in the same process is a hard registration conflict.
 //
-// FROZEN ABI (plan §7.1) — components B and C agree on exactly this and nothing else:
+// FROZEN ABI — components B and C agree on exactly this and nothing else:
 //     pxq4::dequant_out(Tensor(a!) out, Tensor slabs, Tensor anchor) -> ()
 //     pxq4::mmv_out(Tensor(a!) out, Tensor x, Tensor slabs, Tensor anchor) -> ()
 //     pxq4::version() -> int
@@ -13,7 +13,7 @@
 // the frozen contract.
 //
 // META / FAKE KERNELS ARE NOT REGISTERED HERE. Per plan §6.7 the fake implementations live in
-// the runtime package (`src/pxq4_vllm/ops.py`, agent B) via torch.library.register_fake.
+// the runtime package (`src/pxq4_vllm/ops.py`, the vLLM plugin (ops.py/linear.py)) via torch.library.register_fake.
 // Registering a Meta kernel here as well would make that call raise on a duplicate
 // registration, so this TU registers CUDA implementations only. The two ops mutate their
 // first argument and return nothing, so the fakes are shape checks with no return value:

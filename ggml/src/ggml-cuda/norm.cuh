@@ -6,7 +6,13 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_node);
+
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// PXA_FUSE_SIBLINGS: N consecutive same-shape L2_NORM nodes in one launch (bit-identical, see
+// norm.cu). false = outside the merged kernel's envelope, nothing launched.
+bool ggml_cuda_op_l2_norm_multi(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, int n);
 
 void ggml_cuda_op_fused_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool is_norm = false);
 

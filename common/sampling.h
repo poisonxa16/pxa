@@ -362,7 +362,22 @@ std::vector<llama_token> llama_sampling_sample_and_accept_n(struct common_sample
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const std::vector<llama_token> & draft, bool grammar_first = false);
 
 // Greedy argmax sampling for speculative drafting
-llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob = nullptr);
+// PXA_MTP_PMIN_TOPK_v1: the largest top-k window the renormaliser will keep on the stack.
+#define COMMON_SAMPLER_PMIN_TOPK_MAX 64
+
+// The argmax's probability renormalised over the k largest logits -- what a `top_k = k`
+// sampler chain reports for its first candidate. `max_val` must be the argmax logit.
+// k < 2 or k >= n falls back to the full-vocabulary softmax. Exposed for tests/.
+float common_sampler_prob_topk_renorm(int n, const float * logits, float max_val, int k);
+
+// PXA_MTP_PMIN_TOPK_v1: `p_min_top_k` selects WHICH probability `out_prob` reports.
+//   0 (or >= n_vocab)  the full-vocabulary softmax of the argmax -- the historical quantity
+//   k >= 2             the argmax renormalised over the k largest logits
+// A confidence floor is only meaningful against the second quantity: on a 248320-token
+// vocabulary the full-vocab number has mean 0.036 and clears 0.75 in 0.0 % of draft steps
+// (measured 2026-09-08), so a 0.75 floor on it is an off switch, not a filter.
+// The top-k form is also cheaper: k exponentials instead of n_vocab.
+llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob = nullptr, int p_min_top_k = 0);
 
 // PXA_SPEC_RELAXED as the sampler resolves it (env, else the config level): true means a draft
 // token inside the target's post-filter candidate set with p >= pmin is kept at temp>0 instead of

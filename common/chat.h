@@ -217,6 +217,21 @@ struct common_chat_parser_params {
 // Check if the template supplied via "--chat-template" is supported or not. Returns true if it's valid
 bool common_chat_verify_template(const std::string & tmpl, bool use_jinja);
 
+// PXA_AUTO_JINJA_v1 (2026-09-10). Some architectures ship a canonical jinja chat template whose
+// turn markers are not in the built-in template map, and there is no near-enough built-in row to
+// fall back to: picking one would format the conversation wrongly and the model would answer a
+// prompt nobody wrote. Gemma 4 is the first: its turns are `<|turn>` / `<turn|>` and its channels
+// `<|channel>` / `<channel|>`, nothing like Gemma 3's `<start_of_turn>`, so the built-in "gemma"
+// row would be wrong even if it did match. Without --jinja the server logs a template parsing
+// error and serves chat with a template that is not the model's.
+//
+// So: when the caller gave neither --jinja nor --chat-template, and the model is one of those
+// architectures AND actually carries a template of its own, turn the jinja path on and SAY SO.
+// An explicit --jinja or --chat-template still decides; PXA_AUTO_JINJA=0 declines and says why.
+// Returns true when it flipped use_jinja.
+bool common_chat_auto_jinja(const struct llama_model * model, bool & use_jinja,
+                            const std::string & chat_template_override);
+
 void common_chat_templates_free(struct common_chat_templates * tmpls);
 
 struct common_chat_templates_deleter {

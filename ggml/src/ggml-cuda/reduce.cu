@@ -7,8 +7,12 @@
 
 #include "reduce.cuh"
 #include "ggml-common.h"
+#include "ggml-backend.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 
 template <typename T, int block_size>
 static __global__ void k_add(int nelem, const T * __restrict__ src, T * __restrict__ dst) {
@@ -117,6 +121,427 @@ static void copy_missing_tensors(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_set_device(ctx.device);
 }
 
+// ---------------------------------------------------------------------------
+// PXA_REDUCE_PINNED_v1 (2026-09-13) -- a low-latency third route for the
+// cross-device REDUCE of the graph/attn split on a two-card, no-NVLink pair.
+//
+// WHY. On the 2x V100 pair the graph/attn split issues 130 REDUCE ops per
+// forward pass (48 delta-net + 16 attention + 64 FFN + 2 in the MTP head),
+// every one of them [n_embd, n_tokens] F32 -- 20 KB at decode, 80 KB in the
+// MTP verify batch. That is a latency problem, not a bandwidth one, and the
+// existing decode route (the p2p-direct branch below) pays for it twice:
+//
+//   * per reduce it issues 4 cudaEventRecord + 4 cudaStreamWaitEvent + 2
+//     kernel launches + ~10 device switches to move 20 KB, and
+//   * because its kernel reads the PEER's partial out of peer DEVICE memory,
+//     the scheduler must prove the producer kernels COMPLETED before the
+//     reduce runs -- that is the per-reduce ggml_backend_synchronize in
+//     ggml_backend_sched_compute_splits(). 128 full pipeline drains per pass.
+//
+// THE ROUTE. Each device stages its own partial into its own pinned host
+// slot, publishes a strictly increasing arrival token, spins on the peer's
+// token, then reads the peer's slot and sums -- all inside ONE kernel,
+// launched on that device's OWN stream. No events, no host handshake, and
+// nothing reads peer device memory, so the scheduler's drain is not needed
+// either (see pxa_reduce_pinned_handles(), which the scheduler asks).
+//
+// BIT-IDENTITY. The wire type is the destination type: no narrowing on the
+// wire. The p2p-direct kernel computes a0+a1 on one card and a1+a0 on the
+// other; IEEE addition is commutative, so summing local+peer in destination
+// precision on both cards is bit-identical to the p2p route AND to a
+// single-device sum. tests/test-reduce-pinned.cu holds that to the bit.
+//
+// SLOT SAFETY WITHOUT AN EVENT. Call N writes host slot s = N % POOL. The
+// same slot is written again by call N+POOL. Our call N+1 cannot leave its
+// spin until the peer has entered ITS call N+1 phase 2, which on the peer's
+// stream is ordered after the peer's call N kernel has finished reading slot
+// s. Our call N+POOL is ordered after our call N+1 on our own stream, so the
+// slot is free by construction and the wraparound needs no cudaEvent at all.
+//
+// SAFETY VALVE. The spin is bounded (~10 s). On expiry the kernel sets a
+// mapped host flag and exits rather than wedging a card; the host reads the
+// flag and says so loudly. A wrong number that announces itself beats a GPU
+// that has to be reset.
+// ---------------------------------------------------------------------------
+
+#define PXA_RP_BLOCKS          8
+#define PXA_RP_THREADS         256
+#define PXA_RP_ARRIVAL_STRIDE  64                 // one cache line per (slot,rank,block)
+#define PXA_RP_POOL            4                  // host staging slots per device
+#define PXA_RP_BUF_BYTES       (1024u*1024u)      // per slot per device
+#define PXA_RP_SPIN_MAX        100000000ll        // ~10 s at __nanosleep(100)
+
+struct pxa_rp_host_mem {
+    uint8_t * host = nullptr;
+    uint8_t * dev  = nullptr;
+    cudaError_t alloc(size_t bytes) {
+        cudaError_t rc = cudaHostAlloc((void **)&host, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+        if (rc != cudaSuccess) { host = nullptr; return rc; }
+        rc = cudaHostGetDevicePointer((void **)&dev, host, 0);
+        if (rc != cudaSuccess) { cudaFreeHost(host); host = nullptr; dev = nullptr; }
+        return rc;
+    }
+};
+
+struct pxa_rp_pipeline {
+    int             dev[2]    = { 0, 1 };
+    size_t          buf_bytes = PXA_RP_BUF_BYTES;
+    long long       calls     = 0;
+    pxa_rp_host_mem buf[2];
+    pxa_rp_host_mem arrival;
+    pxa_rp_host_mem err;
+};
+
+static bool pxa_reduce_pinned_enabled() {
+    static const bool v = [](){ const char * e = getenv("PXA_REDUCE_PINNED"); return e && atoi(e) != 0; }();
+    return v;
+}
+
+// Built once, on the first predicate call. Returns nullptr when the route is off or the
+// machine does not qualify; the decision is therefore per-process and deterministic.
+static pxa_rp_pipeline * pxa_rp_get() {
+    static pxa_rp_pipeline * p = nullptr;
+    static bool tried = false;
+    if (tried) return p;
+    tried = true;
+    if (!pxa_reduce_pinned_enabled()) {
+        return nullptr;
+    }
+    auto & info = ggml_cuda_info();
+    if (info.device_count != 2) {
+        fprintf(stderr, "PXA_REDUCE_ROUTE: pinned requested but device_count=%d (needs exactly 2) -- staying on the existing routes\n", info.device_count);
+        return nullptr;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (info.devices[i].cc < CC_VOLTA) {
+            fprintf(stderr, "PXA_REDUCE_ROUTE: pinned requested but device %d has cc=%d (needs >= %d for __nanosleep) -- staying on the existing routes\n",
+                    i, info.devices[i].cc, CC_VOLTA);
+            return nullptr;
+        }
+    }
+    auto * q = new pxa_rp_pipeline();
+    const size_t arrival_bytes = (size_t)PXA_RP_POOL * 2 * PXA_RP_BLOCKS * PXA_RP_ARRIVAL_STRIDE;
+    const size_t staging_bytes = (size_t)PXA_RP_POOL * q->buf_bytes;
+    int cur_dev = 0;
+    cudaGetDevice(&cur_dev);
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; ++i) {
+        ggml_cuda_set_device(q->dev[i]);
+        ok = q->buf[i].alloc(staging_bytes) == cudaSuccess;
+    }
+    ggml_cuda_set_device(q->dev[0]);
+    ok = ok && q->arrival.alloc(arrival_bytes) == cudaSuccess;
+    ok = ok && q->err.alloc(sizeof(int)) == cudaSuccess;
+    if (ok) {
+        memset(q->arrival.host, 0, arrival_bytes);
+        memset(q->err.host, 0, sizeof(int));
+    }
+    ggml_cuda_set_device(cur_dev);
+    if (!ok) {
+        fprintf(stderr, "PXA_REDUCE_ROUTE: pinned requested but the pinned-host allocation failed -- staying on the existing routes\n");
+        delete q;
+        return nullptr;
+    }
+    fprintf(stderr, "PXA_REDUCE_ROUTE: pinned ON (PXA_REDUCE_PINNED=1) devices=%d,%d cc=%d,%d "
+                    "staging=%dx%zuKB/device arrival=%dx2x%dx%dB blocks=%d threads=%d drain-skip=ON\n",
+            q->dev[0], q->dev[1], info.devices[0].cc, info.devices[1].cc,
+            PXA_RP_POOL, (size_t)(q->buf_bytes >> 10), PXA_RP_POOL, PXA_RP_BLOCKS, PXA_RP_ARRIVAL_STRIDE,
+            PXA_RP_BLOCKS, PXA_RP_THREADS);
+    p = q;
+    return p;
+}
+
+static int * pxa_rp_arrival_ptr(const pxa_rp_pipeline * p, int slot, int rank) {
+    const size_t off = ((size_t)slot * 2 + rank) * PXA_RP_BLOCKS * PXA_RP_ARRIVAL_STRIDE;
+    return (int *)(p->arrival.dev + off);
+}
+
+template <typename T> static __device__ __forceinline__ T pxa_rp_add(T a, T b) { a += b; return a; }
+template <typename T> static __device__ __forceinline__ T pxa_rp_poison();
+template <> __device__ __forceinline__ float pxa_rp_poison<float>() { return __int_as_float(0x7fffffff); }
+template <> __device__ __forceinline__ half  pxa_rp_poison<half >() { return __ushort_as_half(0x7fff);   }
+
+// One kernel, three phases. sendbuf and recvbuf are the same in-place tensor.
+template <typename T>
+static __global__ void k_pxa_reduce_pinned(
+        const T * __restrict__ sendbuf,
+        T       * __restrict__ recvbuf,
+        T       * __restrict__ host_mine,
+        const T * __restrict__ host_other,
+        int                    count,
+        int   *                arrival_mine,
+        const int *            arrival_other,
+        int                    token,
+        int   *                err_flag) {
+
+    constexpr int VEC      = 16 / sizeof(T);   // one 16 B transaction, the widest single copy on Volta
+    constexpr int ARR_INTS = PXA_RP_ARRIVAL_STRIDE / sizeof(int);
+
+    const int tid  = threadIdx.x;
+    const int bid  = blockIdx.x;
+    const int gtid = bid * blockDim.x + tid;
+    const int gnt  = gridDim.x * blockDim.x;
+    const int nvec = count / VEC;
+    const int tail = nvec * VEC;
+
+    __shared__ int s_timed_out;
+    if (tid == 0) { s_timed_out = 0; }
+    __syncthreads();
+
+    // Phase 1: publish our own contribution into our pinned host slot.
+    for (int i = gtid; i < nvec; i += gnt) {
+        const int off = i * VEC;
+        *(int4 *)(host_mine + off) = *(const int4 *)(sendbuf + off);
+    }
+    if (bid == 0 && tid < count - tail) {
+        host_mine[tail + tid] = sendbuf[tail + tid];
+    }
+
+    __threadfence_system();   // commit the host writes before the token
+    __syncthreads();
+
+    // Phase 2: one arrival slot per block, so blocks proceed independently.
+    if (tid == 0) {
+        int       * mine  = arrival_mine  + bid * ARR_INTS;
+        const int * other = arrival_other + bid * ARR_INTS;
+        *(volatile int *)mine = token;
+        __threadfence_system();
+        long long spins = 0;
+        while (*(const volatile int *)other != token) {
+#if __CUDA_ARCH__ >= CC_VOLTA
+            __nanosleep(100);
+#endif
+            if (++spins > PXA_RP_SPIN_MAX) { *(volatile int *)err_flag = 1; s_timed_out = 1; break; }
+        }
+    }
+    __syncthreads();
+    __threadfence_system();   // acquire the peer's host writes
+
+    // Phase 3: local + peer, in destination precision, in place. A block whose arrival spin
+    // timed out writes NaN instead of a sum, so a missed handshake can never be mistaken for a
+    // number; the host aborts on the flag at the next reduce.
+    const bool bad = s_timed_out != 0;
+    for (int i = gtid; i < nvec; i += gnt) {
+        const int off = i * VEC;
+        T other[VEC];
+        *(int4 *)other = *(const int4 *)(host_other + off);
+        #pragma unroll
+        for (int k = 0; k < VEC; ++k) {
+            recvbuf[off + k] = bad ? pxa_rp_poison<T>() : pxa_rp_add(sendbuf[off + k], other[k]);
+        }
+    }
+    if (bid == 0 && tid < count - tail) {
+        recvbuf[tail + tid] = bad ? pxa_rp_poison<T>() : pxa_rp_add(sendbuf[tail + tid], host_other[tail + tid]);
+    }
+}
+
+// The one place eligibility is decided. The scheduler asks this before it drops the
+// per-reduce backend drain, and ggml_cuda_op_reduce asks the same function before it
+// takes the route -- they can never disagree.
+extern "C" bool pxa_reduce_pinned_handles(const struct ggml_tensor * dst) {
+    if (!dst || dst->op != GGML_OP_REDUCE)                  return false;
+    if ((ggml_op)dst->op_params[0] != GGML_OP_ADD)          return false;
+    if (dst->op_params[3] == 1)                             return false;  // reduce-OFF container
+    if (dst->op_params[1] != 2 || dst->op_params[2] != 2)   return false;  // nreduce == nhave == 2
+    if (dst->op_params[4] != 0)                             return false;  // every device holds a partial
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) return false;
+    if (dst->ne[1] >= 32)                                   return false;  // prefill keeps the ring path
+    if (!ggml_is_contiguous(dst))                           return false;
+    if (!dst->src[0] || !dst->src[1])                       return false;
+    return pxa_rp_get() != nullptr;
+}
+
+// Returns false only if something the predicate could not see makes the route impossible;
+// the caller then has to fall through, so keep this in step with the predicate.
+static bool pxa_reduce_pinned_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    auto * p = pxa_rp_get();
+    if (!p) return false;
+
+    auto & info = ggml_cuda_info();
+
+    if (p->err.host && *(volatile int *)p->err.host) {
+        fprintf(stderr, "PXA_REDUCE_PINNED: a cross-device arrival spin timed out (>%lld x 100 ns). The reduce that "
+                        "timed out wrote NaN rather than a number, so nothing downstream is trustworthy.\n",
+                (long long)PXA_RP_SPIN_MAX);
+        GGML_ABORT("PXA_REDUCE_PINNED: cross-device arrival spin timed out");
+    }
+
+    const int64_t ne        = ggml_nelements(dst);
+    const size_t  type_size = ggml_type_size(dst->type);
+    const size_t  max_chunk = p->buf_bytes / type_size;
+
+    for (int64_t start = 0; start < ne; start += (int64_t)max_chunk) {
+        const int64_t chunk = std::min((int64_t)max_chunk, ne - start);
+        const int     slot  = (int)(p->calls % PXA_RP_POOL);
+        const int     token = (int)(++p->calls);
+
+        for (int r = 0; r < 2; ++r) {
+            const int d    = p->dev[r];
+            const int peer = p->dev[1 - r];
+            ggml_cuda_set_device(d);
+            cudaStream_t stream = info.all_ctx[d]->stream();
+            char * data = (char *)dst->src[d]->data + (size_t)start * type_size;
+            void * mine  = p->buf[r    ].dev + (size_t)slot * p->buf_bytes;
+            void * other = p->buf[1 - r].dev + (size_t)slot * p->buf_bytes;
+            if (dst->type == GGML_TYPE_F16) {
+                k_pxa_reduce_pinned<half><<<PXA_RP_BLOCKS, PXA_RP_THREADS, 0, stream>>>(
+                    (const half *)data, (half *)data, (half *)mine, (const half *)other,
+                    (int)chunk, pxa_rp_arrival_ptr(p, slot, r), pxa_rp_arrival_ptr(p, slot, 1 - r),
+                    token, (int *)p->err.dev);
+            } else {
+                k_pxa_reduce_pinned<float><<<PXA_RP_BLOCKS, PXA_RP_THREADS, 0, stream>>>(
+                    (const float *)data, (float *)data, (float *)mine, (const float *)other,
+                    (int)chunk, pxa_rp_arrival_ptr(p, slot, r), pxa_rp_arrival_ptr(p, slot, 1 - r),
+                    token, (int *)p->err.dev);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    ggml_cuda_set_device(ctx.device);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// PXA_REDUCE_TIME_v1 (2026-09-13) -- what one reduce actually costs, per route.
+//
+// PXA_REDUCE_TIME=<n> prints a table every <n> completed samples. A ring of
+// event pairs is recorded around the route on the owner's stream and read back
+// lazily when its slot comes round again, so the hot path never synchronises;
+// a sample whose stop event is not ready yet is dropped rather than waited on.
+// The host clock around the same span is the enqueue cost -- the launches,
+// the event traffic and the device switches -- which is the half of the bill
+// the pinned route is meant to remove.
+// ---------------------------------------------------------------------------
+
+enum { PXA_RT_NONE = 0, PXA_RT_NCCL, PXA_RT_RING, PXA_RT_P2P, PXA_RT_STAGED, PXA_RT_PINNED, PXA_RT_N };
+
+static const char * pxa_rt_name(int r) {
+    switch (r) {
+        case PXA_RT_NCCL:   return "nccl";
+        case PXA_RT_RING:   return "ring";
+        case PXA_RT_P2P:    return "p2p-direct";
+        case PXA_RT_STAGED: return "staged-copy";
+        case PXA_RT_PINNED: return "pinned-host";
+        default:            return "unrouted";
+    }
+}
+
+#define PXA_RT_RING_N   64
+#define PXA_RT_NE1_MAX  8
+
+struct pxa_rt_bucket { long long n = 0; double gpu_us = 0, gpu_max = 0, host_us = 0, host_max = 0; };
+
+struct pxa_rt_state {
+    long long report_every = 0;
+    long long done         = 0;
+    pxa_rt_bucket b[PXA_RT_N][PXA_RT_NE1_MAX + 1];
+    // per-device event rings
+    cudaEvent_t ev_a[GGML_CUDA_MAX_DEVICES][PXA_RT_RING_N] = {};
+    cudaEvent_t ev_b[GGML_CUDA_MAX_DEVICES][PXA_RT_RING_N] = {};
+    int         ev_route[GGML_CUDA_MAX_DEVICES][PXA_RT_RING_N] = {};
+    int         ev_ne1  [GGML_CUDA_MAX_DEVICES][PXA_RT_RING_N] = {};
+    bool        ev_live [GGML_CUDA_MAX_DEVICES][PXA_RT_RING_N] = {};
+    int         head    [GGML_CUDA_MAX_DEVICES] = {};
+    bool        made    [GGML_CUDA_MAX_DEVICES] = {};
+};
+
+static pxa_rt_state & pxa_rt() {
+    static pxa_rt_state st = [](){
+        pxa_rt_state s;
+        const char * e = getenv("PXA_REDUCE_TIME");
+        s.report_every = e ? atoll(e) : 0;
+        return s;
+    }();
+    return st;
+}
+
+static void pxa_rt_report() {
+    auto & st = pxa_rt();
+    fprintf(stderr, "PXA_REDUCE_TIME: %lld samples\n", st.done);
+    fprintf(stderr, "PXA_REDUCE_TIME  %-12s %-5s %9s %10s %10s %10s %10s\n",
+            "route", "ne1", "n", "gpu_us", "gpu_max", "host_us", "host_max");
+    for (int r = 1; r < PXA_RT_N; ++r) {
+        for (int k = 0; k <= PXA_RT_NE1_MAX; ++k) {
+            const auto & b = st.b[r][k];
+            if (!b.n) continue;
+            fprintf(stderr, "PXA_REDUCE_TIME  %-12s %-5d %9lld %10.2f %10.2f %10.2f %10.2f\n",
+                    pxa_rt_name(r), k, b.n, b.gpu_us / b.n, b.gpu_max, b.host_us / b.n, b.host_max);
+        }
+    }
+}
+
+struct pxa_rt_scope {
+    int      dev  = -1;
+    int      slot = -1;
+    int      r    = PXA_RT_NONE;
+    int      ne1  = 0;
+    bool     on   = false;
+    std::chrono::steady_clock::time_point t0;
+
+    pxa_rt_scope(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+        auto & st = pxa_rt();
+        if (st.report_every <= 0) return;
+        on  = true;
+        dev = ctx.device;
+        ne1 = (int)std::min<int64_t>(dst->ne[1], PXA_RT_NE1_MAX);
+        if (!st.made[dev]) {
+            ggml_cuda_set_device(dev);
+            for (int i = 0; i < PXA_RT_RING_N; ++i) {
+                CUDA_CHECK(cudaEventCreate(&st.ev_a[dev][i]));
+                CUDA_CHECK(cudaEventCreate(&st.ev_b[dev][i]));
+            }
+            st.made[dev] = true;
+        }
+        slot = st.head[dev];
+        if (st.ev_live[dev][slot]) {
+            st.ev_live[dev][slot] = false;
+            if (cudaEventQuery(st.ev_b[dev][slot]) == cudaSuccess) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, st.ev_a[dev][slot], st.ev_b[dev][slot]) == cudaSuccess) {
+                    auto & b = st.b[st.ev_route[dev][slot]][st.ev_ne1[dev][slot]];
+                    const double us = ms * 1000.0;
+                    b.gpu_us += us;
+                    if (us > b.gpu_max) b.gpu_max = us;
+                }
+            }
+        }
+        CUDA_CHECK(cudaEventRecord(st.ev_a[dev][slot], ctx.stream()));
+        t0 = std::chrono::steady_clock::now();
+    }
+
+    void route(int rr) { r = rr; }
+
+    ~pxa_rt_scope() {
+        if (!on) return;
+        const double host_us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - t0).count();
+        auto & st = pxa_rt();
+        auto & ctxinfo = ggml_cuda_info();
+        ggml_cuda_set_device(dev);
+        cudaEventRecord(st.ev_b[dev][slot], ctxinfo.all_ctx[dev]->stream());
+        st.ev_route[dev][slot] = r;
+        st.ev_ne1  [dev][slot] = ne1;
+        st.ev_live [dev][slot] = true;
+        st.head[dev] = (slot + 1) % PXA_RT_RING_N;
+        auto & b = st.b[r][ne1];
+        b.n++;
+        b.host_us += host_us;
+        if (host_us > b.host_max) b.host_max = host_us;
+        if (++st.done % st.report_every == 0) {
+            pxa_rt_report();
+        }
+    }
+};
+
+// The scheduler drops its per-reduce backend drain for exactly the nodes the predicate above
+// accepts. Registered from a file-scope constructor; the slot it writes is a plain function
+// pointer, zero-initialised before any dynamic initialisation runs, so the order is safe.
+static struct pxa_reduce_pinned_registrar {
+    pxa_reduce_pinned_registrar() {
+        ggml_backend_set_reduce_pinned_predicate(&pxa_reduce_pinned_handles);
+    }
+} g_pxa_reduce_pinned_registrar;
+
 void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     auto op = (ggml_op)dst->op_params[0];
@@ -152,6 +577,22 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         return;
     }
 
+    // PXA_REDUCE_TIME_v1: times whichever route is taken, per route and per row count. The
+    // destructor closes the measurement on every return path below.
+    pxa_rt_scope _rt(ctx, dst);
+
+    // PXA_REDUCE_PINNED_v1: the third route. The scheduler has already dropped its per-reduce
+    // backend drain for exactly the nodes this predicate accepts, so a "yes" here is binding.
+    if (pxa_reduce_pinned_handles(dst)) {
+        if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH pinned-host\n");
+        _rt.route(PXA_RT_PINNED);
+        if (!pxa_reduce_pinned_run(ctx, dst)) {
+            GGML_ABORT("PXA_REDUCE_PINNED: the predicate accepted this reduce but the route refused it; "
+                       "the scheduler has already skipped the drain, so falling through would be unsound");
+        }
+        return;
+    }
+
     auto & info = ggml_cuda_info();
 #ifdef GGML_USE_NCCL
     // Somehow I'm not able to figure out how to use NCCL correctly.
@@ -176,6 +617,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
        (dst->type != GGML_TYPE_BF16 || bf16_supported)) {
         GGML_ASSERT(info.have_nccl);
         GGML_ASSERT(info.device_count == nreduce);
+        _rt.route(PXA_RT_NCCL);
         auto data_type = dst->type == GGML_TYPE_F32 ? ncclFloat : dst->type == GGML_TYPE_BF16 ? ncclBfloat16 : ncclHalf;
         ncclGroupStart();
         for (int i = 0; i < nreduce; ++i) {
@@ -296,6 +738,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
     //
     if (dst->ne[1] >= 32) {
         if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH ring(ne1>=32)\n");
+        _rt.route(PXA_RT_RING);
         auto nelem = ggml_nelements(dst);
         auto tt = ggml_internal_get_type_traits(dst->type);
         GGML_ASSERT(nelem % tt.blck_size == 0);
@@ -467,6 +910,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
     }
     if (dst->ne[1] < 32 && ctx.p2p_enabled) {
         if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH p2p-direct\n");
+        _rt.route(PXA_RT_P2P);
         GGML_ASSERT(dst->type != GGML_TYPE_Q8_0);
         // PXA_REDUCE_CAPTURE: make this cross-device direct-peer reduce CUDA-graph-capturable.
         static const bool _pxa_rc = getenv("PXA_REDUCE_CAPTURE") != nullptr;
@@ -584,6 +1028,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         return;
     }
     if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH staged-copy(no-p2p)\n");
+    _rt.route(PXA_RT_STAGED);
     auto required_size = nbytes*(nhave-1);
     if (required_size > ctx.copy_size) {
         if (ctx.copy_buffer) {

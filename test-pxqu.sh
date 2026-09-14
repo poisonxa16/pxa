@@ -7,8 +7,8 @@
 #   decode grep     : `grep "eval time" | head -1` matches "prompt eval time" FIRST.
 #                     That reported prefill as decode once already. Filter, do not head.
 #   no rm of logs   : an earlier A/B deleted each arm's output. Keep every log.
-#   nvidia-smi read : card 0 carries ~8.4 GiB of production granite. -ts must respect it.
-#   card 3 refusal  : production VLM + embeddings. Opt-in only, with a ceiling.
+#   nvidia-smi read : card 0 already has ~8.4 GiB in use by another model. -ts must respect it.
+#   card 3 refusal  : carries a resident VLM + embeddings. Opt-in only, with a ceiling.
 set -u
 # Set PXQ_HOST_GUARD to pin this script to one host.
 [ -n "${PXQ_HOST_GUARD:-}" ] && [ "$(hostname)" != "$PXQ_HOST_GUARD" ] && \
@@ -57,7 +57,7 @@ docker run --rm --runtime=nvidia \
   -v "$(dirname "$MODEL")":"$(dirname "$MODEL")":ro \
   -v "$(cd "${LOGDIR:-.}" && pwd)":"$(cd "${LOGDIR:-.}" && pwd)" \
   -w /src --name "pxqu-test-$MODE-$TAG" \
-  pxa-sm60-dev:latest \
+  "${IMAGE:-pxa-sm60-dev:latest}" \
   /src/build-cuda/bin/llama-cli \
     -m "$MODEL" -ngl 99 -ts "$TS" \
     -ot 'per_layer_token_embd\.weight=CPU' \

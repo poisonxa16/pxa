@@ -255,6 +255,10 @@ extern "C" {
         MTP_OP_WARMUP           = 1,
         MTP_OP_UPDATE_ACCEPTED  = 2,
         MTP_OP_DRAFT_GEN        = 3,
+        // PXA_MTP_DRAFT_CACHE_ONLY: advance the MTP head's K/V cache over already-verified tokens
+        // and nothing else -- no query, no attention, no output projection, no FFN, no LM head.
+        // Only legal when the caller wants zero outputs; see common/pxa-mtp-cache-only.h.
+        MTP_OP_KV_ONLY          = 4,
     };
 
     typedef struct llama_token_data {
@@ -409,6 +413,10 @@ extern "C" {
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
+        // PXA_RS_RING: number of recurrent-state snapshot planes kept per sequence for
+        // speculative rollback (0 = off, today's behaviour). Only honoured when the
+        // PXA_RS_RING lever is on; see src/llama-context.h.
+        uint32_t n_rs_seq;
         uint32_t n_threads;         // number of threads to use for generation
         uint32_t n_threads_batch;   // number of threads to use for batch processing
         int32_t  max_extra_alloc;   // Max. additional VRAM the scheduler is allowed to allocate
@@ -749,6 +757,14 @@ extern "C" {
     // default cannot be honored at one site and ignored at another.
     LLAMA_API bool llama_pxa_mtp_lazy_warmup(void);
 
+    // PXA_MTP_READBACK_v1: whether an MTP head graph marks its own feature row a graph
+    // output. Default 1, and it should stay 1 -- that row is the conditioning hidden the
+    // next draft step is decoded from, and without the flag ggml-alloc may hand its buffer
+    // to a later node once the head's lm_head has consumed it. PXA_MTP_HEAD_OUTPUT=0
+    // reproduces the stale read-back (measured 2026-09-08) and exists only so a
+    // single binary can be A/B'd fix-on vs fix-off. Never a shipping setting.
+    LLAMA_API bool llama_pxa_mtp_head_output(void);
+
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);
@@ -840,6 +856,16 @@ extern "C" {
     LLAMA_API bool llama_model_is_hybrid(const struct llama_model * model);
 
     LLAMA_API bool llama_model_has_recurrent(const struct llama_model * model);
+
+    // PXA_MTP_DRAFT_CACHE_ONLY: true when this model's MTP head can be decoded as a K/V-only
+    // refresh (MTP_OP_KV_ONLY) -- a supported architecture with a single grafted NextN layer.
+    LLAMA_API bool llama_model_supports_mtp_kv_only(const struct llama_model * model);
+
+    // PXA_MTP_BATCH_SLOTS_ROWS_v1: true when this model's MTP draft graph (MTP_OP_DRAFT_GEN) sizes
+    // its conditioning-hidden input by the batch token count, so one decode may carry a row per
+    // drafting sequence. False means the graph takes exactly one hidden row per decode and a
+    // multi-row draft batch would be built with mismatched tensors -- callers must draft serially.
+    LLAMA_API bool llama_model_supports_mtp_multi_row_draft(const struct llama_model * model);
 
     // Returns true if the model is a Gemma 4 MTP assistant (external frozen-KV speculative drafter)
     LLAMA_API bool llama_model_is_gemma4_mtp_assistant(const struct llama_model * model);
@@ -985,6 +1011,14 @@ extern "C" {
     // Initialise the checkpoint system for the upcoming speculation window.
     LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
 
+    // The largest per-step checkpoint capacity (drafted + 1) this context can afford: the per-step
+    // recurrent buffers scale linearly with the draft length, and an allocation that merely fits
+    // can still leave a device with too little room for the compute pool it grows into during
+    // decode. Returns want_max_tokens when nothing needs clamping, or 1 when not even a two-token
+    // capacity is affordable (the caller should then leave the checkpoint mode alone).
+    // PXA_CKPT_BUDGET=0 disables it; PXA_CKPT_BUDGET_MARGIN_MB sets the headroom (default 256).
+    LLAMA_API int llama_spec_ckpt_budget_max_tokens(struct llama_context * ctx, int want_max_tokens);
+
     // Save the current recurrent state as a speculative checkpoint.
     LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
 
@@ -1015,6 +1049,31 @@ extern "C" {
                     llama_seq_id   seq_id_src,
                     llama_seq_id   seq_id_dst,
                        llama_pos   p0,
+                       llama_pos   p1);
+
+    // PXA_SLOT_FORK_v1: repoint sequence `seq_id_dst`'s attention-KV prefix [0, p1) onto the
+    // cells that sequence `seq_id_src` already holds, without copying a single K/V byte.
+    // Equivalent to dropping the destination's own duplicate of [0, p1) and then tagging the
+    // source's cells in that range with the destination sequence id, which under one shared
+    // (unified) ring is pure cell metadata. The source sequence is left completely untouched
+    // and keeps serving: the shared cells simply carry two sequence ids, and a later removal
+    // on either side only drops that side's tag.
+    //
+    // The destination's non-attention per-sequence state (recurrent/SSM rows, the PLE window)
+    // is NOT derived from cells and is therefore NOT touched here - the caller owns it. For a
+    // hybrid/recurrent model the caller must have placed the destination's state for exactly
+    // the boundary p1 into the destination's own row first (llama_state_seq_set_data with
+    // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY does exactly that); this call then re-asserts the
+    // destination's state-row binding so the next graph reads that row.
+    //
+    // Returns the number of cells the destination now shares with the source, or -1 when the
+    // cache cannot support the operation (pure-recurrent cache, or a degenerate argument).
+    // Callers must verify the result against the prefix they asked for - a short count means
+    // the source's own prefix was incomplete and the fork must be abandoned.
+    LLAMA_API int32_t llama_kv_cache_seq_share_prefix(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id_src,
+                    llama_seq_id   seq_id_dst,
                        llama_pos   p1);
 
     // Removes all tokens that do not belong to the specified sequence

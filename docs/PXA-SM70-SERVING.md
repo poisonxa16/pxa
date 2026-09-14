@@ -170,11 +170,11 @@ above reads NVML instead of trusting the image label.
 
 ## Engine base
 
-The image is built from our fork of 1Cat-vLLM at tag **v1.5.0** plus the PXA commits
+The image is built from my fork of the Volta vLLM port at tag **v1.5.0** plus the PXA commits
 (the Pascal port, the short-prefill guard, the build recipe, the vendored PXQ4
 sidecar). The shipped tags are `ghcr.io/poisonxa16/pxa-vllm:sm70` and
 `ghcr.io/poisonxa16/pxa-vllm:sm60`; the images built from the previous base are kept
-as `:sm70-v1cat-8f5d78e` and `:sm60-v1cat-8f5d78e` so a regression can be bisected
+as `:sm70-v15-8f5d78e` and `:sm60-v15-8f5d78e` so a regression can be bisected
 against the exact bytes that produced the earlier numbers.
 
 What that base changes for this seat, and what it does not, is written up once in

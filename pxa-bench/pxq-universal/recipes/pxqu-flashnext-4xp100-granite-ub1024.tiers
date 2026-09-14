@@ -28,7 +28,7 @@
 #         "Setting default device in layer N" lines and rebalance from the log, never
 #         from memory). ub2048 is NOT attempted: the head-card compute buffer carries
 #         the n_vocab*n_ubatch logits slab and the 5-card campaign already measured the
-#         miss; ub1024 is the owner floor and the measured sweet spot.
+#         miss; ub1024 is the floor here and the measured sweet spot.
 #
 # WHAT CHANGED vs PARENT (the ONLY change):
 #   ffn_gate_exps + ffn_up_exps stepped pxq3 -> pxq2 on layers 19..43 (50 rules,

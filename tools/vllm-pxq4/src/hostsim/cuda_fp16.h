@@ -7,7 +7,7 @@
 // project's gates G1/G3 are CPU-only by design, but they only exercise a numpy reference —
 // they cannot see the .cuh. This shim closes that hole: the *actual* kernel source is compiled
 // and run on the CPU, block by block, with real threads and a real barrier, so a numpy-vs-
-// kernel-source bit-exactness test can run on any machine before the GPU lease is ever taken.
+// kernel-source bit-exactness test can run on any machine before any GPU is needed.
 //
 // It is a TEST harness. It is never compiled into the shipped .so.
 //

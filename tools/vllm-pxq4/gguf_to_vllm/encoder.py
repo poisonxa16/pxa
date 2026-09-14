@@ -32,7 +32,7 @@ ALWAYS ENCODE A WHOLE TENSOR FROM ROW 0. ``row0`` seeds the deterministic tie-br
 weights. The binding below has no row0 parameter for that reason: there is no legitimate
 caller for a partial encode.
 
-The extension is not built by this component (plan §9: agent C owns ``csrc/``). If
+The extension is not built by this component (plan §9: the CUDA kernel (csrc/) owns ``csrc/``). If
 ``--encoder`` is not given, a P2 policy fails loudly at planning time rather than silently
 falling back to fp16 — a silent fallback would produce a checkpoint that loads, runs, and is
 simply slower than advertised, which is the hardest kind of bug to notice.

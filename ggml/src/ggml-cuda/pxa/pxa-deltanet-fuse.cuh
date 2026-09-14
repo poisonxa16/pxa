@@ -13,20 +13,25 @@
 //   GET_ROWS(state) + MUL(reset mask)                   2 kernels -> 1  (pxa_dn_gather_mask_f32)
 //   CONCAT(new row) + SET_ROWS(scatter to cache)        2 kernels -> 0  (written in place)
 //
-// Env gate: PXA_FUSE_DELTANET (bitmask, default 3 = bits 0|1; =0 restores the eager path)
+// Env gate: PXA_FUSE_DELTANET (bitmask, default 53 = bits 0|2|4|5; =0 restores the eager path)
 //   bit0 (1): the qk-norm/state-writeback cluster (anchored at the SILU node; consumes the
 //             23-node SILU..CONCAT window incl. the already-fused ADD+SOFTPLUS+MUL beta-gate).
 //             GUARDED: fires only on the exact in-place state alias (PXA_FUSE_DELTANET_WAR).
 //   bit1 (2): the out-gate rms+silu fusion (anchored at FUSED_RMS_NORM). GUARDED: the
 //             sole-consumer claim is verified against the graph, not asserted.
 //   bit2 (4): the state-row gather+reset-mask fusion (anchored at GET_ROWS; both dsts written,
-//             so it makes no dead-store claim). OFF by default -- measured never to match the
-//             live decode graph; bit-exact and free, but unexercised. =7 re-arms it.
+//             so it makes no dead-store claim). IN the shipped default -- 53 = bits 0|2|4|5. The
+//             "OFF by default ... measured never to match the live decode graph ... =7 re-arms
+//             it" text that stood here was true from 2026-09-03 to 2026-09-09 (the bit was
+//             carried armed-but-dead) and is superseded twice over: the default has included
+//             bit2 since the 2026-09-04 re-cut, so "=7 re-arms it" is void, and the 2026-09-09
+//             reason census named the real cause. See the HISTORY note and the census further
+//             down this file. Bit-exact and free.
 //   bit3 (8): LEGACY row absorb. Absorb the trailing SET_ROWS by writing the new row straight
 //             into the cache row. OFF by default; it is held to pxa_dn_scatter_dst_safe(), the
 //             same exact-alias predicate as bit0, so on the SAFE carry it can never fire. Kept
 //             only as the historical reproducer; bit5 is the shippable form.
-//   bit4 (16): SAFE-CARRY cluster (2026-09-03, decode2 lane). Exactly bit0's three kernels, but
+//   bit4 (16): SAFE-CARRY cluster (2026-09-03). Exactly bit0's three kernels, but
 //             the conv tail and the new ssm state are written into CC's OWN storage -- the
 //             destination the graph allocated for the CONCAT -- instead of into the recurrent
 //             cache row. Nothing is written outside the graph's dataflow, so the exact-alias
@@ -41,13 +46,16 @@
 //             tensor's storage -- i.e. there is provably no reader of the old row contents in the
 //             window the early write opens. See pxa_dn_row_window_clear(); the scan itself is
 //             printable with PXA_DN_ROWSCAN=1, which NAMES any such reader.
-//   bits 0|1 default ON: measured +3.7% P100 decode on the published U16 config (docs/LEVERS.md
+//   SHIPPED DEFAULT = 53 = bits 0|2|4|5 (pxa_fuse_deltanet_default(), pxa-enhance.cuh:420;
+//   REFERENCE -> 0 = eager path). bit1 is OUT of the default since 2026-09-04 -- see the bit1
+//   note below. The historical speed number belongs to the mask it was actually measured on:
+//   bits 0|1 (mask 3) measured +3.7% P100 decode on the published U16 config (docs/LEVERS.md
 //   §2), bit-exact vs the eager kernels; pattern mismatch still falls through to eager per-node.
 //
 // Correctness notes:
 //  - Pure eval-time pattern fusion: the ggml graph is UNCHANGED; only the launched kernel
 //    sequence differs. Any structural mismatch falls through to the eager per-node path.
-//  - Bit-exact math vs the eager kernels: silu x/(1+e^-x); l2_norm rsqrtf(fmaxf(sumsq,eps^2));
+//  - Bit-exact math vs the eager kernels: silu x/(1+e^-x); l2_norm rsqrtf(sumsq+eps);
 //    fused_rms_norm rsqrtf(sumsq/ncols+eps) * w; fused_mul_unary(SILU, no-limit) silu(z)*y.
 //  - The state-row conv-tail write (kernel B) is ordered AFTER the SSM_CONV read of the same
 //    region by stream order; the delta-net in-place ssm-state update is race-free because every
@@ -138,7 +146,7 @@ static inline bool pxa_dn_scatter_dst_safe(const ggml_tensor * SR, const ggml_te
 }
 
 // ---------------------------------------------------------------------------------------------
-// decode2 lane, 2026-09-03: the reader-set scan behind bit5 (and the PXA_DN_ROWSCAN diagnostic).
+// 2026-09-03: the reader-set scan behind bit5 (and the PXA_DN_ROWSCAN diagnostic).
 //
 // bit3's defect was never an arithmetic one: it wrote the packed state row EARLY (at the top of
 // the cluster, instead of at the trailing SET_ROWS) and asserted -- in a comment -- that "nobody
@@ -335,7 +343,9 @@ static __global__ void pxa_dn_silu_qknorm_f32(
             __syncthreads();
             sumsq = smem[0];
         }
-        const float scale = rsqrtf(fmaxf(sumsq, eps*eps));
+        // PXA_KERNFIX 2026-09-09 (defect B): reference GDN L2 norm, eps added under the sqrt;
+        // kept bit-exact against the eager l2_norm kernel it replaces (norm.cu l2_norm_f32).
+        const float scale = rsqrtf(sumsq + eps);
         float * dstp = (int)blockIdx.x < nh ? qn + blockIdx.x*hd : kn + (blockIdx.x - nh)*hd;
         nv = 0;
         for (int c = tid; c < hd; c += blockDim.x) {
@@ -400,50 +410,248 @@ static __global__ void pxa_dn_gather_mask_f32(
 // The read side of the safe gather/scatter state path is the reason PXA_DN_NP1_FASTPATH could be
 // turned off (it aliased the live cache row); this keeps that fix and takes back part of its cost.
 //
-// STATUS 2026-09-03: this pattern DOES NOT CURRENTLY FIRE on the Qwable-27B decode graph, and the
-// bit claims no win. Evidence, PXA_PROFILE at bs=1 decode, per token: MUL stays at 64 with the bit
-// on and 64 with it off (a fire would drop it by 48), and PXA_FUSE_DELTANET=7 is byte-identical to
-// =3 on the greedy sha. The most likely cause is that the scheduler puts a split boundary between
-// the GET_ROWS and the MUL -- the mask is a host-buffer INPUT, so the split that consumes it can
-// start at the MUL -- in which case nodes[i+1] is simply not the MUL and the match falls through
-// to eager. Left armed because the check is one compare per GET_ROWS and it is exact when it does
-// match, but do NOT credit it in any table until a profile shows MUL at 16 per token.
+// HISTORY 2026-09-03 .. 2026-09-09. From 2026-09-03 to 2026-09-09 this pattern never fired on the
+// live decode graph, and the bit was carried as armed-but-dead. The 2026-09-03 note guessed a
+// scheduler split boundary between the GET_ROWS and the MUL; the reason census below (added
+// 2026-09-09) was written to replace the guess with a count, and the count named a different
+// cause. See the "WHY IT DID NOT FIRE" note above pxa_dn_gm_reason_name().
+//
+// Deliberately NOT a dead-store fusion: both destinations are written, so no claim is made about
+// who else in the graph reads the GET_ROWS output. What it buys is the launch and the re-READ of
+// the ~4 MB state row that the eager MUL would do -- per delta-net layer, per token.
+
+// ---------------------------------------------------------------------------------------------
+// bit2 reason census. The old instrument answered "did it fire" (once, and only for an op-code
+// mismatch); every other decline returned silently, so a dead lever looked exactly like a lever
+// whose shape guard was one field off. This one names the FIRST predicate that rejected each
+// candidate site, so the log says which line to fix instead of which line to suspect.
+//
+// PXA_FUSE_DELTANET_LOG=1   reason histogram (dumped every 20000 decisions AND at exit)
+// PXA_DN_GM_DUMP=<n>        print the node neighbourhood of the first n candidate sites
+// PXA_DN_GM_WINDOW=<n>      how many REAL nodes ahead to look for the MUL (default 1 = the
+//                           historical "next non-no-op node"; >1 hoists the multiply over the
+//                           nodes in between, which pxa_dn_gm_window_safe() must prove is legal)
+enum pxa_dn_gm_reason {
+    PXA_DN_GM_FIRE = 0,   // fused
+    PXA_DN_GM_EOG,        // no candidate MUL before the end of this split -- the split-boundary case
+    PXA_DN_GM_NO_MUL,     // a MUL consuming this gather is not inside the window
+    PXA_DN_GM_TYPE,       // F32/I32 type guard
+    PXA_DN_GM_SHAPE,      // 2-D gather / index shape guard
+    PXA_DN_GM_CONTIG,     // contiguity / stride guard
+    PXA_DN_GM_MASK,       // the second MUL operand is not a [1, n_seqs] broadcast mask
+    PXA_DN_GM_SMALL,      // gather narrower than the 4096-column floor: not the state row
+    PXA_DN_GM_DEVICE,     // the pair straddles two CUDA devices
+    PXA_DN_GM_UNSAFE,     // a node between the pair forbids moving the multiply up to the gather
+    PXA_DN_GM_FULL,       // the absorb table is full (never expected; declines rather than skips)
+    PXA_DN_GM_COUNT
+};
+
+static const char * pxa_dn_gm_reason_name(int r) {
+    switch (r) {
+        case PXA_DN_GM_FIRE:   return "fired";
+        case PXA_DN_GM_EOG:    return "end-of-split";
+        case PXA_DN_GM_NO_MUL: return "no-mul-in-window";
+        case PXA_DN_GM_TYPE:   return "type";
+        case PXA_DN_GM_SHAPE:  return "shape";
+        case PXA_DN_GM_CONTIG: return "contig";
+        case PXA_DN_GM_MASK:   return "mask-shape";
+        case PXA_DN_GM_SMALL:  return "too-narrow";
+        case PXA_DN_GM_DEVICE: return "cross-device";
+        case PXA_DN_GM_UNSAFE: return "window-unsafe";
+        case PXA_DN_GM_FULL:   return "absorb-table-full";
+    }
+    return "?";
+}
+
+static std::atomic<long> pxa_dn_gm_counts[PXA_DN_GM_COUNT];
+
+static void pxa_dn_gm_dump_census(void) {
+    long total = 0;
+    for (int r = 0; r < PXA_DN_GM_COUNT; ++r) total += pxa_dn_gm_counts[r].load(std::memory_order_relaxed);
+    if (total == 0) return;
+    fprintf(stderr, "==== PXA_FUSE_DELTANET bit2 gather+mask census (mask=%d, sites=%ld) ====\n",
+            pxa_fuse_deltanet_mask(), total);
+    for (int r = 0; r < PXA_DN_GM_COUNT; ++r) {
+        const long v = pxa_dn_gm_counts[r].load(std::memory_order_relaxed);
+        if (v) fprintf(stderr, "  %-18s %ld\n", pxa_dn_gm_reason_name(r), v);
+    }
+    fflush(stderr);
+}
+
+static inline bool pxa_dn_gm_log_on() {
+    static const bool on = getenv("PXA_FUSE_DELTANET_LOG") != nullptr;
+    return on;
+}
+
+// The 20000-decision threshold the fire census uses means a short run -- a fixture, a smoke, a
+// twenty-token needle -- printed nothing at all, which is how a dead lever stayed invisible.
+// Dump at exit as well, so every run that touched a site reports what it saw.
+static void pxa_dn_gm_tally(int reason) {
+    if (!pxa_dn_gm_log_on()) return;
+    static const bool armed = [] { atexit(pxa_dn_gm_dump_census); return true; }();
+    (void) armed;
+    static std::atomic<long> seen{0};
+    pxa_dn_gm_counts[reason].fetch_add(1, std::memory_order_relaxed);
+    if ((seen.fetch_add(1, std::memory_order_relaxed) + 1) % 20000 == 0) pxa_dn_gm_dump_census();
+}
+
+// The neighbourhood print: for the first n candidate sites, every node from the gather to the end
+// of the search window, with the op, the name and the shape. This is what turns "it declines" into
+// "node[i+1] is a CONT named conv_states, so the MUL is three nodes further on".
+static void pxa_dn_gm_site_dump(const ggml_cgraph * cgraph, int i, int j, int window, int reason) {
+    static const int budget = [] {
+        const char * e = getenv("PXA_DN_GM_DUMP");
+        return e ? atoi(e) : 0;
+    }();
+    static std::atomic<int> left{budget};
+    if (budget <= 0) return;
+    // don't spend the budget on the graph's token-embedding and expert-weight gathers
+    if (reason == PXA_DN_GM_SMALL) return;
+    if (left.fetch_sub(1) <= 0) return;
+    const ggml_tensor * G = cgraph->nodes[i];
+    fprintf(stderr, "PXA_DN_GM site node[%d] %s ne=[%lld,%lld] -> %s (mul@%d, n_nodes=%d)\n",
+            i, G->name, (long long) G->ne[0], (long long) G->ne[1],
+            pxa_dn_gm_reason_name(reason), j, cgraph->n_nodes);
+    const int hi = j > 0 ? j : (i + window < cgraph->n_nodes ? i + window : cgraph->n_nodes - 1);
+    for (int k = i; k <= hi && k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        fprintf(stderr, "    node[%4d] %-18s %-20s ne=[%lld,%lld,%lld,%lld] %s\n",
+                k, ggml_op_name(n->op), n->name,
+                (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                ggml_is_noop(n) ? "(no-op)" : "");
+    }
+    fflush(stderr);
+}
+
+static int pxa_dn_gm_decline(const ggml_cgraph * cgraph, int i, int j, int window, int reason) {
+    pxa_dn_gm_tally(reason);
+    pxa_dn_gm_site_dump(cgraph, i, j, window, reason);
+    // keep the old fired/declined row meaning what it always meant: candidate STATE gathers only,
+    // not every narrow get_rows in the graph.
+    if (reason != PXA_DN_GM_FIRE && reason != PXA_DN_GM_SMALL) pxa_dn_fire_log("gather-mask", false);
+    return 0;
+}
+
+// The multiply is executed at the gather's position, so any node the graph put BETWEEN them now
+// runs after a write it used to run before. Absorbing is legal only when no node strictly inside
+// the window touches the multiply's destination storage (ggml-alloc is free to have placed it over
+// a tensor those nodes still read) and none of them writes the mask the fused kernel reads.
+static bool pxa_dn_gm_window_safe(const ggml_cgraph * cgraph, int i, int j,
+                                  const ggml_tensor * M, const ggml_tensor * MSK) {
+    for (int k = i + 1; k < j; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (ggml_is_noop(n)) continue;
+        if (!pxa_dn_disjoint(M->data, ggml_nbytes(M), n)) return false;         // clobbers/reads our dst
+        if (!pxa_dn_disjoint(MSK->data, ggml_nbytes(MSK), n)) return false;     // rewrites the mask
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (!n->src[s]) continue;
+            if (!pxa_dn_disjoint(M->data, ggml_nbytes(M), n->src[s])) return false;
+        }
+    }
+    return true;
+}
+
+// Nodes whose work was already done by an earlier fused launch in this same graph-compute pass.
+// The table self-drains: every entry is registered for a node index strictly ahead of the current
+// one and removed when the dispatcher reaches it. It is also cleared at the start of every graph
+// compute so an aborted pass cannot leak an entry into the next one.
+#define PXA_DN_GM_ABSORB_MAX 16
+static thread_local const ggml_tensor * pxa_dn_gm_absorbed[PXA_DN_GM_ABSORB_MAX];
+static thread_local int pxa_dn_gm_absorbed_n = 0;
+
+static inline void pxa_dn_gm_absorb_reset() { pxa_dn_gm_absorbed_n = 0; }
+
+static inline bool pxa_dn_gm_absorb_take(const ggml_tensor * t) {
+    for (int k = 0; k < pxa_dn_gm_absorbed_n; ++k) {
+        if (pxa_dn_gm_absorbed[k] == t) {
+            pxa_dn_gm_absorbed[k] = pxa_dn_gm_absorbed[--pxa_dn_gm_absorbed_n];
+            return true;
+        }
+    }
+    return false;
+}
+
+// WHY IT DID NOT FIRE (census, 2026-09-09):
+//
+// Fires on the GET_ROWS node when a MUL that consumes it sits inside the search window. Returns
+// the number of nodes consumed beyond the GET_ROWS (the caller advances by it), or 0 for no match.
+// When the MUL is not the next real node, the nodes in between still run in their own place and
+// the MUL alone is marked absorbed, so node coverage is exactly the eager set either way.
 static int pxa_try_deltanet_gather_mask(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     if (!(pxa_fuse_deltanet_mask() & 4)) return 0;
-    if (i + 1 >= cgraph->n_nodes) return 0;
-    // decode2 2026-09-03: the pair is not always ADJACENT in the node list -- the reshape/view
-    // nodes the graph builder emits between them are no-ops the executor already skips, but the
-    // old i+1 test treated one as a mismatch and the bit never fired. Skip no-ops (and nothing
-    // else) when looking for the MUL; the count of consumed nodes is returned so the caller
-    // advances past exactly the nodes covered here.
-    int j = i + 1;
-    while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])) ++j;
-    if (j >= cgraph->n_nodes) return 0;
     const ggml_tensor * G = cgraph->nodes[i];      // GET_ROWS
-    const ggml_tensor * M = cgraph->nodes[j];      // MUL by the state mask
-    if (G->op != GGML_OP_GET_ROWS || M->op != GGML_OP_MUL) { pxa_dn_fire_log("gather-mask", false); return 0; }
-    if (M->src[0] != G || !M->src[1]) return 0;
+    if (G->op != GGML_OP_GET_ROWS) return 0;       // not a candidate site: not counted
+
+    // Default 1 = the historical semantics: the multiply must be the next REAL node (no-ops never
+    // count). The real graph satisfies that -- the node dump shows GET_ROWS, VIEW(state mask), MUL --
+    // so the shipped behaviour change is the device guard above and nothing else. A larger window
+    // lets the multiply be hoisted over intervening real nodes, which pxa_dn_gm_window_safe() has to
+    // prove is legal; it is a lever, not a default, so one thing is measured at a time.
+    static const int window = [] {
+        const char * e = getenv("PXA_DN_GM_WINDOW");
+        const int v = e ? atoi(e) : 1;
+        return v < 1 ? 1 : v;
+    }();
+
+    // Shape-guard the gather itself BEFORE hunting for the MUL, so the census counts one reason
+    // per site and the histogram separates "not the state gather" from "the pair is broken".
     const ggml_tensor * SRC = G->src[0];
     const ggml_tensor * IDX = G->src[1];
-    const ggml_tensor * MSK = M->src[1];
     if (!SRC || !IDX) return 0;
-    if (SRC->type != GGML_TYPE_F32 || G->type != GGML_TYPE_F32 || M->type != GGML_TYPE_F32) return 0;
-    if (IDX->type != GGML_TYPE_I32 || MSK->type != GGML_TYPE_F32) return 0;
+    if (G->ne[0] < 4096) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_SMALL);
+    if (SRC->type != GGML_TYPE_F32 || G->type != GGML_TYPE_F32) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_TYPE);
+    if (IDX->type != GGML_TYPE_I32) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_TYPE);
     // 2-D gather only: [ncols, n_seqs] out of [ncols, n_rows]; contiguous rows both sides.
-    if (G->ne[2] != 1 || G->ne[3] != 1 || SRC->ne[2] != 1 || SRC->ne[3] != 1) return 0;
-    if (IDX->ne[1] != 1 || IDX->ne[2] != 1 || IDX->ne[3] != 1) return 0;
-    if (IDX->ne[0] != G->ne[1]) return 0;
-    if (!ggml_is_contiguous(G) || !ggml_is_contiguous(M)) return 0;
-    if (!ggml_is_contiguous_rows(SRC)) return 0;
-    if (SRC->nb[0] != sizeof(float) || SRC->nb[1] % sizeof(float)) return 0;
-    if (IDX->nb[0] != sizeof(int32_t)) return 0;
+    if (G->ne[2] != 1 || G->ne[3] != 1 || SRC->ne[2] != 1 || SRC->ne[3] != 1) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_SHAPE);
+    if (IDX->ne[1] != 1 || IDX->ne[2] != 1 || IDX->ne[3] != 1) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_SHAPE);
+    if (IDX->ne[0] != G->ne[1]) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_SHAPE);
+    if (!ggml_is_contiguous(G)) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_CONTIG);
+    if (!ggml_is_contiguous_rows(SRC)) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_CONTIG);
+    if (SRC->nb[0] != sizeof(float) || SRC->nb[1] % sizeof(float)) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_CONTIG);
+    if (IDX->nb[0] != sizeof(int32_t)) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_CONTIG);
+
+    // Look ahead for the MUL that consumes this gather. No-ops (reshape/view/permute) never count
+    // against the window; real nodes do, and the window bounds how far the multiply may be moved.
+    if (i + 1 >= cgraph->n_nodes) return pxa_dn_gm_decline(cgraph, i, -1, window, PXA_DN_GM_EOG);
+    int j = -1;
+    int seen = 0;
+    for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (ggml_is_noop(n)) continue;
+        if (n->op == GGML_OP_MUL && n->src[0] == G) { j = k; break; }
+        if (++seen >= window) break;
+    }
+    if (j < 0) {
+        // Distinguish "the split ends here" from "the multiply is further away than the window":
+        // the first is a scheduler question, the second is a window question, and the fix differs.
+        bool any_real = false;
+        for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+            if (!ggml_is_noop(cgraph->nodes[k])) { any_real = true; break; }
+        }
+        return pxa_dn_gm_decline(cgraph, i, -1, window, any_real ? PXA_DN_GM_NO_MUL : PXA_DN_GM_EOG);
+    }
+
+    const ggml_tensor * M   = cgraph->nodes[j];    // MUL by the state mask
+    const ggml_tensor * MSK = M->src[1];
+    if (!MSK) return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_MASK);
+    if (M->type != GGML_TYPE_F32 || MSK->type != GGML_TYPE_F32) return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_TYPE);
+    if (!ggml_is_contiguous(M)) return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_CONTIG);
     // the mask must broadcast over dim 0 and match one value per gathered row
-    if (MSK->ne[0] != 1 || MSK->ne[1] != G->ne[1] || MSK->ne[2] != 1 || MSK->ne[3] != 1) return 0;
-    if (MSK->nb[1] % sizeof(float)) return 0;
-    if (!ggml_are_same_shape(G, M)) return 0;
-    // this is the state row, not some small gather: only worth a fused launch when it is big
-    if (G->ne[0] < 4096) return 0;
-    if (!ops_are_same_device(cgraph, i, j)) return 0;
+    if (MSK->ne[0] != 1 || MSK->ne[1] != G->ne[1] || MSK->ne[2] != 1 || MSK->ne[3] != 1) return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_MASK);
+    if (MSK->nb[1] % sizeof(float)) return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_MASK);
+    if (!ggml_are_same_shape(G, M)) return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_SHAPE);
+    if (!ops_are_same_device(cgraph, i, j)) return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_DEVICE);
+    if (!pxa_dn_gm_window_safe(cgraph, i, j, M, MSK)) return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_UNSAFE);
+
+    // Are the nodes in between all no-ops? Then the caller can simply advance past them. Otherwise
+    // they must still execute in their own place and only the MUL is marked absorbed.
+    bool contiguous_pair = true;
+    for (int k = i + 1; k < j; ++k) {
+        if (!ggml_is_noop(cgraph->nodes[k])) { contiguous_pair = false; break; }
+    }
+    if (!contiguous_pair && pxa_dn_gm_absorbed_n >= PXA_DN_GM_ABSORB_MAX) {
+        return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_FULL);
+    }
 
     const int64_t ncols = G->ne[0];
     const int64_t nseqs = G->ne[1];
@@ -455,8 +663,12 @@ static int pxa_try_deltanet_gather_mask(ggml_backend_cuda_context & ctx, const g
             (const float *)MSK->data, (float *)G->data, (float *)M->data,
             ncols, (int64_t)(SRC->nb[1]/sizeof(float)), (int64_t)(MSK->nb[1]/sizeof(float)));
     CUDA_CHECK(cudaGetLastError());
+    pxa_dn_gm_tally(PXA_DN_GM_FIRE);
+    pxa_dn_gm_site_dump(cgraph, i, j, window, PXA_DN_GM_FIRE);
     pxa_dn_fire_log("gather-mask", true);
-    return j - i;
+    if (contiguous_pair) return j - i;
+    pxa_dn_gm_absorbed[pxa_dn_gm_absorbed_n++] = M;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -888,7 +1100,7 @@ static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml
     }
 
     // ---------------------------------------------------------------------------------------
-    // G2-F4a CLASS WAR (nondet lane, 2026-09-03). The SECOND thing this fusion removes, besides
+    // G2-F4a CLASS WAR (2026-09-03). The SECOND thing this fusion removes, besides
     // F's own store, is the kernel boundary between READING x / w / z and WRITING M. Unfused,
     // the launch boundary is a grid-wide barrier: FUSED_RMS_NORM has read every byte of x before
     // FUSED_MUL_UNARY writes a byte of M. Fused, the only barrier is the per-block

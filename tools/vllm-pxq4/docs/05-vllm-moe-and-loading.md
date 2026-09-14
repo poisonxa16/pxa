@@ -1,7 +1,7 @@
 # 05 — vLLM PXQ4 backend: the template, the loading path, and the MoE delta
 
-All paths below are inside the running container `vllm-qwen38-27b-cyber-1` on the DGX build host, source
-checkout `/opt/1Cat-vLLM` (fork `1cat_vllm-0.1.dev1+g2ceb15066.cu128`). Everything was read
+All paths below are inside the running container the production vLLM container on the GPU build host, source
+checkout of the Volta vLLM fork at git `2ceb15066`. Everything was read
 read-only via `docker exec`. No GPU was used; no container was modified.
 
 ---
@@ -135,9 +135,9 @@ and the w4a4/w4a16 fp4 schemes.
   - `df -h /` inside the container reports `overlay 207G used 198G, 0 avail, 100%`. **You cannot
     build in this container.** Build in a fresh container from the same base image with a
     writable volume under `/path/to/models`, then install the resulting wheel.
-  - `site-packages/vllm` is a **copied install**, not an editable link to `/opt/1Cat-vLLM`
+  - `site-packages/vllm` is a **copied install**, not an editable link to `the vLLM fork checkout`
     (`ls -la` shows a real directory, and `vllm.__file__` →
-    `/opt/vllm-venv/lib/python3.12/site-packages/vllm/__init__.py`). Editing `/opt/1Cat-vLLM/vllm/*.py`
+    `/opt/vllm-venv/lib/python3.12/site-packages/vllm/__init__.py`). Editing `the vLLM fork checkout/vllm/*.py`
     changes nothing at runtime. Another reason to go out-of-tree.
 * **Caveat (ASSUMPTION):** two `TORCH_LIBRARY` namespaces coexisting is standard PyTorch, but I
   did not build or load such an `.so` against this image — no GPU runs were permitted. The one
@@ -346,7 +346,7 @@ anyway.
 | **(c) re-quantize from HF weights into a vLLM-native layout** | very high | very high | **Reject.** Throws away the artifact we already have and validated, forces a second quantizer implementation to be kept bit-compatible with `pxq6.cuh`/`src/pxq6r-quantize.inc.cpp` forever, and every future PXQ tier change becomes a two-place change. It also buys nothing: the kernels want the panel/slab layout regardless of what file it arrived in. |
 
 Option (b) also has a property the others don't: **it never touches the fork.** The converter is a
-standalone script; the runtime side is an out-of-tree pip package (§A2). Kewaii's tree stays clean,
+standalone script; the runtime side is an out-of-tree pip package (§A2). the upstream vLLM tree stays clean,
 which matters if this is going to be offered upstream.
 
 ### B3. The recommended path in detail — and how it handles five types
@@ -434,7 +434,7 @@ solved.**
 1. **Converter output size.** Dequantizing `token_embd` (Q6_K) and `output.weight` (Q8_0) to fp16
    costs ~4.8 GiB on top of the 14.64 GiB artifact. Per-GPU at TP=4 this is fine (embeddings and
    LM head are vocab/column parallel), but the on-disk safetensors will be ~19 GiB. Confirm free
-   space **under `/path/to/models`** — never `/` (100% full).
+   space **under `/path/to/models`** — never `/`.
 2. **Name mapping is the fiddly part**, not the bytes. Budget the time there, and validate by
    diffing the converted key set against the AWQ twin's key set before any load attempt.
 3. **`in_proj_qkvz` panel concatenation** assumes the four sub-projections' row counts are each
@@ -464,4 +464,4 @@ solved.**
      parameter declarations of §A4 and the three-way `get_quant_method` of §B3.
    * entry point in group `vllm.general_plugins`.
 3. Build it in a **fresh** container from the same image with a writable volume under
-   `/path/to/models` — the production container's overlay is 100% full and must not be written to.
+   `/path/to/models` — the production container's overlay must not be written to.

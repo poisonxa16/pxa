@@ -117,34 +117,62 @@ static inline bool pxq_imx_optin_enabled() {
     }();
     return on;
 }
+// PXA_PXQ_KQW, the PREDICATE. Pure: it reads the env and prints nothing. The announcement that used
+// to live inside this function moved to pxq_kqw_announce() below, because the default configuration
+// never CALLS this function and a line announcing the default weighting must not be attached to a call
+// the default never makes (bug pxq-kqw-inert-without-imx-optin). It also moved UP, in front of the
+// gate, so the gate below can report KQW's consequence without a second copy of this control flow.
+//
+// DEFAULT ON since 2026-08-24. The prior default (raw imatrix values as MSE weights) was
+// MEASURED to make PXQ4 WORSE than no imatrix at all (Ornith-9B, 580 chunks, clean A/B:
+// no-imx 8.3076 vs raw-imx 8.3542), while the SAME imatrix file improves Q4_K_M by -0.0766
+// under stock llama.cpp weighting w = imx * sqrt(sigma2_row + x^2). Mechanism: raw imatrix
+// columns span orders of magnitude, so inside a 16/8-wide sub-block the weighted argmin fits
+// only the hottest columns and the coarse 16-candidate sub-scale then clamps the block's
+// large-|x| entries on cold columns; the sqrt(sigma2+x^2) factor keeps per-element magnitude
+// in the objective so the block scale still respects outliers. PXA_PXQ_KQW=0 restores the
+// raw-imx weighting for A/B archaeology. No-imatrix artifacts are unaffected either way
+// (w = 1 exactly on that path).
+//
+// REACHABILITY, written down because it IS bug pxq-kqw-inert-without-imx-optin: this lever needs an
+// imatrix to have any effect, and by default NO imatrix is consumed -- pxq_imx_gate below discards it
+// unless PXA_PXQ_IMX=1 (default OFF). So under shipped defaults KQW resolves ON and weights nothing,
+// and the weighting actually in force is the unweighted one. ON here means "not disabled", not
+// "in effect"; the two differ on every default run.
+static inline bool pxq_kqw_enabled() {
+    static const bool on = [](){
+        const char * e = getenv("PXA_PXQ_KQW");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+// Names the weighting IN FORCE, once, at the point a row is actually weighted. Called from
+// pxq_kqw_row_weights after its `!imx` guard, so it can only ever describe a computation that runs --
+// which is the property the old placement lacked.
+static inline void pxq_kqw_announce() {
+    static const bool once = [](){
+        if (pxq_kqw_enabled())
+            fprintf(stderr, "PXQ imatrix weighting: k-quant form w = imx * sqrt(sigma2_row + x^2) APPLIED to this artifact (default; PXA_PXQ_KQW=0 for legacy raw-imx)\n");
+        else
+            fprintf(stderr, "PXA_PXQ_KQW=0: LEGACY raw-imatrix MSE weights APPLIED to this artifact (measured ppl REGRESSION vs no-imatrix on PXQ4; A/B use only)\n");
+        return true;
+    }();
+    (void)once;
+}
 static inline const float * pxq_imx_gate(const float * imx) {
     if (!imx || pxq_imx_optin_enabled()) return imx;
     static const bool warned = [](){
-        fprintf(stderr, "PXQ tiers: imatrix IGNORED (measured net-negative on the PXQ lattice; PXA_PXQ_IMX=1 to consume it — see pxq6-quantize.inc.cpp)\n");
+        // THE SECOND SENTENCE IS THE POINT (bug pxq-kqw-inert-without-imx-optin). This branch is the ONE
+        // place an imatrix is discarded, and discarding it is also what leaves PXA_PXQ_KQW with nothing
+        // to weight -- an imatrix is its only input. Before this, the operator was told the imatrix was
+        // ignored and NOT told that a default-ON mechanism was therefore doing nothing, so "no weighting
+        // in force" and "a different weighting in force" printed identically. Stated where the decision
+        // is taken, and read off the same predicate the weighting path uses, so the two cannot drift.
+        fprintf(stderr, "PXQ tiers: imatrix IGNORED (measured net-negative on the PXQ lattice; PXA_PXQ_IMX=1 to consume it — see pxq6-quantize.inc.cpp). PXA_PXQ_KQW is %s and is INERT on this run: an imatrix is its only input, and none reaches it\n", pxq_kqw_enabled() ? "default-ON" : "OFF (PXA_PXQ_KQW=0)");
         return true;
     }();
     (void)warned;
     return nullptr;
-}
-static inline bool pxq_kqw_enabled() {
-    // DEFAULT ON since 2026-08-24. The prior default (raw imatrix values as MSE weights) was
-    // MEASURED to make PXQ4 WORSE than no imatrix at all (Ornith-9B, 580 chunks, clean A/B:
-    // no-imx 8.3076 vs raw-imx 8.3542), while the SAME imatrix file improves Q4_K_M by -0.0766
-    // under stock llama.cpp weighting w = imx * sqrt(sigma2_row + x^2). Mechanism: raw imatrix
-    // columns span orders of magnitude, so inside a 16/8-wide sub-block the weighted argmin fits
-    // only the hottest columns and the coarse 16-candidate sub-scale then clamps the block's
-    // large-|x| entries on cold columns; the sqrt(sigma2+x^2) factor keeps per-element magnitude
-    // in the objective so the block scale still respects outliers. PXA_PXQ_KQW=0 restores the
-    // raw-imx weighting for A/B archaeology. No-imatrix artifacts are unaffected either way
-    // (w = 1 exactly on that path).
-    static const bool on = [](){
-        const char * e = getenv("PXA_PXQ_KQW");
-        const bool v = !e || atoi(e) != 0;
-        if (v) fprintf(stderr, "PXQ imatrix weighting: k-quant form w = imx * sqrt(sigma2_row + x^2) (default; PXA_PXQ_KQW=0 for legacy raw-imx)\n");
-        else   fprintf(stderr, "PXA_PXQ_KQW=0: LEGACY raw-imatrix MSE weights (measured ppl REGRESSION vs no-imatrix on PXQ4; A/B use only)\n");
-        return v;
-    }();
-    return on;
 }
 // PXA_PXQ_SMIN: smallest sub index whose ceiling covers the block peak within half a top step,
 // sign-aware (the peak's own side of the book sets the cap and the top gap):
@@ -171,7 +199,9 @@ static inline int pxq_sub_floor(const float * x, int bs, float anchor,
 // unchanged when the gate is off or there is no imatrix -- the unweighted path NEVER moves.
 static inline const float * pxq_kqw_row_weights(const float * x, const float * imx, int64_t K,
                                                 std::vector<float> & buf) {
-    if (!imx || !pxq_kqw_enabled()) return imx;
+    if (!imx) return imx;           // nothing to weight: an imatrix is KQW's only input
+    pxq_kqw_announce();             // an imatrix IS present, so the weighting decision is now real
+    if (!pxq_kqw_enabled()) return imx;
     double s2 = 0.0;
     for (int64_t i = 0; i < K; ++i) s2 += (double)x[i]*(double)x[i];
     s2 /= (double)K;

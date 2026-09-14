@@ -58,8 +58,7 @@ step "quantize BF16 -> PXQ4"
 if [ ! -s "$PXQ4" ]; then
   # The row-gather guard refuses panel codecs on per_layer_token_embd and falls
   # back to Q4_K; deliberately not overridable by --custom-q.
-  /usr/local/bin/pxa-memcap.sh qwen4exp-quant 64G \
-    "$REPO/build-cuda/bin/llama-quantize" "$BF16" "$PXQ4" PXQ4 12 \
+  ${PXQ_QUANT_WRAPPER:-} "$REPO/build-cuda/bin/llama-quantize" "$BF16" "$PXQ4" PXQ4 12 \
       2>&1 | tee "$LOGD/quantize.log" | tail -40
 fi
 ls -l "$PXQ4"

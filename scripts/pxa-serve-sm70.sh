@@ -19,7 +19,7 @@
 # WHY THESE VALUES, so they are not "tidied" away later:
 #  GMU 0.88     - measured ceiling for this model on a 16 GiB card at TP=2, and what
 #                 the seat has run at since 2026-08-31. NOT 0.90+: 0.98 with a pinned
-#                 12 GiB KV is a 4-card DGX setting and ABORTS before the model loads.
+#                 12 GiB KV is a 4x32GB setting and ABORTS before the model loads on 16 GB cards.
 #  v12b lib     - the MMA decode kernel; PXQ4_MMV_MMA=1 arms it. v10 is the older
 #                 scalar path and is slower on every decode cell.
 #  MNBT 4096    - the seat value. 2048 halves the long-prefill chunk for no gain here.

@@ -102,7 +102,7 @@ The 1080 Ti's 11 GB budget targets a PXQ2-quantized ~35B model. `--ctx-checkpoin
 checkpoint buffers cost more headroom than the resumable-prefix win is worth.
 
 ```bash
-docker run -d --name pxa-1080ti \
+docker run -d --name pxa-server \
     --gpus '"device=0"' \
     -e PXA_ENHANCE=1 \
     -e LLAMA_ARG_PORT=8390 \
@@ -210,7 +210,7 @@ first shard — llama.cpp finds the rest by name.
 
 ## PXA_* environment gates
 
-These are engine-internal levers, compiled into this build with the `rc/unified-final-20260903`
+These are engine-internal levers, compiled into this build with the unified build of 2026-09-03
 defaults below. You normally do **not** need to touch any of them — they're documented here
 so you know what's active and how to turn one off if you hit something unexpected on your
 card. Set with `-e NAME=value` on `docker run`.

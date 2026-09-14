@@ -42,11 +42,13 @@
 // two in lockstep.
 #pragma once
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "ggml.h"   // ggml_pxa_model_profile — the MODEL half of the adaptive decisions
+#include "pxq23-mmvq.h"   // the frozen PXQ2/PXQ3 s8 books the admission gate below self-checks
 
 // 0 = REFERENCE, 1 = DEFAULT, 2 = ENHANCE — see the header comment. The resolution lives in
 // ggml.c so every consumer in the tree (CUDA and non-CUDA alike) reads the same answer.
@@ -221,13 +223,132 @@ static inline const char * pxa_model_class_name() {
 //   pure sm_60 / no census    -> 0 (P100 has no DP4A — the emulation path is not a win)
 // The pxq-mmvq.cuh resolver keeps its own loud print + the BOOK/SUB-override
 // decline; explicit PXA_PXQ_MMVQ always wins.
+// PXA_PXQ23_MMVQ (2026-09-09) — which of the two LOW tiers may ride the same MMVQ path.
+// Bitmask so each tier can be A/B'd on its own: bit 0 = PXQ2, bit 1 = PXQ3, 3 = both, 0 = off.
+//
+// It is a SEPARATE lever from PXA_PXQ_MMVQ on purpose. PXA_PXQ_MMVQ says "this device and this
+// model may use the q8_1 GEMV at all"; this says "and the 2-bit / 3-bit tiers are among the ones
+// it may use", which is a different question with its own fidelity evidence. Both must be on.
+//
+// TWO REFUSALS, and they are refusals rather than fallbacks because a silent numeric disagreement
+// between the fused decode kernels and this one is the failure mode that matters:
+//   - any PXQ2/PXQ3 book or sub-scale override in the environment. This path carries FROZEN s8
+//     copies of the books and cannot take a runtime upload, exactly as the PXQ4 path cannot.
+//   - a self-check that recomputes the frozen s8 books from the codec's own float tables. If a
+//     table is ever re-frozen without re-deriving the snap, the two decoders would disagree by
+//     a whole book entry; this catches that at startup instead of in someone's perplexity.
+static inline bool pxa_pxq23_mmvq_snap_ok() {
+    static const float  b2[4] = PXQ2_BOOK_INIT,      b3[8] = PXQ3_BOOK_INIT;
+    static const int8_t q2[4] = PXQ2_MMVQ_S8_INIT,   q3[8] = PXQ3_MMVQ_S8_INIT;
+    float a2 = 0.0f, a3 = 0.0f;
+    for (int i = 0; i < 4; ++i) a2 = fabsf(b2[i]) > a2 ? fabsf(b2[i]) : a2;
+    for (int i = 0; i < 8; ++i) a3 = fabsf(b3[i]) > a3 ? fabsf(b3[i]) : a3;
+    if (!(a2 > 0.0f) || !(a3 > 0.0f)) return false;
+    if (a2 != PXQ2_MMVQ_ABSMAX || a3 != PXQ3_MMVQ_ABSMAX) return false;
+    for (int i = 0; i < 4; ++i) if ((int) rintf(b2[i] * (127.0f/a2)) != (int) q2[i]) return false;
+    for (int i = 0; i < 8; ++i) if ((int) rintf(b3[i] * (127.0f/a3)) != (int) q3[i]) return false;
+    return true;
+}
+
+static inline int pxa_pxq23_mmvq_mask() {
+    static const int mask = [](){
+        if (pxa_config_level() == 0) return 0;                    // REFERENCE opts out of everything
+        const char * e = getenv("PXA_PXQ23_MMVQ");
+        // DEFAULT OFF, and the reason is measured, not cautionary. Decode is a large win on
+        // sm_70 (uniform PXQ2 +36.4% at np1 and +47.8% at np2, uniform PXQ3 +36.4% / +51.9%,
+        // 2026-09-10, 2xV100, medians of 7), but the pre-registered ship rule also required the
+        // mean KL divergence against the file's own exact path to be no worse than the PXQ4
+        // kernel already on this path shows against its own, and it is not: 0.004624 (PXQ2) and
+        // 0.002186 (PXQ3) against the PXQ4 comparator's 0.000951, one session, -b 8 -ub 8.
+        // So this is a lever a user opts into with the numbers in front of them, not a default.
+        // docs/lab/LEVERS.md carries the full table and the confound (the three tiers are three
+        // files, and the uniform-PXQ2 file's PPL 23.2 is a fragile operating point).
+        int m = e ? atoi(e) : 0;
+        if (m < 0 || m > 3) m = 0;
+        if (m) {
+            const char * ovr = getenv("PXA_PXQ2_BOOK") ? "PXA_PXQ2_BOOK"
+                             : getenv("PXA_PXQ3_BOOK") ? "PXA_PXQ3_BOOK"
+                             : getenv("PXA_PXQ_CEIL_V2") ? "PXA_PXQ_CEIL_V2"
+                             : getenv("PXA_PXQ2_V3") ? "PXA_PXQ2_V3"
+                             : getenv("PXA_PXQ6_SUB") ? "PXA_PXQ6_SUB"
+                             : getenv("PXA_PXQ2_SUB") ? "PXA_PXQ2_SUB"
+                             : getenv("PXA_PXQ3_SUB") ? "PXA_PXQ3_SUB" : nullptr;
+            if (ovr) {
+                fprintf(stderr, "PXA_PXQ23_MMVQ: DISABLED — %s is set and this path holds frozen "
+                                "book/sub copies\n", ovr);
+                m = 0;
+            } else if (!pxa_pxq23_mmvq_snap_ok()) {
+                fprintf(stderr, "PXA_PXQ23_MMVQ: DISABLED — the frozen s8 books no longer match "
+                                "PXQ2_BOOK_INIT/PXQ3_BOOK_INIT (re-derive the snap)\n");
+                m = 0;
+            } else {
+                fprintf(stderr, "PXA_PXQ23_MMVQ: mode %d (%s%s%s decode via the q8_1 MMVQ kernel, "
+                                "s8 book snap — NOT bit-exact vs the fused fp16 mmv, fidelity-gated)\n",
+                        m, (m & 1) ? "PXQ2" : "", (m == 3) ? "/" : "", (m & 2) ? "PXQ3" : "");
+            }
+        }
+        return m;
+    }();
+    return mask;
+}
+
+// PXA_PXQ_MMV_H2 (2026-09-10) — half2 inner loop for the PXQ2/PXQ3 dense decode mmv, GP100 only.
+// Bitmask like PXA_PXQ23_MMVQ: bit0 = PXQ2, bit1 = PXQ3.
+//
+// The two low tiers share one fused decode kernel with PXQ4 and issue the same 16 pair decodes
+// per 32 weights whatever their code width, so on a P100 uniform PXQ2 moves 39% fewer bytes than
+// uniform PXQ4 and decodes at the same speed (18.50 vs 18.01 t/s, 27B, two cards, tg32 medians of
+// 7) — 177 GB/s per active card against ~550 achievable. The loop is ALU-bound there, and the
+// int8 route that fixed it on sm_70 needs dp4a, which GP100 does not have. It does have full-rate
+// HFMA2 and fp16-exact LM4/LM8 books, so the pair decode collapses to one smem gather plus one
+// HFMA2 with no book error.
+//
+// It is NOT bit-exact against the fp32 arm: x is rounded to fp16 once at stage time and the
+// 16-element group accumulates in fp16 (everything above that group stays fp32). It is the default
+// ON for cc == 600 because the pre-registered rule is satisfied: a decode win at np1
+// AND np2 on ALL FOUR low-tier classes (PXQ2 uniform +9.69/+11.36%, PXQ3 uniform +14.46/+16.08%,
+// PXQ2-attn4 +4.10/+5.42%, PXQ3-balanced +6.57/+7.36%, bands disjoint) AND a fidelity pass against
+// each file's own exact fp32 path (mean KLD 30-37x under the 0.000951 bar, same-top-p ~1.0pp over
+// 98.710%). Every one of those deltas carries a measured second-arm term of +1.0 to +3.5% (the
+// pp512 control rose on all four classes), which is why the ledger quotes the control beside the
+// delta. PXA_PXQ_MMV_H2=0 returns to the exact fp32 decode loop.
+//
+// The arch gate is cc == 600 EXACTLY, not >=: sm_61 runs fp16 at 1/64 rate, so shipping a >= gate
+// would hand consumer Pascal a kernel 64x slower than the one it has. It lives in pxq6.cuh next
+// to the format ids (pxa_pxq_mmv_h2_on); this function is the mask alone.
+static inline int pxa_pxq_mmv_h2_mask() {
+    static const int mask = [](){
+        if (pxa_config_level() == 0) return 0;                    // REFERENCE opts out of everything
+        const char * e = getenv("PXA_PXQ_MMV_H2");
+        int m = e ? atoi(e) : 3;                                  // DEFAULT ON, cc == 600 only: both
+                                                                  // low tiers, per the ship rule
+        if (m < 0 || m > 3) m = 0;
+        if (m) {
+            fprintf(stderr, "PXA_PXQ_MMV_H2: mode %d (%s%s%s dense decode via the half2 pair-LUT loop, "
+                            "sm_60 only — NOT bit-exact vs the fp32 mmv, fidelity-gated; the fp16-exact "
+                            "book self-check runs at first dispatch)\n",
+                    m, (m & 1) ? "PXQ2" : "", (m == 3) ? "/" : "", (m & 2) ? "PXQ3" : "");
+        }
+        return m;
+    }();
+    return mask;
+}
+
 static inline int pxa_pxq_mmvq_auto_default() {
     // Armed at DEFAULT as well as ENHANCE as of 2026-07-31. It used to require level 2,
     // so every user running the binary as shipped got the non-MMVQ path and none of the
     // sm_70 backbone benefit -- the lever existed, self-armed on paper, and never fired.
     // REFERENCE (0) still opts out, and PXA_PXQ_MMVQ=0 remains an explicit override.
     if (pxa_config_level() == 0) return 0;
-    if (!pxa_model_known() || pxa_model().n_pxq_mmvq_tensors <= 0) return 0;
+    if (!pxa_model_known()) return 0;
+    // A uniform PXQ2/PXQ3 file carries no PXQ4 tensor at all, so the PXQ4 census alone would
+    // leave the master switch off and the low tiers would never reach their own kernel. Count
+    // them only when PXA_PXQ23_MMVQ actually admits them, so no existing file changes path.
+    const int mask23 = pxa_pxq23_mmvq_mask();
+    const int n_elig = pxa_model().n_pxq_mmvq_tensors
+                     + ((mask23 & 1) ? pxa_model().n_pxq2_tensors : 0)
+                     + ((mask23 & 2) ? pxa_model().n_pxq3_tensors : 0);
+    if (n_elig <= 0) return 0;
     const pxa_topology_t & t = g_pxa_topology;
     if (!t.valid) return 0;
     if (t.has_sm70 || t.has_other) return 1;
@@ -255,19 +376,19 @@ static inline bool pxa_gate_default(bool shipped_dflt) {
 // exercised, so shipping it on would ship an unmeasured path for no win. PXA_FUSE_DELTANET=7
 // re-arms it for whoever chases the split boundary that keeps nodes[i+1] from being the MUL.
 //
-// Bit 3 -- the CONCAT->SET_ROWS scatter absorption -- is OUT by owner decision 2026-09-03, even
+// Bit 3 -- the CONCAT->SET_ROWS scatter absorption -- is deliberately left OUT (2026-09-03), even
 // though it is the larger win of the two (+3.3% decode: 37.93 / 37.97 t/s against 36.72 / 36.71).
 // It contains no arithmetic change; it only points the two producers of the new state row at the
 // recurrent cache row so the trailing SET_ROWS copy can be dropped. It nevertheless MOVES THE
-// GREEDY SHA (99bcbd30 -> 9140f97e), and it is the only thing in this set that does -- the nine
+// GREEDY SHA (99bcbd30 -> 9140f97e), and it is the only thing in this change that does -- the nine
 // arch-defaulted ship-set levers are all byte-identical. A change with zero arithmetic that moves
 // the output must be reading or writing a different byte than the eager path, which is the
-// layout-dependent aliasing class the overlap lane is root-causing on this same recurrent path;
+// layout-dependent aliasing class the overlap work is root-causing on this same recurrent path;
 // three stable runs are not proof against a bug whose trigger is the compute-buffer layout.
 // PXA_FUSE_DELTANET=15 re-enables it for that hunt -- and even then it must still clear
 // pxa_dn_scatter_dst_safe(), the same exact-alias predicate bit0 is held to.
 //
-// Bits 4 and 5 (decode2 lane, 2026-09-03) are the safe-carry answer to the two holes above.
+// Bits 4 and 5 (2026-09-03) are the safe-carry answer to the two holes above.
 // Bit 4 (16) runs bit0's identical three kernels but writes into CC's OWN compute-buffer storage
 // -- the destination the graph allocated for the CONCAT -- so nothing leaves the graph dataflow
 // and no alias predicate is needed; the guard instead proves CC's range disjoint from every
@@ -277,13 +398,13 @@ static inline bool pxa_gate_default(bool shipped_dflt) {
 // split graph shows that no node between this cluster and the SET_ROWS it absorbs touches the
 // state tensor's storage. That is the assertion bit3 made in a comment and never checked, and it
 // is why bit3 moved the sha with no arithmetic change. PXA_DN_ROWSCAN=1 prints the reader set.
-// Default flipped 3 -> 55 (decode2 lane, 2026-09-03), then 55 -> 53 (nondet lane, 2026-09-04,
+// Default flipped 3 -> 55 (2026-09-03), then 55 -> 53 (2026-09-04,
 // see the bit-1 note below): the 12/12-at-np1-and-np2 gate is on
 // file for bit2, bit4 and bit4+bit5 (552 requests, 0 sha divergence, 0 missed needle), and the
 // one measurement cleared the ship bar (39.4 vs same-session ik 37.3, non-overlapping). bit3 (8)
 // stays off -- its predicate is structurally false on the safe carry, so it is dead weight now.
 //
-// Bit 1 -- the out-gate fusion -- is OUT of the default as of 2026-09-04 (nondet lane). It is the
+// Bit 1 -- the out-gate fusion -- is OUT of the default as of 2026-09-04. It is the
 // one bit in this family that is NOT bit-exact against the eager kernels, and the reason is a
 // write-after-read race, not rounding: the fused kernel is one block per row and reads its row
 // twice (sumsq, then the store) with only a per-block __syncthreads() between, so when ggml-alloc
@@ -469,7 +590,7 @@ static inline const char * pxa_enhance_path_name(int cc) {
     return "generic";
 }
 
-// PXA_MODE=balance|max — the owner-facing POSTURE knob (2026-07-22). 0 = BALANCE (default),
+// PXA_MODE=balance|max — the user-facing POSTURE knob (2026-07-22). 0 = BALANCE (default),
 // 1 = MAX. The postures are the PRODUCT; the kernel levers are the means:
 //   BALANCE (the daily): -fa on, ub 2048-class. Best decode AND best-possible prefill IN the
 //     fa-on regime — FA_MASK_SKIP_TILE carries the prefill by default; FA_PREFILL_SPLIT (big
@@ -497,18 +618,53 @@ static inline const char * pxa_mode_name() {
 // PXA_FA_MASK_SKIP_TILE: fully-masked-KV-tile skip ported to the tile-f16 FA kernel (the
 // fattn-wmma-f16 skip is already shipped unconditional). A KV tile whose mask is entirely
 // -inf contributes exactly zero (exp(-inf-max)==0, running max unchanged, rescale==1), so
-// skipping it is bit-identical BY CONSTRUCTION. SCOPE — this mirrors the fattn.cu dispatch,
-// do not widen it in prose: the tile-f16 kernel is reached on sm_60 only (fast_fp16_available()
-// excludes sm_61; fp16_mma_available() sends sm_70+ to the WMMA/MMA kernels), only at
-// GGML_PREC_DEFAULT, and only when Q->ne[1] > 8 with head-dim != 256 — i.e. batched/prefill
-// shapes under -fa on (a BALANCE carrier; inert at fa-off, and Q->ne[1] <= 8 decode shapes take
-// the vec kernels instead). At those same shapes sm_61 and the F32-precision path take the
-// tile-f32 kernel, which carries its own opt-in PXA_FA_MASK_SKIP_TILE_F32 (fattn-tile-f32.cu).
+// skipping it is bit-identical BY CONSTRUCTION. SCOPE — this mirrors the fattn.cu dispatch
+// (fattn.cu:327-352), do not widen it in prose: the tile-f16 kernel is reached on sm_60 only
+// (fast_fp16_available() excludes sm_61; fp16_mma_available() sends sm_70+ to the WMMA/MMA
+// kernels), only at GGML_PREC_DEFAULT, and only when Q->ne[1] > 8. The "head-dim != 256" term
+// that used to end this sentence was TRUE before 2026-08-03 and is FALSE now: PXA_FA_TILE256
+// (default ON) makes `Q->ne[0] == 256 && !pxa_fa_tile256_enabled()` false, so the test at
+// fattn.cu:331 collapses to `ne[1] <= 8` and head-dim 256 DOES reach tile-f16 at prefill shapes
+// (fattn-tile-f16.cu:470 carries the matching `case 256:`). That is load-bearing, not pedantic:
+// head 256 is the SHIPPING case here (122B-A10B/qwen35moe; Qwable-27B), so do NOT read this
+// lever as inert for the P100 seats — it is the conclusion that would make its own A/B look
+// pointless. Shapes: batched/prefill under -fa on (a BALANCE carrier; inert at fa-off, and
+// Q->ne[1] <= 8 decode shapes take the vec kernels instead).
+// Also corrected in the same sentence: the F32-precision path does NOT take the tile-f32 kernel
+// at head 256. The non-DEFAULT-precision arm of the `!fp16_mma_available` dispatch sends vec_f32
+// whenever `ne[1] <= 8 || ne[0] == 256`, so at head 256 the tile-f32 kernel — and with it its
+// opt-in PXA_FA_MASK_SKIP_TILE_F32 — is not reached at any batch size. sm_61 takes it only at
+// `ne[1] > 8 && ne[0] != 256`.
+// ⚠ That arm is at fattn.cu:357-362 as of this writing, NOT the 349-353 this comment first cited.
+// The first citation was correct in the PARENT of the commit that wrote it and wrong in the commit
+// itself: that commit added 9 lines above this arm, which is exactly what moved it. Cite the
+// construct above, not the number — a line number in a comment is a claim about a state the file
+// will not keep.
 // Default ON at DEFAULT/ENHANCE per the 2026-07-22 posture directive; REFERENCE -> off.
 // Env wins (PXA_FA_MASK_SKIP_TILE=0 rolls back).
-// ⚠ HONESTY GATE: the silicon A/B (sha-set + decode-guard) has NOT yet run — compiled clean,
-// equivalence argued by construction, target pf>=900 fa-on ub2048 P100. No speedup is measured
-// for this lever yet; do not quote numbers until that A/B has run.
+// ⚠ HONESTY GATE — DISCHARGED 2026-09-11T23:50Z. The silicon A/B has RUN, and it ran on the
+// SHIPPED artifact (725388cb02, binary version 5466), not on a development build, and the A/B
+// was pre-registered before it ran. Cell:
+// 4096-token prefill co-resident with a 4096-token band, -np 2, cards 0,1,5,6 (sm_60 P100),
+// gate = timings.prompt_ms.
+//     OFF  mean 23133.8 ms  (23133.5, 23134.0)
+//     ON   mean 20747.2 ms  (20738.1, 20756.2)   noise floor 2.1 ms (a third ON boot)
+//     EFFECT +2386.6 ms = +11.50 % — the skip SAVES this much prefill.
+//     IDENTITY: every arm's output shas identical, so the saving is not bought with arithmetic.
+// QUOTE THE +11.50 % FOR THAT CELL AND NO OTHER. It is a prefill-wall effect in a co-resident
+// multi-sequence cell. Nothing here measures decode, and nothing here measures a single-card
+// seat or sm_70/sm_61.
+// ⚠ THE np1 DISCRIMINATOR BENEATH IT IS NOT POWERED, and the harness prints it as if it were.
+// One -np 1 pair was run to ask whether a mask exists for a SINGLE sequence: ON 20230.7 ms vs
+// OFF 20622.5 ms, +1.94 %. The harness renders that as a binary readout — "identical → the mask
+// gate is real; different → the skip fires far more widely than the docblock above claims" —
+// and read at face value it says the second. It cannot say either. n=1 boot per arm, and the
+// SAME harness's own 1024-token scaling control drifted 1.38 % across exactly those two boots:
+// the instrument's drift is the same size as the effect it is being asked to resolve. A delta
+// no larger than the drift, sampled once per arm, separates nothing. The co-resident claim
+// above stands as written; the np1 cell is UNRESOLVED and needs a replicated, interleaved arm
+// set before anyone reads it in either direction. Recorded here rather than dropped because the
+// next reader meets the same binary readout and reaches the same unwarranted conclusion.
 static inline bool pxa_fa_mask_skip_tile() {
     static const bool v = [](){
         const char * e = getenv("PXA_FA_MASK_SKIP_TILE");
@@ -518,18 +674,83 @@ static inline bool pxa_fa_mask_skip_tile() {
     return v;
 }
 
-// PXA_FA_TILE_F32ACC (2026-08-30, register C2.16): surgical fp32-accumulator variant of the
-// Pascal tile-f16 FA kernel. Promotes ONLY the per-thread running state — kqmax, kqsum and the
-// VKQ output accumulators — to fp32 registers; the shared-memory staging (KV_tmp, Q_h2, the KQ
-// score tile) stays half2, so the smem budget and the D=256 route are unchanged. Targets the
-// long-sequence accumulation error (VKQ/kqsum sum thousands of half-rounded terms at 32k ctx)
-// implicated in the sm_60 fidelity floor (register C2.17/C2.18) while keeping the half2 dot
-// products. Register cost: VKQ 8->16 regs/j at D=256/ncols=16 under __launch_bounds__(.,1) —
-// occupancy and a speed A/B are owed before any default flip. NOT bit-identical to the f16
-// path by design (it is the higher-precision arm). Default OFF; env-only.
+// PXA_FA_TILE_F32ACC (2026-08-30, register C2.16; DEFAULT ON since 2026-09-09): fp32-accumulator
+// variant of the Pascal tile-f16 FA kernel. Promotes ONLY the per-thread running state -- kqmax,
+// kqsum and the VKQ output accumulators -- to fp32 registers; the shared-memory staging (KV_tmp,
+// Q_h2, the KQ score tile) stays half2, so the smem budget and the D=256 route are unchanged.
+//
+// WHY IT IS THE DEFAULT NOW, and it is a correctness argument rather than a fidelity preference.
+// The tile kernel walks the key range in 64-cell tiles, and WHICH key lands in WHICH tile is
+// decided by the key's CELL index in the shared KV ring, not by its position in the sequence. A
+// request is placed wherever the ring has room, so the same prompt tiles differently depending on
+// what another sequence still holds. With half running state that is not a reassociation the eye
+// cannot see: kqsum is 64 separate accumulators (one per key-slot within a tile) folded by a
+// butterfly sum, VKQ is rescaled at every tile boundary, and at a running sum of 2048 the gap
+// between representable fp16 values is already 2.0. So the ROUNDING of a twenty-thousand-term
+// accumulation became a function of where the band was placed.
+//
+// Measured on the 4x P100 Flash-Next seat, 20,859-token prompt, greedy, -np 2 --kv-unified: from
+// cell 0 the first token was '\n\n' at p = 0.965 against the end token at 0.033, and from cell
+// 101 -- the same prompt, the same process, only another sequence's 100 cells resident below it
+// -- it was 0.632 against 0.348, a swing of about 3.8 nats on the first generated token, enough
+// to answer the question or return nothing at all. One cell of shift (cells 257, 4097) keeps 63
+// of every 64 tile members together and moved it by 0.013; a shift deep into a tile rescrambles
+// every tile. The three mask-side guards were bisected on the seat and all three are innocent
+// (PXA_FA_MASK_SKIP_TILE=0, PXA_KQ_MASK_PAD1=0 and both off reproduce the collapsed number to
+// nine decimals), and a hermetic CPU test (tests/test-kv-band-align.cpp) shows the placement, the
+// exact cell_max, the window width and the whole mask fill are bit-identical at every offset.
+// tests/test-fa-band-align.cpp mirrors this kernel's arithmetic term for term and measures the
+// two arms directly: fp32 running state is placement-invariant to fp32 round-off, fp16 is not.
+//
+// Cost: VKQ 8->16 regs/j at D=256/ncols=16 under __launch_bounds__(.,1). NOT bit-identical to the
+// old f16-accumulator path -- by construction, since that path was wrong at every offset and not
+// only at the misaligned ones. PXA_FA_TILE_F32ACC=0 restores it for an A/B.
+//
+// Hygiene fix (2026-09-11): REFERENCE -> false. Same correction, and the same reason, as
+// PXA_P100_FP16_GEMM immediately above. ggml.h:3414 documents level 0 as "every PXA lever forced
+// OFF (the bit-exact audit baseline)"; a correctness fix the reference level cannot switch off is
+// not a baseline, because it leaves the lever's own effect unmeasurable against the reference
+// arithmetic. That the f16 accumulator is wrong at every band placement is precisely WHY REFERENCE
+// must be able to select it -- reproducing the original arithmetic is what a reference run is for.
+// Explicit env still wins at any level.
 static inline bool pxa_fa_tile_f32acc() {
     static const bool v = [](){
         const char * e = getenv("PXA_FA_TILE_F32ACC");
+        if (e) return atoi(e) != 0;
+        return pxa_config_level() != 0;
+    }();
+    return v;
+}
+
+// PXA_FA_TILE_V2 (2026-09-09). DEFAULT OFF. An alternative SCHEDULE for the same batched
+// flash-attention arithmetic the tile-f16 kernel already runs on the no-tensor-core cards, in its
+// own file (ggml/src/ggml-cuda/pxa/fattn-tile-v2.cu) so the shipping kernel is not touched.
+//
+// It moves bytes differently and computes nothing differently. The shipping kernel's staging tile
+// is declared half2 KV_tmp[64][D/2 + 1]; that "+ 1" is what makes the QK access (32 lanes reading
+// 32 DIFFERENT ROWS at one column) bank-conflict free, and it is also what makes a row start off a
+// 16-byte boundary, so the hot loop can only ever issue 32-bit shared loads -- six of them per k
+// step to feed eight half2 FMAs. v2 drops the pad, keeps the row stride a power of two, and
+// permutes within the row instead (row r stores 16-byte chunk c at c ^ (r mod R)). That is
+// conflict free for the QK pattern, the PV pattern AND the staging pattern, and it is 16-byte
+// addressable, so the QK loop reads K and Q as 128-bit chunks with k unrolled by four: twenty-four
+// 32-bit loads per four k steps become six 128-bit loads, for the same FMAs in the same order.
+//
+// The running state (kqmax, kqsum, VKQ) is fp32 unconditionally in that file -- there is no
+// half-accumulator arm to select, because the tile walk groups keys by CELL index and half running
+// state makes a long accumulation depend on where a request's band was placed (see
+// PXA_FA_TILE_F32ACC above and tests/test-fa-band-align.cpp).
+//
+// Because nothing arithmetic changes, the bar for this lever is BITWISE equality with the shipping
+// kernel, not a tolerance -- which is also why it is safe to leave the shipping path exactly as it
+// is and let this be selected only when the lever is set. Env only: PXA_FA_TILE_V2=1 arms it.
+// It is inert unless the tile-f16 kernel would have run anyway (sm_60 batched shapes), it declines
+// whenever PXA_FA_F16_KV_CHUNK is armed (it supplies no chunked twin), and it never changes
+// whether a kernel runs, only which schedule runs it.
+// NO SPEED NUMBER EXISTS FOR THIS LEVER YET. Do not quote one until the A/B has run.
+static inline bool pxa_fa_tile_v2() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_FA_TILE_V2");
         return e && atoi(e) != 0;
     }();
     return v;
@@ -568,11 +789,31 @@ static inline int pxa_fa_prefill_split_ne11() {
 // PXA_FA_GQA_PACK ENHANCE default (2026-09-03). The packed-GQA vec kernel is reached on ONE
 // shape only: the f32 vec FA kernel at Dk==Dv==256, cols_per_block==1, f16 K and V, no logit
 // softcap — i.e. D=256 f16-KV decode. Unlike the nine house levers this IS a distinct kernel
-// with its own register budget, and its measured basis is the 4x P100 hybrid-MoE seat (part of
-// the twelve-lever ship set: +49% decode at 86k fill). So it arms only on a MULTI-CARD
-// Pascal-GP100 (sm_60) topology, the cell it was measured on, and stays env-only everywhere
-// else -- a single P100 and every other architecture are unmeasured for it. NH must divide
-// both the head count and the gqa_ratio or the dispatch falls back to the stock kernel anyway.
+// with its own register budget, so it arms only on a MULTI-CARD Pascal-GP100 (sm_60) topology
+// and stays env-only everywhere else -- a single P100 and every other architecture are
+// unmeasured for it. NH must divide both the head count and the gqa_ratio or the dispatch falls
+// back to the stock kernel anyway.
+//
+// ⚠⚠ CORRECTED 2026-09-12. This comment used to justify the arming with "its measured basis is
+// the 4x P100 hybrid-MoE seat (part of the twelve-lever ship set: +49% decode at 86k fill)".
+// No such figure exists anywhere in the record, and docs/COOKBOOK.md says of this lever and
+// MOE_DEVICE_MAP together: "Do not quote a throughput number for either." What IS on record:
+//   * docs/lab/LEVERS.md (this lever's row): NH=4 measured +6.9% at fill 8881 on the 4x P100
+//     seat, n=3 medians, control in the same run; unchanged at fill 15; prefill untouched
+//     (prefill takes cols_per_block > 1, so it never reaches this kernel). ONE fill, not a basis.
+//   * the same row: "⚠ Not bit-exact" vs the shipped PXA_FA_VEC_ILP V pass (1-accumulator vs
+//     4-accumulator order) -- and "Default stays 0 until a coherence + ppl gate is recorded".
+//     That gate is NOT recorded, yet this function returns 4 at level >= 2 and ENHANCE IS the
+//     default level (ggml.c ggml_pxa_config_level: PXA_ENHANCE unset -> 2). So on this cell the
+//     lever is armed with no env set, while the row that owns it still advertised default 0.
+//   * the reviewer-cell row: the effect DOES NOT REPRODUCE there (+1.7% MTP off, +2.7% MTP on,
+//     NH=8 +0.3% = noise) and that arm is VOID -- engagement was never proven, because the
+//     banner's static resolver proves only that the env var was PARSED, not that the kernel
+//     dispatched (the kernel gate also needs cols_per_block == 1).
+// Net: a not-bit-exact kernel with one positive A/B at one fill and no engagement proof is armed
+// by the default level on this cell. That is disclosed in docs/COOKBOOK.md and must not be quoted
+// as a win. Bug 85 owns the fattn-vec-f32.cuh firing counter that would settle it; this default
+// should be revisited when that lands.
 // Explicit PXA_FA_GQA_PACK wins in both directions (0 reverts, 2/8 pick another pack width).
 static inline int pxa_fa_gqa_pack_default() {
     if (pxa_config_level() < 2) return 0;
@@ -583,10 +824,16 @@ static inline int pxa_fa_gqa_pack_default() {
 
 // PXA_MOE_DEVICE_MAP ENHANCE default (2026-09-03). Mode 1 moves the MoE expert-row mapping onto
 // the device, removing a D2H + cudaStreamSynchronize from inside graph compute. It can only fire
-// on a MoE model (the call site is the mul_mat_id row-mapping prep) and its measured basis is the
-// same 4x P100 seat, so like FA_GQA_PACK it arms on a MULTI-CARD sm_60 topology only and stays
-// env-only elsewhere. Mode 2 (device kernels + a host cross-check) remains env-only at every level.
-// Explicit PXA_MOE_DEVICE_MAP wins in both directions.
+// on a MoE model (the call site is the mul_mat_id row-mapping prep), so like FA_GQA_PACK it arms
+// on a MULTI-CARD sm_60 topology only and stays env-only elsewhere. Mode 2 (device kernels + a
+// host cross-check) remains env-only at every level. Explicit PXA_MOE_DEVICE_MAP wins both ways.
+//
+// ⚠ CORRECTED 2026-09-12: this comment used to call the 4x P100 seat "its measured basis". Nothing
+// was ever A/B'd for mode 1, so there is no measured basis. What IS on record (docs/lab/LEVERS.md,
+// this lever's row): ENGAGEMENT + CORRECTNESS verified -- the host cross-check rebuilds the expert
+// map and compares it element-by-element, 48/48 rows identical and 0 mismatches on the 4x P100
+// (sm_60) cell, with the =0 control logging 0 FIRING lines against 4 for an unset arm.
+// THROUGHPUT: no A/B on record, and docs/COOKBOOK.md says not to quote one.
 static inline int pxa_moe_device_map_default() {
     if (pxa_config_level() < 2) return 0;
     const pxa_topology_t & t = g_pxa_topology;
@@ -644,6 +891,13 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
         fprintf(stderr, " | dev%d %s(sm_%d):", i, names[i], cc / 10);
         const int i8 = pxa_int8_prefill_mode_resolve();
         if (level == 0) {
+            // LOAD-BEARING CLAIM, not a label. This string asserts that every PXA lever is off,
+            // so it is true only for as long as every resolver in the tree honours level 0.
+            // It was FALSE until 2026-09-11: pxa_fa_tile_f32acc() returned a bare `true` at
+            // every level, so a reference boot ran the fp32-accumulator FA change while
+            // printing this line (bug 67). If a future gate must be level-independent it may
+            // not be silent here: either the gate honours level 0, or this sentence gains a
+            // qualifier naming exactly what it does not cover.
             fprintf(stderr, " reference [all PXA levers OFF]");
         } else if (cc >= 700 && cc < 750) {
             if (pxa_volta_cublas_ne11() > 0) {
@@ -656,12 +910,23 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
         } else if (cc == 610 && (i8 == 1 || i8 == 2)) {
             // No MASK_SKIP_TILE here: fast_fp16_available() excludes cc 610, so sm_61 never
             // dispatches the tile-f16 kernel the lever lives in — reporting it ON would be a
-            // phantom lever. sm_61 takes tile-f32, whose skip is PXA_FA_MASK_SKIP_TILE_F32.
+            // phantom lever. sm_61 takes tile-f32, whose skip is PXA_FA_MASK_SKIP_TILE_F32 — but
+            // only at `ne[1] > 8 && ne[0] != 256`. At head 256 the fattn.cu:327 arm sends vec_f32
+            // instead, so NEITHER skip lever applies there; do not read the pointer above as a
+            // remedy at head 256, which is the shipping shape (122B-A10B/qwen35moe; Qwable-27B).
             fprintf(stderr, " INT8_PREFILL ON [+182%% pf, G3]");
             if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [mode %d]", pxa_router_fuse_mode_resolve());
         } else if (cc == 600) {
-            fprintf(stderr, " FP16_GEMM %s [2:1 hgemm] MASK_SKIP_TILE %s [bit-exact]",
-                    pxa_p100_fp16_gemm() ? "ON" : "off", pxa_fa_mask_skip_tile() ? "ON" : "off");
+            // FA_TILE_F32ACC belongs on this line and was missing from it: it is the same tile-f16
+            // kernel as MASK_SKIP_TILE and runs on the same dispatch path (fattn-tile-f16.cu:495
+            // checks it immediately before the skip), so a per-device row that names one and not the
+            // other understates what the card is actually running. Its label is deliberately NOT
+            // "[bit-exact]": unlike the skip, this is an ARITHMETIC change and is not bit-identical
+            // to the f16 accumulator it replaces -- see its docblock above. The two levers sit side
+            // by side here precisely so the difference between them is readable at a glance.
+            fprintf(stderr, " FP16_GEMM %s [2:1 hgemm] MASK_SKIP_TILE %s [bit-exact] FA_TILE_F32ACC %s [fp32 acc, not bit-exact vs f16 acc]",
+                    pxa_p100_fp16_gemm() ? "ON" : "off", pxa_fa_mask_skip_tile() ? "ON" : "off",
+                    pxa_fa_tile_f32acc() ? "ON" : "off");
             if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [mode %d]", pxa_router_fuse_mode_resolve());
         } else if (i8 == 2) {
             fprintf(stderr, " INT8_PREFILL ON [TEST all-arch]");
@@ -693,11 +958,12 @@ static inline void pxa_enhance_log_model_decisions() {
     if (!m.valid || !g_pxa_topology.valid) return;
     fprintf(stderr,
             "PXA model=%s class=%s experts=%d(top%d) vocab=%d mtp_head=%s mtp_active=%s "
-            "pxq_mmvq_tensors=%d | topology=\"%s\" | level=%s\n",
+            "pxq_mmvq_tensors=%d pxq2_tensors=%d pxq3_tensors=%d | topology=\"%s\" | level=%s\n",
             m.arch_name[0] ? m.arch_name : "?", pxa_model_class_name(),
             m.n_expert, m.n_expert_used, m.n_vocab,
             m.has_mtp_head ? "yes" : "no", m.mtp_active ? "yes" : "no",
-            m.n_pxq_mmvq_tensors, pxa_topology_name(), pxa_config_level_name());
+            m.n_pxq_mmvq_tensors, m.n_pxq2_tensors, m.n_pxq3_tensors,
+            pxa_topology_name(), pxa_config_level_name());
     // REFERENCE opts out of every auto-set, so there is nothing to report there. DEFAULT
     // is NOT silent any more: since 2026-07-31 PXQ_MMVQ (and FUSE_DELTANET) arm at DEFAULT,
     // so early-returning here would print "auto-set engages only under PXA_ENHANCE=1" while
@@ -729,19 +995,39 @@ static inline void pxa_enhance_log_model_decisions() {
             pxa_model_is_deltanet()
                 ? "deltanet hybrid arch — cluster + row-absorb fusions active (bit-exact with eager; out-gate fusion off by default, guarded, see pxa/README.md)"
                 : "INERT on this arch — no Gated-DeltaNet ops in the graph");
-    // PXQ_MMVQ
+    // PXQ_MMVQ, and which tiers it is allowed to carry
     {
         const char * e = getenv("PXA_PXQ_MMVQ");
         const int auto_mode = pxa_pxq_mmvq_auto_default();
+        const int mask23    = pxa_pxq23_mmvq_mask();
+        const int n_elig    = m.n_pxq_mmvq_tensors
+                            + ((mask23 & 1) ? m.n_pxq2_tensors : 0)
+                            + ((mask23 & 2) ? m.n_pxq3_tensors : 0);
         const char * why =
             e                                ? "explicit env override" :
-            auto_mode == 1                   ? "auto (DEFAULT/ENHANCE) x PXQ4/PXQ4HQ-bearing model x sm_70+ present (ship recipe A4m; fidelity-neutral paired dppl +0.016%)" :
-            auto_mode == 2                   ? "auto (DEFAULT/ENHANCE) x PXQ4/PXQ4HQ-bearing model x all-sm_61 fleet (real DP4A)" :
-            (m.n_pxq_mmvq_tensors <= 0)      ? "OFF: model carries no MMVQ-eligible PXQ4/PXQ4HQ tensors" :
+            auto_mode == 1                   ? "auto (DEFAULT/ENHANCE) x MMVQ-eligible model x sm_70+ present (ship recipe A4m; fidelity-neutral paired dppl +0.016%)" :
+            auto_mode == 2                   ? "auto (DEFAULT/ENHANCE) x MMVQ-eligible model x all-sm_61 fleet (real DP4A)" :
+            (n_elig <= 0)                    ? "OFF: model carries no tier this path is allowed to decode" :
             (t.has_sm60 && !t.has_sm70)      ? "OFF: sm_60-only fleet — P100 has no DP4A, the emulation path is not a win" :
                                                "OFF";
         fprintf(stderr, "PXA_AUTO: PXQ_MMVQ=%s (%s; override PXA_PXQ_MMVQ)\n",
                 e ? e : (auto_mode == 1 ? "1" : auto_mode == 2 ? "2" : "0"), why);
+        fprintf(stderr, "PXA_AUTO: PXQ23_MMVQ=%d (%s; override PXA_PXQ23_MMVQ)\n", mask23,
+                mask23 == 3 ? "PXQ2 and PXQ3 may ride the q8_1 GEMV (fidelity-gated s8 snap)" :
+                mask23 == 1 ? "PXQ2 only" :
+                mask23 == 2 ? "PXQ3 only" :
+                (m.n_pxq2_tensors + m.n_pxq3_tensors) > 0
+                    ? "OFF: the low tiers keep their bespoke fused decode kernels"
+                    : "INERT: this model carries no PXQ2/PXQ3 tensor");
+        const int maskh2 = pxa_pxq_mmv_h2_mask();
+        const int n_low  = m.n_pxq2_tensors + m.n_pxq3_tensors;
+        fprintf(stderr, "PXA_AUTO: PXQ_MMV_H2=%d (%s; override PXA_PXQ_MMV_H2)\n", maskh2,
+                !t.has_sm60         ? "INERT: no sm_60 device — the half2 decode loop is gated cc==600 exactly (sm_61 runs fp16 at 1/64 rate)" :
+                n_low <= 0          ? "INERT: this model carries no PXQ2/PXQ3 tensor" :
+                maskh2 == 3         ? "PXQ2 and PXQ3 dense decode on the half2 pair-LUT loop (sm_60 devices only)" :
+                maskh2 == 1         ? "PXQ2 only (sm_60 devices only)" :
+                maskh2 == 2         ? "PXQ3 only (sm_60 devices only)" :
+                                      "OFF: the low tiers keep the exact fp32 decode loop");
     }
     // The device-only levers, restated with model context so ONE ledger holds every decision.
     fprintf(stderr, "PXA_AUTO: VOLTA_CUBLAS_NE11=%d (%s; override PXA_VOLTA_CUBLAS_NE11)\n",
@@ -754,9 +1040,42 @@ static inline void pxa_enhance_log_model_decisions() {
             pxa_p100_fp16_gemm() ? "on" : "off",
             t.has_sm60 ? "sm_60 present: GP100 2:1 fp16 hgemm on dense GEMMs (+51% gpt-oss prefill measured); sm_61 excluded (1:64 fp16)"
                        : "INERT: no sm_60 device");
+    // bug fleet-report-omits-arch-scope-so-an-inert-lever-reads-on: this reason now carries the
+    // lever's arch scope, restated no wider than the resolver's own docblock above (pxa_fa_mask_skip_tile,
+    // "SCOPE -- this mirrors the fattn.cu dispatch, do not widen it in prose"): the tile-f16 kernel is
+    // reached on sm_60 ONLY -- fast_fp16_available() excludes sm_61, and fp16_mma_available() sends
+    // sm_70+ to the WMMA/MMA kernels. The P100_FP16_GEMM line directly above states the same kind of
+    // fact ("INERT: no sm_60 device"); this line did not, so on an all-sm_61 fleet (the 1080 Ti, which
+    // runs as its own fleet in the VLM container) it reported an engaged lever on a fleet where the
+    // per-device report above deliberately suppresses it as a phantom. Reporting only -- no dispatch
+    // change; the dispatch was always correct.
     fprintf(stderr, "PXA_AUTO: FA_MASK_SKIP_TILE=%s (%s; override PXA_FA_MASK_SKIP_TILE)\n",
             pxa_fa_mask_skip_tile() ? "on" : "off",
-            "bit-identical by construction; engages on fully-masked KV tiles (np2 co-resident slots)");
+            t.has_sm60
+                ? "sm_60 present: bit-identical by construction; engages on fully-masked KV tiles (np2 co-resident slots)"
+                : "INERT: no sm_60 device -- the tile-f16 kernel this gate lives in is never dispatched (fast_fp16_available() excludes sm_61; fp16_mma_available() sends sm_70+ to the WMMA/MMA kernels; sm_61 takes tile-f32 only at ne[1] > 8 && ne[0] != 256, whose skip is the separate PXA_FA_MASK_SKIP_TILE_F32 -- at head 256 sm_61 takes vec_f32 and no skip lever fires at all)");
+    // PXA_FA_TILE_F32ACC -- the third per-device lever, and the only one this ledger did not print.
+    // It was not silent: fattn-tile-f16.cu:501 fires its own "PXA_FA_TILE_F32ACC: ENGAGED" line.
+    // But that proof is per-KERNEL-DISPATCH, so it says nothing about the resolved default, and a
+    // boot that never dispatched the tile-f16 kernel reported nothing at all -- an absent line being
+    // indistinguishable from a lever that is off. It therefore has the same shape as the two lines
+    // above it and belongs in the same list.
+    //
+    // SCOPE is FA_MASK_SKIP_TILE's scope, stated the same way for the same reason: this is the same
+    // tile-f16 kernel, reached on sm_60 ONLY, so a fleet with no sm_60 device must read INERT rather
+    // than "on". Do not widen it in prose -- it mirrors the fattn.cu dispatch.
+    //
+    // REFERENCE is a third state worth naming, and it is why the 2026-09-11 hygiene fix (REFERENCE
+    // -> false, docblock above) needs saying out loud: at level 0 this lever is OFF by design, and an
+    // operator reading "off" needs to know that is the baseline being measured against rather than a
+    // lever that failed to engage. Reporting only -- no dispatch change.
+    fprintf(stderr, "PXA_AUTO: FA_TILE_F32ACC=%s (%s; override PXA_FA_TILE_F32ACC)\n",
+            pxa_fa_tile_f32acc() ? "on" : "off",
+            !t.has_sm60
+                ? "INERT: no sm_60 device -- this is the same tile-f16 kernel as FA_MASK_SKIP_TILE above, never dispatched here (fast_fp16_available() excludes sm_61; fp16_mma_available() sends sm_70+ to the WMMA/MMA kernels)"
+                : pxa_config_level() == 0
+                    ? "OFF: REFERENCE (level 0) selects the original fp16 accumulator -- that IS the baseline this fix is measured against, not a lever that declined to engage"
+                    : "sm_60 present: fp32 kqmax/kqsum/VKQ running state in the tile-f16 FA kernel; a CORRECTNESS fix, not a speed lever (the f16 accumulator's rounding depended on band placement) -- PXA_FA_TILE_F32ACC=0 restores the f16 path for an A/B");
     fprintf(stderr, "PXA_AUTO: INT8_PREFILL=%d (%s; override PXA_PXQ_INT8_PREFILL)\n",
             pxa_int8_prefill_mode_resolve(),
             t.has_sm61 ? "sm_61 present: DP4A int8 prefill (+182% pf 1080Ti, PXQ2 5.8k cold)"

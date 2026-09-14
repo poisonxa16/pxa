@@ -307,7 +307,7 @@ def test_from_config_rejects_foreign_quant_method():
 
 def _uses_split_gdn_input_projections(quant_config) -> bool:
     """VERBATIM COPY of vllm/model_executor/models/qwen3_5.py:127-157
-    (fork 1Cat-vLLM @ 2ceb15066).  Do not "clean up" -- its value is that it is
+    (the Volta vLLM fork @ 2ceb15066).  Do not "clean up" -- its value is that it is
     identical to the code that will actually run."""
     ignored_modules: list[str] = []
 

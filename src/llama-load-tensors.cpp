@@ -11,6 +11,7 @@
 #include <future>
 #include <regex>
 #include <unordered_set>
+#include <algorithm>
 
 #define LLAMA_API_INTERNAL
 
@@ -121,6 +122,7 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     bool create_deepseek2_tensors(const LLM_TN & tn);
 
     bool create_glm_dsa_tensors(const LLM_TN & tn);
+    bool create_glm5next_tensors(const LLM_TN & tn);
 
     bool create_deepseek4_tensors(const LLM_TN & tn);
     bool create_dspark_tensors(const LLM_TN & tn);
@@ -237,9 +239,24 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
     buft_layer_count[model.buft_input.buft_matrix]++;
     buft_layer_count[model.buft_output.buft]++;
     buft_layer_count[model.buft_output.buft_matrix]++;
+    // PXA_LAYER_MAP=1: print the layer -> device map. -ts is a proportion, the layers it
+    // lands on are integers, and for a MoE model one layer either way is ~2 GiB of VRAM --
+    // which is the difference between a config that boots fully resident and one that OOMs.
+    // Without this the only feedback is the per-buffer byte totals, from which the mapping
+    // has to be guessed.
+    const bool pxa_layer_map = getenv("PXA_LAYER_MAP") != nullptr;
     for (int i = 0; i < n_layer; ++i) {
         buft_layer_count[model.buft_layer[i].buft]++;
         buft_layer_count[model.buft_layer[i].buft_matrix]++;
+        if (pxa_layer_map) {
+            LLAMA_LOG_INFO("PXA_LAYER_MAP: layer %2d -> %s\n", i,
+                    ggml_backend_buft_name(model.buft_layer[i].buft_matrix));
+        }
+    }
+    if (pxa_layer_map) {
+        LLAMA_LOG_INFO("PXA_LAYER_MAP: input -> %s, output -> %s\n",
+                ggml_backend_buft_name(model.buft_input.buft_matrix),
+                ggml_backend_buft_name(model.buft_output.buft_matrix));
     }
 
     default_cpu_buft = llama_default_buffer_type_cpu(true);
@@ -3210,6 +3227,157 @@ bool create_tensors_helper::create_glm_dsa_tensors(const LLM_TN & tn) {
 // DS4 is NOT an MLA architecture: attn_kv is a plain MQA projection (1 KV head of
 // n_embd_head_k) and the output projection is a LoRA pair (attn_output_a/_b). There is
 // no attn_k_b / attn_v_b, so nothing here feeds llm_prepare_mla / is_mla_model().
+// PXA_GLM5NEXT: GLM-5.3-Flash ("glm5next"). Shapes verified tensor-by-tensor against the
+// unsloth UD-Q2_K_XL GGUF header, and against upstream PR #27773
+// (src/models/glm5-next.cpp::load_arch_tensors).
+//
+// 46 blocks: 0..44 are the trunk (34 KDA + 11 MLA/DSA, interleaved so that every 4th is MLA),
+// block 45 is the NextN/MTP draft head, loaded only with -mtp.
+bool create_tensors_helper::create_glm5next_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const int64_t hc         = hparams.dsv4_hc_mult;      // 4
+    const int64_t hc_mix_dim = (2 + hc)*hc;               // 24
+
+    const int64_t q_lora_rank  = hparams.n_lora_q;        // 1536
+    const int64_t kv_lora_rank = hparams.n_lora_kv;       // 512
+
+    // NoPE MLA: the whole key head is the "nope" half.
+    const int64_t n_embd_head_qk_rope = hparams.n_rot;              // 0
+    const int64_t n_embd_head_qk_nope = hparams.n_embd_head_k(0) - hparams.n_rot; // 256
+    const int64_t n_embd_head_v_mla   = hparams.n_embd_head_v(0);   // 256
+
+    const int64_t head_dim = hparams.n_embd_head_kda;     // 128
+    const int64_t d_conv   = hparams.ssm_d_conv;          // 4
+    const int64_t d_inner  = head_dim * n_head;           // 8192
+
+    const int64_t n_indexer_head = hparams.indexer_n_head;   // 32
+    const int64_t n_embd_indexer = hparams.indexer_head_size;// 128
+    const int64_t kpool          = hparams.indexer_kpool;    // 4
+
+    const int64_t n_ff_exp        = hparams.n_ff_exp;        // 2048
+    const int64_t n_expert_shared = hparams.n_expert_shared; // 1
+
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+    model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+    model.output      = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab});
+
+    const int n_trunk = n_layer - (int) hparams.nextn_predict_layers;
+
+    for (int i = 0; i < n_layer; ++i) {
+        const bool is_mtp_layer = i >= n_trunk;
+
+        int flags = 0;
+        if (!model.mtp && is_mtp_layer) {
+            flags |= llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_NOT_REQUIRED;
+        }
+
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        auto & layer = model.layers[i];
+
+        const auto graph_or_attn = (model.split_mode == LLAMA_SPLIT_MODE_GRAPH ||
+                                    model.split_mode == LLAMA_SPLIT_MODE_ATTN);
+        auto norm_ctx = graph_or_attn ? ctx_split : ctx_layer;
+        auto moe_ctx  = graph_or_attn ? ctx_split : ctx_layer;
+
+        layer.attn_norm = create_tensor(norm_ctx, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
+        layer.ffn_norm  = create_tensor(norm_ctx, tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, flags);
+
+        // --- mHC mixers. The NextN block has none: it is spliced into an already-collapsed
+        //     hidden state, so there are no residual streams left to mix. ---
+        if (!is_mtp_layer) {
+            layer.hc_attn_fn    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc*n_embd, hc_mix_dim});
+            layer.hc_attn_base  = create_tensor(norm_ctx,  tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim});
+            layer.hc_attn_scale = create_tensor(norm_ctx,  tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3});
+            layer.hc_ffn_fn     = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc*n_embd, hc_mix_dim});
+            layer.hc_ffn_base   = create_tensor(norm_ctx,  tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim});
+            layer.hc_ffn_scale  = create_tensor(norm_ctx,  tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3});
+        }
+
+        if (!is_mtp_layer && hparams.recurrent_layer_arr[i]) {
+            // ---------------- KDA (linear attention) layer ----------------
+            // The conv weights are written 3D [d_conv, 1, d_inner] by the converter; accept a
+            // 4D spelling too, which is what upstream's loader allows.
+            auto conv = [&](llm_tensor tid) {
+                ggml_tensor * t = create_tensor(ctx_split, tn(tid, "weight", i), {d_conv, 1, d_inner, 1},
+                                                llama_model_loader::TENSOR_NOT_REQUIRED);
+                return t ? t : create_tensor(ctx_split, tn(tid, "weight", i), {d_conv, 1, d_inner});
+            };
+            layer.ssm_conv1d_q = conv(LLM_TENSOR_SSM_CONV1D_Q);
+            layer.ssm_conv1d_k = conv(LLM_TENSOR_SSM_CONV1D_K);
+            layer.ssm_conv1d_v = conv(LLM_TENSOR_SSM_CONV1D_V);
+
+            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, d_inner});
+            layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, d_inner});
+            layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, d_inner});
+            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd});
+
+            // forget gate: low-rank n_embd -> head_dim -> d_inner, plus a per-channel bias
+            layer.ssm_f_a  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd, head_dim});
+            layer.ssm_f_b  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_F_B,  "weight", i), {head_dim, d_inner});
+            layer.ssm_dt_b = create_tensor(norm_ctx,  tn(LLM_TENSOR_SSM_DT,   "bias",   i), {d_inner});
+            // A_log, one per head; the GGUF stores it with no ".weight" suffix
+            layer.ssm_a    = create_tensor(norm_ctx,  tn(LLM_TENSOR_SSM_A_NOSCAN, i), {n_head});
+            // beta (the delta-rule write strength), one per head
+            layer.ssm_beta = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head});
+            // output gate: low-rank n_embd -> head_dim -> d_inner
+            layer.ssm_g_a  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd, head_dim});
+            layer.ssm_g_b  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_G_B,  "weight", i), {head_dim, d_inner});
+            layer.ssm_norm = create_tensor(norm_ctx,  tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim});
+        } else {
+            // ---------------- MLA + DSA indexer layer ----------------
+            layer.attn_q_a_norm  = create_tensor(norm_ctx, tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, flags);
+            layer.attn_kv_a_norm = create_tensor(norm_ctx, tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, flags);
+
+            layer.wq_a      = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, flags);
+            layer.wq_b      = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head * (n_embd_head_qk_nope + n_embd_head_qk_rope)}, flags);
+            layer.wkv_a_mqa = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + n_embd_head_qk_rope}, flags);
+            layer.wk_b      = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_B,      "weight", i), {n_embd_head_qk_nope, kv_lora_rank, n_head}, flags);
+            layer.wv_b      = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V_B,      "weight", i), {kv_lora_rank, n_embd_head_v_mla, n_head}, flags);
+            layer.wo        = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT,      "weight", i), {n_head * n_embd_head_v_mla, n_embd}, flags);
+
+            // The indexer's k_norm is a real LayerNorm: it has a bias as well as a weight.
+            layer.indexer_k_norm     = create_tensor(norm_ctx,  tn(LLM_TENSOR_INDEXER_K_NORM,      "weight", i), {n_embd_indexer}, flags);
+            layer.indexer_k_norm_b   = create_tensor(norm_ctx,  tn(LLM_TENSOR_INDEXER_K_NORM,      "bias",   i), {n_embd_indexer}, flags);
+            layer.indexer_proj       = create_tensor(norm_ctx,  tn(LLM_TENSOR_INDEXER_PROJ,        "weight", i), {n_embd, n_indexer_head}, flags);
+            layer.indexer_attn_k     = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_ATTN_K,      "weight", i), {n_embd, n_embd_indexer}, flags);
+            layer.indexer_attn_q_b   = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_ATTN_Q_B,    "weight", i), {q_lora_rank, n_indexer_head * n_embd_indexer}, flags);
+            layer.indexer_kpool_gate = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, n_embd_indexer}, flags);
+            layer.indexer_kpool_ape  = create_tensor(norm_ctx,  tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,  "weight", i), {n_embd_indexer, kpool}, flags);
+        }
+
+        if (i < (int) hparams.n_layer_dense_lead) {
+            layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff});
+            layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd});
+            layer.ffn_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff});
+        } else {
+            layer.ffn_gate_inp    = create_tensor(moe_ctx,  tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, flags);
+            layer.ffn_exp_probs_b = create_tensor(moe_ctx,  tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, flags);
+
+            layer.ffn_gate_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
+            layer.ffn_down_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
+            layer.ffn_up_exps   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
+
+            layer.ffn_gate_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
+            layer.ffn_down_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, flags);
+            layer.ffn_up_shexp   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
+        }
+
+        if (is_mtp_layer) {
+            layer.nextn.eh_proj          = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, flags);
+            layer.nextn.enorm            = create_tensor(norm_ctx,  tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, flags);
+            layer.nextn.hnorm            = create_tensor(norm_ctx,  tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, flags);
+            layer.nextn.embed_tokens     = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab}, flags | llama_model_loader::TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_head = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab}, flags | llama_model_loader::TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_norm = create_tensor(norm_ctx,  tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, flags | llama_model_loader::TENSOR_NOT_REQUIRED);
+        }
+    }
+
+    return true;
+}
+
 bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
     LOADING_PRELUDE
 
@@ -4478,10 +4646,111 @@ bool create_tensors_helper::merge_qkv(const LLM_TN & tn, int i, int bias, bool i
     return fused_qkv;
 }
 
+// PXA 2026-09-08. The PXQ tiers are PANEL-addressed, not row-addressed: the bytes
+// of one tensor are `experts outermost -> 64-row panels row-major -> K-major slabs`, and each
+// panel opens with a 128 B header holding one fp16 anchor PER ROW that covers ALL of K
+// (ggml/src/ggml-cuda/pxa/pxq6.cuh:15-17). ggml's own size arithmetic is numerically exact for
+// PXQ -- that is what row_meta_size = 2 buys (ggml/src/ggml.c:1200-1211) -- so every size-based
+// assertion in the split upload path passes. The BYTES it copies are still wrong unless the cut
+// lands where the panel structure allows, and nothing checked that. Concretely:
+//
+//   dim 2 (expert id)  ALWAYS SAFE. nb[2] is exactly the physical per-expert stride; the upload
+//                      is a flat sequential memcpy (ggml-cuda.cu:1236-1246), codec-agnostic.
+//   dim 1 (rows)       SAFE IFF every chunk boundary is a multiple of PXQ_PANEL_ROWS. 64 ggml
+//                      rows is EXACTLY one physical panel for every tier:
+//                        PXQ4/PXQ6 64*(2 + 17K/32) = 128 + 34K = 128 + (K/32)*1088
+//                        PXQ4HQ    64*(2 + 18K/32) = 128 + 36K = 128 + (K/32)*1152
+//                        PXQ6R     64*(2 + 21K/32) = 128 + 42K = 128 + (K/32)*1344
+//                      so a 64-aligned cut lands on a panel boundary and the row-run copy at
+//                      ggml-cuda.cu:1167-1191 is byte-exact. An unaligned cut halves a panel.
+//   dim 0 (K)          SAFE ONLY FOR A TYPE THE CUDA UPLOADER KNOWS HOW TO SLICE. The per-row
+//                      anchors live ONCE in the panel header and span all of K, so a K-split has
+//                      to duplicate them -- the header is row_meta_size (2) B/row x 64 rows =
+//                      128 B and is re-emitted into each half. That duplication IS implemented:
+//                      for a type listed in k_map (ggml/src/ggml-cuda.cu), the split uploader
+//                      steps in whole 64-row panels and reads the K/32 slabs the kernel actually
+//                      addresses. For any OTHER panel type the loader still refuses, because
+//                      reading such a tensor row-contiguously yields a slice that is wrong
+//                      without being detectably wrong.
+//
+// The callers hand dim 1 a 64-aligned split (see pxa_split_granularity()); dim 0 is allowed only
+// where pxa_type_pxq_k_split_ok() says the uploader can slice it. This is the backstop that makes
+// a wrong slice unreachable instead of silent.
+static bool pxa_type_is_pxq_panel(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_PXQ1:
+        case GGML_TYPE_PXQ2:
+        case GGML_TYPE_PXQ3:
+        case GGML_TYPE_PXQ4:
+        case GGML_TYPE_PXQ4HQ:
+        case GGML_TYPE_PXQ6:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Types the CUDA split uploader can K-slice byte-exactly: the types carrying an entry in k_map in
+// ggml/src/ggml-cuda.cu. THE TWO LISTS MUST STAY IN STEP. A type named here but missing there is
+// uploaded with n_interleave == 1, which reads rows contiguously across panel boundaries and
+// yields a slice that is wrong without being detectably wrong -- so the failure mode of getting
+// this wrong is silent corruption, and the conservative direction is to refuse.
+// Adding a type is one table entry plus that type's own load-and-produce check. The panel geometry
+// (bs 32, row_meta_size 2, 64 rows, 128 B header) is shared across
+// PXQ4/PXQ4HQ/PXQ2/PXQ3/PXQ1/PXQ6, and the uploader takes bs/ts/row_meta_size from the type
+// traits, so listing PXQ4 alone is a statement about what has been verified, not about geometry.
+static bool pxa_type_pxq_k_split_ok(enum ggml_type t) {
+    return t == GGML_TYPE_PXQ4;   // PXQ4_BM 64, slab 1088 B; verified against the real GGUF 325/325
+}
+
+// Rows per physical PXQ panel. Must match PXQ4_BM / PXQ6_BM in the CUDA codec.
+#define PXA_PXQ_PANEL_ROWS 64
+
+// Split granularity for a tensor: quant block size, floored at 16, but raised to a whole panel
+// for the PXQ tiers so that a dim-1 cut can never halve one.
+static int pxa_split_granularity(enum ggml_type type, int floor_gran) {
+    int g = floor_gran;
+    if (ggml_is_quantized(type)) {
+        auto tt = ggml_internal_get_type_traits(type);
+        if (tt.blck_size > g) g = tt.blck_size;
+    }
+    if (pxa_type_is_pxq_panel(type) && g < PXA_PXQ_PANEL_ROWS) {
+        g = PXA_PXQ_PANEL_ROWS;
+    }
+    return g;
+}
+
 static void prepare_split_tensors(int split_dim, ggml_context * ctx, ggml_tensor * tensor, llama_split_tensor & split_tensor,
         const std::vector<int> & splits, std::vector<size_t> & mem_used) {
     GGML_ASSERT(split_dim <= 2);
     GGML_ASSERT(splits.size() > 1);
+
+    if (pxa_type_is_pxq_panel(tensor->type)) {
+        // The dim-1 check below still applies to EVERY panel type, PXQ4 included: a dim-1 cut must
+        // land on a panel boundary whatever the type. Only the dim-0 refusal is type-specific.
+        if (split_dim == 0 && !pxa_type_pxq_k_split_ok(tensor->type)) {
+            throw std::runtime_error(format(
+                "split mode 'graph'/'attn' cannot split the PXQ tensor '%s' (type %s) on dim 0 (K): "
+                "this panel type has no verified K-slicer in the CUDA split uploader, and slicing it "
+                "row-contiguously would produce a wrong slice rather than an error. Use '-sm layer', "
+                "or requantize this tensor to a row-addressed type. (PXQ4 IS K-splittable -- see "
+                "pxa_type_pxq_k_split_ok().)",
+                tensor->name, ggml_type_name(tensor->type)));
+        }
+        if (split_dim == 1) {
+            for (size_t i = 0; i < splits.size(); ++i) {
+                if (splits[i] > 0 && (splits[i] % PXA_PXQ_PANEL_ROWS) != 0) {
+                    throw std::runtime_error(format(
+                        "split mode 'graph'/'attn' would cut the PXQ tensor '%s' (type %s) at row "
+                        "chunk %d, which is not a multiple of the %d-row panel: the slice would be "
+                        "silently wrong. This is a split-granularity bug, not a user error -- "
+                        "report it with this line.",
+                        tensor->name, ggml_type_name(tensor->type), splits[i], PXA_PXQ_PANEL_ROWS));
+                }
+            }
+        }
+    }
+
     std::string name{tensor->name};
     split_tensor.tensor_splits.resize(splits.size());
     if (split_dim < 0) {
@@ -5155,6 +5424,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_deepseek2_tensors(tn); break;
         case LLM_ARCH_GLM_DSA:
             use_mmap_buffer = create_glm_dsa_tensors(tn); break;
+        case LLM_ARCH_GLM5NEXT:
+            use_mmap_buffer = create_glm5next_tensors(tn); break;
         case LLM_ARCH_DEEPSEEK4:
             use_mmap_buffer = create_deepseek4_tensors(tn); break;
         case LLM_ARCH_DEEPSEEK4_DSPARK:
@@ -5216,14 +5487,17 @@ bool create_tensors_helper::create_tensors() {
     }
 
     {
+        // Kept in step with the earlier demote in llama.cpp (llama_model_load): no Gemma-4 file
+        // has been measured through the graph-parallel builder, so -sm graph / -sm attn falls
+        // back to -sm layer for the whole arch, not just the per-layer-embedding variants.
         const bool unsupported =
             (model.arch == LLM_ARCH_GEMMA4_MTP) ||
-            (model.arch == LLM_ARCH_GEMMA4 && model.tok_embd_per_layer);
+            (model.arch == LLM_ARCH_GEMMA4);
         if (unsupported && (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN)) {
             LLAMA_LOG_WARN("\n=========================================================\n");
             LLAMA_LOG_WARN("Split mode 'graph' is not supported for %s\n",
                            model.arch == LLM_ARCH_GEMMA4_MTP ? "Gemma 4 MTP assistant"
-                                                              : "this Gemma4 variant");
+                                                              : "Gemma 4 (unmeasured on this arch)");
             LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
             LLAMA_LOG_WARN("===========================================================\n\n");
             model.split_mode = LLAMA_SPLIT_MODE_LAYER;
@@ -5475,11 +5749,11 @@ bool create_tensors_helper::create_tensors() {
                                  split_tensors.find(layer.ffn_gate) != split_tensors.end() &&
                                  split_tensors.find(layer.ffn_up)   != split_tensors.end();
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
-                    }
+                    // One chunk vector is used as a dim-0 split of `down` and a dim-1 split of
+                    // up/gate, so the granularity must satisfy all three types (2026-09-08).
+                    int ffn_granularity = std::max({ pxa_split_granularity(layer.ffn_down->type, 16),
+                                                     pxa_split_granularity(layer.ffn_up->type,   16),
+                                                     pxa_split_granularity(layer.ffn_gate->type, 16) });
                     auto split = create_split(layer.ffn_down->ne[0], ffn_granularity, cur_splits, mem_used);
                     LLAMA_LOG_DEBUG("  split_ffn:"); for ([[maybe_unused]] auto s : split) LLAMA_LOG_DEBUG(" %d", s); LLAMA_LOG_DEBUG("\n");
                     prepare_split_tensors(0, ctx_split, layer.ffn_down, layer.split_ffn_down, split, mem_used);
@@ -5495,10 +5769,17 @@ bool create_tensors_helper::create_tensors() {
                 bool use_split = split_tensors.find(layer.ffn_down_exps) != split_tensors.end() && has_up_gate;
 
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down_exps->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down_exps->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
+                    int ffn_granularity = pxa_split_granularity(layer.ffn_down_exps->type, 16);
+                    if (layer.ffn_up_exps) {
+                        ffn_granularity = std::max(ffn_granularity, pxa_split_granularity(layer.ffn_up_exps->type, 16));
+                    }
+                    if (layer.ffn_gate_exps) {
+                        ffn_granularity = std::max(ffn_granularity, pxa_split_granularity(layer.ffn_gate_exps->type, 16));
+                    }
+                    if (layer.ffn_up_gate_exps) {
+                        // this one is split with the chunk vector doubled, so half a panel is
+                        // still a whole panel -- but the base vector must still be panel-aligned.
+                        ffn_granularity = std::max(ffn_granularity, pxa_split_granularity(layer.ffn_up_gate_exps->type, 16));
                     }
                     ffn_split = create_split(layer.ffn_down_exps->ne[0], ffn_granularity, cur_splits, mem_used);
                     LLAMA_LOG_DEBUG("  split_ffn_exps:"); for ([[maybe_unused]] auto s : ffn_split) LLAMA_LOG_DEBUG(" %d", s);
@@ -5536,11 +5817,9 @@ bool create_tensors_helper::create_tensors() {
                                  split_tensors.find(layer.ffn_gate_shexp) != split_tensors.end() &&
                                  split_tensors.find(layer.ffn_up_shexp)   != split_tensors.end();
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down_shexp->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down_shexp->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
-                    }
+                    int ffn_granularity = std::max({ pxa_split_granularity(layer.ffn_down_shexp->type, 16),
+                                                     pxa_split_granularity(layer.ffn_up_shexp->type,   16),
+                                                     pxa_split_granularity(layer.ffn_gate_shexp->type, 16) });
                     auto split = create_split(layer.ffn_down_shexp->ne[0], ffn_granularity, cur_splits, mem_used);
                     bool ok = true;
                     if (!ffn_split.empty()) {

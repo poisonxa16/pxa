@@ -14,13 +14,13 @@ v100,2x V100 (2;4),Qwable-27B,pxa + fused-twin split default (57fdd9091c),PXQ4,8
 1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa shipped 45dded40d8,PXQ2,1013.0 (cold fa-off),624.7 (chat fa-on),65.19,PUBLISHED tier fusion2-35b-PXQ2 (c11b45ef); earlier 1346/747 was on the defective archive and is struck
 1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa + N14 LUT 52d3e7828d,PXQ2,1032.0 (cold fa-off),635.3 (chat fa-on),65.34,PUBLISHED tier; prefill LOSES to upstream (-11%/-12%); int8 prefill nondeterminism flagged; surgery reopened
 v100,2x V100 (2;4),Qwable-27B,pxa + Volta mma FA + f16 GEMM route (2a370b46a0),PXQ4,909.8,802.2,34.3,two passes 908.7/910.9 - 804.3/800.2; greedy identical @3k; PP + CUDA-graph + layer-major the measurement session
-v100,2x V100 (2;4),Qwable-27B,pxa + Volta mma FA + f16 GEMM route at -ub 512,PXQ4,1032.6,1006.0,34.05,STRUCK: measured on the unsafe in-place state path; safe path = 769 @20k; re-measure on rc/unified
-p100,2x P100 (1;5),Qwable-27B,pxa prefill branch at -ub 512,PXQ4,265.8,267.4,18.27,STRUCK pending re-measure on rc/unified (prefill branch lacks the np==1 fix)
-p100,2x P100 (1;5),Qwable-27B,pxa prefill branch at -ub 256,PXQ4,310.7,294.1,18.34,STRUCK pending re-measure on rc/unified (prefill branch lacks the np==1 fix)
+v100,2x V100 (2;4),Qwable-27B,pxa + Volta mma FA + f16 GEMM route at -ub 512,PXQ4,1032.6,1006.0,34.05,STRUCK: measured on the unsafe in-place state path; safe path = 769 @20k; re-measure on the unified build
+p100,2x P100 (1;5),Qwable-27B,pxa prefill branch at -ub 512,PXQ4,265.8,267.4,18.27,STRUCK pending re-measure on the unified build (prefill branch lacks the np==1 fix)
+p100,2x P100 (1;5),Qwable-27B,pxa prefill branch at -ub 256,PXQ4,310.7,294.1,18.34,STRUCK pending re-measure on the unified build (prefill branch lacks the np==1 fix)
 1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa + N15 joint-table loader + fusion guard (0a3ca95453),PXQ2,1069.1 (cold fa-off),649.7 (chat fa-on),65.03,published tier same hour: upstream 1141.4/727.8/52.34; still -6.3%/-10.7% prefill; phase 2 (MMQ tile occupancy) running
 1080ti,1x 1080 Ti (3),PXA-Fusion2-35B,pxa + N16 mmq-loop tile (e902f1cf07),PXQ2,1252.8 (cold fa-off),717.5 (chat fa-on),65.0,published tier same window: upstream 1123.5/712.5; +11.5% cold, chat tie; deterministic
-v100,2x V100 (2;4),Qwable-27B,pxa rc/unified-20260903 (safe path) ub 2048,PXQ4,915.0,807.4,35.10,unified build n=7 concurrent with a P100 arm; ub 512 = 831/745
-p100,2x P100 (1;5),Qwable-27B,pxa rc/unified-20260903 (safe path) ub 256,PXQ4,218.4,,,unified build; ub 2048 shipped-build 231/205 stands as the P100 row until the overlap lane
+v100,2x V100 (2;4),Qwable-27B,pxa unified build 2026-09-03 (safe path) ub 2048,PXQ4,915.0,807.4,35.10,unified build n=7 concurrent with a P100 arm; ub 512 = 831/745
+p100,2x P100 (1;5),Qwable-27B,pxa unified build 2026-09-03 (safe path) ub 256,PXQ4,218.4,,,unified build; ub 2048 shipped-build 231/205 stands as the P100 row until the overlap lane
 v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 6163d43954,PXQ4,,,36.34,CANDIDATE 2026-09-03 01:46 decode @fill8 n=5 median; same-session base 35.12 (contended box); FUSE_DELTANET=7 graphs off; bit-exact to reference
 v100,2x V100 (2;4),Qwable-27B,pxa dev-branch 3b0c99f817 ASYNC_INPUTS=1,PXQ4,,791.2,,CANDIDATE 2026-09-03 00:50 20801 ub2048 2 runs; base same session 776.1; async default off
 v100,2x V100 (2;4),Qwable-27B,pxa dev-branch all three levers (pre-guard),PXQ4,,1018.5,,STRUCK-PENDING-GUARD 20801 ub512 busy 1.24 vs base 745; SHARE_INPUTS exposed the DeltaNet fusion race; re-measure after PXA_FUSE_DELTANET_WAR

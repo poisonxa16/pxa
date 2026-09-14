@@ -8,7 +8,7 @@ the mixed-type tail (§6) and the economics (§7).
 
 ---
 
-## 1. Where the three agents AGREE (treat as established)
+## 1. Where the three analyses AGREE (treat as established)
 
 Unanimous, and each point independently re-verified below or in the recon docs:
 
@@ -49,13 +49,13 @@ Stride `2*row_size` with q at offset 0 and gate at offset `row_size` is **per-he
 `[q_h0(256) | gate_h0(256) | q_h1(256) | ...]`, 24 pairs. This is the same order
 `qwen3_next.py:565-567` reconstructs (`view(..., num_heads, -1)` then `chunk(2, dim=-1)`).
 **No permutation in the converter.** A contiguous 3072-row (TP=4) / 6144-row (TP=2) slice is
-semantically correct. The moe agent's fallback ("a 256-row = 4-panel reorder") is moot but was
+semantically correct. The MoE analysis's fallback ("a 256-row = 4-panel reorder") is moot but was
 the right shape of contingency.
 
 ### 2.2 Does the row-parallel loader consult `packed_factor`?
 **row-parallel said NO (packed attrs are inert on the K axis). VERIFIED, on BOTH loader paths.**
 
-- v1: `RowParallelLinear.weight_loader`, `/opt/1Cat-vLLM/vllm/model_executor/layers/linear.py:1728-1761`.
+- v1: `RowParallelLinear.weight_loader`, `the vLLM fork checkout/vllm/model_executor/layers/linear.py:1728-1761`.
   Reads only `input_dim`; `packed_dim`/`packed_factor` never appear. The narrow is
   `shard_size = param_data.shape[input_dim]; start_idx = self.tp_rank*shard_size;
   loaded_weight.narrow(input_dim, start_idx, shard_size)` at :1749-1752, guarded by
@@ -65,7 +65,7 @@ the right shape of contingency.
   to `BasevLLMParameter.load_row_parallel_weight` → `_assert_and_load` (`parameter.py:102-103, 93-97`),
   i.e. a **full copy**. That *is* the required 128 B header duplication, obtained with no custom loader.
 
-So the two agents' parameter shapings are not in conflict — `packed_dim:0/packed_factor:64`
+So both analyses' parameter shapings are not in conflict — `packed_dim:0/packed_factor:64`
 governs the column axis only (`linear.py:1556-1560`, `parameter.py:606-609`), and is ignored on the row axis.
 Both recommend the same declaration and it is correct:
 ```
@@ -84,11 +84,11 @@ contradiction — but it is real and it is the largest single VRAM item in the t
 independently.** Census byte totals: PXQ4 12,231,950,336 · Q8_0 1,621,032,960 · Q6_K 1,042,944,000 ·
 MXFP4 802,160,640 · F32 10,686,464 = 15,708,774,400 B = 14.63 GiB (matches the artifact).
 Only **11.39 GiB is PXQ4**; at TP=4 that is 2.848 GiB/GPU. Independent recomputation of the
-moe agent's Policy A (everything non-PXQ4 → fp16) gives **5222.2 MB = 4.864 GiB/GPU at TP=4**,
+MoE analysis's Policy A (everything non-PXQ4 → fp16) gives **5222.2 MB = 4.864 GiB/GPU at TP=4**,
 matching their 4.863 to the third decimal. Policy A is *worse* than the incumbent AWQ 4.64 GiB/GPU.
 See §7.
 
-### 2.5 A fused `[k;v]` parameter would mis-split at TP=2 (moe agent)
+### 2.5 A fused `[k;v]` parameter would mis-split at TP=2 (MoE analysis)
 Correct as a warning about a *custom* parameter, but it does not apply to stock vLLM:
 `QKVParallelLinear.weight_loader` computes q/k/v offsets separately per `shard_id`
 (`linear.py:1538-1546`) before the packing divide (`:1556-1560`) and narrows the *loaded* tensor at
@@ -96,7 +96,7 @@ Correct as a warning about a *custom* parameter, but it does not apply to stock 
 plain column loader would hand rank0 all of K. Keep k and v as separate shard ids — which the stock
 loader already does.
 
-### 2.6 46 KB smem cap (kernels recon) — row-parallel agent could not verify it
+### 2.6 46 KB smem cap (kernels recon) — row-parallel analysis could not verify it
 Still **NOT VERIFIED** here; I did not re-check `ggml-cuda.cu:4262`. Immaterial to sharding: at TP=4
 every staged-x figure is ≤20.5 KB and at TP=2 ≤34.8 KB, so both sit below even the conservative cap.
 The direction of the effect is unambiguous — K-splitting only ever *reduces* the staged-x footprint.
@@ -105,7 +105,7 @@ The direction of the effect is unambiguous — K-splitting only ever *reduces* t
 
 ## 3. BOTTOM LINE
 
-### TP = 4 (DGX, 4×V100-32GB, NVLink): **SHARDS. No re-quantization.**
+### TP = 4 (GPU host, 4×V100-32GB, NVLink): **SHARDS. No re-quantization.**
 - Column-parallel: whole-panel memcpy. Every partition is a multiple of 64 rows.
   q|gate 3072 (48 panels) · k 256 (4) · v 256 (4) · GDN qkvz 512/512/1536/1536 (8/8/24/24,
   cumulative offsets 0/512/1024/2560 → 0/8/16/40 panels) · gate_up 4352 each (68 panels).
@@ -114,7 +114,7 @@ The direction of the effect is unambiguous — K-splitting only ever *reduces* t
   6144→1536 (48); ssm_out 6144→1536. All %32. Cost +0.065% (ffn_down) / +0.184% (attn_output)
   = **0.60 MiB/rank total**.
 
-### TP = 2 (Unraid, 2×V100-16GB, PHB/no NVLink): **SHARDS. No re-quantization.**
+### TP = 2 (2x V100 box, 2×V100-16GB, PHB/no NVLink): **SHARDS. No re-quantization.**
 Identical conclusion, strictly more slack: q|gate 6144 (96 panels), k/v 512 (8), GDN 1024/1024/3072/3072
 (offsets 0/16/32/80 panels), gate_up 8704 (136), ffn_down K 8704 (272 slabs), attn_output K 3072 (96).
 Header-duplication cost 0.40 MiB/rank. **There is no shape in this model that passes at TP=2 and fails
@@ -188,17 +188,17 @@ Bottom line: **we are not blocked on quantizer capability, and we do not need to
   `/path/to/hf/<reference-hf-model>/config.json`, 311 entries):
   it contains `lm_head`, every `mtp.*` linear, all `visual.*`, and per-layer
   `linear_attn`, `linear_attn.norm`, `linear_attn.in_proj_b`, `linear_attn.in_proj_a`.
-  So **their 4.64 GiB/GPU carries an fp16 lm_head and an fp16 MTP block** — confirming the moe agent's
+  So **their 4.64 GiB/GPU carries an fp16 lm_head and an fp16 MTP block** — confirming the MoE analysis's
   stated assumption, and meaning a PXQ4 lm_head is an advantage the incumbent structurally does not have.
   (Whether the bare `linear_attn` entry also exempts `in_proj_qkvz`/`out_proj` is **NOT VERIFIED** —
   the presence of explicit `in_proj_a/b` children suggests parent entries do not propagate.)
 - The same list confirms `in_proj_b`/`in_proj_a` are ignored in production, which is exactly what
   `_uses_split_gdn_input_projections` matches on
-  (`/opt/1Cat-vLLM/vllm/model_executor/models/qwen3_5.py:127-157`: scans
+  (`the vLLM fork checkout/vllm/model_executor/models/qwen3_5.py:127-157`: scans
   `modules_to_not_convert` / `ignored_layers` / `ignore` / `config['ignore']` for `linear_attn`,
   `.linear_attn`, `linear_attn.in_proj_a`, `linear_attn.in_proj_b`). Our `PXQ4Config` must expose the
   same, or the fused GDN projection gains `[48, 48]` rows → 12/rank at TP=4, which can never satisfy
-  `rows % 64`. **Geometrically mandatory, as the moe agent said.**
+  `rows % 64`. **Geometrically mandatory, as the MoE analysis said.**
 
 ## 6. The sm70 fast-path hazard — resolved, and less scary than reported
 All three warned about `_sm70_f16_force_enable`. Settled: `_mark_default_sm70_dense_modules`
@@ -213,7 +213,7 @@ Both interceptors are called *before* `quant_method.apply()` (`linear.py:1789-17
 are the only thing standing between us and AWQ kernels reading PXQ4 bytes.
 
 ## 7. What actually threatens the project (not sharding)
-The moe agent's headline stands and is the most important finding of the three reports:
+The MoE analysis's headline stands and is the most important finding of the three reports:
 **"PXQ4 kernel + fp16 everything else" is a regression, not a win.** At TP=4, Policy A = 4.864 GiB/GPU
 vs the incumbent's 4.64. The premise only holds if `ssm_out` (0.75 GiB packed, 48 tensors) and the LM
 head (`output.weight`, Q8_0, 1.35 GiB) are also served at 4 bits. Both are geometrically eligible for

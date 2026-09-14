@@ -34,6 +34,97 @@ mitigation and needs no rebuild.
 `/completion` requests with `n_predict 1`, `n_probs 2`, `temperature 0`, `cache_prompt false`, and
 compare every returned probability. They must be identical to the last digit.
 
+## Query-time sparse attention: reusing one selection for several tokens is deferred, not shipped
+
+The mechanism that makes this lever worth having on long context — select the attended cells once
+and reuse the selection for the next several tokens instead of re-selecting every token — is not
+in this release. It cannot be added as a small change: dropping the selection/score/top-k/expand
+chain for a token that is reusing a previous selection removes roughly 28 graph nodes per
+sparse-attention layer, and this engine treats a change in node count as a signal to re-reserve
+every compute buffer and rebuild the graph a second time. Doing that on every token that *does*
+still need a fresh selection would cost more than the mechanism saves. A real design needs two
+graph shapes and a cheap way to pick between them per token; pricing that switch is the next step,
+not a rewrite of the selection itself. What ships instead is the selection machinery's own
+overhead work — see `docs/lab/LEVERS.md`'s `PXA_QSA_GRID_INCR` / `PXA_QSA_FAST_TOPK` rows.
+
+- **Status:** open; deferred rather than half-built. The lever still selects densely every token
+  when it engages at all, gated off below a fill floor where dense attention is simply cheaper.
+
+## A gate-multiply fusion does not fold its preceding bias-add above one token
+
+An existing graph fusion collapses a gate's sigmoid (or SiLU) and the multiply that consumes it
+into one kernel launch, and the machinery behind it already supports a multi-row batch — the
+kernel indexes correctly for any number of tokens. The **graph builder** does not take that arm,
+though: three shared-expert-gate call sites gate the fused form on the batch being exactly one
+token wide, a stricter condition than the kernel actually needs. Above one token — every prefill
+chunk, and every speculative-decode verify batch — each of those sites pays two launches (the
+nonlinearity, then the multiply) where the fused kernel would do one, on every mixture-of-experts
+layer. Decode is unaffected; it is already one token wide and already takes the fused arm.
+
+Separately, and not the same gap: the fusion has never folded a *preceding* bias-add into the
+same launch, on any batch width. That half only matters for a model whose feed-forward gate/up
+carries a bias tensor, which neither shipped seat model does, so it is recorded rather than built.
+
+Closing the multi-token half is not a free launch-count reduction to flip on: the fused kernel
+computes the sigmoid and the multiply in one rounding step instead of two, which is the same
+mathematics but not bit-identical to the unfused pair. A fix needs the full determinism gate at
+both server topologies plus a needle check, not a bit-exactness proof.
+
+- **Status:** open, scoped, not built. `PXA_FUSE_SIBLINGS_CENSUS=1` (see `docs/lab/LEVERS.md`)
+  reports how often this exact `ADD` → fused-gate pattern occurs on a real graph, if you want to
+  size it before touching it.
+
+## MTP under two concurrent requests: a lazy-warmup step refuses a free draft token rather than guessing
+
+Fixed as of this release, in the sense that the previous behaviour is gone: an MTP draft step used
+to ask for the target model's hidden state at a given batch row without checking whether that row
+was still addressable, and under a specific two-slot shape — one slot mid-prefill on a long
+ubatch while another is verifying — it could silently get back the hidden state of a *different*
+token, because that particular batch shape stores hidden rows packed by output position rather
+than by the position they actually came from. That silent wrong-answer path is closed: the
+addressing rule now refuses instead of guessing whenever the buffer shape does not support the
+request.
+
+What is left, and is not a bug: the refused case still costs something. When it fires, the MTP
+draft loses its free carried-over token for that cycle — an error is logged
+(`MTP hidden state is empty during speculation`) and the draft re-seeds from a fresh decode
+instead, which is correct but not free. It only fires under the specific concurrent-prefill shape
+described above, and only while that shape persists.
+
+- **Status:** correctness fixed; the residual cost is accepted, not chased, in this release.
+
+## Two defects found while chasing the hybrid re-entry `NaN`, left unfixed on purpose
+
+Reading every unified-cache cell mutation while root-causing the attention-window sizing defect
+(see `RELEASE-NOTES-2026-09-09.md`) turned up two more real issues, neither of which
+could be tied to that failure and neither of which is fixed in this release — shipping an
+unrelated fix alongside the one that was actually proven was judged worse than reporting both and
+moving on:
+
+- The scan behind `llama_kv_cache_seq_rm` resets a cell's source-sequence tag (`cell.src`) in a
+  way that has not been checked against every caller's expectations.
+- The server's prompt-cache lookup (`server_prompt_cache::load`) moves the token list out of
+  **every** candidate entry it searches while looking for the best match, not only the one it
+  ultimately picks — it is harmless today only because the default code path that consumes the
+  result copies rather than relying on the (now-emptied) candidates it did not choose.
+
+- **Status:** open, both. Neither has a reproduction tying it to observed bad output; both are
+  latent until someone finds the call shape that reaches them.
+
+## PXQ2 / PXQ3 on vLLM: the kernels are intentionally behind PXQ4's own tuning
+
+PXQ2 and PXQ3 now convert and serve on the vLLM sidecar (`docs/VLLM.md`), through the same tiered
+dispatch PXQ4's mixture-of-experts modules already used. Their linear-module kernels deliberately
+do **not** carry the split-partials scratch-arena tuning PXQ4's own kernels use on the V100
+serving path — that machinery exists to avoid warp starvation at PXQ4's specific matrix-vector
+launch shapes, and the header comment for the PXQ2/PXQ3 kernels states plainly that there is no
+equivalent starvation to fix at the shapes these two tiers actually run. This is a scoping
+decision, not an oversight, and it means a PXQ2/PXQ3 linear module should not be expected to match
+a PXQ4 module's tuning depth cycle for cycle at this point in the project.
+
+- **Status:** working as scoped. Revisit only if a PXQ2/PXQ3-specific starvation pattern is ever
+  measured.
+
 ## `--pxq-universal` quantize: harmless CUDA-driver noise + argument order
 
 **Two things trip people up when building a PXQU (`--pxq-universal`) quant. Neither is a real bug.**
@@ -177,19 +268,167 @@ WARNING: deepseek2/MLA with -fa off degrades severely with context; use -fa on -
 Heed it on sm_60/sm_70+. On an all-sm_61 fleet, fa-off is not a warning-worthy state — it's
 the default for a reason.
 
-## Gemma-4 (128-expert Gemma MoE) is unsupported — fails clean at load
+## Gemma 4: dense runs, the sparse MoE and the MTP assistant still fail clean at load
 
-The PXA runtime is tuned for Qwen-family MoE. The **128-expert Gemma-4 MoE** path (`GEMMA4`
-with per-layer embeddings, and the `GEMMA4_MTP` assistant) is **not supported**: on the affected
-expert-config it corrupted the heap (`double free or corruption` on batches >= 1024 tokens) and
-fell back to ~8 t/s scalar decode.
-
-Rather than risk heap corruption, the runtime now **fails clean at model-load / context-creation**
-with a clear error instead of attempting the build:
+**Dense Gemma 4 runs on this engine** — `gemma4` with `n_expert = 0`. What was measured is the 12B
+(`google/gemma-4-12B-it`, both Google's QAT `q4_0` GGUF and a `Q8_0` converted here from the bf16
+release). The 31B is the same graph at a different size and is expected to work but was not run;
+the small per-layer-embedding **E2B and E4B take a different path through the builder and are
+untested** — they load, and nothing more than that is claimed. Two variants still refuse, and the
+error now says which one you hit:
 
 ```
-PXA runtime does not support arch 'gemma4' (128-expert Gemma-4 MoE); use stock llama.cpp. See docs/KNOWN-ISSUES.md.
+PXA runtime does not support this 'gemma4' variant (128-expert sparse Gemma-4 MoE); use stock llama.cpp. Dense Gemma-4 is supported. See docs/KNOWN-ISSUES.md.
 ```
+
+- **The sparse MoE** (`gemma-4-26B-A4B`, 128 experts) — a real defect, not caution. On the affected
+  expert config it corrupted the heap (`double free or corruption` on batches >= 1024 tokens) and
+  fell back to roughly 8 t/s scalar decode. The refusal happens at graph-build time, which
+  `llama_build_graph` runs at context creation inside a `try`/`catch`, so it surfaces as a clean
+  load-time error rather than a corrupted process. **Workaround: run it on stock llama.cpp.**
+- **The MTP assistant drafter** (`gemma4_mtp`, the `-it-assistant` files) — no known defect; it has
+  simply never been measured here, and a path this engine has not measured does not ship enabled.
+  **Workaround: run the dense target without a drafter.**
+
+Demoted rather than refused: `-sm graph` and `-sm attn` fall back to `-sm layer` on any Gemma-4
+file, with a warning. A graph-parallel (tensor-parallel) builder exists for this architecture but
+no Gemma-4 file has been measured through it. `-sm layer` is the default, so this only affects an
+explicit request.
+
+Chat works out of the box: Gemma 4 ships its own jinja template, and the built-in template map has
+no row for it — its turns are `<|turn>` / `<turn|>`, not Gemma 3's `<start_of_turn>`, so the
+built-in `gemma` row would be wrong rather than merely missing. `llama-server` and `llama-cli`
+therefore turn the jinja path on for this architecture by themselves and say so on stderr; an
+explicit `--jinja` or `--chat-template` still decides, and `PXA_AUTO_JINJA=0` declines with a
+reason. Before this, a launch with no flags logged `chat template parsing error` and formatted the
+conversation with a template that was not the model's.
+
+### What was measured, on `gemma-4-12B-it-qat-q4_0`
+
+One Tesla P100 (sm_60) unless the row says CPU; stock llama.cpp `82dbc4f01` built from source is
+the comparison engine. A Qwen3-0.6B-Q8_0 control was taken in the same session for every
+cross-engine number, because this engine and stock are not byte-identical on any architecture.
+
+| Gate | Result |
+| --- | --- |
+| Loads and serves | yes, on CPU and on one card; the boot line names the architecture, the expert count and every lever it turns on or declines |
+| Greedy identity vs stock (3 prompts x 64 tokens, temp 0, CPU) | 2/3 byte-identical — the same rate the Qwen3-0.6B control gave in the same session; through `/v1/chat/completions` 2/3 against a control of 1/3 |
+| Greedy identity, card vs CPU vs stock | prompt 1 byte-identical across all three; prompt 3 on the card reproduces stock's CPU answer exactly |
+| Retrieval (a fact in the first line, asked for at the end) | answered correctly at **3,121 / 8,267 / 21,358 prompt tokens** |
+| Perplexity vs stock (wikitext-2, `-c 2048`, 10 chunks, CPU) | ours 835.34 ± 52.31, stock 845.35 ± 52.90 — ratio **0.988** |
+| Prefill batches >= 1024 tokens (`-b 2048 -ub 2048`) | clean: three rounds of 1,024 + 2,048 + 3,121-token prompts, server alive, no heap diagnostic in the log |
+| Determinism, single slot (`-np 1`, 7 prompts, 3 boots) | **7/7** byte-identical |
+| Determinism, two co-resident slots (`-np 2`) | **2/7** — see below |
+| Every lever on vs `PXA_REFERENCE=1` | 2/3 byte-identical; the one difference has the reference build reproducing the CPU and stock answer |
+| Speed, `llama-bench`, `-fa 1` | pp512 **207.1 ± 7.5 t/s**, tg64 **17.1 ± 1.8 t/s** |
+| Speed, through the server | decode 29.8 t/s at short context, 9.1 t/s with 8k in the slot |
+
+Retrieval has to be asked for the way the model is meant to be used. Gemma 4 is a turn-structured
+model with a thinking channel: hand it a long document as **raw text** through `/completion` and it
+degenerates into a repeating token instead of answering — and so does stock llama.cpp on the same
+file, at a shorter length than it takes to break this engine. The numbers above come from
+`/v1/chat/completions` with the model's own template, and with an answer budget large enough for
+the model to finish thinking first: at 160 tokens it is still reasoning and the answer channel is
+empty; at 1,200 the answer itself contains both identifiers.
+
+### Concurrent slots are not bit-reproducible on Gemma 4
+
+With two co-resident slots (`-np 2`), the same prompt at `temperature=0` can return different
+completions in the two slots, and different completions from the single-slot reference: **2 of 7
+prompts identical, against 7 of 7 at a single slot**, with the slots erased before every request so
+every completion starts at the same KV placement. It reproduces with **every lever off**
+(`PXA_REFERENCE=1`), so it is not one of this engine's optimisations — it is structural on this
+architecture and is under investigation. Single-stream serving is unaffected. If you need
+bit-reproducible output from Gemma 4 today, run it at `-np 1`.
+
+### Size `-c` to what you actually need
+
+This engine allocates the KV cache for **every** layer at the full context. Gemma 4 runs a
+1,024-token sliding window on 40 of its 48 layers, so those layers need a window's worth of cache
+and are given a whole context's worth instead: **336 KiB per token**, or 1,344 MiB at `-c 4096`,
+where an engine with a per-layer window cache uses 544 MiB for the same model and context. Two
+things follow, and both are measured:
+
+- On a 16 GB card the practical ceiling is around 24k tokens for the 12B, not the 262k the model
+  supports.
+- Prefill cost tracks the **allocated** context, not the prompt: the same prompts run at 122 t/s at
+  `-c 4096`, 68 t/s at `-c 18432` and 28 t/s at `-c 22528` on one P100. Flash attention is a wash
+  either way (122.3 t/s with `-fa on`, 123.4 with it off).
+
+A per-layer window cache is the fix and is not in this release.
+
+### One number that is reported and not interpreted
+
+Scored against stock llama.cpp's own logits, this engine's mean KL divergence on Gemma 4 is
+**0.146** on the QAT `q4_0` file at `-c 2048`, **0.159** on the same file at `-c 1024`, and
+**0.203** on a `Q8_0` file at `-c 1024` — top-token agreement 88.4–88.8% in all three. It is flat
+in context, flat in quantization type, and unexplained. Two plausible explanations were tested and
+**both are wrong**: it is not the sliding window (it does not change between `-c 1024`, where every
+scored token has less than a window of history, and `-c 2048`, where every scored token has more),
+and it is not stock's CPU weight-repacking path (it is no smaller on a `Q8_0` file, which stock
+does not repack, than on the `q4_0` file, which it does).
+
+Read it next to the regime it was taken in. **Both engines score this model above PPL 500 on
+wikitext** — raw or wrapped in the model's own turn structure, `Q8_0` or `q4_0`, this engine or
+stock. A model that uncertain will disagree with a second implementation about the top token
+roughly one time in nine without either being wrong. Corpus metrics for Gemma 4 are recorded here
+because they were measured, not because they are diagnostic; the quality evidence is the identity
+rate against the control, the retrieval results, and the perplexity **ratio** of 0.988 against
+stock on the identical file.
+
+### A PXQ file for Gemma 4
+
+`gemma-4-12B-it` converted from Google's bf16 release to `Q8_0` and quantized from there. Every
+row below is scored against that `Q8_0`'s own logits, same corpus, card and binary, so the rows
+are comparable to each other:
+
+| File | Bytes | PPL | ln(PPL/base) | Mean KLD | Same top-1 |
+| --- | --- | --- | --- | --- | --- |
+| `Q8_0` (reference) | 12,669,627,712 | 546.47 | — | — | — |
+| **PXQ4** | 6,981,972,000 | 600.20 | 0.101 | **1.337** | 57.4% |
+| Google's QAT `q4_0` | 6,975,879,296 | 782.82 | 0.367 | 3.033 | 40.2% |
+
+*(wikitext-2, `-c 2048`, 10 chunks, one P100.)* The whole tier set, on the same text wrapped in
+the model's own turn structure (4 chunks, base PPL 533.99), against that same reference:
+
+| File | Bytes | PPL | Mean KLD | Same top-1 |
+| --- | --- | --- | --- | --- |
+| **PXQ4** | 6,981,972,000 | 557.20 | **1.137** | 58.1% |
+| PXQ3-balanced | 5,920,289,024 | 1,452.35 | 2.362 | 41.9% |
+| Google's QAT `q4_0` | 6,975,879,296 | 869.30 | 2.809 | 41.2% |
+| PXQ2-attn4 | 4,858,605,760 | 444,224.68 | 9.865 | 1.2% |
+
+**Ship PXQ4 for this model.** PXQ3-balanced is the aggressive tier and its two metrics disagree —
+better KL divergence than the QAT file at 15% fewer bytes, far worse perplexity. **PXQ2-attn4 does
+not work on Gemma 4 at all**: agreeing with the reference on the next token 1.2% of the time is a
+destroyed model, not a degraded one, and the profile's protection of attention cannot rescue it
+because this architecture keeps half its bytes in 15,360-wide FFN projections on all 48 layers even
+at two bits. It is measured here so that nobody tries it and reports a broken engine.
+
+**At matched bytes the PXQ4 file is 2.3x closer to the full-precision reference than Google's own
+4-bit file of this model** — and it still answers: booted from the PXQ4 file, it retrieves a fact
+from the first line of a 3,121- and an 8,267-token document and states it in the answer. Three
+things belong next to that claim. Google's QAT file is a *retrained* model rather than a
+quantization of these weights, so it is a comparison of two shipping files and not a clean codec
+A/B. The absolute KL divergences are large because of the regime described above and rank the
+files against each other rather than standing alone. And PXQ3-balanced is the tier where the two
+metrics disagree — better KL divergence than the QAT file at 15% fewer bytes, considerably worse
+perplexity — so it is offered as the aggressive tier and nothing more.
+
+The composition is what the quantizer chose with no flags: 240 tensors at PXQ4 (attention Q and
+output, and all three FFN projections), 88 at `Q8_0` (attention K and V — 48 and 40, because the
+eight full-attention layers share K as V and carry no V tensor at all), `token_embd` at `Q6_K`,
+and 338 F32. **No tensor fell back for geometry**: every 2-D tensor in this architecture clears the
+slab codec's 64-row, 32-wide requirement. The file was quantized from `Q8_0` rather than from
+bf16, which is a second lossy pass and therefore strictly below what a single pass from the
+original weights would give.
+
+Scope: the `gemma4` / `gemma4_mtp` graph-build paths only. Every other architecture is unaffected;
+this is a targeted refusal, not an allowlist.
+
+Until 2026-09-10 the guard was a denylist **by architecture**: it refused every Gemma-4 file,
+including the dense ones, which had therefore never been tested here. The condition is now the
+shape that actually fails (`n_expert > 0`), so the dense models are refused no longer.
 
 ## `v2026.09.02`: delta-net state aliasing can produce garbage output (fixed in the next build)
 
@@ -238,12 +477,6 @@ yourself from the same source weights can land noticeably larger on disk and res
 file about 60 MB larger than the published tier no longer fits that same protocol on this card:
 it fails to allocate its first request's compute buffers. If you are on an 11 GB card, prefer the
 published PXQ2 tier over a fresh re-export, or drop `-ub` (or the context) until it fits.
-
-- **Scope:** the `GEMMA4` / `GEMMA4_MTP` graph-build paths only. Every other architecture the fork
-  supports (llama, qwen3moe, glm4_moe, openai_moe, deepseek2, minimax_m2, ...) is unaffected — this
-  is a targeted denylist, not a Qwen-only allowlist.
-- **Workaround:** run Gemma-4 on **stock llama.cpp**. The PXA runtime does not attempt Gemma-4
-  optimization; the guard exists only to fail safely rather than corrupt memory.
 
 ## Multi-slot Flash-Next: the fast single-sequence prefill lever turns itself off above one slot
 
@@ -359,3 +592,245 @@ is another 0.3%, i.e. nothing.
 - **Override:** `PXA_PIPELINE_PP=1` forces it on for any architecture, if you have the VRAM and
   want to measure it yourself.
 - **Status:** fixed and defaulted deliberately; not a limitation you need to work around.
+
+## `PXA_DSA_ATTN=1`: a node the CUDA backend declines falls to the CPU backend
+
+The sparse-attention path is requested per node, by attaching an index list to the flash-attention
+node's `src[5]`. The CUDA backend now **declines** such a node when it cannot honour the request,
+instead of running a dense kernel on it — a dense kernel handed a too-narrow index list does not
+compute the dense answer, it computes a different one (measured 73.2% off in RMS).
+
+Declining is the correct behaviour, but it has a consequence worth stating: the scheduler then
+places that node on the CPU backend, which answers the *dense* question. So with the lever armed,
+a node CUDA declines is silently answered by a different computation than the one that was asked
+for — just slowly rather than wrongly.
+
+Nothing reaches this today: the graph builder's own gate mirrors the backend's predicate, so no
+shipping model attaches an index list the backend would decline. That is two places agreeing, not
+a guarantee, and the lever ships **off**.
+
+- **Status:** open, and bounded by the lever being off. The fix is for the request to be refused at
+  graph-build time rather than resolved by a fallback at schedule time.
+
+## `PXA_KV_INDEX_CHECK` is a debug instrument, and it is not bit-neutral
+
+`PXA_KV_SEQ_RM_INDEX` itself is: with the index on and off, the same prompts produce byte-identical
+answers, checked over three aged boots with the prompt cache driven to its ceiling.
+`PXA_KV_INDEX_CHECK=1` — which rebuilds the index from scratch on every indexed removal and compares
+— is a different matter: two of the twelve gate prompts (`p128`, `p1536`) moved against the control
+with it on, while the on-vs-off comparison without it was exact.
+
+That is the shape of an observer changing what it observes, not of the index being wrong, and it is
+why the check is an instrument rather than a gate. Use it to find drift; do not use it in a run
+whose output you intend to compare against anything.
+
+- **Status:** by design, documented rather than fixed. `PXA_KV_SEQ_RM_INDEX` ships off; the check
+  ships off with it.
+
+## Four-card Flash-Next seat: identical within a boot, not always across boots
+
+At one request at a time on the four-card hybrid-MoE seat, greedy output is **deterministic within
+a boot** — the same prompt gives the same bytes every time, for as long as the server stays up.
+Across boots it is not: five of the twelve fixed gate prompts, all of them 2,048 tokens or longer,
+produce a different completion after a restart. Shorter prompts are stable across boots too.
+
+That pattern — long prompts only, stable within a process, moving between processes — points at
+something fixed at load or first use rather than at a race in the decode loop, but the cause is
+still being narrowed and I would rather say that than guess in public.
+
+- **Status:** open, under investigation. It does not affect a running server's reproducibility,
+  which is what a client actually sees; it affects comparing a number taken today against one
+  taken after a restart. Take both sides of any comparison within one boot.
+
+## Fixed in this release — long prompts could answer differently, or not at all, on either card family
+
+Long prompts on the GP100-class cards could answer differently, or not at all, depending on what
+else the server was holding. The kernel responsible is the tile flash-attention kernel, which on
+those cards handles BATCHED attention -- prompt processing, and any speculative verify batch
+wider than eight columns. It kept its running softmax state in half precision, and it walks the keys in 64-cell tiles whose membership is
+decided by the slot a request lands in rather than by the prompt itself — so the rounding of a
+twenty-thousand-term accumulation moved when the placement moved.
+
+I want to be blunt about how bad it was, because I only found out by measuring it: on a
+20,859-token prompt, from one placement the first token was a newline at 96.5% and the model
+answered; from another, four hundred cells further along, the end-of-text token won at 59.6% and it
+returned nothing — and against a double-precision reference the half-precision arithmetic was 26%
+off at *both* placements, so the good-looking one was not right either, it was lucky.
+
+I checked the fix rather than assuming it, on both kinds of model, and the two answers are
+different enough to be worth your time.
+
+On a **dense** model — a 27B at PXQ4 on two GP100-class cards, 20,801-token prompt — the fixed
+kernel is placement-invariant: start the request's KV band at cell 0 or at cell 101 and the first
+token's distribution agrees to about one part in a thousand (top-1 0.0432 against 0.0431). The old
+half-precision kernel was *also* placement-stable on that model, and still wrong: it put the top
+token at 0.057 where fp32 says 0.043, and ranked a different token second. That is the 26% seen
+live rather than against a reference — stable and wrong is the worst combination, because nothing
+about it looks broken.
+
+On a **mixture-of-experts** model the fix removes the failure but not the variation. On the
+four-card seat both placements now return the same correct 32-token answer to the 20,859-token
+needle prompt, where the old kernel returned nothing at the misaligned one — but their first-token
+distributions still differ (0.70 against 0.93 for that token). The fixed kernel leaves rounding-order
+residue at the 1e-7 level, and greedy top-10 expert routing plus recurrent layers amplify it: a
+near-tie in the routing can land on the other side. That is inherent to greedy expert selection
+under any arithmetic that is not bit-exact, not a defect left over. So on a MoE seat, if you need
+reproducible output, erase both slots before a request or drive it with one slot (`-np 1`); on a
+dense model you no longer need to.
+
+The fix is not free: on the four-card seat that 20,859-token prompt takes 54.7 s to prefill instead
+of 49.4 s, about 10% slower. I would make that trade again — the alternative is a fast answer that
+is 26% off and occasionally empty.
+
+The running state is fp32 now. Two consequences you should expect. Answers to long prompts on these
+cards change against the previous release, on purpose. This is a GP100-class change only: the
+V100-class cards run a different batched-attention kernel that this release does not touch, so
+their output and their speed are unchanged for reasons that have nothing to do with this fix.
+On the older cards it is not free — this is a correctness change, and I would
+rather you get different bytes than confidently wrong ones. And the empty-answer class goes away
+with it. `PXA_FA_TILE_F32ACC=0` restores the old arithmetic if you need to compare.
+
+## Speculative decoding is lossless in its acceptance rule, not in its arithmetic
+
+The acceptance rule only ever keeps a drafted token when the target model would have produced it,
+so speculation cannot put a token in the output that the model did not choose. That is not the same
+as producing the same bytes: with MTP speculation at the default depth, greedy output differed from
+unspeculated greedy output on 5 of 6 fixed prompts on the 27B model. The verify batch's reduction
+shape is not the single-row decode's, so a near-tie can land on the other side of the tie — and
+wherever the draft sequence happened to be identical, the text was identical too, which is the
+signature of arithmetic rather than of a rule being broken.
+
+- **Status:** by design, and stated rather than hidden. If you need greedy text that is
+  bit-reproducible against an unspeculated run, turn speculation off with
+  `--spec-type none` (or leave `PXA_AUTO_SPEC=0` set, which stops the engine arming it for you).
+
+## The vLLM sidecar's log-probabilities endpoint returns 500
+
+Asking the sidecar for token log-probabilities fails with a server error. Generation itself is
+unaffected — this is the logprobs response path only — and the llama-engine server's equivalent
+endpoint works. It is being diagnosed; I would rather ship the line than have you find it.
+
+- **Status:** open. If you need log-probabilities today, take them from the llama-engine server.
+
+## Speculation changes the bytes, and the cascade changes more of them
+
+Already stated above for MTP: speculation is lossless in its acceptance rule and not in its
+arithmetic. The n-gram cascade is the same effect with a wider reach — at temperature 0, only 2 of
+12 fixed prompts came back identical to the same server with no drafter at all. Every one of the
+twelve is a valid greedy continuation; they are not the *same* valid continuation.
+
+- **Status:** by design, and the reason is the verify batch's reduction shape rather than the
+  drafter proposing anything the model would not have chosen. If you need greedy text that is
+  bit-reproducible against an undrafted run, use `--spec-type none`.
+
+## Fixed 2026-09-13 — the MTP head re-planned its graph twice per accepted token
+
+**How it showed.** Not as an error. A boot looked healthy and decode looked ordinary; the only
+visible trace was a stream of reserve lines in the log and, at longer draft lengths, an
+out-of-memory a dozen speculative cycles into a run that had started fine. What was happening is
+that the MTP head's two passes built **different graph shapes** — the N-row update pass asks for
+fewer output rows than it has, so it carries an `out_ids` row-slice; the 1-row draft pass asks for
+one row out of one, so the slice was skipped — and one context cannot hold two node counts under a
+single allocator plan. Every alternation re-planned: a full backend drain plus a compute-buffer
+reallocation, **twice per accepted token**. Over one bench that is 229 re-reserves at width 5.
+
+Counted over a whole boot including prefill, reserve calls / coverage failures / allocator re-plans
+were **242 / 174 / 176**; they are now **7 / 5 / 11**. The fix (`PXA_MTP_STABLE_OUT_IDS`, default on)
+builds the slice unconditionally — at one row out of one the slice is the identity, so no value
+changes — and a thrash guard (`PXA_RESERVE_GUARD`, cap `PXA_RESERVE_MAX`, default 24) latches the
+mechanism off per context if it ever does start churning again.
+
+- **Status:** fixed, default on, and the output is unchanged: greedy probe hash, draft counters and
+  the full 512-token control generation are identical to the pre-fix arm. `PXA_MTP_STABLE_OUT_IDS=0`
+  restores the old shape if you need to reproduce the churn.
+
+## The main context still has two graph shapes, and the guard is what makes it cheap
+
+The same cause survives in the main model, in a smaller form. Its last layer carries the same
+`out_ids` row-slice (`GET_ROWS attn_out-63` and `GET_ROWS sainp_get_rows-63`), and the mirror image
+of the MTP case applies: the reserve is widened to 2048 and asks for 2047 outputs, so it **builds**
+the slice; a real decode ubatch is a verify batch in which every row is an output, so it **skips**
+it. Two shapes, and the coverage test fails on the widths a verify batch actually takes (2, 4, 5, 44,
+55 have all been observed).
+
+The guard blacklists each shape after one failed try, so the cost is bounded at roughly **5 coverage
+failures and 11 allocator re-plans per boot** — per boot, not per cycle. The same unconditional-slice
+treatment that fixed the MTP head would work here and the identity argument is unchanged, but it
+would add two `get_rows` to **every** main-model decode to save 11 re-plans per boot, and it would
+need its own bitwise and speed proof. That trade was declined deliberately.
+
+- **Status:** known, not fixed, bounded. `PXA_RESERVE_DEBUG=1` prints the two nodes if you want to
+  see it for yourself; revisit only if a profile says those re-plans matter.
+
+## Per-step recurrent checkpoints scale with the draft length, and on a 16 GB card that is the ceiling
+
+A recurrent (DeltaNet/GDN) target checkpoints its state every speculation window. In the exact
+`per-step` mode the buffers hold one conv+SSM snapshot **per drafted step**, so they scale linearly
+with how many tokens the drafter proposes. Measured on a 2× V100 16 GB pair with the 27B PXQ4 file:
+
+| capacity (`max_tokens`) | card 0 | card 1 |
+|---|---|---|
+| 5 (a 4-token draft) | 377.58 MiB | 226.55 MiB |
+| 33 | 2996.02 MiB | 1797.61 MiB |
+| 65 | 5988.52 MiB | 3593.11 MiB |
+
+At 65 the first card's budget is weights 7587.75 + KV 1245.52 + compute 432.93 + checkpoint 5988.52 =
+**15254 of 16384 MiB** — and the allocation *succeeds*, which is the trap. It leaves about 0.7 GB, the
+CUDA pool grows during decode, and the first sizeable pool allocation then dies with an out-of-memory
+about a dozen speculative cycles later, a long way from the line that caused it. Because it is a
+**startup** allocation, no scheduler-side escape hatch avoids it.
+
+`PXA_CKPT_BUDGET` (default on) now decides the capacity by affordability rather than by fit: after
+these buffers are claimed, does every device still hold the compute buffers it has already reserved
+plus `PXA_CKPT_BUDGET_MARGIN_MB` (default 256)? Every drafter stage is clamped to the answer, and the
+answer is printed at **every** boot, clamp or no clamp:
+
+```
+common_speculative_init: recurrent checkpoint budget: the chain drafts up to 4 tokens (capacity 5), this context can checkpoint 5
+common_speculative_init: recurrent checkpoint budget: the chain asks to draft 64 tokens, this context can checkpoint 33 - every stage is clamped to n_max=32
+```
+
+- **Status:** the crash is fixed; the **ceiling is not, and it is physics rather than a defect**. A
+  16 GB card cannot checkpoint an arbitrarily long draft exactly, so on this pair a 64/48 n-gram stage
+  resolves to a capacity in the fifties at `-sm layer` and around twenty under `-sm attn`, which leaves
+  less headroom. **Read the budget line before comparing two arms**: two runs that differ only in the
+  capacity they were granted have been compared as if they were like for like, and the clamp is not
+  otherwise visible anywhere.
+
+## `--recurrent-ckpt-mode gpu-fallback` changes the greedy output and halves prose throughput
+
+The obvious way to buy a longer draft is to stop preallocating: `gpu-fallback` keeps small (~75 MiB
+per card) shadow buffers whatever the draft length is, and it does avoid the out-of-memory above. It
+is also a measured loss on both counts that matter. On the default cascade at `-sm layer`, in a valid
+window (bracket drift 0.00%) with identical draft counters in both arms:
+
+| mode | control | prose | greedy probe hash |
+|---|---|---|---|
+| `per-step` (the default that resolves) | 83.00 | **82.13** | `a5467dd43144` |
+| `gpu-fallback` | 82.19 | **41.60** | `18c44e18e36f` |
+
+Control is untouched and **prose halves**, which is the signature: prose rejects drafts far more often
+than the repetitive class does, so it pays the restore cost far more often. And the hash moves — the
+restored state is not the state that was saved, so this is a fidelity difference and not only a speed
+one.
+
+- **Status:** open, and **not recommended**. A rollback mode that alters the output is a defect, not a
+  lever; the shadow buffers are most likely a narrower copy of the recurrent state. Use
+  `PXA_CKPT_BUDGET` (on by default) to get a long draft with exact per-step checkpoints instead. The
+  mode is kept because it is the only way to run a draft length this pair cannot checkpoint at all.
+
+## Reproducing an upstream tensor-split number: it is sensitive to what else the host is doing
+
+A note for anyone repeating the cross-engine comparisons in the release notes, because it cost time
+here. Upstream `llama.cpp`'s two-card tensor split exchanges partials through pinned host memory with
+an **in-kernel spin on a host-memory arrival token** — a design that is right for a pair with no peer
+path, and one that holds a CPU busy while it waits. Its throughput therefore moves with host load in a
+way this engine's peer-direct route does not: across three windows in one morning, with this engine's
+own bracket arm holding steady, the same upstream cascade arm read **141.11**, **134.26** and
+**114.47** tok/s on the control class — the 114 arm being the one that ran with two CUDA compiles on
+the host.
+
+- **Status:** not a defect in either engine; a measurement hazard. Quote an upstream tensor-split
+  number only from a window whose bracket arms agree, run the box otherwise idle, and say which window
+  the number came from. The same caution applies in reverse to any arm of this engine that is compared
+  against one.

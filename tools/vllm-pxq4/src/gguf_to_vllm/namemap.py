@@ -1,7 +1,7 @@
 """namemap.py — ggml tensor name -> HF/vLLM tensor name, and the per-policy PXQ4 allow-list.
 
 SINGLE SOURCE OF TRUTH for plan §5.4. Every name below was checked against the AWQ twin's
-``model.safetensors.index.json`` and safetensors header on the DGX this session, so the target
+``model.safetensors.index.json`` and safetensors header on the GPU host this session, so the target
 side is FACT, not inference: ``linear_attn.in_proj_qkv``/``in_proj_z``/``in_proj_a``/
 ``in_proj_b``/``out_proj``/``conv1d``/``A_log``/``dt_bias``/``norm``, ``self_attn.{q,k,v,o}_proj``
 with ``q_proj`` at [12288, 5120], ``mlp.{gate,up,down}_proj``, ``model.language_model.*``,
@@ -49,7 +49,14 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from . import namemap_qwen4exp as Q4
+
 HF_LM = "model.language_model"
+
+
+def arch_of(kv: dict[str, Any]) -> str:
+    """``general.architecture``. The one switch every arch-specific table hangs off."""
+    return str(kv.get("general.architecture") or "")
 
 
 def arch_kv(kv: dict[str, Any], *suffixes: str, default: Any = None) -> Any:
@@ -74,18 +81,34 @@ def arch_kv(kv: dict[str, Any], *suffixes: str, default: Any = None) -> Any:
 # ---------------------------------------------------------------------------------------------
 # vLLM module suffixes (what get_quant_method sees as `prefix`), per policy. Plan §3, §5.5.
 # ---------------------------------------------------------------------------------------------
-#: Modules served by PXQ4 in P1 — exactly those that are already PXQ4 in the artifact AND are
-#: uniformly PXQ4 across every output_partition_size of their fused vLLM module (§3.1).
+#: Modules served as a PXQ panel tier in P1 — the dense (non-MoE) qwen35 module names, uniformly
+#: servable across every output_partition_size of their fused vLLM module (§3.1). NOTE, learned
+#: the hard way (2026-09-08, a dense qwen35-PXQ3 source converted with policy m2 instead of this
+#: one): "served" does NOT mean "must already be pxq4 on disk". build_plan's emit branch
+#: (the `want_pxq4` arm) is tier-generic — ``TT.is_pxq(ti.type_id)`` is true for pxq2/pxq3/pxq4
+#: alike, and any of the three takes the native byte-split passthrough at ITS OWN on-disk tier
+#: (recorded per-module in quantization_config.pxq_tiers); only a NON-panel source (fp16/q8_0/
+#: MXFP4/...) is re-encoded, and only then does it become pxq4 specifically (the encoder's only
+#: output format). So P1 serves a pxq2-native, pxq3-native OR pxq4-native artifact identically —
+#: whichever tier is actually on disk for THIS file. The per-tensor comments below describe the
+#: PXQ4-native artifact these policies were first written against; they are illustrative, not a
+#: precondition. Use the module NAMES to decide whether a policy fits a new architecture — use
+#: `m1`/`m2`/`m2f`/`m3` (MoE ``mlp.experts`` naming) for a routed-expert source and `p1`/`p2*`
+#: (dense ``mlp.gate_proj``/`mlp.up_proj`/`mlp.down_proj`) for a dense one — NOT the tier the
+#: comments happen to name, which is an artifact of whatever file was on disk when they were
+#: written.
 PXQ4_MODULES_P1: frozenset[str] = frozenset({
-    "mlp.gate_up_proj",            # <- ggml ffn_gate + ffn_up, both pxq4
-    "mlp.down_proj",               # <- ggml ffn_down, pxq4
-    "self_attn.o_proj",            # <- ggml attn_output, pxq4
-    "linear_attn.in_proj_qkvz",    # <- ggml attn_qkv + attn_gate, both pxq4
+    "mlp.gate_up_proj",            # <- ggml ffn_gate + ffn_up (native tier, or MXFP4 re-encode)
+    "mlp.down_proj",               # <- ggml ffn_down (native tier, or MXFP4 re-encode)
+    "self_attn.o_proj",            # <- ggml attn_output (native tier, or MXFP4 re-encode)
+    "linear_attn.in_proj_qkvz",    # <- ggml attn_qkv + attn_gate (native tier, or MXFP4 re-encode)
 })
 
-#: P2a adds the GDN output projection. It is MXFP4 (ggml id 39) in the artifact, so it must be
-#: RE-ENCODED to PXQ4 — this is the single largest decode-bandwidth lever that does not touch a
-#: tensor class the backbone table deliberately protects.
+#: P2a adds the GDN output projection. In the artifact these policies were first written
+#: against it was MXFP4 (ggml id 39) and so was RE-ENCODED to PXQ4 — the single largest
+#: decode-bandwidth lever that does not touch a tensor class the backbone table deliberately
+#: protects. In a source where ``ssm_out`` is already a native panel tier (e.g. a PXQ3 file),
+#: this module is instead a pure byte-split passthrough at that tier — see the P1 note above.
 PXQ4_MODULES_P2A = PXQ4_MODULES_P1 | {"linear_attn.out_proj"}
 
 #: P2b WOULD add the LM head — and deliberately does NOT.
@@ -144,8 +167,61 @@ PXQ4_MODULES_M1: frozenset[str] = frozenset({
     "linear_attn.in_proj_qkvz",         # <- ggml attn_qkv + attn_gate, both pxq4
 })
 
+#: The TIERED MoE policies, for a qwen35moe artifact whose routed experts are PXQ2 or PXQ3
+#: rather than PXQ4 -- i.e. the Fusion 35B files, and eventually Flash-Next.
+#:
+#: In those files the ONLY panel-format tensors are the 120 routed-expert stacks
+#: (ffn_{gate,up,down}_exps); attention, the GDN block and the shared experts are MXFP4, k/v
+#: are q8_0, the LM head is q6_K. So there are two honest ways to build the checkpoint and
+#: both are provided, because one is the deliverable and the other is its control:
+#:
+#:   m2      the routed experts stay at WHATEVER TIER THEY ARE ON DISK (a byte move), and the
+#:           MXFP4 backbone -- shared experts, attn_output, attn_qkv+attn_gate -- is RE-ENCODED
+#:           to PXQ4 with the native encoder. This is the existing P2A lever applied to a
+#:           different tensor set, not new numerics. It is the variant that FITS: 8.50 GiB of
+#:           pxq2 experts + 2.71 GiB of backbone = 11.2 GiB on a 16 GiB card, against 13.1 GiB
+#:           if the backbone goes to fp16.
+#:   m2f     identical, except the MXFP4 backbone is decoded to fp16 (zero new numerics, no
+#:           encoder needed). This is the CONTROL for the same-top-token gate: it isolates
+#:           "does the PXQ2/PXQ3 expert path decode correctly" from "does the backbone
+#:           re-encode cost quality".
+#:
+#: ``self_attn.qkv_proj`` is absent from both, for the same reason it is absent from m1: its
+#: fused partners attn_k/attn_v are q8_0, so the fused module is mixed-type and must be dense.
+PXQ_MODULES_M2: frozenset[str] = frozenset({
+    "mlp.experts",                      # <- ggml ffn_{gate,up,down}_exps, pxq2 or pxq3
+    "mlp.shared_expert.gate_up_proj",   # <- ggml ffn_{gate,up}_shexp, mxfp4 -> RE-ENCODE
+    "mlp.shared_expert.down_proj",      # <- ggml ffn_down_shexp,      mxfp4 -> RE-ENCODE
+    "self_attn.o_proj",                 # <- ggml attn_output,         mxfp4 -> RE-ENCODE
+    "linear_attn.in_proj_qkvz",         # <- ggml attn_qkv + attn_gate, mxfp4 -> RE-ENCODE
+    "linear_attn.out_proj",             # <- ggml ssm_out,             mxfp4 -> RE-ENCODE
+})
+
+#: The fp16-backbone control: only the routed experts stay quantized.
+PXQ_MODULES_M2F: frozenset[str] = frozenset({"mlp.experts"})
+
+#: Modules served as int8 + per-row fp16 scale rather than as a panel tier. Today this is the
+#: LM head and only the LM head, and the reason it is a separate mechanism rather than another
+#: tier is shape: the head is one [V, H] tensor read in full once per token, whose vocab axis
+#: is what vLLM's loader shards -- while a panel tier's vocab axis is PANELS, which is exactly
+#: what makes a PXQ4 head an engine change and a Q8 head not one. See sidecar/head_q8.py.
+POLICY_Q8: dict[str, frozenset[str]] = {
+    "m3": frozenset({"lm_head"}),
+}
+
+#: m3 = m2's panel-tier modules, plus the head at int8. It exists because the pipeline-parallel decode
+#: census found 1.77 GiB of a 2.78 GiB per-token budget still in fp16, of which the head alone
+#: was 970 MiB -- the largest single item on the decode path and the one no tier could reach.
+PXQ_MODULES_M3: frozenset[str] = PXQ_MODULES_M2
+
 POLICY_MODULES: dict[str, frozenset[str]] = {
+    #: qwen4exp / Flash-Next. Lives in namemap_qwen4exp beside the geometry argument that
+    #: decides it (640-wide experts, a tier-mixed qkv, a 2.5-panel TP=4 shard).
+    "f1": Q4.PXQ_MODULES_F1,
     "m1": PXQ4_MODULES_M1,
+    "m2": PXQ_MODULES_M2,
+    "m2f": PXQ_MODULES_M2F,
+    "m3": PXQ_MODULES_M3,
     "p1": PXQ4_MODULES_P1,
     "p2a": frozenset(PXQ4_MODULES_P2A),
     "p2b": frozenset(PXQ4_MODULES_P2B),
@@ -180,6 +256,8 @@ def assert_policy_supported(policy: str) -> None:
     """Refuse a policy that cannot produce a loadable checkpoint. Call before planning."""
     if policy in BLOCKED_POLICIES:
         raise SystemExit(BLOCKED_POLICIES[policy])
+    # NOTE the scope: UNSERVABLE_PXQ4_MODULES is about the PANEL layout. lm_head at int8 is a
+    # different mechanism with a different loader story and is checked by POLICY_Q8, not here.
     bad = [m for m in POLICY_MODULES[policy] if m.rsplit(".", 1)[-1] in UNSERVABLE_PXQ4_MODULES]
     if bad:
         raise SystemExit(
@@ -207,12 +285,27 @@ _ALL_LINEAR_MODULES: tuple[str, ...] = (
 )
 
 
-def ignore_list(policy: str) -> list[str]:
+def q8_list(policy: str) -> list[str]:
+    """Modules this policy serves as int8 + per-row scale."""
+    return sorted(POLICY_Q8.get(policy, frozenset()))
+
+
+def ignore_list(policy: str, arch: str = "") -> list[str]:
     served = POLICY_MODULES[policy]
+    q8 = POLICY_Q8.get(policy, frozenset())
     ig = list(BASE_IGNORE)
-    ig += [m for m in _ALL_LINEAR_MODULES if m not in served]
-    ig.append("model.visual")
-    return ig
+    # Each arch builds a different set of linears WITH a quant_config, and only those need an
+    # ignore entry. Listing a module the arch does not have is harmless; MISSING one is not --
+    # get_quant_method would route it to a PXQ method that has no tensors for it.
+    all_linear = Q4.ALL_LINEAR_MODULES if arch == Q4.ARCH else _ALL_LINEAR_MODULES
+    ig += [m for m in all_linear if m not in served]
+    if arch != Q4.ARCH:
+        ig.append("model.visual")
+    # A module served as int8 must NOT also be ignored. get_quant_method checks ignore FIRST
+    # and it wins, so leaving lm_head here would route the head to fp16 while the checkpoint
+    # contains only int8 tensors for it -- a missing-weight crash at best, and the config
+    # would be describing a file that does not exist.
+    return [m for m in ig if not any(m == q or m.rsplit(".", 1)[-1] == q for q in q8)]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -363,7 +456,15 @@ def GGML_TO_HF(name: str, kv: dict[str, Any]) -> str | None:
     Returns None for the MTP block (plan §3: ``mtp.*`` is P3, not emitted in P1/P2) — the fork
     ships ``qwen3_5_mtp.py`` and the AWQ twin carries ``mtp.*`` in a separate file, so adding
     it later is additive and does not invalidate a checkpoint made now.
+
+    qwen4exp (Flash-Next) is a DIFFERENT MODEL, not a variant: no attn_norm, no
+    post_attention_norm, no output_norm, a hyperconnection instead, a QSA indexer whose q and k
+    fuse into one tensor, and a PLE stack. Its table lives in namemap_qwen4exp and is reached
+    by this dispatch rather than by bolting its suffixes onto the qwen35 tables, where the two
+    archs' identically-named-but-differently-shaped entries would shadow each other.
     """
+    if arch_of(kv) == Q4.ARCH:
+        return Q4.ggml_to_hf(name, kv)
     if name in _GLOBAL_MAP:
         return _GLOBAL_MAP[name]
 
@@ -556,6 +657,28 @@ VALUE_TRANSFORMS: dict[str, tuple[Callable[[Any], Any], str]] = {
 }
 
 
+#: qwen4exp's transform table, assembled from the suffix lists namemap_qwen4exp declares
+#: (that module is import-free by design, so the callables live here beside the qwen35 ones).
+VALUE_TRANSFORMS_QWEN4EXP: dict[str, tuple[Callable[[Any], Any], str]] = {
+    **{s_: (_minus_one, "gemma-norm: HF stores w-1, ggml stores w")
+       for s_ in Q4.GEMMA_NORM_SUFFIXES},
+    **{s_: (_a_to_a_log, "A_log = log(-A): ggml stores A, HF stores its log")
+       for s_ in Q4.A_LOG_SUFFIXES},
+}
+
+
+def value_transform(suffix: str, kv: dict[str, Any]):
+    """The (fn, description) for one ggml suffix under this file's arch, or None.
+
+    Arch-dispatched for the same reason the name map is: ``attn_q_norm.weight`` needs the
+    gemma -1 in BOTH archs but ``output_norm.weight`` exists only in one, and a shared table
+    would quietly apply a transform to a tensor of the same name and a different convention.
+    """
+    if arch_of(kv) == Q4.ARCH:
+        return VALUE_TRANSFORMS_QWEN4EXP.get(suffix)
+    return VALUE_TRANSFORMS.get(suffix)
+
+
 def ggml_suffix(ggml_name: str) -> str:
     """``blk.7.ssm_dt.bias`` -> ``ssm_dt.bias``; a global tensor keeps its own name."""
     m = _BLK.match(ggml_name)
@@ -577,6 +700,20 @@ _FUSE: tuple[tuple[str, str], ...] = (
     ("linear_attn.in_proj_z", "linear_attn.in_proj_qkvz"),
     ("linear_attn.in_proj_b", "linear_attn.in_proj_ba"),
     ("linear_attn.in_proj_a", "linear_attn.in_proj_ba"),
+    # qwen4exp: GatedResidual(use_combine=True) merges the per-layer down and inject columns
+    # into ONE MergedColumnParallelLinear (hyperconnection.py; _HC_WEIGHTS_MAPPER in the fork's
+    # model.py:176-186 is the checkpoint-side half). The model-level hyper_connection_mixer is
+    # use_combine=False and keeps a plain input_mix_weight_down; it is not named here, so it
+    # stays its own module. The attribute names are spelled out because _FUSE matches on a
+    # DOT-anchored suffix and "attn_hyper_connection" is one identifier, not "attn" + ".".
+    ("attn_hyper_connection.input_mix_weight_down",
+     "attn_hyper_connection.input_mix_weight_down_block_inject"),
+    ("attn_hyper_connection.block_inject_weight",
+     "attn_hyper_connection.input_mix_weight_down_block_inject"),
+    ("mlp_hyper_connection.input_mix_weight_down",
+     "mlp_hyper_connection.input_mix_weight_down_block_inject"),
+    ("mlp_hyper_connection.block_inject_weight",
+     "mlp_hyper_connection.input_mix_weight_down_block_inject"),
     ("self_attn.q_proj", "self_attn.qkv_proj"),
     ("self_attn.k_proj", "self_attn.qkv_proj"),
     ("self_attn.v_proj", "self_attn.qkv_proj"),
@@ -622,6 +759,21 @@ def module_suffix(module: str) -> str:
     if len(parts) >= 2 and not parts[-2].isdigit():
         return ".".join(parts[-2:])
     return parts[-1]
+
+
+def layer_qualified_suffix(module: str) -> str:
+    """``...layers.44.mlp.experts`` -> ``layers.44.mlp.experts``; no layer -> module_suffix.
+
+    The suffix to use when the collapsed two-component key would name two different tiers.
+    The runtime resolves ``pxq_tiers`` by longest-declared-suffix-wins against the module
+    prefix vLLM passes to get_quant_method (``model.layers.44.mlp.experts``), so a key that
+    starts at ``layers.<N>`` is both unambiguous and still a suffix.
+    """
+    parts = module.split(".")
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i] == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+            return ".".join(parts[i:])
+    return module_suffix(module)
 
 
 def is_pxq4_module(module: str, policy: str) -> bool:

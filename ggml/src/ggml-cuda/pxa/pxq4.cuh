@@ -100,6 +100,13 @@ static __device__ __forceinline__ float pxq4_glu_apply(float g, float u, int una
         float ui = fmaxf(fminf(u, limit), -limit);
         return gi / (1.0f + expf(-gi * alpha)) * (1.0f + ui);
     }
+    if (unary == 2) {                    // DSV4 / GLM-5.3-Flash asymmetric clamp, THEN silu
+        // up -> [-limit, limit], gate -> [-inf, limit], out = silu(gate_clamped) * up_clamped.
+        // NOT the silu-then-clamp below: clamping silu(gate) is a different function.
+        const float gi = fminf(g, limit);
+        const float ui = fmaxf(fminf(u, limit), -limit);
+        return (gi / (1.0f + expf(-gi))) * ui;
+    }
     // SILU-swiglu
     if (limit < 1e-6f) return (g / (1.0f + expf(-g))) * u;
     float gs = g / (1.0f + expf(-g));

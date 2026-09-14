@@ -24,6 +24,7 @@
 // -----------------------------------------------------------------------------
 #include "../common.cuh"
 #include "delta-net.cuh"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -51,8 +52,20 @@ __device__ __forceinline__ float reduce_sum(float x, float * s) {
     return x;
 }
 
-template <int HEAD_DIM, int block_size>
-__global__ void delta_net_recurrent_f32(
+// PXA_DN_OCCUPANCY: the recurrence body, factored out of the __global__ entry point so that
+// the default kernel and the opt-in __launch_bounds__ variant below run the identical
+// instruction sequence -- the only difference between them is a launch-bounds attribute on
+// the wrapper, never a code difference in the body itself.
+//
+// PXA_BISECT: g_per_channel is a TEMPLATE parameter, not a runtime argument. As a runtime
+// argument the KDA-only per-key decay array `dcol` below was live on the Gated DeltaNet
+// path too -- HEAD_DIM/num_warps = 32 extra floats per thread at <128,128>, which took the
+// prefill instantiation from 96 to 128 registers on sm_70 (5 blocks/SM -> 4) and cost every
+// non-KDA hybrid (qwen35 among them) 2-5% of prefill. Split into two instantiations: with
+// g_per_channel == false every expression below is textually the pre-KDA one. The two
+// rewrites compose: the split is on the body, so both entry points below inherit it.
+template <int HEAD_DIM, int block_size, bool g_per_channel>
+__device__ __forceinline__ void delta_net_recurrent_body(
     const float * __restrict__ q,         // [HEAD_DIM, n_tokens, n_heads, n_seqs]
     const float * __restrict__ k,         // [HEAD_DIM, n_tokens, n_heads, n_seqs]
     const float * __restrict__ v,         // [HEAD_DIM, n_tokens, n_heads, n_seqs]
@@ -61,6 +74,10 @@ __global__ void delta_net_recurrent_f32(
     const float * __restrict__ state_in,  // [HEAD_DIM, HEAD_DIM*n_heads, 1, n_seqs]
     float * __restrict__ dst,             // output + new_state(s) concatenated
     float * __restrict__ saved_states,
+    // PXA_RS_RING: strides (in elements) of the per-step capture destination. <= 0 means "derive
+    // them from the dense [step][batch_pos][state] layout", which is bit-identical to before.
+    const int64_t sv_row_stride_in,
+    const int64_t sv_step_stride_in,
     float * __restrict__ state_ext,       // PXA_FUSE_DELTANET: optional external new-state destination
     const int32_t * __restrict__ state_ext_idx, // PXA_DN_SCATTER_FUSE: optional DEVICE-side row index
     const int64_t state_ext_row_stride,         //   (elements) row stride of the destination buffer
@@ -71,6 +88,9 @@ __global__ void delta_net_recurrent_f32(
     const int64_t n_seqs,
     const int64_t output_offset,          // offset where state starts in output
     size_t vnb1, size_t vnb2, size_t vnb3) {
+    // PXA_GLM5NEXT: g_per_channel == false = one forget scalar per head (Gated DeltaNet), g is
+    // [n_tokens,1,H,n_seqs]; true = one forget value per KEY CHANNEL (Kimi Delta Attention), g is
+    // a contiguous [HEAD_DIM, n_tokens, H, n_seqs].
     constexpr int warps_per_head = HEAD_DIM/WARP_SIZE;
     const int batch_idx = blockIdx.x / (warps_per_head*n_heads);
     const int sub_head_idx  = blockIdx.x % (warps_per_head*n_heads);
@@ -99,12 +119,18 @@ __global__ void delta_net_recurrent_f32(
 
     // State step stride for save_all_states: HEAD_DIM^2 * n_heads * n_seqs
     const int64_t state_step_stride = HEAD_DIM * HEAD_DIM * n_heads * n_seqs;
+    // PXA_RS_RING: the capture destination may be a strided window of a taller state tensor.
+    const int64_t sv_row_stride  = sv_row_stride_in  > 0 ? sv_row_stride_in  : state_batch_stride;
+    const int64_t sv_step_stride = sv_step_stride_in > 0 ? sv_step_stride_in : state_step_stride;
 
     // Pointers for this batch/head
     const float * q_ptr = q + batch_idx * qkv_stride_batch_kq + head_idx_kq * qkv_stride_head;
     const float * k_ptr = k + batch_idx * qkv_stride_batch_kq + head_idx_kq * qkv_stride_head;
     const float * v_ptr = v + batch_idx * vnb3 + head_idx * vnb2;
     const float * g_ptr = g + batch_idx * g_stride_batch + head_idx;
+    const float * g_ptr_kda = g_per_channel
+        ? g + batch_idx * (HEAD_DIM * n_tokens * n_heads) + head_idx * (HEAD_DIM * n_tokens)
+        : nullptr;
     const float * beta_ptr = beta_in + batch_idx * g_stride_batch + head_idx;
     const float * state_src = state_in + batch_idx * state_batch_stride + state_head_offset;
 
@@ -160,14 +186,36 @@ __global__ void delta_net_recurrent_f32(
         float attn_score = reduce_sum<block_size>(sum_kq, sum_helper);
 
         float beta_val = sigmoid_f(beta_ptr[t*n_heads]);
-        float decay    = expf(fminf(g_ptr[t*n_heads], 50.0f));
+        float decay    = g_per_channel ? 1.0f : expf(fminf(g_ptr[t*n_heads], 50.0f));
+
+        // PXA_GLM5NEXT: Kimi Delta Attention's forget gate is indexed by the KEY channel
+        // (upstream PR #27773's gated_delta_net kernel does S[i][j] *= exp(g[i]) with i = key),
+        // and each thread here owns whole COLUMNS of the state -- col is the key index, row_out
+        // the value index. A per-key decay therefore cannot be factored out of the two sums the
+        // way Gated DeltaNet's one-scalar-per-head gate can, so it is folded into the state as
+        // it is read. With g_per_channel == 0 every expression below is textually the old one.
+        // sized to 1 on the GDN path so it costs no registers there (see the note on the template)
+        float dcol[g_per_channel ? HEAD_DIM/num_warps : 1];
+        if constexpr (g_per_channel) {
+#pragma unroll
+            for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
+                int col = num_warps*i + col_idx_0;
+                dcol[i] = expf(fminf(g_ptr_kda[t*HEAD_DIM + col], 50.0f));
+            }
+        }
 
         float sum1 = 0, sum2 = 0;
 #pragma unroll
         for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
             int col = num_warps*i + col_idx_0;
-            sum1 += state_local[i] * sK[col];
-            sum2 += state_local[i] * sQ[col];
+            if constexpr (g_per_channel) {
+                const float s = state_local[i] * dcol[i];
+                sum1 += s * sK[col];
+                sum2 += s * sQ[col];
+            } else {
+                sum1 += state_local[i] * sK[col];
+                sum2 += state_local[i] * sQ[col];
+            }
         }
         all_sum1[col_idx_0*WARP_SIZE_S + row] = sum1;
         all_sum2[col_idx_0*WARP_SIZE_S + row] = sum2;
@@ -181,22 +229,28 @@ __global__ void delta_net_recurrent_f32(
             sum2 += all_sum2[i*WARP_SIZE_S + row];
         }
 
-        //float sv_new = beta_val * (v_ptr[t * qkv_stride_token + row_out] - sum1 * decay);
-        float sv_new = beta_val * (v_ptr[t * vnb1 + row_out] - sum1 * decay);
+        // the decay is already inside sum1/sum2 on the KDA path
+        float sv_new = beta_val * (v_ptr[t * vnb1 + row_out] - (g_per_channel ? sum1 : sum1 * decay));
         if (col_idx_0 == 0) {
-            out_base[t * out_token_stride + row_out] = sum2 * decay + sv_new * attn_score;
+            out_base[t * out_token_stride + row_out] =
+                (g_per_channel ? sum2 : sum2 * decay) + sv_new * attn_score;
         }
 
         for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
             int col = num_warps*i + col_idx_0;
-            float new_state_val = decay * state_local[i] + sv_new * sK[col];
+            float new_state_val;
+            if constexpr (g_per_channel) {
+                new_state_val = dcol[i] * state_local[i] + sv_new * sK[col];
+            } else {
+                new_state_val = decay * state_local[i] + sv_new * sK[col];
+            }
             new_state_val = fminf(fmaxf(new_state_val, -1e6f), 1e6f);
             state_local[i] = new_state_val;
         }
 
         // Save per-step state if requested
         if (saved_states && t < n_tokens - 1) {
-            float * state_step_dst = saved_states + batch_idx * state_batch_stride + state_head_offset + t * state_step_stride;
+            float * state_step_dst = saved_states + batch_idx * sv_row_stride + state_head_offset + t * sv_step_stride;
             for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
                 int col = num_warps*i + col_idx_0;
                 state_step_dst[col*HEAD_DIM + row_out] = state_local[i];
@@ -217,6 +271,78 @@ __global__ void delta_net_recurrent_f32(
     }
 }
 
+// Default entry point: today's kernel, byte-for-byte -- no launch-bounds attribute, same
+// code path as before this file carried PXA_DN_OCCUPANCY.
+template <int HEAD_DIM, int block_size, bool g_per_channel>
+__global__ void delta_net_recurrent_f32(
+    const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+    const float * __restrict__ g, const float * __restrict__ beta_in,
+    const float * __restrict__ state_in, float * __restrict__ dst, float * __restrict__ saved_states,
+    // PXA_RS_RING: strides (in elements) of the per-step capture destination; <= 0 = derive.
+    const int64_t sv_row_stride, const int64_t sv_step_stride,
+    float * __restrict__ state_ext, const int32_t * __restrict__ state_ext_idx,
+    const int64_t state_ext_row_stride, const int64_t n_heads, const int64_t gqa_ratio,
+    const int repeat_type, const int64_t n_tokens, const int64_t n_seqs,
+    const int64_t output_offset, size_t vnb1, size_t vnb2, size_t vnb3) {
+    delta_net_recurrent_body<HEAD_DIM, block_size, g_per_channel>(
+        q, k, v, g, beta_in, state_in, dst, saved_states, sv_row_stride, sv_step_stride,
+        state_ext, state_ext_idx,
+        state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset,
+        vnb1, vnb2, vnb3);
+}
+
+// PXA_DN_OCCUPANCY=<n>, n>=1: opt-in variant carrying an explicit min-blocks-per-SM occupancy
+// hint (MJ-PORT item 3, "the one thing that might still transfer"). Identical body to the
+// default kernel above -- bit-identical output by construction, since only a compiler launch
+// attribute differs; this is a register-allocation / occupancy experiment, not a numerics change.
+template <int HEAD_DIM, int block_size, int MIN_BLOCKS, bool g_per_channel>
+__global__ __launch_bounds__(block_size, MIN_BLOCKS) void delta_net_recurrent_f32_occ(
+    const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+    const float * __restrict__ g, const float * __restrict__ beta_in,
+    const float * __restrict__ state_in, float * __restrict__ dst, float * __restrict__ saved_states,
+    // PXA_RS_RING: strides (in elements) of the per-step capture destination; <= 0 = derive.
+    const int64_t sv_row_stride, const int64_t sv_step_stride,
+    float * __restrict__ state_ext, const int32_t * __restrict__ state_ext_idx,
+    const int64_t state_ext_row_stride, const int64_t n_heads, const int64_t gqa_ratio,
+    const int repeat_type, const int64_t n_tokens, const int64_t n_seqs,
+    const int64_t output_offset, size_t vnb1, size_t vnb2, size_t vnb3) {
+    delta_net_recurrent_body<HEAD_DIM, block_size, g_per_channel>(
+        q, k, v, g, beta_in, state_in, dst, saved_states, sv_row_stride, sv_step_stride,
+        state_ext, state_ext_idx,
+        state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset,
+        vnb1, vnb2, vnb3);
+}
+
+// PXA_DN_OCCUPANCY=<n>: 0/unset keeps today's kernel untouched; n in {1,2,3,4} launches the
+// __launch_bounds__(block_size, n) variant above instead. Parsed once and cached; any other
+// positive value is treated as unset (logged once) rather than silently guessing a hint.
+static int pxa_dn_occupancy_hint() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * env = getenv("PXA_DN_OCCUPANCY");
+        int v = (env && *env) ? atoi(env) : 0;
+        if (v < 0 || v > 4) {
+            if (v != 0) {
+                fprintf(stderr, "PXA_DN_OCCUPANCY=%d is out of the supported {1,2,3,4} range; ignoring\n", v);
+            }
+            v = 0;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
+template <int HEAD_DIM, int block_size, bool g_per_channel, typename... Args>
+static void delta_net_dispatch(int occ, int num_blocks, size_t smem_size, cudaStream_t stream, Args... args) {
+    switch (occ) {
+        case 1: delta_net_recurrent_f32_occ<HEAD_DIM, block_size, 1, g_per_channel><<<num_blocks, block_size, smem_size, stream>>>(args...); break;
+        case 2: delta_net_recurrent_f32_occ<HEAD_DIM, block_size, 2, g_per_channel><<<num_blocks, block_size, smem_size, stream>>>(args...); break;
+        case 3: delta_net_recurrent_f32_occ<HEAD_DIM, block_size, 3, g_per_channel><<<num_blocks, block_size, smem_size, stream>>>(args...); break;
+        case 4: delta_net_recurrent_f32_occ<HEAD_DIM, block_size, 4, g_per_channel><<<num_blocks, block_size, smem_size, stream>>>(args...); break;
+        default: delta_net_recurrent_f32<HEAD_DIM, block_size, g_per_channel><<<num_blocks, block_size, smem_size, stream>>>(args...); break;
+    }
+}
+
 static void delta_net_f32_cuda(
     const float * q,
     const float * k,
@@ -226,6 +352,8 @@ static void delta_net_f32_cuda(
     const float * state_in,
     float * dst,
     float * saved_states,
+    const int64_t sv_row_stride,   // PXA_RS_RING (<=0: derive)
+    const int64_t sv_step_stride,  // PXA_RS_RING (<=0: derive)
     float * state_ext,
     const int32_t * state_ext_idx,
     const int64_t state_ext_row_stride,
@@ -236,6 +364,7 @@ static void delta_net_f32_cuda(
     const int     repeat_type,
     const int64_t n_seqs,
     size_t vnb1, size_t vnb2, size_t vnb3,
+    const int g_per_channel,
     const int device_id,
     const int cc, // compute capability (e.g., 890 for SM 8.9, 1200 for SM 12.0)
     cudaStream_t stream) {
@@ -252,23 +381,45 @@ static void delta_net_f32_cuda(
     const int num_blocks = n_seqs * n_heads * (head_dim/WARP_SIZE);
     const size_t smem_size = 2 * head_dim * sizeof(float);
 
+    const int dn_occ = pxa_dn_occupancy_hint();
+
     if (n_tokens <= 8) {
         constexpr int threads_per_block = 256;
         if (head_dim == 64) {
-            delta_net_recurrent_f32<64, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, saved_states, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            if (g_per_channel) {
+                delta_net_dispatch<64, threads_per_block, true>(dn_occ, num_blocks, smem_size, stream,
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            } else {
+                delta_net_dispatch<64, threads_per_block, false>(dn_occ, num_blocks, smem_size, stream,
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            }
         } else {
-            delta_net_recurrent_f32<128, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, saved_states, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            if (g_per_channel) {
+                delta_net_dispatch<128, threads_per_block, true>(dn_occ, num_blocks, smem_size, stream,
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            } else {
+                delta_net_dispatch<128, threads_per_block, false>(dn_occ, num_blocks, smem_size, stream,
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            }
         }
     } else {
         constexpr int threads_per_block = 128;
         if (head_dim == 64) {
-            delta_net_recurrent_f32<64, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, saved_states, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            if (g_per_channel) {
+                delta_net_dispatch<64, threads_per_block, true>(dn_occ, num_blocks, smem_size, stream,
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            } else {
+                delta_net_dispatch<64, threads_per_block, false>(dn_occ, num_blocks, smem_size, stream,
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            }
         } else {
-            delta_net_recurrent_f32<128, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, saved_states, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            if (g_per_channel) {
+                delta_net_dispatch<128, threads_per_block, true>(dn_occ, num_blocks, smem_size, stream,
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            } else {
+                delta_net_dispatch<128, threads_per_block, false>(dn_occ, num_blocks, smem_size, stream,
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+            }
         }
     }
 
@@ -310,8 +461,15 @@ void ggml_cuda_op_delta_net_ex2(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(src1->ne[0] == head_dim && src1->ne[1] == n_tokens && src1->ne[2] == n_heads_kq && src1->ne[3] == n_seqs);
     // V: [head_dim, n_tokens, n_heads, n_seqs]
     GGML_ASSERT(src2->ne[0] == head_dim && src2->ne[1] == n_tokens && src2->ne[2] == n_heads && src2->ne[3] == n_seqs);
-    // G: [n_tokens, 1, n_heads, n_seqs]
-    GGML_ASSERT(src3->ne[0] == n_tokens && src3->ne[1] == 1 && src3->ne[2] == n_heads && src3->ne[3] == n_seqs);
+    // G: [n_tokens, 1, n_heads, n_seqs] (GDN) or [head_dim, n_tokens, n_heads, n_seqs] (KDA)
+    const int g_per_channel = dst->op_params[1];
+    if (g_per_channel) {
+        GGML_ASSERT(src3->ne[0] == head_dim && src3->ne[1] == n_tokens && src3->ne[2] == n_heads && src3->ne[3] == n_seqs);
+        // the kernel indexes g with the packed strides above, so it has to actually be packed
+        GGML_ASSERT(ggml_is_contiguous(src3));
+    } else {
+        GGML_ASSERT(src3->ne[0] == n_tokens && src3->ne[1] == 1 && src3->ne[2] == n_heads && src3->ne[3] == n_seqs);
+    }
     // Beta: [1, n_tokens, n_heads, n_seqs]
     GGML_ASSERT(src4->ne[0] == 1 && src4->ne[1] == n_tokens && src4->ne[2] == n_heads && src4->ne[3] == n_seqs);
     // State: [head_dim, head_dim*n_heads, 1, n_seqs]
@@ -324,7 +482,14 @@ void ggml_cuda_op_delta_net_ex2(ggml_backend_cuda_context & ctx, ggml_tensor * d
     int repeat_type = dst->op_params[0];
     if (src6) {
         GGML_ASSERT(src6->type == GGML_TYPE_F32);
-        GGML_ASSERT(src6->ne[0] >= (n_tokens - 1)*state_size);
+        // PXA_RS_RING: with a retargeted capture the dense bound does not apply; check the
+        // largest element the strided store can touch instead.
+        const int64_t sv_row  = dst->op_params[2] > 0 ? (int64_t) dst->op_params[2] : head_dim*head_dim*n_heads;
+        const int64_t sv_step = dst->op_params[3] > 0 ? (int64_t) dst->op_params[3] : state_size;
+        const int64_t sv_max  = (n_tokens > 1 ? (n_tokens - 2)*sv_step : 0)
+                              + (n_seqs   > 0 ? (n_seqs   - 1)*sv_row  : 0)
+                              + head_dim*head_dim*n_heads;
+        GGML_ASSERT(ggml_nelements(src6) >= sv_max);
     }
 
     const int64_t expected_size = output_size + state_size;
@@ -345,11 +510,14 @@ void ggml_cuda_op_delta_net_ex2(ggml_backend_cuda_context & ctx, ggml_tensor * d
         (const float *)src5->data,
         (float *)dst->data,
         src6 ? (float *)src6->data : nullptr,
+        (int64_t) dst->op_params[2],   // PXA_RS_RING capture row stride  (0 = derive)
+        (int64_t) dst->op_params[3],   // PXA_RS_RING capture step stride (0 = derive)
         state_dst_override,
         state_dst_row_idx,
         state_dst_row_stride,
         head_dim, n_tokens, n_heads, gqa_ratio, repeat_type, n_seqs,
         src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
+        g_per_channel,
         device_id, cc,
         ctx.stream());
 

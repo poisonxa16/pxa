@@ -3,21 +3,23 @@
 # the production container.
 #
 # CONSTRAINTS THIS SCRIPT EXISTS TO RESPECT:
-#   * the running vLLM container (vllm-qwen38-27b-cyber-1) is someone else's production
+#   * the running vLLM container (the production vLLM container) is someone else's production
 #     service. It is never stopped, restarted, or written to. We only read its image name.
 #   * that container's overlay / is 100% full (207 G used, 0 avail), so nothing may be
 #     installed into the image and no build tree may live on /.
-#   * the DGX host / is also full. Everything lives under /mnt/models.
+#   * the GPU host / is also full. Everything lives under PXA_MODELS_DIR (default ./models;
+#     set it to an absolute path here -- the docker bind-mounts below need one).
 #
-# Usage, from the DGX:  bash build.sh
+# Usage, from the GPU host:  bash build.sh
 set -euo pipefail
 
-SRC="${PXQ4_SRC:-/mnt/models/pxa-vllm-pxq4/csrc}"
-OUT="${PXQ4_OUT:-/mnt/models/pxa-vllm-pxq4/site/pxq4_vllm/_lib}"
-BUILD="${PXQ4_BUILD:-/mnt/models/pxa-vllm-pxq4/build}"
+MODELS_DIR="${PXA_MODELS_DIR:-./models}"
+SRC="${PXQ4_SRC:-$MODELS_DIR/pxa-vllm-pxq4/csrc}"
+OUT="${PXQ4_OUT:-$MODELS_DIR/pxa-vllm-pxq4/site/pxq4_vllm/_lib}"
+BUILD="${PXQ4_BUILD:-$MODELS_DIR/pxa-vllm-pxq4/build}"
 
 # Same image as the running service, so the torch/nvcc/gcc it links against are byte-identical
-# to the ones the server will load it into. --rm, no GPU request, no lease: nvcc does not need
+# to the ones the server will load it into. --rm, no GPU request: nvcc does not need
 # a device to compile for sm_70.
 # Build against the SAME image the server runs, so torch/nvcc/gcc are byte-identical to what
 # will dlopen the result. PXQ4_IMAGE names it directly; PXQ4_REF_CONTAINER derives it from a
@@ -25,7 +27,7 @@ BUILD="${PXQ4_BUILD:-/mnt/models/pxa-vllm-pxq4/build}"
 # requirement, and anyone else must set one of the two variables.
 IMAGE="${PXQ4_IMAGE:-}"
 if [ -z "$IMAGE" ]; then
-  REF="${PXQ4_REF_CONTAINER:-vllm-qwen38-27b-cyber-1}"
+  REF="${PXQ4_REF_CONTAINER:-the production vLLM container}"
   IMAGE="$(docker inspect -f '{{.Config.Image}}' "$REF" 2>/dev/null || true)"
 fi
 if [ -z "$IMAGE" ]; then
@@ -38,7 +40,7 @@ echo "building against image: $IMAGE"
 
 mkdir -p "$BUILD" "$OUT"
 
-# Mount the common ancestor of SRC/OUT/BUILD rather than a hardcoded /mnt/models, so the
+# Mount the common ancestor of SRC/OUT/BUILD rather than a hardcoded path, so the
 # script works wherever the tree actually lives.
 MOUNT_ROOT="${PXQ4_MOUNT_ROOT:-$(printf '%s\n%s\n%s\n' "$SRC" "$OUT" "$BUILD" \
   | sed 's|/[^/]*$||' | sort | awk 'NR==1{p=$0} {while (index($0,p)!=1) sub(/\/[^/]*$/,"",p)} END{print p}')}"
@@ -67,7 +69,7 @@ docker run --rm \
 
 echo
 echo "smoke test (still no GPU work — just proves the ops register):"
-docker run --rm -v /mnt/models:/mnt/models --entrypoint /bin/bash "$IMAGE" -lc "
+docker run --rm -v "$MOUNT_ROOT":"$MOUNT_ROOT" --entrypoint /bin/bash "$IMAGE" -lc "
   /opt/vllm-venv/bin/python - <<'PY'
 import torch
 torch.ops.load_library('$OUT/libpxq4_sm70.so')

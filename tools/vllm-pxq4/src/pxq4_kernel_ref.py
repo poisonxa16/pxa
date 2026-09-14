@@ -6,7 +6,7 @@ no vLLM dependency, and it must stay that way: gates G1/G3 run here, on any mach
 the GPU lease is ever taken.
 
 RELATIONSHIP TO THE PLAN. Plan §6.2 (`src/pxq4_vllm/layout.py`) and §6.3
-(`src/pxq4_vllm/reference.py`) are owned by agent A. The names and semantics below are the
+(`src/pxq4_vllm/reference.py`) are owned by the reference (reference.py). The names and semantics below are the
 ones those files must expose, and they are reproduced here verbatim rather than imported so
 that this component can be validated standalone. When both exist they must be diffed, not
 forked: `dequant`, `BOOK`, `SUB`, `split_blob`, `join_blob`, `panel_bytes`, `tensor_bytes`,
@@ -34,7 +34,7 @@ from __future__ import annotations
 import numpy as np
 
 # ---------------------------------------------------------------------------------------------
-# geometry (plan §6.2)
+# geometry
 # ---------------------------------------------------------------------------------------------
 PANEL_ROWS = 64
 SLAB_COLS = 32
@@ -148,7 +148,7 @@ def check_tables(book: np.ndarray = BOOK, sub: np.ndarray = SUB) -> None:
 
 
 # ---------------------------------------------------------------------------------------------
-# dequant (plan §6.3)
+# dequant
 # ---------------------------------------------------------------------------------------------
 def dequant(slabs: np.ndarray, anchor: np.ndarray, *, book: np.ndarray = BOOK,
             sub: np.ndarray = SUB) -> np.ndarray:

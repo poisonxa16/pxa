@@ -30,12 +30,12 @@ ggml_cgraph * llm_build_context::build_qwen3next() {
     // from the main model's last-layer hidden state (mirror build_qwen35moe). Otherwise build the
     // normal delta-net + full-attention trunk.
     if (cparams.mtp_op_type != MTP_OP_NONE) {
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
+        // PXA_MTP_BATCH_SLOTS_ROWS_v1: one hidden row per BATCH token, for every MTP op type.
+        // The draft-gen graph used to allocate a single [n_embd] row here because every draft decode
+        // was a 1-row batch; a multi-row draft step then concatenated it against [n_embd, n_tokens]
+        // token embeddings and aborted. See common/pxa-mtp-batch-slots.h. No-op at n_tokens == 1.
+        ggml_tensor * hidden_states_from_main_model =
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
         lctx.inp_mtp_states = hidden_states_from_main_model;
@@ -53,7 +53,10 @@ ggml_cgraph * llm_build_context::build_qwen3next() {
         ggml_tensor * inp_out_ids = (n_tokens > 1 && (!lctx.cparams.mtp || pxa_mtp_lazy_out_ids(n_tokens))) ? build_inp_out_ids() : nullptr; // PXA_MTP_LAZY_WARMUP_v1
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+        // PXA_RS_RING: when the ring is armed the tensor carries TWO index vectors: [0, n_tokens) are
+        // the write rows (plane 0, absolute seq_id -- today's meaning) and [n_tokens, 2*n_tokens) are
+        // the read rows (rs_idx[seq]*plane_rows + seq). Ring off -> the shape is unchanged.
+        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens * (lctx.kv_self.rs_ring_armed() ? 2 : 1));
         cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
         ggml_set_input(lctx.inp_s_seq_qnext);
 
@@ -258,6 +261,15 @@ struct ggml_tensor * llm_build_context::build_qwen3next_mtp(
     cb(cur, "ffn_out", il);
 
     cb(cur, "result_norm", -1);
+    // PXA_MTP_READBACK_v1: the MTP head's own feature row. mtp_accept_batch() and the draft loop
+    // read it back with llama_get_embeddings_ith() and feed it to the next MTP_OP_DRAFT_GEN decode
+    // as the conditioning hidden, and llama_decode() picks this node by name as the embeddings
+    // source for an MTP op. Without the output flag ggml-alloc may reuse its buffer once the head's
+    // lm_head has consumed it, and the D2H copy then reads a later node's data -- logits right,
+    // hidden wrong. See build_qwen35.cpp for the measurement.
+    if (llama_pxa_mtp_head_output()) { // PXA_MTP_HEAD_OUTPUT=0 reproduces the stale read-back (debug only)
+        ggml_set_output(cur);
+    }
 
     cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb, false);
     cb(cur, "result_output", -1);

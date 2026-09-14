@@ -59,6 +59,11 @@ add_library(llama
             llama-hparams.cpp
             llama-kv-cache-dsv4.h
             llama-kv-cache-dsv4.cpp
+            llama-kv-cache-kpool.h
+            llama-kv-cache-kpool.cpp
+            llama-kpool-grid.cpp
+            llama-qsa-prof.h
+            llama-qsa-prof.cpp
             llama-delta-net.h
             llama-delta-net.cpp
             unicode.h
@@ -113,6 +118,7 @@ add_library(llama
             graphs/build_arctic.cpp
             graphs/build_deepseek2.cpp
             graphs/build_deepseek4.cpp
+            graphs/build_glm5next.cpp
             graphs/build_dspark.cpp
             graphs/build_glm4.cpp
             graphs/build_bitnet.cpp

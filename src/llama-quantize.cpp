@@ -8,6 +8,8 @@
 
 #include "pxq-quants.h"
 #include "pxq-cpu.h"
+#include "pxa-pxq-policy.h"
+#include "pxa-glm5next-quant.h"
 
 #include <thread>
 #include <atomic>
@@ -1005,6 +1007,48 @@ static const pxa_pxq_bb_cfg & pxa_pxq_backbone_cfg() {
     return cfg;
 }
 
+// ============================================================================
+// PXQ TIER POLICY (POLICY_REV 3) — the named MIX on top of the table above
+// ============================================================================
+// src/pxa-pxq-policy.h carries the rule, the reasoning and the pxq4hq cap; this is only the
+// selection. --pxq-policy <name> / --pxq-uniform in llama-quantize set PXA_PXQ_POLICY before
+// the quantize call, which is why the CLI flags need no change to the public params struct.
+//
+// THE DEFAULT IS NOW PER-TIER, and only the PXQ2 base moved (2026-09-09, KLD ladder).
+//
+// Measured against a PXQ4 anchor at perplexity 6.27: uniform PXQ2 lands at 30.01 — 4.8x the
+// anchor, mean KLD 1.654, agreeing with the anchor's top token on 48.8% of positions, which is
+// a coin flip. The same base under `attn4` lands at 9.35 (1.49x, KLD 0.453, 72.8%) for 10.1%
+// more bytes, and decodes FASTER on both engines. A 4.8x perplexity default that nobody had
+// measured is not a conservative choice, it is an unexamined one, so the PXQ2 base now defaults
+// to attn4. PXQ3 and above are unchanged: they already converge to that shape under `balanced`,
+// and flipping a default nobody measured for them would repeat the mistake in the other
+// direction. `--pxq-policy uniform` (or `--pxq-uniform`) still selects the old allocation
+// exactly, and POLICY_REV does NOT bump: the profiles' semantics are unchanged, only which one
+// is picked when the caller says nothing.
+static bool pxa_pxq_policy_explicit(pxa_pxq_policy_id * out) {
+    static pxa_pxq_policy_id v   = PXA_POLICY_UNIFORM;
+    static const bool        set = [] {
+        const char * e = getenv("PXA_PXQ_POLICY");
+        if (!e || !*e) return false;
+        if (!pxa_pxq_policy_parse(e, &v)) {
+            LLAMA_LOG_WARN("PXA_PXQ_POLICY: unknown profile '%s' (want uniform|balanced|attn4) "
+                           "— keeping the per-tier default\n", e);
+            return false;
+        }
+        return true;
+    }();
+    if (set) *out = v;
+    return set;
+}
+
+
+
+// The policy layer stands down for any EXPLICIT backbone override. core/hq/pxq6/lite/legacy
+// each pin the backbone on purpose (they are A/B arms and reproduction switches); a profile
+// silently reshaping one of them would make two differently-named things produce the same
+// file, which is the exact confusion BACKBONE_REV 2's provenance keys exist to prevent.
+
 // tier context for the table above. PXA_TIER_NONE == "this ftype has no backbone table".
 enum pxa_pxq_tier {
     PXA_TIER_NONE = 0,
@@ -1016,6 +1060,26 @@ enum pxa_pxq_tier {
     PXA_TIER_PXQ6,
     PXA_TIER_PXQU,
 };
+
+// The effective profile for a named tier: what the caller asked for, or the tier's default.
+static pxa_pxq_policy_id pxa_pxq_policy_for_tier(pxa_pxq_tier tier) {
+    pxa_pxq_policy_id v = PXA_POLICY_UNIFORM;
+    if (pxa_pxq_policy_explicit(&v)) {
+        return v;
+    }
+    // the rule itself lives in pxa-pxq-policy.h so the test reads the same one
+    return pxa_pxq_policy_default_for(tier == PXA_TIER_PXQ2   ? GGML_TYPE_PXQ2
+                                    : tier == PXA_TIER_PXQ3   ? GGML_TYPE_PXQ3
+                                    : tier == PXA_TIER_PXQ4HQ ? GGML_TYPE_PXQ4HQ
+                                    : tier == PXA_TIER_PXQ6   ? GGML_TYPE_PXQ6
+                                                              : GGML_TYPE_PXQ4);
+}
+
+static bool pxa_pxq_policy_active_for(pxa_pxq_tier tier) {
+    const pxa_pxq_bb_cfg & c = pxa_pxq_backbone_cfg();
+    return pxa_pxq_policy_for_tier(tier) != PXA_POLICY_UNIFORM &&
+           c.mode != PXA_BB_LEGACY && !c.core && !c.hq && !c.pxq6 && !c.lite;
+}
 
 // the classes the table maps onto a NATIVE PXQ slab type (so the write-loop dispatch must
 // treat them as eligible). token_embd (Q6_K), attn_k/v (Q8_0) and the per-head gate (F16)
@@ -1101,8 +1165,10 @@ static bool pxa_custom_rule_matches(const llama_model_quantize_params * params, 
 static int g_pxa_customq_demoted = 0;
 
 // The resolver. Returns GGML_TYPE_COUNT for "not mine — leave to the legacy pipeline".
-static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier,
-                                       bool model_has_experts) {
+// Call pxa_pxq_backbone_type() (below), not this: the ssm_out floor is applied there, on the
+// OUTPUT of every branch in here, which is the only place that catches all of them.
+static ggml_type pxa_pxq_backbone_type_resolve(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier,
+                                               bool model_has_experts) {
     const pxa_pxq_bb_cfg & cfg = pxa_pxq_backbone_cfg();
     if (cfg.mode == PXA_BB_LEGACY || tier == PXA_TIER_NONE) {
         return GGML_TYPE_COUNT;
@@ -1253,9 +1319,15 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     // at all. Default only: an explicit PXA_PXQ_BACKBONE=core/hq/pxq6 still wins below, and
     // the assertion remains the backstop if that override mislabels the output.
     if (!model_has_experts && core_tier && !cfg.core && !cfg.hq && !cfg.pxq6) {
-        return tier == PXA_TIER_PXQ6   ? GGML_TYPE_PXQ6
-             : tier == PXA_TIER_PXQ4HQ ? GGML_TYPE_PXQ4HQ
-                                       : GGML_TYPE_PXQ4;
+        const ggml_type named = tier == PXA_TIER_PXQ6   ? GGML_TYPE_PXQ6
+                              : tier == PXA_TIER_PXQ4HQ ? GGML_TYPE_PXQ4HQ
+                                                        : GGML_TYPE_PXQ4;
+        // POLICY_REV 3: the named tier is the FFN's; the attention block buys up from it.
+        // `uniform` (the default) returns `named` untouched, so this line is a no-op on every
+        // recipe published before 2026-09-09.
+        return pxa_pxq_policy_active_for(tier)
+             ? pxa_pxq_policy_apply(name, t->ne[1], named, false, pxa_pxq_policy_for_tier(tier))
+             : named;
     }
     // Same rule for the sub-4-bit tiers on dense models (2026-08-10, first user: muse-glimmer
     // 30B). Without this, tier PXQ3 on a dense model routed the whole GEMM backbone to the
@@ -1266,7 +1338,13 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     // PXA_PXQ_BACKBONE=core/hq/pxq6 still wins below.
     if (!model_has_experts && (tier == PXA_TIER_PXQ2 || tier == PXA_TIER_PXQ3)
         && !cfg.core && !cfg.hq && !cfg.pxq6) {
-        return tier == PXA_TIER_PXQ2 ? GGML_TYPE_PXQ2 : GGML_TYPE_PXQ3;
+        const ggml_type named = tier == PXA_TIER_PXQ2 ? GGML_TYPE_PXQ2 : GGML_TYPE_PXQ3;
+        // POLICY_REV 3, and this is the branch it was written for: uniform PXQ2 on a dense
+        // model puts the attention projections at 2.27 bpw, which is the allocation nobody
+        // ever measured and chose. See src/pxa-pxq-policy.h.
+        return pxa_pxq_policy_active_for(tier)
+             ? pxa_pxq_policy_apply(name, t->ne[1], named, false, pxa_pxq_policy_for_tier(tier))
+             : named;
     }
 
     if (cfg.core) {
@@ -1290,24 +1368,61 @@ static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tens
     const ggml_type hi = cfg.hq   ? GGML_TYPE_PXQ4HQ
                        : cfg.pxq6 ? GGML_TYPE_PXQ6
                                   : GGML_TYPE_PXQ4;
+    ggml_type rev2;
     switch (tier) {
         case PXA_TIER_PXQ1:                                       // only via PXA_PXQ_BACKBONE=universal
         case PXA_TIER_PXQ2:
             // attn_output is the worst-measured class (3.2x) — give it the HQ 4-bit tier.
             // DeepSeek-V4's o-LoRA pair is the same class (see above).
-            return (pxa_name_is(name, "attn_output.weight")   ||
+            rev2 = (pxa_name_is(name, "attn_output.weight")   ||
                     pxa_name_is(name, "attn_output_a.weight") ||
                     pxa_name_is(name, "attn_output_b.weight")) ? GGML_TYPE_PXQ4HQ : GGML_TYPE_PXQ4;
+            break;
         case PXA_TIER_PXQ3:
         case PXA_TIER_PXQU:
-            return GGML_TYPE_PXQ4HQ;
+            rev2 = GGML_TYPE_PXQ4HQ;
+            break;
         case PXA_TIER_PXQ4:
         case PXA_TIER_PXQ4HQ:
         case PXA_TIER_PXQ6:
-            return hi;
+            rev2 = hi;
+            break;
         default:
             return GGML_TYPE_COUNT;
     }
+    // POLICY_REV 3 on the MoE backbone. `uniform` returns rev2 untouched. A profile flattens
+    // the whole ladder onto one backbone rule — pxq4, pxq4hq on attn_output — which at PXQ3
+    // is SMALLER than the rev-2 all-pxq4hq backbone it replaces (4.2526 bpw against 4.52) and
+    // rides the faster of the two MMVQ types. Stands down under any explicit
+    // PXA_PXQ_BACKBONE arm; see pxa_pxq_policy_active_for().
+    if (!pxa_pxq_policy_active_for(tier)) {
+        return rev2;
+    }
+    return pxa_pxq_policy_apply(name, t->ne[1], rev2, model_has_experts, pxa_pxq_policy_for_tier(tier));
+}
+
+// THE ssm_out FLOOR, applied to the resolver's OUTPUT — see the measured table in
+// src/pxa-pxq-policy.h. Deliberately a wrapper rather than an extra branch inside: the
+// resolver has FOUR independent ways to hand ssm_out a PXQ level (the dense named-tier
+// branch, the sub-4-bit dense branch, the MoE rev-2 table, and the profile buy-up that runs
+// on top of all three — ssm_out is PXA_ROLE_ATTN, so balanced and attn4 climb it to the pxq4
+// cap), and a floor written into any one of them is a floor the next branch walks around.
+// Every caller goes through here, so the write loop, the emitted-tier prediction that decides
+// which codebook KVs get stamped, and the resolved pxa.pxq.backbone_map all agree by
+// construction. --custom-q still outranks it: the write loop and the map both stand this
+// table down for a tensor a user rule already claims.
+static ggml_type pxa_pxq_backbone_type(const std::string & name, const ggml_tensor * t, pxa_pxq_tier tier,
+                                       bool model_has_experts) {
+    const ggml_type resolved = pxa_pxq_backbone_type_resolve(name, t, tier, model_has_experts);
+    if (tier == PXA_TIER_NONE || !pxa_pxq_is_ssm_out(name)) {
+        return resolved;
+    }
+    // the slab codecs need 64-row panels and 32-wide blocks; without the geometry there is no
+    // higher PXQ tier to lift to and the write loop's own q8_0 demotion is the right landing
+    if (!pxq4_tensor_geometry_ok(t)) {
+        return resolved;
+    }
+    return pxa_pxq_ssm_out_floor(name, resolved);
 }
 
 // PXQ slab-tier eligibility (shared by every PXQ tier): routed expert tensors (_exps.weight)
@@ -1367,6 +1482,21 @@ static ggml_type pxa_pxq_landing_type(const std::string & name, const ggml_tenso
         case PXA_TIER_PXQ4HQ: return GGML_TYPE_PXQ4HQ;
         case PXA_TIER_PXQ4:   return GGML_TYPE_PXQ4;
         default:              return rules_type;   // PXA_TIER_NONE / PXA_TIER_PXQU
+    }
+}
+
+// The ggml type a PXQ ftype's LEVEL names — the tier its routed experts (MoE) or its whole
+// GEMM backbone (dense, uniform) are written at. PXA_TIER_PXQU has no single answer by
+// definition: its mix comes from the map.
+static ggml_type pxa_pxq_tier_named_type(pxa_pxq_tier tier) {
+    switch (tier) {
+        case PXA_TIER_PXQ1:   return GGML_TYPE_PXQ1;
+        case PXA_TIER_PXQ2:   return GGML_TYPE_PXQ2;
+        case PXA_TIER_PXQ3:   return GGML_TYPE_PXQ3;
+        case PXA_TIER_PXQ4:   return GGML_TYPE_PXQ4;
+        case PXA_TIER_PXQ4HQ: return GGML_TYPE_PXQ4HQ;
+        case PXA_TIER_PXQ6:   return GGML_TYPE_PXQ6;
+        default:              return GGML_TYPE_COUNT;
     }
 }
 
@@ -1803,6 +1933,54 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     // routed expert stack can be claimed, which is the case the assertion is certain to catch.
     // A partial shortfall is a warning, not a refusal -- the tier map / --custom-q may well
     // make up the difference and only the real composition can settle it.
+    // ------------------------------------------------------------------------------------
+    // PXQU UNMAPPED-EXPERT GUARD (2026-09-08). Under PXQ_UNIVERSAL a routed
+    // expert stack that the .tiers map does NOT name gets no per-tensor target, so
+    // pxa_pxq_landing_type() returns the rules type unchanged — and for a PXQ ftype that is
+    // the flattened MXFP4 default, 4.25 bpw. The stack is then written as flat MXFP4: bigger
+    // than every tier the map places, in violation of this tree's zero-MXFP4 rule, with no
+    // warning anywhere. It is silent because the composition assertion disables its
+    // named-tier check for PXQU (the mix is map-defined) and MXFP4 counts as neither PXQ
+    // family nor an error.
+    //
+    // This is not hypothetical either: both glm5next maps written on 2026-09-08 covered
+    // blocks 3..44 and left blk.45 (the NextN block, which IS a full MoE block in the unsloth
+    // file) unnamed — 2.16 GiB of source that would have landed at 3.59 GiB of MXFP4.
+    //
+    // Refuse here, before the write loop, and name the stacks. Escape hatch for an operator
+    // who really does want the MXFP4 landing: PXA_PXQU_ALLOW_UNMAPPED_EXPERTS=1.
+    if (pxq_tier == PXA_TIER_PXQU) {
+        std::vector<std::string> unmapped;
+        for (const auto & w : ml.weights) {
+            const std::string tname(ggml_get_name(w.tensor));
+            if (!pxa_name_ends(tname, "_exps.weight"))              continue;
+            if (pxa_custom_rule_matches(params, tname))             continue;
+            // a tensor the arch keep-list copies through is not "unmapped", it is kept
+            if (model.arch == LLM_ARCH_GLM5NEXT &&
+                pxa_glm5next_keep_at_source(tname,
+                    (int) model.hparams.n_layer - (int) model.hparams.nextn_predict_layers)) continue;
+            unmapped.push_back(tname);
+        }
+        if (!unmapped.empty()) {
+            std::string list;
+            for (size_t i = 0; i < unmapped.size() && i < 8; ++i) { list += "\n    "; list += unmapped[i]; }
+            if (unmapped.size() > 8) list += format("\n    ... and %d more", (int) unmapped.size() - 8);
+            const bool allow = getenv("PXA_PXQU_ALLOW_UNMAPPED_EXPERTS")
+                            && atoi(getenv("PXA_PXQU_ALLOW_UNMAPPED_EXPERTS")) != 0;
+            const std::string msg = format(
+                "PXQ_UNIVERSAL: %d routed expert stack(s) are not named by the tier map and would "
+                "be written as flat MXFP4 (4.25 bpw) — larger than every tier the map places, and "
+                "invisible to the composition assertion because a UNIVERSAL mix is map-defined:%s\n"
+                "Add them to the .tiers map, or set PXA_PXQU_ALLOW_UNMAPPED_EXPERTS=1 if the MXFP4 "
+                "landing is genuinely what you want.", (int) unmapped.size(), list.c_str());
+            if (allow) {
+                LLAMA_LOG_WARN("%s OVERRIDDEN by PXA_PXQU_ALLOW_UNMAPPED_EXPERTS.\n", msg.c_str());
+            } else {
+                throw std::runtime_error(msg);
+            }
+        }
+    }
+
     if (pxq_tier != PXA_TIER_NONE && pxq_tier != PXA_TIER_PXQU) {
         // CustomQ is a function-local alias at every use site, not a file-scope type.
         using CustomQ = std::pair<std::string, ggml_type>;
@@ -1945,6 +2123,57 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
 
     gguf_set_val_u32(ctx_out, "general.file_type", ftype); // TODO: use LLM_KV
+
+    // THE SET OF PXQ TIERS THIS FILE WILL ACTUALLY CONTAIN.
+    // ------------------------------------------------------------------------------------
+    // Every PXQ tier is a codebook format: a reader cannot decode a pxq3 tensor without
+    // pxa.pxq3.book / .sub. Until 2026-09-09 those KVs were written from the REQUESTED FTYPE
+    // — `if (pxq2_out)` writes the pxq2 book — which was already wrong before any profile
+    // existed: a PXQ2 target on a MoE model emits a pxq4 backbone (which reads the pxq6-family
+    // tables) and stamped only the pxq2 book, so the file was undecodable by anything that did
+    // not fall back to compiled-in defaults. POLICY_REV 3 makes it impossible to miss — a
+    // dense PXQ2-balanced file carries pxq3 attention — but the bug is older than the profiles.
+    //
+    // Fixed by driving the KV block from the tiers the run will EMIT. This set is predicted by
+    // running the write loop's own decision chain over the model's tensors (the same mirror the
+    // backbone_map below already uses), and it is CHECKED against the real composition after
+    // the write loop: any tier that reaches the output without its book aborts the run and
+    // removes the file, exactly like the composition assertion. A prediction that is allowed to
+    // be wrong silently is not a fix.
+    std::set<ggml_type> pxq_tiers_present;
+    if (pxq_tier != PXA_TIER_NONE) {
+        const ggml_type named = pxa_pxq_tier_named_type(pxq_tier);
+        for (int i = 0; i < ml.n_tensors; ++i) {
+            const ggml_tensor * meta = ml.get_tensor_meta(i);
+            const std::string   tname = ggml_get_name(meta);
+            if (ggml_n_dims(meta) < 2) {
+                continue;
+            }
+            ggml_type t = GGML_TYPE_COUNT;
+            if (const ggml_type ct = pxa_custom_rule_type(params, tname); ct < GGML_TYPE_COUNT) {
+                t = ct;                                   // --custom-q / a PXQU tier map
+            } else if (pxa_name_ends(tname, "_exps.weight") ||
+                       (pxq_tier != PXA_TIER_PXQU && pxq4_legacy_native_class(tname))) {
+                // the expert path takes the level — floored for ssm_out, which reaches this
+                // branch only via the PXA_PXQ_NATIVE=ssm opt-in and would otherwise predict a
+                // tier the write loop is no longer going to emit. A prediction that disagrees
+                // with the write loop costs the file its codebook KV and the run aborts on the
+                // composition check, so the two must be floored in the same breath.
+                t = pxa_pxq_ssm_out_floor(tname, named);
+            } else {
+                t = pxa_pxq_backbone_type(tname, meta, pxq_tier, model.hparams.n_expert > 1);
+            }
+            if (pxa_is_pxq_slab_type(t)) {
+                // geometry can force a tier off its requested type; the write loop's own
+                // fallback is q8_0, never another PXQ tier, so a geometry failure can only
+                // REMOVE a tier from this set, never add one
+                if (pxq4_tensor_geometry_ok(meta)) {
+                    pxq_tiers_present.insert(t);
+                }
+            }
+        }
+    }
+
     if (pxq_tier != PXA_TIER_NONE) {
         // BACKBONE_REV provenance: which allocation table produced this file's NON-expert
         // tensors. 1 = the historical flat-MXFP4 backbone, 2 = the per-class table. The
@@ -2028,6 +2257,65 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
         gguf_set_val_str(ctx_out, "pxa.pxq.backbone_map", bb_map.c_str());
         LLAMA_LOG_INFO("PXQ backbone map (resolved): %s\n", bb_map.c_str());
+        // Say WHY the DeltaNet out-proj is not on the level everything else is on. It is the
+        // one entry in that map whose type cannot be derived from the level name, so somebody
+        // comparing two files' byte counts has no other way to account for the difference —
+        // and the number below is the whole reason the floor exists. Printed only when the map
+        // it is describing actually shows it, so a --custom-q override (which prints as
+        // `ssm_out=custom:...`) does not get credited to the default.
+        if (const ggml_type prot = pxa_pxq_ssm_out_protect_type(); prot < GGML_TYPE_COUNT &&
+            bb_map.find(std::string("ssm_out=") + ggml_type_name(prot)) != std::string::npos) {
+            LLAMA_LOG_INFO("PXQ ssm_out protected at %s: the DeltaNet output projection is ~5%% of the "
+                           "bytes and 7x the divergence. Mean KLD against its own Q8_0 source on "
+                           "Qwen3.8-27B (wikitext-2, -c 2048, 10 chunks, one class changed): "
+                           "pxq4 0.433, mxfp4 0.060, pxq4hq 0.049, pxq6 0.044, q8_0 0.043; "
+                           "file cost against the pxq4 landing: +0.30%%, +1.20%%, +5.10%%.\n"
+                           "PXQ ssm_out: override with --custom-q 'ssm_out\\.weight=<type>', or "
+                           "PXA_PXQ_SSM_OUT=<type> / =off to drop the floor entirely.\n",
+                           ggml_type_name(prot));
+        }
+
+        // POLICY_REV 3 provenance. The backbone_map above already says what every ROLE landed
+        // on, resolved from this model's own tensors — these keys say WHICH NAMED RULE put it
+        // there, which is the thing an A/B table needs in a column and the thing a file cannot
+        // otherwise tell you once two profiles have produced the same byte count for different
+        // reasons. Written on every PXQ target, including uniform: "this file was built with
+        // no profile" is a fact worth stamping, not an absence to infer.
+        {
+            const pxa_pxq_policy_id pol   = pxa_pxq_policy_for_tier(pxq_tier);
+            const bool              on    = pxa_pxq_policy_active_for(pxq_tier);
+            const char * const      pname = on ? pxa_pxq_policy_name(pol) : "uniform";
+            const char * const level =
+                pxq_tier == PXA_TIER_PXQ1   ? "pxq1"   : pxq_tier == PXA_TIER_PXQ2   ? "pxq2"   :
+                pxq_tier == PXA_TIER_PXQ3   ? "pxq3"   : pxq_tier == PXA_TIER_PXQ4   ? "pxq4"   :
+                pxq_tier == PXA_TIER_PXQ4HQ ? "pxq4hq" : pxq_tier == PXA_TIER_PXQ6   ? "pxq6"   :
+                                              "pxqu";
+            const bool moe = model.hparams.n_expert > 1;
+            gguf_set_val_u32(ctx_out, "pxa.policy.rev",   3u);
+            gguf_set_val_str(ctx_out, "pxa.policy.name",  pname);
+            gguf_set_val_str(ctx_out, "pxa.policy.level", level);
+            gguf_set_val_str(ctx_out, "pxa.policy.bulk",  moe ? "routed_experts" : "ffn");
+            std::string summary = std::string(pname) + ": level " + level + " names the "
+                                + (moe ? "routed expert" : "FFN") + " tier";
+            if (!on) {
+                summary += "; no profile (BACKBONE_REV 2 as published)";
+            } else if (pol == PXA_POLICY_ATTN4) {
+                summary += "; attention pxq4, attn_output pxq4hq";
+            } else {
+                summary += moe ? "; backbone pxq4, attn_output pxq4hq"
+                               : "; attention +1 notch, attn_output +2 (cap pxq4hq)";
+            }
+            gguf_set_val_str(ctx_out, "pxa.policy.summary", summary.c_str());
+            // ONE line, in the log, every run — the thing you grep for when a file's identity
+            // is in question six weeks from now.
+            LLAMA_LOG_INFO("PXQ policy: %s\n", summary.c_str());
+            if (pol != PXA_POLICY_UNIFORM && !on) {
+                LLAMA_LOG_WARN("PXQ policy: profile '%s' was requested but STOOD DOWN — an "
+                               "explicit PXA_PXQ_BACKBONE arm owns the backbone in this run. "
+                               "The output is a plain BACKBONE_REV 2 file.\n",
+                               pxa_pxq_policy_name(pol));
+            }
+        }
         // and the raw override strings, so "why does this arm differ" is a KV lookup too
         std::string bb_ovr;
         if (const char * e = getenv("PXA_PXQ_BACKBONE"); e && *e) {
@@ -2045,19 +2333,52 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             gguf_set_val_str(ctx_out, "pxa.pxq.backbone_overrides", bb_ovr.c_str());
         }
     }
-    if (pxq6_out || pxq6hq_out) {   // 4-bit-tier provenance: the frozen tables this file was built with
+    // ---- codebook KVs: ONE `if` PER TIER THE FILE ACTUALLY CONTAINS --------------------
+    // Driven by pxq_tiers_present (built above from the write loop's own decision chain), not
+    // by the requested ftype. `|| pxqu_out` is kept on the low tiers because a PXQU map can
+    // name a tier for a tensor the prediction above resolves through --custom-q; the set
+    // already covers that, and the redundancy costs 20 floats.
+    const bool need_pxq4 = pxq_tiers_present.count(GGML_TYPE_PXQ4) ||
+                           pxq_tiers_present.count(GGML_TYPE_PXQ4HQ) || pxq6_out || pxq6hq_out;
+    const bool need_hq   = pxq_tiers_present.count(GGML_TYPE_PXQ4HQ) || pxq6hq_out;
+    if (need_pxq4) {   // 4-bit-tier provenance: the frozen tables this file was built with
         gguf_set_val_u32(ctx_out, "pxa.pxq6.version", 1);
-        gguf_set_val_str(ctx_out, "pxa.pxq6.tier", pxq6hq_out ? "hq" : "core");
+        // "tier" says which SUB16 table the 4-bit codes were snapped against. A mixed file can
+        // hold both pxq4 and pxq4hq, and the hq sub is the one a decoder must have to read the
+        // hq tensors, so it wins when both are present; pxq4's own sub is the [0] table and a
+        // reader identifies it from the tensor's ggml type, not from this string.
+        gguf_set_val_str(ctx_out, "pxa.pxq6.tier", need_hq ? "hq" : "core");
         gguf_set_arr_data(ctx_out, "pxa.pxq6.book", GGUF_TYPE_FLOAT32, pxq6_book_q(), 16);
-        gguf_set_arr_data(ctx_out, "pxa.pxq6.sub",  GGUF_TYPE_FLOAT32, pxq6_sub_q(pxq6hq_out ? 1 : 0), 16);
+        gguf_set_arr_data(ctx_out, "pxa.pxq6.sub",  GGUF_TYPE_FLOAT32, pxq6_sub_q(need_hq ? 1 : 0), 16);
     }
-    if (pxq6r_out) {   // PXQ6 (5-bit LM32 tier) provenance: 32-entry book + shared SUB16
+    if (pxq_tiers_present.count(GGML_TYPE_PXQ4HQ)) {
+        // PXQ4HQ'S OWN KVs, ADDITIVE, and the reason they exist.
+        //
+        // The block above records ONE table pair for the whole 4-bit family, and the "tier"
+        // string is what says whether pxa.pxq6.sub is SUB16 or the HQ tier's SUB8. That is
+        // decidable for a file with one 4-bit tier in it and NOT decidable for a mixed one:
+        // POLICY_REV 3's attention promotion produces exactly that mixed file -- pxq4 bulk with
+        // a pxq4hq attention block -- and "hq" wins, so the pxq4 tensors' SUB16 is then not in
+        // the file at all. Every external reader has to infer it, which is the same class of
+        // "the file does not describe itself" bug the pxq2/pxq3 book stamping fixed earlier
+        // today.
+        //
+        // These two keys close it without changing what any existing key means: pxa.pxq6.* is
+        // written exactly as before, so every reader in the field is bit-for-bit unaffected,
+        // and a reader that knows this tier takes its tables from here and stops guessing.
+        // The book is PX16, shared with pxq4 -- recorded anyway, because "which tiers are in
+        // this file and what were they built with" should be answerable from the KVs alone.
+        gguf_set_val_u32(ctx_out, "pxa.pxq4hq.version", 1);
+        gguf_set_arr_data(ctx_out, "pxa.pxq4hq.book", GGUF_TYPE_FLOAT32, pxq6_book_q(), 16);
+        gguf_set_arr_data(ctx_out, "pxa.pxq4hq.sub",  GGUF_TYPE_FLOAT32, pxq6_sub_q(1), 16);
+    }
+    if (pxq6r_out || pxq_tiers_present.count(GGML_TYPE_PXQ6)) {   // the 5-bit LM32 tier
         gguf_set_val_u32(ctx_out, "pxa.pxq6.version", 1);
         gguf_set_val_str(ctx_out, "pxa.pxq6.tier", "lm32");
         gguf_set_arr_data(ctx_out, "pxa.pxq6.book", GGUF_TYPE_FLOAT32, pxq6r_book_q(), 32);
         gguf_set_arr_data(ctx_out, "pxa.pxq6.sub",  GGUF_TYPE_FLOAT32, pxq6r_sub_q(), 16);
     }
-    if (pxq2_out || pxqu_out) {
+    if (pxq_tiers_present.count(GGML_TYPE_PXQ2) || pxq2_out || pxqu_out) {
         // version 3 == PXA_PXQ2_V3 refit book; version 2 == PXA_PXQ_CEIL_V2 v2 book (the book
         // KV below carries the actual table either way; the version KV is what the loader's
         // mismatch guard reads)
@@ -2065,10 +2386,17 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         gguf_set_arr_data(ctx_out, "pxa.pxq2.book", GGUF_TYPE_FLOAT32, pxq2_book_q(), 4);
         gguf_set_arr_data(ctx_out, "pxa.pxq2.sub",  GGUF_TYPE_FLOAT32, pxq2_sub_q(), 16);
     }
-    if (pxq3_out || pxqu_out) {
+    if (pxq_tiers_present.count(GGML_TYPE_PXQ3) || pxq3_out || pxqu_out) {
         gguf_set_val_u32(ctx_out, "pxa.pxq3.version", pxq_ceil_v2_enabled() ? 2u : 1u);
         gguf_set_arr_data(ctx_out, "pxa.pxq3.book", GGUF_TYPE_FLOAT32, pxq3_book_q(), 8);
         gguf_set_arr_data(ctx_out, "pxa.pxq3.sub",  GGUF_TYPE_FLOAT32, pxq3_sub_q(), 16);
+    }
+    if (pxq_tiers_present.count(GGML_TYPE_PXQ1)) {
+        // PXQ1's book is the fixed {-1,+1} pair and its subs are the shared SUB16, so this tier
+        // never needed a book KV of its own to be decodable. It gets a version stamp anyway so
+        // "which tiers are in this file" is answerable from the KVs alone, which is the whole
+        // point of the block.
+        gguf_set_val_u32(ctx_out, "pxa.pxq1.version", 1);
     }
     if (pxqu_out) {
         // No pxa.pxqu.preset provenance KV: it would need a new `pxqu_preset` field threaded
@@ -2097,6 +2425,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                  model.arch == LLM_ARCH_GEMMA4 ||
                  model.arch == LLM_ARCH_QWEN35MOE ||   // hybrid: only full-attn layers carry wv (every full_attention_interval)
                  model.arch == LLM_ARCH_QWEN3NEXT ||    // same Gated-DeltaNet hybrid layout
+                 model.arch == LLM_ARCH_GLM5NEXT ||    // hybrid: 34 KDA layers carry attn_v, the
+                                                       // 11 MLA layers carry attn_v_b instead, so
+                                                       // n_attention_wv is 34 of 46 -- neither 0,
+                                                       // nor n_layer, nor 3*n_layer
                  model.arch == LLM_ARCH_QWEN35 ||      // dense sibling of QWEN35MOE; identical hybrid layout
                  model.arch == LLM_ARCH_UNKNOWN) && "n_attention_wv is unexpected");
 
@@ -2107,6 +2439,17 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     std::map<int, std::pair<int64_t, size_t>> comp_stats;   // type -> {count, bytes}
     std::vector<std::string> comp_written_files;            // every path this run opened for write
     std::map<std::string, pxa_err_acc> errbudget;   // PXA_PXQ_ERRBUDGET, empty unless enabled
+
+    // --dry-run: tensors the REAL run would refuse as a second lossy pass (see the dry-run arm)
+    int    n_dry_would_refuse  = 0;
+    // glm5next keep-list bookkeeping (reported at the end of the run; see pxa-glm5next-quant.h)
+    int    n_glm5next_kept     = 0;
+    size_t glm5next_kept_bytes = 0;
+    // --dry-run PLAN: the per-tensor lines are already printed by the loop, but a multi-hour
+    // job is signed off from a summary, not from 1412 lines. Group them by tensor class
+    // (the name with the block index stripped) and by source->landing type pair.
+    struct pxa_plan_row { int64_t n; size_t src; size_t dst; std::string src_t, dst_t; };
+    std::map<std::string, pxa_plan_row> plan_rows;
 
     std::vector<std::thread> workers;
     workers.reserve(nthread);
@@ -2327,6 +2670,20 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         // quantize the extra output tensor
         quantize = tensor == output_tensor || quantize;
 
+        // ---------------------------------------------------------------------------------
+        // GLM-5.3-Flash (glm5next) keep-list. Placed AFTER the output_tensor line on purpose:
+        // it is the last word, so `--extra-output-tensor` cannot drag a precision-sensitive
+        // tensor back into the quantizer. See src/pxa-glm5next-quant.h for why each class is
+        // on the list; upstream PR #27773 leaves the same set unquantized.
+        if (model.arch == LLM_ARCH_GLM5NEXT && quantize) {
+            const int n_trunk = (int) model.hparams.n_layer - (int) model.hparams.nextn_predict_layers;
+            if (pxa_glm5next_keep_at_source(name, n_trunk)) {
+                quantize = false;
+                ++n_glm5next_kept;
+                glm5next_kept_bytes += ggml_nbytes(tensor);
+            }
+        }
+
         enum ggml_type new_type;
         void * new_data = nullptr;
         size_t new_size = 0;
@@ -2361,6 +2718,28 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                         LLAMA_LOG_INFO("\nPXQ backbone rev2: %s -> %s ", ggml_type_name(new_type),
                                        ggml_type_name(bb));
                         new_type = bb;
+                    }
+                    // THE ssm_out FLOOR, second route. The table above never sees this one:
+                    // further down, the native-PXQ dispatch upgrades "an untouched MXFP4
+                    // default" to the WHOLE-FILE tier for any pxq4_legacy_native_class tensor,
+                    // and PXA_PXQ_NATIVE=ssm puts ssm_out in that class — so under
+                    // PXA_PXQ_BACKBONE=legacy or =lite the DeltaNet out-proj lands on the level
+                    // itself (pxq2 at a PXQ2 target) with the backbone table standing down.
+                    // Same class, same measurement, same floor. Applied HERE, while new_type is
+                    // still the mxfp4 that triggers that upgrade, so a non-slab floor type takes
+                    // the ordinary codec path instead of falling into the PXQ dispatch; the
+                    // emitted-tier prediction floors the same branch for the same reason.
+                    // --custom-q still outranks it, exactly as it outranks the table.
+                    if (new_type == GGML_TYPE_MXFP4 && pxq_tier != PXA_TIER_PXQU &&
+                        pxa_pxq_is_ssm_out(name) && pxq4_legacy_native_class(name) &&
+                        !pxa_custom_rule_matches(params, name)) {
+                        const ggml_type lvl = pxa_pxq_tier_named_type(pxq_tier);
+                        const ggml_type floored = lvl < GGML_TYPE_COUNT ? pxa_pxq_ssm_out_floor(name, lvl) : lvl;
+                        if (floored < GGML_TYPE_COUNT && floored != lvl) {
+                            LLAMA_LOG_INFO("\nPXQ ssm_out floor: %s -> %s ", ggml_type_name(lvl),
+                                           ggml_type_name(floored));
+                            new_type = floored;
+                        }
                     }
                 }
             }
@@ -2545,6 +2924,23 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             fflush(stdout);
 
             if (params->dry_run) {
+                // The else-arm below REFUSES a q8_0 or PXQ source unless
+                // --i-know-this-is-double-lossy is set, and that refusal lives on a path a dry
+                // run never takes -- so a dry run could pass cleanly and the real run abort
+                // minutes in on a tensor the plan said nothing about. (It did, 2026-09-08:
+                // GLM-5.3-Flash UD-Q2_K_XL steps exactly ONE tensor, blk.11.ffn_down_shexp, up
+                // to q8_0, and the job died there after 4 minutes and 19.5 GB.) Project the
+                // refusal too, and say so again at the end of the run.
+                if (!params->allow_double_lossy &&
+                    (pxa_is_pxq_slab_type(tensor->type) || tensor->type == GGML_TYPE_Q8_0)) {
+                    LLAMA_LOG_WARN("\n[dry-run: WOULD REFUSE] %s is %s in the source and this "
+                                   "plan requantizes it -- the real run needs "
+                                   "--i-know-this-is-double-lossy, or pin it to its source type "
+                                   "with --custom-q '^%s$=%s' ",
+                                   name.c_str(), ggml_type_name(tensor->type),
+                                   name.c_str(), ggml_type_name(tensor->type));
+                    ++n_dry_would_refuse;
+                }
                 // Project the SAME landing the else-arm below would produce. Without this the
                 // dry run reported every PXQ-eligible tensor as its MXFP4 default, which on a
                 // MoE model made the composition summary (and the assertion that reads it)
@@ -2674,7 +3070,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     // allows it, in every backbone mode.
                     const bool bb_legacy = pxa_pxq_backbone_cfg().mode == PXA_BB_LEGACY;
                     const ggml_type demoted = bb_legacy ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
-                    // LOUD-DEMOTE (2026-07-28, owner-requested): a silently demoted EXPLICIT
+                    // LOUD-DEMOTE (2026-07-28): a silently demoted EXPLICIT
                     // --custom-q target is how an A/B arm ends up byte-identical to its control
                     // and "measures" nothing. Scream, count, and summarize at the end.
                     if (pxa_custom_rule_matches(params, name)) {
@@ -2767,6 +3163,23 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
 
 QuantizationDone:;
+        if (params->dry_run) {
+            std::string cls = name;
+            if (cls.compare(0, 4, "blk.") == 0) {
+                const size_t dot = cls.find('.', 4);
+                if (dot != std::string::npos) cls = "blk.*." + cls.substr(dot + 1);
+            }
+            auto & r = plan_rows[cls];
+            r.n   += 1;
+            r.src += ggml_nbytes(tensor);
+            r.dst += new_size;
+            const char * st = ggml_type_name(tensor->type);
+            const char * dt = ggml_type_name(new_type);
+            if (r.src_t.empty())                r.src_t = st;
+            else if (r.src_t != st)             r.src_t = "(mixed)";
+            if (r.dst_t.empty())                r.dst_t = dt;
+            else if (r.dst_t != dt)             r.dst_t = "(mixed)";
+        }
         total_size_org += ggml_nbytes(tensor);
         total_size_new += new_size;
         comp_stats[(int) new_type].first  += 1;
@@ -2785,6 +3198,38 @@ QuantizationDone:;
     close_ofstream();
     for (auto & c:ctx_outs) {
         gguf_free(c);
+    }
+
+    if (params->dry_run) {
+        LLAMA_LOG_INFO("%s: ---- DRY RUN PLAN (per tensor class; nothing was written) ----\n", __func__);
+        LLAMA_LOG_INFO("%s:   %-40s %5s  %-10s -> %-10s %10s %10s %8s\n", __func__,
+                       "class", "n", "source", "landing", "src MiB", "out MiB", "ratio");
+        double p_src = 0, p_dst = 0;
+        for (const auto & kv : plan_rows) {
+            const auto & r = kv.second;
+            LLAMA_LOG_INFO("%s:   %-40s %5lld  %-10s -> %-10s %10.1f %10.1f %7.2fx%s\n", __func__,
+                           kv.first.c_str(), (long long) r.n, r.src_t.c_str(), r.dst_t.c_str(),
+                           r.src/1024.0/1024.0, r.dst/1024.0/1024.0,
+                           r.src ? (double) r.dst / (double) r.src : 0.0,
+                           r.src_t == r.dst_t && r.src == r.dst ? "  (copied)" : "");
+            p_src += r.src; p_dst += r.dst;
+        }
+        LLAMA_LOG_INFO("%s:   %-40s        %-10s    %-10s %10.1f %10.1f %7.2fx\n", __func__,
+                       "TOTAL", "", "", p_src/1024.0/1024.0, p_dst/1024.0/1024.0,
+                       p_src ? p_dst/p_src : 0.0);
+        LLAMA_LOG_INFO("%s: ---------------------------------------------------------------\n", __func__);
+        if (n_dry_would_refuse > 0) {
+            LLAMA_LOG_WARN("%s: THIS PLAN WILL NOT RUN AS-IS: %d tensor(s) are q8_0/PXQ in the "
+                           "source and would be requantized, which the real run refuses as a "
+                           "second lossy pass (see the [dry-run: WOULD REFUSE] lines above). "
+                           "Either pin them to their source type with --custom-q, or pass "
+                           "--i-know-this-is-double-lossy.\n", __func__, n_dry_would_refuse);
+        }
+    }
+    if (n_glm5next_kept > 0) {
+        LLAMA_LOG_INFO("%s: glm5next keep-list: %d tensor(s), %.2f MiB copied at source precision "
+                       "(indexer / mHC / KDA gates / MLA absorb pair / router / norms / head / NextN)\n",
+                       __func__, n_glm5next_kept, glm5next_kept_bytes/1024.0/1024.0);
     }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
@@ -2819,6 +3264,42 @@ QuantizationDone:;
         }
 
         static const std::set<int> pxq_family = { 248, 252, 253, 254, 255, 256 };   // PXQ1,4,4HQ,2,3,6
+
+        // ---- CODEBOOK COVERAGE ASSERTION (2026-09-09) ----------------------------------
+        // The book/sub KVs were chosen before the write loop, from a PREDICTION of which tiers
+        // this run would emit. Here is the ground truth. A tier that reached the output without
+        // its codebook produces a file that cannot be decoded by anything that reads the KVs
+        // honestly — which is worse than a mislabelled file, because it fails at load rather
+        // than at quality. Treated exactly like the composition assertion: remove every file
+        // this run wrote, and exit non-zero. There is no override, because unlike composition
+        // there is no legitimate reason to want one.
+        if (pxq_tier != PXA_TIER_NONE) {
+            std::string missing;
+            for (const auto & r : comp_stats) {
+                if (!pxq_family.count(r.first) || r.second.second == 0) {
+                    continue;
+                }
+                const ggml_type t = (ggml_type) r.first;
+                if (!pxq_tiers_present.count(t)) {
+                    if (!missing.empty()) missing += ", ";
+                    missing += ggml_type_name(t);
+                }
+            }
+            if (!missing.empty()) {
+                for (const auto & f : comp_written_files) {
+                    if (std::remove(f.c_str()) == 0) {
+                        LLAMA_LOG_ERROR("%s: removed undecodable output %s\n", __func__, f.c_str());
+                    }
+                }
+                throw std::runtime_error(
+                    "PXQ codebook assertion: the output contains tier(s) [" + missing +
+                    "] whose pxa.<tier>.book / .sub KVs were not written, because the pre-write "
+                    "prediction of the emitted tier set missed them. The file would not be "
+                    "decodable by a reader that takes the KVs at their word. This is a bug in "
+                    "the prediction in llama_model_quantize_internal(), not an operator error.");
+            }
+        }
+
         int spec_type = -1;          // the single tier a UNIFORM PXQ target names (-1 = none/map)
         bool pxq_target = true;
         switch (params->ftype) {

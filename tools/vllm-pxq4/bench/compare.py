@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import json, sys, statistics
-R = "/mnt/models/pxa-hth/results/"
+import json, os, sys, statistics
+R = os.environ.get("PXA_MODELS_DIR", "./models") + "/bench/results/"
 def load(t):
     try: return json.load(open(R+t+".json"))
     except Exception: return None

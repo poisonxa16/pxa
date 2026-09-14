@@ -126,6 +126,7 @@ enum e_model {
     MODEL_355B_A32B,
     MODEL_397B_A17B, // Qwen-3.5-MoE
     MODEL_744B_A40B,
+    MODEL_320B_A17B, // GLM-5.3-Flash
     MODEL_E2B,
     MODEL_E4B,
 };
@@ -372,6 +373,19 @@ struct llama_layer {
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+    // PXA_GLM5NEXT: k-pool compressor of the DSA indexer (glm5next only)
+    struct ggml_tensor * indexer_kpool_gate = nullptr;
+    struct ggml_tensor * indexer_kpool_ape  = nullptr;
+    // PXA_GLM5NEXT: Kimi Delta Attention - three separate short convolutions over q/k/v,
+    // and two low-rank pairs driving the forget gate (f) and the output gate (g).
+    struct ggml_tensor * ssm_conv1d_q = nullptr;
+    struct ggml_tensor * ssm_conv1d_k = nullptr;
+    struct ggml_tensor * ssm_conv1d_v = nullptr;
+    struct ggml_tensor * ssm_f_a      = nullptr;
+    struct ggml_tensor * ssm_f_b      = nullptr;
+    struct ggml_tensor * ssm_g_a      = nullptr;
+    struct ggml_tensor * ssm_g_b      = nullptr;
+
 
     // DeepSeek-V4. Field names match llama.cpp src/llama-model.h @ upstream 82dbc4f01
     // so that the graph body transliterated from src/models/deepseek4.cpp compiles
@@ -661,7 +675,10 @@ struct llama_model {
     }
 
     bool is_mla_model() const {
-        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4;
+        // PXA_GLM5NEXT: glm5next is MLA on 11 of its 45 blocks; the other 34 are recurrent, so
+        // every consumer of this must also honour hparams.is_recurrent(il).
+        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA ||
+               arch == LLM_ARCH_MISTRAL4  || arch == LLM_ARCH_GLM5NEXT;
     }
 
     static inline int hadamard_size(int head_size) {

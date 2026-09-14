@@ -53,7 +53,7 @@
 // WHY: a V100 does 62.8 TOPS of dp4a against 125 TFLOPS of HMMA, so a dp4a GEMM starts at HALF the
 // ceiling of the fp16 tensor-core GEMM it replaces, while the dequant pass it removes is only ~12%
 // of the prefill wall. A 2x slower multiply cannot be paid for out of a 12% saving. Independently
-// confirmed by the V70 lane (pxq4-v70.cuh, register-direct m8n8k4): -40..-52% on the same cell.
+// confirmed by the V70 path (pxq4-v70.cuh, register-direct m8n8k4): -40..-52% on the same cell.
 // Two structurally different PXQ4-native sm_70 prefill GEMMs both land at ~half of dequant+cuBLAS.
 // KEPT because it is correct (tests/test-pxq4-mmq.cu, 176 checks, 0 failures) and because the
 // conclusion INVERTS on any card whose int8 rate beats its fp16 rate -- Turing/Ampere INT8 tensor
@@ -100,9 +100,9 @@ static inline int pxa_pxq4_mmq_nw() {
     return nw;
 }
 
-// Per-shape route skip (main #282 note 1): a comma-separated list of "R:K" the MMQ tile must
+// Per-shape route skip: a comma-separated list of "R:K" the MMQ tile must
 // decline so the incumbent dequant+cuBLAS HGEMM stays selectable on shapes where dp4a really is
-// slower. Same mechanism and same spelling as the V70 lane's PXA_PXQ_GEMM_V70_SKIP.
+// slower. Same mechanism and same spelling as the V70 path's PXA_PXQ_GEMM_V70_SKIP.
 static inline bool pxa_pxq4_mmq_route_ok(int R, int K) {
     static const std::string skip = [] {
         const char * e = getenv("PXA_PXQ4_MMQ_SKIP");

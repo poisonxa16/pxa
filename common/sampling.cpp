@@ -1620,11 +1620,66 @@ static float prob_scalar(int n, const float * logits, float max_val) {
     return (float)(1./sum_exp);
 }
 
-llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob) {
+// PXA_MTP_PMIN_TOPK_v1: the argmax's probability renormalised over the k largest logits, i.e.
+// what a `top_k = k` sampler chain would report for its first candidate. `max_val` is the argmax
+// logit, so the argmax is candidate 0 and its renormalised probability is
+// 1 / sum_j exp(l_j - max_val) over the k largest l_j (the j = 0 term being exactly 1).
+//
+// One pass, k exponentials. The pass keeps the k largest logits in an ascending array with an
+// early-out against the smallest kept value, so the common case is a compare per token -- the same
+// order as the argmax scan and far cheaper than the n_vocab exponentials the full-vocab softmax
+// needs. Falls back to the full-vocab number when k is not a usable window.
+float common_sampler_prob_topk_renorm(int n, const float * logits, float max_val, int k) {
+    if (k < 2 || k >= n) {
+        return prob_scalar(n, logits, max_val);
+    }
+
+    // top[0] is the smallest of the k kept, top[k-1] the largest.
+    float top[COMMON_SAMPLER_PMIN_TOPK_MAX];
+    if (k > COMMON_SAMPLER_PMIN_TOPK_MAX) {
+        k = COMMON_SAMPLER_PMIN_TOPK_MAX;
+    }
+    int n_top = 0;
+    for (int i = 0; i < n; ++i) {
+        const float v = logits[i];
+        if (n_top == k && v <= top[0]) {
+            continue;
+        }
+        int pos;
+        if (n_top < k) {
+            pos = n_top++;
+        } else {
+            pos = 0;
+            // drop the smallest: shift down while the new value is larger than the next kept one
+            while (pos + 1 < k && v > top[pos + 1]) {
+                top[pos] = top[pos + 1];
+                ++pos;
+            }
+            top[pos] = v;
+            continue;
+        }
+        // insert into the ascending prefix [0, pos)
+        while (pos > 0 && top[pos - 1] > v) {
+            top[pos] = top[pos - 1];
+            --pos;
+        }
+        top[pos] = v;
+    }
+
+    double sum_exp = 0.0;
+    for (int i = 0; i < n_top; ++i) {
+        sum_exp += exp((double) (top[i] - max_val));
+    }
+    return sum_exp > 0.0 ? (float) (1.0 / sum_exp) : 1.0f;
+}
+
+llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob, int p_min_top_k) {
     GGML_UNUSED(gsmpl);
 
     float * logits = llama_get_logits_ith(ctx, idx);
     const int n_vocab = llama_n_vocab(llama_get_model(ctx));
+
+    const bool use_topk = out_prob && p_min_top_k >= 2 && p_min_top_k < n_vocab;
 
     int best_id = 0;
     float max_val = logits[0];
@@ -1632,11 +1687,15 @@ llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, str
     static const bool has_avx2 = __builtin_cpu_supports("avx2");
     if (has_avx2 && common_sampler_speculative_top1_avx2(logits, n_vocab, best_id, max_val)) {
         if (out_prob) {
-            static const bool has_fma = __builtin_cpu_supports("fma");
-            if (has_fma) {
-                *out_prob = prob_avx2(n_vocab, logits, max_val);
+            if (use_topk) {
+                *out_prob = common_sampler_prob_topk_renorm(n_vocab, logits, max_val, p_min_top_k);
             } else {
-                *out_prob = prob_scalar(n_vocab, logits, max_val);
+                static const bool has_fma = __builtin_cpu_supports("fma");
+                if (has_fma) {
+                    *out_prob = prob_avx2(n_vocab, logits, max_val);
+                } else {
+                    *out_prob = prob_scalar(n_vocab, logits, max_val);
+                }
             }
         }
         return best_id;
@@ -1650,7 +1709,9 @@ llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, str
     }
 
     if (out_prob) {
-        *out_prob = prob_scalar(n_vocab, logits, max_val);
+        *out_prob = use_topk
+            ? common_sampler_prob_topk_renorm(n_vocab, logits, max_val, p_min_top_k)
+            : prob_scalar(n_vocab, logits, max_val);
     }
 
     return best_id;

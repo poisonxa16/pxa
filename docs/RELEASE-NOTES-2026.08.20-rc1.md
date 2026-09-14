@@ -122,9 +122,9 @@ kernels, the plugin surface and the sharding/MTP verdicts.
 `register_quantization_config` plugin hook — zero lines of vLLM modified — so it survives vLLM
 upgrades instead of fighting them. Apache 2.0, matching vLLM.
 
-⚠ **It requires [1Cat-vLLM](https://github.com/KewaiiGamer/1Cat-vLLM), not upstream vLLM.**
-Upstream does not target compute capability 7.0. That fork carries the sm_70 work this backend
-depends on entirely: the TurboMind sm_70 W4A16 GEMM, the `FLASH_ATTN_V100` attention backend,
+⚠ **It requires a vLLM build with sm_70 (V100) support, not upstream vLLM.**
+Upstream does not target compute capability 7.0. The sm_70 pieces this backend depends on
+entirely are the TurboMind sm_70 W4A16 GEMM, the `FLASH_ATTN_V100` attention backend,
 and the Qwen Gated-DeltaNet kernels. PXA contributed to getting that V100 support working; this
 is a continuation of it, not a fork of it. On sm_80+ hardware you do not need any of that, but
 the sm_70 path is what this sidecar was built and measured against.

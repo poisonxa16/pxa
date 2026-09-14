@@ -3798,9 +3798,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_EXPAND",
 
     "MASK_TO_IDX",
+    "KPOOL_SCORE",
+    "QSA_TOPK",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -3924,9 +3926,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_expand(x,r,p,c)",
 
     "mask_to_idx(m)",
+    "kpool_score(kq,w,m)",
+    "qsa_top_k(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5581,6 +5585,37 @@ struct ggml_tensor * ggml_reduce(
     result->op_params[0] = (int)op;
     result->op_params[1] = n;
     result->op_params[2] = nhave;
+
+    // PXA 2026-09-08 -- PXA_REDUCE_VIEW_INVARIANT.
+    //
+    // Two consumers of this node are written against `result->view_src == last`:
+    //   * ggml-backend.cpp (`view_src == node->src[j]`) pins the reduce's backend to the
+    //     backend of that source. Without the match it is never pinned and is assigned by
+    //     adjacency instead.
+    //   * llm_build_context::get_input_tensor_sm_graph (`cur == view_src` -> `cur = input`)
+    //     is what gives the HOME device's consumer an edge to the REDUCE node. Without the
+    //     match, every device is handed src[id] and *nothing in the graph reads the reduce* --
+    //     it has zero consumers, and its effect survives only as an in-place side effect the
+    //     DAG does not model.
+    //
+    // But ggml_new_tensor_impl deliberately collapses one level of view (see "find the base
+    // tensor and absolute offset"), so if `last` is ITSELF a view, view_src lands on the base
+    // and both invariants silently fail. Repairing view_src here would re-introduce a
+    // multi-level view, which is exactly what that collapse exists to prevent -- so instead we
+    // report it once per tensor and fix it at the call site (the DeltaNet split path was the
+    // only offender: its partial is a bare ggml_reshape_2d whenever n_tokens <= 32).
+    if (result->view_src != last) {
+        static int n_warn = 0;
+        if (n_warn < 8) {
+            ++n_warn;
+            fprintf(stderr,
+                "ggml_reduce: WARNING: source '%s' is a view, so the reduce node's view_src is its "
+                "base ('%s') and not the source itself. The reduce will have NO consumer in the "
+                "graph and its backend will not be pinned. Make the partial non-view (ggml_cont / "
+                "ggml_cast) before calling ggml_reduce.\n",
+                last->name, result->view_src ? result->view_src->name : "(null)");
+        }
+    }
     return result;
 }
 
@@ -7488,6 +7523,52 @@ struct ggml_tensor * ggml_moe_up_gate(
 
     ggml_set_op_params_i32(result, 0, (int32_t) op);
 
+    return result;
+}
+
+// PXA/GLM5NEXT+DSV4 (2026-09-08): MoE up/gate with the asymmetric SwiGLU clamp
+//   up   -> [-limit, limit]
+//   gate -> [-inf,   limit]
+//   out   = silu(gate) * up
+// which is NOT the silu-then-clamp of gpt-oss/step35 that op_params[1] already carried.
+//
+// WHY IT MATTERS. llm_build_moe_ffn forced can_use_fmoe = false for these two architectures
+// precisely because no fused kernel could express this clamp, so their routed experts emitted
+// three standalone MUL_MAT_ID nodes and reached NONE of the fused PXQ MoE drivers -- every one
+// of which is keyed on GGML_OP_MOE_FUSED_UP_GATE. Measured consequence on GLM-5.3-Flash: the
+// generic per-expert loop's host ids readback + cudaStreamSynchronize ran 126 times per decode
+// token. The clamp is a two-line epilogue (pxq4_glu_apply arm `unary == 2`), so it costs the
+// kernels nothing to carry.
+//
+// The mode rides in op_params[2] so every existing caller (which never writes it) keeps its
+// exact previous meaning; op_params[1] carries the limit as it already does for step35.
+// The unfusable / host-placed leg builds the SAME decomposition llm_build_moe_ffn built before,
+// clamps included -- a graph that cannot fuse must still compute the clamped function.
+struct ggml_tensor * ggml_moe_up_gate_clamped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as_up,
+            struct ggml_tensor  * as_gate,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            float                 limit) {
+    GGML_ASSERT(as_up && as_gate);
+
+    if (!ggml_moe_up_gate_can_fuse(as_up->type, as_gate->type) ||
+        !ggml_are_same_shape(as_up, as_gate) ||
+        !ggml_fused_up_gate_placement_ok(as_up, as_gate)) {
+        struct ggml_tensor * up   = ggml_mul_mat_id(ctx, as_up,   b, ids);
+        struct ggml_tensor * gate = ggml_mul_mat_id(ctx, as_gate, b, ids);
+        up   = ggml_clamp(ctx, up,   -limit, limit);
+        gate = ggml_clamp(ctx, gate, -INFINITY, limit);
+        return ggml_swiglu_split(ctx, gate, up);
+    }
+
+    struct ggml_tensor * result = ggml_moe_up_gate(ctx, as_up, as_gate, b, ids, GGML_UNARY_OP_SILU);
+    // the three conditions above are exactly ggml_moe_up_gate's own fallback guard, so it cannot
+    // have decomposed; assert rather than silently returning an unclamped graph.
+    GGML_ASSERT(result->op == GGML_OP_MOE_FUSED_UP_GATE);
+    ggml_set_op_params_f32(result, 1, limit);
+    ggml_set_op_params_i32(result, 2, 1);
     return result;
 }
 
@@ -9644,6 +9725,18 @@ struct ggml_tensor * ggml_tri(
     return result;
 }
 
+// PXA_RS_RING: see ggml.h. op_params[2] = per-step capture ROW stride (elements between two
+// batch positions), op_params[3] = per-step capture STEP stride (elements between two steps).
+// 0 in either slot means "derive it from the capture buffer's dense layout", which is what every
+// caller that never calls this does -- so the stores are bit-identical without the ring.
+void ggml_op_set_save_strides(struct ggml_tensor * a, int64_t row_stride, int64_t step_stride) {
+    GGML_ASSERT(a->op == GGML_OP_DELTA_NET || a->op == GGML_OP_SSM_CONV);
+    GGML_ASSERT(row_stride  >= 0 && row_stride  <= INT32_MAX);
+    GGML_ASSERT(step_stride >= 0 && step_stride <= INT32_MAX);
+    a->op_params[2] = (int32_t) row_stride;
+    a->op_params[3] = (int32_t) step_stride;
+}
+
 struct ggml_tensor * ggml_delta_net(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -9653,6 +9746,21 @@ struct ggml_tensor * ggml_delta_net(
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
         struct ggml_tensor  * saved_steps) {
+    return ggml_delta_net_ext(ctx, q, k, v, g, beta, state, saved_steps, 0);
+}
+
+// PXA_GLM5NEXT: see ggml.h. g_per_channel == 1 switches the forget gate from one scalar per
+// head (Gated DeltaNet) to one value per value-channel (Kimi Delta Attention).
+struct ggml_tensor * ggml_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * saved_steps,
+        int                   g_per_channel) {
     GGML_ASSERT(ggml_is_contiguous(q));
     GGML_ASSERT(ggml_is_contiguous(k));
     GGML_ASSERT(ggml_is_contiguous(state));
@@ -9674,7 +9782,12 @@ struct ggml_tensor * ggml_delta_net(
 
     GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == n_tokens && k->ne[2] == H_k && k->ne[3] == n_seqs);
     GGML_ASSERT(v->ne[1] == n_tokens && v->ne[3] == n_seqs);
-    GGML_ASSERT(g->ne[0] == n_tokens && g->ne[1] == 1 && g->ne[2] == H_v && g->ne[3] == n_seqs);
+    if (g_per_channel) {
+        // KDA: one forget value per value channel, per token, per head.
+        GGML_ASSERT(g->ne[0] == S_v && g->ne[1] == n_tokens && g->ne[2] == H_v && g->ne[3] == n_seqs);
+    } else {
+        GGML_ASSERT(g->ne[0] == n_tokens && g->ne[1] == 1 && g->ne[2] == H_v && g->ne[3] == n_seqs);
+    }
     GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == n_tokens && beta->ne[2] == H_v && beta->ne[3] == n_seqs);
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v * H_v && state->ne[2] == 1 && state->ne[3] == n_seqs);
     //GGML_ASSERT(H_k == H_v);
@@ -9685,12 +9798,17 @@ struct ggml_tensor * ggml_delta_net(
 
     if (saved_steps) {
         GGML_ASSERT(saved_steps->type == GGML_TYPE_F32);
-        GGML_ASSERT(saved_steps->ne[0] >= (n_tokens - 1)*state_size);
+        // PXA_RS_RING: a retargeted capture (ggml_op_set_save_strides) writes into a DIFFERENT
+        // buffer shape, and the strides are set after construction, so the dense capacity check
+        // moves to the compute path where the strides are known. ggml_nelements is the honest
+        // bound that holds for both layouts.
+        GGML_ASSERT(ggml_nelements(saved_steps) >= (n_tokens - 1)*state_size);
     }
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, output_size + state_size);
 
     result->op     = GGML_OP_DELTA_NET;
+    result->op_params[1] = g_per_channel;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
@@ -9815,6 +9933,64 @@ struct ggml_tensor * ggml_mask_to_index(
 
     result->op     = GGML_OP_MASK_TO_IDX;
     result->src[0] = mask;
+
+    return result;
+}
+
+// ggml_kpool_score
+
+struct ggml_tensor * ggml_kpool_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kq,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask) {
+    GGML_ASSERT(kq->type      == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(kq));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(kq->ne[3] == 1);
+    // one weight per indexer head per token
+    GGML_ASSERT(weights->ne[0] == kq->ne[2]);
+    GGML_ASSERT(weights->ne[1] == kq->ne[1]);
+    GGML_ASSERT(ggml_nrows(weights) == kq->ne[1]);
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == kq->ne[0]);
+        GGML_ASSERT(mask->ne[1] == kq->ne[1]);
+        GGML_ASSERT(ggml_nrows(mask) == kq->ne[1]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kq->ne[0], kq->ne[1]);
+
+    result->op     = GGML_OP_KPOOL_SCORE;
+    result->src[0] = kq;
+    result->src[1] = weights;
+    result->src[2] = mask;
+
+    return result;
+}
+
+// ggml_qsa_top_k
+//
+// PXA_QSA: see the contract on the declaration in ggml.h. Same answer as ggml_top_k(a, k),
+// reached by a radix SELECT plus a sort of the k survivors instead of a sort of the whole row.
+
+struct ggml_tensor * ggml_qsa_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(k > 0 && k <= 2048);
+    GGML_ASSERT(a->ne[0] >= k);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, a->ne[1], a->ne[2], a->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) k);
+
+    result->op     = GGML_OP_QSA_TOPK;
+    result->src[0] = a;
 
     return result;
 }
@@ -10218,7 +10394,11 @@ struct ggml_tensor * ggml_ssm_conv(
         // delta_net capture gate (src/llama-delta-net.cpp) guarantees that before wiring a
         // capture tensor in.
         GGML_ASSERT(saved_steps->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_nelements(saved_steps) >= (d_conv - 1)*d_inner*n_tokens);
+        // PXA_RS_RING: a retargeted capture (ggml_op_set_save_strides, applied AFTER this
+        // constructor) writes into a differently-shaped window, so the dense bound cannot be
+        // checked here. One row is the floor; the real, stride-aware bound is asserted in the
+        // compute path, where the strides are known.
+        GGML_ASSERT(ggml_nelements(saved_steps) >= (d_conv - 1)*d_inner);
     }
 
     bool is_node = false;
@@ -17180,7 +17360,15 @@ static void ggml_compute_forward_l2_norm_f32(
         for (int64_t i00 = 0; i00 < ne00; i00++) {
             sum += (ggml_float) (x[i00] * x[i00]);
         }
-        const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
+        // PXA_KERNFIX 2026-09-09 (defect B): the Gated DeltaNet reference L2 norm adds eps
+        // UNDER the sqrt -- x/sqrt(sum(x^2)+eps) -- it does not floor the norm at eps. The
+        // floor form deviates from a plain 1/sqrt(sum) only once sum < eps^2, the add form
+        // once sum is merely comparable to eps: different length scales, and this op is the
+        // sole q/k normaliser for every DeltaNet/GDN graph in the tree (see the file header
+        // of tests/test-l2-norm-gdn-eps.cpp). For a well-conditioned row in float32 the two
+        // agree bit-for-bit -- sum + 1e-12 == sum for any sum >= ~1e-4, and the floor never
+        // engages there either -- so only degenerate rows change.
+        const float scale = 1.0f/sqrtf((float) sum + eps);
         for (int j = 0; j < (int)ne00; ++j) {
             y[j] = scale * x[j];
         }
@@ -18611,6 +18799,16 @@ static void ggml_compute_forward_soft_max_f32(
                 // if we have sinks, make a correction as if they were included in the softmax
                 if (sk) {
                     max = MAX(max, sk[i02]);
+                }
+
+                // PXA_SOFTMAX_MASKED_ROW_FINITE (2026-09-09), the same belt and braces as the
+                // flash-attention kernel: an all-masked row leaves max == -inf, expf(-inf - -inf)
+                // is NaN, and the row's whole output is NaN. Such a row is always an upstream
+                // defect (see PXA_KV_CELL_MAX_EXACT in src/llama.cpp); zero is the finite answer
+                // for "attended to nothing". Costs one compare per row on the correct path.
+                if (max == -INFINITY) {
+                    ggml_vec_set_f32(ne00, dp, 0.0f);
+                    continue;
                 }
 
                 ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
@@ -21241,10 +21439,20 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                     vs = expf(s - M);
                 }
 
-                v_to_float(v_data, V32, Dv);
+                // An F32 V is accepted by the assert above, but type_traits[GGML_TYPE_F32] has no
+                // .to_float (nothing to convert), so it must use its rows directly -- calling
+                // v_to_float on it would be a null call. Every other V type goes through the
+                // converter into V32 as before.
+                const float * v_f32;
+                if (v->type == GGML_TYPE_F32) {
+                    v_f32 = (const float *) v_data;
+                } else {
+                    v_to_float(v_data, V32, Dv);
+                    v_f32 = V32;
+                }
 
                 // V += v*expf(s - M)
-                ggml_vec_mad_f32(Dv, VKQ32, V32, vs);
+                ggml_vec_mad_f32(Dv, VKQ32, v_f32, vs);
             }
 
             S = S*ms + vs; // scale and increment sum with partial sum
@@ -21273,8 +21481,21 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         }
 
         // V /= S
-        const float S_inv = 1.0f/S;
-        ggml_vec_scale_f32(Dv, VKQ32, S_inv);
+        //
+        // PXA_FA_MASKED_ROW_FINITE (2026-09-09), belt and braces, not a fix: when every key of a
+        // row is masked the loop above never runs, S stays 0 and VKQ32 stays 0, so 1/S is +inf
+        // and 0*inf writes NaN across the whole row -- which then reaches a recurrent carry or a
+        // pooled key and poisons every later token on that context. A fully-masked row is always
+        // a defect UPSTREAM of this kernel (a mask sized against the wrong cell range, an
+        // admission that left a sequence with no cells); the real one this guard was written
+        // beside is PXA_KV_CELL_MAX_EXACT in src/llama.cpp. Zero is the finite, contribution-free
+        // answer for "attended to nothing", and it cannot be mistaken for a real distribution.
+        // (VKQ32 is already all zeros in that case -- the accumulator was memset and never
+        // touched -- so skipping the normalisation writes a clean zero row below.)
+        if (S != 0.0f) {
+            const float S_inv = 1.0f/S;
+            ggml_vec_scale_f32(Dv, VKQ32, S_inv);
+        }
 
         // dst indices
         const int i1 = iq1;
@@ -21665,7 +21886,18 @@ static int ggml_compute_forward_ssm_conv_f32(
         // PXA_MULTISEQ_CKPT: multi-seq capture supported; layout [step][batch_pos][conv_state]
         // (see ggml_ssm_conv). n_kv == 1 no longer required.
         GGML_ASSERT(src4->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_nelements(src4) >= (nc - 1)*nr*n_t);
+        // PXA_RS_RING: stride-aware bound -- the largest element the capture can touch. With the
+        // dense layout (op_params 0) this is exactly the historical (nc-1)*nr*n_t.
+        const int64_t sv_row_b  = dst->op_params[2] > 0 ? (int64_t) dst->op_params[2] : (int64_t)(nc - 1)*nr;
+        const int64_t sv_step_b = dst->op_params[3] > 0 ? (int64_t) dst->op_params[3] : (int64_t)n_kv*(nc - 1)*nr;
+        const int64_t sv_steps  = n_kv > 0 ? (int64_t) n_t / n_kv : (int64_t) n_t;
+        // with the ring the dead LAST step is not recorded, so the deepest step written is
+        // sv_steps-2 -- the same bound the delta-net capture has always had.
+        const int64_t sv_last_b = dst->op_params[3] > 0 ? sv_steps - 2 : sv_steps - 1;
+        const int64_t sv_max_b  = (sv_last_b > 0 ? sv_last_b*sv_step_b : 0)
+                                + (n_kv > 1 ? (int64_t)(n_kv - 1)*sv_row_b : 0)
+                                + (int64_t)(nc - 1)*nr;
+        GGML_ASSERT(ggml_nelements(src4) >= sv_max_b);
     }
     GGML_ASSERT((nr*n_t) + (nc*nr*n_kv) == ggml_nelements(dst));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
@@ -21721,6 +21953,10 @@ static int ggml_compute_forward_ssm_conv_f32(
     // index is a simple run counter keyed on sq[0]. For n_kv == 1 this degenerates to the legacy
     // per-token advance (byte-identical layout).
     float * saved_base = src4 ? (float *)src4->data : NULL;
+    // PXA_RS_RING: retargeted capture strides (elements); 0 = the dense [step][batch_pos] layout.
+    const bool    sv_ring        = dst->op_params[3] > 0;
+    const int64_t sv_row_stride  = dst->op_params[2] > 0 ? (int64_t) dst->op_params[2] : (int64_t)(nc - 1)*nr;
+    const int64_t sv_step_stride = sv_ring ? (int64_t) dst->op_params[3] : (int64_t)n_kv*(nc - 1)*nr;
     int pxa_prev_seq = -1;
     int pxa_step = -1;
 
@@ -21754,14 +21990,21 @@ static int ggml_compute_forward_ssm_conv_f32(
             // insert x on the last column
             s[(nc - 1) + i1*nc] = x0[i1];
         }
+        // PXA_RS_RING: the conv capture normally records EVERY step, including the last, whose
+        // snapshot is dead (per_step_restore only ever reads steps 0..n_seq_tokens-2, and the
+        // final state lives in the live row). With the ring on there is no plane for it, so skip
+        // it and match the delta-net capture's `t + 1 < n_tokens` bound exactly.
+        const int64_t sv_seq_tokens = n_kv > 0 ? (int64_t) n_t / n_kv : (int64_t) n_t;
         if (saved_base) {
             // PXA_MULTISEQ_CKPT: step = within-seq token index, batch_pos = sq[0] (local state column)
             pxa_step = (sq[0] == pxa_prev_seq) ? pxa_step + 1 : 0;
             pxa_prev_seq = sq[0];
-            float * y = saved_base + ((size_t)pxa_step*n_kv + sq[0])*(size_t)(nc - 1)*nr + (size_t)ir0*(nc - 1);
-            for (int i1 = 0; i1 < ir; ++i1) {
-                for (int i0 = 0; i0 < nc - 1; ++i0) {
-                    y[i0 + i1*(nc-1)] = s[i0 + 1 + i1*nc];
+            if (!(sv_ring && pxa_step + 1 >= sv_seq_tokens)) {
+                float * y = saved_base + (size_t)pxa_step*sv_step_stride + (size_t)sq[0]*sv_row_stride + (size_t)ir0*(nc - 1);
+                for (int i1 = 0; i1 < ir; ++i1) {
+                    for (int i0 = 0; i0 < nc - 1; ++i0) {
+                        y[i0 + i1*(nc-1)] = s[i0 + 1 + i1*nc];
+                    }
                 }
             }
         }
@@ -22031,12 +22274,23 @@ static void ggml_compute_forward_delta_net_f32(
     const int nth = params->nth;
 
     int repeat_type = dst->op_params[0];
+    // PXA_GLM5NEXT: 0 = scalar forget gate per head (Gated DeltaNet, Qwen3-Next/Qwen4Exp),
+    // 1 = one forget value per value channel (Kimi Delta Attention, GLM-5.3-Flash).
+    const int g_per_channel = dst->op_params[1];
     const int64_t state_step_stride = head_dim * head_dim * n_heads * n_seqs;
+    // PXA_RS_RING: the per-step capture destination may be a strided window of a taller state
+    // tensor (a ring of planes) instead of its own dense buffer. 0 = the dense layout, exactly.
+    const int64_t sv_row_stride  = dst->op_params[2] > 0 ? (int64_t) dst->op_params[2] : head_dim * head_dim * n_heads;
+    const int64_t sv_step_stride = dst->op_params[3] > 0 ? (int64_t) dst->op_params[3] : state_step_stride;
     float * state_working = out_data + output_size;
 
     if (src6) {
         GGML_ASSERT(src6->type == GGML_TYPE_F32);
-        GGML_ASSERT(src6->ne[0] >= (n_tokens - 1)*state_step_stride);
+        // largest element the capture can touch, valid for both layouts
+        const int64_t sv_max = (n_tokens > 1 ? (n_tokens - 2)*sv_step_stride : 0)
+                             + (n_seqs   > 0 ? (n_seqs   - 1)*sv_row_stride  : 0)
+                             + head_dim*head_dim*n_heads;
+        GGML_ASSERT(ggml_nelements(src6) >= sv_max);
     }
 
     const int64_t total_heads = n_heads * n_seqs;
@@ -22054,7 +22308,11 @@ static void ggml_compute_forward_delta_net_f32(
     const int64_t vnb1 = src2->nb[1]/sizeof(float);   // v    token stride
     const int64_t vnb2 = src2->nb[2]/sizeof(float);   // v    head  stride
     const int64_t vnb3 = src2->nb[3]/sizeof(float);   // v    seq   stride
-    const int64_t gnb0 = src3->nb[0]/sizeof(float);   // g    token stride
+    // g_per_channel == 0: g is [n_tokens, 1, H, n_seqs], so nb[0] is the token stride.
+    // g_per_channel == 1: g is [S_v, n_tokens, H, n_seqs], so nb[0] is the channel stride
+    //                     and nb[1] is the token stride.
+    const int64_t gnb0 = src3->nb[0]/sizeof(float);   // g    token stride (GDN) / channel stride (KDA)
+    const int64_t gnb1 = src3->nb[1]/sizeof(float);   // g    token stride (KDA only)
     const int64_t gnb2 = src3->nb[2]/sizeof(float);   // g    head  stride
     const int64_t gnb3 = src3->nb[3]/sizeof(float);   // g    seq   stride
     const int64_t bnb1 = src4->nb[1]/sizeof(float);   // beta token stride
@@ -22064,11 +22322,17 @@ static void ggml_compute_forward_delta_net_f32(
     const int64_t h_start = ith * heads_per_thread;
     const int64_t h_end = (h_start + heads_per_thread < total_heads) ? h_start + heads_per_thread : total_heads;
 
-    const float eps = 1e-12f;
     const float scale = 1.0f / sqrtf((float) head_dim);
 
     float * v_new_buf = (float *) malloc(head_dim * sizeof(float));
     GGML_ASSERT(v_new_buf);
+    // PXA_GLM5NEXT: KDA decay, one entry per value channel. Only the KDA path reads it, so it
+    // is only allocated there -- a Gated DeltaNet forward allocates exactly what it did before.
+    float * decay_buf = NULL;
+    if (g_per_channel) {
+        decay_buf = (float *) malloc(head_dim * sizeof(float));
+        GGML_ASSERT(decay_buf);
+    }
 
     for (int64_t h_idx = h_start; h_idx < h_end; ++h_idx) {
         const int64_t batch_idx = h_idx / n_heads;
@@ -22081,6 +22345,8 @@ static void ggml_compute_forward_delta_net_f32(
         const int64_t g_head_offset    = batch_idx * gnb3 + head_idx * gnb2;
         const int64_t beta_head_offset = batch_idx * bnb3 + head_idx * bnb2;
         const int64_t state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
+        // PXA_RS_RING: the capture buffer may have a different row stride than the working state.
+        const int64_t save_head_offset  = batch_idx * sv_row_stride + head_idx * (head_dim * head_dim);
         const int64_t out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int64_t out_token_stride = head_dim * n_heads;
 
@@ -22096,17 +22362,32 @@ static void ggml_compute_forward_delta_net_f32(
             const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
             const float * v_t = v_data + v_head_offset + t * vnb1;
 
-            const float g_val    = g_data[g_head_offset + t * gnb0];
+            const float g_val    = g_per_channel ? 0.0f : g_data[g_head_offset + t * gnb0];
             const float beta_raw = beta_data[beta_head_offset + t * bnb1];
-
-            float q_norm_sq = 0.0f;
-            float k_norm_sq = 0.0f;
-            for (int64_t i = 0; i < head_dim; ++i) {
-                q_norm_sq += q_t[i] * q_t[i];
-                k_norm_sq += k_t[i] * k_t[i];
+            if (g_per_channel) {
+                const float * g_t = g_data + g_head_offset + t * gnb1;
+                for (int64_t i = 0; i < head_dim; ++i) {
+                    decay_buf[i] = expf(fminf(g_t[i * gnb0], 50.0f));
+                }
             }
-            const float q_norm_inv = 1.0f / sqrtf(q_norm_sq + eps);
-            const float k_norm_inv = 1.0f / sqrtf(k_norm_sq + eps);
+
+            // PXA_KERNFIX 2026-09-09 (defect B): q and k arrive ALREADY L2-normalised and this
+            // kernel must NOT normalise them again. Every production caller normalises in the
+            // graph with the reference formula x/sqrt(sum(x^2)+eps) before the op --
+            // src/llama-delta-net.cpp build_qkv (two ggml_l2_norm nodes) and
+            // src/graphs/build_glm5next.cpp:228, whose comment states the convention outright:
+            // "so the CUDA delta-net kernel (which does NOT normalise internally) is fed
+            // pre-normalised q/k -- see PORT spec S2 note 2". ggml-cuda/pxa/delta-net.cu indeed
+            // contains no normalisation at all, so the second pass this kernel used to perform
+            // existed on the CPU backend ONLY: the two backends of the same GGML_OP_DELTA_NET
+            // computed different functions of the same graph for any q/k row whose norm landed
+            // inside the graph-side epsilon band (a masked, padded or freshly-reset position),
+            // where the CPU renormalised the damped row back to unit length and CUDA did not.
+            // One normalisation, in the graph, for both backends. The unit factors are kept
+            // rather than deleting every multiply so the recurrence below stays a line-for-line
+            // match of the CUDA kernel and of tests/test-kda-delta-net.cpp's oracle.
+            const float q_norm_inv = 1.0f;
+            const float k_norm_inv = 1.0f;
 
             const float beta_val = 1.0f / (1.0f + expf(-beta_raw));
             const float decay    = expf(fminf(g_val, 50.0f));
@@ -22118,6 +22399,49 @@ static void ggml_compute_forward_delta_net_f32(
 
             float * out_t = out_data + out_head_offset + t * out_token_stride;
 
+            if (g_per_channel) {
+                // PXA_GLM5NEXT: Kimi Delta Attention's forget gate is indexed by the KEY
+                // channel, not by the value channel -- upstream llama.cpp PR #27773's
+                // ggml_compute_forward_gated_delta_net_one_chunk() does
+                //     S[i][j] *= exp(g[i])          i = key, j = value
+                // and fla's chunk_kda carries g with the same (B,T,H,K) shape as k. A per-key
+                // decay CANNOT be factored out of the sum over keys the way Gated DeltaNet's
+                // one-scalar-per-head gate can, so this path decays the state FIRST and then
+                // runs the plain delta rule on the decayed state, reading the output off the
+                // UPDATED state exactly as upstream does. In this tree's layout
+                // state[row = value, col = key], "decay column col" is a contiguous run.
+                for (int64_t col = 0; col < head_dim; ++col) {
+                    const float d = decay_buf[col];
+                    float * s_col = state + col * head_dim;
+                    for (int64_t row = 0; row < head_dim; ++row) {
+                        s_col[row] *= d;
+                    }
+                }
+
+                for (int64_t row = 0; row < head_dim; ++row) {
+                    float v_prime = 0.0f;
+                    for (int64_t col = 0; col < head_dim; ++col) {
+                        v_prime += state[row + col * head_dim] * (k_t[col] * k_norm_inv);
+                    }
+                    v_new_buf[row] = (v_t[row] - v_prime) * beta_val;
+                }
+
+                for (int64_t col = 0; col < head_dim; ++col) {
+                    const float k_col = k_t[col] * k_norm_inv;
+                    for (int64_t row = 0; row < head_dim; ++row) {
+                        const float s = state[row + col * head_dim] + v_new_buf[row] * k_col;
+                        state[row + col * head_dim] = fminf(fmaxf(s, -1e6f), 1e6f);
+                    }
+                }
+
+                for (int64_t row = 0; row < head_dim; ++row) {
+                    float o = 0.0f;
+                    for (int64_t col = 0; col < head_dim; ++col) {
+                        o += state[row + col * head_dim] * (q_t[col] * q_norm_inv);
+                    }
+                    out_t[row] = o * scale;
+                }
+            } else {
             for (int64_t row = 0; row < head_dim; ++row) {
                 float v_prime = 0.0f;
                 float out_val = 0.0f;
@@ -22131,9 +22455,11 @@ static void ggml_compute_forward_delta_net_f32(
                     out_val += s * q_col;
                 }
 
-                const float v_new = v_t[row] * beta_val - v_prime * beta_val * decay * k_norm_inv;
+                // Gated DeltaNet: one scalar decay per head, so it factors out of both sums.
+                const float d_row = decay;
+                const float v_new = v_t[row] * beta_val - v_prime * beta_val * d_row * k_norm_inv;
                 v_new_buf[row] = v_new;
-                out_t[row] = out_val * decay * q_norm_inv * scale + v_new * attn_score;
+                out_t[row] = out_val * d_row * q_norm_inv * scale + v_new * attn_score;
             }
 
             for (int64_t col = 0; col < head_dim; ++col) {
@@ -22144,15 +22470,20 @@ static void ggml_compute_forward_delta_net_f32(
                     state[row + col * head_dim] = fminf(fmaxf(s, -1e6f), 1e6f);
                 }
             }
+            }
 
             if (saved_steps && t + 1 < n_tokens) {
-                float * next_state = saved_steps + state_head_offset + t * state_step_stride;
+                // PXA_RS_RING: same store, strides from op_params (0 = the dense layout).
+                float * next_state = saved_steps + save_head_offset + t * sv_step_stride;
                 memcpy(next_state, state, state_head_size * sizeof(float));
             }
         }
     }
 
     free(v_new_buf);
+    if (decay_buf) {
+        free(decay_buf);
+    }
 }
 
 static void ggml_compute_forward_delta_net(
@@ -22459,6 +22790,179 @@ static void ggml_compute_forward_mask_to_idx(
             if (!(v <= -INFINITY)) {
                 idx_r[n++] = (int32_t) j;
             }
+        }
+    }
+}
+
+// ggml_compute_forward_qsa_topk
+//
+// PXA_QSA: the block top-k as a radix SELECT. Floats become a monotone unsigned key (the IEEE
+// total order, so -inf is the smallest key and a masked block sorts last); four 8-bit histogram
+// passes, most significant digit first, locate the EXACT value of the k-th largest element;
+// everything strictly above it is in, and the ties AT it are taken in ascending column index,
+// which is precisely what the stable descending sort this replaces does with them. Only the k
+// survivors are then sorted.
+//
+// The answer is identical to ggml_top_k's, set and order, which is what lets it be a drop-in --
+// and what tests/test-qsa-select.cpp asserts against a reference stable sort over adversarial
+// score vectors (heavy ties, all-equal, half -inf, relu's exact zeros, k >= n).
+
+static inline uint32_t ggml_qsa_topk_key(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// exposed so the engine, the CUDA kernel's reference and the unit test all read ONE algorithm
+void ggml_qsa_topk_row_f32(const float * src, int n, int k, int32_t * dst) {
+    if (n <= 0 || k <= 0) {
+        return;
+    }
+    if (k > n) {
+        k = n;
+    }
+
+    uint32_t hist[256];
+    memset(hist, 0, sizeof(hist));
+    for (int i = 0; i < n; ++i) {
+        hist[ggml_qsa_topk_key(src[i]) >> 24]++;
+    }
+
+    uint32_t prefix = 0;
+    int      above  = 0;
+    int      digit  = 255;
+    for (; digit > 0; --digit) {
+        if (above + (int) hist[digit] >= k) {
+            break;
+        }
+        above += (int) hist[digit];
+    }
+    prefix = (uint32_t) digit << 24;
+
+    for (int shift = 16; shift >= 0; shift -= 8) {
+        const uint32_t mask_hi = 0xffffffffu << (shift + 8);
+        memset(hist, 0, sizeof(hist));
+        for (int i = 0; i < n; ++i) {
+            const uint32_t key = ggml_qsa_topk_key(src[i]);
+            if ((key & mask_hi) == (prefix & mask_hi)) {
+                hist[(key >> shift) & 0xffu]++;
+            }
+        }
+        int d = 255;
+        for (; d > 0; --d) {
+            if (above + (int) hist[d] >= k) {
+                break;
+            }
+            above += (int) hist[d];
+        }
+        prefix |= (uint32_t) d << shift;
+    }
+
+    // `prefix` is the exact threshold key; take everything above it, then k - above of the ties
+    // at it, in ascending column index
+    const uint32_t thr   = prefix;
+    const int      n_tie = k - above;
+    int n_out = 0, n_taken_tie = 0;
+    for (int i = 0; i < n && n_out < k; ++i) {
+        const uint32_t key = ggml_qsa_topk_key(src[i]);
+        if (key > thr) {
+            dst[n_out++] = i;
+        } else if (key == thr && n_taken_tie < n_tie) {
+            ++n_taken_tie;
+            dst[n_out++] = i;
+        }
+    }
+
+    // insertion sort of the k survivors by descending key. dst is in ascending index order, and
+    // the comparison is strict, so equal keys keep that order -- i.e. it is stable.
+    for (int i = 1; i < n_out; ++i) {
+        const int32_t  vi = dst[i];
+        const uint32_t ki = ggml_qsa_topk_key(src[vi]);
+        int j = i - 1;
+        while (j >= 0 && ggml_qsa_topk_key(src[dst[j]]) < ki) {
+            dst[j + 1] = dst[j];
+            --j;
+        }
+        dst[j + 1] = vi;
+    }
+}
+
+static void ggml_compute_forward_qsa_topk(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    GGML_ASSERT(nb00 == sizeof(float));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int k = ggml_get_op_params_i32(dst, 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr = ggml_nrows(src0);
+
+    for (int64_t i = ith; i < nr; i += nth) {
+        const float * src_row = (const float *)((const char *) src0->data + i*nb01);
+        int32_t     * dst_row = (int32_t     *)((      char *) dst->data  + i*nb1);
+        ggml_qsa_topk_row_f32(src_row, (int) ne00, k, dst_row);
+    }
+}
+
+// ggml_compute_forward_kpool_score
+
+// PXA_GLM5NEXT: the reduction order below is not free choice. The chain this op
+// replaces ends in ggml_sum_rows over ne0 == n_head, and EACH BACKEND'S fused
+// reduction must match THAT BACKEND'S sum_rows, not the other one's -- the two
+// already disagree in the last ulp today, and the point of the fusion is to change
+// speed and memory, not numbers.
+//
+// CPU: ggml_compute_forward_sum_rows_f32 calls ggml_vec_sum_f32, which accumulates
+// sequentially in ggml_float (double) and stores one float at the end. That is what
+// this function does.
+//
+// CUDA: k_sum_rows_f32 runs one warp per row and finishes with warp_reduce_sum's xor
+// butterfly, which the kernel in ggml-cuda/kpool-score.cu reproduces in-thread. See
+// the note there.
+static void ggml_compute_forward_kpool_score(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * kq   = dst->src[0];
+    const struct ggml_tensor * w    = dst->src[1];
+    const struct ggml_tensor * mask = dst->src[2];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && kq->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(kq) && ggml_is_contiguous(w) && ggml_is_contiguous(dst));
+
+    const int64_t n_pool = kq->ne[0];
+    const int64_t n_tok  = kq->ne[1];
+    const int64_t n_head = kq->ne[2];
+
+    GGML_ASSERT(n_head > 0 && n_head <= 64 && (n_head & (n_head - 1)) == 0);
+
+    // one (token, pool-chunk) slice per thread
+    const int64_t nr = n_tok;
+    const int64_t r0 = (nr * params->ith) / params->nth;
+    const int64_t r1 = (nr * (params->ith + 1)) / params->nth;
+
+    for (int64_t it = r0; it < r1; ++it) {
+        const float * wr = (const float *) w->data + it*n_head;
+              float * dr = (float *) dst->data + it*n_pool;
+        const float * mr = mask ? (const float *) mask->data + it*n_pool : NULL;
+
+        for (int64_t ip = 0; ip < n_pool; ++ip) {
+            const float * kp = (const float *) kq->data + it*n_pool + ip;
+            ggml_float sum = 0.0;
+            for (int64_t h = 0; h < n_head; ++h) {
+                const float v = kp[h*n_pool*n_tok];
+                // ggml_vec_relu_f32's exact form, not fmaxf: they differ on -0.0
+                sum += (ggml_float) (((v > 0.0f) ? v : 0.0f) * wr[h]);
+            }
+            const float s = (float) sum;
+            dr[ip] = mr ? s + mr[ip] : s;
         }
     }
 }
@@ -23798,6 +24302,103 @@ static void ggml_compute_forward_cross_entropy_loss_back(
     }
 }
 
+// PXA 2026-09-08. CPU fallback for GGML_OP_REDUCE.
+//
+// GGML_OP_REDUCE is the tensor-parallel (-sm graph) all-reduce primitive: the node is a VIEW of
+// its last non-null source, src[j] is device j's partial, and the CUDA implementation
+// (ggml/src/ggml-cuda/reduce.cu) sums the partials and writes the sum back into EVERY
+// participating source, in place -- an all-reduce, not a reduce-to-one. Consumers then read
+// their own src[id] (see llm_build_context::get_input_tensor_sm_graph).
+//
+// Until now the CPU backend aborted here, which meant graph-split correctness had no CPU
+// regression test of any kind. This implements the same semantics on one address space so such
+// a test can exist. It is NOT a performance path and is not reachable from any single-device
+// or -sm layer run: nothing builds a REDUCE unless -sm graph/attn is active, which needs >= 2
+// devices.
+//
+// op_params: [0] = op (ADD only), [1] = nreduce (slot count), [2] = nhave (non-null at build
+// time), [3] = 1 means "container only, reduce is off", [4] = bitmask of slots filled in after
+// the fact. Mirrors reduce.cu:121-153.
+static void ggml_compute_forward_reduce(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const enum ggml_op op = (enum ggml_op) dst->op_params[0];
+    GGML_ASSERT(op == GGML_OP_ADD); // only reduce_add exists, same as the CUDA path
+    const int nreduce = dst->op_params[1];
+    const int nhave   = dst->op_params[2];
+
+    if (dst->op_params[3] == 1) {
+        return; // container only: the reduce is switched off (PXA_REPLICATE_RECURRENT et al.)
+    }
+
+    GGML_ASSERT(nhave >= 2 && nhave <= nreduce);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    // Q8_0 would need a requantising add (reduce.cu has a bespoke kernel for it); refuse it here
+    // rather than compute something subtly different from the CUDA path.
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+
+    struct ggml_tensor * srcs[GGML_MAX_SRC];
+    int n = 0;
+    for (int j = 0; j < nreduce; ++j) {
+        struct ggml_tensor * s = dst->src[j];
+        if (!s) continue;
+        GGML_ASSERT(s->type == dst->type);
+        GGML_ASSERT(ggml_are_same_shape(s, dst));
+        GGML_ASSERT(ggml_is_contiguous(s));
+        srcs[n++] = s;
+    }
+    GGML_ASSERT(n >= 2);
+
+    const int64_t ne = ggml_nelements(dst);
+
+    // split the element range over the thread pool
+    const int64_t dr    = (ne + params->nth - 1) / params->nth;
+    const int64_t start = dr * params->ith;
+    const int64_t end   = MIN(start + dr, ne);
+    if (start >= end) {
+        return;
+    }
+
+    // Sum in a fixed slot order so the result is reproducible, then write it back to every
+    // source -- that is what makes this an all-reduce and what the consumers depend on.
+    if (dst->type == GGML_TYPE_F32) {
+        for (int64_t i = start; i < end; ++i) {
+            float acc = ((const float *) srcs[0]->data)[i];
+            for (int j = 1; j < n; ++j) {
+                acc += ((const float *) srcs[j]->data)[i];
+            }
+            for (int j = 0; j < n; ++j) {
+                ((float *) srcs[j]->data)[i] = acc;
+            }
+        }
+    } else if (dst->type == GGML_TYPE_F16) {
+        for (int64_t i = start; i < end; ++i) {
+            float acc = GGML_FP16_TO_FP32(((const ggml_fp16_t *) srcs[0]->data)[i]);
+            for (int j = 1; j < n; ++j) {
+                acc += GGML_FP16_TO_FP32(((const ggml_fp16_t *) srcs[j]->data)[i]);
+            }
+            const ggml_fp16_t v = GGML_FP32_TO_FP16(acc);
+            for (int j = 0; j < n; ++j) {
+                ((ggml_fp16_t *) srcs[j]->data)[i] = v;
+            }
+        }
+    } else { // BF16
+        for (int64_t i = start; i < end; ++i) {
+            float acc = GGML_BF16_TO_FP32(((const ggml_bf16_t *) srcs[0]->data)[i]);
+            for (int j = 1; j < n; ++j) {
+                acc += GGML_BF16_TO_FP32(((const ggml_bf16_t *) srcs[j]->data)[i]);
+            }
+            const ggml_bf16_t v = GGML_FP32_TO_BF16(acc);
+            for (int j = 0; j < n; ++j) {
+                ((ggml_bf16_t *) srcs[j]->data)[i] = v;
+            }
+        }
+    }
+
+    // dst aliases srcs[last] (the node is a view of it), so dst already holds the sum.
+}
+
 /////////////////////////////////
 
 static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor,
@@ -23818,10 +24419,13 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
     switch (tensor->op) {
         case GGML_OP_REDUCE:
             {
-                GGML_ABORT("REDUCE not implemented");
-            }
+                ggml_compute_forward_reduce(params, tensor);
+            } break;
         case GGML_OP_FAKE_CPY:
             {
+                // ggml_fake_cpy() has no call sites anywhere in the tree (only the declaration,
+                // the definition, and the scheduler/CUDA handling). Left unimplemented on CPU
+                // deliberately: implementing it would give the impression it is a live path.
                 GGML_ABORT("FAKE_CPY not implemented");
             }
         case GGML_OP_DUP:
@@ -24210,6 +24814,14 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
         case GGML_OP_DSV4_HC_EXPAND:
             {
                 ggml_compute_forward_dsv4_hc_expand(params, tensor);
+            } break;
+        case GGML_OP_KPOOL_SCORE:
+            {
+                ggml_compute_forward_kpool_score(params, tensor);
+            } break;
+        case GGML_OP_QSA_TOPK:
+            {
+                ggml_compute_forward_qsa_topk(params, tensor);
             } break;
         case GGML_OP_MASK_TO_IDX:
             {
@@ -25269,6 +25881,8 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
         case GGML_OP_MASK_TO_IDX:
+        case GGML_OP_KPOOL_SCORE:
+        case GGML_OP_QSA_TOPK:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -25906,6 +26520,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     }
 
     switch (node->op) {
+        // PXA 2026-09-08: the CPU REDUCE fallback splits over the element range,
+        // so it takes the full thread pool. Without this case ggml_graph_plan aborts on
+        // "op not implemented: REDUCE" before ggml_compute_forward is ever reached -- which is
+        // exactly what tests/test-reduce-split.cpp caught.
+        case GGML_OP_REDUCE:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
@@ -26008,6 +26627,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
         case GGML_OP_MASK_TO_IDX:
+        case GGML_OP_KPOOL_SCORE:
+        case GGML_OP_QSA_TOPK:
             {
                 n_tasks = n_threads;
             } break;

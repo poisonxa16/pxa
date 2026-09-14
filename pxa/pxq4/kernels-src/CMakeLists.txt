@@ -9,7 +9,7 @@
 #   cmake --build build -j
 #
 # The production container's / is 100% full and must never be written to. build.sh keeps every
-# byte of the build tree under /mnt/models.
+# byte of the build tree under $PXA_MODELS_DIR.
 
 cmake_minimum_required(VERSION 3.18)
 project(pxq4_sm70 LANGUAGES CXX CUDA)

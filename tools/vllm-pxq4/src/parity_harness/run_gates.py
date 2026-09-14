@@ -5,9 +5,9 @@ run_gates.py -- one command, one verdict.
     python -m parity_harness.run_gates --real fx.npz       # + real tensors from the GGUF
     python -m parity_harness.run_gates --gpu               # also G6/G8 (needs a GPU)
 
-Deliberately does NOT require pytest: these gates have to be runnable on the DGX inside a
+Deliberately does NOT require pytest: these gates have to be runnable on the GPU host inside a
 throwaway container with nothing installed but numpy, and inside the production container
-(read-only, disk 100% full) where installing anything is impossible.  The test modules are
+(read-only) where installing anything is impossible.  The test modules are
 plain functions with asserts, so pytest can collect them too if it happens to be present.
 
 Exit code 0 iff every non-skipped gate passed.  A SKIP is never counted as a pass, and the

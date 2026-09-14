@@ -39,7 +39,8 @@ static __global__ void cpy_flt(const char * cx, char * cdst_direct, const int ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
-// PXA_CPY_FASTDIV (default OFF): the same copy, with the index arithmetic done by
+// PXA_CPY_FASTDIV (house lever: ON at ENHANCE, the shipped level; OFF at DEFAULT/REFERENCE):
+// the same copy, with the index arithmetic done by
 // multiply-and-shift instead of integer division.
 //
 // cpy_flt above resolves i03/i02/i01/i00 and i13/i12/i11/i10 with six divisions per element,
@@ -95,6 +96,121 @@ static bool pxa_cpy_fastdiv_enabled() {
         // the kernel's index range -- arch-independent and bit-identical. PXA_CPY_FASTDIV still
         // overrides in both directions.
         return pxa_cuda_house_lever("PXA_CPY_FASTDIV");
+    }();
+    return v;
+}
+
+
+// PXA_CPY_ROWS (default OFF): the same copy again, with the thread -> work mapping coarsened
+// from one element to one ROW.
+//
+// cpy_flt_fastdiv above already made each element's index arithmetic cheap (multiply-shift
+// instead of a 64-bit division), but it did not make it rarer: every element still resolves a
+// full 4-D source index and a full 4-D destination index, six divides' worth of work for one
+// scalar move. On a decode-sized copy that arithmetic, not the data, is what the kernel is
+// waiting on.
+//
+// This variant computes the index arithmetic ONCE PER ROW and then walks the row. Dim 0 must
+// describe the same run of elements on both sides (ne00 == ne10), which is what makes "element k
+// of row r" mean the same thing for the source and for the destination; given that, the flat
+// index i = r*ne00 + k decomposes into a row index r that is shared by both sides and an
+// in-row offset k that is shared by both sides. Every element is therefore copied from and to
+// exactly the byte addresses the per-element kernel would have used -- the mapping is coarser,
+// the values and addresses are identical, so the copy is bit-identical by construction.
+//
+// Two shapes of row arithmetic:
+//   DENSE=true  -- the higher dims are dense on both sides (nb01 == ne00*nb00, nb02 == ne01*nb01,
+//                  nb03 == ne02*nb02, and the destination equivalents). The row offset is then
+//                  literally r*nb01 (source) and r*nb11 (destination): one multiply each.
+//   DENSE=false -- arbitrary higher-dim strides (a copy into a strided view, e.g. a KV-cache
+//                  write). Two multiply-shifts per side recover (i01,i02,i03), amortised over the
+//                  whole row instead of paid per element.
+//
+// NT is how many threads cooperate on one row: NT=1 is one thread per row (the least index
+// arithmetic, but consecutive threads then touch addresses a row apart, so the loads/stores do
+// not coalesce), NT=WARP_SIZE is one warp per row (index arithmetic amortised 32x AND the row
+// walked with a coalesced stride). Which one is worth landing is a measurement, not an opinion --
+// PXA_CPY_ROWS selects: 0/unset = off (per-element path unchanged), 1 = thread-per-row,
+// 2 = warp-per-row.
+template <cpy_kernel_t cpy_1, int NT, bool DENSE>
+static __global__ void cpy_flt_rows(const char * cx, char * cdst_direct, const int nrows, const int ne0,
+                               const uint3 fd_s1, const uint3 fd_s2,
+                               const int nb00, const int nb01, const int nb02, const int nb03,
+                               const uint3 fd_d1, const uint3 fd_d2,
+                               const int nb10, const int nb11, const int nb12, const int nb13,
+                               char ** cdst_indirect, int graph_cpynode_index) {
+    const int tid  = blockDim.x*blockIdx.x + threadIdx.x;
+    const int row  = NT == 1 ? tid : tid / NT;
+    const int lane = NT == 1 ? 0   : tid % NT;
+
+    if (row >= nrows) {
+        return;
+    }
+
+    char * cdst = (cdst_indirect != nullptr) ? cdst_indirect[graph_cpynode_index] : cdst_direct;
+
+    int64_t x_row;
+    int64_t d_row;
+
+    if (DENSE) {
+        x_row = (int64_t) row*nb01;
+        d_row = (int64_t) row*nb11;
+    } else {
+        uint32_t r = (uint32_t) row;
+        const uint32_t i03 = pxa_fastdiv(r, fd_s2); r -= i03*fd_s2.z;   // fd_s2 divides by ne01*ne02
+        const uint32_t i02 = pxa_fastdiv(r, fd_s1); r -= i02*fd_s1.z;   // fd_s1 divides by ne01
+        const uint32_t i01 = r;
+        x_row = (int64_t)i01*nb01 + (int64_t)i02*nb02 + (int64_t)i03*nb03;
+
+        uint32_t q = (uint32_t) row;
+        const uint32_t i13 = pxa_fastdiv(q, fd_d2); q -= i13*fd_d2.z;
+        const uint32_t i12 = pxa_fastdiv(q, fd_d1); q -= i12*fd_d1.z;
+        const uint32_t i11 = q;
+        d_row = (int64_t)i11*nb11 + (int64_t)i12*nb12 + (int64_t)i13*nb13;
+    }
+
+    for (int k = lane; k < ne0; k += NT) {
+        cpy_1(cx + x_row + (int64_t)k*nb00, cdst + d_row + (int64_t)k*nb10);
+    }
+}
+
+// PXA_CPY_ROWS: 0/unset = off, 1 = thread per row, 2 = warp per row (every shape),
+// 3 = warp per row on the shapes it actually wins on. Read once into a static; this sits on a
+// per-token path. Default OFF.
+//
+// MEASURED 2026-09-09, one P100 (sm_60), a standalone copy microbenchmark, best of 3 x 200
+// iterations, against the shipped per-element fastdiv kernel. The lesson is that the mapping is
+// not free: coarsening it trades index arithmetic for parallelism and coalescing, and on most
+// shapes that trade is a loss.
+//
+//   shape (ne0 x nrows)     thread/row   warp/row
+//   128 x 8    (KV write)      0.19x       0.94x
+//   128 x 8    padded rows     0.09x       0.91x
+//    64 x 32   (gdn state)     0.25x       1.02x
+//   4096 x 1   (1-tok resid)   0.007x      0.09x
+//   4096 x 8   (8-tok resid)   0.007x      0.12x
+//   4096 x 256 (prefill)       0.02x       0.75x
+//   128 x 4096 (narrow rows)   0.09x       2.69x
+//
+// Thread per row is a loss everywhere and is kept only so the A/B has the literal form of the
+// mechanism in it. Warp per row is a wash on small shapes, a real loss on wide rows -- with a
+// 4096-wide row the grid collapses to `nrows` blocks and the card is left idle -- and a 2.7x win
+// on many narrow rows, where the per-element kernel is paying six index resolutions for four
+// bytes and the warp mapping still fills the machine.
+//
+// So the arm worth shipping is not a blanket on/off: it is "take the row mapping when the row is
+// narrow AND there are enough of them to fill the card", which is what mode 3 gates on. The
+// thresholds below are the microbenchmark's own boundary, not a guess: 128-wide rows win at 4096
+// rows and wash at 8, 4096-wide rows lose at every row count measured.
+#define PXA_CPY_ROWS_MAX_NE0   256
+#define PXA_CPY_ROWS_MIN_ROWS  256
+
+static int pxa_cpy_rows_mode() {
+    static const int v = [] {
+        const char * e = getenv("PXA_CPY_ROWS");
+        if (!e) return 0;
+        const int m = atoi(e);
+        return m >= 1 && m <= 3 ? m : 0;
     }();
     return v;
 }
@@ -252,6 +368,49 @@ static void ggml_cpy_flt_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11, const int nb12, const int nb13, cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
 
     const int num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+
+    // PXA_CPY_ROWS: one thread (or one warp) per row instead of per element. Requires only that
+    // dim 0 spans the same run on both sides (ne00 == ne10) -- then the flat index splits into a
+    // shared row index and a shared in-row offset, and every element lands on the byte addresses
+    // the per-element kernel would have used. Declines fall through to the kernels below.
+    if (const int pxa_rows_mode = pxa_cpy_rows_mode()) {
+        const int64_t nrows64 = ne00 > 0 ? (int64_t) ne / ne00 : 0;
+        const bool dense_src = (int64_t)nb01 == (int64_t)ne00*nb00 &&
+                               (int64_t)nb02 == (int64_t)ne01*nb01 &&
+                               (int64_t)nb03 == (int64_t)ne02*nb02;
+        const bool dense_dst = (int64_t)nb11 == (int64_t)ne10*nb10 &&
+                               (int64_t)nb12 == (int64_t)ne11*nb11 &&
+                               (int64_t)nb13 == (int64_t)ne12*nb12;
+        if (ne > 0 && ne00 > 0 && ne00 == ne10 && ne % ne00 == 0 &&
+            nrows64 > 0 && nrows64 <= (int64_t)INT32_MAX &&
+            ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0 &&
+            (int64_t)ne01*ne02 <= (int64_t)UINT32_MAX &&
+            (int64_t)ne11*ne12 <= (int64_t)UINT32_MAX &&
+            // mode 3 declines the shapes the microbenchmark measured as a loss
+            (pxa_rows_mode != 3 ||
+             (ne00 <= PXA_CPY_ROWS_MAX_NE0 && nrows64 >= PXA_CPY_ROWS_MIN_ROWS))) {
+            const int   nrows = (int) nrows64;
+            const uint3 fd_s1 = pxa_init_fastdiv_values((uint32_t) ne01);
+            const uint3 fd_s2 = pxa_init_fastdiv_values((uint32_t)((int64_t)ne01*ne02));
+            const uint3 fd_d1 = pxa_init_fastdiv_values((uint32_t) ne11);
+            const uint3 fd_d2 = pxa_init_fastdiv_values((uint32_t)((int64_t)ne11*ne12));
+            const bool  dense = dense_src && dense_dst;
+            const int   nt    = pxa_rows_mode == 1 ? 1 : WARP_SIZE;
+            const int   nblk  = (int)(((int64_t)nrows*nt + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE);
+#define PXA_CPY_ROWS_LAUNCH(NT_, DENSE_)                                                              \
+            cpy_flt_rows<cpy_1_flt<src_t, dst_t>, NT_, DENSE_>                                        \
+                <<<nblk, CUDA_CPY_BLOCK_SIZE, 0, stream>>>                                            \
+                (cx, cdst, nrows, ne00, fd_s1, fd_s2, nb00, nb01, nb02, nb03,                         \
+                 fd_d1, fd_d2, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++)
+            if (nt == 1) {
+                if (dense) { PXA_CPY_ROWS_LAUNCH(1, true); } else { PXA_CPY_ROWS_LAUNCH(1, false); }
+            } else {
+                if (dense) { PXA_CPY_ROWS_LAUNCH(WARP_SIZE, true); } else { PXA_CPY_ROWS_LAUNCH(WARP_SIZE, false); }
+            }
+#undef PXA_CPY_ROWS_LAUNCH
+            return;
+        }
+    }
 
     const int64_t s2 = (int64_t)ne00*ne01*ne02;
     const int64_t d2 = (int64_t)ne10*ne11*ne12;
@@ -880,6 +1039,108 @@ static void ggml_cpy_flt_contiguous_cuda_2(
     cpy_flt_contiguous<src_t, dst_t><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (ne, cx1, cx2, cdst1, cdst2, cdst_indirect, graph_cpynode_index);
     graph_cpynode_index += 2;
+}
+
+// PXA_FUSE_SIBLINGS: N consecutive same-shape CPY nodes in one launch.
+//
+// blockIdx.y picks the node and blockIdx.x*blockDim.x + threadIdx.x picks the element, i.e. the
+// grid of the N separate launches concatenated along y. Every node reads and writes exactly the
+// elements it read and wrote alone, in the same conversion, so the merged launch is bit-identical
+// to the N it replaces; the caller has already proved that no node in the run writes into another
+// node's source or destination, which is what makes running them concurrently equivalent to
+// running them in order.
+struct pxa_cpy_multi {
+    const char * src[PXA_SIB_MAX];
+    char       * dst[PXA_SIB_MAX];
+};
+
+template <typename src_t, typename dst_t>
+static __global__ void cpy_flt_contiguous_multi(const pxa_cpy_multi p, const int ne,
+                                                char ** cdst_indirect, int graph_cpynode_index) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int n = blockIdx.y;
+
+    auto dst = (dst_t *) ((cdst_indirect != nullptr) ? cdst_indirect[graph_cpynode_index + n]
+                                                     : p.dst[n]);
+    auto src = (const src_t *) p.src[n];
+
+    // the same conversion the single-node strided kernel uses (cpy_1_flt -> convert_flt), so the
+    // merged launch cannot round differently from the launches it replaces
+    convert_flt<src_t, dst_t>(&src[i], &dst[i]);
+}
+
+template <typename src_t, typename dst_t>
+static void ggml_cpy_flt_contiguous_cuda_n(const pxa_cpy_multi & p, int n, const int ne,
+        cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
+    const dim3 grid((unsigned)((ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE), (unsigned) n, 1);
+    cpy_flt_contiguous_multi<src_t, dst_t><<<grid, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+        (p, ne, cdst_indirect, graph_cpynode_index);
+    graph_cpynode_index += n;
+}
+
+// nodes[k] is a GGML_OP_CPY graph node: src[0] is what is read, src[1] is what is written.
+// Returns false without launching anything when the run is outside the envelope above.
+bool ggml_cuda_cpy_n(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n, bool disable_indirection) {
+    if (n < 2 || n > PXA_SIB_MAX) {
+        return false;
+    }
+
+    const ggml_tensor * s0 = nodes[0]->src[0];
+    const ggml_tensor * d0 = nodes[0]->src[1];
+    const int64_t nelem    = ggml_nelements(d0);
+
+    if (nelem <= 0 || nelem > INT32_MAX) {
+        return false;
+    }
+
+    pxa_cpy_multi p = {};
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * src = nodes[k]->src[0];
+        const ggml_tensor * dst = nodes[k]->src[1];
+        if (!src || !dst)                                              return false;
+        if (src->type != s0->type || dst->type != d0->type)            return false;
+        if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst))      return false;
+        if (!ggml_are_same_shape(src, dst))                            return false;
+        if (ggml_nelements(dst) != nelem)                              return false;
+        p.src[k] = (const char *) src->data;
+        p.dst[k] = (char *)       dst->data;
+    }
+
+    char ** dest_ptrs = nullptr;
+    int graph_cpynode_index = -1;
+#if defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS) || defined(GGML_MUSA_GRAPHS)
+    if (ctx.cur_graph && ctx.cur_graph->use_cpy_indirection && !disable_indirection) {
+        dest_ptrs = ctx.cur_graph->dest_ptrs_d;
+        graph_cpynode_index = ctx.cur_graph->graph_cpynode_index;
+    }
+#else
+    GGML_UNUSED(disable_indirection);
+#endif
+
+    const ggml_type st = s0->type;
+    const ggml_type dt = d0->type;
+    const int ne = (int) nelem;
+
+    if      (st == GGML_TYPE_F32  && dt == GGML_TYPE_F32 ) { ggml_cpy_flt_contiguous_cuda_n<float,        float       >(p, n, ne, ctx.stream(), dest_ptrs, graph_cpynode_index); }
+    else if (st == GGML_TYPE_F32  && dt == GGML_TYPE_F16 ) { ggml_cpy_flt_contiguous_cuda_n<float,        half        >(p, n, ne, ctx.stream(), dest_ptrs, graph_cpynode_index); }
+    else if (st == GGML_TYPE_F32  && dt == GGML_TYPE_BF16) { ggml_cpy_flt_contiguous_cuda_n<float,        nv_bfloat16 >(p, n, ne, ctx.stream(), dest_ptrs, graph_cpynode_index); }
+    else if (st == GGML_TYPE_F16  && dt == GGML_TYPE_F16 ) { ggml_cpy_flt_contiguous_cuda_n<half,         half        >(p, n, ne, ctx.stream(), dest_ptrs, graph_cpynode_index); }
+    else if (st == GGML_TYPE_F16  && dt == GGML_TYPE_F32 ) { ggml_cpy_flt_contiguous_cuda_n<half,         float       >(p, n, ne, ctx.stream(), dest_ptrs, graph_cpynode_index); }
+    else { return false; }
+
+    CUDA_CHECK(cudaGetLastError());
+
+#if defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS) || defined(GGML_MUSA_GRAPHS)
+    if (ctx.cur_graph && ctx.cur_graph->use_cpy_indirection && !disable_indirection) {
+        ctx.cur_graph->graph_cpynode_index = graph_cpynode_index;
+    }
+#endif
+    return true;
 }
 
 bool ggml_cuda_cpy_2(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const ggml_tensor * src2,

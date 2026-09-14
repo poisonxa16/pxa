@@ -164,9 +164,68 @@ by the snap validation — and the gate turns *itself* off if any `PXA_PXQ6_BOOK
 table override is set, because this translation unit carries its own frozen copies and takes no
 runtime uploads. Not bit-exact versus the fused fp16 decode kernels. **Env:** `PXA_PXQ_MMVQ` =
 `0` off, `1` sm_70+ (what it was built for), `2` any card with real DP4A (cc ≥ 6.1, test).
-**Default is auto**: at DEFAULT or ENHANCE, on a PXQ4/PXQ4HQ-bearing model, it resolves to 1 when
-an sm_70+ device is present and to 2 on an all-sm_61 fleet; it stays off on an sm_60-only fleet
-(P100 has no DP4A) and at REFERENCE. The startup `PXA_AUTO:` line prints which arm fired and why.
+**Default is auto**: at DEFAULT or ENHANCE, on a model carrying a tier this path may decode, it
+resolves to 1 when an sm_70+ device is present and to 2 on an all-sm_61 fleet; it stays off on an
+sm_60-only fleet (P100 has no DP4A) and at REFERENCE. The startup `PXA_AUTO:` line prints which
+arm fired and why.
+
+### `pxq23-mmvq.h` — the two low tiers on the same path (2026-09-09)
+The scope above was two tiers of six, and the two it left out are the ones a memory-bound decode
+would most like to use: PXQ2 and PXQ3 are what the uniform quantisation profile produces, so the
+*smaller* file could not use the *faster* kernel. They are registered now, behind their own lever.
+
+They fit because the two low tiers carry PXQ6-core's scale machinery byte for byte — 64 B scale
+SoA, one scale byte per row, low nibble for elements 0–15 and high for 16–31, the same frozen
+SUB16 LUT. What differs is only the code stream: 8 B rows of 2-bit codes for PXQ2, 12 B **bit-plane**
+rows for PXQ3. So a policy in `pxq-mmvq.cuh` now owns exactly three things — the scale nibble, how
+many `u32` words of code a thread's run spans, and how a group's 8 codes become 8 `int8` book
+values — and the q8_1 side, the accumulate, the row/anchor hoisting and the launcher are shared
+verbatim. PXQ2's 4-entry book fits in one register, so **one PRMT covers 4 codes** where the
+16-entry PX16 book needs three; that pays for the 2-bit→nibble spread ladder, and the plain
+`ny=1` kernel comes out at exactly PXQ4's 488 SASS instructions on sm_70 while moving half the
+weight bytes. PXQ3 pays a second spread for its high plane: 584 instructions, +19.7%, for −25%
+bytes.
+
+**Why this file is a plain `.h` and not a `.cuh`:** it compiles for the host with PRMT emulated
+exactly, so `tests/test-pxq23-mmvq-snap.cpp` checks the decode **exhaustively on a CPU in half a
+second** — all 2¹⁶ PXQ2 code patterns and all 2²⁴ PXQ3 (low-plane, high-plane) pairs against the
+format as the codec's own tables state it, then the panel/slab/scale addressing bit-for-bit
+against `pxa_pxq_dequant_row()`. `tests/test-pxq-mmvq-cols.cu` carries that proof onto the device
+by running the same patterns through the real PRMT (measured on a P100: 562 cases,
+135,010,816 values, 0 failed).
+
+**Numerics.** Same contract as above, `q = rint(book · 127/absmax)` with `absmax/127` folded into
+the fp16 row anchor: PXQ2 `{-127,-34,34,126}`, PXQ3 `{-127,-77,-42,-13,13,41,76,127}`. 127/absmax
+is the right scale because a dot propagates the *absolute* snap error, so the largest scale that
+keeps `|q| ≤ 127` is the accurate one. Worst per-weight snap: 0.372 % of absmax (PXQ2), 0.323 %
+(PXQ3), against 0.354 % for the PX16 book already shipping here — all three spend the full int8
+range and all three pay about half an LSB.
+
+**Env:** `PXA_PXQ23_MMVQ`, a bitmask: bit 0 = PXQ2, bit 1 = PXQ3, `3` = both, `0` = off. It is
+separate from `PXA_PXQ_MMVQ` because "this device may use the q8_1 GEMV" and "the low tiers are
+among the tiers it may use" are different questions with different evidence; both must be on. It
+refuses to arm if any PXQ2/PXQ3 book or sub-scale override is in the environment, and it refuses
+if a startup self-check cannot rederive the frozen int8 books from the codec's float tables. It
+fires only at cc ≥ `CC_VOLTA`: `PXA_PXQ_MMVQ`'s mode 2 (an all-sm_61 fleet) carries PXQ4 on its
+own evidence and does not carry these.
+
+**Default OFF, and the reason is the honest one.** Decode is a large win — measured on 2×V100,
+Qwen3.8-27B, medians of 7: uniform PXQ2 **+36.4 % (np1) / +47.8 % (np2)**, uniform PXQ3 **+36.4 %
+/ +51.9 %**, and +13.4…+30.0 % on the promoted profiles, whose off arm already had PXQ4 attention
+on MMVQ. But the pre-registered ship rule also required the mean KL divergence against the file's
+own exact path to be *no worse than PXQ4's existing fused kernel shows against its own*, and it is
+not: measured in one session at `-c 2048 --chunks 10 -b 8 -ub 8`, PXQ2 scores 0.004624 and PXQ3
+0.002186 against the PXQ4 comparator's 0.000951 — 4.9× and 2.3×. So it ships as a lever with its
+numbers rather than as a default. Note the comparison cannot be unconfounded: the three tiers are
+three *files*, and the uniform-PXQ2 file sits at PPL 23.2, an operating point where the same-size
+arithmetic perturbation converts into far more KL divergence. The host harness puts the weight
+snap at 0.0223 % (PXQ2) and 0.0178 % (PXQ3) of ‖w‖·‖x‖ — both the same size as the q8_1
+activation cost PXQ4 pays too. `docs/lab/LEVERS.md` carries the full table.
+
+⚠ **Gate this with `-b 8 -ub 8`.** `llama-perplexity` is pure prefill and at the default `-b 512`
+the `ne11 <= 8` dispatch gate never opens, so both arms return bit-identical logits — a false PASS
+on a run in which the kernel never fired. And a greedy-hash *difference* is not a usable
+engagement check: 64 greedy tokens came out byte-identical across arms on three of four files.
 
 ### `pxq-moemap.cuh`
 Device-side construction of the MoE expert row mapping and tile list. The host version of this
@@ -204,6 +263,26 @@ and a full-drain barrier on ring wrap; and `acquire()` declines while the consum
 capturing, because a graph that replays a baked arena pointer reads a recycled region. **Env:**
 `PXA_DQC_MB` **default 0 = off** (it changes allocation counts and stream structure, so it ships
 armed only by env); `PXA_DQC_MIN_NY` default 64. **Measured loss — see below.**
+
+### `PXA_VOLTA_CUBLAS_TILE` — lives in `ggml-cuda.cu`, listed here with the other prefill levers
+Fixed-width column tiling for the Volta quantized-weight prefill GEMM. That path is "dequantize
+`src0` to f16 once, then one `cublasGemmEx` at the full batch width": the conversion does not care
+about the batch, but cuBLAS does — it picks its internal kernel and its accumulation blocking from
+the shape it is handed, so raising `-ub` can move the same op onto a different cuBLAS kernel with a
+different summation order. That is the drift `PXA_KPOOL_SCORE_TILE` already pins for the one k-pool
+GEMM; this is its general form for the dense quantized path. Set to `T` and a batch wider than `T`
+is issued as a run of GEMMs of exactly `T` columns (plus the remainder in the tail), every one of
+them against the same already-converted weight buffer — only the activation and output column
+pointers advance — so the wider nominal batch still pays for exactly one dequant while the shape
+cuBLAS sees stays pinned. Both `cublasGemmEx` call sites in `ggml_cuda_op_mul_mat_cublas` take it
+(the `CUBLAS_COMPUTE_32F` F32-output form and the `CUBLAS_COMPUTE_16F` form). Gated on
+`cc == 7.0` **and** a quantized `src0`. This is a trade, not a free win: more launches, less work
+per launch, and the tail tile is by construction narrower than `T` — whether it beats simply
+running the wider N directly is unmeasured on our cards and is the A/B this lever exists for.
+**Env:** `PXA_VOLTA_CUBLAS_TILE` **default 0 = off** — unset, the branch issues the single untiled
+call it always has, so a flag-off run is byte-identical to a build without this. Not bit-exact
+versus the untiled call once it actually splits (the GEMM shape changes on purpose), so it wants
+the logit-spread gate, not a hash comparison.
 
 ### `pxa-smalln.cu` / `pxa-smalln.cuh`
 `PXA_SPEC_SMALLN`, the B4 speculative-verify engine: a multi-column dequant-FMA GEMV for the

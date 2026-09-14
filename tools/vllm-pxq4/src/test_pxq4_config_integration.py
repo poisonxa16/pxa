@@ -7,7 +7,7 @@ Still CPU-only -- no GPU, no model, no engine.  Run it inside a *throwaway*
 container from the serving image (never the production container):
 
   docker run --rm --network none -e CUDA_VISIBLE_DEVICES= \
-    -v /mnt/models/pxa-vllm-pxq4/impl:/work -w /work kewaii/vllm:latest \
+    -v $PXA_MODELS_DIR/pxa-vllm-pxq4/impl:/work -w /work ${VLLM_IMAGE:-vllm/vllm-openai:latest} \
     /opt/vllm-venv/bin/python test_pxq4_config_integration.py
 
 Every check here is one that a stub cannot honestly make:
@@ -16,7 +16,7 @@ Every check here is one that a stub cannot honestly make:
   3. the real ``_verify_quantization`` override-probe loop -- confirming no
      built-in method hijacks a ``quant_method: "pxq4"`` checkpoint;
   4. real ``importlib.metadata`` entry-point discovery from a hand-written
-     ``.dist-info``, which is how this ships (the image's / is 100% full).
+     ``.dist-info``, which is how this ships (the image is read-only in practice).
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ def test_our_override_does_not_hijack_the_incumbent_checkpoint():
 
 def test_entry_point_discovery_from_a_handwritten_dist_info():
     """This is the shipping mechanism: PYTHONPATH + a .dist-info we write by
-    hand, because nothing can be installed into the image (its / is 100% full,
+    hand, because nothing can be installed into the image (it is read-only in practice,
     0 bytes available)."""
     import importlib.metadata as md
 

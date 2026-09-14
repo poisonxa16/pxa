@@ -14,7 +14,7 @@ logic.  Those live in ``linear.py`` / ``parameters.py`` (component B) and
 ``csrc/`` (component C).
 
 --------------------------------------------------------------------------
-Verified against the fork at /opt/1Cat-vLLM, git 2ceb15066 (v0.1.dev1+g2ceb15066).
+Verified against the fork at the vLLM fork checkout, git 2ceb15066 (v0.1.dev1+g2ceb15066).
 Every file:line below was read in that tree.
 
   * ``QuantizationConfig`` ABC and the six abstract members:
@@ -73,6 +73,8 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import register_quantization_config
+
+import tiers as _tiers
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -86,6 +88,12 @@ else:  # the fork aliases this to ``str`` outside TYPE_CHECKING (base_config.py:
 logger = init_logger(__name__)
 
 QUANT_METHOD_NAME = "pxq4"
+#: The SUPERSET name. A checkpoint may declare either; they select the same config class.
+#: "pxq4" is kept as the primary registered name so that every checkpoint already in the field
+#: -- and every launcher that passes --quantization pxq4 -- keeps working untouched. "pxq" is
+#: what a tiered (pxq2/pxq3/pxq4) checkpoint should declare, because "pxq4" would be a lie
+#: about its contents.
+QUANT_METHOD_ALIASES = ("pxq4", "pxq")
 
 # --------------------------------------------------------------------------
 # On-disk geometry.  These are NOT tunables: they are the ggml type-252 layout,
@@ -265,6 +273,11 @@ class PXQ4Config(QuantizationConfig):
         backbone_map: str | None = None,
         modules_to_not_convert: list[str] | None = None,
         raw_config: dict[str, Any] | None = None,
+        pxq_tiers: "dict[str, str] | None" = None,
+        q8_modules: "list[str] | None" = None,
+        tier_books: "dict[str, list[float]] | None" = None,
+        tier_sub: "list[float] | None" = None,
+        tier_subs: "dict[str, list[float]] | None" = None,
     ) -> None:
         # base_config.py:72-76 -- creates ``packed_modules_mapping``, which
         # model_loader/utils.py:290 later rebinds to the model class's mapping.
@@ -297,14 +310,131 @@ class PXQ4Config(QuantizationConfig):
         # Union used for dispatch.  ``modules_to_not_convert`` carries "mtp",
         # which must also route to fp16 if an MTP module is ever constructed in
         # a process that shares this config object.
-        self._ignore_for_dispatch: tuple[str, ...] = tuple(
-            dict.fromkeys([*self.ignore, *self.modules_to_not_convert])
-        )
+        # ORDER IS LOAD-BEARING: _ignore_for_dispatch below READS self.q8_modules, so the
+        # assignment has to happen first. It did not, and a config carrying q8_modules --
+        # i.e. every m3 checkpoint -- raised AttributeError inside __init__ before it could
+        # be loaded. Latent because the only configs exercised until now had no q8 modules.
+        # Modules served as int8 + per-row fp16 scale. Today that is lm_head and only
+        # lm_head; the list is a list rather than a boolean so that a future head-shaped
+        # tensor does not need a new field.
+        self.q8_modules: list[str] = list(q8_modules or [])
+
+        # A module served as int8 must not also be in the ignore list: ignore is checked
+        # first and wins, so leaving lm_head there would silently serve an fp16 head that the
+        # checkpoint does not contain -- a missing-weight crash at best. The converter is
+        # supposed to drop it from `ignore` when it emits a q8 head; drop it here too rather
+        # than depend on that, and say so.
+        _ign = [m for m in dict.fromkeys([*self.ignore, *self.modules_to_not_convert])
+                if not any(m == q or m.endswith("." + q) or q.endswith("." + m)
+                           for q in self.q8_modules)]
+        if self.q8_modules and len(_ign) != len(set([*self.ignore, *self.modules_to_not_convert])):
+            logger.info("pxq: %s served as int8; removed from the ignore list",
+                        ", ".join(self.q8_modules))
+        self._ignore_for_dispatch: tuple[str, ...] = tuple(_ign)
+
+        # ---------------------------------------------------------------- tiers
+        # ``pxq_tiers`` maps a module SUFFIX (the same shape of pattern as ``pxq4_modules``)
+        # to a tier name. Longest suffix wins, so a file can say
+        #   {"mlp.experts": "pxq2", "mlp.experts.w2": "pxq3"}
+        # and get pxq2 gate/up with pxq3 down -- which is what the Flash-Next quantizer emits.
+        # A file that declares nothing is uniformly pxq4, because every checkpoint written
+        # before tiers existed is.
+        self.pxq_tiers: dict[str, str] = dict(pxq_tiers or {})
+        for _mod, _t in self.pxq_tiers.items():
+            _tiers.tier_by_name(_t)          # raises on an unknown tier, at load, by name
+        self.tier_books: dict[str, tuple[float, ...]] = {
+            str(k): tuple(float(x) for x in v) for k, v in (tier_books or {}).items()
+        }
+        for _name, _book in self.tier_books.items():
+            _t = _tiers.tier_by_name(_name)
+            if len(_book) != _t.book_n:
+                raise ValueError(
+                    f"pxq: tier_books[{_name!r}] has {len(_book)} entries, tier {_name} "
+                    f"has a {_t.book_n}-entry book")
+        # The SUB16 LUT is SHARED by every tier that spends one sub index per 16 elements (the
+        # engine reuses PXQ6's verbatim for the LM4/LM8 books). ``tier_sub`` exists only so a
+        # file can record it explicitly; when absent the PXQ4 ``sub`` is it, and the converter
+        # asserts they are equal.
+        self.tier_sub: tuple[float, ...] = tuple(tier_sub) if tier_sub else tuple(self.sub)
+        # ``tier_subs`` is the exception to that sharing and exists for exactly one tier.
+        # pxq4hq spends one sub index per EIGHT elements against its own SUB8 fit, so its table
+        # is a different 16 floats and must not be uploaded through the shared path. A file
+        # that carries pxq4hq tensors and no tier_subs["pxq4hq"] is refused at load rather than
+        # decoded against SUB16, which loads, shards and is uniformly wrong.
+        self.tier_subs: dict[str, tuple[float, ...]] = {
+            str(k): tuple(float(x) for x in v) for k, v in (tier_subs or {}).items()
+        }
+        for _name, _sub in self.tier_subs.items():
+            _tiers.tier_by_name(_name)       # raises on an unknown tier, at load, by name
+            if len(_sub) != 16:
+                raise ValueError(
+                    f"pxq: tier_subs[{_name!r}] has {len(_sub)} entries; every PXQ sub-scale "
+                    f"table is 16 four-bit levels")
 
         self._log_dispatch = os.getenv("PXQ4_LOG_DISPATCH", "0") == "1"
         self._fused_checked = False
 
         self._validate()
+
+    # ------------------------------------------------------------------ tiers
+    def tier_for(self, prefix: str, which: str | None = None):
+        """Resolve the PXQ tier serving ``prefix`` (optionally its ``w13`` / ``w2`` half).
+
+        Longest declared suffix wins; nothing declared means pxq4. Returning a Tier rather
+        than a name is deliberate -- the caller then cannot invent a slab stride.
+        """
+        cands = [prefix]
+        if which:
+            cands.insert(0, f"{prefix}.{which}")
+        best_pat, best_tier = "", None
+        for cand in cands:
+            for pat, name in self.pxq_tiers.items():
+                if (cand == pat or cand.endswith("." + pat)) and len(pat) > len(best_pat):
+                    best_pat, best_tier = pat, name
+            if best_tier is not None:
+                break
+        return _tiers.tier_by_name(best_tier) if best_tier else _tiers.default_tier()
+
+    def book_for(self, tier) -> tuple[float, ...]:
+        """This tier's book, from the file if it recorded one, else the frozen default.
+
+        A file that carries pxq2/pxq3 tensors and no pxq2/pxq3 book is REFUSED rather than
+        decoded with the compiled-in table: the quantizer's books are overridable
+        (PXA_PXQ2_V3, PXA_PXQ_CEIL_V2, PXA_PXQ*_BOOK) and using the wrong one is silent,
+        uniform weight error across every expert in the model.
+        """
+        if tier.is_pxq4:
+            return tuple(self.book)
+        book = self.tier_books.get(tier.name)
+        if book is None:
+            raise ValueError(
+                f"pxq: this checkpoint serves modules at tier {tier.name} but its "
+                f"quantization_config carries no tier_books[{tier.name!r}]. The tables are "
+                f"overridable at quantize time and the file is the only record of which were "
+                f"used, so decoding with the compiled-in default is not offered.")
+        return book
+
+    def sub_for(self, tier) -> "tuple[float, ...] | None":
+        """This tier's sub-scale LUT: its OWN when it has one, otherwise the shared SUB16.
+
+        Only pxq4hq owns one. Returning the shared table for every other tier is what keeps
+        ``tiers.upload_tables`` a single call site, and returning it EXPLICITLY rather than
+        letting the caller reach for ``tier_sub`` is what stops a future tier from silently
+        inheriting the wrong table.
+        """
+        if not getattr(tier, "own_sub", False):
+            return tuple(self.tier_sub)
+        sub = self.tier_subs.get(tier.name)
+        if sub is None:
+            raise ValueError(
+                f"pxq: this checkpoint serves modules at tier {tier.name}, whose sub-scale "
+                f"table is NOT the shared SUB16, but its quantization_config carries no "
+                f"tier_subs[{tier.name!r}]. Decoding those tensors against SUB16 would load, "
+                f"shard and pass every shape assertion while being uniformly wrong, so it is "
+                f"refused. Re-convert the GGUF with a converter that records the tier's own "
+                f"table (it is in the file as pxa.pxq4hq.sub, or as pxa.pxq6.sub when "
+                f"pxa.pxq6.tier says 'hq').")
+        return sub
 
     # ---------------------------------------------------------------- checks
 
@@ -437,10 +567,10 @@ class PXQ4Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Volta.  Unconditional -- unlike awq.py:177-184 / compressed_tensors_
-        # wNa16.py:80-88 in this fork, which return 70 only when the turbomind
-        # knob is on, our kernels are sm_70-native by construction.
-        return 70
+        # PASCAL PORT: the sm_60 kernel build (libpxq4_sm60.so, selected via
+        # PXQ4_LIB) is gated bit-exact against the sm_70 production lib, so
+        # Pascal is a first-class target for this site copy.
+        return 60
 
     @staticmethod
     def get_config_filenames() -> list[str]:
@@ -453,7 +583,7 @@ class PXQ4Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "PXQ4Config":
         quant_method = config.get("quant_method")
-        if quant_method not in (None, QUANT_METHOD_NAME):
+        if quant_method not in (None, *QUANT_METHOD_ALIASES):
             raise ValueError(
                 f"pxq4: PXQ4Config.from_config called on a "
                 f"quant_method={quant_method!r} checkpoint"
@@ -462,13 +592,21 @@ class PXQ4Config(QuantizationConfig):
         # Refuse a file whose declared geometry is not the one this backend
         # implements.  These keys are optional (older converter output may omit
         # them); when present they must agree exactly.
-        for key, expected in (
-            ("type_id", PXQ4_TYPE_ID),
+        # ``type_id`` and ``slab_bytes`` describe the DEFAULT tier only. A tiered checkpoint
+        # (quant_method "pxq") carries a per-module tier map instead and legitimately holds
+        # tensors of more than one stride, so those two keys are checked only when the file
+        # declares no tier map. panel_rows / slab_cols / header_bytes are shared by every tier
+        # and are always checked.
+        _tiered = bool(config.get("pxq_tiers"))
+        _geom_keys = (
             ("panel_rows", PXQ4_PANEL_ROWS),
             ("slab_cols", PXQ4_SLAB_COLS),
-            ("slab_bytes", PXQ4_SLAB_BYTES),
             ("header_bytes", PXQ4_HEADER_BYTES),
-        ):
+        )
+        if not _tiered:
+            _geom_keys = _geom_keys + (("type_id", PXQ4_TYPE_ID),
+                                       ("slab_bytes", PXQ4_SLAB_BYTES))
+        for key, expected in _geom_keys:
             if key in config and int(config[key]) != expected:
                 raise ValueError(
                     f"pxq4: checkpoint declares {key}={config[key]}, this backend "
@@ -495,6 +633,11 @@ class PXQ4Config(QuantizationConfig):
             tier=str(config.get("tier", "core")),
             backbone_rev=config.get("backbone_rev"),
             backbone_map=config.get("backbone_map"),
+            pxq_tiers=config.get("pxq_tiers"),
+            q8_modules=config.get("q8_modules"),
+            tier_books=config.get("tier_books"),
+            tier_sub=config.get("tier_sub"),
+            tier_subs=config.get("tier_subs"),
             modules_to_not_convert=(
                 _as_str_list(config["modules_to_not_convert"], "modules_to_not_convert")
                 if "modules_to_not_convert" in config
@@ -527,7 +670,7 @@ class PXQ4Config(QuantizationConfig):
         del user_quant, hf_config
         if not isinstance(hf_quant_cfg, dict):
             return None
-        if hf_quant_cfg.get("quant_method") != QUANT_METHOD_NAME:
+        if hf_quant_cfg.get("quant_method") not in QUANT_METHOD_ALIASES:
             return None
         return QUANT_METHOD_NAME
 
@@ -597,6 +740,29 @@ class PXQ4Config(QuantizationConfig):
             # and every fp16 tensor class of the mixed-type backbone.
             return self._dispatch(prefix, "fp16 (default)", UnquantizedLinearMethod())
 
+        # ---- int8 LM head ------------------------------------------------
+        # Checked BEFORE the PXQ4 backstop below, because the two say opposite
+        # things about the same layer and the Q8 path is the one that works.
+        # PXQ4 lm_head remains refused (its vocab axis is panels, not rows);
+        # Q8 lm_head is two ordinary tensors the stock vocab loader shards on
+        # its own, so it needs no fork change. See head_q8.py for the reading
+        # of vocab_parallel_embedding.py that establishes that.
+        if _matches(prefix, self.q8_modules):
+            if type(layer).__name__ == "VocabParallelEmbedding":
+                # embed_tokens is a real VocabParallelEmbedding and its method
+                # would have to implement embedding(); a gather from int8 rows
+                # is a different job with no bandwidth argument behind it (the
+                # embedding is read one row per token, not in full). Refuse by
+                # name rather than half-serve it.
+                raise ValueError(
+                    f"pxq: {prefix} is listed in q8_modules, but it is a "
+                    f"VocabParallelEmbedding. Only ParallelLMHead is served as int8; "
+                    f"an embedding is a per-token row gather and quantizing it saves "
+                    f"nothing on the decode path.")
+            from .head_q8 import PXQ8HeadMethod  # noqa: PLC0415
+
+            return self._dispatch(prefix, "q8 head", PXQ8HeadMethod(self))
+
         # ParallelLMHead / VocabParallelEmbedding: None -> UnquantizedEmbeddingMethod
         # (vocab_parallel_embedding.py:479-483).  Backstop only: _validate()
         # already rejected an lm_head/embed_tokens entry in pxq4_modules at
@@ -617,9 +783,23 @@ class PXQ4Config(QuantizationConfig):
                 "PXQ4Config._validate() -- see UNSERVABLE_PXQ4_LEAF_MODULES."
             )
 
-        # Attention (attention.py:159, mla_attention.py:928) and FusedMoE
-        # (fused_moe/layer.py:349-364) both accept None. This model has no MoE
-        # (866 tensors, zero *_exps) and we do not quantize the KV cache.
+        # FusedMoE. Returning None here installs UnquantizedFusedMoEMethod
+        # (fused_moe/layer.py:357-358), which allocates the expert stacks DENSE in the model
+        # dtype -- 216.0 GiB of fp16 expert weight for the 122B against 63.55 GiB of P100
+        # VRAM. Dense fp16 experts were the original 122B OOM blocker; PXQ4MoEMethod is the fix.
+        if type(layer).__name__ in ("FusedMoE", "RoutedExperts") or hasattr(layer, "moe_config"):
+            if _matches(prefix, self.pxq4_modules):
+                from .moe import PXQ4MoEMethod
+                moe_cfg = getattr(layer, "moe_config", None)
+                t13 = self.tier_for(prefix, "w13")
+                t2 = self.tier_for(prefix, "w2")
+                logger.info("pxq dispatch: %-64s -> moe (w13=%s, w2=%s)",
+                            prefix, t13.name, t2.name)
+                return PXQ4MoEMethod(self, moe_cfg, prefix=prefix)
+            return None
+
+        # Attention (attention.py:159, mla_attention.py:928) accepts None, and we do not
+        # quantize the KV cache.
         return None
 
     def _dispatch(self, prefix: str, kind: str, method: QuantizeMethodBase) -> QuantizeMethodBase:

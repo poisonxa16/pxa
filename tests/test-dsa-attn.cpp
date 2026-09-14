@@ -21,8 +21,8 @@
 //     be rejected and one that must be accepted. A gate that only ever says yes is not
 //     a gate.
 //
-// Deliberately tiny: a few hundred MB of VRAM, because the DGX is on loan and its
-// owner's server is resident on all 8 cards.
+// Deliberately tiny: a few hundred MB of VRAM, so it runs alongside other workloads on a
+// shared GPU.
 //
 
 #include "ggml.h"

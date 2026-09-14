@@ -11,6 +11,8 @@
 #include "fattn-vec-f32-interface.cuh"
 #include "fattn-wmma-f16-interface.cuh"
 #include "pxa/fattn-volta-mma.cuh"
+#include "pxa/fattn-tile-v2.cuh"
+#include "pxa/fattn-tile-big.cuh"
 #include "fattn-mma-f16-interface.cuh"
 #include "fattn-new-mma.cuh"
 #include "fattn.cuh"
@@ -52,7 +54,12 @@ static inline bool pxq_use_sm60_vec_f32(const int cc, const ggml_tensor * Q) {
 // 122B-A10B (qwen35moe, head 256) 4xP100 rig at 8881-token fill: flash_attn_vec_ext_f16 was 52.7%
 // of prefill GPU time (60 launches x 281 ms avg) — every query column re-streams the whole KV
 // extent with no tile reuse. The D=256 tile-f16 (ncols=16) restores KQ-tile data reuse.
-// Default ON; PXA_FA_TILE256=0 restores the vec route. Decode (ne1 <= 8) is untouched.
+// Default ON. PXA_FA_TILE256=0 routes D=256 prefill back to the vec-f16 kernel: that is a
+// KERNEL-SELECTION rollback, NOT a return to correct arithmetic. NP-DET-2026-09-09 measured the
+// vec route returning the empty answer at the aligned offset on this same seat and fill -- both
+// routes carry half accumulators, so the rollback swaps one too-coarse rounding realisation for
+// another. The lever that fixes it is PXA_FA_TILE_F32ACC (see below), and it does not exist on
+// the vec path. Decode (ne1 <= 8) is untouched either way.
 // PXA_FA_TILE_VOLTA — sm_70 flash-attention kernel choice.
 //
 // DEFAULT OFF -- DO NOT TURN THIS ON. It was briefly defaulted to AUTO on the strength
@@ -68,11 +75,15 @@ static inline bool pxq_use_sm60_vec_f32(const int cc, const ggml_tensor * Q) {
 // ship gate. The MMA route in fattn-volta-mma.cu is both FASTER (877.63 / 769.89) and
 // parity-clean, so nothing is lost by leaving this off.
 //
-// NOTE FOR WHOEVER OWNS THE TILE KERNEL: the same D=256 ncols=16 tile-f16 instance is the
-// DEFAULT prefill path on sm_60 via PXA_FA_TILE256. This capture does not prove it is
-// broken there -- sm_70 takes different branches, and PXA_FA_MASK_SKIP_TILE auto-armed in
-// these runs is tile-only and a prime suspect -- but the P100 seat deserves the same
-// greedy-32 capture before anyone trusts it.
+// NOTE -- RESOLVED; the capture this asked for was taken. NP-DET-2026-09-09 ran the head-256
+// seat and found the sm_60 D=256 tile-f16 PREFILL path returns the right token with
+// PXA_FA_TILE_F32ACC ON (the shipped default): what was too coarse was the fp16 accumulation,
+// not the tile instance as such, and the vec route PXA_FA_TILE256=0 falls back to is wrong at
+// the same fill. The two greedy captures of 2026-09-02 do not bear on this -- the first never
+// started its containers (docker bind failure, so no arm ran) and neither recorded the model or
+// the head-dim, so identical shas across their arms cannot be told apart from an inert lever.
+// PXA_FA_MASK_SKIP_TILE, auto-armed in those runs, still has its own A/B outstanding -- see its
+// HONESTY GATE in ggml-cuda/pxa/pxa-enhance.cuh.
 //
 // PXA_FA_TILE_VOLTA=1 or =2 still routes sm_70 to the tile kernel for A/B work.
 //
@@ -214,6 +225,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // Paired with the identical check in ggml_cuda_fattn_is_supported(): the gate now
+    // refuses every index-list node the DSA path did not take, so the scheduler can no
+    // longer route one here. Abort rather than fall through -- the fall-through would
+    // hand a node that asked for sparse attention to a dense kernel that ignores src[5],
+    // and would do it silently. Unreachable in both configurations of the switch: with
+    // PXA_DSA_ATTN off no graph in this tree builds an index list at all, and with it on
+    // build_dsv4_attn_mha() mirrors this predicate before emitting one.
+    if (ggml_cuda_dsa_attn_requested(dst)) {
+        GGML_ABORT("FLASH_ATTN_EXT carries a DSA index list (src[5]) that ggml_cuda_dsa_attn_supported() "
+                   "declined, and no dense CUDA kernel honours src[5]. Set PXA_DSA_ATTN=1, or do not "
+                   "attach an index list to this node.");
+    }
+
     ggml_tensor local_dst, Kl, Vl, Ml;
     // PXA_NANFIX_SWA_SLICE (2026-08-16): the windowed SWA slice below assumed KV-cache cell
     // INDEX order matches POSITION order, so that the last pad(max(ntokens,256)+n_swa) cells of
@@ -275,6 +299,18 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // PXA_FA_TILE_512 (2026-09-13, default OFF). Head sizes 512/512 (Gemma 4's global layers) and
+    // 576/512 (MLA) have no no-tensor-core kernel in this tree, so on sm_60/sm_70 the backend
+    // declines the node and the graph runs the unfused KQ/soft_max/KQV path instead. The pxa tile
+    // kernel in pxa/fattn-tile-big.cu serves exactly those two head-size pairs on exactly those two
+    // architectures; it declines everything else, so arming the lever can only ever change whether
+    // a 512-wide node runs fused, never which kernel a 64/128/256 node gets. The identical check
+    // sits in ggml_cuda_fattn_is_supported() at the same position -- keep the two paired.
+    if (ggml_cuda_fattn_tile_big_armed() && ggml_cuda_fattn_tile_big_is_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_tile_big(ctx, dst);
+        return;
+    }
+
     // PXA_FA_TILE_VOLTA (experimental, default OFF). sm_70 HAS working WMMA, so the selector below
     // sends Volta to the WMMA kernel and the tile kernels only ever serve the no-mma cards (sm_60
     // P100). That makes tile-vs-WMMA on Volta untestable. This lever routes sm_70 -- and only sm_70
@@ -321,7 +357,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     ggml_cuda_flash_attn_ext_vec_f16(ctx, dst);
                 }
             } else {
-                ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
+                // PXA_FA_TILE_V2 (default OFF): same arithmetic, a different tile schedule.
+                // Only ever reached where the shipping tile-f16 kernel would have run anyway, and
+                // it declines any shape it does not serve, so arming the lever can change WHICH
+                // schedule runs and never WHETHER a kernel runs.
+                if (ggml_cuda_fattn_tile_v2_armed() && ggml_cuda_fattn_tile_v2_is_supported(ctx, dst)) {
+                    ggml_cuda_flash_attn_ext_tile_v2(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
+                }
             }
         } else {
             if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
@@ -419,9 +463,29 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
         return true;
     }
 
+    // ... and nodes WITH src[5] must NOT fall through, which the sentence above always
+    // claimed and no code enforced. The DSA path is the only CUDA kernel that reads the
+    // index list; once it has declined -- because PXA_DSA_ATTN is off, or because this is
+    // a shape, dtype or op_params combination it does not serve -- nothing below will
+    // honour the request, so the node belongs on a backend that computes the node it was
+    // given rather than on a dense kernel that answers a different question.
+    //
+    // This is also what makes the default-off control observable at EVERY head size. The
+    // dense checks below are head-size tables: at 384/512 they decline on their own, so
+    // the switch looked authoritative there, while at 128/256 -- the two head sizes the
+    // shipping models use -- they accepted and the switch had no effect on the answer.
+    if (ggml_cuda_dsa_attn_requested(dst)) {
+        return false;
+    }
+
     if (cc >= CC_OFFSET_AMD) {
         return precision == GGML_PREC_DEFAULT ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
                                               : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+    }
+
+    // PXA_FA_TILE_512: paired with the identical check in ggml_cuda_flash_attn_ext() above.
+    if (ggml_cuda_fattn_tile_big_armed() && ggml_cuda_fattn_tile_big_is_supported(ctx, dst)) {
+        return true;
     }
 
     if (!fast_fp16_available(cc)) {

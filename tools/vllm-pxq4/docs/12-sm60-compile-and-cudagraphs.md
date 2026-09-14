@@ -88,7 +88,7 @@ died on an exception long before it could produce a wrong answer.
 ## What actually delivered: breakable CUDA graphs
 
 The fork already carries `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
-(`vllm/compilation/breakable_cudagraph.py`), written for the V100 lane. It
+(`vllm/compilation/breakable_cudagraph.py`), written for the V100 build. It
 replaces torch.compile's FX-graph splitting with runtime stream-capture breaks:
 one capture drives the whole forward and intercepts attention / kv-cache custom
 ops at the dispatcher to end the capture, run the op eagerly, and resume. The
@@ -167,7 +167,7 @@ shapes, no sync.
 * The working tree of the fork had an *untested* edit swapping the pure-torch
   KV write for `torch.ops._C_cache_ops.reshape_and_cache_flash`, an op this
   build does not have. It had never run: the serving container predated it.
-  Check `git -C 1cat diff` before trusting that what is running is what is on
+  Check `git -C <fork> diff` before trusting that what is running is what is on
   disk.
 
 ## Where the remaining gap is

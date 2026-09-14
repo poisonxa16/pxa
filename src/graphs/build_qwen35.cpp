@@ -9,6 +9,24 @@
 // lm_head compute output rows only" on prefill. That full-vocab lm_head over every prompt token
 // was the dominant structural MTP prefill tax. Gen/verify batches (n_tokens <= 64) keep full
 // rows for the accept path, exactly as before. Eager mode (lazy resolved off) is byte-unchanged.
+// PXA_MTP_STABLE_OUT_IDS (=0 disables): keep the MTP head's graph SHAPE constant across the two
+// batches a speculative cycle alternates between. The head decodes an N-row update pass (which
+// asks for fewer output rows than it has, so it carries an out_ids row-slice) and then a 1-row
+// draft pass (which asks for one row out of one, so the slice was skipped). Two node counts on one
+// context means the graph allocator's single plan can never cover both: it re-plans - a full
+// backend drain and a compute-buffer reallocation - on every pass, twice per accepted token.
+//
+// Building the slice unconditionally costs two extra get_rows on the 1-row pass, and at one row
+// out of one the slice is the identity, so the values are unchanged; what it buys is one shape,
+// one plan, and no re-plan at all in steady state.
+static bool pxa_mtp_stable_out_ids() {
+    static const bool on = [] {
+        const char * e = getenv("PXA_MTP_STABLE_OUT_IDS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool pxa_mtp_lazy_out_ids(int64_t n_tokens) {
     const bool lazy = llama_pxa_mtp_lazy_warmup();
     if (lazy && n_tokens > 64) {
@@ -32,12 +50,12 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
     ggml_tensor * cur = nullptr;
 
     if (cparams.mtp_op_type != MTP_OP_NONE) {
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
+        // PXA_MTP_BATCH_SLOTS_ROWS_v1: one hidden row per BATCH token, for every MTP op type.
+        // The draft-gen graph used to allocate a single [n_embd] row here because every draft decode
+        // was a 1-row batch; a multi-row draft step then concatenated it against [n_embd, n_tokens]
+        // token embeddings and aborted. See common/pxa-mtp-batch-slots.h. No-op at n_tokens == 1.
+        ggml_tensor * hidden_states_from_main_model =
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
         lctx.inp_mtp_states = hidden_states_from_main_model;
@@ -46,6 +64,11 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
         const auto & mtp_layer = model.layers[il_mtp];
 
         cur = build_qwen35moe_mtp(mtp_layer, hidden_states_from_main_model, n_embd_head, gf, inp_pos);
+        if (cur == nullptr) {
+            // PXA_MTP_DRAFT_CACHE_ONLY: the K/V cache writes are already expanded into the graph and
+            // there is no result tensor by design (the decode requested zero outputs).
+            return gf;
+        }
     } else {
         delta_net delta(lctx, batch);
 
@@ -53,7 +76,9 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
         ggml_tensor * inp_out_ids = (n_tokens > 1 && (!lctx.cparams.mtp || pxa_mtp_lazy_out_ids(n_tokens))) ? build_inp_out_ids() : nullptr; // PXA_MTP_LAZY_WARMUP_v1
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+        // PXA_RS_RING: when armed the tensor carries TWO index vectors -- [0, n_tokens) the write rows
+        // (plane 0, absolute seq_id) and [n_tokens, 2*n_tokens) the read rows. Ring off -> unchanged.
+        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens * (lctx.kv_self.rs_ring_armed() ? 2 : 1));
         cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
         ggml_set_input(lctx.inp_s_seq_qnext);
 
@@ -126,12 +151,12 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
     if (cparams.mtp_op_type != MTP_OP_NONE) {
         // MTP tail-only graph
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
+        // PXA_MTP_BATCH_SLOTS_ROWS_v1: one hidden row per BATCH token, for every MTP op type.
+        // The draft-gen graph used to allocate a single [n_embd] row here because every draft decode
+        // was a 1-row batch; a multi-row draft step then concatenated it against [n_embd, n_tokens]
+        // token embeddings and aborted. See common/pxa-mtp-batch-slots.h. No-op at n_tokens == 1.
+        ggml_tensor * hidden_states_from_main_model =
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
         lctx.inp_mtp_states = hidden_states_from_main_model;
@@ -140,6 +165,9 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         const auto & mtp_layer = model.layers[il_mtp];
 
         cur = build_qwen35_mtp(mtp_layer, hidden_states_from_main_model, n_embd_head, gf, inp_pos);
+        if (cur == nullptr) {
+            return gf; // PXA_MTP_DRAFT_CACHE_ONLY: see build_qwen35moe()
+        }
     } else {
         delta_net delta(lctx, batch);
 
@@ -147,7 +175,9 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         ggml_tensor * inp_out_ids = (n_tokens > 1 && (!lctx.cparams.mtp || pxa_mtp_lazy_out_ids(n_tokens))) ? build_inp_out_ids() : nullptr; // PXA_MTP_LAZY_WARMUP_v1
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+        // PXA_RS_RING: when armed the tensor carries TWO index vectors -- [0, n_tokens) the write rows
+        // (plane 0, absolute seq_id) and [n_tokens, 2*n_tokens) the read rows. Ring off -> unchanged.
+        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens * (lctx.kv_self.rs_ring_armed() ? 2 : 1));
         cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
         ggml_set_input(lctx.inp_s_seq_qnext);
 
@@ -214,8 +244,14 @@ struct ggml_tensor * llm_build_context::build_qwen35moe_mtp(
 
     const int il = hparams.n_layer - 1;
 
-    struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
-    struct ggml_tensor * inp_out_ids = (n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
+    // PXA_MTP_DRAFT_CACHE_ONLY: a K/V-only refresh builds no attention, so it needs no KQ mask --
+    // and not building it also removes the O(n_tokens * n_kv) host-side mask fill from the step.
+    const bool store_only = cparams.mtp_op_type == MTP_OP_KV_ONLY;
+
+    struct ggml_tensor * KQ_mask = store_only ? nullptr : build_inp_KQ_mask();
+    const bool want_out_ids = !store_only && n_outputs > 0 &&
+                              (pxa_mtp_stable_out_ids() ? true : (n_tokens > 1 && n_outputs < n_tokens));
+    struct ggml_tensor * inp_out_ids = want_out_ids ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * token_emb = build_inp_embd_mtp(model.tok_embd);
 
@@ -309,6 +345,17 @@ struct ggml_tensor * llm_build_context::build_qwen35moe_mtp(
     // proper per-device reduce (row-selected per device + residual row-selected per device), so the MoE
     // FFN sees a REDUCE input and stays concurrency/device-coherent. Intrinsic to the split head (NOT an
     // offload artifact): the cross-device read exists with or without --n-cpu-moe.
+    if (store_only) {
+        // K/V projection + rotation + cache write, and nothing else. The head's own KV is what the
+        // next real draft attends to; the logits and hidden rows this pass would otherwise produce
+        // are not read by anyone (see common/pxa-mtp-cache-only.h for the gate).
+        build_std_attention(gf, mtp_layer.attn_norm, cur,
+                inp_pos, nullptr, nullptr,
+                nullptr, nullptr, nullptr,
+                kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr, /* store_only = */ true);
+        return nullptr;
+    }
+
     cur = build_std_attention(gf, mtp_layer.attn_norm, cur,
             inp_pos, inp_out_ids, nullptr,
             KQ_mask, nullptr, nullptr,
@@ -332,6 +379,19 @@ struct ggml_tensor * llm_build_context::build_qwen35moe_mtp(
     cb(cur, "ffn_out", il);
 
     cb(cur, "result_norm", -1);
+    // PXA_MTP_READBACK_v1: this row IS the head's conditioning hidden for the next draft step --
+    // mtp_accept_batch and the draft loop both read it back with llama_get_embeddings_ith() and
+    // feed it to the following MTP_OP_DRAFT_GEN decode. Without the output flag ggml-alloc is free
+    // to hand its buffer to a later node once the head's own lm_head has consumed it, and the D2H
+    // copy in llama_decode() then reads whatever landed there. That is exactly what happened on the
+    // multi-row accepted-token commit: the logits were right (they are computed before the reuse)
+    // while the hidden came back orthogonal to the true row -- so the free carried token was good
+    // and every chain conditioned on it collapsed. The trunk graph already protects its own feature
+    // row this way (build_qwen35moe/build_qwen35: ggml_set_output(inpL) under "result_mtp_embd");
+    // the head's row was the one left unprotected.
+    if (llama_pxa_mtp_head_output()) { // PXA_MTP_HEAD_OUTPUT=0 reproduces the stale read-back (debug only)
+        ggml_set_output(cur);
+    }
 
     cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb, false);
     cb(cur, "result_output", -1);
@@ -348,9 +408,14 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
 
     const int il = hparams.n_layer - 1;
 
-    struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+    // PXA_MTP_DRAFT_CACHE_ONLY: see build_qwen35moe_mtp
+    const bool store_only = cparams.mtp_op_type == MTP_OP_KV_ONLY;
 
-    struct ggml_tensor * inp_out_ids = (n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
+    struct ggml_tensor * KQ_mask = store_only ? nullptr : build_inp_KQ_mask();
+
+    const bool want_out_ids = !store_only && n_outputs > 0 &&
+                              (pxa_mtp_stable_out_ids() ? true : (n_tokens > 1 && n_outputs < n_tokens));
+    struct ggml_tensor * inp_out_ids = want_out_ids ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * token_emb = build_inp_embd_mtp(model.tok_embd);
 
@@ -389,6 +454,15 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     // row-select happens PER-DEVICE inside the attention reduce, keeping the output a per-device REDUCE
     // for the split dense FFN (llm_build_ffn also reads input->src[id] via get_input_tensor_sm_graph).
     // The old external ggml_get_rows() collapsed the reduce to a single-device GET_ROWS read cross-device.
+    if (store_only) {
+        // K/V projection + rotation + cache write, and nothing else
+        build_std_attention(gf, mtp_layer.attn_norm, cur,
+                inp_pos, nullptr, nullptr,
+                nullptr, nullptr, nullptr,
+                kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr, /* store_only = */ true);
+        return nullptr;
+    }
+
     cur = build_std_attention(gf, mtp_layer.attn_norm, cur,
             inp_pos, inp_out_ids, nullptr,
             KQ_mask, nullptr, nullptr,
@@ -410,6 +484,19 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     // As far as I can tell this was wrong. We need the FFN output, and not the normalized result.
     //cur = llm_build_norm(ctx0, cur, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il);
     cb(cur, "result_norm", -1);
+    // PXA_MTP_READBACK_v1: this row IS the head's conditioning hidden for the next draft step --
+    // mtp_accept_batch and the draft loop both read it back with llama_get_embeddings_ith() and
+    // feed it to the following MTP_OP_DRAFT_GEN decode. Without the output flag ggml-alloc is free
+    // to hand its buffer to a later node once the head's own lm_head has consumed it, and the D2H
+    // copy in llama_decode() then reads whatever landed there. That is exactly what happened on the
+    // multi-row accepted-token commit: the logits were right (they are computed before the reuse)
+    // while the hidden came back orthogonal to the true row -- so the free carried token was good
+    // and every chain conditioned on it collapsed. The trunk graph already protects its own feature
+    // row this way (build_qwen35moe/build_qwen35: ggml_set_output(inpL) under "result_mtp_embd");
+    // the head's row was the one left unprotected.
+    if (llama_pxa_mtp_head_output()) { // PXA_MTP_HEAD_OUTPUT=0 reproduces the stale read-back (debug only)
+        ggml_set_output(cur);
+    }
 
     //cur = build_output(lctx, ctx0, cur, model.output, nullptr, cb);
     cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb, false);

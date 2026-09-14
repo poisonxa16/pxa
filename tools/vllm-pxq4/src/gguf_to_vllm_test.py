@@ -1,4 +1,4 @@
-"""gguf_to_vllm_test.py — CPU-only test suite for the converter. No GPU, no DGX, no lease.
+"""gguf_to_vllm_test.py — CPU-only test suite for the converter. No GPU, no GPU.
 
 Run:  python3 gguf_to_vllm_test.py            (from the impl/ directory)
 

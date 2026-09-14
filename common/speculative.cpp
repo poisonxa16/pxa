@@ -1,4 +1,7 @@
 #include "speculative.h"
+#include "pxa-mtp-batch-slots.h"
+#include "pxa-mtp-cache-only.h"
+#include "pxa-mtp-kvpos.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -14,6 +17,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <set>
 #include <unordered_map>
 
 // ============================================================================
@@ -162,6 +166,29 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_SUFFIX
 };
 
+// PXA_SPEC_NGRAM_ALIAS_v1 (2026-09-09) -- one word for the drafter a model without an MTP head
+// can actually use.
+//
+// The self-speculation family below is six separate spellings of "guess the next tokens from
+// tokens already in the context": ngram_simple, ngram_map_k, ngram_map_k4v, ngram_mod,
+// ngram_cache and suffix. A user who loads a plain dense GGUF -- which has no MTP head, so the
+// engine's fastest drafter is not available to them at all -- has no way to know which of the six
+// to name, and picking wrong is the difference between a measured win and a measured loss. So
+// `--spec-type ngram` (or `prompt-lookup`, the name the technique is published under) resolves to
+// the variant this campaign MEASURED best, and carries that variant's measured knobs with it.
+//
+// Two properties this alias deliberately keeps:
+//   * It is an ALIAS, not a type. common_speculative_type_to_str() still prints the CONCRETE
+//     variant, so a boot log always says what actually ran and no number is ever filed against a
+//     name that does not exist in the enum.
+//   * It fills only ABSENT knobs. `--spec-type ngram:n_max=8` gets 8, and every key the user names
+//     wins, exactly like the PXA_AUTO layer's contract.
+//
+// The target and its defaults are one edit, on purpose: when a measurement overturns the ranking,
+// this table moves and nothing else does.
+static constexpr enum common_speculative_type COMMON_SPECULATIVE_NGRAM_ALIAS_TARGET =
+    COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
@@ -172,8 +199,54 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
-    {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX}
+    {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX},
+    // aliases -- resolved to a concrete variant above, never printed back
+    {"ngram",         COMMON_SPECULATIVE_NGRAM_ALIAS_TARGET},
+    {"prompt_lookup", COMMON_SPECULATIVE_NGRAM_ALIAS_TARGET}
 };
+
+// the set of spellings that are aliases rather than types -- the stage parser asks, so that it
+// knows whether it may fill the measured defaults below.
+static const std::set<std::string> common_speculative_type_alias_names = {
+    "ngram", "prompt_lookup"
+};
+
+bool common_speculative_type_name_is_alias(const std::string & name) {
+    std::string normalized = name;
+    std::replace(normalized.begin(), normalized.end(), '-', '_');
+    return common_speculative_type_alias_names.count(normalized) > 0;
+}
+
+// The measured knobs the alias carries, per concrete target. Sources are named so a future edit
+// has to argue with a number rather than with a preference.
+void common_speculative_apply_alias_defaults(common_speculative_stage_params & stage) {
+    switch (stage.type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+            // n_max=4, n_min=2 is the pair the PXA_AUTO layer already ships for qwen35moe, where it
+            // measured +23.0% first-request decode on code traffic (24.44 -> 30.05 t/s) and +4.6%
+            // on prose, prefill-neutral. n_min=2 is the load-bearing half: it makes a one-token
+            // match fall through instead of paying for a verify batch.
+            if (!stage.has_n_max_override())        { stage.n_max        = 4; }
+            if (!stage.has_n_min_override())        { stage.n_min        = 2; }
+            // ngram_mod hashes WITHOUT collision detection, so the hash width is a quality knob:
+            // the implementation warns below 16 and the global default is 12. The alias is the
+            // beginner's spelling, so it takes the width the implementation asks for.
+            if (!stage.has_ngram_size_n_override()) { stage.ngram_size_n = 16; }
+            break;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+            // the map keeps up to four continuations per key and filters by hit count, so it is
+            // exact where ngram_mod is lossy; its size knobs keep their stock values (12/48) and
+            // only the draft shape is filled.
+            if (!stage.has_n_max_override())        { stage.n_max        = 4; }
+            if (!stage.has_n_min_override())        { stage.n_min        = 2; }
+            break;
+        default:
+            if (!stage.has_n_max_override())        { stage.n_max        = 4; }
+            if (!stage.has_n_min_override())        { stage.n_min        = 2; }
+            break;
+    }
+}
 
 struct common_speculative_config {
     common_speculative_stage_params stage;
@@ -293,6 +366,14 @@ struct common_speculative_state {
     }
 
     virtual void accept(uint16_t n_accepted) = 0;
+
+    // PXA_SLOT_ERASE_SPEC_HARD_v1 (2026-09-14): unconditionally drop any persistent table this
+    // stage keeps BEYOND what begin()/begin_seq() already clear per generation. begin() resets
+    // the per-generation bookkeeping (i_last, n_draft_last, the low-acceptance streak) but a
+    // stage's learned map (e.g. common_ngram_mod's hashed entries) is deliberately left across
+    // generations to stay warm within one slot's lifetime -- until a slot ERASE says that slot's
+    // lifetime, and everything it learned, is over. Default no-op: most stages have no such table.
+    virtual void hard_reset() {}
 };
 
 struct common_speculative_state_mtp;
@@ -319,9 +400,179 @@ static int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch
 // bit-identical to baseline. When ON, the per-cycle draft depth K is chosen from a running
 // acceptance EMA (raise K when drafts land, shrink toward 1 when they get rejected) so a
 // near-certain-reject tail draft does not cost an MTP-head forward + a wider verify pass.
+// PXA_MTP_ZERO_OUTPUT_COMMIT (2026-09-09; ):
+// split the commit decode's two jobs the way mainline llama.cpp does.
+//
+// Our accepted-token commit does two things in one decode: it advances the MTP head's K/V over the
+// verified positions, AND it produces one logit so the next cycle's first draft token can be
+// sampled for free. Because of the second job the batch has to ask for an output, so the whole head
+// runs for every row -- the FFN and a 248320-row LM-head GEMV over rows that nobody reads.
+//
+// Mainline splits them: its catch-up decode sets logits = 0 on EVERY row (n_outputs == 0, so the
+// row-select gathers nothing and the FFN and LM head compute nothing), and its draft loop then
+// re-decodes the last position as its own step 0 to get the logit. The trade is one extra 1-row MTP
+// decode (~2.9 ms measured) against a full-graph pass over 1+A rows collapsed to a K/V-only one.
+//
+// With the lever ON: the commit batch asks for no outputs, the last-row embedding read-back is
+// skipped, and the cached free token stays absent -- so mtp_speculative_gen_draft() takes its
+// i0 == 0 path and re-decodes the row at n_past itself. That row is committed history under
+// PXA_MTP_KVPOS_v1, and the i0 == 0 pre-loop seq_rm added there is what makes rewriting it safe.
+// The K/V arithmetic is identical either way (same hidden row, same token, same position), so the
+// cache the drafter attends to is unchanged; only which decode produces the first logit moves.
+//
+// DEFAULT OFF: the window measures it as an arm. It is also the caller-side half of the split --
+// with zero outputs our graph already collapses the FFN and the LM head (build_qwen35_mtp builds
+// inp_out_ids whenever n_tokens > 1 && n_outputs < n_tokens), but the query projection and the
+// attention still run. The MTP_OP_KV_ONLY / store_only graph (introduced 2026-09-08) is what
+// removes those, and it composes with this as a one-line change to that graph's own
+// wants_output condition.
+// -1 = not resolved yet, 0 = off, 1 = on. Resolved from the env on first read, or set earlier by
+// the PXA_AUTO layer for a family that measured it (common_speculative_mtp_zero_output_commit_set_default).
+static int pxa_mtp_zero_output_commit_state = -1;
+
+bool common_speculative_mtp_zero_output_commit() {
+    if (pxa_mtp_zero_output_commit_state < 0) {
+        const char * env = getenv("PXA_MTP_ZERO_OUTPUT_COMMIT");
+        pxa_mtp_zero_output_commit_state = (env && atoi(env) != 0) ? 1 : 0;
+    }
+    return pxa_mtp_zero_output_commit_state == 1;
+}
+
+void common_speculative_mtp_zero_output_commit_set_default(bool on) {
+    // An explicit PXA_MTP_ZERO_OUTPUT_COMMIT always wins over an auto-armed default; the operator
+    // naming the lever has decided. Called once, before any decode, from the server's PXA_AUTO block.
+    if (getenv("PXA_MTP_ZERO_OUTPUT_COMMIT")) {
+        return;
+    }
+    pxa_mtp_zero_output_commit_state = on ? 1 : 0;
+}
+
+// PXA_MTP_PMIN_TOPK_v1: WHICH probability the MTP confidence floor compares against.
+//
+// The floor was inherited from draft-MODEL speculation, where a proposal costs a whole second
+// forward pass. It was applied here to a FULL-VOCABULARY softmax of the head's argmax, and on a
+// 248320-token vocabulary that number has mean 0.036 and clears 0.75 in 0.0 % of draft steps
+// (measured 2026-09-08) -- so the stock 0.75 floor was not a confidence
+// filter, it was an off switch, and it is why n_max was unreachable before PXA_MTP_KVPOS_v1's
+// sibling fix. Compare the same quantity a top_k = 10 sampler chain would report for its first
+// candidate instead, which is what the upstream llama.cpp drafter compares
+// (common/speculative.cpp: it samples through a top_k = 10 chain and tests cur_p->data[0].p).
+//
+// Default 10. At the family's own auto default (p_min = 0) nothing computes a probability at all,
+// so this is INERT on the shipping path -- it changes only the runs that arm a floor
+// (PXA_MTP_PMIN=X, --spec-type mtp:...,p_min=X, a per-request speculative.p_min, or any family
+// that still inherits the 0.75 global) and the PXA_MTP_STATS histograms, which deliberately
+// report the same quantity the floor compares so the instrument measures what the knob does.
+// It is also cheaper: 10 exponentials per draft step instead of 248320.
+//   PXA_MTP_PMIN_TOPK=0   the historical full-vocabulary softmax
+//   PXA_MTP_PMIN_TOPK=k   renormalise over the k largest logits (k clamped to 64)
+//   PXA_REFERENCE=1       resolves to 0, like every other level-gated lever
+static int pxa_mtp_pmin_topk() {
+    static const int k = [](){
+        const char * e = getenv("PXA_MTP_PMIN_TOPK");
+        if (e) {
+            const int v = atoi(e);
+            return v < 0 ? 0 : (v > COMMON_SAMPLER_PMIN_TOPK_MAX ? COMMON_SAMPLER_PMIN_TOPK_MAX : v);
+        }
+        return ggml_pxa_config_level() >= 1 ? 10 : 0;
+    }();
+    return k;
+}
+
 static bool pxa_mtp_adaptive_k_enabled() {
     static const int v = getenv("PXA_MTP_ADAPTIVE_K") ? atoi(getenv("PXA_MTP_ADAPTIVE_K")) : 0;
     return v != 0;
+}
+
+// PXA_MTP_STATS (2026-09-08): per-cycle accounting of the MTP self-speculation
+// loop, so the reason a draft chain is SHORT is measurable instead of inferred. Off by default
+// (one getenv-cached bool); PXA_MTP_STATS=1 turns it on, PXA_MTP_STATS_EVERY (default 200) sets
+// the dump period, and a final dump is emitted from common_speculative_print_stats().
+// Per cycle we record: how many tokens were proposed, why the chain stopped (the cached token's
+// probability gate, the in-loop p_min gate, reaching n_max, or a decode/embedding failure), the
+// top-1 probability of every drafted token, the wall time of the draft call, and -- fed from
+// accept() -- how many of those tokens the target then accepted.
+struct pxa_mtp_stats_t {
+    bool     on    = false;
+    int      every = 200;
+    uint64_t cycles        = 0;
+    uint64_t drafted       = 0;
+    uint64_t accepted      = 0;
+    uint64_t accept_calls  = 0;
+    uint64_t mtp_decodes   = 0;
+    uint64_t draft_us      = 0;
+    double   p_sum         = 0.0;
+    uint64_t p_n           = 0;
+    uint64_t p_ge_075      = 0;   // drafted steps whose top-1 prob would clear the stock p_min
+    uint64_t len_hist[9]   = {0}; // proposed chain length, 0..8+
+    uint64_t acc_hist[9]   = {0}; // accepted tokens per verify, 0..8+
+    uint64_t trunc_cached  = 0;   // chain collapsed to 1 by the cached token's prob < p_min
+    uint64_t trunc_pmin    = 0;   // in-loop p_min break
+    uint64_t trunc_nmax    = 0;   // ran the full n_max chain
+    uint64_t trunc_fail    = 0;   // llama_decode / embeddings failure
+    uint64_t since_dump    = 0;
+    pxa_mtp_stats_t() {
+        on    = getenv("PXA_MTP_STATS") && atoi(getenv("PXA_MTP_STATS")) != 0;
+        every = getenv("PXA_MTP_STATS_EVERY") ? std::max(1, atoi(getenv("PXA_MTP_STATS_EVERY"))) : 200;
+    }
+};
+
+static pxa_mtp_stats_t & pxa_mtp_stats() {
+    static pxa_mtp_stats_t s;
+    return s;
+}
+
+static void pxa_mtp_stats_dump(const char * why) {
+    auto & st = pxa_mtp_stats();
+    if (!st.on || st.cycles == 0) {
+        return;
+    }
+    std::string lh, ah;
+    for (int i = 0; i < 9; ++i) {
+        lh += (i ? "," : "") + std::to_string((unsigned long long) st.len_hist[i]);
+        ah += (i ? "," : "") + std::to_string((unsigned long long) st.acc_hist[i]);
+    }
+    const double d_mean = (double) st.drafted  / (double) st.cycles;
+    const double a_mean = st.accept_calls ? (double) st.accepted / (double) st.accept_calls : 0.0;
+    const double a_rate = st.drafted ? (double) st.accepted / (double) st.drafted : 0.0;
+    const double p_mean = st.p_n ? st.p_sum / (double) st.p_n : -1.0;
+    const double p_hi   = st.p_n ? 100.0 * (double) st.p_ge_075 / (double) st.p_n : -1.0;
+    LOG_WRN("PXA_MTP_STATS[%s]: cycles=%llu proposed=%llu (mean %.3f/cycle) accepted=%llu "
+            "(mean %.3f/verify, accept_rate %.3f) mtp_decodes=%llu draft=%.3f ms/cycle | "
+            "len_hist[0..8+]=%s acc_hist[0..8+]=%s | stop: cached_pmin=%llu pmin=%llu nmax=%llu fail=%llu | "
+            "top1_p mean=%.3f, %%>=0.75 = %.1f\n",
+            why,
+            (unsigned long long) st.cycles, (unsigned long long) st.drafted, d_mean,
+            (unsigned long long) st.accepted, a_mean, a_rate,
+            (unsigned long long) st.mtp_decodes,
+            st.cycles ? (double) st.draft_us / (double) st.cycles / 1000.0 : 0.0,
+            lh.c_str(), ah.c_str(),
+            (unsigned long long) st.trunc_cached, (unsigned long long) st.trunc_pmin,
+            (unsigned long long) st.trunc_nmax,   (unsigned long long) st.trunc_fail,
+            p_mean, p_hi);
+}
+
+// PXA_MTP_STATS: close one draft cycle. `stop` is 0 cached-token p_min collapse, 1 in-loop p_min
+// break, 2 the full n_max chain, 3 a decode/embedding failure.
+static void pxa_mtp_stats_record(pxa_mtp_stats_t & st, int64_t t0, size_t n_drafted, int n_decode, int stop) {
+    if (!st.on) {
+        return;
+    }
+    st.cycles      += 1;
+    st.drafted     += n_drafted;
+    st.mtp_decodes += (uint64_t) (n_decode > 0 ? n_decode : 0);
+    st.draft_us    += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t0);
+    st.len_hist[n_drafted < 8 ? n_drafted : 8] += 1;
+    switch (stop) {
+        case 0:  st.trunc_cached += 1; break;
+        case 1:  st.trunc_pmin   += 1; break;
+        case 3:  st.trunc_fail   += 1; break;
+        default: st.trunc_nmax   += 1; break;
+    }
+    if (++st.since_dump >= (uint64_t) st.every) {
+        st.since_dump = 0;
+        pxa_mtp_stats_dump("running");
+    }
 }
 
 struct mtp_last_embd {
@@ -442,6 +693,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
     }
 
     void accept(uint16_t n_accepted) override {
+        // PXA_MTP_STATS: the target has just told us how many of the proposed tokens it kept.
+        if (auto & st = pxa_mtp_stats(); st.on) {
+            st.accepted     += n_accepted;
+            st.accept_calls += 1;
+            st.acc_hist[n_accepted < 8 ? n_accepted : 8] += 1;
+        }
         // PXA_MTP_ADAPTIVE_K: fold the realized accept ratio into the running EMA that drives K.
         if (pxa_mtp_adaptive_k_enabled() && pxa_ak_drafted > 0) {
             float f = (float) n_accepted / (float) pxa_ak_drafted;
@@ -951,6 +1208,18 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
             }
         }
     }
+
+    // PXA_SLOT_ERASE_SPEC_HARD_v1: the entries mod.add() accumulates are exactly the "warm map"
+    // that lets a second identical request draft longer than the first (begin() only re-hashes
+    // the current prompt INTO the same table; it does not clear it, by design, so the table stays
+    // useful across a slot's own follow-up turns). A slot ERASE ends that lifetime, so the table
+    // -- and the adaptive streak state that rides beside it -- must go with it.
+    void hard_reset() override {
+        mod.reset();
+        i_last       = 0;
+        n_draft_last = 0;
+        n_low        = 0;
+    }
 };
 
 struct common_speculative_state_ngram_cache : public common_speculative_state {
@@ -1191,6 +1460,48 @@ static bool common_speculative_stage_chain_matches(
     return true;
 }
 
+// PXA_MTP_PMIN_v1 (2026-09-08; DEFAULT REVERTED 2026-09-09): resolve
+// the confidence floor for an MTP stage that carries no explicit `p_min=` in its --spec-type entry.
+//
+// The floor decides how long a draft chain may get: mtp_speculative_gen_draft() stops at the first
+// token whose FULL-VOCAB softmax top-1 probability falls under it, and collapses the whole chain to
+// the single cached token when the carried-over token is under it. Our stock draft default is 0.75
+// (COMMON_SPEC_P_MIN_DEFAULT); upstream's own MTP drafter defaults the same knob to 0.0.
+//
+// MEASURED, 2026-09-09 (2x V100-16GB, Qwen3.8-27B PXQ4, decode 256 np1,
+// median of 3; measured 2026-09-08):
+//
+//   plain 36.73 t/s | p_min=0.75: n1 44.71  n2 42.71  n3 42.84  n4 42.35
+//                   | p_min=0.00: n1 44.75  n2 35.11  n3 29.55  n4 28.94
+//
+// Dropping the floor did exactly what it claimed -- the proposed-length histogram moved from "1 in
+// 100% of cycles" to "n_max in 100% of cycles" -- and it made the engine SLOWER at every depth
+// above 1, because the target accepted a depth->=2 proposal in only 9 of 388 verifies (2.3%). The
+// deep chain is not paying for itself while the MTP KV rows the draft attends to are one position
+// out (PXA_MTP_KVPOS_v1, below). So the default goes back to the stock floor -- which at the shipped
+// n_max=1 is inert anyway (a chain of 1 cannot be truncated below 1) -- and 0.0 stays one env var
+// away as the lab value that re-runs the experiment once the alignment fix has been measured.
+//
+//   unset            -> inherit the global p_min (0.75 stock) -- the measured-best default
+//   PXA_MTP_PMIN=0   -> no floor: propose the full n_max every cycle (the 2026-09-08 experiment)
+//   PXA_MTP_PMIN=X   -> any explicit floor
+//   PXA_MTP_PMIN=-1  -> inherit the global p_min (identical to unset; kept so the lever's
+//                       "inherit" spelling keeps working for scripts that already use it)
+//
+// An explicit `--spec-type mtp:...,p_min=X` always wins over all of the above, and so does a
+// per-request `speculative.p_min`.
+static float pxa_mtp_stage_p_min(float inherited) {
+    static const char * env     = getenv("PXA_MTP_PMIN");
+    static const bool   has_env = env != nullptr;
+    static const float  env_val = has_env ? (float) atof(env) : 0.0f;
+
+    if (has_env) {
+        return env_val < 0.0f ? inherited : env_val;
+    }
+
+    return inherited;
+}
+
 static common_params_speculative common_speculative_get_runtime_params(
         const common_speculative_config & config,
         const common_params_speculative & params,
@@ -1201,6 +1512,11 @@ static common_params_speculative common_speculative_get_runtime_params(
     result.n_max = stage.has_n_max_override() ? stage.n_max : params.n_max;
     result.n_min = stage.has_n_min_override() ? stage.n_min : params.n_min;
     result.p_min = stage.has_p_min_override() ? stage.p_min : params.p_min;
+
+    // PXA_MTP_PMIN_v1: the MTP self-speculation stage does not inherit the draft-model floor.
+    if (config.type == COMMON_SPECULATIVE_TYPE_MTP && !stage.has_p_min_override()) {
+        result.p_min = pxa_mtp_stage_p_min(result.p_min);
+    }
 
     if (config.type == COMMON_SPECULATIVE_TYPE_SUFFIX) {
         result.suffix_min_match_len = stage.has_suffix_min_match_len_override()
@@ -1318,6 +1634,56 @@ common_speculative * common_speculative_init(
         return nullptr;
     }
 
+    // PXA_CKPT_BUDGET: a recurrent target checkpoints every speculation window, and the per-step
+    // checkpoint buffers scale linearly with the draft length - 378+227 MiB at 5 tokens, 5988+3593
+    // at 65 on a 2x16 GB pair with Qwen3.8-27B PXQ4. Auto mode used to claim them whenever the
+    // allocation merely fitted, leaving one card with ~0.7 GB and killing the first sizeable
+    // compute-pool allocation a dozen cycles later. Ask what the context can AFFORD before the
+    // drafters are built, and clamp the chain to it: a draft length the checkpoint cannot carry is
+    // not a faster draft, it is an out-of-memory a minute later.
+    // Only the per-step mode claims the buffers the budget is about; gpu-fallback and cpu keep
+    // small shadows whatever the draft length is, so clamping the chain for them would cost draft
+    // depth for nothing.
+    const bool pxa_ckpt_budget_applies = params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_AUTO ||
+                                         params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_PER_STEP;
+    if (pxa_ckpt_budget_applies && llama_model_has_recurrent(llama_get_model(ctx_tgt))) {
+        const int want   = std::max(1, params.get_max_stage_n_max() + 1);
+        const int afford = llama_spec_ckpt_budget_max_tokens(ctx_tgt, want);
+        // Print it every boot, clamp or no clamp: which capacity a run actually got is not
+        // otherwise visible anywhere, and two arms that differ only in it have been compared as
+        // if they were like for like.
+        const int eff_n_max = afford >= 2 ? std::min(want - 1, afford - 1) : want - 1;
+        LOG_INF("%s: recurrent checkpoint budget: the chain drafts up to %d tokens (capacity %d), "
+                "this context can checkpoint %d -> effective n_max = %d\n",
+                __func__, want - 1, want, afford, eff_n_max);
+        if (afford >= 2 && afford < want) {
+            const int32_t cap = afford - 1;
+            LOG_INF("%s: recurrent checkpoint budget: the chain asks to draft %d tokens, this context can "
+                    "checkpoint %d - every stage is clamped to n_max=%d\n",
+                    __func__, want - 1, afford, cap);
+            if (params.n_max > cap) {
+                params.n_max = cap;
+            }
+            for (auto & st : params.stages) {
+                // effective n_max of a stage: its own override, else the global draft length
+                if ((st.has_n_max_override() ? st.n_max : params.n_max) > cap) {
+                    st.n_max = cap;
+                }
+            }
+            if (params.n_min > cap) {
+                params.n_min = cap;
+            }
+            for (auto & st : params.stages) {
+                if (st.n_min > cap) {
+                    st.n_min = cap;
+                }
+            }
+        } else if (afford < 2) {
+            LOG_WRN("%s: recurrent checkpoint budget: this context cannot afford even a two-token per-step "
+                    "checkpoint; the checkpoint mode is left to resolve itself\n", __func__);
+        }
+    }
+
     const auto stages = params.get_resolved_stages();
     if (params.model_dft && llama_model_is_gemma4_mtp_assistant(params.model_dft)) {
         const bool has_draft_stage = std::any_of(stages.begin(), stages.end(), [](const common_speculative_stage_params & stage) {
@@ -1366,6 +1732,27 @@ common_speculative * common_speculative_init(
             if (stage_params.ngram_size_n < 16) {
                 LOG_WRN("%s: ngram_mod n=%d is too small - poor quality is possible, see: https://github.com/ggml-org/llama.cpp/pull/19164\n", __func__, stage_params.ngram_size_n);
             }
+        }
+
+        // PXA_MTP_PMIN_v1: make the resolved MTP confidence floor visible in the boot log -- it is
+        // what actually decides the draft chain length, and it is not printed anywhere else.
+        if (stage.type == COMMON_SPECULATIVE_TYPE_MTP) {
+            const float pxa_p_min = stage.has_p_min_override()
+                ? stage.p_min
+                : pxa_mtp_stage_p_min(params.p_min);
+            const int pxa_topk = pxa_mtp_pmin_topk();
+            LOG_INF("%s: MTP stage: n_max=%d, p_min=%.3f (%s), p_min compares %s%s\n", __func__,
+                    stage.has_n_max_override() ? stage.n_max : params.n_max,
+                    (double) pxa_p_min,
+                    stage.has_p_min_override() ? "explicit p_min (CLI or PXA_AUTO)" :
+                    (getenv("PXA_MTP_PMIN") ? "PXA_MTP_PMIN" : "stock floor, measured best 2026-09-09"),
+                    // PXA_MTP_PMIN_TOPK_v1: the floor's SCALE is as decisive as its value -- 0.75 on a
+                    // full-vocab softmax over 248320 tokens is an off switch, 0.75 over 10 candidates
+                    // is a filter. Print which one is armed next to the number it is compared with.
+                    pxa_topk >= 2 ? "the top-" : "the FULL-VOCABULARY softmax",
+                    pxa_topk >= 2 ? (std::to_string(pxa_topk) + "-renormalised probability"
+                                     + (getenv("PXA_MTP_PMIN_TOPK") ? " (PXA_MTP_PMIN_TOPK)" : "")).c_str()
+                                  : (getenv("PXA_MTP_PMIN_TOPK") ? " (PXA_MTP_PMIN_TOPK=0)" : " (PXA_REFERENCE)"));
         }
 
         configs.push_back(common_speculative_config(stage, stage_params));
@@ -1544,6 +1931,21 @@ void common_speculative_begin_seq(common_speculative * spec, llama_seq_id seq_id
             impl->begin(prompt);
         }
         impl->n_call_begin++;
+    }
+}
+
+// PXA_SLOT_ERASE_SPEC_HARD_v1 (2026-09-14): full teardown of every impl's persistent state, for a
+// slot ERASE. Distinct from begin()/begin_seq(), which run at the start of every generation and
+// deliberately leave a stage's learned table (e.g. common_ngram_mod) in place so it stays warm
+// across a slot's own follow-up turns -- that table is what an erase must actually clear, since
+// the slot's next occupant should not draft against the previous occupant's learned map.
+void common_speculative_hard_reset(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->hard_reset();
     }
 }
 
@@ -1832,8 +2234,12 @@ bool common_speculative_capture_output_hidden(
         return true;
     }
 
+    // PXA_MTP_HIDDEN_BY_BATCH_ROW_v1: `output_index` is, and always was, a RAW BATCH ROW at every
+    // caller (the server passes slot.i_batch - i, and ensure_sequence_hidden passes -1 for "the last
+    // row produced"). It is read as one now, and refused when the target's embedding buffer is not
+    // dense by batch row, instead of silently answering from another token's row.
     common_speculative_feature_view features;
-    if (!llama_spec_get_hidden_feature_view_from_output_index(ctx, output_index, seq_id, pos, features)) {
+    if (!llama_spec_get_hidden_feature_view_from_batch_row(ctx, output_index, seq_id, pos, features)) {
         return false;
     }
 
@@ -1945,30 +2351,43 @@ bool common_speculative_copy_output_hidden_rows(
         return true;
     }
 
-    return llama_spec_copy_hidden_rows_from_output_indices(ctx, output_indices, hidden_rows);
+    // PXA_MTP_HIDDEN_BY_BATCH_ROW_v1: these are the verify batch's own row indices (slot.i_batch_dft,
+    // or {0..n-1} of a checkpoint re-decode), i.e. RAW BATCH ROWS.
+    return llama_spec_copy_hidden_rows_from_batch_rows(ctx, output_indices, hidden_rows);
 }
 
+// PXA_MTP_KVPOS_v1 (2026-09-09): the tokens an accepted verify step commits to the
+// MTP head's K/V cache, paired row-for-row with the target hidden rows captured for that step.
+//
+// Hidden row i is h_{pos_base+i} (the target's output at verify row i, whose token sits at position
+// pos_base+i), and the MTP row it belongs to is (h_{q-1}, x_q) at q = pos_base+i+1 -- so row i takes
+// ids[i], the token the target produced at that verify row, and is written at
+// pxa_mtp_commit_pos(pos_base, i). One shape for every stage type.
+//
+// BEFORE this fix the two stage types disagreed, and BOTH were off by one, differently:
+//   * MTP-drafted steps used ids (the right pairing) but wrote them at pos_base+i -- one position
+//     LOW, which is the defect measured 2026-09-08;
+//   * steps drafted by another stage of a composite chain (ngram + mtp) shifted the TOKENS instead
+//     -- [sampled_before, ids[0..n-2]] at pos_base+i -- writing (h_q, x_q) at q: the position was
+//     right but the pair was the unshifted one, exactly the "one-token conditioning skew" the
+//     prompt warm-up shifts its hidden rows to avoid. Its last row then seeded the cached free
+//     draft token with a prediction of a token the sequence already had.
+// `sampled_before` is retained in the signature (and in the request struct the batched path fills)
+// because it is the caller's own record of the step; the K/V pairing no longer needs it.
 static bool common_speculative_build_commit_tokens(
         common_speculative_type spec_type_used,
         llama_token sampled_before,
         const std::vector<llama_token> & ids,
         std::vector<llama_token> & commit_tokens) {
+    GGML_UNUSED(spec_type_used);
+    GGML_UNUSED(sampled_before);
+
     commit_tokens.clear();
     if (ids.empty()) {
         return true;
     }
 
-    if (spec_type_used == COMMON_SPECULATIVE_TYPE_MTP) {
-        commit_tokens = ids;
-        return true;
-    }
-
-    commit_tokens.reserve(ids.size());
-    commit_tokens.push_back(sampled_before);
-    if (ids.size() > 1) {
-        commit_tokens.insert(commit_tokens.end(), ids.begin(), ids.end() - 1);
-    }
-
+    commit_tokens = ids;
     return commit_tokens.size() == ids.size();
 }
 
@@ -1988,14 +2407,21 @@ static bool common_speculative_apply_hidden_rows(
         return false;
     }
 
+    // PXA_MTP_KVPOS_v1: row i holds (hidden row i, ids[i]) and belongs at ids[i]'s OWN position,
+    // pos_base + 1 + i -- not at pos_base + i, which put every committed row one position low and
+    // left the newest position empty for the next draft to attend across. The feature view is keyed
+    // by position (common_speculative_feature_view_copy_batch_rows looks each batch row up by
+    // batch.pos[i]), so it is built at the same base or the copy finds nothing.
+    const llama_pos commit_pos0 = pxa_mtp_commit_pos0(pos_base);
+
     llama_batch accepted_batch = llama_batch_init(ids.size(), 0, 1);
     for (size_t i = 0; i < ids.size(); ++i) {
-        common_batch_add(accepted_batch, ids[i], pos_base + (llama_pos) i, { seq_id }, true);
+        common_batch_add(accepted_batch, ids[i], pxa_mtp_commit_pos(pos_base, (int32_t) i), { seq_id }, true);
     }
 
     common_speculative_feature_view feature_view;
     const bool have_feature_view = common_speculative_feature_view_from_hidden_rows(
-        hidden_rows, mtp_state->n_embd, seq_id, pos_base, feature_view);
+        hidden_rows, mtp_state->n_embd, seq_id, commit_pos0, feature_view);
     const int32_t ret = have_feature_view
         ? common_speculative_on_target_batch(spec, accepted_batch, feature_view, false)
         : -1;
@@ -2053,6 +2479,7 @@ bool common_speculative_commit_accepted_output(
 }
 
 void common_speculative_print_stats(const common_speculative * spec, double slot_tps, int n_decoded, int n_past, common_params_speculative * active_params) {
+    pxa_mtp_stats_dump("final"); // PXA_MTP_STATS: end-of-request roll-up (no-op when the counters are off)
     if (spec == nullptr) {
         return;
     }
@@ -2227,6 +2654,300 @@ llama_context * common_speculative_get_companion_ctx(common_speculative * spec) 
     return nullptr;
 }
 
+// PXA_SPEC_SEQ_STATE_v1 (2026-09-13) -- the per-sequence drafter carry as bytes; see speculative.h.
+//
+// Layout, little-endian, fixed width so a blob written by one build is readable by another with the
+// same embedding width (and rejected by one with a different width, which is the point of storing
+// it): magic, version, n_embd, then the target hidden row and then the last-draft cache, each
+// preceded by its own present flag and length. Nothing here is a pointer or a container header, so
+// the blob is safe to write to disk and read back in another process.
+namespace {
+constexpr uint32_t PXA_SPEC_SEQ_STATE_MAGIC   = 0x31535850u; // "PXS1"
+constexpr uint32_t PXA_SPEC_SEQ_STATE_VERSION = 1u;
+
+template <typename T> void pxa_spec_put(std::vector<uint8_t> & out, const T & v) {
+    const uint8_t * p = reinterpret_cast<const uint8_t *>(&v);
+    out.insert(out.end(), p, p + sizeof(T));
+}
+
+template <typename T> bool pxa_spec_get(const uint8_t * data, size_t size, size_t & off, T & v) {
+    if (off + sizeof(T) > size) {
+        return false;
+    }
+    std::memcpy(&v, data + off, sizeof(T));
+    off += sizeof(T);
+    return true;
+}
+} // namespace
+
+bool common_speculative_get_seq_state(const common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
+
+    const auto * mtp_state = common_speculative_get_mtp_state(spec);
+    if (mtp_state == nullptr) {
+        return false;
+    }
+
+    const auto it_hidden = mtp_state->target_hidden_by_seq.find(seq_id);
+    const auto it_draft  = mtp_state->draft_cache_by_seq.find(seq_id);
+
+    const bool have_hidden = it_hidden != mtp_state->target_hidden_by_seq.end() && !it_hidden->second.empty();
+    const bool have_draft  = it_draft  != mtp_state->draft_cache_by_seq.end()   && !it_draft->second.embd.empty();
+
+    if (!have_hidden && !have_draft) {
+        return false;
+    }
+
+    pxa_spec_put(data, PXA_SPEC_SEQ_STATE_MAGIC);
+    pxa_spec_put(data, PXA_SPEC_SEQ_STATE_VERSION);
+    pxa_spec_put(data, (int32_t) mtp_state->n_embd);
+
+    pxa_spec_put(data, (uint32_t) (have_hidden ? 1 : 0));
+    if (have_hidden) {
+        pxa_spec_put(data, (uint64_t) it_hidden->second.size());
+        const uint8_t * p = reinterpret_cast<const uint8_t *>(it_hidden->second.data());
+        data.insert(data.end(), p, p + it_hidden->second.size() * sizeof(float));
+    }
+
+    pxa_spec_put(data, (uint32_t) (have_draft ? 1 : 0));
+    if (have_draft) {
+        pxa_spec_put(data, (uint64_t) it_draft->second.embd.size());
+        const uint8_t * p = reinterpret_cast<const uint8_t *>(it_draft->second.embd.data());
+        data.insert(data.end(), p, p + it_draft->second.embd.size() * sizeof(float));
+        pxa_spec_put(data, it_draft->second.prob);
+        pxa_spec_put(data, (int32_t) it_draft->second.last_id);
+    }
+
+    return true;
+}
+
+bool common_speculative_set_seq_state(common_speculative * spec, llama_seq_id seq_id, const uint8_t * data, size_t size) {
+    pxa_mtp_prefetch_wait_seq(seq_id); // PXA_MTP_PREFETCH: drain in-flight companion commit first
+
+    auto * mtp_state = common_speculative_get_mtp_state(spec);
+    if (mtp_state == nullptr) {
+        return false;
+    }
+
+    // A refused blob must leave the sequence with NO carry rather than the previous occupant's.
+    mtp_clear_target_hidden(*mtp_state, seq_id);
+
+    if (data == nullptr || size == 0) {
+        return false;
+    }
+
+    size_t   off = 0;
+    uint32_t magic = 0, version = 0, have = 0;
+    int32_t  n_embd = 0;
+
+    if (!pxa_spec_get(data, size, off, magic) || magic != PXA_SPEC_SEQ_STATE_MAGIC) {
+        LOG_WRN("%s: refusing a speculative carry with the wrong magic\n", __func__);
+        return false;
+    }
+    if (!pxa_spec_get(data, size, off, version) || version != PXA_SPEC_SEQ_STATE_VERSION) {
+        LOG_WRN("%s: refusing a speculative carry of version %u\n", __func__, version);
+        return false;
+    }
+    if (!pxa_spec_get(data, size, off, n_embd) || n_embd != mtp_state->n_embd) {
+        LOG_WRN("%s: refusing a speculative carry for width %d (this model is %d)\n",
+                __func__, (int) n_embd, mtp_state->n_embd);
+        return false;
+    }
+
+    std::vector<float> hidden;
+    mtp_last_embd      draft;
+    bool               have_draft = false;
+
+    if (!pxa_spec_get(data, size, off, have)) {
+        return false;
+    }
+    if (have) {
+        uint64_t n = 0;
+        if (!pxa_spec_get(data, size, off, n) || n == 0 || n > (uint64_t) INT32_MAX ||
+                off + n * sizeof(float) > size) {
+            LOG_WRN("%s: truncated hidden row in a speculative carry\n", __func__);
+            return false;
+        }
+        hidden.resize((size_t) n);
+        std::memcpy(hidden.data(), data + off, (size_t) n * sizeof(float));
+        off += (size_t) n * sizeof(float);
+        if ((int32_t) hidden.size() != n_embd) {
+            LOG_WRN("%s: hidden row of %d floats against a width of %d\n",
+                    __func__, (int) hidden.size(), (int) n_embd);
+            return false;
+        }
+    }
+
+    if (!pxa_spec_get(data, size, off, have)) {
+        return false;
+    }
+    if (have) {
+        uint64_t n = 0;
+        if (!pxa_spec_get(data, size, off, n) || n == 0 || n > (uint64_t) INT32_MAX ||
+                off + n * sizeof(float) > size) {
+            LOG_WRN("%s: truncated draft cache in a speculative carry\n", __func__);
+            return false;
+        }
+        draft.embd.resize((size_t) n);
+        std::memcpy(draft.embd.data(), data + off, (size_t) n * sizeof(float));
+        off += (size_t) n * sizeof(float);
+        int32_t last_id = -1;
+        if (!pxa_spec_get(data, size, off, draft.prob) || !pxa_spec_get(data, size, off, last_id)) {
+            LOG_WRN("%s: truncated draft cache tail in a speculative carry\n", __func__);
+            return false;
+        }
+        draft.last_id = (int) last_id;
+        have_draft = true;
+    }
+
+    if (off != size) {
+        LOG_WRN("%s: %zu trailing bytes in a speculative carry\n", __func__, size - off);
+        return false;
+    }
+
+    if (!hidden.empty()) {
+        mtp_state->target_hidden_by_seq[seq_id] = std::move(hidden);
+    }
+    if (have_draft) {
+        mtp_state->draft_cache_by_seq[seq_id] = std::move(draft);
+    }
+
+    return true;
+}
+
+static int pxa_mtp_readback_check_level() {
+    static const int v = getenv("PXA_MTP_READBACK_CHECK") ? atoi(getenv("PXA_MTP_READBACK_CHECK")) : 0;
+    return v;
+}
+
+// PXA_MTP_READBACK_CHECK: see the call site in mtp_accept_batch. Debug only; it re-decodes the
+// commit batch's LAST row on its own and reports how the read-back hidden differs. It rewrites the
+// same cell with the same content, restores `last` and the companion's draft-input buffer, so with
+// the lever off (the default) nothing here runs and with it on the flow is unchanged apart from
+// two extra 1-row decodes and the printout.
+static void pxa_mtp_readback_check(
+        common_speculative_state_mtp & state,
+        const llama_batch & accepted_batch,
+        llama_seq_id seq_id,
+        const float * hidden_rows,
+        mtp_last_embd & last) {
+    const int level = pxa_mtp_readback_check_level();
+    if (level <= 0 || accepted_batch.n_tokens <= 0 || hidden_rows == nullptr) {
+        return;
+    }
+
+    llama_context * ctx = state.ctx_mtp;
+    const int n_embd = state.n_embd;
+    const int n = accepted_batch.n_tokens;
+    const llama_seq_id kv_seq = llama_n_seq_max(ctx) <= 1 ? 0 : seq_id;
+
+    const llama_token   tok_last = accepted_batch.token[n - 1];
+    const llama_pos     pos_last = accepted_batch.pos[n - 1];
+    const float * const h_last   = hidden_rows + (size_t) (n - 1) * n_embd;
+
+    std::vector<float> h_commit(last.embd.begin(), last.embd.end());
+    const llama_token tok_commit = last.last_id;
+    const float       p_commit   = last.prob;
+
+    // Capture the WHOLE companion embedding buffer as the commit decode left it, so the row the
+    // read-back actually returned can be identified among the rows the decode produced.
+    std::vector<float> embd_all;
+    if (const float * base = llama_get_embeddings(ctx); base != nullptr) {
+        embd_all.assign(base, base + (size_t) n * n_embd);
+    }
+
+    auto stats = [&](const std::vector<float> & a, const std::vector<float> & b,
+                     double & max_abs, double & cosine, double & l2a, double & l2b) {
+        double sa = 0, sb = 0, dot = 0; max_abs = 0;
+        for (int i = 0; i < n_embd; ++i) {
+            const double x = a[i], y = b[i];
+            sa += x * x; sb += y * y; dot += x * y;
+            const double d = x - y < 0 ? y - x : x - y;
+            if (d > max_abs) max_abs = d;
+        }
+        l2a = sqrt(sa); l2b = sqrt(sb);
+        cosine = (sa > 0 && sb > 0) ? dot / (sqrt(sa) * sqrt(sb)) : 0.0;
+    };
+
+    // Re-run the last row on its own, once per op type under test.
+    auto rerun = [&](llama_mtp_op_type op, std::vector<float> & h_out, llama_token & tok_out, float & p_out) -> bool {
+        if (llama_kv_cache_seq_pos_max(ctx, kv_seq) >= pos_last) {
+            llama_kv_cache_seq_rm(ctx, kv_seq, pos_last, -1);
+        }
+        if (!llama_set_draft_input_hidden_state_copy(ctx, h_last, (size_t) n_embd)) {
+            return false;
+        }
+        llama_batch b1 = llama_batch_init(1, 0, 1);
+        common_batch_add(b1, tok_last, pos_last, { kv_seq }, true);
+        llama_set_mtp_op_type(ctx, op);
+        const int32_t rc = llama_decode(ctx, b1);
+        llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+        llama_batch_free(b1);
+        if (rc != 0) {
+            return false;
+        }
+        const float * e = llama_get_embeddings_ith(ctx, 0);
+        if (e == nullptr) {
+            return false;
+        }
+        h_out.assign(e, e + n_embd);
+        if (!llama_set_draft_input_hidden_state_copy(ctx, h_out.data(), h_out.size())) {
+            return false;
+        }
+        tok_out = common_sampler_sample_speculative(nullptr, ctx, 0, &p_out, pxa_mtp_pmin_topk());
+        return true;
+    };
+
+    std::vector<float> h_draft;
+    llama_token tok_draft = -1;
+    float       p_draft   = 0.0f;
+    const bool  ok_draft  = rerun(MTP_OP_DRAFT_GEN, h_draft, tok_draft, p_draft);
+
+    if (ok_draft) {
+        double max_abs, cosine, l2c, l2d;
+        stats(h_commit, h_draft, max_abs, cosine, l2c, l2d);
+        LOG_WRN("PXA_MTP_READBACK_CHECK n=%d pos_last=%d tok_last=%d | commit vs DRAFT_GEN: "
+                "max|d|=%.6f cos=%.6f L2(commit)=%.4f L2(draft)=%.4f tok %d(p=%.4f) vs %d(p=%.4f)%s\n",
+                n, (int) pos_last, (int) tok_last, max_abs, cosine, l2c, l2d,
+                (int) tok_commit, (double) p_commit, (int) tok_draft, (double) p_draft,
+                max_abs == 0.0 ? " IDENTICAL" : " DIFFER");
+        for (int r = 0; r < n && !embd_all.empty(); ++r) {
+            std::vector<float> row(embd_all.begin() + (size_t) r * n_embd,
+                                   embd_all.begin() + (size_t) (r + 1) * n_embd);
+            double ma, cs, la, lb;
+            stats(row, h_draft, ma, cs, la, lb);
+            LOG_WRN("PXA_MTP_READBACK_CHECK   embd buffer row %d/%d vs DRAFT_GEN: max|d|=%.6f cos=%.6f L2=%.4f%s\n",
+                    r, n, ma, cs, la, ma == 0.0 ? "   <== THIS IS THE CORRECT ROW" : "");
+        }
+    } else {
+        LOG_WRN("PXA_MTP_READBACK_CHECK n=%d pos_last=%d: DRAFT_GEN re-run FAILED\n", n, (int) pos_last);
+    }
+
+    if (level >= 2) {
+        std::vector<float> h_ua1;
+        llama_token tok_ua1 = -1;
+        float       p_ua1   = 0.0f;
+        if (rerun(MTP_OP_UPDATE_ACCEPTED, h_ua1, tok_ua1, p_ua1)) {
+            double max_abs, cosine, l2a, l2b;
+            stats(h_ua1, ok_draft ? h_draft : h_commit, max_abs, cosine, l2a, l2b);
+            LOG_WRN("PXA_MTP_READBACK_CHECK n=%d pos_last=%d | 1-row UPDATE_ACCEPTED vs %s: "
+                    "max|d|=%.6f cos=%.6f L2=%.4f/%.4f tok %d(p=%.4f)%s\n",
+                    n, (int) pos_last, ok_draft ? "DRAFT_GEN" : "commit",
+                    max_abs, cosine, l2a, l2b, (int) tok_ua1, (double) p_ua1,
+                    max_abs == 0.0 ? " IDENTICAL" : " DIFFER");
+        } else {
+            LOG_WRN("PXA_MTP_READBACK_CHECK n=%d pos_last=%d: 1-row UPDATE_ACCEPTED re-run FAILED\n",
+                    n, (int) pos_last);
+        }
+    }
+
+    // Restore the flow: the cached free token and its hidden are the COMMIT's, exactly as before.
+    last.embd.assign(h_commit.begin(), h_commit.end());
+    last.last_id = tok_commit;
+    last.prob    = p_commit;
+    llama_set_draft_input_hidden_state_copy(ctx, last.embd.data(), last.embd.size());
+}
+
 static int32_t mtp_accept_batch(
         common_speculative_state_mtp & state,
         const llama_batch & accepted_batch,
@@ -2245,13 +2966,31 @@ static int32_t mtp_accept_batch(
     }
 
     auto & last = mtp_get_last_embd(state, seq_id);
+
+    // PXA_MTP_ZERO_OUTPUT_COMMIT: the decode above asked for no outputs, so there is no embedding
+    // to read and no free token to sample. Leave the cache empty and the next draft re-decodes this
+    // position as its own step 0 (mainline's split).
+    if (common_speculative_mtp_zero_output_commit()) {
+        last.last_id = -1;
+        return 0;
+    }
+
     const float * embd = llama_get_embeddings_ith(state.ctx_mtp, accepted_batch.n_tokens - 1);
     if (embd != nullptr) {
         std::memcpy(last.embd.data(), embd, last.embd.size() * sizeof(float));
         if (!llama_set_draft_input_hidden_state_copy(state.ctx_mtp, last.embd.data(), last.embd.size())) {
             return -1;
         }
-        last.last_id = common_sampler_sample_speculative(nullptr, state.ctx_mtp, accepted_batch.n_tokens - 1, &last.prob);
+        last.last_id = common_sampler_sample_speculative(nullptr, state.ctx_mtp, accepted_batch.n_tokens - 1, &last.prob, pxa_mtp_pmin_topk());
+
+        // PXA_MTP_READBACK_CHECK (debug lever, default off): the third defect's bisect. The commit
+        // decode's last row and a 1-row DRAFT_GEN decode of the SAME (hidden, token, position) over
+        // the same companion K/V are, on paper, the identical computation -- so their read-back
+        // hidden rows must be bit-identical. Measured on the GPU they are not: chains built on the
+        // commit's row collapse (measured 2026-09-08). Re-run the last row two more ways and
+        // print the deltas, so the cause is localised to (a) the multi-row batch, (b) the op type,
+        // or (c) neither.  1 = compare vs DRAFT_GEN, 2 = also compare vs a 1-row UPDATE_ACCEPTED.
+        pxa_mtp_readback_check(state, accepted_batch, seq_id, hidden_rows, last);
     }
 
     return 0;
@@ -2337,9 +3076,11 @@ std::vector<llama_seq_id> common_speculative_commit_accepted_hidden_rows_batched
     }
 
     // Per-seq KV cleanup BEFORE the batched decode (mirrors mtp_update_kv_cache's pre-decode rm):
-    // drop any stale rows at/after this seq's start position so the commit writes clean cells.
+    // drop any stale rows at/after this seq's FIRST COMMITTED position so the commit writes clean
+    // cells. PXA_MTP_KVPOS_v1: that is pos_base + 1, not pos_base -- the row at pos_base holds
+    // (h_{pos_base-1}, x_{pos_base}) and is the committed history this batch continues from.
     for (const auto & ps : prepared) {
-        const llama_pos start_pos = ps.pos_base;
+        const llama_pos start_pos = pxa_mtp_commit_pos0(ps.pos_base);
         if (llama_kv_cache_seq_pos_max(ctx, ps.seq_id) >= start_pos) {
             llama_kv_cache_seq_rm(ctx, ps.seq_id, start_pos, -1);
         }
@@ -2349,10 +3090,13 @@ std::vector<llama_seq_id> common_speculative_commit_accepted_hidden_rows_batched
     llama_batch batch = llama_batch_init((int) total_tokens, 0, 1);
     std::vector<float> hidden_all;
     hidden_all.reserve(total_tokens * (size_t) n_embd);
+    // PXA_MTP_ZERO_OUTPUT_COMMIT: same split as the serial path -- no row asks for an output and no
+    // free token is sampled, so this batched commit is a pure K/V catch-up too.
+    const bool pxa_zero_output = common_speculative_mtp_zero_output_commit();
     for (auto & ps : prepared) {
         for (size_t i = 0; i < ps.commit_tokens.size(); ++i) {
             const bool is_last = (i + 1 == ps.commit_tokens.size());
-            common_batch_add(batch, ps.commit_tokens[i], ps.pos_base + (llama_pos) i, { ps.seq_id }, is_last);
+            common_batch_add(batch, ps.commit_tokens[i], pxa_mtp_commit_pos(ps.pos_base, (int32_t) i), { ps.seq_id }, is_last && !pxa_zero_output);  // PXA_MTP_KVPOS_v1
             if (is_last) {
                 ps.last_token_batch_idx = batch.n_tokens - 1;
             }
@@ -2380,8 +3124,14 @@ std::vector<llama_seq_id> common_speculative_commit_accepted_hidden_rows_batched
     // Per-seq tail: read this seq's last-token embedding, cache it as the next draft input, and
     // sample the free draft token (mirrors mtp_accept_batch's tail). Each read is at this seq's
     // own last-token batch index, so the per-seq output map stays correct within the one decode.
+    // PXA_MTP_ZERO_OUTPUT_COMMIT: nothing was output, so there is nothing to read -- every seq's
+    // next draft starts from its own step 0.
     for (auto & ps : prepared) {
         auto & last = mtp_get_last_embd(*mtp_state, ps.seq_id);
+        if (pxa_zero_output) {
+            last.last_id = -1;
+            continue;
+        }
         const float * embd = llama_get_embeddings_ith(ctx, ps.last_token_batch_idx);
         if (embd == nullptr) {
             failed.push_back(ps.seq_id);
@@ -2392,7 +3142,7 @@ std::vector<llama_seq_id> common_speculative_commit_accepted_hidden_rows_batched
             failed.push_back(ps.seq_id);
             continue;
         }
-        last.last_id = common_sampler_sample_speculative(nullptr, ctx, ps.last_token_batch_idx, &last.prob);
+        last.last_id = common_sampler_sample_speculative(nullptr, ctx, ps.last_token_batch_idx, &last.prob, pxa_mtp_pmin_topk());
     }
 
     llama_batch_free(batch);
@@ -2643,11 +3393,18 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     common_sampler_reset(smpl);
 
+    // PXA_MTP_STATS: cycle-local accounting (zero cost when the counters are off).
+    auto & pxa_st = pxa_mtp_stats();
+    const int64_t pxa_st_t0 = pxa_st.on ? ggml_time_us() : 0;
+    int  pxa_st_stop = 2;    // 0 cached_pmin, 1 pmin, 2 nmax, 3 fail
+
     llama_batch mtp_batch = llama_batch_init(1, 0, 1);
     llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN);
 
     float prob;
-    auto prob_ptr = p_min > 0 ? &prob : nullptr;
+    // PXA_MTP_STATS: with p_min == 0 the draft loop skips the full-vocab softmax entirely; ask for
+    // the probability anyway while the counters are on, so the p distribution is observable.
+    auto prob_ptr = (p_min > 0 || pxa_st.on) ? &prob : nullptr;
 
     llama_token current_input_id = id_last;
     llama_pos current_n_past = n_past;
@@ -2658,6 +3415,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     if (last.last_id >= 0) {
         if (last.prob < p_min) {
             n_draft = 1;
+            pxa_st_stop = 0; // PXA_MTP_STATS: chain collapsed to the cached token by p_min
         }
         current_input_id = last.last_id;
         last.last_id = -1;
@@ -2666,9 +3424,24 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         if (!llama_set_draft_input_hidden_state_copy(ctx, last.embd.data(), last.embd.size())) {
             llama_batch_free(mtp_batch);
             llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+            pxa_mtp_stats_record(pxa_st, pxa_st_t0, drafts.size(), 0, 3);
             return drafts;
         }
         i0 = 1;
+    }
+
+    // PXA_MTP_KVPOS_v1: the row at n_past is committed history -- (h_{n_past-1}, x_{n_past}).
+    // With a cached free token the commit has already written it and it must survive untouched;
+    // without one, the first loop iteration below is about to (re)write it, so drop any stale cell
+    // there (and anything above it) first, exactly as mtp_update_kv_cache does before its decode.
+    // Before the commit positions were corrected nothing was ever stored at n_past, so a duplicate
+    // cell for that logical position could not arise and this cleanup was not needed.
+    // Gemma4 external MTP (constant_draft_positions) keeps every draft row at n_past by design and
+    // is deliberately left alone.
+    if (i0 == 0 && !constant_draft_positions) {
+        if (llama_kv_cache_seq_pos_max(ctx, kv_seq) >= n_past) {
+            llama_kv_cache_seq_rm(ctx, kv_seq, n_past, -1);
+        }
     }
 
     int n_decode = 0;
@@ -2679,16 +3452,23 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
         ++n_decode;
         if (llama_decode(ctx, mtp_batch) != 0) {
+            pxa_st_stop = 3;
             break;
         }
 
-        llama_token id_next = common_sampler_sample_speculative(smpl, ctx, 0, prob_ptr);
+        llama_token id_next = common_sampler_sample_speculative(smpl, ctx, 0, prob_ptr, pxa_mtp_pmin_topk());
+        if (pxa_st.on && prob_ptr) {
+            pxa_st.p_sum += (double) prob;
+            pxa_st.p_n   += 1;
+            if (prob >= 0.75f) pxa_st.p_ge_075 += 1;
+        }
         if (getenv("PXA_MTP_DBG")) {
             LOG_WRN("PXA_MTP_DBG step %d: in_id=%d n_past=%d -> draft=%d prob=%.3f\n",
                 i, (int)current_input_id, (int)current_n_past, (int)id_next, prob_ptr ? (double)prob : -1.0);
         }
 
         if (i > 0 && prob_ptr && prob < p_min) {
+            pxa_st_stop = 1;
             break;
         }
 
@@ -2696,6 +3476,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
         const float * emb = llama_get_embeddings_ith(ctx, 0);
         if (!emb) {
+            pxa_st_stop = 3;
             break;
         }
         if (getenv("PXA_MTP_DBG")) {
@@ -2707,6 +3488,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         // Keep a stable copy because later decode steps reuse ctx->embd storage.
         memcpy(last.embd.data(), emb, n_embd * sizeof(float));
         if (!llama_set_draft_input_hidden_state_copy(ctx, last.embd.data(), last.embd.size())) {
+            pxa_st_stop = 3;
             break;
         }
 
@@ -2714,6 +3496,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         current_n_past++;
 
         if (prob_ptr && prob < p_min) {
+            pxa_st_stop = 1;
             break;
         }
     }
@@ -2722,15 +3505,17 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     // Purge the metadata for the draft tokens.
     // This prevents cache state corruption where two cells map to the same logical position.
-    // If the state contained in `last` had a valid token id and probability, it means that we
-    // have previously run an "accept" batch, where the token sampled from the main model was included.
-    // In that case, we need to discard all tokens that we ran here to get the KV cache to the correct state.
-    //   => for i0 = 1 we discard from n_past
-    // But if we did not have a valid last token_id, it means the first token we run was sampled from the
-    // main model. Hence we want to keep this token in the KV cache and discard all other tokens.
-    //   => for i0 = 0 we discard from n_past + 1
+    //
+    // PXA_MTP_KVPOS_v1: the draft region starts at n_past + 1 in BOTH cases, because the row at
+    // n_past is committed history either way -- with a cached free token the commit wrote it (only
+    // now that commits land at the right position; before, nothing was ever stored there, which is
+    // why discarding from n_past looked harmless), and without one the loop above just wrote it and
+    // the original comment already said to keep it. Discarding from n_past would delete the row the
+    // very next draft has to attend to, re-opening the hole this fix closes.
+    // (constant_draft_positions never has a cached token, so i0 is always 0 there and the bound is
+    // unchanged for Gemma4 external MTP.)
     if (n_decode > 0) {
-        llama_kv_cache_seq_rm(ctx, kv_seq, n_past + 1 - i0, n_past + n_decode + 2);
+        llama_kv_cache_seq_rm(ctx, kv_seq, pxa_mtp_draft_region_pos0(n_past), n_past + n_decode + 2);
     }
 
     // PXA_MTP_ADAPTIVE_K: record how many draft tokens we emitted this cycle so accept() can form
@@ -2739,7 +3524,373 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         state.pxa_ak_drafted = (uint32_t) drafts.size();
     }
 
+    pxa_mtp_stats_record(pxa_st, pxa_st_t0, drafts.size(), n_decode, pxa_st_stop);
+
     return drafts;
+}
+
+// PXA_MTP_BATCH_SLOTS (2026-09-09): the same draft, scheduled across
+// slots instead of within one.
+// -----------------------------------------------------------------------------
+// mtp_speculative_gen_draft() above runs ONE sequence's chain: up to K 1-row decodes on the shared
+// companion, each conditioned on the hidden row the previous one produced. At -np N the server
+// calls it N times per cycle, so the companion sees N*K round trips. Mainline instead puts one row
+// per drafting sequence into the SAME batch and advances them together (common/speculative.cpp:
+// 1596-1746 at ggml-org/llama.cpp 304665fe7), paying K decodes of N rows.
+//
+// This is that regrouping and nothing else. Per sequence the token fed in, the position it is
+// written at, the K/V row it lands in, the hidden row it is conditioned on, the argmax that comes
+// out and the p_min ordering that decides whether the chain continues are all unchanged -- the
+// per-sequence half of the loop lives in common/pxa-mtp-batch-slots.h as pxa_mtp_draft_chain and is
+// replayed against a transcription of the serial loop in tests/test-mtp-batch-slots.cpp. What
+// changes is that the decodes interleave: chains with different depths simply drop out of the batch
+// as they stop, so a step's batch is exactly the still-running chains.
+//
+// It needs three things that already exist and are NOT introduced here: the SHARED companion with
+// n_seq_max = n_parallel (PXA_SHARED_MTP_v1), the multi-row draft-input hidden buffer that
+// prepare_mtp_graph_inputs() slices per token, and per-row read-back by batch index. The batched
+// COMMIT (common_speculative_commit_accepted_hidden_rows_batched) already uses all three.
+//
+// Returns false when the batched path does not apply -- the caller then runs the serial
+// common_speculative_draft() per slot, unchanged. On true, every request's `result` is filled
+// (possibly empty, exactly as the serial call would have left it).
+bool common_speculative_draft_batched(
+        common_speculative * spec,
+        std::vector<common_speculative_draft_req> & reqs) {
+
+    for (auto & r : reqs) {
+        r.result.clear();
+    }
+
+    if (!pxa_mtp_batch_slots_enabled() || spec == nullptr || reqs.size() < 2) {
+        return false;
+    }
+    // The autotune tuner proposes per-CALL params and reads back a single last_n_drafted, so it has
+    // no meaning across a batch of slots. Composite chains (ngram + mtp) fall back too: the batched
+    // path is the MTP impl only, and the dispatcher's "try the next impl if this one drafted
+    // nothing" rule is per-slot control flow this does not reproduce.
+    if (spec->tuner && spec->tuner->enabled) {
+        return false;
+    }
+    if (spec->impls.size() != 1) {
+        return false;
+    }
+    auto * mtp_state = common_speculative_get_mtp_state(spec);
+    if (mtp_state == nullptr || mtp_state->ctx_mtp == nullptr || mtp_state->n_embd <= 0) {
+        return false;
+    }
+    if (spec->impls[0].get() != static_cast<common_speculative_state *>(mtp_state)) {
+        return false;
+    }
+    // Gemma 4 external MTP holds every draft row at n_past by design, so two steps of one chain
+    // already share a position; that path keeps its serial loop.
+    if (mtp_state->constant_draft_positions) {
+        return false;
+    }
+
+    llama_context * ctx    = mtp_state->ctx_mtp;
+    const int       n_embd = mtp_state->n_embd;
+
+    int32_t max_seq_id = -1;
+    for (const auto & r : reqs) {
+        if (r.draft_base_pos < 0) {
+            return false;   // MTP slots always carry one; without it the position is guessed
+        }
+        max_seq_id = std::max(max_seq_id, (int32_t) r.seq_id);
+    }
+    if (!pxa_mtp_batch_slots_applicable((int32_t) reqs.size(),
+                                        llama_n_seq_max(ctx),
+                                        llama_n_ubatch(ctx),
+                                        max_seq_id)) {
+        return false;
+    }
+
+    // PXA_MTP_BATCH_SLOTS_ROWS_v1: a batched step puts one row per slot into a SINGLE
+    // MTP_OP_DRAFT_GEN decode, so the companion's draft-gen graph has to size its conditioning-hidden
+    // input by the batch token count. An architecture whose MTP builder still allocates one [n_embd]
+    // row would concatenate it against [n_embd, n_rows] token embeddings and abort inside ggml_concat
+    // while the graph is being BUILT -- earlier than prepare_mtp_graph_inputs(), whose float-count
+    // check would otherwise have refused the decode cleanly. Ask the model up front and say so once,
+    // rather than discovering it from a stack trace.
+    if (!llama_model_supports_mtp_multi_row_draft(llama_get_model(ctx))) {
+        static bool pxa_bs_arch_warned = false;
+        if (!pxa_bs_arch_warned) {
+            pxa_bs_arch_warned = true;
+            LOG_WRN("%s: PXA_MTP_BATCH_SLOTS is set, but this model's MTP draft graph takes one hidden "
+                    "row per decode - drafting serially instead\n", __func__);
+        }
+        return false;
+    }
+
+    spec->t_step_start_us = ggml_time_us();
+
+    auto & impl = spec->impls[0];
+    auto & pxa_st = pxa_mtp_stats();
+
+    // The whole batched draft is what the serial path charges to impl->t_draft_us, one call per slot.
+    common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+
+    // ---- per-sequence preparation: exactly common_speculative_state_mtp::draft()'s head ----
+    struct prepared_chain {
+        pxa_mtp_draft_chain  chain;
+        size_t               req_idx    = 0;
+        const float *        next_hidden = nullptr;  // the row fed into this chain's next decode
+        std::vector<float> * embd_slot   = nullptr;  // where the read-back is stored (last.embd)
+        int64_t              t0          = 0;
+        int32_t              n_min       = 0;
+    };
+    std::vector<prepared_chain> chains;
+    chains.reserve(reqs.size());
+
+    // PXA_MTP_BATCH_SLOTS_WARM_v1: settle the whole step BEFORE writing any per-sequence state.
+    // Preparation used to decide and mutate in one pass, which made a late refusal impossible: by the
+    // time a slot turned out to be un-batchable its cached free token had already been consumed
+    // (last.last_id cleared), so handing the step back would have silently dropped that token. The
+    // caller answers false by running the ORDINARY serial drafter over the same requests, so a
+    // refusal has to leave the drafter exactly as it found it. This pass therefore only reads.
+    struct scouted_req {
+        common_params_speculative  params;
+        const std::vector<float> * target_hidden = nullptr;  // null: nothing for this slot to draft from
+        pxa_mtp_batch_slot_state   state;
+    };
+    std::vector<scouted_req> scouted(reqs.size());
+    std::vector<pxa_mtp_batch_slot_state> states;
+    states.reserve(reqs.size());
+
+    for (size_t ri = 0; ri < reqs.size(); ++ri) {
+        auto & r  = reqs[ri];
+        auto & sc = scouted[ri];
+
+        // PXA_MTP_PREFETCH: drain any in-flight companion commit for this seq before touching
+        // ctx_mtp -- including before reading the K/V position the warm-up test below compares.
+        pxa_mtp_prefetch_wait_seq(r.seq_id);
+
+        const auto runtime_stages = r.params.get_resolved_stages();
+        const bool use_runtime_stage_overrides = common_speculative_stage_chain_matches(runtime_stages, spec->configs);
+        const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[0] : spec->configs[0].stage;
+        sc.params = common_speculative_get_runtime_params(spec->configs[0], r.params, runtime_stage);
+
+        sc.state.seq_id            = (int32_t) r.seq_id;
+        sc.state.n_past            = (int32_t) r.draft_base_pos;
+        sc.state.companion_pos_max = (int32_t) llama_kv_cache_seq_pos_max(ctx, r.seq_id);
+
+        const auto hidden_it = mtp_state->target_hidden_by_seq.find(r.seq_id);
+        if (hidden_it == mtp_state->target_hidden_by_seq.end() || (int) hidden_it->second.size() != n_embd) {
+            LOG_WRN("%s: missing target hidden state for seq_id %d\n", __func__, (int) r.seq_id);
+        } else {
+            sc.target_hidden = &hidden_it->second;
+            sc.state.have_target_hidden = true;
+        }
+
+        int32_t n_draft = sc.params.n_max;
+        // PXA_MTP_ADAPTIVE_K: same ladder as mtp_speculative_gen_draft(), factored into
+        // pxa_mtp_adaptive_k_depth() so the two schedulers cannot drift apart.
+        if (pxa_mtp_adaptive_k_enabled() && n_draft > 1) {
+            const int32_t k_adapt = pxa_mtp_adaptive_k_depth(mtp_state->pxa_ak_ema, n_draft);
+            if (getenv("PXA_MTP_DBG")) {
+                LOG_WRN("PXA_MTP_ADAPTIVE_K: ema=%.3f n_draft=%d -> K=%d\n",
+                        (double) mtp_state->pxa_ak_ema, n_draft, k_adapt);
+            }
+            n_draft = k_adapt;
+        }
+        sc.state.n_draft = n_draft;
+
+        states.push_back(sc.state);
+    }
+
+    // The step rule lives in pxa-mtp-batch-slots.h next to the shape rule, so the CPU test drives the
+    // same code the server does: a slot whose companion K/V row has not caught up sends the WHOLE step
+    // to the serial drafter, and so does a step with fewer than two slots left to regroup.
+    int32_t n_batchable = 0;
+    int32_t cold_slot   = -1;
+    if (pxa_mtp_batch_slots_step_decision(states.data(), states.size(), &n_batchable, &cold_slot)
+            != PXA_MTP_BATCH_STEP_BATCH) {
+        if (cold_slot >= 0) {
+            const auto & cs = states[(size_t) cold_slot];
+            LOG_WRN("%s: MTP context not fully warmed up for seq_id %d: pos_max = %d, expected >= %d"
+                    " - drafting this step serially\n",
+                    __func__, (int) cs.seq_id, (int) cs.companion_pos_max, (int) cs.n_past - 1);
+        }
+        return false;
+    }
+
+    // ---- the commit pass: from here on the step is going to run, so it may write ----
+    for (size_t ri = 0; ri < reqs.size(); ++ri) {
+        auto & r  = reqs[ri];
+        auto & sc = scouted[ri];
+
+        impl->n_call_draft++;
+
+        if (!pxa_mtp_batch_slot_can_draft(sc.state)) {
+            if (sc.target_hidden != nullptr) {
+                // A resolved depth of zero: the serial drafter drops the cached cross-step token and
+                // returns an empty draft for this slot, so do exactly that.
+                mtp_invalidate_cached_draft(*mtp_state, r.seq_id);
+            }
+            continue;
+        }
+
+        auto & last = mtp_get_last_embd(*mtp_state, r.seq_id);
+
+        prepared_chain pc;
+        pc.req_idx   = ri;
+        pc.embd_slot = &last.embd;
+        pc.t0        = pxa_st.on ? ggml_time_us() : 0;
+        pc.n_min     = sc.params.n_min;
+
+        const bool has_cached = last.last_id >= 0;
+        const int32_t cached_id = last.last_id;
+        const float   cached_prob = last.prob;
+        if (has_cached) {
+            last.last_id = -1;
+        }
+
+        if (!pc.chain.begin(r.seq_id,
+                            sc.state.n_draft,
+                            sc.params.p_min,
+                            /* have_prob */ sc.params.p_min > 0 || pxa_st.on,
+                            r.draft_base_pos,
+                            r.id_last,
+                            has_cached,
+                            cached_id,
+                            cached_prob)) {
+            mtp_invalidate_cached_draft(*mtp_state, r.seq_id);
+            continue;
+        }
+
+        // The first row's conditioning hidden: the cached free token's own MTP hidden when the
+        // commit produced one, otherwise the target's stored hidden for this sequence.
+        pc.next_hidden = has_cached ? last.embd.data() : sc.target_hidden->data();
+
+        chains.push_back(std::move(pc));
+    }
+
+    if (chains.empty()) {
+        return true;    // every slot resolved to an empty draft; nothing to decode
+    }
+
+    common_sampler_reset(mtp_state->smpl);
+
+    // The row at n_past is committed history; a chain that starts at i == 0 is about to rewrite it
+    // and must drop any stale cell there first (PXA_MTP_KVPOS_v1).
+    for (const auto & pc : chains) {
+        if (pc.chain.needs_pre_purge() && llama_kv_cache_seq_pos_max(ctx, pc.chain.seq_id) >= pc.chain.n_past) {
+            llama_kv_cache_seq_rm(ctx, pc.chain.seq_id, pc.chain.n_past, -1);
+        }
+    }
+
+    // ---- the step loop: one decode per STEP, one row per still-running chain ----
+    llama_batch mtp_batch = llama_batch_init((int32_t) chains.size(), 0, 1);
+    llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN);
+
+    std::vector<float>   hidden_all;
+    std::vector<int32_t> row_of;    // batch row -> index into `chains`
+    hidden_all.reserve(chains.size() * (size_t) n_embd);
+    row_of.reserve(chains.size());
+
+    for (;;) {
+        mtp_batch.n_tokens = 0;
+        hidden_all.clear();
+        row_of.clear();
+
+        for (size_t c = 0; c < chains.size(); ++c) {
+            auto & pc = chains[c];
+            if (!pc.chain.wants_step()) {
+                continue;
+            }
+            common_batch_add(mtp_batch, pc.chain.cur_id, pc.chain.step_pos(), { (llama_seq_id) pc.chain.seq_id }, true);
+            hidden_all.insert(hidden_all.end(), pc.next_hidden, pc.next_hidden + n_embd);
+            row_of.push_back((int32_t) c);
+            pc.chain.on_step_issued();
+        }
+
+        if (mtp_batch.n_tokens == 0) {
+            break;
+        }
+
+        if (!llama_set_draft_input_hidden_state_copy(ctx, hidden_all.data(), hidden_all.size()) ||
+                llama_decode(ctx, mtp_batch) != 0) {
+            for (int32_t c : row_of) {
+                chains[c].chain.on_fail();
+            }
+            break;
+        }
+
+        for (size_t row = 0; row < row_of.size(); ++row) {
+            auto & pc = chains[row_of[row]];
+
+            float prob = 0.0f;
+            float * prob_ptr = pc.chain.have_prob ? &prob : nullptr;
+            const llama_token id_next = common_sampler_sample_speculative(mtp_state->smpl, ctx, (int) row, prob_ptr);
+
+            if (pxa_st.on && prob_ptr) {
+                pxa_st.p_sum += (double) prob;
+                pxa_st.p_n   += 1;
+                if (prob >= 0.75f) pxa_st.p_ge_075 += 1;
+            }
+            if (getenv("PXA_MTP_DBG")) {
+                LOG_WRN("PXA_MTP_DBG seq %d step %d: in_id=%d n_past=%d -> draft=%d prob=%.3f\n",
+                        (int) pc.chain.seq_id, (int) pc.chain.i, (int) pc.chain.cur_id,
+                        (int) pc.chain.cur_pos, (int) id_next, prob_ptr ? (double) prob : -1.0);
+            }
+
+            if (pc.chain.on_sample(id_next, prob) == PXA_MTP_DRAFT_STEP_STOP) {
+                continue;
+            }
+
+            const float * emb = llama_get_embeddings_ith(ctx, (int32_t) row);
+            if (!emb) {
+                pc.chain.on_fail();
+                continue;
+            }
+            // Keep a stable copy: the next step's decode reuses ctx->embd storage.
+            std::memcpy(pc.embd_slot->data(), emb, (size_t) n_embd * sizeof(float));
+            pc.next_hidden = pc.embd_slot->data();
+
+            pc.chain.on_hidden(prob);
+        }
+    }
+
+    llama_batch_free(mtp_batch);
+    llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+
+    // ---- per-sequence tail: exactly mtp_speculative_gen_draft()'s tail ----
+    bool any_draft = false;
+    for (auto & pc : chains) {
+        auto & chain = pc.chain;
+
+        if (chain.needs_purge()) {
+            llama_kv_cache_seq_rm(ctx, chain.seq_id, chain.purge_p0(), chain.purge_p1());
+        }
+
+        if (pxa_mtp_adaptive_k_enabled()) {
+            mtp_state->pxa_ak_drafted = (uint32_t) chain.drafts.size();
+        }
+
+        pxa_mtp_stats_record(pxa_st, pc.t0, chain.drafts.size(), chain.n_decode, chain.stop);
+
+        auto & result = reqs[pc.req_idx].result;
+        result = std::move(chain.drafts);
+
+        // The dispatcher's self-spec fallback threshold, per slot (common_speculative_draft).
+        if (!result.empty() && pc.n_min > 0 && (int) result.size() < pc.n_min) {
+            LOG_DBG("%s: impl %s drafted %zu tokens, below fallback threshold %d - dropping\n",
+                    __func__, common_speculative_type_to_str(impl->type).c_str(), result.size(), pc.n_min);
+            result.clear();
+        }
+
+        if (!result.empty()) {
+            any_draft = true;
+            impl->n_gen_drafts++;
+            impl->n_gen_tokens += result.size();
+        }
+    }
+
+    // curr_impl drives common_speculative_current_type() and common_speculative_accept(); the shared
+    // companion has exactly one impl, so this is the same value the serial path would have left.
+    spec->curr_impl = any_draft ? impl.get() : nullptr;
+
+    return true;
 }
 
 
@@ -2778,11 +3929,37 @@ int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch
         mtp_batch.seq_id   = mtp_seq_ptrs.data();
         mtp_batch.n_seq_id = mtp_nseq.data();
     }
+    // PXA_MTP_DRAFT_CACHE_ONLY: the prompt warm-up is a pure catch-up -- its caller
+    // (common_speculative_prompt_warmup) never reads a logit or a hidden row back, it only checks
+    // the return code. The accept path is NOT: mtp_accept_batch reads the last row's embedding and
+    // samples the next free draft token from it, so it keeps the full graph. When the reduced graph
+    // is taken, NO row asks for an output, which is the condition the whole thing is gated on.
+    const pxa_mtp_cache_only_state pxa_co = {
+        /* .enabled       = */ pxa_mtp_cache_only_enabled(),
+        /* .wants_output  = */ !is_prompt_warmup,
+        /* .n_layer_nextn = */ llama_model_supports_mtp_kv_only(llama_get_model(ctx)) ? 1 : 0,
+        /* .n_tokens      = */ mtp_batch.n_tokens,
+    };
+    const bool pxa_kv_only = pxa_mtp_cache_only_ok(pxa_co);
+
     for (int i = 0; i < mtp_batch.n_tokens; ++i) {
         mtp_batch.logits[i] = false;
     }
-    mtp_batch.logits[mtp_batch.n_tokens-1] = true;
-    if (is_prompt_warmup) {
+    // PXA_MTP_ZERO_OUTPUT_COMMIT: with the lever on, an ACCEPTED-token catch-up asks for no outputs
+    // at all -- n_outputs == 0, so the row-select gathers nothing and the FFN and the 248320-row
+    // LM head compute nothing. The prompt warm-up keeps its trailing output row (it is the
+    // cache-only path above, not this lever's).
+    const bool pxa_zero_output = !is_prompt_warmup && common_speculative_mtp_zero_output_commit();
+    // The two levers compose and are independently default-off: either one suppresses the
+    // trailing output row, and the cache-only lever additionally switches the op type, because
+    // MTP_OP_KV_ONLY is the stronger statement (store the KV, run nothing else) and it must win
+    // when both are on.
+    if (!pxa_kv_only && !pxa_zero_output) {
+        mtp_batch.logits[mtp_batch.n_tokens-1] = true;
+    }
+    if (pxa_kv_only) {
+        llama_set_mtp_op_type(ctx, MTP_OP_KV_ONLY);
+    } else if (is_prompt_warmup) {
         llama_set_mtp_op_type(ctx, MTP_OP_WARMUP);
     } else {
         llama_set_mtp_op_type(ctx, MTP_OP_UPDATE_ACCEPTED);

@@ -73,7 +73,7 @@ static __global__ void k_get_rows_float(
     dst_row[i00] = i01 >= 0 && i01 < ne01 ? dst_t(src0_row[i00]) : dst_t(0);
 }
 
-// PXA_GETROWS_NARROW (default OFF): flattened (row, element) mapping for very narrow gathers.
+// PXA_GETROWS_NARROW (house lever: ON at ENHANCE, the shipped level; OFF at DEFAULT/REFERENCE):
 //
 // The general k_get_rows_float kernel gives every gathered row its own CUDA block
 // (block_nums = (ceil(ne00/256), ne10, ne11*ne12)).  When ne00 is 1 or 2 that is one block of
@@ -207,13 +207,25 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
 
     const int32_t * src1_i32 = (const int32_t *) src1_d;
+
+    // PXA_GLM5NEXT: I32 -> I32. GLM-5.3-Flash's DSA indexer expands its selected pools into cell
+    // indices with a get_rows over an I32 table (one node per MLA block), and without this the
+    // whole node fell back to the CPU backend and split the graph 11 times per forward. get_rows
+    // on a same-width type is a pure row copy, so the F32 kernel does it verbatim on the bits --
+    // no dequantisation, no arithmetic, nothing that could interpret the payload.
+    if (src0->type == GGML_TYPE_I32) {
+        GGML_ASSERT(dst->type == GGML_TYPE_I32);
+        get_rows_cuda_float(src0, src1, dst, src0_d, src1_i32, dst_d, stream);
+        return;
+    }
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     switch (src0->type) {
         case GGML_TYPE_F16:

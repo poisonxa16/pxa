@@ -1,12 +1,12 @@
 """
-adapters.py -- optional bindings to the OTHER agents' components.
+adapters.py -- optional bindings to the other components (reference, plugin, kernel).
 
-The harness must be useful before agents A, B and C have landed anything, so every
+The harness must be useful before the other components have landed anything, so every
 foreign component is discovered at runtime and its absence downgrades a gate to SKIP,
 never to PASS.  A gate that cannot see the thing it tests must say so.
 
-  * `pxq4_vllm.reference` / `pxq4_vllm.layout` (agent A)  -- plan §6.2, §6.3
-  * `libpxq4_sm70.so` -> torch.ops.pxq4.*     (agent C)   -- plan §7.1
+  * `pxq4_vllm.reference` / `pxq4_vllm.layout` (the reference (reference.py))  -- plan §6.2, §6.3
+  * `libpxq4_sm70.so` -> torch.ops.pxq4.*     (the CUDA kernel (csrc/))   -- plan §7.1
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ class Missing:
         return f"<missing {self.what}: {self.why}>"
 
 
-# The plan (§4) names the runtime package `pxq4_vllm`, but the early prototypes landed
-# under flatter names while the repo layout was still being settled.
+# The design names the runtime package `pxq4_vllm`, but the components landed their work
+# in this scratchpad under flatter names while the repo layout was still being settled.
 # Search both, in plan order, so the gates keep working either way and nothing is skipped
 # merely because a directory got renamed.
 _REF_CANDIDATES = ("pxq4_vllm.reference", "gguf_to_vllm.reference", "pxq4_kernel_ref")
@@ -55,7 +55,7 @@ def ref_module():
 def all_ref_modules():
     """Every reference implementation that is importable, as {name: module}.
 
-    More than one is normal here: agent A ships one for the converter and agent C ships
+    More than one is normal here: the reference (reference.py) ships one for the converter and the CUDA kernel (csrc/) ships
     one as the kernel's numpy twin.  They are INDEPENDENT transcriptions of the same C,
     so cross-checking all of them against each other and against cref is strictly more
     evidence than checking one.
@@ -96,8 +96,8 @@ def pxq4_ops():
     """torch.ops.pxq4 with dequant_out/mmv_out loaded, or Missing.
 
     Resolution order:
-      1. pxq4_vllm.ops.load_library()  -- the supported path once agent B has landed
-      2. $PXQ4_LIB                     -- direct .so path, for testing agent C standalone
+      1. pxq4_vllm.ops.load_library()  -- the supported path once the vLLM plugin (ops.py/linear.py) has landed
+      2. $PXQ4_LIB                     -- direct .so path, for testing the CUDA kernel (csrc/) standalone
       3. already-loaded torch.ops.pxq4 -- someone else loaded it
     """
     t = torch_module()

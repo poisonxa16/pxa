@@ -357,7 +357,7 @@ static int pxa_pxq_v70_min_ny() {
 // route (k_pxq6_dequant_matrix + cublasGemmEx, dequant included) is marked ROUTE_CUBLAS, so the
 // worst case is zero regression rather than K7's -11..-36%. The static rows below are populated
 // from test #5 of tools/pxq4-v70-test.cu at the Measure phase; until then the table is empty and
-// the whole lane is held off by PXA_PXQ_GEMM_V70 defaulting to 0. PXA_PXQ_GEMM_V70_SKIP is the
+// the whole path is held off by PXA_PXQ_GEMM_V70 defaulting to 0. PXA_PXQ_GEMM_V70_SKIP is the
 // manual arm: "R:K,R:K,..." denylists shapes without a rebuild.
 struct pxq4_v70_route { int R, K, min_ny, max_ny; };
 // The leading { 0, 0, 0, 0 } is a SENTINEL, not a rule: a real R is never 0, and a zero-length

@@ -137,7 +137,14 @@ fi
 info "REF=$REF -> commit $COMMIT_SHORT, TAG=$TAG"
 
 WORK=$(mktemp -d /tmp/pxq-release-XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+# KEEP_WORK=1 keeps the staged tree. The trap deletes the stage on EVERY exit path, so a cut that
+# dies in one of the guards below leaves nothing to look at -- and the guard's own one-line message
+# is then the only evidence of what it refused. Inspecting a refused package has to be possible.
+if [ -n "${KEEP_WORK:-}" ]; then
+  trap 'echo "make-release-tarball.sh: KEEP_WORK set -- stage left at $WORK"' EXIT
+else
+  trap 'rm -rf "$WORK"' EXIT
+fi
 
 # A cmake --build against THIS BUILD_DIR still running would make the binaries we're about to
 # copy a moving target. Best-effort guard: look at ACTUAL "cmake" processes (pgrep -x, exact
@@ -147,7 +154,7 @@ trap 'rm -rf "$WORK"' EXIT
 #
 # This box runs many worktrees that all name their build dir "build-spd" (or "build"), so a
 # basename-only match on cmdline also false-positives across worktrees (seen in practice: a
-# different lane's "cmake --build build-spd" matched ours by basename alone). Disambiguate by
+# a different worktree's "cmake --build build-spd" matched ours by basename alone). Disambiguate by
 # resolving the candidate process's own cwd through ITS OWN /proc/<pid>/mountinfo (namespace-
 # aware — dockerized builds bind-mount BUILD_DIR's parent to something like /work, and the
 # mountinfo "root" field names the real host-side subvolume path) and comparing that against
@@ -464,7 +471,44 @@ chmod +x "$STAGE/tools/pxa-launch.py"
 # bench/fair, bench/gate, docs, license
 # ---------------------------------------------------------------------------------------------
 cp -a "$EXPORT/bench/fair/." "$STAGE/bench/fair/"
-cp -a "$EXPORT/bench/gate/." "$STAGE/bench/gate/"
+
+# bench/gate/ is copied BY NAME, not by wildcard, and LAST-RUN.md is deliberately NOT shipped.
+#
+# FOUND 2026-09-11, caught by tarball_scan.sh on the Sep-11 package: build-machine-paths hits=11,
+# box-tooling hits=5, every one of them in this single file. LAST-RUN.md is the record of a gate
+# run ON THE BUILD MACHINE -- it carries absolute /mnt paths and, worse, the internal model
+# FILENAMES that run was pointed at. The release rules keep both out of shipping files, and
+# neither is of any use to a user: what a user needs is the gate TOOLING.
+#
+# The wildcard was the defect. Every other doc in this script is copied by name (see the docs/
+# block below); this was the one line that shipped "whatever is in the directory", so a run record
+# written on Sep-9 evening was published in the Sep-11 package without anyone deciding to publish
+# it -- and it was absent from the Sep-9 package only because that run had not happened yet. The
+# scan result is the provenance: Sep-9 hits=0, Sep-11 hits=11, same script, different file.
+#
+# Sanitizing the file would be the wrong fix -- it is rewritten by every gate run, so the leak
+# returns with the next one. Withholding it is durable. A package's gate result still reaches
+# users through START-HERE.md and the manifest.
+# keep() asserts the OUTCOME, not the command. As first written it checked that the file existed at
+# REF and then ran `cp -a` without ever looking at the result -- and that copy failed for all three
+# prompts, because the mkdir near the top of this script creates bench/gate/ but NOT
+# bench/gate/prompts/. There is no `set -e` here, so the run continued and tarred a package whose own
+# gate harness cannot start: run-gate.sh loops over those three files and dies "missing prompt file".
+# The file was never lost by REF; it was lost in transit. A guard that checks the input and not the
+# outcome reports success for a copy that did not happen -- the same shape as the LAST-RUN.md leak
+# this function was written to fix, one level down.
+keep() {
+  [ -e "$EXPORT/$1" ] || die "REF $REF lost a required gate file: $1"
+  mkdir -p "$STAGE/$(dirname "$1")"
+  cp -a "$EXPORT/$1" "$STAGE/$1"
+  [ -e "$STAGE/$1" ] || die "required gate file did not survive staging: $1"
+}
+keep bench/gate/README.md
+keep bench/gate/run-gate.sh
+keep bench/gate/prompts/coherence.txt
+keep bench/gate/prompts/needle20801.txt
+keep bench/gate/prompts/needle3121.txt
+
 cp -a "$EXPORT/bench/fair-battle.md" "$STAGE/bench/fair-battle.md"
 
 cp -a "$EXPORT/README.md" "$STAGE/docs/README.md"
@@ -481,6 +525,123 @@ cp -a "$EXPORT/LICENSING.md" "$STAGE/LICENSING.md"
 # stale filename)
 cp -a "$EXPORT/README.md" "$STAGE/README.md"
 cp -a "$RELNOTES" "$STAGE/$(basename "$RELNOTES")"
+
+# ---------------------------------------------------------------------------------------------
+# THE CROSS-REFERENCED DOCS -- every link target the shipped docs name, not just the six above
+# ---------------------------------------------------------------------------------------------
+# ⚠ ADDED 2026-09-12 AFTER A LINK AUDIT OF THE SHIPPED rc3 PACKAGE: 13 .md files, every relative
+# target resolved against the directory of the file that names it -> 25 DEAD LINKS. Every one of
+# them pointed at a file that EXISTS IN THE TREE, so the defect was packaging, not content: the
+# README names fourteen relative targets and this script staged six. The worst was `LEVERS.md` --
+# the standing release rule names docs/LEVERS.md as THE lever doc, and the shipped README.md,
+# RELEASE-NOTES-2026-09-11.md and docs/COOKBOOK.md all point at it, yet it was in no package at all.
+# Ship each at the path the references already use, and FAIL if one is absent rather than stage a
+# package whose own cross-references are dead -- a missing doc is the same class of defect as the
+# gate-file copy this script already guards with keep(): the input was checked, the outcome was not.
+keep_doc() { # path relative to EXPORT == path relative to STAGE
+  [ -e "$EXPORT/$1" ] || die "a cross-referenced doc is absent from REF $REF: $1
+       (a shipped README/notes file links to it; packaging without it ships a dead link)"
+  mkdir -p "$STAGE/$(dirname "$1")"
+  # -L: docs/LEVERS.md is a SYMLINK (-> lab/LEVERS.md). `cp -a` alone would carry the link into the
+  # tarball, where its target is not present, and leave every reference dangling -- so dereference,
+  # and ship the content at both paths, which is what the two reference styles in-tree expect.
+  mkdir -p "$(dirname "$STAGE/$1")"
+  cp -aL "$EXPORT/$1" "$STAGE/$1"
+  [ -e "$STAGE/$1" ] || die "cross-referenced doc did not survive staging: $1"
+}
+keep_doc docs/LEVERS.md
+keep_doc docs/lab/LEVERS.md
+keep_doc docs/QUANTIZING.md
+keep_doc docs/PXQU-CONVERT.md
+keep_doc docs/PXA-SM70-SERVING.md
+keep_doc BUILD-FROM-SOURCE.md
+keep_doc bench/README.md
+keep_doc RELEASE-NOTES-2026-09-02.md
+keep_doc RELEASE-NOTES-2026-09-07.md
+keep_doc RELEASE-NOTES-2026-09-09.md
+
+# Added 2026-09-14, again named by the dead-link guard: the 09-13 notes and docs/COOKBOOK.md cite the
+# leaderboard for every cross-engine cell and every pending re-measure. The board has no outbound
+# links of its own, so shipping it closes the class without opening another one, and the numbers in
+# the notes stay traceable to the evidence inside the package rather than to a page on the web.
+keep_doc bench/LEADERBOARD.md
+
+# Added 2026-09-14, named by the guard below once it learned to read <img> tags: every shipped page
+# opens with the banner as an HTML <img>, the README embeds the fair-battle chart, and the 09-07
+# notes embed their five dark chart variants. Images are copied whole, never merged.
+keep_doc docs/assets/pxa-network-banner.png
+keep_doc docs/assets/before-after-2026-09-07-dark.png
+keep_doc docs/assets/context-vs-1cat-2026-09-07-dark.png
+keep_doc docs/assets/home-spec-ladder-2026-09-07-dark.png
+keep_doc docs/assets/us-vs-them-2026-09-03-dark.png
+keep_doc docs/assets/vs-1cat-2026-09-07-dark.png
+keep_doc banner.png
+keep_doc bench/fair-battle.svg
+
+# ⚠ ADDED 2026-09-12, NAMED BY THE DEAD-LINK GUARD BELOW, not by inspection. Staging the three
+# historical notes and the docs they cite pulled in this second ring: QUANTIZING.md,
+# PXA-SM70-SERVING.md and 09-09 all point at docs/VLLM.md (the serving line's own reference, 79 KB),
+# and VLLM.md in turn points at the sm_60 recipe, the QWEN4EXP converter note, the vllm-pxq4 tool
+# README and the serving stack's own README. The closure from the staged set is FIVE files and it
+# terminates -- measured, not assumed -- which is why the answer is to ship them rather than de-link
+# five sentences in docs that exist to be read. Nothing here is a doc we would withhold: the one
+# file in pxa/pxq4/ that would not belong in a release (BOX-ENV.md, a box-environment record) is not
+# linked from any shipped doc, so it stays out, and a lone README with its siblings absent is the
+# smaller cost than a dead link in a shipped table.
+keep_doc docs/VLLM.md
+keep_doc docs/PXA-SM60-SERVING.md
+keep_doc docs/QWEN4EXP-PXQ4.md
+keep_doc tools/vllm-pxq4/README.md
+keep_doc pxa/pxq4/README.md
+
+# The two files copied INTO docs/ carry links written for the repo ROOT, so every one of them breaks
+# by exactly one directory (docs/README.md alone accounted for 15 of the 25 dead links). Rewrite the
+# targets for their new depth: docs/X.md -> X.md, and anything at the root gains a "../".
+for f in "$STAGE/docs/README.md" "$STAGE/docs/$(basename "$RELNOTES")"; do
+  [ -f "$f" ] || continue
+  sed -i -E \
+    -e 's#\]\(docs/#](#g' \
+    -e 's#\]\(bench/#](../bench/#g' \
+    -e 's#\]\(RELEASE-NOTES-#](../RELEASE-NOTES-#g' \
+    -e 's#\]\(BUILD-FROM-SOURCE\.md\)#](../BUILD-FROM-SOURCE.md)#g' \
+    -e 's#src="docs/#src="#g' \
+    -e 's#src="bench/#src="../bench/#g' \
+    -e 's#src="banner\.png"#src="../banner.png"#g' \
+    "$f"
+done
+
+# The three HISTORICAL notes are cited by the shipped README as the evidence behind numbers the
+# README itself quotes ("that is the only place the +40% figure comes from"), and the release rule
+# requires every number in a shipped doc to be traceable to that release's bench evidence -- so they
+# have to travel with the package. They were written for the repo, where they sit beside docs/ at
+# the root and where a provenance comment may name a build-machine path. Two repairs, both narrow:
+#
+#  (1) LINKS. `](COOKBOOK.md)` written from the root means docs/COOKBOOK.md. The package's root
+#      copies of these notes still sit at the root, so the bare name resolves to nothing, and
+#      09-09's link to `../bench/gate/LAST-RUN.md` points above the package into nothing at all.
+#  (2) PATHS. 09-07 names the absolute path of the profiler output behind the PASCAL-DECODE-GAP
+#      numbers, and the leak guard below refuses to tar any stage carrying /mnt -- correctly.
+#
+# Sanitizing is the WRONG fix for a file a gate run rewrites (see the LAST-RUN.md note above): the
+# leak returns with the next run. These three are frozen history that no run regenerates, so the
+# prefix is the only thing that has to go and the reference keeps its meaning without it.
+#
+# LAST-RUN.md is deliberately NOT repointed at some other file: this script withholds it on purpose
+# (build-machine paths + internal model filenames), so the sentence that names it is DE-LINKED and
+# left as prose, which is what it is -- a pointer to an artifact that is not ours to publish.
+for f in "$STAGE"/RELEASE-NOTES-*.md; do
+  [ -f "$f" ] || continue
+  grep -q -e '/mnt/' -e '/boot/' -e '](COOKBOOK.md)' -e '](KNOWN-ISSUES.md)' -e '](VLLM.md)' \
+       -e 'LAST-RUN.md](' "$f" || continue
+  sed -i -E \
+    -e 's#\]\(COOKBOOK\.md\)#](docs/COOKBOOK.md)#g' \
+    -e 's#\]\(KNOWN-ISSUES\.md\)#](docs/KNOWN-ISSUES.md)#g' \
+    -e 's#\]\(VLLM\.md\)#](docs/VLLM.md)#g' \
+    -e 's#\[`bench/gate/LAST-RUN\.md`\]\(\.\./bench/gate/LAST-RUN\.md\)#`bench/gate/LAST-RUN.md`#g' \
+    -e 's#/mnt/[^ ,)]*#<build-machine path>#g' \
+    -e 's#/boot/[^ ,)]*#<build-machine path>#g' \
+    "$f"
+done
 
 # ---------------------------------------------------------------------------------------------
 # VERSION
@@ -520,11 +681,15 @@ GLIBC_FLOOR=${GLIBC_FLOOR:-"(objdump unavailable or reported nothing)"}
 GLIBCXX_FLOOR=${GLIBCXX_FLOOR:-"(objdump unavailable or reported nothing)"}
 info "minimum libc floor: $GLIBC_FLOOR / $GLIBCXX_FLOOR"
 
+# VERSION ships to users, so it carries no path from the machine that built it: the build
+# directory is NAMED, not located, plus whether this script built it or was handed it.
+# Through rc1 this field was the absolute $BUILD_DIR, which told a reader nothing and named
+# a directory on my box.
 cat > "$STAGE/VERSION" <<EOF
 tag:              $TAG
 commit:           $COMMIT
 ref:              $REF
-built_from_dir:   $BUILD_DIR
+build_dir:        $(basename "$BUILD_DIR")$([ "$SELF_BUILT" = 1 ] && echo " (self-built by this script)" || echo " (supplied)")
 packaged:         $(date -u +%Y-%m-%dT%H:%M:%SZ)
 cuda_runtime:     $CUDA_MAJOR_MINOR
 cuda_archs_built: $CUDA_ARCHS
@@ -555,6 +720,75 @@ PATCHELF_OK="$PATCHELF_OK" \
 HEADER=0 \
 OUT="$STAGE/START-HERE.md" \
   "$HERE/gen-start-here.sh" || die "START-HERE.md render failed"
+
+# ---------------------------------------------------------------------------------------------
+# DEAD-LINK GUARD -- refuse to TAR a package whose own cross-references do not resolve
+# ---------------------------------------------------------------------------------------------
+# Same shape as the leak guard below, and the same lesson keep() already records one level up: a
+# check that reads the INPUT (is the file there in REF?) reports success for a package that ships a
+# broken reference. This one reads the STAGE.
+#
+# The defect class is not hypothetical. The shipped v2026.09.11-rc3 package had 25 dead links
+# across its 13 .md files, every one of them a target that EXISTS in the tree -- so the fault was
+# packaging, not content: the README names fourteen relative targets and this script staged six.
+# Repointing those six would have fixed one package; this guard is what fixes the NEXT cut, because
+# the same mistake arrives wearing a different filename (a note links a doc, and that doc links the
+# next one). Targets are resolved against the directory of the file that NAMES them, which is the
+# only reading a reader has.
+#
+# A target that is missing on purpose (LAST-RUN.md: build-machine paths + internal model
+# filenames, withheld by the bench/gate block above) must be DE-LINKED in the sentence that names
+# it, not tolerated here -- an allowlist would re-open the hole for the next file that lands in it.
+DEADLINK=$(python3 - "$STAGE" <<'PY'
+import os,re,sys
+stage=sys.argv[1]
+pat=re.compile(r'\[[^\]]*\]\(([^)\s]+)\)|<img[^>]*\ssrc="([^"]+)"')
+dead=[]
+for dp,_dn,fn in os.walk(stage):
+    for f in fn:
+        if not f.endswith('.md'):
+            continue
+        p=os.path.join(dp,f)
+        try:
+            txt=open(p,encoding='utf-8',errors='replace').read()
+        except OSError:
+            continue
+        for m in pat.finditer(txt):
+            t=(m.group(1) or m.group(2) or '').split('#')[0].strip()
+            if not t or '://' in t or t.startswith('mailto:'):
+                continue
+            if not os.path.exists(os.path.normpath(os.path.join(dp,t))):
+                dead.append('%s: %s' % (os.path.relpath(p,stage),t))
+print('\n'.join(sorted(set(dead))))
+PY
+)
+if [ -n "$DEADLINK" ]; then
+  die "staged package has dead cross-references -- refusing to tar:
+$DEADLINK
+(each line is <file that names the link>: <target>; either ship the target with keep_doc, or
+ de-link the sentence when the target is an artifact we deliberately do not publish)"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# leak guard -- refuse to TAR a package that carries build-machine paths
+# ---------------------------------------------------------------------------------------------
+# The staging rules in this script have now twice been the difference between a clean package and
+# a published one (the bench/gate wildcard above; the empty-REF provenance bug in the wrapper).
+# Both were silent: the package built, the tarball existed, and the fault was only visible to a
+# reader who went looking. This guard is the one place the package build can FAIL on the thing it
+# shipped rather than on the thing it printed.
+#
+# It checks the STAGE tree, not the repository, because the leak class lives in files this script
+# WRITES (VERSION, START-HERE.md, run-server.sh, the manifest) that the repository never sees.
+# `-I` skips binaries, so the .so/.elf payload is not read; two of the three build-machine roots
+# are enough to catch the class; a fuller scan lives outside the repo and remains the full
+# scan (attribution, host names, private branches) run against the finished artifact.
+LEAK=$(grep -rIl -e '/mnt/' -e '/boot/' "$STAGE" 2>/dev/null || true)
+if [ -n "$LEAK" ]; then
+  die "staged package leaks build-machine paths -- refusing to tar:
+$LEAK
+$(grep -rIn -e '/mnt/' -e '/boot/' "$STAGE" 2>/dev/null | head -20)"
+fi
 
 # ---------------------------------------------------------------------------------------------
 # archive

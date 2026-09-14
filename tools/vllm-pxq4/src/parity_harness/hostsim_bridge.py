@@ -1,5 +1,5 @@
 """
-hostsim_bridge.py -- drive agent C's kernel on the CPU, via ctypes, with no GPU.
+hostsim_bridge.py -- drive the CUDA kernel on the CPU, via ctypes, with no GPU.
 
 `pxq4_kernel_hostsim.cpp` compiles the REAL `k_pxq4_dequant_matrix` / `k_pxq4_mmv` device
 code against a tiny host shim that fakes blockIdx/threadIdx/__syncthreads.  That means the
@@ -8,7 +8,7 @@ here, today, against the actual kernel source rather than a description of it.
 
 What this DOES prove: the layout arithmetic, the nibble and scale-SoA addressing, the
 table values, the accumulation order, the canonical nfix fold, the fp16 store, and the
-whole shard-then-dequant invariant, all in agent C's own code.
+whole shard-then-dequant invariant, all in the CUDA kernel's own code.
 
 What it does NOT prove, and G6/G8 on real hardware still must: the launch configuration,
 the dynamic-shared-memory opt-in, CUDA-graph capture, warp-level primitives (__shfl_sync,

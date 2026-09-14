@@ -17,7 +17,8 @@ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_
 // PXQ tiers do not use the flat-block-index vec_dot: their panel/slab layout needs (row, kb) and
 // the blocks-per-row count separately. Compile-time switch, so no other type's codegen changes.
 template <ggml_type type>
-static constexpr bool pxq_mmvq_layout = (type == GGML_TYPE_PXQ4 || type == GGML_TYPE_PXQ4HQ);
+static constexpr bool pxq_mmvq_layout = (type == GGML_TYPE_PXQ4 || type == GGML_TYPE_PXQ4HQ ||
+                                         type == GGML_TYPE_PXQ2 || type == GGML_TYPE_PXQ3);
 
 // ROWS PER BLOCK. A PXQ slab holds 64 rows x 16 B of codes contiguously, so a k-block of ONE row
 // is a 16 B island and the next k-block of that row is a whole slab (1088/1152 B) away: with the
@@ -34,11 +35,16 @@ static constexpr int mmvq_rows_per_block = pxq_mmvq_layout<type>
         ? (ncols_y <= 2 ? ROWS : (ROWS > 2 ? 2 : ROWS))
         : (ncols_y < 4 ? 1 : 2);
 
+// The tier's policy, and the slab stride the panel arithmetic steps by. Both come off the policy
+// so a new tier is one struct in pxq-mmvq.cuh and one arm here, with nothing to keep in sync.
 template <ggml_type type>
-static constexpr int pxq_mmvq_slab = (type == GGML_TYPE_PXQ4) ? PXQ6_SLAB_BYTES : PXQ6HQ_SLAB_BYTES;
+using pxq_mmvq_pol =
+    std::conditional_t<type == GGML_TYPE_PXQ4, pxq_mmvq_pol_p6,
+    std::conditional_t<type == GGML_TYPE_PXQ2, pxq_mmvq_pol_p2,
+    std::conditional_t<type == GGML_TYPE_PXQ3, pxq_mmvq_pol_p3, pxq_mmvq_pol_p6hq>>>;
 
 template <ggml_type type>
-using pxq_mmvq_pol = std::conditional_t<type == GGML_TYPE_PXQ4, pxq_mmvq_pol_p6, pxq_mmvq_pol_p6hq>;
+static constexpr int pxq_mmvq_slab = pxq_mmvq_pol<type>::SLAB;
 
 template <ggml_type type, int VDR, int ROWS>
 static __device__ __forceinline__ float pxq_mmvq_dot(
@@ -48,6 +54,19 @@ static __device__ __forceinline__ float pxq_mmvq_dot(
     return vec_dot_pxq_q8_1<pxq_mmvq_pol<type>, VDR, ROWS>(slab, r, i, anch, sub, sc, bq8_1, iqs);
 }
 
+// The same dot in its two halves: decode one (row, k-block) of the weight once, then score that
+// fragment against each activation column. Same arithmetic, same order, bit-identical result --
+// see the note over pxq_mmvq_wfrag in pxa/pxq-mmvq.cuh.
+template <ggml_type type, int VDR, int ROWS>
+using pxq_mmvq_frag = pxq_mmvq_wfrag<pxq_mmvq_pol<type>, VDR, ROWS>;
+
+template <ggml_type type, int VDR, int ROWS>
+static __device__ __forceinline__ float pxq_mmvq_dot_f(
+        const pxq_mmvq_frag<type, VDR, ROWS> & w, const float anch,
+        const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+    return pxq_mmvq_dot_frag<pxq_mmvq_pol<type>, VDR, ROWS>(w, anch, bq8_1, iqs);
+}
+
 // The 16-entry sub-scale table is the one lookup PXQ has that MXFP4's E8M0 exponent trick does
 // not: its index is a 4-bit field of the weight stream, so it is divergent across the warp and
 // the compiler cannot hoist it out of the k loop the way it hoists the uniform code book. Stage
@@ -55,8 +74,7 @@ static __device__ __forceinline__ float pxq_mmvq_dot(
 template <ggml_type type>
 static __device__ __forceinline__ const float * pxq_mmvq_stage_sub(float * s_sub, int tid) {
     if (tid < 16) {
-        if constexpr (type == GGML_TYPE_PXQ4) s_sub[tid] = pxq_mmvq_pol_p6::subtab()[tid];
-        else                                  s_sub[tid] = pxq_mmvq_pol_p6hq::subtab()[tid];
+        s_sub[tid] = pxq_mmvq_pol<type>::subtab()[tid];
     }
     __syncthreads();
     return s_sub;
@@ -77,7 +95,7 @@ struct pxq_mmvq_rowbase {
         r0  = row0 & 63;
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) {
-            anch[i] = __half2float(((const half *) pan)[r0 + i]) * PXQ_MMVQ_BFOLD;
+            anch[i] = __half2float(((const half *) pan)[r0 + i]) * pxq_mmvq_pol<type>::BFOLD;
         }
     }
     __device__ const uint8_t * slab(int kbx) const {
@@ -134,12 +152,18 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_MXFP4   : return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_PXQ4    : return VDR_PXQ_Q8_1_MMVQ;
         case GGML_TYPE_PXQ4HQ  : return VDR_PXQ_Q8_1_MMVQ;
+        case GGML_TYPE_PXQ2    : return VDR_PXQ_Q8_1_MMVQ;
+        case GGML_TYPE_PXQ3    : return VDR_PXQ_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS  : return VDR_IQ4_XS_Q8_1_MMVQ;
         default                : return 1;
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP>
+// HOIST: decode each weight fragment once per (row, k-block) and reuse it across the ncols_y
+// activation columns, instead of once per (column, row, k-block). Bit-identical, on by default;
+// HOIST=false reproduces the pre-2026-09-08 structure and exists so tests/test-pxq-mmvq-cols.cu
+// can run both arms in one binary. PXQ tiers only -- no other type's codegen sees it.
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP, bool HOIST = true>
 static __device__ void k_mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy,
     const float * bias, float * __restrict__ dst,
@@ -180,11 +204,25 @@ static __device__ void k_mul_mat_vec_q(
             const int kby = kbx * (qk/QK8_1);
             const uint8_t * slab = rb.slab(kbx);
             pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> sc; sc.load(slab, rb.r0);
-#pragma unroll
-            for (int j = 0; j < ncols_y; ++j) {
+            if constexpr (HOIST && ncols_y > 1) {
+                // row outer: unpack this (row, k-block) once, then run it against every column.
+                // Each tmp[j][i] still takes exactly one addend per k-block, in k-block order.
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(slab, rb.r0 + i, i, rb.anch[i], sub, sc, &y[j*blocks_per_col_y + kby], kqs);
+                    pxq_mmvq_frag<type, VDRP, rows_per_cuda_block> w;
+                    w.load(slab, rb.r0 + i, i, sub, sc, kqs);
+#pragma unroll
+                    for (int j = 0; j < ncols_y; ++j) {
+                        tmp[j][i] += pxq_mmvq_dot_f<type, VDRP, rows_per_cuda_block>(w, rb.anch[i], &y[j*blocks_per_col_y + kby], kqs);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        tmp[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(slab, rb.r0 + i, i, rb.anch[i], sub, sc, &y[j*blocks_per_col_y + kby], kqs);
+                    }
                 }
             }
         }
@@ -241,7 +279,7 @@ static __device__ void k_mul_mat_vec_q(
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP>
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP, bool HOIST = true>
 static __device__ void k_fused_mul_mat_vec_q(
     const void * __restrict__ vup, const void * __restrict__ vgate,
     const float * __restrict__ bias_u, const float * __restrict__ bias_g,
@@ -295,12 +333,36 @@ static __device__ void k_fused_mul_mat_vec_q(
             const uint8_t * sg = rg.slab(kbx);
             pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> scu; scu.load(su, ru.r0);
             pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> scg; scg.load(sg, rg.r0);
-#pragma unroll
-            for (int j = 0; j < ncols_y; ++j) {
+            if constexpr (HOIST && ncols_y > 1) {
+                // Up and gate are decoded in turn, not together, so only one fragment is live at
+                // a time and the extra registers do not double for the fused twin.
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp_u[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(su, ru.r0 + i, i, ru.anch[i], sub, scu, &y[j*blocks_per_col_y + kby], kqs);
-                    tmp_g[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(sg, rg.r0 + i, i, rg.anch[i], sub, scg, &y[j*blocks_per_col_y + kby], kqs);
+                    {
+                        pxq_mmvq_frag<type, VDRP, rows_per_cuda_block> w;
+                        w.load(su, ru.r0 + i, i, sub, scu, kqs);
+#pragma unroll
+                        for (int j = 0; j < ncols_y; ++j) {
+                            tmp_u[j][i] += pxq_mmvq_dot_f<type, VDRP, rows_per_cuda_block>(w, ru.anch[i], &y[j*blocks_per_col_y + kby], kqs);
+                        }
+                    }
+                    {
+                        pxq_mmvq_frag<type, VDRP, rows_per_cuda_block> w;
+                        w.load(sg, rg.r0 + i, i, sub, scg, kqs);
+#pragma unroll
+                        for (int j = 0; j < ncols_y; ++j) {
+                            tmp_g[j][i] += pxq_mmvq_dot_f<type, VDRP, rows_per_cuda_block>(w, rg.anch[i], &y[j*blocks_per_col_y + kby], kqs);
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        tmp_u[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(su, ru.r0 + i, i, ru.anch[i], sub, scu, &y[j*blocks_per_col_y + kby], kqs);
+                        tmp_g[j][i] += pxq_mmvq_dot<type, VDRP, rows_per_cuda_block>(sg, rg.r0 + i, i, rg.anch[i], sub, scg, &y[j*blocks_per_col_y + kby], kqs);
+                    }
                 }
             }
         }
@@ -385,7 +447,7 @@ static __device__ void k_fused_mul_mat_vec_q(
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP>
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP, bool HOIST = true>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
 __launch_bounds__(nwarps*WARP_SIZE, 1)
@@ -405,10 +467,10 @@ static __global__ void mul_mat_vec_q(
     const char * cx = (const char *)vx + i02*nb02;
     const char * cy = (const char *)vy + i2*nb12;
     const float * b = (const float *)(bias ? ids_data ? (const char *)bias + i02*bias_nb1 : bias : nullptr);
-    k_mul_mat_vec_q<type, ncols_y, nwarps, ROWS, VDRP>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    k_mul_mat_vec_q<type, ncols_y, nwarps, ROWS, VDRP, HOIST>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP>
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP, bool HOIST = true>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
 __launch_bounds__(nwarps*WARP_SIZE, 1)
@@ -431,7 +493,7 @@ static __global__ void fused_mul_mat_vec_q(
     const float * cx_u_b = bias_u ? (const float *)((const char *)bias_u + i02*bias_nb1) : nullptr;
     const float * cx_g_b = bias_g ? (const float *)((const char *)bias_g + i02*bias_nb1) : nullptr;
     const char * cy = (const char *)vy + i2*nb12;
-    k_fused_mul_mat_vec_q<type, ncols_y, nwarps, ROWS, VDRP>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
+    k_fused_mul_mat_vec_q<type, ncols_y, nwarps, ROWS, VDRP, HOIST>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
             unary_op, limit);
 }
 
@@ -624,6 +686,8 @@ extern void mul_mat_vec_iq4_nl_q8_1_cuda(const mmvq_args & args, cudaStream_t st
 extern void mul_mat_vec_mxfp4_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_pxq4_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_pxq4hq_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
+extern void mul_mat_vec_pxq2_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
+extern void mul_mat_vec_pxq3_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_iq4_xs_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_iq3_s_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 

@@ -1,15 +1,18 @@
 #!/bin/bash
 set -euo pipefail
-SRC=/mnt/models/pxa-int-v6/src
-OUT=/mnt/models/pxa-int-v6/site/pxq4_vllm/_lib
-BUILD=/mnt/models/pxa-int-v6/build
+# PXA_MODELS_DIR should be an absolute path here: it is bind-mounted into the container
+# below at the same path (the ./models default is meant for non-docker use).
+MODELS_DIR="${PXA_MODELS_DIR:-./models}"
+SRC=$MODELS_DIR/pxa-int-v6/src
+OUT=$MODELS_DIR/pxa-int-v6/site/pxq4_vllm/_lib
+BUILD=$MODELS_DIR/pxa-int-v6/build
 mkdir -p "$BUILD" "$OUT"
 docker run --rm \
-  -v /mnt/models:/mnt/models \
+  -v "$MODELS_DIR":"$MODELS_DIR" \
   -w "$BUILD" \
   -e SRC="$SRC" -e OUT="$OUT" \
   --entrypoint /bin/bash \
-  kewaii/vllm:latest -lc '
+  ${VLLM_IMAGE:-vllm/vllm-openai:latest} -lc '
     set -euo pipefail
     PY=/opt/vllm-venv/bin/python
     PREFIX="$($PY -c "import torch;print(torch.utils.cmake_prefix_path)")"

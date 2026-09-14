@@ -1,0 +1,162 @@
+# PXQU tier map 'pxqu-glm53flash-pxq2': glm5next routed experts, blocks 3..44 x 3 tensors.
+# expert budget 79.92 GiB -> 79.92 GiB used, avg 2.255 bpw, hist {'pxq2': 126}
+# THE DEFAULT MAP for GLM-5.3-Flash on 4x P100 (2026-09-08).
+# Uniform PXQ2 on every routed expert stack. That is not a lack of ambition, it is the
+# optimum for the two card sets we actually have:
+#   * PXQ2 is the lowest tier with a MEASURED wrel on this codec family. PXQ1's wrel in the
+#     generator is a placeholder (0.62, ~2x pxq2) and no sensitivity sweep exists for
+#     glm5next, so nothing here is allowed below pxq2.
+#   * Above pxq2 every extra byte lands in HOST RAM, not VRAM (see the ledger below), and a
+#     host-resident expert stack is read over PCIe/DRAM every token. Going to the 85 GiB
+#     'hq' map buys pxq3 on 18 deep down_exps and costs ~5.1 GiB more host traffic per token
+#     -- roughly 2.7 more block-equivalents on the CPU side.
+# So: minimise host overflow, stay at the measured tier, spend nothing on either end.
+#
+# VRAM ledger (real: nvidia-smi allocatable 16270 MiB/P100, 16145 MiB/V100; GPU 0 is NO
+# LONGER shared with another resident model, so 4x P100 is 63.55 GiB, not the 55.60 GiB the 2026-09-08
+# 07:00 maps assumed). Per-card fixed cost = 280 MiB ctx/CUDA + 570 MiB compute (980 on the
+# head card) + 1.2 GiB reserve + KV/state share. Backbone after our rules = 6.19 GiB.
+#   A) 4x P100 (0,1,5,6) -c 8192 : 54.40 GiB on card, 31.71 on host (50 of 126 expert
+#      tensors = 16.7 block-equivalents). Host RAM free ~70 GiB, mmap'd.
+#   B) 6 cards (+2x V100 2,4)    : 80.41 GiB on card, 5.71 on host (9 of 126 = 3.0 blocks).
+#      -c 32768 costs +0.64 GiB of KV and does not change either split.
+# ONE artifact serves both sets; only the runtime -ts/-ot differ. See
+#
+# blk.45 (NextN/MTP) is deliberately NOT in this map: the quantiser's glm5next keep-list
+# copies that whole block at source precision (our loader marks it TENSOR_SKIP without
+# --mtp, so it costs disk and no VRAM). Leaving it merely UNMAPPED would have written it as
+# flat MXFP4 -- see the PXQU unmapped-expert guard in src/llama-quantize.cpp.
+# Shapes are the real ones from the unsloth UD-Q2_K_XL GGUF header.
+# Solved by a Lagrangian knapsack on a PROXY sensitivity (depth x kind), not a
+# measured sens.json -- no sensitivity sweep exists for glm5next yet. Regenerate
+# from a real imatrix before treating the assignment as final.
+# The precision-sensitive tensors (indexer.*, indexer_compressor_*, hc_*, ssm_a,
+# ssm_dt.bias, ssm_f_*, ssm_g_*, ssm_norm, attn_k_b, attn_v_b, *_norm) are NOT in
+# this map and must be left at source precision by the quantiser's keep list.
+# Consumed by llama-quantize --pxq-universal.
+^blk\.3\.ffn_gate_exps\.weight$=pxq2
+^blk\.3\.ffn_up_exps\.weight$=pxq2
+^blk\.3\.ffn_down_exps\.weight$=pxq2
+^blk\.4\.ffn_gate_exps\.weight$=pxq2
+^blk\.4\.ffn_up_exps\.weight$=pxq2
+^blk\.4\.ffn_down_exps\.weight$=pxq2
+^blk\.5\.ffn_gate_exps\.weight$=pxq2
+^blk\.5\.ffn_up_exps\.weight$=pxq2
+^blk\.5\.ffn_down_exps\.weight$=pxq2
+^blk\.6\.ffn_gate_exps\.weight$=pxq2
+^blk\.6\.ffn_up_exps\.weight$=pxq2
+^blk\.6\.ffn_down_exps\.weight$=pxq2
+^blk\.7\.ffn_gate_exps\.weight$=pxq2
+^blk\.7\.ffn_up_exps\.weight$=pxq2
+^blk\.7\.ffn_down_exps\.weight$=pxq2
+^blk\.8\.ffn_gate_exps\.weight$=pxq2
+^blk\.8\.ffn_up_exps\.weight$=pxq2
+^blk\.8\.ffn_down_exps\.weight$=pxq2
+^blk\.9\.ffn_gate_exps\.weight$=pxq2
+^blk\.9\.ffn_up_exps\.weight$=pxq2
+^blk\.9\.ffn_down_exps\.weight$=pxq2
+^blk\.10\.ffn_gate_exps\.weight$=pxq2
+^blk\.10\.ffn_up_exps\.weight$=pxq2
+^blk\.10\.ffn_down_exps\.weight$=pxq2
+^blk\.11\.ffn_gate_exps\.weight$=pxq2
+^blk\.11\.ffn_up_exps\.weight$=pxq2
+^blk\.11\.ffn_down_exps\.weight$=pxq2
+^blk\.12\.ffn_gate_exps\.weight$=pxq2
+^blk\.12\.ffn_up_exps\.weight$=pxq2
+^blk\.12\.ffn_down_exps\.weight$=pxq2
+^blk\.13\.ffn_gate_exps\.weight$=pxq2
+^blk\.13\.ffn_up_exps\.weight$=pxq2
+^blk\.13\.ffn_down_exps\.weight$=pxq2
+^blk\.14\.ffn_gate_exps\.weight$=pxq2
+^blk\.14\.ffn_up_exps\.weight$=pxq2
+^blk\.14\.ffn_down_exps\.weight$=pxq2
+^blk\.15\.ffn_gate_exps\.weight$=pxq2
+^blk\.15\.ffn_up_exps\.weight$=pxq2
+^blk\.15\.ffn_down_exps\.weight$=pxq2
+^blk\.16\.ffn_gate_exps\.weight$=pxq2
+^blk\.16\.ffn_up_exps\.weight$=pxq2
+^blk\.16\.ffn_down_exps\.weight$=pxq2
+^blk\.17\.ffn_gate_exps\.weight$=pxq2
+^blk\.17\.ffn_up_exps\.weight$=pxq2
+^blk\.17\.ffn_down_exps\.weight$=pxq2
+^blk\.18\.ffn_gate_exps\.weight$=pxq2
+^blk\.18\.ffn_up_exps\.weight$=pxq2
+^blk\.18\.ffn_down_exps\.weight$=pxq2
+^blk\.19\.ffn_gate_exps\.weight$=pxq2
+^blk\.19\.ffn_up_exps\.weight$=pxq2
+^blk\.19\.ffn_down_exps\.weight$=pxq2
+^blk\.20\.ffn_gate_exps\.weight$=pxq2
+^blk\.20\.ffn_up_exps\.weight$=pxq2
+^blk\.20\.ffn_down_exps\.weight$=pxq2
+^blk\.21\.ffn_gate_exps\.weight$=pxq2
+^blk\.21\.ffn_up_exps\.weight$=pxq2
+^blk\.21\.ffn_down_exps\.weight$=pxq2
+^blk\.22\.ffn_gate_exps\.weight$=pxq2
+^blk\.22\.ffn_up_exps\.weight$=pxq2
+^blk\.22\.ffn_down_exps\.weight$=pxq2
+^blk\.23\.ffn_gate_exps\.weight$=pxq2
+^blk\.23\.ffn_up_exps\.weight$=pxq2
+^blk\.23\.ffn_down_exps\.weight$=pxq2
+^blk\.24\.ffn_gate_exps\.weight$=pxq2
+^blk\.24\.ffn_up_exps\.weight$=pxq2
+^blk\.24\.ffn_down_exps\.weight$=pxq2
+^blk\.25\.ffn_gate_exps\.weight$=pxq2
+^blk\.25\.ffn_up_exps\.weight$=pxq2
+^blk\.25\.ffn_down_exps\.weight$=pxq2
+^blk\.26\.ffn_gate_exps\.weight$=pxq2
+^blk\.26\.ffn_up_exps\.weight$=pxq2
+^blk\.26\.ffn_down_exps\.weight$=pxq2
+^blk\.27\.ffn_gate_exps\.weight$=pxq2
+^blk\.27\.ffn_up_exps\.weight$=pxq2
+^blk\.27\.ffn_down_exps\.weight$=pxq2
+^blk\.28\.ffn_gate_exps\.weight$=pxq2
+^blk\.28\.ffn_up_exps\.weight$=pxq2
+^blk\.28\.ffn_down_exps\.weight$=pxq2
+^blk\.29\.ffn_gate_exps\.weight$=pxq2
+^blk\.29\.ffn_up_exps\.weight$=pxq2
+^blk\.29\.ffn_down_exps\.weight$=pxq2
+^blk\.30\.ffn_gate_exps\.weight$=pxq2
+^blk\.30\.ffn_up_exps\.weight$=pxq2
+^blk\.30\.ffn_down_exps\.weight$=pxq2
+^blk\.31\.ffn_gate_exps\.weight$=pxq2
+^blk\.31\.ffn_up_exps\.weight$=pxq2
+^blk\.31\.ffn_down_exps\.weight$=pxq2
+^blk\.32\.ffn_gate_exps\.weight$=pxq2
+^blk\.32\.ffn_up_exps\.weight$=pxq2
+^blk\.32\.ffn_down_exps\.weight$=pxq2
+^blk\.33\.ffn_gate_exps\.weight$=pxq2
+^blk\.33\.ffn_up_exps\.weight$=pxq2
+^blk\.33\.ffn_down_exps\.weight$=pxq2
+^blk\.34\.ffn_gate_exps\.weight$=pxq2
+^blk\.34\.ffn_up_exps\.weight$=pxq2
+^blk\.34\.ffn_down_exps\.weight$=pxq2
+^blk\.35\.ffn_gate_exps\.weight$=pxq2
+^blk\.35\.ffn_up_exps\.weight$=pxq2
+^blk\.35\.ffn_down_exps\.weight$=pxq2
+^blk\.36\.ffn_gate_exps\.weight$=pxq2
+^blk\.36\.ffn_up_exps\.weight$=pxq2
+^blk\.36\.ffn_down_exps\.weight$=pxq2
+^blk\.37\.ffn_gate_exps\.weight$=pxq2
+^blk\.37\.ffn_up_exps\.weight$=pxq2
+^blk\.37\.ffn_down_exps\.weight$=pxq2
+^blk\.38\.ffn_gate_exps\.weight$=pxq2
+^blk\.38\.ffn_up_exps\.weight$=pxq2
+^blk\.38\.ffn_down_exps\.weight$=pxq2
+^blk\.39\.ffn_gate_exps\.weight$=pxq2
+^blk\.39\.ffn_up_exps\.weight$=pxq2
+^blk\.39\.ffn_down_exps\.weight$=pxq2
+^blk\.40\.ffn_gate_exps\.weight$=pxq2
+^blk\.40\.ffn_up_exps\.weight$=pxq2
+^blk\.40\.ffn_down_exps\.weight$=pxq2
+^blk\.41\.ffn_gate_exps\.weight$=pxq2
+^blk\.41\.ffn_up_exps\.weight$=pxq2
+^blk\.41\.ffn_down_exps\.weight$=pxq2
+^blk\.42\.ffn_gate_exps\.weight$=pxq2
+^blk\.42\.ffn_up_exps\.weight$=pxq2
+^blk\.42\.ffn_down_exps\.weight$=pxq2
+^blk\.43\.ffn_gate_exps\.weight$=pxq2
+^blk\.43\.ffn_up_exps\.weight$=pxq2
+^blk\.43\.ffn_down_exps\.weight$=pxq2
+^blk\.44\.ffn_gate_exps\.weight$=pxq2
+^blk\.44\.ffn_up_exps\.weight$=pxq2
+^blk\.44\.ffn_down_exps\.weight$=pxq2

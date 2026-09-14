@@ -589,6 +589,24 @@ struct ggml_cuda_type_traits<GGML_TYPE_PXQ4HQ> {
     static constexpr int qi = QI4_NL;
 };
 
+// The two LOW tiers pack 32 values into 8 B (PXQ2) and 12 B (PXQ3) rather than 16 B, but MMVQ
+// reads (qk, qi) as "values per block" and "8-value code groups per block", and on that reading
+// all four PXQ tiers are the same shape -- 32 values, 4 groups. So the thread map, the q8_1 block
+// pairing and the launcher are shared unchanged; only the code load inside the policy differs.
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PXQ2> {
+    static constexpr int qk = QK4_NL;
+    static constexpr int qr = QR4_NL;
+    static constexpr int qi = QI4_NL;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PXQ3> {
+    static constexpr int qk = QK4_NL;
+    static constexpr int qr = QR4_NL;
+    static constexpr int qi = QI4_NL;
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS> {
     static constexpr int qk = QK_K;
@@ -672,6 +690,10 @@ extern "C" int ggml_pxa_cuda_is_volta_only(void);
 // specific instruction, the same values computed a cheaper way. They were measured on the 4x P100
 // seat, so gating them on "Volta-only process" (the 2026-09-03 shape, the only architecture
 // question a non-CUDA TU could ask) left them off on the silicon they were measured on.
+// PXA_FUSE_SIBLINGS: the most same-op same-shape nodes that may be merged into one launch.
+// Bounds the by-value pointer packs the merged kernels take as an argument.
+#define PXA_SIB_MAX 8
+
 static inline bool pxa_cuda_house_lever(const char * name) {
     const char * e = getenv(name);
     if (e) {

@@ -21,14 +21,17 @@ struct delta_net {
                       ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
                       ggml_tensor * g, ggml_tensor * beta, ggml_tensor * state,
                       int il, const llm_build_cb & cb, int repeat_type,
-                      ggml_tensor * per_step_ckpt = nullptr);
+                      ggml_tensor * per_step_ckpt = nullptr,
+                      // PXA_RS_RING: per-step capture strides (elements); 0 = the dense layout
+                      int64_t sv_row_stride = 0, int64_t sv_step_stride = 0);
 
     // PXA_LLAMA_FIX_v4: takes n_seqs + per-request runtime tensors (state_row_idx, conv_seq_map, state_mask) so the
     // mixed (concurrent) path runs ONE batched delta-net (n_seqs=n_tok) instead of a per-token subgraph loop.
     ggml_tensor * build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, ggml_tensor * state_row_idx, ggml_tensor * conv_seq_map, ggml_tensor * state_mask, ggml_tensor * inp_out_ids,
             int64_t n_seqs, bool reset_state_local, int il, const llm_build_cb & cb, int64_t pxa_static_slot = -1,
-            bool hc_mode = false) const;
+            bool hc_mode = false,
+            ggml_tensor * state_row_idx_w = nullptr) const;   // PXA_RS_RING: scatter index (plane 0)
 
     ggml_tensor * build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
@@ -59,6 +62,9 @@ private:
     // caching the three views here is exactly per-graph. Keyed on ctx0 as a cheap guard.
     mutable ggml_context * shared_view_ctx    = nullptr;
     mutable ggml_tensor  * shared_state_row   = nullptr;
+    // PXA_RS_RING: the READ index view (may point at a history plane); shared_state_row stays the
+    // WRITE index (plane 0). Null / equal when the ring is off.
+    mutable ggml_tensor  * shared_state_row_rd = nullptr;
     mutable ggml_tensor  * shared_conv_map    = nullptr;
     mutable ggml_tensor  * shared_state_mask  = nullptr;
     mutable int64_t        shared_view_n_seqs = -1;
@@ -87,7 +93,11 @@ private:
             int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
             int64_t n_seqs_in, uint32_t qnext_state_slots, bool reset_state_local,
             float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
-            ggml_tensor * per_step_ssm = nullptr, ggml_tensor * per_step_conv = nullptr, int64_t pxa_static_slot = -1);
+            ggml_tensor * per_step_ssm = nullptr, ggml_tensor * per_step_conv = nullptr, int64_t pxa_static_slot = -1,
+            // PXA_RS_RING: rows per ring plane (0 = ring off) and the WRITE row index (plane 0).
+            // With the ring on, state_row_idx is the READ index (it may point at a history plane)
+            // and state_row_idx_w is where the new state is scattered.
+            uint32_t rs_plane_rows = 0, ggml_tensor * state_row_idx_w = nullptr);
 
     static ggml_tensor * build_gated_output(llama_context & lctx, ggml_context * ctx0, ggml_tensor * ssm_norm, ggml_tensor * ssm_out,
             ggml_tensor * output, ggml_tensor * z, int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb, bool sigmoid_gate = false);

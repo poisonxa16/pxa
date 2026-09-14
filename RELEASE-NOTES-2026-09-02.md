@@ -66,6 +66,30 @@ Output-identical. Stacked with the host-overhead cuts below, the full shipped se
 **+49% decode at 86,401 tokens, +2.3% at low fill**, over a bracketing control pair, output
 identical in every arm.
 
+> ⚠ **CORRECTED 2026-09-12 — this section's numbers stand as measured, but they are not the last
+> word, and neither of the two figures above should be quoted as settled.** The historical text is
+> left intact so the provenance is readable; read it with these three facts.
+>
+> **(1) The +40% did not reproduce.** A later re-measure on a reviewer cell found no effect, and the
+> lever is recorded there as `VOID — engagement not proven`: the kernel was never proven to *fire*
+> at that shape, so the 12.52 -> 17.54 pair cannot be attributed to it. The instrument that would
+> settle it — a firing counter in `fattn-vec-f32.cuh`'s dispatch path — is not in the shipped build.
+> See `docs/LEVERS.md`, row `PXA_FA_GQA_PACK` (which reads **DOES NOT REPRODUCE. NOT SHIPPED.** for
+> the arm and **VOID** for the reviewer cell).
+>
+> **(2) `docs/COOKBOOK.md` states the rule directly: "Do not quote a throughput number for either."**
+> ("either" = this lever and `PXA_MOE_DEVICE_MAP`.) The +40% above is therefore a measurement of
+> record that must not be presented as this lever's effect.
+>
+> **(3) The +49% is a set figure and its arithmetic moved on a rounding choice.** It is the whole
+> twelve-lever enhance set measured together (`ctl2` 13.26 ±2.4% -> ship-set 19.33 ±6.6% =
+> **+45.8%**, i.e. +46%), and the `+49%` annotation came from a control rounded to 13.0. The
+> deep-fill arm is also the noisiest point on the rig — an independent deep-fill A/B on the same
+> seat reported a ±11.74% spread with the generation length itself unstable (256/120/5 tokens on
+> one arm, 6/6/6/6 on the other). The README carries the corrected pair.
+>
+> The one thing that is *not* in question is the output identity in every arm.
+
 ### Host-overhead cuts
 
 Four more bit-identical fixes, instrumented with a per-token host/GPU timing split

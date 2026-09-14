@@ -10,7 +10,7 @@
 //        slab  = panel + HDR + kb*SLAB
 //        anchor= ((const half*)panel)[row]
 //      vLLM's stock weight loaders can only narrow() a single declared dim, so the converter
-//      splits the blob into two tensors (plan §5.3):
+//      splits the blob into two tensors:
 //        slabs  uint8   [P, S, 1088]   P = N/64 panels, S = K/32 slabs
 //        anchor float16 [P, 64]
 //      giving
@@ -29,7 +29,10 @@
 //      See k_pxq4_mmv for the exactness argument.
 //
 // NOT vendored (deliberately dropped): every MoE kernel (gufuse / down_scat / grouped / WMMA),
-// the HQ policy pxq6_pol_p6hq, the PXQ2/PXQ3/PXQ6R policies, the int8/MMVQ family, the K-split
+// the HQ policy pxq6_pol_p6hq, the PXQ6R policy, the int8/MMVQ family, the K-split
+// (PXQ2 and PXQ3 are NOT in this list: as of the v13/v14 tier libraries their policies live in
+// pxq23_kernel.cu/.cuh -- a sibling TU, not this header -- and are compiled into libpxq_<arch>_v13
+// and later for both sm_60 and sm_70. This header still carries only the PXQ4 policy.)
 // workspace kernels (they cudaMalloc and decline under stream capture — pxq6.cuh:2480-2494 —
 // which is disqualifying under vLLM's FULL_AND_PIECEWISE cuda graphs), and every decode MODE
 // variant except MODE_TAB. All engine env gates that select the other modes default to OFF
@@ -59,6 +62,69 @@ static __device__ float pxq4_sub16_g[16] = PXQ4_SUB16_INIT;
 // format policy — pxq6_pol_p6, pxq6.cuh:317-346, with the panel-relative anchor() accessor
 // removed (the anchor now arrives as its own tensor; see addressing edit 1).
 // ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// v11 DECODE SPEED WORK (2026-09-01, V100-PCIE-16GB, Qwen3.5-27B TP2 decode shapes, M = 1).
+//
+// Four changes, all of them BIT-IDENTICAL to v10 by construction (cache hints, instruction
+// scheduling and barrier bookkeeping only -- not one floating-point operand, operation or
+// operation ORDER is touched). Verified: 54/54 tensors (9 shapes x M in {1,2,4} x
+// {mmv_out, mmv_out_mono}) max abs diff = 0 against libpxq4_sm70_v10.so.
+//
+//   1. ld.global.cs on the weight stream (pxq4_ldscale / pxq4_ldcodes). Slab bytes are read
+//      exactly once and never reused, so evict-first is the correct L1/L2 policy for them;
+//      it stops the weight stream from evicting part[] out of the 6 MB L2 between a chunk
+//      block's store and the winning block's read. Biggest single win.
+//   2. Register double-buffering of the kb loop (pxq4_slabreg / pxq4_load_slab /
+//      pxq4_dot32_reg). Slab kb+KSEG's two loads are ISSUED before slab kb is FOLDED. The
+//      accumulation chain is unchanged. Costs 32 -> 40 registers (6 blocks/SM instead of 8)
+//      and pays for it on the long-K shapes.
+//   3. The winning block reads its OWN chunk out of the register it just stored instead of
+//      round-tripping it through part[].
+//   4. Barrier bookkeeping: the pre-staging __syncthreads() is redundant in THIS kernel (it
+//      owns one chunk, so pxq4_xs has no previous readers), and __syncthreads_or folds the
+//      winner flag's shared store + barrier + shared load into one BAR.RED.OR.
+//
+// MEASURED (CUDA-graph timed, 200 launches, L2-defeating rotating weight set, PXQ4_MMV_
+// SPLIT_MAX_BLOCKS=300; us and GB/s of PXQ4 weight bytes):
+//   shape                     v10            v11          cuBLAS fp16 GEMV reference
+//   out_proj  5120x3072   22.41 / 373    20.49 / 408          742 GB/s
+//   qkvz      8192x5120   42.59 / 524    38.91 / 573          775 GB/s
+//   down      5120x8704   50.20 / 472    42.25 / 561          765 GB/s
+//   gate_up  17408x5120   81.34 / 583    80.17 / 591          583 GB/s
+//
+// WHAT DID NOT WORK, measured on this card, so it is not rediscovered:
+//   * ld.global.cg (L1 bypass) on the weight stream: dead flat, +-0.2% on all four shapes.
+//   * BFE nibble extraction (2 BFEs replacing shift+mask+mask+shift, halving the integer op
+//     count of pxq4_pol::pair): 1.5-2.0% SLOWER. Integer ALU is not the constraint, which is
+//     consistent with the retired MODE_TAB table-delivery family.
+//   * ld.global.cs on the part[] read as well: 0.9% on gate_up only, noise elsewhere. Not
+//     taken -- .cs still ALLOCATES in L1, and part[] is the one buffer in this kernel that is
+//     written by another SM. pxq4_ld_part stays on __ldcg.
+//   * PXQ4_CANON_V2=1 (2 FFMA instead of FMUL+FFMA+FADD per pair) is worth a further 1.3% on
+//     qkvz and 3.2% on down -- and is NOT bit-identical (it is a re-baselining switch). Not
+//     taken; recorded so the size of the prize is known.
+//
+// ABLATION FLOOR, for whoever picks this up next. Two diagnostic builds (wrong results, kept
+// out of tree) bound what is left:
+//   zero-compute, part[] kept  : 18.47 / 37.03 / 38.17 / 71.68 us
+//   full compute, part[] removed: 16.77 / 35.74 / 41.69 / 66.71 us
+//   both removed (memory floor) : 13.32 / 29.86 / 31.93 / 58.06 us = 628/747/742/816 GB/s
+// The memory system will do 816 GB/s on this access pattern. What stands between v11 and it
+// is (a) the part[] round trip, which is nfix*N*KSEG*4 bytes each way and is STRUCTURAL --
+// out = sum_s (sum_c t(c,s)) cannot fold the kseg axis inside a block without reassociating,
+// and a block cannot own a RANGE of chunks for the same reason -- and (b) dequant instruction
+// throughput, which the closed MODE_TAB family already bounds at <= 1.11x.
+// ---------------------------------------------------------------------------------------------
+
+// scale-byte load; carries the same cache policy as the code row it belongs to.
+static __device__ __forceinline__ int pxq4_ldscale(const uint8_t * p) {
+#ifdef __CUDA_ARCH__
+    return (int)__ldcs(p);       // read once, never reused: evict-first (v11 change 1)
+#else
+    return (int)*p;              // hostsim
+#endif
+}
+
 struct pxq4_pol {
     static constexpr int SLAB       = PXQ4_SLAB_BYTES;
     static constexpr int CODE_OFF   = PXQ4_CODE_OFF;
@@ -92,7 +158,7 @@ struct pxq4_pol {
     // (pxq-cpu.h:16-18, ggml-pxq6-tables.h:7-9).
     __device__ static void row_effs(const uint8_t * slab, int row, float anch,
                                     const float * sub, float * eff) {
-        const int sb = slab[row];
+        const int sb = pxq4_ldscale(slab + row);
         eff[0] = anch * sub[sb & 0xf];    // elements  0-15 of this 32-element block
         eff[1] = anch * sub[sb >> 4];     // elements 16-31
     }
@@ -110,7 +176,11 @@ struct pxq4_pol {
 // torch-allocated (>=256 B aligned) tensor base, so the uint4 load is always 16-B aligned.
 // The launcher asserts contiguity, which is what makes that hold. (pxq6.cuh:436-441)
 static __device__ __forceinline__ void pxq4_ldcodes(const uint8_t * p, uint32_t * q) {
-    *(uint4 *)q = *(const uint4 *)p;
+#ifdef __CUDA_ARCH__
+    *(uint4 *)q = __ldcs((const uint4 *)p);   // read once, never reused (v11 change 1)
+#else
+    *(uint4 *)q = *(const uint4 *)p;          // hostsim
+#endif
 }
 
 // The inner accumulation shape. PXQ_CANON_V2 == 0 is the shipping form; it emits
@@ -128,16 +198,26 @@ static __device__ __forceinline__ float pxq4_acc2(float acc, float a0, float x0,
 
 // dot product of one weight row's 32-element block against 32 activations.
 // (pxq6.cuh:634-674, MODE_TAB arm only)
+// One slab's per-row weight operands, held in registers. Splitting the load off pxq4_dot32
+// lets the kb loop issue the next slab's loads before folding the current one. The values,
+// and the order they are folded in, are untouched: this is scheduling only.
+struct pxq4_slabreg { uint32_t q[4]; int sb; };
+
+static __device__ __forceinline__ void pxq4_load_slab(const uint8_t * __restrict__ slab, int row,
+                                                      pxq4_slabreg & r) {
+    r.sb = pxq4_ldscale(slab + row);
+    pxq4_ldcodes(slab + pxq4_pol::CODE_OFF + row * pxq4_pol::CODE_BYTES, r.q);
+}
+
 template <bool VECX>
-static __device__ __forceinline__ float pxq4_dot32(const uint8_t * __restrict__ slab, int row,
-                                                   float anch,
-                                                   const float * __restrict__ xk,
-                                                   const float * __restrict__ tab,
-                                                   const float * __restrict__ sub) {
+static __device__ __forceinline__ float pxq4_dot32_reg(const pxq4_slabreg & r, float anch,
+                                                       const float * __restrict__ xk,
+                                                       const float * __restrict__ tab,
+                                                       const float * __restrict__ sub) {
     float eff[PXQ4_NEFF];
-    pxq4_pol::row_effs(slab, row, anch, sub, eff);
-    uint32_t q[4];
-    pxq4_ldcodes(slab + pxq4_pol::CODE_OFF + row * pxq4_pol::CODE_BYTES, q);
+    eff[0] = anch * sub[r.sb & 0xf];
+    eff[1] = anch * sub[r.sb >> 4];
+    const uint32_t * q = r.q;
 
     // Two partial sums: t[0] accumulates the eff[0] half (elements 0-15, i.e. byte pairs
     // b = 0..7), t[1] the eff[1] half. `(b*NEFF) >> 4` is the engine's index expression;
@@ -165,6 +245,17 @@ static __device__ __forceinline__ float pxq4_dot32(const uint8_t * __restrict__ 
         }
     }
     return eff[0] * t[0] + eff[1] * t[1];
+}
+
+template <bool VECX>
+static __device__ __forceinline__ float pxq4_dot32(const uint8_t * __restrict__ slab, int row,
+                                                   float anch,
+                                                   const float * __restrict__ xk,
+                                                   const float * __restrict__ tab,
+                                                   const float * __restrict__ sub) {
+    pxq4_slabreg r;
+    pxq4_load_slab(slab, row, r);
+    return pxq4_dot32_reg<VECX>(r, anch, xk, tab, sub);
 }
 
 // Canonical chunk count: a function of SHAPE ONLY. That is the property that makes a K-split
@@ -564,7 +655,6 @@ k_pxq4_mmv_fused(const uint8_t * __restrict__ slabs,
     __shared__ float tab[16];
     __shared__ float sub[16];
     __shared__ float red[PXQ4_MMV_KSEG * PXQ4_BM];
-    __shared__ int   last;
 
     pxq4_pol::stage_tabs(tab, sub, threadIdx.x);
 
@@ -580,16 +670,36 @@ k_pxq4_mmv_fused(const uint8_t * __restrict__ slabs,
     const int b1 = (kslabs * (c + 1)) / nfix;
     const int n  = (b1 - b0) * PXQ4_QK;
 
-    __syncthreads();                                    // covers the stage_tabs writes
     for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
         pxq4_xs[idx] = __half2float(xt[b0 * PXQ4_QK + idx]);
     }
+    // This kernel owns exactly ONE chunk, so pxq4_xs has no previous readers to protect and
+    // this single barrier already orders the stage_tabs writes above against every tab/sub
+    // read below. (k_pxq4_mmv's first barrier is NOT redundant: its chunk loop rewrites
+    // pxq4_xs underneath the previous chunk's readers.)
     __syncthreads();
 
+    // v11 change 2: register double-buffering. Slab kb+KSEG's two global loads are ISSUED
+    // before slab kb is FOLDED, so a warp always has a second weight load in flight. The
+    // accumulation is untouched -- t still takes dot32(kb) for ascending kb, left-associated,
+    // with the identical operands -- so this is scheduling only and stays bit-identical.
     float t = 0.f;
-    for (int kb = b0 + kseg; kb < b1; kb += PXQ4_MMV_KSEG) {
-        t += pxq4_dot32<VECX>(pan_slabs + (size_t)kb * pxq4_pol::SLAB, row, anch,
-                              pxq4_xs + (size_t)(kb - b0) * PXQ4_QK, tab, sub);
+    {
+        int kb = b0 + kseg;
+        if (kb < b1) {
+            pxq4_slabreg r0, r1;
+            pxq4_load_slab(pan_slabs + (size_t)kb * pxq4_pol::SLAB, row, r0);
+            for (;;) {
+                const int  kn   = kb + PXQ4_MMV_KSEG;
+                const bool more = (kn < b1);
+                if (more) pxq4_load_slab(pan_slabs + (size_t)kn * pxq4_pol::SLAB, row, r1);
+                t += pxq4_dot32_reg<VECX>(r0, anch,
+                                          pxq4_xs + (size_t)(kb - b0) * PXQ4_QK, tab, sub);
+                if (!more) break;
+                r0 = r1;
+                kb = kn;
+            }
+        }
     }
 
     const size_t  tile  = (size_t)(PXQ4_MMV_KSEG * PXQ4_BM);
@@ -601,16 +711,20 @@ k_pxq4_mmv_fused(const uint8_t * __restrict__ slabs,
     // The release orders only thread 0's OWN prior accesses, so without it lanes 1..255 may not
     // have issued their part[] stores when the counter is bumped, and the winner reads stale
     // words. Omitting it still passes a single-shot parity check, by luck. Do not remove it.
+    // v11 change 4: the load-bearing first barrier is unchanged; the winner flag's shared
+    // store + second barrier + shared load collapse into one __syncthreads_or (BAR.RED.OR),
+    // which is the same barrier with the same memory semantics plus an OR reduction.
     __syncthreads();
+    int won = 0;
     if (threadIdx.x == 0) {
         const unsigned old = pxq4_arrive_release(&ctr[(size_t)iy * panels + p]);
-        last = (old == (unsigned)(nfix - 1));
-        if (last) {
+        won = (old == (unsigned)(nfix - 1));
+        if (won) {
             ctr[(size_t)iy * panels + p] = 0u;           // rearm for the next launch
             pxq4_fence_acq_rel();                        // acquire the other blocks' part[]
         }
     }
-    __syncthreads();                                     // propagates the acquire to the block
+    const int last = __syncthreads_or(won);              // barrier + broadcast in one
     if (!last) return;
 
     // ---- k_pxq4_mmv_reduce's fold, verbatim ---------------------------------------------
@@ -618,7 +732,10 @@ k_pxq4_mmv_fused(const uint8_t * __restrict__ slabs,
     // same fp32 word either way, so this is a cache-hint change only.
     float su = 0.f;
     for (int cc = 0; cc < nfix; ++cc) {                  // chunk fold, ascending c
-        su += pxq4_ld_part(&pbase[(size_t)cc * tile + threadIdx.x]);
+        // v11 change 3: this block's OWN chunk is still live in t, and t is exactly the fp32 word it just
+        // stored at pbase[c*tile+tid]. Reading the register instead of the global round-trip
+        // removes 1/nfix of the reduce's global traffic and yields the identical fp32 value.
+        su += (cc == c) ? t : pxq4_ld_part(&pbase[(size_t)cc * tile + threadIdx.x]);
     }
     red[threadIdx.x] = su;                               // threadIdx.x == kseg*64 + row
     __syncthreads();

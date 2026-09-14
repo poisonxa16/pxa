@@ -65,7 +65,7 @@ our GPU time alone.
   0.036 ms — and so are the 30 GDN `RMSNormGated` norms, which take the FLA Triton path.
   Two of four proposed kernels retired by measurement before any CUDA was written.
 * **The routed MoE is 10.4%**, so a perfect fused MoE block is bounded at ~2.165 ms.
-  moe-fused's form A measured +0.55% single decode against the same library with the
+  The fused-MoE form A measured +0.55% single decode against the same library with the
   fused path off — a clean three-point isolation — and is not byte-identical (7/20).
 
 ## What shipped and what did not

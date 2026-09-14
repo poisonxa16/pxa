@@ -1,11 +1,11 @@
-# 1Cat-vLLM sm_70 4-bit backend — reverse engineering
+# The Volta vLLM fork's sm_70 4-bit backend — notes
 
-Target: `vllm-qwen38-27b-cyber-1` on the DGX build host, image `kewaii/vllm:latest`.
-Source tree present and complete at `/opt/1Cat-vLLM` (git `2ceb150`, "feat: add Dockerfile"),
+Target: the production vLLM container on the GPU build host, image `${VLLM_IMAGE:-vllm/vllm-openai:latest}`.
+Source tree present and complete at `the vLLM fork checkout` (git `2ceb150`, "feat: add Dockerfile"),
 installed as a **non-editable wheel copy** at `/opt/vllm-venv/lib/python3.12/site-packages/vllm`
 (`vllm.__file__` from `/` resolves to site-packages; version `0.1.dev1+g2ceb15066`).
 `nvcc` 12.8.93 is present in the container at `/usr/local/cuda/bin/nvcc`.
-Prebuilt wheels also at `/opt/1Cat-vLLM/dist-cu128-sm70/`.
+Prebuilt wheels also at `the vLLM fork checkout/dist-cu128-sm70/`.
 
 **VERDICT: a clean seam exists.** Two of them, at different levels, and they compose.
 Nothing found in this fork blocks adding a first-class `pxq4` quantization method on sm_70.
@@ -204,7 +204,7 @@ FACT: **full sources shipped.** Not binary-only.
 our own `pxq4::` namespace, ship it as a pip package alongside their wheel. No rebuild of their
 164 MB `_C`, no fork of their tree, works against the wheel they already ship. Recommended.
 (b) *In-tree* — add `csrc/pxq4_sm70/` + CMake block mirroring `CMakeLists.txt:365-410`. Better
-if we intend to upstream to Kewaii, but requires a full rebuild.
+if we intend to upstream upstream, but requires a full rebuild.
 
 Note (a) still costs a copy of the TurboMind headers if we want the s884 mainloop; those are
 Apache-2.0 and header-mostly under `kernels/gemm/`, so vendoring is legal and mechanical.
@@ -256,7 +256,7 @@ FACT — the kernels exist and are quantization-independent:
   `splitting_ops` in `vllm/config/compilation.py:764-773`, which is why they appear in the
   container's `FULL_AND_PIECEWISE` log line.
 - The recurrent core kernels are a **separate package**, `flash_qla`
-  (`/opt/1Cat-vLLM/flash_qla/ops/gated_delta_rule/...`), imported at
+  (`the vLLM fork checkout/flash_qla/ops/gated_delta_rule/...`), imported at
   `qwen_gdn_linear_attn.py:1529, 1668-1683, 1814, 2941, 3525` — TileLang
   (`chunk_gated_delta_rule_fwd_sm70_tilelang`) and a compiled `sm70/fused_fwd` extension.
   The log string "FlashQLA-SM70" is at `:1581`, the fp16-only guard at `:1934`
@@ -365,7 +365,7 @@ tok/s number — with a slower generic path for prefill.
 5. Kernel: first target M=1 decode GEMV (`nvfp4_raw_gemv_warp_kernel` shape); then, if the
    numbers justify it, the `Config_NVF4`-shaped s884 path at group 16.
 
-Nothing in steps 1-4 requires modifying `/opt/1Cat-vLLM`. Step 5 optionally vendors
+Nothing in steps 1-4 requires modifying `the vLLM fork checkout`. Step 5 optionally vendors
 Apache-2.0 TurboMind headers.
 
 ## 9. What we do NOT inherit

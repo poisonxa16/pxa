@@ -16,6 +16,7 @@
 #include "nlohmann/json.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
@@ -568,6 +569,48 @@ std::string common_chat_templates_source(const struct common_chat_templates * tm
         LOG_DBG("%s: unknown template variant: %s\n", __func__, variant.c_str());
     }
     return tmpls->template_default->source();
+}
+
+bool common_chat_auto_jinja(const struct llama_model * model, bool & use_jinja,
+                            const std::string & chat_template_override) {
+    // An explicit choice always wins, in both directions.
+    if (model == nullptr || use_jinja || !chat_template_override.empty()) {
+        return false;
+    }
+
+    char arch[128] = {0};
+    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) <= 0) {
+        return false;
+    }
+
+    // The list is deliberately explicit rather than "anything the built-in map cannot parse":
+    // flipping the default for every unknown template would change behaviour for models nobody
+    // has looked at. A row is added here when someone has checked what the template renders.
+    const bool needs_jinja = (strcmp(arch, "gemma4") == 0 || strcmp(arch, "gemma4_mtp") == 0);
+    if (!needs_jinja) {
+        return false;
+    }
+
+    // Only if the file really carries its own template; without one there is nothing to render.
+    if (llama_model_chat_template(model, /* name */ nullptr) == nullptr) {
+        return false;
+    }
+
+    if (const char * e = getenv("PXA_AUTO_JINJA"); e && atoi(e) == 0) {
+        fprintf(stderr,
+                "PXA_AUTO: JINJA=off (PXA_AUTO_JINJA=0; '%s' ships a chat template the built-in map "
+                "does not know, so chat will be formatted with a template that is not the model's)\n",
+                arch);
+        return false;
+    }
+
+    use_jinja = true;
+    fprintf(stderr,
+            "PXA_AUTO: JINJA=on ('%s' ships its own chat template and the built-in map has no row for "
+            "it - its turns are <|turn>/<turn|>, not Gemma 3's <start_of_turn>, so no built-in row is "
+            "close enough to substitute; override with --chat-template, or PXA_AUTO_JINJA=0)\n",
+            arch);
+    return true;
 }
 
 common_chat_templates_ptr common_chat_templates_init(const struct llama_model * model,

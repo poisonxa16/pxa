@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -470,6 +471,166 @@ static void phase3_shape(int nrows, int n_per_row, uint64_t & seed) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// PHASE 4 — per-tier incumbent dequant cost (added 2026-09-09).
+//
+// WHY. The 2D prefill route for every PXQ tier that has no native GEMM is
+// k_pxq6_dequant_matrix -> fp16 scratch -> cuBLAS HGEMM, and the question this phase answers is
+// whether the low-bit tiers pay MORE for that first stage than the 4-bit nibble tiers do. They
+// produce the SAME fp16 output for the same shape, so wall time is the comparable quantity and
+// GB/s is only informational: PXQ2 reads 576 B per slab, PXQ3 832 B and PXQ4 1088 B, all of them
+// writing the same 4096 B. If the kernel is bandwidth-bound the narrower tiers must be FASTER;
+// if PXQ3 is slower than PXQ4 despite reading 24% fewer bytes, the bit-plane reassembly in
+// pxq6_pol_p3::pair() is the cost and there is an ALU gap worth closing.
+// Same instrument as phase 3 (cudaEvent, median of REP), same synthesized panels.
+// ---------------------------------------------------------------------------------------------
+template <class POL>
+static double phase4_tier_ms(const char * tier, int nrows, int n_per_row, uint64_t & seed, double * gbps) {
+    const int panels = nrows/PXQ6_BM, kslabs = n_per_row/PXQ6_QK;
+    const int64_t nel = (int64_t)nrows*n_per_row;
+    std::vector<uint8_t> raw;
+    build_raw<POL>(raw, panels, kslabs, seed);
+    uint8_t * d_raw = nullptr; half * d_y = nullptr;
+    CUCK(cudaMalloc(&d_raw, raw.size()));
+    CUCK(cudaMemcpy(d_raw, raw.data(), raw.size(), cudaMemcpyHostToDevice));
+    CUCK(cudaMalloc(&d_y, (size_t)nel*sizeof(half)));
+
+    const double gb = ((double)nel*2.0 + (double)raw.size()) / (1024.0*1024.0*1024.0);
+    cudaEvent_t a, b; CUCK(cudaEventCreate(&a)); CUCK(cudaEventCreate(&b));
+    const int REP = 20;
+    std::vector<float> ms(REP);
+    for (int i = 0; i < REP; ++i) {
+        CUCK(cudaEventRecord(a));
+        k_pxq6_dequant_matrix<POL, half><<<(int64_t)panels*kslabs, 64>>>(d_raw, d_y, kslabs, n_per_row);
+        CUCK(cudaEventRecord(b));
+        CUCK(cudaEventSynchronize(b));
+        CUCK(cudaEventElapsedTime(&ms[i], a, b));
+    }
+    CUCK(cudaGetLastError());
+    std::sort(ms.begin(), ms.end());
+    const double med = ms[REP/2];
+    *gbps = gb / (med / 1000.0);
+    printf("  %-14s %4dx%-5d raw %8zu B  %7.3f ms  %6.1f GB/s\n",
+           tier, nrows, n_per_row, raw.size(), med, *gbps);
+    CUCK(cudaEventDestroy(a)); CUCK(cudaEventDestroy(b));
+    CUCK(cudaFree(d_raw)); CUCK(cudaFree(d_y));
+    return med;
+}
+
+static void phase4(uint64_t & seed) {
+    printf("PHASE 4 per-tier incumbent dequant cost (same fp16 output, so ms is the comparison)\n");
+    const int shapes[][2] = {{2048, 5120}, {4096, 4096}, {10240, 5120}};
+    for (const auto & sh : shapes) {
+        double g = 0;
+        const double t2 = phase4_tier_ms<pxq6_pol_p2>  ("PXQ2   (p2)  ", sh[0], sh[1], seed, &g);
+        const double t3 = phase4_tier_ms<pxq6_pol_p3>  ("PXQ3   (p3)  ", sh[0], sh[1], seed, &g);
+        const double t4 = phase4_tier_ms<pxq6_pol_p6>  ("PXQ4   (p6)  ", sh[0], sh[1], seed, &g);
+        const double th = phase4_tier_ms<pxq6_pol_p6hq>("PXQ4HQ (p6hq)", sh[0], sh[1], seed, &g);
+        printf("    -> vs PXQ4 nibble: PXQ2 %+.1f%%  PXQ3 %+.1f%%  PXQ4HQ %+.1f%%   (negative = cheaper)\n",
+               (t2/t4 - 1.0)*100.0, (t3/t4 - 1.0)*100.0, (th/t4 - 1.0)*100.0);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// PHASE 5 - PXQ3 prefill pair-LUT (PXA_PXQ3_PAIRLUT_DQ), bit-identity THEN cost (added 2026-09-09).
+//
+// WHY THIS IS A MEMCMP AND NOT A TOLERANCE CHECK. pairl3() is a SOURCING change: it reads the
+// same book values, staged through the same POL::bookv() the tab[] gathers use, and hands the
+// same float2 to the same two multiplies in the same order. There is therefore no rounding
+// argument to make and no epsilon to choose -- either every one of the nrows*n_per_row halves is
+// identical or the change is wrong. A zero-tolerance device-side compare is the only honest gate,
+// and it is run BEFORE the timing so a fast wrong kernel cannot be reported as a win.
+//
+// Shapes include the ragged tail (kslabs % 8 == 1) and the single-slab case, because the LUT is
+// staged per BLOCK and a block-count-dependent staging bug would hide on the round shapes.
+// ---------------------------------------------------------------------------------------------
+static __global__ void k_diff_halves(const half * __restrict__ a, const half * __restrict__ b,
+                                     int64_t n, unsigned int * __restrict__ ndiff,
+                                     int64_t * __restrict__ first) {
+    const int64_t i = (int64_t)blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    // compare the RAW 16 bits, not the float value: NaN payloads and -0.0 must also agree.
+    const unsigned short x = __half_as_ushort(a[i]);
+    const unsigned short y = __half_as_ushort(b[i]);
+    if (x != y) {
+        atomicAdd(ndiff, 1u);
+        atomicMin((unsigned long long *)first, (unsigned long long)i);
+    }
+}
+
+static void phase5_shape(int nrows, int n_per_row, uint64_t & seed, bool timed) {
+    const int panels = nrows/PXQ6_BM, kslabs = n_per_row/PXQ6_QK;
+    const int64_t nel = (int64_t)nrows*n_per_row;
+    std::vector<uint8_t> raw;
+    build_raw<pxq6_pol_p3>(raw, panels, kslabs, seed);
+
+    uint8_t * d_raw = nullptr; half * d_off = nullptr; half * d_on = nullptr;
+    unsigned int * d_nd = nullptr; int64_t * d_first = nullptr;
+    CUCK(cudaMalloc(&d_raw, raw.size()));
+    CUCK(cudaMemcpy(d_raw, raw.data(), raw.size(), cudaMemcpyHostToDevice));
+    CUCK(cudaMalloc(&d_off, (size_t)nel*sizeof(half)));
+    CUCK(cudaMalloc(&d_on,  (size_t)nel*sizeof(half)));
+    CUCK(cudaMalloc(&d_nd, sizeof(unsigned int)));
+    CUCK(cudaMalloc(&d_first, sizeof(int64_t)));
+    CUCK(cudaMemset(d_nd, 0, sizeof(unsigned int)));
+    const int64_t big = INT64_MAX;
+    CUCK(cudaMemcpy(d_first, &big, sizeof(int64_t), cudaMemcpyHostToDevice));
+    // poison the ON buffer so an unlaunched kernel cannot pass as "identical"
+    CUCK(cudaMemset(d_on, 0x5a, (size_t)nel*sizeof(half)));
+
+    const int64_t nblk = (int64_t)panels*kslabs;
+    k_pxq6_dequant_matrix<pxq6_pol_p3, half, false><<<nblk, 64>>>(d_raw, d_off, kslabs, n_per_row);
+    k_pxq6_dequant_matrix<pxq6_pol_p3, half, true ><<<nblk, 64>>>(d_raw, d_on,  kslabs, n_per_row);
+    CUCK(cudaDeviceSynchronize());
+    CUCK(cudaGetLastError());
+
+    k_diff_halves<<<(int)((nel + 255)/256), 256>>>(d_off, d_on, nel, d_nd, d_first);
+    CUCK(cudaDeviceSynchronize());
+    unsigned int nd = 0; int64_t first = 0;
+    CUCK(cudaMemcpy(&nd, d_nd, sizeof(nd), cudaMemcpyDeviceToHost));
+    CUCK(cudaMemcpy(&first, d_first, sizeof(first), cudaMemcpyDeviceToHost));
+    ck(nd == 0, "PHASE5 %dx%d: PAIRL3 differs from pair() in %u of %lld halves (first index %lld)",
+       nrows, n_per_row, nd, (long long)nel, (long long)first);
+
+    if (timed) {
+        cudaEvent_t a, b; CUCK(cudaEventCreate(&a)); CUCK(cudaEventCreate(&b));
+        const int REP = 20;
+        double med[2] = {0, 0};
+        for (int arm = 0; arm < 2; ++arm) {
+            std::vector<float> ms(REP);
+            for (int i = 0; i < REP; ++i) {
+                CUCK(cudaEventRecord(a));
+                if (arm) k_pxq6_dequant_matrix<pxq6_pol_p3, half, true ><<<nblk, 64>>>(d_raw, d_on,  kslabs, n_per_row);
+                else     k_pxq6_dequant_matrix<pxq6_pol_p3, half, false><<<nblk, 64>>>(d_raw, d_off, kslabs, n_per_row);
+                CUCK(cudaEventRecord(b));
+                CUCK(cudaEventSynchronize(b));
+                CUCK(cudaEventElapsedTime(&ms[i], a, b));
+            }
+            std::sort(ms.begin(), ms.end());
+            med[arm] = ms[REP/2];
+        }
+        printf("  p3 %5dx%-5d  pair() %7.3f ms   pairl3 %7.3f ms   %+.1f%%   (identical output)\n",
+               nrows, n_per_row, med[0], med[1], (med[1]/med[0] - 1.0)*100.0);
+        CUCK(cudaEventDestroy(a)); CUCK(cudaEventDestroy(b));
+    } else {
+        printf("  p3 %5dx%-5d  bit-identical (%lld halves)\n", nrows, n_per_row, (long long)nel);
+    }
+
+    CUCK(cudaFree(d_raw)); CUCK(cudaFree(d_off)); CUCK(cudaFree(d_on));
+    CUCK(cudaFree(d_nd));  CUCK(cudaFree(d_first));
+}
+
+static void phase5(uint64_t & seed) {
+    printf("PHASE 5 PXQ3 prefill pair-LUT: zero-tolerance identity first, then cost\n");
+    phase5_shape(   64,    32, seed, false);   // single slab
+    phase5_shape(   64,  4096, seed, false);
+    phase5_shape(  256,   288, seed, false);   // kslabs = 9: the ragged tail
+    phase5_shape( 1024,  1024, seed, false);
+    phase5_shape( 2048,  5120, seed, true);    // the phase-4 shapes, so the two tables line up
+    phase5_shape( 4096,  4096, seed, true);
+    phase5_shape(10240,  5120, seed, true);
+}
+
+// ---------------------------------------------------------------------------------------------
 int main(int argc, char ** argv) {
     bool do_bw = true;
     for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--no-bw")) do_bw = false;
@@ -489,6 +650,8 @@ int main(int argc, char ** argv) {
         printf("PHASE 3 achieved bandwidth (informational, not a gate)\n");
         phase3_shape(2048, 5120, seed);
         phase3_shape(4096, 4096, seed);
+        phase4(seed);
+        phase5(seed);
     }
 
     printf("\n%s: %d checks, %d failures\n", g_fail ? "FAILED" : "PASS", g_checks, g_fail);

@@ -131,6 +131,10 @@ struct result_timings {
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
 
+    // PXA_SLOT_FORK_v1: prompt tokens this request did not prefill because it forked the prefix
+    // off another slot's live KV. Only included when > 0, so the field's presence is the signal.
+    int32_t forked_n = 0;
+
     json to_json() const;
 };
 
@@ -361,6 +365,14 @@ struct server_prompt_checkpoint {
 
     int64_t n_tokens;
 
+    // PXA_CKPT_EVICT: how many restores have come from THIS checkpoint, and whether it was placed
+    // at a replay boundary (the first checkpoint after this slot re-entered its cached prompt).
+    // Counted unconditionally -- it is also the free instrumentation for "does our checkpoint
+    // restore ever actually fire" -- and only *used* by the weighted eviction policy
+    // (PXA_CKPT_EVICT=value). See examples/server/pxa-ckpt-evict.h.
+    uint32_t replay_hits = 0;
+    bool     boundary    = false;
+
     std::vector<uint8_t> data;
 
     size_t size() const {
@@ -374,6 +386,8 @@ struct server_prompt_checkpoint {
         j["pos_min_prompt"] = pos_min_prompt;
         j["pos_max_prompt"] = pos_max_prompt;
         j["n_tokens"] = n_tokens;
+        j["replay_hits"] = replay_hits;
+        j["boundary"] = boundary;
         return j;
     }
 
@@ -383,6 +397,9 @@ struct server_prompt_checkpoint {
         pos_min_prompt = j.value<llama_pos>("pos_min_prompt", 0);
         pos_max_prompt = j.value<llama_pos>("pos_max_prompt", 0);
         n_tokens = j.value<int64_t>("n_tokens", 0);
+        // absent in checkpoints written before PXA_CKPT_EVICT: an unseen checkpoint has no hits
+        replay_hits = j.value<uint32_t>("replay_hits", 0);
+        boundary = j.value<bool>("boundary", false);
     }
 };
 

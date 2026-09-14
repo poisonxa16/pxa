@@ -15,10 +15,13 @@
 // activation quantization MXFP4 gets on this path, so the comparison is like-for-like.
 // NOT bit-exact vs the fused fp16 decode kernels: a fidelity gate is mandatory before shipping.
 //
-// SCOPE. p6 (GGML_TYPE_PXQ4) and p6hq (GGML_TYPE_PXQ4HQ) only — both are PX16-book tiers and
-// both are covered by the snap validation. PXQ4's own E2M1 tier and the LM32/LM4/LM8 books are
-// deliberately NOT here. If any PXA_PXQ6_BOOK/_SUB/_SUB_HQ table override is set the gate turns
-// itself OFF (this TU carries its own frozen copies and does not take runtime uploads).
+// SCOPE. The two PX16-book tiers p6 (GGML_TYPE_PXQ4) and p6hq (GGML_TYPE_PXQ4HQ) unconditionally,
+// and since 2026-09-09 the two LOW tiers PXQ2 (LM4) and PXQ3 (LM8, bit-plane) behind their own
+// lever PXA_PXQ23_MMVQ — same contract, their own frozen s8 books and their own fidelity
+// evidence; the weight decode for those two lives in pxq23-mmvq.h so it can be tested on a CPU.
+// PXQ4's own E2M1 tier and the LM32 book are deliberately NOT here. If any table override is set
+// (PXA_PXQ6_BOOK/_SUB/_SUB_HQ here, PXA_PXQ2_BOOK/PXQ3_BOOK/CEIL_V2/PXQ2_V3/_SUB there) the
+// affected gate turns itself OFF — this TU carries frozen copies and takes no runtime upload.
 //
 // ENV: PXA_PXQ_MMVQ = 0 (default, OFF: byte-identical dispatch to the previous build)
 //                   | 1 (sm_70+ — the arch this was built for)
@@ -27,6 +30,9 @@
 
 #include "../common.cuh"
 #include "pxa-enhance.cuh"   // pxa_pxq_mmvq_auto_default: ENHANCE x model x device auto-set
+#include "pxq23-mmvq.h"      // the PXQ2/PXQ3 weight decode (host-testable; see that header)
+#include "../../../include/ggml-pxq2-tables.h"
+#include "../../../include/ggml-pxq3-tables.h"
 #include "../../../include/ggml-pxq6-tables.h"
 
 // ---------------------------------------------------------------------------------------------
@@ -70,25 +76,113 @@ static __device__ __forceinline__ int2 pxq_mmvq_table16_seq(const int q4, const 
 }
 
 // ---------------------------------------------------------------------------------------------
-// layout policies. Both tiers: panel = 128 B fp16 row-anchor header + kslabs slabs; slab = scale
-// SoA + 64 x 16 B nibble code rows; panels row-major; experts outermost (the caller has already
-// applied the expert offset, so e == 0 here). Codes are 16 B aligned for every row.
-//   p6   : slab 1088 B, 64 B SoA, one 4-bit SUB16 per 16 elems (2 nibbles/row/slab)
-//   p6hq : slab 1152 B, 128 B SoA, one 4-bit SUB8 per 8 elems (4 nibbles/row/slab)
-// m = code word index 0..3 == k-group 8m..8m+7.
+// layout policies. Every tier: panel = 128 B fp16 row-anchor header + kslabs slabs; slab = scale
+// SoA + 64 code rows; panels row-major; experts outermost (the caller has already applied the
+// expert offset, so e == 0 here).
+//   p6   : slab 1088 B, 64 B SoA, 16 B code rows, one 4-bit SUB16 per 16 elems
+//   p6hq : slab 1152 B, 128 B SoA, 16 B code rows, one 4-bit SUB8 per 8 elems
+//   p2   : slab  576 B, 64 B SoA,  8 B code rows, one 4-bit SUB16 per 16 elems (as p6)
+//   p3   : slab  832 B, 64 B SoA, 12 B code rows, one 4-bit SUB16 per 16 elems (as p6)
+// m = code group index 0..3 == k-group 8m..8m+7. A policy owns exactly three things the tiers
+// disagree about: which scale nibble a group takes, how many u32 words of code a thread's run
+// spans, and how a group's 8 codes become 8 s8 book values in k order. Everything else — the
+// q8_1 side, the accumulate, the launcher, the row/anchor hoisting — is shared verbatim.
+//   BFOLD is the tier's book absmax / 127; it rides in the row anchor (see pxq_mmvq_rowbase) so
+// the inner loop carries one fewer multiply. For the two PX16-book tiers it is 1/127 exactly,
+// which is what PXQ_MMVQ_BFOLD has always been.
 // ---------------------------------------------------------------------------------------------
 struct pxq_mmvq_pol_p6 {
     static constexpr int SLAB = PXQ6_SLAB_BYTES, CODE_OFF = 64, NEFF = 2, SPR = 1;
+    static constexpr float BFOLD = PXQ_MMVQ_BFOLD;
     __device__ static const float * subtab() { return pxq_mmvq_sub16; }
     __device__ static int sidx(int i, int m) { return i; }             // 1 scale byte per row
     __device__ static int snib(int sb, int m) { return (sb >> (4*(m >> 1))) & 0xf; }
+
+    // one u32 of nibble codes per group, so a thread's VDR groups are one contiguous load
+    template <int VDR> static constexpr int NWORDS = VDR;
+    template <int VDR>
+    __device__ static void load_words(const uint8_t * __restrict__ slab, int r, int iqs, uint32_t * qw) {
+        const uint8_t * cp = slab + CODE_OFF + 16*r + 4*iqs;
+        if constexpr (VDR == 4) { *(uint4 *)qw = *(const uint4 *)cp; }
+        else                    { *(uint2 *)qw = *(const uint2 *)cp; }
+    }
+    template <int VDR>
+    __device__ static int2 group(const uint32_t * qw, int l, int iqs) {
+        return pxq_mmvq_table16_seq((int) qw[l], pxq_mmvq_book_s8);
+    }
 };
 
 struct pxq_mmvq_pol_p6hq {
     static constexpr int SLAB = PXQ6HQ_SLAB_BYTES, CODE_OFF = 128, NEFF = 4, SPR = 2;
+    static constexpr float BFOLD = PXQ_MMVQ_BFOLD;
     __device__ static const float * subtab() { return pxq_mmvq_sub8; }
     __device__ static int sidx(int i, int m) { return 2*i + (m >> 1); } // 2 scale bytes per row
     __device__ static int snib(int sb, int m) { return (sb >> (4*(m & 1))) & 0xf; }
+
+    template <int VDR> static constexpr int NWORDS = VDR;
+    template <int VDR>
+    __device__ static void load_words(const uint8_t * __restrict__ slab, int r, int iqs, uint32_t * qw) {
+        const uint8_t * cp = slab + CODE_OFF + 16*r + 4*iqs;
+        if constexpr (VDR == 4) { *(uint4 *)qw = *(const uint4 *)cp; }
+        else                    { *(uint2 *)qw = *(const uint2 *)cp; }
+    }
+    template <int VDR>
+    __device__ static int2 group(const uint32_t * qw, int l, int iqs) {
+        return pxq_mmvq_table16_seq((int) qw[l], pxq_mmvq_book_s8);
+    }
+};
+
+// PXQ2: 2-bit codes, 8 B rows, one u32 per 16 elems -- so ONE word carries two groups and a
+// thread's whole VDR run is one 4 B (VDR 2) or 8 B (VDR 4) load, half of what the 4-bit tiers
+// move. iqs is always even (it is VDR * a thread index and VDR is 2 or 4), so group l takes the
+// low half of its word when l is even and the high half when l is odd -- a compile-time choice,
+// not a runtime one.
+struct pxq_mmvq_pol_p2 {
+    static constexpr int SLAB = PXQ2_SLAB_BYTES, CODE_OFF = 64, NEFF = 2, SPR = 1;
+    static constexpr float BFOLD = PXQ2_MMVQ_BFOLD;
+    __device__ static const float * subtab() { return pxq_mmvq_sub16; }
+    __device__ static int sidx(int i, int m) { return i; }
+    __device__ static int snib(int sb, int m) { return (sb >> (4*(m >> 1))) & 0xf; }
+
+    template <int VDR> static constexpr int NWORDS = VDR/2;
+    template <int VDR>
+    __device__ static void load_words(const uint8_t * __restrict__ slab, int r, int iqs, uint32_t * qw) {
+        const uint8_t * cp = slab + CODE_OFF + 8*r + 4*(iqs >> 1);
+        if constexpr (VDR == 4) { *(uint2 *)qw = *(const uint2 *)cp; }
+        else                    { qw[0] = *(const uint32_t *)cp; }
+    }
+    template <int VDR>
+    __device__ static int2 group(const uint32_t * qw, int l, int iqs) {
+        const pxq_mmvq_g8 g = pxq2_mmvq_gather8(pxq2_mmvq_lo16(qw[l >> 1], l));
+        return make_int2(g.x, g.y);
+    }
+};
+
+// PXQ3: bit-plane. The low plane is addressed exactly as PXQ2's codes are; the high plane is one
+// more u32 for the whole 32-element slab, of which a group takes byte m. A thread therefore loads
+// its low word(s) plus that one shared word -- 12 B rows never reach 8 B alignment, so these stay
+// separate 4 B loads rather than a wide one that could walk off the last row of the last slab.
+struct pxq_mmvq_pol_p3 {
+    static constexpr int SLAB = PXQ3_SLAB_BYTES, CODE_OFF = 64, NEFF = 2, SPR = 1;
+    static constexpr float BFOLD = PXQ3_MMVQ_BFOLD;
+    __device__ static const float * subtab() { return pxq_mmvq_sub16; }
+    __device__ static int sidx(int i, int m) { return i; }
+    __device__ static int snib(int sb, int m) { return (sb >> (4*(m >> 1))) & 0xf; }
+
+    template <int VDR> static constexpr int NWORDS = VDR/2 + 1;   // low-plane words + the high plane
+    template <int VDR>
+    __device__ static void load_words(const uint8_t * __restrict__ slab, int r, int iqs, uint32_t * qw) {
+        const uint8_t * cp = slab + CODE_OFF + 12*r;
+#pragma unroll
+        for (int t = 0; t < VDR/2; ++t) qw[t] = *(const uint32_t *)(cp + 4*((iqs >> 1) + t));
+        qw[VDR/2] = *(const uint32_t *)(cp + 8);
+    }
+    template <int VDR>
+    __device__ static int2 group(const uint32_t * qw, int l, int iqs) {
+        const pxq_mmvq_g8 g = pxq3_mmvq_gather8(pxq2_mmvq_lo16(qw[l >> 1], l),
+                                                pxq3_mmvq_hi8 (qw[VDR/2], iqs + l));
+        return make_int2(g.x, g.y);
+    }
 };
 
 // The block's ROWS rows are adjacent, so their scale bytes are an adjacent run inside the slab's
@@ -127,26 +221,28 @@ struct pxq_mmvq_scales {
 // VDR = code words (8 k-values each) this thread owns: 2 -> a thread pair splits the 16 B code
 // row and each issues LDG.64; 4 -> one thread owns the whole row and issues a single LDG.128,
 // halving the memory instructions per useful byte at the cost of half the k-parallelism.
+//
+// This whole-dot form is what the ncols_y == 1 launch runs. Multi-column launches run the split
+// form below (pxq_mmvq_wfrag + pxq_mmvq_dot_frag), which is this function with its weight-only
+// prologue lifted out of the column loop and is bit-identical to it; this one then doubles as the
+// reference arm of tests/test-pxq-mmvq-cols.cu, so KEEP THE TWO ARITHMETICALLY IN STEP.
 template <class POL, int VDR, int ROWS>
 static __device__ __forceinline__ float vec_dot_pxq_q8_1(
         const uint8_t * __restrict__ slab, const int r, const int i, const float anch,
         const float * __restrict__ sub, const pxq_mmvq_scales<POL, ROWS> & sc,
         const block_q8_1 * __restrict__ bq8_1, const int iqs) {
 
-    // this thread's code bytes: CODE_OFF and SLAB are multiples of 64 and iqs is a multiple of
-    // VDR, so the address is 4*VDR aligned.
-    uint32_t qw[VDR];
-    const uint8_t * cp = slab + POL::CODE_OFF + 16*r + 4*iqs;
-    if constexpr (VDR == 4) { *(uint4 *)qw = *(const uint4 *)cp; }
-    else                    { *(uint2 *)qw = *(const uint2 *)cp; }
+    // this thread's code words, however many the tier packs its VDR groups into
+    uint32_t qw[POL::template NWORDS<VDR>];
+    POL::template load_words<VDR>(slab, r, iqs, qw);
 
     const int * q8 = (const int *) bq8_1->qs;
 
     float sum = 0.0f;
 #pragma unroll
     for (int l = 0; l < VDR; ++l) {
-        const int  m = iqs + l;                            // code word == 8-element k group
-        const int2 v = pxq_mmvq_table16_seq((int) qw[l], pxq_mmvq_book_s8);
+        const int  m = iqs + l;                            // code group == 8-element k group
+        const int2 v = POL::template group<VDR>(qw, l, iqs);
         int s = ggml_cuda_dp4a(v.x, q8[2*m + 0], 0);
         s     = ggml_cuda_dp4a(v.y, q8[2*m + 1], s);
         sum  += sub[POL::snib(sc.byte(POL::sidx(i, m)), m)] * (float) s;
@@ -156,10 +252,79 @@ static __device__ __forceinline__ float vec_dot_pxq_q8_1(
 }
 
 // ---------------------------------------------------------------------------------------------
+// WEIGHT-SIDE DECODE, HOISTED OUT OF THE COLUMN LOOP (2026-09-08)
+// ---------------------------------------------------------------------------------------------
+// Everything vec_dot_pxq_q8_1() does before its first dp4a is a function of the WEIGHT alone: the
+// 8 B/16 B code load, the byte-perm book gather, and the per-code-word sub-scale lookup all depend
+// on (slab, r, i, iqs) and never on which activation column is being scored. A GEMV that scores
+// several activation columns against the same rows -- the spec-verify / multi-slot widths this
+// kernel is explicitly built for, see the ROWS note in mmvq-templates.cuh -- was therefore
+// unpacking the same nibbles ncols_y times over. Split the work in two: pxq_mmvq_wfrag decodes one
+// (row, k-block) once, pxq_mmvq_dot_frag consumes it once per column.
+//
+// The per-column arithmetic and its ORDER are untouched. For every (row, column) pair the l loop
+// still runs 0..VDR-1 and still does dp4a(v.x, ...) -> dp4a(v.y, ...) -> fma of eff*(float)s into
+// `sum`, and still finishes with anch * ds * sum, so each output is bit-identical to the
+// unhoisted vec_dot_pxq_q8_1() by construction. The caller's j/i loop swap does not change it
+// either: every tmp[j][i] still receives exactly one addend per k-block, in k-block order.
+// tests/test-pxq-mmvq-cols.cu proves it differentially against vec_dot_pxq_q8_1() above, which is
+// kept verbatim as the reference arm (it is not instantiated by the engine build).
+//
+// COST. VDR=2 -> 4 int + 2 float, VDR=4 -> 8 int + 4 float held live across the column loop. The
+// ncols_y == 1 caller does not use this path at all (see k_mul_mat_vec_q), so the single-column
+// register budget -- the one the ROWS sweep was tuned against -- is untouched.
+// ---------------------------------------------------------------------------------------------
+template <class POL, int VDR, int ROWS>
+struct pxq_mmvq_wfrag {
+    int2  v  [VDR];      // book values in k order: .x = k 0..3 of the word, .y = k 4..7
+    float eff[VDR];      // that code word's sub-scale
+
+    __device__ __forceinline__ void load(
+            const uint8_t * __restrict__ slab, const int r, const int i,
+            const float * __restrict__ sub, const pxq_mmvq_scales<POL, ROWS> & sc, const int iqs) {
+        uint32_t qw[POL::template NWORDS<VDR>];
+        POL::template load_words<VDR>(slab, r, iqs, qw);
+#pragma unroll
+        for (int l = 0; l < VDR; ++l) {
+            const int m = iqs + l;                         // code group == 8-element k group
+            v  [l] = POL::template group<VDR>(qw, l, iqs);
+            eff[l] = sub[POL::snib(sc.byte(POL::sidx(i, m)), m)];
+        }
+    }
+};
+
+// The irreducibly per-column half: 2*VDR dp4a and VDR fma against an already-decoded fragment.
+template <class POL, int VDR, int ROWS>
+static __device__ __forceinline__ float pxq_mmvq_dot_frag(
+        const pxq_mmvq_wfrag<POL, VDR, ROWS> & w, const float anch,
+        const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+
+    const int * q8 = (const int *) bq8_1->qs;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR; ++l) {
+        const int m = iqs + l;
+        int s = ggml_cuda_dp4a(w.v[l].x, q8[2*m + 0], 0);
+        s     = ggml_cuda_dp4a(w.v[l].y, q8[2*m + 1], s);
+        sum  += w.eff[l] * (float) s;
+    }
+
+    return anch * __low2float(bq8_1->ds) * sum;
+}
+
+
+// ---------------------------------------------------------------------------------------------
 // host gates
 // ---------------------------------------------------------------------------------------------
+// Which PXQ tiers may take this path. The two PX16-book tiers always may (they are what it was
+// built for); the two LOW tiers may when PXA_PXQ23_MMVQ admits them — see the lever, its two
+// refusals and the s8 self-check in pxa-enhance.cuh. Every caller that routes a node to MMVQ
+// asks this one question, so one predicate moves the whole dispatch.
 static inline bool pxa_pxq_mmvq_type(ggml_type t) {
-    return t == GGML_TYPE_PXQ4 || t == GGML_TYPE_PXQ4HQ;
+    if (t == GGML_TYPE_PXQ4 || t == GGML_TYPE_PXQ4HQ) return true;
+    const int m23 = pxa_pxq23_mmvq_mask();
+    return (t == GGML_TYPE_PXQ2 && (m23 & 1)) || (t == GGML_TYPE_PXQ3 && (m23 & 2));
 }
 
 // MODEL-AWARE DEFAULT (2026-07-29): explicit PXA_PXQ_MMVQ always wins; with the env
@@ -220,4 +385,14 @@ static inline bool pxa_pxq_mmvq_on(int cc) {
     if (m == 0) return false;
     if (m == 1) return cc >= CC_VOLTA;
     return cc >= 610;                 // real DP4A only; sm_60 would run the emulation
+}
+
+// Same question, asked with the tier in hand. Mode 2 (an all-sm_61 fleet) carries PXQ4 and
+// PXQ4HQ on their own 2026-07-28 evidence; it does NOT carry the two low tiers, whose decode win
+// was measured on sm_70 and only on sm_70. So a 1080 Ti fleet keeps the bespoke fused decode for
+// PXQ2/PXQ3 until somebody measures it there — a lever should arm on the arch its gate passed on.
+static inline bool pxa_pxq_mmvq_on_type(int cc, ggml_type t) {
+    if (!pxa_pxq_mmvq_on(cc)) return false;
+    if (t == GGML_TYPE_PXQ2 || t == GGML_TYPE_PXQ3) return cc >= CC_VOLTA;
+    return true;
 }

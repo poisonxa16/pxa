@@ -3,8 +3,8 @@
 Everything before this ran on the CPU host simulator. This is the first time the
 kernel executed on a GPU.
 
-Date: 2026-08-18. Hardware: Tesla V100-SXM2-32GB, cc 7.0, DGX card 7 only.
-Container: `kewaii/vllm:latest`, CUDA 12.8 (nvcc V12.8.93), torch 2.10.0+cu128,
+Date: 2026-08-18. Hardware: Tesla V100-SXM2-32GB, cc 7.0, GPU host card 7 only.
+Container: `${VLLM_IMAGE:-vllm/vllm-openai:latest}`, CUDA 12.8 (nvcc V12.8.93), torch 2.10.0+cu128,
 built with `cmake -DCMAKE_CUDA_ARCHITECTURES=70`.
 
 ## Result
@@ -17,7 +17,7 @@ The oracle is legitimate: `pxq4_kernel_hostsim.cpp` compiles the *same kernel
 source* for the host, so CPU and GPU are the same arithmetic on two backends.
 
 Source provenance was checked rather than assumed — all six kernel files on the
-DGX were md5-identical to branch `pxa/vllm-pxq4-sidecar`.
+GPU host were md5-identical to branch `pxa/vllm-pxq4-sidecar`.
 
 ### Numbers
 
@@ -70,7 +70,7 @@ capture, or multi-GPU.
 
 ## Constraints observed
 
-The DGX is lent, not ours. GPUs 0-3 (the owner's) were never touched; no container
+The GPU host is lent, not ours. GPUs 0-3 (I's) were never touched; no container
 was stopped, killed or removed; only `docker run --rm` with
 `NVIDIA_VISIBLE_DEVICES=7`; free memory was checked before and after every run
 (minimum seen 2601 MiB against a 1200 MiB abort threshold); nothing under

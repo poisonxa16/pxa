@@ -60,7 +60,7 @@ than torch.mm on Volta.  We must never arm it for ourselves: it reads
 ``layer.weight``, which a PXQ4 layer does not have.
 
 ==============================================================================
-VERIFIED FACTS THIS FILE DEPENDS ON (all read in /opt/1Cat-vLLM, git 2ceb15066)
+VERIFIED FACTS THIS FILE DEPENDS ON (all read in the vLLM fork checkout, git 2ceb15066)
 ==============================================================================
 * ``LinearMethodBase.create_weights`` signature: linear.py:290-313;
   ``apply``: linear.py:316-325.

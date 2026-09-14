@@ -261,6 +261,25 @@ struct pxq6_pol_p2 {
     __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
         (void)q; (void)b; (void)plut; return make_float2(0.f, 0.f);
     }
+    // H2 (PXA_PXQ_MMV_H2, MODE 7 — sm_60 only). A PXQ2 pair is ONE NIBBLE of the code word:
+    // elem 2b at bits sh..sh+1 and elem 2b+1 at sh+2..sh+3 with sh = 2*((2b)&15), i.e. exactly
+    // the four bits `pair()` already extracts twice. So a 16-entry half2 LUT keyed on that
+    // nibble collapses the whole pair decode to BFE + LDS.32, and the pair of book values
+    // arrives as one __half2 operand for a single HFMA2. The LUT is staged from bookv() — the
+    // same per-TU global table stage_tabs() fills tab[] from — and the LM4 book is fp16-exact
+    // by the pxa_pxq23_book_ok() self-check, so the LUT carries ZERO book error: the halves are
+    // the exact same numbers, not approximations of them.
+    static constexpr int H2LUT = 16;
+    __device__ static int h2key(const uint32_t * q, int b) {
+        return (int)((q[b >> 3] >> (2*((2*b) & 15))) & 0xfu);
+    }
+    __device__ static void h2codes(int key, int & c0, int & c1) {
+        c0 = key & 3;
+        c1 = (key >> 2) & 3;
+    }
+    __device__ static __half2 pairh2(const uint32_t * q, int b, const __half2 * hlut) {
+        return hlut[h2key(q, b)];
+    }
 };
 
 struct pxq6_pol_p3 {
@@ -318,6 +337,24 @@ struct pxq6_pol_p3 {
         const uint32_t hi2 = (q[2]      >> (2*b))            & 0x3u;   // high plane: bits 2b, 2b+1
         return plut[lo4 | (hi2 << 4)];
     }
+    // H2 (PXA_PXQ_MMV_H2, MODE 7 — sm_60 only): PAIRL3's key, PAIRL3's 64 entries, but the
+    // value is a __half2 instead of a float2 so the pair feeds one HFMA2 instead of two fp32
+    // multiply-adds. Same key derivation, same book (bookv), and the LM8 book is fp16-exact by
+    // the pxa_pxq23_book_ok() self-check, so the entries are the exact book values — the LUT
+    // itself introduces no error at all, on either tier.
+    static constexpr int H2LUT = 64;
+    __device__ static int h2key(const uint32_t * q, int b) {
+        const uint32_t lo4 = (q[b >> 3] >> (2*((2*b) & 15))) & 0xfu;
+        const uint32_t hi2 = (q[2]      >> (2*b))            & 0x3u;
+        return (int)(lo4 | (hi2 << 4));
+    }
+    __device__ static void h2codes(int key, int & c0, int & c1) {
+        c0 = (key & 3)        | (((key >> 4) & 1) << 2);
+        c1 = ((key >> 2) & 3) | (((key >> 5) & 1) << 2);
+    }
+    __device__ static __half2 pairh2(const uint32_t * q, int b, const __half2 * hlut) {
+        return hlut[h2key(q, b)];
+    }
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -353,7 +390,14 @@ static void dequantize_row_pxq3_cuda(const void * vx, dst_t * y, const int64_t n
     pxq23_maybe_upload_books(dev);
     const int kslabs = (int)(n_per_row / PXQ3_QK);
     const int64_t nslabs = (nrows / PXQ3_BM) * (int64_t)kslabs;
-    k_pxq6_dequant_matrix<pxq6_pol_p3, dst_t><<<nslabs, 64, 0, stream>>>((const uint8_t *)vx, y, kslabs, n_per_row);
+    // PXA_PXQ3_PAIRLUT_DQ: two instantiations of the same kernel, picked once per call from a
+    // gate that reads its env var exactly once. Bit-exact by sourcing (see the PAIRL3 note on
+    // k_pxq6_dequant_matrix and phase 5 of tests/test-pxq-dq-wide), so this is a speed lever only.
+    if (pxa_pxq3_pairlut_dq()) {
+        k_pxq6_dequant_matrix<pxq6_pol_p3, dst_t, true ><<<nslabs, 64, 0, stream>>>((const uint8_t *)vx, y, kslabs, n_per_row);
+    } else {
+        k_pxq6_dequant_matrix<pxq6_pol_p3, dst_t, false><<<nslabs, 64, 0, stream>>>((const uint8_t *)vx, y, kslabs, n_per_row);
+    }
 }
 
 template <typename dst_t>

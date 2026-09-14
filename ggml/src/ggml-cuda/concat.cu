@@ -196,7 +196,8 @@ static __global__ void concat_f32_non_cont(
 }
 
 
-// PXA_CONCAT_FLAT (default OFF): flattened one-thread-per-element non-contiguous concat.
+// PXA_CONCAT_FLAT (house lever: ON at ENHANCE, the shipped level; OFF at DEFAULT/REFERENCE):
+// flattened one-thread-per-element non-contiguous concat.
 //
 // concat_f32_non_cont maps one CUDA block to each (i1, i2, i3) and loops i0 over blockDim.x,
 // so only min(ne0, CUDA_CONCAT_BLOCK_SIZE) threads in a block do anything. That is fine when

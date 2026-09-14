@@ -28,13 +28,11 @@ step() { echo; echo "=== [$(date -u +%H:%M:%S)] $* ==="; }
 if [ ! -s "$BF16" ]; then
   step "convert HF -> BF16 GGUF"
   df -h "$OUT" | tail -1
-  # capped so a runaway cannot take the host down (188 GB RAM, zero swap)
-  # pxa-memcap.sh <name> <limit> <command...>. 64G is far above the converter's
-  # working set (one tensor at a time) but stops a runaway allocation dead --
-  # that is what this cap is for. memory.max counts page cache, which is
-  # reclaimable, so a big streaming read/write reclaims rather than OOMs.
-  /usr/local/bin/pxa-memcap.sh qwen4exp-convert 64G \
-      python3 -u "$REPO/convert_qwen4exp.py" "$SRC" \
+  # Optional memory-cap wrapper: set PXQ_MEMCAP to a command that caps the
+  # converter's RSS if you want one. The converter works one tensor at a time,
+  # so the cap exists only to stop a runaway allocation dead.
+  MEMCAP="${PXQ_MEMCAP:-}"
+  $MEMCAP python3 -u "$REPO/convert_qwen4exp.py" "$SRC" \
       --outfile "$BF16" 2>&1 | tee "$LOGD/convert.log"
 else
   step "BF16 already present, skipping convert"

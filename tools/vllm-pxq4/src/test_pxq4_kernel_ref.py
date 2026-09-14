@@ -41,7 +41,7 @@ def _load_hostsim():
         return None
     if not os.path.exists(_LIB_PATH):
         # The host simulator is a BUILD ARTIFACT, not a checked-in file. Its absence
-        # means "no compiler here" (Unraid has no g++), not "the kernel is wrong".
+        # means "no compiler here" (2x V100 box has no g++), not "the kernel is wrong".
         # Reporting 8 hard failures for a missing toolchain is a misleading signal -
         # the same class of defect this suite exists to catch. Skip loudly instead.
         raise _HostsimUnavailable(
@@ -359,7 +359,7 @@ _FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 def test_real_artifact_panel():
     """Panel 0 of blk.0.attn_gate.weight, lifted verbatim out of
-    /mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf (ggml type 252, K=5120, R=6144) by
+    $PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4.gguf (ggml type 252, K=5120, R=6144) by
     dump_one_panel.py. A panel is a self-contained byte range, so 174208 bytes is a complete,
     legal PXQ4 tensor of 64 rows -- which is itself the column-parallel sharding claim.
 

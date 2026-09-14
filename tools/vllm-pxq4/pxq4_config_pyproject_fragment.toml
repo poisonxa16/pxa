@@ -1,15 +1,15 @@
 # Fragment for pxq4-vllm/pyproject.toml -- the registration half only.
 # Component B owns the rest of the file (build backend, deps, package dirs).
 #
-# The container image is read-only in practice (its / is 100% full), so the
+# The container image is read-only in practice (read-only in practice), so the
 # shipping path is NOT `pip install`. It is:
 #
-#   /mnt/models/pxa-vllm-pxq4/site/
+#   $PXA_MODELS_DIR/pxa-vllm-pxq4/site/
 #       pxq4_vllm/...
 #       pxq4_vllm-0.1.0.dist-info/METADATA          <- 3 lines, see below
 #       pxq4_vllm-0.1.0.dist-info/entry_points.txt  <- pxq4_config_entry_points.txt
 #
-#   PYTHONPATH=/mnt/models/pxa-vllm-pxq4/site
+#   PYTHONPATH=$PXA_MODELS_DIR/pxa-vllm-pxq4/site
 #
 # importlib.metadata.entry_points() scans .dist-info dirs on sys.path, so the
 # entry point resolves with nothing installed. This pyproject stays in the repo

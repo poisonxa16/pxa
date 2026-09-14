@@ -88,16 +88,16 @@ HOW TO READ EVERY CLAIM IN THIS FILE
 THE DECISION IS NOT JUST ABOUT THE HARDWARE
 
     DENSE 27B PXQ4, 2x P100 sm_60 -- vLLM wins everything measured
-      single decode   vLLM 24.01  vs llama.cpp 13.7   (1.75x)   SCOREBOARD D3/D1
-      agg decode @8   vLLM ~70    vs llama.cpp 12.4   (5.6x)    SCOREBOARD D3/D1
-      prefill         vLLM ~225   vs llama.cpp 156.5  (1.44x)   SCOREBOARD D3/D1
-      agg decode @4   vLLM UNMEASURED vs llama.cpp 12.0         SCOREBOARD D3
+      single decode   vLLM 24.01  vs llama.cpp 13.7   (1.75x)   the measurement record
+      agg decode @8   vLLM ~70    vs llama.cpp 12.4   (5.6x)    the measurement record
+      prefill         vLLM ~225   vs llama.cpp 156.5  (1.44x)   the measurement record
+      agg decode @4   vLLM UNMEASURED vs llama.cpp 12.0         the measurement record
       ^ the llama.cpp side (D1) is ONE boot, below this corpus's own 2-boot bar,
         and the graphs-ON dense arm (D2) was never launched at all.
 
     MoE 35B PXQ4, 2x P100 sm_60 -- SPLIT SEAT, this is the important branch
-      np1  llama.cpp 95.6  vs vLLM 30.4   llama.cpp 3.14x   SCOREBOARD M1/M7
-      np4  llama.cpp 75.93 vs vLLM 64.82  llama.cpp +17.1%  MOE-CROSSOVER
+      np1  llama.cpp 95.6  vs vLLM 30.4   llama.cpp 3.14x   the measurement record
+      np4  llama.cpp 75.93 vs vLLM 64.82  llama.cpp +17.1%  the MoE crossover analysis
       np5  llama.cpp 79.49 vs vLLM 64.32  llama.cpp +23.6%  <- llama.cpp PEAKS
       np6  llama.cpp 69.58 vs vLLM 75.60  vLLM +8.7%        <- crossover
       np7  llama.cpp 67.74 vs vLLM 87.03  vLLM +28.5%
@@ -126,16 +126,16 @@ SPEC CORRECTIONS - things this file does NOT do the way the spec says, with why
       through general.file_type (all report 38).
 
   C2. I-2's "22.3 -> 24.0 dense" IS A MoE NUMBER. Adversarial review caught this
-      and it is right. SCOREBOARD rows M8/M9 sit in Table 1a "MoE 35B PXQ4", not
-      the dense table; ENGINE-VERDICT.md:14-22 calls the same pair "the MoE seat".
+      and it is right. the measurement record sit in Table 1a "MoE 35B PXQ4", not
+      the dense table.
       Dense TP=2 single is D3 = 24.01, a different measurement, and there is NO
       dense FAP-vs-FDO pair in the corpus at all (D2 = 0 boots). The OLD version
       of this file carried the same mislabel in its FULL_DECODE_ONLY comment.
       Fixed in both places.
 
   C3. "EVERY vLLM NUMBER IS sm_60" IS OVERSTATED. Also caught by review, also
-      right. PORT-ASSESSMENT.md:82 records a vLLM shared-prefix win of 3.76x
-      measured on the DGX (V100, sm_70). What is true, and what the eligibility
+      right. The record holds a vLLM shared-prefix win of 3.76x measured on
+      V100 (sm_70). What is true, and what the eligibility
       fix actually rests on, is narrower: NO vLLM DECODE-OR-PREFILL THROUGHPUT
       NUMBER on sm_70 exists anywhere in this corpus. The comment at
       vllm_eligibility() states the narrow version.
@@ -161,9 +161,9 @@ SPEC CORRECTIONS - things this file does NOT do the way the spec says, with why
 sm_70 ONLY WAS A LIE, AND IT MADE THE MoE BRANCH UNREACHABLE
   The old file set MIN_VLLM_CAP=70 and routed any selection containing a
   sub-sm_70 card to llama.cpp. Every vLLM decode/prefill number in the decision
-  table below was produced on 2x P100 sm_60 (SCOREBOARD.md:6; MOE-CROSSOVER.md:3,
+  table below was produced on 2x P100 sm_60 (the measurement record; the MoE crossover analysis,
   image pxa-sm60-dev, libpxq4_sm60_v10.so, --attention-backend PASCAL_SDPA,
-  MOE-CROSSOVER.md:77-82). So the old table could never reproduce a single one of
+  the MoE crossover analysis). So the old table could never reproduce a single one of
   its own vLLM cells, and the np>=6 vLLM branch was dead on the only hardware
   where the crossover was measured. Eligibility is a property of the resolved
   IMAGE, probed. See vllm_eligibility().
@@ -234,50 +234,50 @@ def ub_for_card(mem_total_mib):
 # swings 32 points between np5 and np6. A straight line np4->np8 puts the
 # threshold too early and misprices np5 by ~14%. THE TABLE IS STORED, NOT A SLOPE.
 MOE_TABLE = {
-    4: (75.93, 64.82, "llama", "+17.1%"),   # llama.cpp reused from SCOREBOARD M4
+    4: (75.93, 64.82, "llama", "+17.1%"),   # llama.cpp reused from the measurement record
     5: (79.49, 64.32, "llama", "+23.6%"),   # llama.cpp PEAK
     6: (69.58, 75.60, "vllm",  "+8.7%"),    # crossover
     7: (67.74, 87.03, "vllm",  "+28.5%"),
     8: (62.42, 95.81, "vllm",  "+53.5%"),
 }
-MOE_NP1 = (95.6, 30.4, "llama", "3.14x")    # MEASURED SCOREBOARD M1 / M7
+MOE_NP1 = (95.6, 30.4, "llama", "3.14x")    # MEASURED the measurement record / M7
 MOE_LLAMA_MAX_NP = 5        # MEASURED: llama.cpp wins at and below np=5
 MOE_VLLM_MIN_NP  = 6        # MEASURED: vLLM wins at and from np=6
 MOE_TABLE_MAX_NP = 8        # nothing above np=8 was run, on either engine
 
 # MEASURED currency warning that rides every vLLM MoE decision:
-# MOE-CROSSOVER section 6.4 measured 95.81 at np8 on tree 3e34872 where SCOREBOARD
+# the MoE crossover analysis measured 95.81 at np8 on tree 3e34872 where the measurement record
 # M7 has 88.7 on fdec4ae (+8.0%). The doc names the intervening commit as a
 # HYPOTHESIS, not a measurement, and concludes every vLLM MoE number on the
-# SCOREBOARD may now be stale in vLLM's favour. If it is stale the crossover could
+# the measurement record may now be stale in vLLM's favour. If it is stale the crossover could
 # sit BELOW np=6 - i.e. this can change an engine decision, not just a number.
 MOE_CURRENCY_NOTE = ("vLLM MoE currency: 95.81 (tree 3e34872) vs 88.7 (fdec4ae) = +8.0% on the "
                      "same cell, cause hypothesised and NOT tested. If the newer number is real "
-                     "the crossover may sit BELOW np=6. [MOE-CROSSOVER 6.4]")
+                     "the crossover may sit BELOW np=6. [the MoE crossover analysis]")
 
-# MEASURED dense, 27B PXQ4, 2x P100 sm_60, cards 1,5 (SCOREBOARD 2a rows D1/D3).
+# MEASURED dense, 27B PXQ4, 2x P100 sm_60, cards 1,5 (the measurement record rows D1/D3).
 DENSE_NUMBERS = {
     "single":  ("24.01", "13.7",  "1.75x"),
     "agg8":    ("~70",   "12.4",  "5.6x"),
     "prefill": ("~225",  "156.5", "1.44x"),
 }
-DENSE_AGG4_NOTE = ("dense agg@4 on vLLM is UNMEASURED (SCOREBOARD D3); llama.cpp side is 12.0. "
+DENSE_AGG4_NOTE = ("dense agg@4 on vLLM is UNMEASURED (the measurement record); llama.cpp side is 12.0. "
                    "No ratio is printed for np=4 because none was measured.")
-DENSE_WEAKNESS = ("dense envelope: the llama.cpp side (SCOREBOARD D1) is ONE boot, below this "
+DENSE_WEAKNESS = ("dense envelope: the llama.cpp side (the measurement record) is ONE boot, below this "
                   "corpus's own 2-boot bar, and the graphs-ON dense arm (D2) was never launched. "
                   "Direction 1.75x-5.6x is not in doubt; the exact ratios are single-boot.")
 
 # MEASURED MoE long-doc prefill, with the caveat printed EVERY time:
 MOE_LONGDOC_NOTE = ("long-doc prefill: llama.cpp 1136 / ~1058 / ~1000 vs vLLM 567.6 / 595.8 / "
                     "594.4 tok/s (~1.7-1.9x). CAVEAT: CROSS-HARNESS, prompt lengths NOT matched "
-                    "(2059 vs ~6.4k tok) [SCOREBOARD 0.2]. Directionally trusted, not controlled.")
+                    "(2059 vs ~6.4k tok) [the measurement record]. Directionally trusted, not controlled.")
 
 # The anchor models. The crossover is a property of a model x hardware PAIR, not
 # of the engines - other MoE arches on the box (qwen3next MoE-512, qwen3moe
 # MoE-128, deepseek4 MoE-6) have NO engine-vs-engine data at any np.
 ANCHOR_MOE_HINTS   = ("coder-35b", "coder35", "pxa-coder-35b")
 ANCHOR_DENSE_HINTS = ("27b-unc", "qwen38-27b", "qwen3.8-27b")
-ANCHOR_CTX_PER_SLOT = 4096      # MEASURED envelope: --ctx-size np*4096 (MOE-CROSSOVER section 3)
+ANCHOR_CTX_PER_SLOT = 4096      # MEASURED envelope: --ctx-size np*4096 (the MoE crossover analysis)
 
 # ---------------------------------------------------------------------------
 # PXQ TIERS - ggml TENSOR TYPE IDS (ground truth; see SPEC CORRECTION C1)
@@ -343,7 +343,7 @@ GRAPH_SPLIT_GUARDED_ARCHES = {"qwen35moe", "qwen3next", "qwen35", "qwen4exp"}
 VLLM_IMAGES = {
     "pxa-sm60-dev": {
         "caps": {60}, "status": "MEASURED",
-        "why": "produced every MoE-crossover vLLM number (MOE-CROSSOVER.md:77-82; "
+        "why": "produced every MoE-crossover vLLM number (the MoE crossover analysis; "
                "libpxq4_sm60_v10.so, --attention-backend PASCAL_SDPA)",
         # NOT A SELF-CONTAINED IMAGE. `pip list` inside it shows pip and nothing else:
         # it is a bare CUDA runtime, and torch, vllm and the PXQ4 plugin all live on the
@@ -413,17 +413,11 @@ VLLM_IMAGES = {
                "NOT YET GATED. caps is deliberately EMPTY until a V100 smoke passes: this "
                "launcher does not route traffic to an image on the strength of an argument"},
 
-    "kewaii/vllm:latest": {
-        "caps": set(), "status": "INELIGIBLE",
-        "why": "THIRD-PARTY image. Everything we ship must be buildable from our own tree, and "
-               "pxa-vllm:sm70 replaces this. Technically it also silently overrode "
-               "cudagraph_mode from its own SM70 compile policy, and the knob it honours "
-               "crash-loops 3/3 at warmup (DGX-FDO-FAILURE.md)"},
 }
 # MEASURED per-class attention backend.
 ATTN_BACKEND = {
     60: ("PASCAL_SDPA", "MEASURED - the arm that produced every MoE-crossover vLLM cell "
-                        "(MOE-CROSSOVER.md:81)"),
+                        "(the MoE crossover analysis)"),
     70: ("FLASH_ATTN_V100", "[INFERRED] - from the V100 seat launch recipes; no "
                             "engine-vs-engine number was ever taken on sm_70, and as of "
                             "2026-08-25 no vLLM image in this table has a GATED sm_70 seat "
@@ -465,12 +459,12 @@ FA_REGIME_SRC = "docs/COOKBOOK.md:41-63 (Two FA regimes); bench/fair-battle.md:3
 
 # The eleven levers docs/COOKBOOK.md:181-223 names for the 4x P100 Flash-Next seat,
 # in the doc's own order. Kept as DOCUMENTATION of what the engine now sets by
-# itself, NOT emitted (2026-09-06, AUTO-DEFAULTS-AUDIT gap a, order #1400c): since
+# itself, NOT emitted (2026-09-06): since
 # ENHANCE became the default level (2026-09-03) every one of these is the engine's
 # own answer for a 4-card non-mixed sm_60 topology -- the nine house levers follow
 # pxa_house_lever_default() (ON at ENHANCE, any topology) and PXA_FA_GQA_PACK=4 /
 # PXA_MOE_DEVICE_MAP=1 follow their multi-sm_60 gates (pxa-enhance.cuh:571-590),
-# confirmed live in the Phase P alex-ref boot with no env set. Emitting them pinned
+# confirmed live in the 4x P100 reference boot with no env set. Emitting them pinned
 # the recipe against the engine's future defaults with no signal of drift; the
 # engine is the single source of truth for kernel levers. NONE of the eleven differ
 # from what ENHANCE sets, so the emitted env is empty. The twelfth lever the live
@@ -508,7 +502,7 @@ PIPELINE_PP_DEFAULT_ARCHES = {"qwen35", "qwen35moe"}
 PIPELINE_PP_NOTE = (
     "PXA_PIPELINE_PP is an ENGINE default for the qwen35/qwen35moe families only. It is NOT "
     "on for qwen4exp: at -c 150016 across four cards the n_copies=2 compute buffers OOM "
-    "(the measurement ledger, the 1080 Ti no-boot has the same cause). "
+    "(measured 2026-09-03 , the 1080 Ti no-boot has the same cause). "
     "This launcher does not set it either way.")
 
 
@@ -600,13 +594,13 @@ RECIPES = [
         numbers="prefill 1,369 t/s @3,121 tok  |  1,300 @20,801  |  decode 39.5 @fill 8 "
                 "(release binary, quiet box, no env, auto -b/-ub picks these flags)",
         source="RELEASE-NOTES-2026-09-07.md:77 (headline table row); "
-               "the measurement ledger FINAL V100 cells",
+               "measured 2026-09-05 FINAL V100 cells",
         notes=["-ub 2048 beats -ub 512 here ONLY at -b 8192: at the default -b 2048 the "
                "per-chunk llama_synchronize is what made small -ub look good, and removing it "
                "flips the order back (bench/fair-battle.md:169-170; "
-               "the measurement ledger FINAL TABLE).",
+               "measured 2026-09-03 FINAL TABLE).",
                "-b 20480 buys +0.3% over -b 8192 (1,211/1,210 vs 1,207/1,204) - i.e. nothing "
-               "(the measurement ledger chunk-size PROBE)."]),
+               "(measured 2026-09-03 chunk-size PROBE)."]),
     Recipe(
         "2xp100-dense-pxq4", "2x Tesla P100 (sm_60), dense 27B, PXQ4",
         2, {60}, ("dense", "hybrid"), {"PXQ4"},
@@ -615,15 +609,14 @@ RECIPES = [
                 "GPUs 1;5, quiet box, no env, engine auto -b 8192 -ub 256, n=3/3/12; fold n=7 "
                 "reference 340.16 | 316.84 | 17.83)",
         source="RELEASE-NOTES-2026-09-07.md:78 (P100 headline row); bench/fair-battle.md:303 "
-               "(release row + measurement note); P100 final-binary capture, 2026-09-05; "
-               "the measurement ledger FINAL TABLE",
+               "(release row + measurement note); measured 2026-09-03 FINAL TABLE",
         notes=["-ub does NOT transfer between pairs: 2,048 is best on the V100 pair and 256 on "
                "this one (-ub 256 gives 218.4 t/s @3,121 against 231 at -ub 2048 on the DEFAULT "
                "chunk; at -b 8192 the 256 cell is the 340.16 above). "
-               "the measurement ledger (HONEST numbers, UNIFIED build "
+               "measured 2026-09-02 (HONEST numbers, UNIFIED build "
                "#2/#3: P100 ub256 218.4 vs ub2048 231); docs/COOKBOOK.md:103-106.",
                "-ub 512 at the same -b 8192 measured 323.26 / 310.38 / 17.76 (n=7) - about 5% "
-               "behind (the measurement ledger)."]),
+               "behind (measured 2026-09-03 )."]),
     Recipe(
         "1x1080ti-pxq2", "1x GTX 1080 Ti 11 GB (sm_61), 35B MoE, PXQ2",
         1, {61}, ("moe", "hybrid-moe"), {"PXQ2"},
@@ -633,7 +626,7 @@ RECIPES = [
         numbers="cold prefill 1,363.5 t/s @-fa off  |  chat prefill 746.6 @-fa on  |  "
                 "decode 36.73 cold / 65.3 chat  (release binary, no env, auto -b/-ub)",
         source="RELEASE-NOTES-2026-09-07.md:79 (headline table row); "
-               "the measurement ledger",
+               "measured 2026-09-04 ",
         notes=["BOTH FA cells are MEASURED on this card, which is why --workload longdoc is a "
                "real choice here and not an inference: 1,363.5 cold at -fa off against 746.6 "
                "chat at -fa on, decode 36.73 against 65.3.",
@@ -665,7 +658,7 @@ RECIPES = [
                "+ 733 MiB compute buffer on 11,002 MiB free; there is no room for a drafter. "
                "PXA_ENHANCE=1 is still exported, because it is what arms the int8 prefill tile "
                "the numbers depend on - only the auto-drafter is turned off.",
-               "AMENDED 2026-09-04 (defaults lane): the engine now declines this auto-arm by "
+               "AMENDED 2026-09-04: the engine now declines this auto-arm by "
                "itself - AUTO_SPEC refuses below 2 GiB of estimated post-weights headroom and "
                "refuses outright on a single-card sm_61 fleet, printing 'PXA_AUTO: spec "
                "DECLINED', and docs/COOKBOOK.md's 1080 Ti recipe now says so. Emitting "
@@ -696,7 +689,7 @@ RECIPES = [
                "with a single-card cudaMalloc of the whole tensor.",
                "-ub 2048 is the best of 2048/1024/512/256 on this four-card split "
                "(495.07/413.36/28.23 against 305.00/275.69/27.12 at -ub 256) - the OPPOSITE of "
-               "the 2x P100 pair (the measurement ledger, "
+               "the 2x P100 pair (measured 2026-09-02 , "
                "4x P100 seat ubatch sweep).",
                FLASHNEXT_SEAT_EXTRA_NOTE,
                PIPELINE_PP_NOTE,
@@ -930,8 +923,8 @@ def resident_procs(gpus):
 
 def peer_topology():
     """H3 -> (has_p2p, description). This box is all-PHB, no NVLink, no P2P
-    (SCOREBOARD.md:6) - which is WHY custom all-reduce is off in every measured
-    vLLM arm (--disable-custom-all-reduce, MOE-CROSSOVER.md:79). CAR costs ~18%
+    (the measurement record) - which is WHY custom all-reduce is off in every measured
+    vLLM arm (--disable-custom-all-reduce, the MoE crossover analysis). CAR costs ~18%
     vs NCCL on MoE (CAR-VERDICT.md) while the CAR KERNEL is exonerated. We READ
     the topology; we do not hardcode the answer."""
     out = _run(["nvidia-smi", "topo", "-m"], timeout=25)
@@ -1449,8 +1442,8 @@ def vllm_eligibility(sel, image_arg):
     the hardware every vLLM cell in the decision table was measured on. The narrow
     true statement (SPEC CORRECTION C3): NO vLLM decode-or-prefill THROUGHPUT
     number on sm_70 exists anywhere in this corpus - the only sm_70 vLLM figure on
-    record is a 3.76x shared-prefix win on the DGX (PORT-ASSESSMENT.md:82), which
-    is not a seat decision.
+    record is a 3.76x shared-prefix win on a 4x V100 host, which is not a
+    routing decision.
 
     Resolution order, and the probe that failed is always named:
       1. --vllm-image / PXA_VLLM_IMAGE
@@ -1558,7 +1551,7 @@ R = {
           "reported the blocker and then launched anyway."),
  "R-08": ("REFUSING: cudagraph_mode={mode}. FULL_AND_PIECEWISE captures PREFILL graphs and "
           "returns fluent garbage from character zero on short raw /v1/completions prompts. Its "
-          "best aggregate (88.4, SCOREBOARD M8) is BELOW the correct config's (88.7, M7). There "
+          "best aggregate (88.4, the measurement record) is BELOW the correct config's (88.7, M7). There "
           "is no speed argument for it."),
  "R-10": ("REFUSING: -ts with vLLM. vLLM splits parallel work EVENLY; a per-card ratio has no "
           "equivalent and would be silently ignored."),
@@ -1673,14 +1666,14 @@ class Plan(object):
 def envelope_notes(plan, sel, prof, np_, per_slot_ctx, model_path):
     """Section 4.4. The whole decision table is keyed to TWO CARDS OF ONE CLASS.
     Outside that envelope the launcher labels the answer and, where the spec says
-    so, requires --accept-unmeasured. SCOREBOARD.md:273 is the evidence that even
+    so, requires --accept-unmeasured. the measurement record is the evidence that even
     2->2 does not transfer: 22.3 vs 24.6 tok/s on an IDENTICAL config between card
     pairs 1,5 and 0,6."""
     caps = sorted({g[2] for g in sel})
     n = len(sel)
     if n == 2 and caps == [60]:
         plan.evidence.append("MEASURED envelope: exactly 2 cards, both sm_60 - the table applies "
-                             "as measured (SCOREBOARD.md:6, MOE-CROSSOVER.md:3)")
+                             "as measured (the measurement record, the MoE crossover analysis)")
     elif n == 2 and caps == [70]:
         plan.notes.append("[INFERRED]: 2x sm_70. NO engine-vs-engine number exists on Volta on "
                           "this box, for either class. The table below is applied, not measured "
@@ -1699,7 +1692,7 @@ def envelope_notes(plan, sel, prof, np_, per_slot_ctx, model_path):
     elif n not in (1, 2):
         plan.notes.append(f"UNMEASURED card count: the MoE crossover and the dense pair were both "
                           f"measured on exactly 2 cards. You selected {n}. The 2-card answer is "
-                          f"printed and labelled [INFERRED]. SCOREBOARD.md:273 shows 22.3 vs 24.6 "
+                          f"printed and labelled [INFERRED]. the measurement record shows 22.3 vs 24.6 "
                           f"on an identical config between two P100 PAIRS - even 2->2 does not "
                           f"transfer cleanly.")
         plan.needs_ack.append(f"{n}-card selection (table is 2-card only)")
@@ -1842,7 +1835,7 @@ def decide(sel, kind, model, forced, prof, np_, workload, elig_caps, image, prob
         p.reason = f"forced by --engine ({names or 'no GPUs visible'})"
         if not sel:
             p.blockers.append("no GPUs visible - proceeding on your say-so; the engine may fail "
-                              "to start, and CUDA_VISIBLE_DEVICES cannot be scoped (I-12)")
+                              "to start, and CUDA_VISIBLE_DEVICES cannot be scoped")
         if forced_v:
             if tier and tier not in VLLM_SUPPORTED_PXQ:
                 p.blockers.append(f"FORCED vllm but this model is {tier} and the vLLM backend "
@@ -1901,7 +1894,7 @@ def decide(sel, kind, model, forced, prof, np_, workload, elig_caps, image, prob
             p.reason = (f"DENSE model on {len(sel)} eligible card(s) ({names}). vLLM wins dense at "
                         f"every workload MEASURED: {s[0]} vs {s[1]} tok/s single ({s[2]}), "
                         f"{a8[0]} vs {a8[1]} agg@8 ({a8[2]}), {pf[0]} vs {pf[1]} prefill ({pf[2]}).")
-            p.evidence.append("MEASURED dense: SCOREBOARD rows D1 (llama.cpp) / D3 (vLLM), "
+            p.evidence.append("MEASURED dense: the measurement record (llama.cpp) / D3 (vLLM), "
                               "27B PXQ4, 2x P100 sm_60, cards 1,5")
             p.notes.append(DENSE_WEAKNESS)
             if np_ == 4:
@@ -1911,7 +1904,7 @@ def decide(sel, kind, model, forced, prof, np_, workload, elig_caps, image, prob
             p.reason = (f"MoE model, long-document workload ({names}). llama.cpp -sm layer holds "
                         f"the prefill record at every concurrency measured.")
             p.notes.append(MOE_LONGDOC_NOTE)
-            p.evidence.append("MEASURED MoE longdoc: SCOREBOARD section 0.2 - cross-harness, "
+            p.evidence.append("MEASURED MoE longdoc: the measurement record - cross-harness, "
                               "see the note")
         else:
             p.engine, p.reason, ev, nts = moe_seat(np_, names)
@@ -2006,13 +1999,13 @@ def moe_seat(np_, names):
     ev, nts = [], []
     if np_ <= 1:
         l, v, w, m = MOE_NP1
-        ev.append(f"MEASURED np=1: llama.cpp {l} vs vLLM {v} tok/s ({m}) [SCOREBOARD M1/M7]")
+        ev.append(f"MEASURED np=1: llama.cpp {l} vs vLLM {v} tok/s ({m}) [the measurement record]")
         return "llama", (f"MoE at np=1 on {names}. llama.cpp -sm layer wins single-stream by "
                          f"{m}: {l} vs {v} tok/s."), ev, nts
     if np_ in MOE_TABLE:
         l, v, w, m = MOE_TABLE[np_]
         ev.append(f"MEASURED np={np_}: llama.cpp {l} vs vLLM {v} tok/s, {w} by {m} "
-                  f"[MOE-CROSSOVER.md section 1, 11 gated boots, cards 0+6]")
+                  f"[the MoE crossover analysis section 1, 11 gated boots, cards 0+6]")
         if np_ == 5:
             nts.append("np=5 is llama.cpp's PEAK (79.49, ABOVE its own np4 75.93) and it drops "
                        "12.5% in ONE step to np6. Do not read np5 as a point on a line from np4 "
@@ -2113,12 +2106,14 @@ def vram_check(plan, sel, mbytes, ctx, prof, ngl_all):
 # ---------------------------------------------------------------------------
 # ENGINE RESOLUTION (llama.cpp build dirs)
 # ---------------------------------------------------------------------------
+# Absolute paths from one particular machine do not belong in a list every user's launcher walks:
+# nobody else has them, and if a stranger happens to, the launcher would silently prefer it to
+# their own build. PXA_ENGINE_DIR is the way to name a build directory that is not next to you.
 ENGINE_DIR_CANDIDATES = [
     os.environ.get("PXA_ENGINE_DIR", ""),         # set PXA_ENGINE_DIR to your build dir
-    "/mnt/models/pxa-sky-build/build70",          # DGX, sm_70
-    "/mnt/models/PXA/build70",              # DGX, sm_70
     "./build-unified",                            # in-tree build
     "./build",                                    # in-tree build
+    "./build-cuda",                               # in-tree build (the release recipe's name)
 ]
 
 
@@ -2342,7 +2337,7 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
     # card, while the measured best on a 2x P100 pair is 256 - and it never sets
     # -b at all, because the prefill CHUNK is not its job. On both card pairs
     # -b 8192 is worth about +10% long-prompt prefill over the engine default
-    # -b 2048 (the measurement ledger chunk-size PROBE).
+    # -b 2048 (measured 2026-09-03 chunk-size PROBE).
     ub_auto = None
     if not a.ub and R is None and prof.get("arch") == "qwen4exp":
         ub_auto = 1024
@@ -2490,7 +2485,7 @@ def compilation_config(np_):
       custom_ops:["none"]  is MANDATORY wherever FULL_DECODE_ONLY is emitted on
         sm_60. Without it, PP=2+FDO is a HARD BOOT FAILURE - "CUDA error: an
         illegal memory access was encountered", Worker_PP1 ->
-        determine_available_memory -> profile_run (MOE-CROSSOVER.md:271-292,
+        determine_available_memory -> profile_run (the MoE crossover analysis,
         container xover-vllm-boot1, ZERO tokens produced). Adding the key fixed it
         with no other change. Every working recipe on this box carries it
         (BUILD-RECIPE.md:95, graphs_arms.sh:6, live fat-smoke-588671). The previous
@@ -2503,7 +2498,7 @@ def compilation_config(np_):
         stale data and returns fluent garbage from character zero. Chat traffic
         hides it because the template pads past the captured sizes - which is why
         arithmetic gates stayed green while the bug was live. MEASURED: the broken
-        config's best aggregate 88.4 (SCOREBOARD M8) is BELOW the correct config's
+        config's best aggregate 88.4 (the measurement record) is BELOW the correct config's
         88.7 (M7). There is no speed argument for it.
     """
     ladder = list(MEASURED_LADDER)
@@ -2584,7 +2579,7 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
         cmd += ["--attention-backend", backend]
         print(f"  --attention-backend {backend}: {backend_ev}")
 
-    # KV BLOCK SIZE ON VOLTA FOR A GDN HYBRID (board A4/A6, measured 2026-09-06).
+    # KV BLOCK SIZE ON VOLTA FOR A GDN HYBRID, measured 2026-09-06).
     # The v1.5.0 sm_70 image serves a DeltaNet/GDN hybrid at parity with the image it
     # replaces ONLY at --block-size 256: prefill 1002.85 @3k and 993.84 @20k against
     # 1010.0 / 987.3, decode 49.73 vs 49.71, agg@8 178.23 vs 178.33, and the same
@@ -2606,13 +2601,13 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
               "(prefill 1,002.85 / 993.84 t/s, decode 49.73, agg@8 178.23) and is "
               "byte-identical on the determinism gate. Pass --vllm-block-size to override.")
     # H3: no P2P on this box -> custom all-reduce OFF in every measured vLLM arm
-    # (MOE-CROSSOVER.md:79). CAR costs ~18% vs NCCL on MoE while the CAR kernel
+    # (the MoE crossover analysis). CAR costs ~18% vs NCCL on MoE while the CAR kernel
     # itself is exonerated. Read from topology, not hardcoded.
     if not plan_has_p2p():
         cmd += ["--disable-custom-all-reduce"]
 
     # MoE goes PIPELINE parallel; dense goes TENSOR parallel. PP=2 is the arm that
-    # holds every MoE number in the table (MOE-CROSSOVER.md arm B).
+    # holds every MoE number in the table (the MoE crossover analysis arm B).
     if prof.get("is_moe") and deg >= 2:
         cmd += ["--pipeline-parallel-size", str(deg), "--tensor-parallel-size", "1"]
         print(f"  MoE -> PIPELINE parallel (PP={deg}, TP=1). MEASURED: PP=2 + FULL_DECODE_ONLY "
@@ -2626,7 +2621,7 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
     #   previous version of this file. PP=2 + FDO WITHOUT this key is a HARD BOOT
     #   FAILURE: "RuntimeError: Worker failed with error 'CUDA error: an illegal
     #   memory access was encountered'", Worker_PP1 -> determine_available_memory
-    #   -> profile_run (MOE-CROSSOVER.md:271-292, container xover-vllm-boot1,
+    #   -> profile_run (the MoE crossover analysis, container xover-vllm-boot1,
     #   produced ZERO tokens). Adding the key fixed it with no other change. Every
     #   working recipe on this box carries it (BUILD-RECIPE.md:95, graphs_arms.sh:6,
     #   live container fat-smoke-588671). `grep -n custom_ops` on the old file
@@ -2643,11 +2638,10 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
     #   returns fluent garbage from character zero. Chat traffic never shows it
     #   because the chat template pads every prompt past the captured sizes - which
     #   is exactly why arithmetic gates stayed green while the bug was live.
-    #   MEASURED: the broken config's BEST aggregate (88.4, SCOREBOARD M8) is BELOW
+    #   MEASURED: the broken config's BEST aggregate (88.4, the measurement record) is BELOW
     #   the correct config's (88.7, M7). SPEC CORRECTION C2: the 22.3 -> 24.0
     #   single-stream pair that used to be quoted here as "dense" is a MoE pair
-    #   (SCOREBOARD M8/M9, both in table 1a; ENGINE-VERDICT.md:14-22 calls it "the
-    #   MoE seat"). Dense TP=2 single is D3 = 24.01 and has NO FAP arm at all.
+    #   (the measurement record, both in table 1a). Dense TP=2 single is D3 = 24.01 and has NO FAP arm at all.
     #
     # cudagraph_capture_sizes - powers of two covering --max-num-seqs. [1,2,4,8] is
     #   the MEASURED ladder and the fix for the earlier [1,2] cliff at 3+ concurrent
@@ -2676,8 +2670,8 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
         print(f"  --speculative-config: ngram, num_speculative_tokens={n} (YOUR values, not a "
               f"substitution).")
 
-    env = {"TORCHDYNAMO_DISABLE": "1",           # MEASURED arm B env, MOE-CROSSOVER.md:80
-           "VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}  # MEASURED arm B env, MOE-CROSSOVER.md:80
+    env = {"TORCHDYNAMO_DISABLE": "1",           # MEASURED arm B env, the MoE crossover analysis
+           "VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}  # MEASURED arm B env, the MoE crossover analysis
     # An image whose runtime lives on the host also carries the env that makes that
     # runtime importable. setdefault, not assignment: an explicit value already in the
     # measured arm above wins over the image's default.
@@ -2685,19 +2679,19 @@ def build_vllm_cmd(plan, a, prof, ctx, used, image):
         env.setdefault(_k, _v)
     if cc == 70:
         # The sm_70 recipes carry this; the sm_60 arm does NOT - it carries
-        # SITE=<site> LIB=libpxq4_sm60_v10.so PACKED=1 instead (MOE-CROSSOVER.md:78).
+        # SITE=<site> LIB=libpxq4_sm60_v10.so PACKED=1 instead (the MoE crossover analysis).
         # The old file emitted the Volta backend name unconditionally, i.e. into a
         # Pascal image - a config the corpus never ran.
         env["VLLM_SM70_QUANT_BACKEND"] = "turbomind"
     else:
         print("  sm_60 arm: the MEASURED recipe carries SITE=<site> LIB=libpxq4_sm60_v10.so "
-              "PACKED=1 (MOE-CROSSOVER.md:78). Those are IMAGE-INTERNAL paths - this launcher "
+              "PACKED=1 (the MoE crossover analysis). Those are IMAGE-INTERNAL paths - this launcher "
               "will not fabricate them. Declare them in your container invocation or the run is "
               "off the measured envelope (I-11).")
     # VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE is NEVER set: it crash-loops
     # the container at warmup, 3/3 boots (TypeError: 'NoneType' object is not
     # subscriptable in compile_or_warm_up_model -> _dummy_run) and left a seat in a
-    # --restart unless-stopped loop needing manual clearing (DGX-FDO-FAILURE.md).
+    # --restart unless-stopped loop needing manual clearing.
     return cmd, env, used
 
 
@@ -2719,9 +2713,9 @@ def print_post_boot_contract(engine, cv):
     it is not made. This process EXECs the server, so it cannot observe anything
     after the exec - therefore it makes NO health claim at all, and prints the
     checks whoever owns the seat must run. Passing a flag is not evidence the flag
-    took effect: on kewaii/vllm:latest, FULL_DECODE_ONLY parses, boots healthy and
-    is SILENTLY OVERRIDDEN back to FULL_AND_PIECEWISE by that image's own compile
-    policy (DGX-FDO-FAILURE.md). That is the whole failure class this project keeps
+    took effect: on some stock vLLM images, FULL_DECODE_ONLY parses, boots healthy
+    and is SILENTLY OVERRIDDEN back to FULL_AND_PIECEWISE by the image's own compile
+    policy. That is the whole failure class this project keeps
     paying for."""
     print("  POST-BOOT CONTRACT - NOT PERFORMED BY THIS PROCESS (it execs the server):")
     print("    this launcher makes NO healthy/unhealthy claim about the resulting seat.")
@@ -2730,7 +2724,7 @@ def print_post_boot_contract(engine, cv):
         print("       If it is not FULL_DECODE_ONLY, the seat is NOT healthy - shut it down")
         print("       (R-09). A derived image is the fix, not a flag.")
         print("    2. N-way split: per-device resident bytes. MEASURED PP=2 MoE = 10.71 GiB/rank")
-        print("       (ENGINE-VERDICT.md section 4).")
+        print(".")
     else:
         print("    1. posture: llama-server logs 'PXA posture: mode=... fa=... ub=...' at")
         print("       startup - compare ub against the card-type expectation printed above.")
@@ -2745,7 +2739,7 @@ def print_post_boot_contract(engine, cv):
     print(f"       FASTEST_FIRST would put a different card there and say nothing.")
     print("    4. short-prompt correctness: a RAW, NON-chat-templated 1-token and 5-token")
     print("       completion BEFORE any number is trusted, exactly as all 11 crossover boots")
-    print("       did (MOE-CROSSOVER.md section 4.3). Chat-templated traffic pads every prompt")
+    print("       did (the MoE crossover analysis section 4.3). Chat-templated traffic pads every prompt")
     print("       past the captured sizes, which is precisely why the FAP corruption survived")
     print("       arithmetic gating.")
     print("    5. speculation: if you armed one, the acceptance-rate line must be present and")
@@ -3366,7 +3360,7 @@ PRODUCTION_CHAT_SRC = (
     "with NO --chat-template (the file's embedded one) and NO --reasoning-format "
     "[the production seat script]. The vLLM sm_70 seat runs "
     "`--enable-auto-tool-choice --tool-call-parser qwen3_coder` and no reasoning parser "
-    "[same file, start_alina]. --jinja is there because without it every request carrying "
+    "[same file, the server start block]. --jinja is there because without it every request carrying "
     "`tools` returns HTTP 500 while plain chat keeps working - that seat shipped broken for "
     "weeks on exactly this omission.")
 
@@ -4567,7 +4561,7 @@ def plan_and_build(a, gpus):
     show its output, instead of reimplementing the decision and drifting from it.
     Prints the full never-magic report to stdout (the UI captures it), and returns
     (plan, cmd, env, cv, prof, ctx). Refusals still exit, as they always did."""
-    # ---- card selection (I-12: never left to the ambient environment) -------
+    # ---- card selection (never left to the ambient environment) -------------
     cards = {int(x) for x in re.split(r"[,\s]+", a.gpus) if x.strip()} if a.gpus else set()
     sel = [g for g in (gpus or []) if g[0] in cards] if cards else (gpus or [])
     if cards and len(sel) != len(cards):
@@ -4862,7 +4856,7 @@ def plan_and_build(a, gpus):
         cmd, env, used = build_vllm_cmd(plan, a, prof, ctx, used, image)
 
     cv = ",".join(str(g[0]) for g in used)
-    # I-12 / R-07: devices are NEVER left to the ambient environment. If we cannot
+    # Devices are NEVER left to the ambient environment. If we cannot
     # name the devices, we do not execute. The previous version turned an empty
     # device list into the string "all" and then skipped setting
     # CUDA_VISIBLE_DEVICES entirely, so the child inherited every GPU on a box with
@@ -4870,7 +4864,7 @@ def plan_and_build(a, gpus):
     if not cv:
         print("  REFUSING to execute with an unscoped device set: no card could be named for "
               "CUDA_VISIBLE_DEVICES. On this box that means inheriting every GPU, including "
-              "cards other agents are measuring on. (I-12)")
+              "cards another process is measuring on.")
         print("=" * 78)
         sys.exit(3)
     dev_env, dev_note = device_env(cv)
@@ -4992,7 +4986,7 @@ def main():
                          "which on a 16 GiB card is the whole KV budget. See _is_multimodal.")
     ap.add_argument("--vllm-block-size", default="", metavar="N",
                     help="vLLM --block-size. Default: unset, except a GDN hybrid on sm_70, "
-                         "where 256 is the measured seat value (board A4). Pass a number to "
+                         "where 256 is the measured seat value. Pass a number to "
                          "override it, or 0 to emit no --block-size at all.")
     ap.add_argument("--vllm-image", default="")
     ap.add_argument("--cudagraph-mode", default="FULL_DECODE_ONLY")

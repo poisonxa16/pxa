@@ -6,7 +6,7 @@ whether an out-of-tree `torch.ops.pxq4.*` participates in vLLM's FULL_AND_PIECEW
 CUDA-graph capture the way the fork's own `torch.ops._C` does.  Nobody read code that
 answers it, and it cannot be answered without a GPU.  These tests answer it in isolation,
 in seconds, without loading a 27B model -- which is worth a lot, because the alternative
-is discovering it during a full engine start on borrowed hardware.
+is discovering it during a full engine start on a shared GPU host.
 
 Everything here needs a CUDA device.  Nothing here needs vLLM, except the two helpers at
 the bottom that take an already-constructed model.
@@ -50,7 +50,7 @@ def test_schema_declares_output_mutation():
 
 
 def test_meta_kernel_registered():
-    """`register_fake` is mandatory (plan §6.7): tracing happens on meta tensors, and an
+    """`register_fake` is mandatory: tracing happens on meta tensors, and an
     op with no meta implementation raises during Dynamo tracing, before capture is even
     attempted.  This is the cheapest possible check and it catches the most common
     omission in a custom-op port."""
@@ -68,7 +68,7 @@ def test_meta_kernel_registered():
     except NotImplementedError as e:
         raise AssertionError(
             f"pxq4 ops have no meta/fake implementation: {e}\n"
-            f"Add @torch.library.register_fake for both ops (plan §6.7).") from e
+            f"Add @torch.library.register_fake for both ops.") from e
 
 
 def test_apply_allocates_nothing():
@@ -104,7 +104,7 @@ def test_cudagraph_capture_and_replay():
 
     This is the direct test of plan §10 risk 3.  If it passes, the fallback
     (`--cudagraph-mode PIECEWISE` on the CLI) is not needed.  If it fails, it fails HERE
-    in two seconds instead of during a 27B engine start on borrowed GPUs.
+    in two seconds instead of during a 27B engine start on a shared GPU host.
     """
     ops, torch = _require()
     N, K, M = 256, 4096, 4
@@ -149,12 +149,11 @@ def test_cudagraph_capture_and_replay():
 def test_dequant_smem_limit_for_wide_k():
     """mmv stages ALL of x in dynamic shared memory: (K + 256) * 4 bytes
     (pxq6.cuh:938-940).  At K=17408 that is 70,656 B -- above the 48 KiB default and
-    below V100's 96 KiB opt-in cap, so the launcher MUST call cudaFuncSetAttribute
-    (plan §7.3).  K >= 24320 does not fit at all and must fall back to dequant+mm.
+    below V100's 96 KiB opt-in cap, so the launcher MUST call cudaFuncSetAttribute.  K >= 24320 does not fit at all and must fall back to dequant+mm.
 
     A launcher that forgot the opt-in fails with cudaErrorInvalidValue at exactly the
-    shapes that only appear at TP<=2 -- i.e. never on the 4-GPU DGX and always on the
-    2-GPU Unraid box.  That is a bug that ships.
+    shapes that only appear at TP<=2 -- i.e. never on the 4-GPU GPU host and always on the
+    2-GPU 2x V100 box.  That is a bug that ships.
     """
     ops, torch = _require()
     for K, must_work in ((4096, True), (17408, True)):
@@ -191,7 +190,7 @@ def assert_no_sm70_fastpath(model) -> None:
 
     Call this after model load, before serving.
 
-    ASSUMPTION: agent B names the class `PXQ4LinearMethod` (plan §6.6). This helper
+    ASSUMPTION: the vLLM plugin (ops.py/linear.py) names the class `PXQ4LinearMethod`. This helper
     matches on the type name because a plugin-registered class cannot be imported here
     without pulling in vllm. If B renames it, this silently checks nothing -- so the
     coverage helper below exists as the paired positive check.

@@ -151,7 +151,8 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-// PXA_NORM_REGCACHE (default OFF): keep the row in registers across the two passes.
+// PXA_NORM_REGCACHE (house lever: ON at ENHANCE, the shipped level; OFF at DEFAULT/REFERENCE):
+// keep the row in registers across the two passes.
 //
 // The rms/l2 norm kernels read x twice -- once for the sum of squares, once to scale. At
 // single-token decode the grid is one block, so the kernel occupies one SM and is limited by
@@ -177,8 +178,14 @@ static bool pxa_norm_regcache_enabled() {
     return v;
 }
 
-template <int block_size, bool regcache = false>
-static __global__ void rms_norm_f32(const float * x, float * dst, const int ncols, const float eps) {
+// PXA_RMS_SCALE_FUSE: `post` folds a following GGML_OP_SCALE (dst = s*x + b) into this
+// kernel's store. The expression is written EXACTLY as scale_f32 writes it, applied to
+// exactly the value the unfused rms_norm would have stored, so the fused result is
+// bit-identical -- including the -0.0 case, which is why this is a template parameter
+// and not a `post_scale = 1.0f` default (1.0f*-0.0f + 0.0f would flip the sign bit).
+template <int block_size, bool regcache = false, bool post = false>
+static __global__ void rms_norm_f32(const float * x, float * dst, const int ncols, const float eps,
+                                    const float post_scale = 1.0f, const float post_bias = 0.0f) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
@@ -224,19 +231,25 @@ static __global__ void rms_norm_f32(const float * x, float * dst, const int ncol
         for (int k = 0; k < (regcache ? PXA_NORM_MAX_CACHE : 1); ++k) {
             const int col = tid + k*block_size;
             if (col < ncols) {
-                dst[row*ncols + col] = scale * xv[k];
+                const float v = scale * xv[k];
+                dst[row*ncols + col] = post ? post_scale * v + post_bias : v;
             }
         }
     } else {
         for (int col = tid; col < ncols; col += block_size) {
-            dst[row*ncols + col] = scale * x[row*ncols + col];
+            const float v = scale * x[row*ncols + col];
+            dst[row*ncols + col] = post ? post_scale * v + post_bias : v;
         }
     }
 }
 
-template <int block_size, bool regcache = false>
-static __global__ void l2_norm_f32(const float * x, float * dst, const int ncols, const float eps) {
-    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+// PXA_FUSE_SIBLINGS: the l2-norm row body, lifted verbatim out of l2_norm_f32 so that a
+// multi-node launch can reuse it. Every expression, every reduction step and every block size is
+// unchanged -- the only thing the caller decides is which (x, dst, row) triple this block works
+// on -- so a merged launch computes exactly what the separate launches computed.
+template <int block_size, bool regcache>
+static __device__ __forceinline__ void l2_norm_f32_row(const float * x, float * dst, const int row,
+                                                       const int ncols, const float eps) {
     const int tid = threadIdx.x;
 
     float tmp = 0.0f;
@@ -272,7 +285,9 @@ static __global__ void l2_norm_f32(const float * x, float * dst, const int ncols
         tmp = warp_reduce_sum(tmp);
     }
 
-    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+    // PXA_KERNFIX 2026-09-09 (defect B): reference GDN L2 norm, eps added under the sqrt.
+    // Must stay identical to ggml_compute_forward_l2_norm_f32 and to pxa_dn_silu_qknorm_f32.
+    const float scale = rsqrtf(tmp + eps);
 
     if (cached) {
 #pragma unroll
@@ -289,10 +304,31 @@ static __global__ void l2_norm_f32(const float * x, float * dst, const int ncols
     }
 }
 
-template <int block_size>
+template <int block_size, bool regcache = false>
+static __global__ void l2_norm_f32(const float * x, float * dst, const int ncols, const float eps) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    l2_norm_f32_row<block_size, regcache>(x, dst, row, ncols, eps);
+}
+
+// PXA_FUSE_SIBLINGS: N same-shape L2_NORM nodes in one launch. blockIdx.y picks the node,
+// blockIdx.x picks the row -- i.e. the grid of the N separate launches, concatenated. Each block
+// runs the identical row body on the identical row, so the merged result is bit-identical to the
+// N launches it replaces; only the launch count changes.
+struct pxa_norm_multi {
+    const float * x  [PXA_SIB_MAX];
+    float       * dst[PXA_SIB_MAX];
+};
+
+template <int block_size, bool regcache = false>
+static __global__ void l2_norm_f32_multi(const pxa_norm_multi p, const int ncols, const float eps) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    l2_norm_f32_row<block_size, regcache>(p.x[blockIdx.y], p.dst[blockIdx.y], row, ncols, eps);
+}
+
+template <int block_size, bool post = false>
 static __global__ void rms_norm_f32_nc(
         const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
-        const int64_t stride_sample, const float eps) {
+        const int64_t stride_sample, const float eps, const float post_scale = 1.0f, const float post_bias = 0.0f) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -330,7 +366,8 @@ static __global__ void rms_norm_f32_nc(
     const float scale = rsqrtf(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale * x[col];
+        const float v = scale * x[col];
+        dst[col] = post ? post_scale * v + post_bias : v;
     }
 }
 
@@ -370,7 +407,9 @@ static __global__ void l2_norm_f32_nc(
         tmp = warp_reduce_sum(tmp);
     }
 
-    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+    // PXA_KERNFIX 2026-09-09 (defect B): reference GDN L2 norm, eps added under the sqrt.
+    // Must stay identical to ggml_compute_forward_l2_norm_f32 and to pxa_dn_silu_qknorm_f32.
+    const float scale = rsqrtf(tmp + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
         dst[col] = scale * x[col];
@@ -636,6 +675,37 @@ static void rms_norm_f32_nc_cuda(
     }
 }
 
+// PXA_RMS_SCALE_FUSE: the same two launchers, with a following SCALE folded into the store.
+static void rms_norm_scale_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, const float eps,
+                                    const float ps, const float pb, cudaStream_t stream) {
+    constexpr int kBlockSize = 256;
+    if (ncols < 1024) {
+        const dim3 block_dims(kBlockSize, 1, 1);
+        rms_norm_f32<kBlockSize, false, true><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps, ps, pb);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        if (pxa_norm_regcache_enabled()) {
+            rms_norm_f32<1024, true, true><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps, ps, pb);
+        } else {
+            rms_norm_f32<1024, false, true><<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps, ps, pb);
+        }
+    }
+}
+
+static void rms_norm_scale_f32_nc_cuda(
+        const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        const float ps, const float pb, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        rms_norm_f32_nc<WARP_SIZE, true><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps, ps, pb);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        rms_norm_f32_nc<1024, true><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps, ps, pb);
+    }
+}
+
 static void l2_norm_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     GGML_ASSERT(ncols % WARP_SIZE == 0);
     constexpr int kBlockSize = 256;
@@ -783,6 +853,40 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
 }
 
+// PXA_RMS_SCALE_FUSE: GGML_OP_RMS_NORM immediately followed by GGML_OP_SCALE, in one launch.
+// `scale_node` is the SCALE and supplies the destination; `dst` is the RMS_NORM whose buffer is
+// never written. Bit-identical to running the two nodes: the store below is scale_f32's own
+// expression applied to the value rms_norm would have stored. See the note on rms_norm_f32.
+void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_node) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *) src0->data;
+    float * dst_d = (float *) scale_node->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(dst->op == GGML_OP_RMS_NORM && scale_node->op == GGML_OP_SCALE);
+    GGML_ASSERT(scale_node->src[0] == dst);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(dst, scale_node));
+    GGML_ASSERT(ggml_is_contiguous(scale_node));
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    float ps, pb;
+    memcpy(&ps, (const float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&pb, (const float *) scale_node->op_params + 1, sizeof(float));
+
+    const int64_t ne00 = src0->ne[0];
+    if (ggml_is_contiguous(src0)) {
+        rms_norm_scale_f32_cuda(src0_d, dst_d, ne00, ggml_nrows(src0), eps, ps, pb, stream);
+    } else {
+        const auto ts0 = ggml_type_size(src0->type);
+        GGML_ASSERT(src0->nb[0] == ts0);
+        rms_norm_scale_f32_nc_cuda(src0_d, dst_d, ne00, src0->ne[1], src0->ne[2], src0->ne[3],
+                                   src0->nb[1]/ts0, src0->nb[2]/ts0, src0->nb[3]/ts0, eps, ps, pb, stream);
+    }
+}
+
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *)src0->data;
@@ -833,6 +937,57 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const int64_t s03 = src0->nb[3] / ts0;
         l2_norm_f32_nc_cuda(src0_d, dst_d, ne00, src0->ne[1], src0->ne[2], src0->ne[3], s01, s02, s03, eps, stream);
     }
+}
+
+// PXA_FUSE_SIBLINGS: run N consecutive same-shape L2_NORM nodes as one launch. Returns false and
+// touches nothing when the run is outside the envelope the merged kernel covers (the caller then
+// falls back to the per-node path). The launch geometry per node is exactly what
+// l2_norm_f32_cuda would have chosen, so the arithmetic is unchanged.
+bool ggml_cuda_op_l2_norm_multi(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, int n) {
+    if (n < 2 || n > PXA_SIB_MAX) {
+        return false;
+    }
+
+    const ggml_tensor * ref  = dsts[0]->src[0];
+    const int64_t       ne00 = ref->ne[0];
+    const int64_t       nrows = ggml_nrows(ref);
+
+    if (ne00 % WARP_SIZE != 0 || ne00 > INT32_MAX || nrows <= 0 || nrows > INT32_MAX) {
+        return false;
+    }
+
+    float eps = 0.0f;
+    memcpy(&eps, dsts[0]->op_params, sizeof(float));
+
+    pxa_norm_multi p = {};
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * src0 = dsts[k]->src[0];
+        if (src0->type != GGML_TYPE_F32 || dsts[k]->type != GGML_TYPE_F32) return false;
+        if (!ggml_is_contiguous(src0))                                     return false;
+        if (src0->ne[0] != ne00 || ggml_nrows(src0) != nrows)              return false;
+        float e = 0.0f;
+        memcpy(&e, dsts[k]->op_params, sizeof(float));
+        if (memcmp(&e, &eps, sizeof(float)) != 0)                          return false;
+        p.x  [k] = (const float *) src0->data;
+        p.dst[k] = (float *)       dsts[k]->data;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    const dim3 grid((unsigned) nrows, (unsigned) n, 1);
+    constexpr int kBlockSize = 256;
+    if (ne00 < 1024) {
+        const dim3 block_dims(kBlockSize, 1, 1);
+        l2_norm_f32_multi<kBlockSize><<<grid, block_dims, 0, stream>>>(p, (int) ne00, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        if (pxa_norm_regcache_enabled()) {
+            l2_norm_f32_multi<1024, true><<<grid, block_dims, 0, stream>>>(p, (int) ne00, eps);
+        } else {
+            l2_norm_f32_multi<1024><<<grid, block_dims, 0, stream>>>(p, (int) ne00, eps);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 void ggml_cuda_op_fused_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool is_norm) {

@@ -2,7 +2,7 @@
 oracle.py -- INDEPENDENT numpy model of the PXQ4 (ggml type id 252) device format.
 
 Why this file exists at all, given the plan already assigns `src/pxq4_vllm/reference.py`
-to Agent A: a parity harness that only compares Agent A's reference against Agent C's
+to the reference (reference.py): a parity harness that only compares the Python reference against the CUDA kernel's
 kernel proves the two agree, not that either is right. This module is a SECOND,
 independently-written model, transcribed directly from the C
 
@@ -80,7 +80,7 @@ assert np.all(np.diff(BOOK) > 0) and np.all(np.diff(SUB) > 0)
 
 
 # ---------------------------------------------------------------------------------------
-# Layout arithmetic.  Mirrors the plan's src/pxq4_vllm/layout.py contract (plan §6.2) so
+# Layout arithmetic.  Mirrors the plan's src/pxq4_vllm/layout.py contract so
 # the harness can be pointed at either implementation.
 # ---------------------------------------------------------------------------------------
 def panel_bytes(K: int) -> int:
@@ -115,7 +115,7 @@ def assert_geometry(N: int, K: int) -> None:
 def split_blob(blob, N: int, K: int):
     """Raw GGUF tensor bytes -> (slabs uint8[P,S,1088], anchor float16[P,64]).
 
-    This is THE cross-component contract (plan §5.3).  It is a pure split: the header of
+    This is THE cross-component contract.  It is a pure split: the header of
     each panel becomes one anchor row, the remainder becomes that panel's slab stack.
     Not one byte is reordered and not one value is recomputed -- which is why `join_blob`
     below must reproduce the input exactly, and why gate G2 is a byte comparison rather
@@ -323,7 +323,7 @@ def mmv(x, slabs, anchor, *, book=BOOK, sub=SUB,
       * the block owns one 64-row panel; thread (kseg, row) with kseg in 0..KSEG-1
       * kslabs is chopped into `nfix` chunks with boundaries (kslabs*c)//nfix
       * within a chunk, lane kseg walks kb = b0+kseg, b0+kseg+KSEG, ... ASCENDING
-      * per-chunk partial `t` starts at zero and is added into the lane total `su`
+      * per-chunk partial `t` starts at zero and is added into the package total `su`
       * the cross-lane reduction sums s = 0..KSEG-1 in ascending order
     Change any of those and the result moves in the low bits.
     """
@@ -445,7 +445,7 @@ def merged_column_shards(output_sizes, tp_size: int, tp_rank: int):
 
 def check_module_shardable(name: str, output_sizes, K: int, tp_sizes=(1, 2, 4),
                            row_parallel: bool = False):
-    """Converter/config self-check #5 (plan §5.6).  Returns a list of failure strings."""
+    """Converter/config self-check #5.  Returns a list of failure strings."""
     fails = []
     for tp in tp_sizes:
         for i, off, sz in merged_column_shards(output_sizes, tp, 0):

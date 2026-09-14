@@ -274,6 +274,14 @@ static int pxa_dsa_min_ratio() {
     return ratio;
 }
 
+// See dsa_attn.cuh for why an unhonoured index list is a wrong answer rather than a
+// slow one. Deliberately independent of the switch and of every shape rule: it asks
+// only what the node wants, so the two predicates compose as
+// "may CUDA run this?" = dsa_supported(node) || !dsa_requested(node).
+bool ggml_cuda_dsa_attn_requested(const ggml_tensor * dst) {
+    return dst && dst->op == GGML_OP_FLASH_ATTN_EXT && dst->src[5] != nullptr;
+}
+
 bool ggml_cuda_dsa_attn_supported(const ggml_tensor * dst, int cc) {
     if (!dst || dst->op != GGML_OP_FLASH_ATTN_EXT) return false;
 

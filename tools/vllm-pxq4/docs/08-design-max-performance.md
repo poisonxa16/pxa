@@ -1,9 +1,9 @@
-# PXQ4 as a first-class quantization backend in 1Cat-vLLM (sm_70) — maximum-performance design
+# PXQ4 as a first-class quantization backend in the Volta vLLM fork (sm_70) — maximum-performance design
 
-Target: `KewaiiGamer/1Cat-vLLM` @ `2ceb15066`, Qwen3.8-27B (gguf arch `qwen35`), 4x V100-32GB (DGX, TP=4)
-and 2x V100-16GB (Unraid, TP=2). Artifact: `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
+Target: the Volta vLLM fork @ `2ceb15066`, Qwen3.8-27B (gguf arch `qwen35`), 4x V100-32GB (GPU host, TP=4)
+and 2x V100-16GB (2x V100 box, TP=2). Artifact: `/path/to/models/pxa-models/Qwen3.8-27B-PXQ4.gguf`.
 Every line citation below is to a file that was read (either `/path/to/engine-repo` @ `acf8f245`, or
-`/opt/1Cat-vLLM` inside the running container). **No GPU was run in this study. Every throughput
+`the vLLM fork checkout` inside the running container). **No GPU was run in this workflow. Every throughput
 number in this document is a PROJECTION and is labelled as such.**
 
 ---
@@ -38,7 +38,7 @@ parent, §5.4), not a runtime feature.
 | **Policy MAX (this design)** | **3.913 GiB** | **3.321 GiB** | **129.6** |
 | Policy MAX + PXQ4 vocab tier (v2, §4.6) | 3.412 GiB | 3.321 GiB | 129.6 |
 
-At TP=2 (Unraid 2x16 GB): Policy MAX = 7.815 GiB/GPU resident, leaving ~7 GiB/card for KV
+At TP=2 (2x V100 box 2x16 GB): Policy MAX = 7.815 GiB/GPU resident, leaving ~7 GiB/card for KV
 (~110k tokens at 64 KiB/token) — it fits, projected 64.9 tok/s.
 
 The second-order commitment that follows from "maximum performance": **weights stay in PXQ4 in VRAM
@@ -119,10 +119,10 @@ Two hard invariants that the whole design is built around:
 | `tests/*` | 250 | the six gates in §8 |
 | **total** | **~2,120 new + 500 copied** | |
 
-### 2.2 Files to patch in `/opt/1Cat-vLLM`
+### 2.2 Files to patch in `the vLLM fork checkout`
 
 **None. Zero. The design requires no fork patch.** This is deliberate and is what makes the work
-hand-offable to Kewaii as a package rather than a merge.
+hand-offable upstream as a package rather than a merge.
 
 Three *optional* patches, each with a working no-patch fallback:
 
@@ -412,10 +412,10 @@ target_link_libraries(pxq4_sm70 PRIVATE ${TORCH_LIBRARIES})
 
 Operational constraints (FACT from recon): nvcc 12.8, gcc, cmake, ninja and torch 2.10.0+cu128 are
 present in the container image; but **the production container's overlay is 100% full (0 bytes
-available)** and the DGX root filesystem is full. Therefore: build in a **fresh** container from the
-same image with a volume mounted under `/path/to/models`, never inside `vllm-qwen38-27b-cyber-1`, never
+available)** and the build host root filesystem may be full. Therefore: build in a **fresh** container from the
+same image with a volume mounted under `/path/to/models`, never inside the production vLLM container, never
 writing to `/` or host `/tmp`. Also note `site-packages/vllm` is a *copied* install, not
-editable-linked to `/opt/1Cat-vLLM` — edits to `/opt/1Cat-vLLM` are inert at runtime, which is another
+editable-linked to `the vLLM fork checkout` — edits to `the vLLM fork checkout` are inert at runtime, which is another
 reason the no-patch design is the right one.
 
 `_GLIBCXX_USE_CXX11_ABI` must match `torch._C._GLIBCXX_USE_CXX11_ABI`; mismatch is the classic
@@ -537,7 +537,7 @@ wiring `k_pxq6_gemm_gufuse` (`:2631-2762`) and `k_pxq6_gemm_down_scat` (`:2766-2
 expert-id/tile map — the kernels already exist and already expect that shape. Should a dequant
 fallback ever be needed there, it must be **per-active-expert into a transient workspace**
 (`n_active_experts × expert_shard_bytes`), never resident fp16 experts; sizing that requires Sky-35B's
-per-expert shapes, which this study did not measure.
+per-expert shapes, which this workflow did not measure.
 
 ---
 
@@ -564,7 +564,7 @@ like scaling of a measured point on this exact box rather than a fresh guess.
 | Policy A: PXQ4 + fp16 tail | 4.864 GiB | 4.271 GiB | 100.7 | +8.5% |
 | **Policy MAX v1** | **3.913 GiB** | **3.321 GiB** | **129.6** | **+40%** |
 | Policy MAX + PXQ4 vocab (v2) | 3.412 GiB | 3.321 GiB | 129.6 | +40% (capacity only) |
-| Policy MAX, TP=2 (Unraid 16 GB) | 7.815 GiB | 6.631 GiB | 64.9 | n/a |
+| Policy MAX, TP=2 (2x V100 box 16 GB) | 7.815 GiB | 6.631 GiB | 64.9 | n/a |
 
 Largest per-GPU items at TP=4 under Policy MAX: `ffn_gate` 734 MiB, `ffn_up` 734 MiB, `ffn_down` 734
 MiB, `token_embd` 606 MiB (fp16, v1), `attn_qkv` 319 MiB, `attn_gate` 191 MiB, `ssm_out` 191 MiB,
@@ -581,7 +581,7 @@ we would be the only PXQ4 consumer with a 4-bit MTP block, since the incumbent i
 
 Stages S0–S3 need **no GPU at all** except a few seconds of device time for a single tiny allocation
 in S2/S3; those two are the only pre-model GPU touches and must be scheduled inside a lease window
-(this study performs none).
+(this workflow performs none).
 
 | stage | work | checkpoint (pass criterion) | GPU? |
 |---|---|---|---|
@@ -640,9 +640,9 @@ Ranked by expected damage × probability. Each has a detection point and a kill 
 6. **Vendor drift.** We copy 500 lines of `pxq6.cuh` at `acf8f245`. Future llama.cpp-side kernel fixes
    will not propagate. *Mitigate:* `PXQ4_VENDOR_SRC_COMMIT` macro, `pxq4_vendor_edits.md`, and S2's
    bit-exact gate re-run on every re-sync (it is a 30-second test).
-7. **Container/build friction.** Production overlay is 100% full; DGX `/` is 100% full;
+7. **Container/build friction.** The production overlay must not be written to;
    `site-packages/vllm` is a copy, not editable. *Mitigate:* fresh container + `/path/to/models` volume,
-   never touch `vllm-qwen38-27b-cyber-1` beyond `docker exec`-to-read.
+   never touch the production vLLM container beyond `docker exec`-to-read.
 8. **fp16 accumulation in the GEMM path.** `k_pxq6_gemm_grouped` snaps products to fp16
    (`pxq6.cuh:2594-2611`); the WMMA twin is explicitly not bit-exact (`pxq6.cuh:53-59`). Long-context
    prefill accumulation error is a real (if bounded) quality question. *Mitigate:* v1 prefill is

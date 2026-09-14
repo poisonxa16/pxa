@@ -224,6 +224,16 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // PXA_REDUCE_PINNED_v1 (2026-09-13). The scheduler drains every backend before each
+    // GGML_OP_REDUCE split because the in-tree cross-device reduce reads its peer's partial out
+    // of peer DEVICE memory, so enqueued is not good enough -- the producers must have finished.
+    // A reduce route that exchanges through pinned HOST memory and synchronises inside its own
+    // kernel needs no such proof: stream order already gives it. The CUDA backend registers this
+    // predicate so the scheduler can ask, node by node, whether that route will handle it. The
+    // predicate is the SAME function the route itself tests, so the two can never disagree.
+    // Unset (the default, and every non-CUDA build) keeps the drain.
+    GGML_API void                 ggml_backend_set_reduce_pinned_predicate(bool (*fn)(const struct ggml_tensor * node));
+
     // Reset all assignments and allocators - must be called before changing the node backends
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 

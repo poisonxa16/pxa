@@ -134,7 +134,7 @@ def test_reassociation_is_provably_a_noop():
     test fires and the plan's warning becomes live again.  The 5.1 M-combination sweep
     below is cheap insurance on a property that would otherwise be silently lost.
 
-    Practical consequence for agent C: the CUDA kernel is free to fold `anchor * sub`
+    Practical consequence for the CUDA kernel (csrc/): the CUDA kernel is free to fold `anchor * sub`
     into a precomputed `eff` (which pxq6_pol_p6::row_effs already does, pxq6.cuh:337-341)
     without any bit-exactness risk.  That is the arrangement the port inherits anyway.
     """

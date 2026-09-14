@@ -4,6 +4,8 @@
 #include "../llama-model.h"
 #include "../llama-context.h"
 #include "../llama-delta-net.h"
+#include "../llama-kv-cache-kpool.h"
+#include "../llama-qsa-prof.h"
 //
 // The block structure is not the usual norm -> op -> residual. Instead the residual is WIDE:
 // hc parallel streams of n_embd carried as [n_embd, hc, n_tokens]. A low-rank mixer collapses
@@ -226,6 +228,532 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
     return ggml_add(ctx0, hidden, ggml_add(ctx0, ggml_reshape_3d(ctx0, gated, n_embd, hc, n_tokens), conv_out));
 }
 
+// =======================================================================================
+// PXA_QSA: query-time sparse attention
+// =======================================================================================
+//
+// qwen4exp ships a trained sparse-attention indexer on each of its twelve full-attention
+// layers. The reference definition (ref/qwen4exp-mainline.cpp, build_qsa_top_k /
+// build_attn_qsa) is:
+//
+//   k_raw[c]  = index_k_proj * x_c                        ONE 128-wide key per CELL, RAW:
+//                                                         pooling precedes norm and rotation
+//   kb[p]     = rope_multi(rms_norm(mean_{m<r} k_raw[cell(p,m)]) * index_k_norm, blk_pos[p])
+//   q[h,t]    = rope_multi(rms_norm(index_q_proj * x_t) * index_q_norm, pos[t])   h < 4
+//   s[p,t]    = sum_h relu( <kb[p], q[h,t]> )             no scale factor at all
+//   selection = the top (top_k + r - 1) CELLS of the per-cell expansion of s, with the
+//               causal/visibility bias added PER CELL
+//   attention = ordinary dense GQA with everything outside the selection masked to -inf
+//
+// and the whole point of the mechanism is that the last line is where the time goes: masking
+// a cell costs a flash-attention kernel exactly what attending to it costs, so the win is in
+// physically GATHERING the selected cells and attending densely over the compact set.
+//
+// The three arms this builds, and what each one claims:
+//
+//   PXA_QSA unset (the default)   node-for-node the build that shipped; this file is dead
+//   PXA_QSA=1 PXA_QSA_GATHER=0    the selection as an n_kv-wide additive mask over the SAME
+//                                 dense attention the default arm runs -- i.e. exactly the
+//                                 architecture's reference algorithm, and the control
+//   PXA_QSA=1 PXA_QSA_GATHER=1    the same selection, physically gathered, O(n_sel) work
+//
+// Arms 2 and 3 sum the SAME terms in a different order and blocking, so what is claimed
+// between them is identical greedy text and a token-0 logit spread inside tolerance, not bit
+// identity. Arm 1 is byte-identical to the pre-QSA build by construction: nothing below is
+// built, and no side storage is allocated, unless llama_qsa_enabled().
+//
+// WHERE THE PIECES COME FROM
+// --------------------------
+// The block grid -- which cells form a block, which blocks a token may see, the incomplete
+// tail, the padded block count, the gather mask, and the "blocks this ubatch completed" list
+// -- is llama_kpool_* (src/llama-kpool-grid.cpp), already pure and already unit-tested by
+// tests/test-kpool-cache.cpp. It is derived from (pos, seq) per occupied cell and never from
+// cell order, which is exactly what makes it correct under -np 2 --kv-unified, where a block
+// of r consecutive POSITIONS is not r consecutive cells. Nothing in it is architecture
+// specific, and nothing in it changes here beyond one added output (new_blk_pos).
+//
+// WHY MILESTONE 1 NEEDS NO NEW GGML OP
+// ------------------------------------
+// Because the pooled block key is cached, pooling only ever runs for the blocks an ubatch
+// COMPLETES -- one every r tokens at decode, a padded row otherwise -- so the reference's own
+// get_rows + r slice-adds + scale is already cheap and a fused pool-and-score kernel would be
+// optimising a term that is not there. The score then reuses ggml_kpool_score with a constant
+// weight vector: that op computes sum_h relu(kq[p,t,h])*w[h,t] + mask[p,t], which with w = 1
+// IS this architecture's relu-per-head-then-sum, in a reduction order
+// tests/test-kpool-score.cpp already pins bit-for-bit against the unfused chain.
+//
+// TWO DELIBERATE DIVERGENCES FROM THE REFERENCE, BOTH BOUNDED
+// ----------------------------------------------------------
+//  1. THE TAIL IS APPENDED, NOT SCORED. The reference forms a block over every r consecutive
+//     cells including the last, incomplete one, so the newest < r tokens are scored like any
+//     other block and may or may not win a slot. Our grid forms only COMPLETE blocks and
+//     appends the tail unconditionally (indexer_kpool_select_tail), which is the reading that
+//     guarantees a token can always attend to itself.
+//  2. THE BUDGET IS NOT TOPPED UP. The reference's width is a flat top_k + r - 1 = 2051 cells;
+//     ours is n_top whole blocks (2048 cells) plus however many tail cells exist, so when the
+//     tail is short we attend to up to r - 1 = 3 FEWER cells than the reference, out of 2051.
+//     It is deterministic (a function of the position alone) and identical in both QSA arms,
+//     so the three-arm gate is unaffected; closing it would mean changing llama_kpool_n_sel
+//     and the gather-mask layout, which glm5next shares and test-kpool-cache.cpp pins.
+//     tests/test-qsa-gather.cpp measures the exact size of the gap rather than leaving it as
+//     prose here.
+//
+// THE ONE INFERRED QUANTITY
+// -------------------------
+// The reference rotates the pooled block key at ONE position per block and does not say which
+// of the block's r positions that is. The block's FIRST member is the default here (the
+// block-start reading); PXA_QSA_BLKPOS picks another member so the selection-recall probe on
+// a real seat can settle it by measurement rather than by argument.
+//
+
+void llm_build_context::build_qwen4exp_inp_qsa(ggml_cgraph * gf) {
+    build_kpool_inputs(gf);
+
+    auto & in = llama_kpool_get_inputs(lctx);
+    const auto & d = llama_kpool_get_dims(lctx);
+
+    // qwen4exp's one addition to the k-pool input set: the rope position of the pooled key of
+    // each block in the fixed-width new-block group. Only those blocks need a position -- every
+    // other pooled key was rotated by the ubatch that completed it. Laid out exactly like this
+    // tree's mrope inp_pos, SECTION MAJOR over four sections, because ggml_rope_multi reads it
+    // that way.
+    in.new_blk_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*(int64_t) d.n_new_g);
+    cb(in.new_blk_pos, "qsa_new_blk_pos", -1);
+    ggml_set_input(in.new_blk_pos);
+    ggml_build_forward_expand(gf, in.new_blk_pos);
+}
+
+ggml_tensor * llm_build_context::build_qwen4exp_qsa_select(
+        ggml_cgraph * gf,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        ggml_tensor * KQ_mask,
+        bool          gather,
+        int           il) {
+    const auto & layer = model.layers[il];
+    const auto & in    = llama_kpool_get_inputs(lctx);
+    const auto & d     = llama_kpool_get_dims(lctx);
+
+    const int64_t n_ih   = hparams.indexer_n_head;      // 4
+    const int64_t n_ei   = hparams.indexer_head_size;   // 128
+    const int64_t kpool  = d.kpool;                     // r = 4
+    const int64_t n_pool = d.n_pool;
+    const int64_t n_new  = d.n_new_g;                   // the GRAPH width: fixed, always >= 1
+
+    ggml_tensor * idx_l = kv_self.idx_l[il];
+    GGML_ASSERT(idx_l && idx_l->ne[0] == 2*n_ei &&
+                "qsa: the indexer side cache is missing or the wrong width");
+    GGML_ASSERT(idx_l->ne[1] > (int64_t) d.sink &&
+                "qsa: the indexer side cache has no sink row");
+
+    int sections[GGML_MROPE_SECTIONS];
+    std::copy(hparams.rope_sections.begin(), hparams.rope_sections.begin() + GGML_MROPE_SECTIONS,
+              sections);
+    const int n_rot_l = hparams.rope_n_rot(il);
+
+    //
+    // (A) this ubatch's RAW indexer keys, into the side cache
+    //
+    // A cache row is [ raw(128) | pooled(128) ]. The pooled half is zeroed for the cells this
+    // ubatch writes and (re)written below for the blocks this ubatch COMPLETED; every other
+    // row's pooled half still holds whatever ubatch completed its block. Writing the whole
+    // 2*n_ei row at once keeps the destination a plain contiguous 2D view, which is what the
+    // K/V store already does and what every backend's cpy is happiest with.
+    //
+    {
+        ggml_tensor * k_raw = llm_build_lora_mm(lctx, ctx0, layer.index_k_proj, cur);
+        cb(k_raw, "qsa_k_raw", il);
+        pxa_qsa_prof_tag(k_raw, PXA_QSA_ST_IPROJ, il);
+
+        ggml_tensor * pzero = ggml_fill(ctx0,
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_ei, n_tokens), 0.0f);
+        pxa_qsa_prof_tag(pzero, PXA_QSA_ST_IPROJ, il);
+        ggml_tensor * packed = ggml_concat(ctx0, k_raw, pzero, 0);
+
+        // this tree's cache hands out a CONTIGUOUS run of n_tokens cells from kv_head, so the
+        // write is a plain view -- no scatter, no k_idxs input
+        ggml_tensor * dst = ggml_view_2d(ctx0, idx_l, 2*n_ei, n_tokens,
+                idx_l->nb[1], idx_l->nb[1]*kv_head);
+        ggml_tensor * wr = ggml_cpy(ctx0, packed, dst);
+        pxa_qsa_prof_tag(wr, PXA_QSA_ST_IPROJ, il, /*terminal*/ true);
+        ggml_build_forward_expand(gf, wr);
+    }
+
+    const int64_t n_cells    = idx_l->ne[1];
+    ggml_tensor * raw_all    = ggml_view_2d(ctx0, idx_l, n_ei, n_cells, idx_l->nb[1], 0);
+    ggml_tensor * pooled_all = ggml_view_2d(ctx0, idx_l, n_ei, n_cells, idx_l->nb[1],
+                                            ggml_row_size(idx_l->type, n_ei));
+
+    //
+    // (B) pool the blocks this ubatch completed: the mean of the r RAW member keys, then the
+    //     indexer's own RMS norm, then IMRoPE at the block's position.
+    //
+    ggml_tensor * pooled_new = nullptr;
+    {
+        ggml_tensor * rows = ggml_get_rows(ctx0, raw_all,
+                ggml_reshape_1d(ctx0, in.new_pool_idxs, kpool*n_new));
+        rows = ggml_reshape_3d(ctx0, rows, n_ei, kpool, n_new);
+
+        // The mean over the r members, in ONE reduction instead of r cont'd views and r-1 adds.
+        //
+        // That chain was 2*r nodes per layer per token -- 8 of the 20 the profiler attributes to
+        // pooling, 96 of the ~768 QSA adds to the graph -- to average four 128-wide rows, on a
+        // step whose cost is per-launch host work. ggml_sum_rows reduces ne[0] in ASCENDING
+        // INDEX ORDER, so transposing the member axis into ne[0] first gives the identical
+        // summation tree ((k0+k1)+k2)+k3 the explicit adds gave: the pooled key is bit-identical,
+        // not merely equal, which is what keeps the member order fixed for every backend.
+        pooled_new = ggml_cont(ctx0, ggml_permute(ctx0, rows, 1, 0, 2, 3));  // [kpool,n_ei,n_new]
+        pooled_new = ggml_sum_rows(ctx0, pooled_new);                        // [1,n_ei,n_new]
+        pooled_new = ggml_scale(ctx0, ggml_reshape_2d(ctx0, pooled_new, n_ei, n_new),
+                                1.0f/(float) kpool);
+        cb(pooled_new, "qsa_pool_new", il);
+        pxa_qsa_prof_tag(rows,       PXA_QSA_ST_POOL, il);
+        pxa_qsa_prof_tag(pooled_new, PXA_QSA_ST_POOL, il);
+
+        // rope wants [n_dims, n_head, n_tokens]: one "token" per block, one head
+        pooled_new = ggml_reshape_3d(ctx0, pooled_new, n_ei, 1, n_new);
+        pooled_new = llm_build_norm(ctx0, pooled_new, hparams, layer.index_k_norm, nullptr,
+                                    LLM_NORM_RMS, cb, il);
+        pooled_new = ggml_rope_multi(ctx0, pooled_new, in.new_blk_pos, nullptr,
+                n_rot_l, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        pooled_new = ggml_reshape_2d(ctx0, pooled_new, n_ei, n_new);
+        cb(pooled_new, "qsa_pool_new_roped", il);
+
+        if (in.new_pool_rep) {
+            // write back BEFORE the gather below, so one get_rows picks up both the blocks
+            // just completed and the ones some earlier ubatch completed
+            ggml_tensor * wb = ggml_set_rows(ctx0, pooled_all, pooled_new, in.new_pool_rep);
+            pxa_qsa_prof_tag(wb, PXA_QSA_ST_POOL, il, /*terminal*/ true);
+            ggml_build_forward_expand(gf, wb);
+        }
+    }
+
+    ggml_tensor * pooled;
+    if (llama_kpool_get_cache_safe(lctx)) {
+        pooled = ggml_get_rows(ctx0, pooled_all, in.pool_cells);
+    } else {
+        // cells shared between sequences: the block grid is sequence-relative and one cached
+        // pooled key cannot serve both, so every block was recomputed above and the cache is
+        // not read at all
+        GGML_ASSERT(n_new <= n_pool);
+        ggml_tensor * pad = ggml_fill(ctx0,
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_ei, n_pool - n_new), 0.0f);
+        // rows [d.n_new, n_new_g) of pooled_new are padding: they land on block indices
+        // >= n_pool_real, which pool_mask masks with -inf for every token.
+        pooled = ggml_concat(ctx0, pooled_new, pad, 1);
+    }
+    pooled = ggml_reshape_3d(ctx0, pooled, n_ei, 1, n_pool);
+    cb(pooled, "qsa_pool_k", il);
+    pxa_qsa_prof_tag(pooled, PXA_QSA_ST_POOL, il);
+
+    //
+    // (C) score every block for every token: the sum over the 4 indexer heads of relu(dot).
+    //
+    ggml_tensor * score;
+    {
+        ggml_tensor * q = llm_build_lora_mm(lctx, ctx0, layer.index_q_proj, cur);
+        pxa_qsa_prof_tag(q, PXA_QSA_ST_IPROJ, il);
+        q = ggml_reshape_3d(ctx0, q, n_ei, n_ih, n_tokens);
+        q = llm_build_norm(ctx0, q, hparams, layer.index_q_norm, nullptr, LLM_NORM_RMS, cb, il);
+        q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
+                n_rot_l, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(q, "qsa_q", il);
+        pxa_qsa_prof_tag(q, PXA_QSA_ST_IPROJ, il);
+
+        ggml_tensor * q_p = ggml_permute(ctx0, ggml_cont(ctx0, q), 0, 2, 1, 3); // [n_ei,n_tok,n_ih]
+        ggml_tensor * k_p = ggml_permute(ctx0, pooled,             0, 2, 1, 3); // [n_ei,n_pool,1]
+        pxa_qsa_prof_tag(q_p, PXA_QSA_ST_IPROJ, il, /*terminal*/ true);
+
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k_p, q_p);            // [n_pool, n_tokens, n_ih]
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        pxa_qsa_prof_tag(kq, PXA_QSA_ST_SCORE, il);
+
+        // This architecture's indexer has NO per-head weight tensor and no scale, so the fused
+        // op's weight vector is a constant 1. (Whatever scale the architecture applies is a
+        // single positive factor and top-k is invariant under one, so the SELECTION -- the only
+        // thing that leaves this stage -- cannot depend on getting it right.)
+        static const bool fused = [] {
+            const char * e = getenv("PXA_QSA_FUSED_SCORE");
+            return e == nullptr || atoi(e) != 0;   // default ON
+        }();
+        const bool can_fuse = fused && n_ih >= 4 && n_ih <= 32 && (n_ih & (n_ih - 1)) == 0;
+
+        if (can_fuse) {
+            ggml_tensor * ones = ggml_fill(ctx0,
+                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_ih, n_tokens), 1.0f);
+            pxa_qsa_prof_tag(ones, PXA_QSA_ST_SCORE, il);
+            score = ggml_kpool_score(ctx0, kq, ones, in.pool_mask);
+        } else {
+            ggml_tensor * s = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3)); // [n_ih,n_tok,n_pool]
+            s = ggml_relu(ctx0, s);
+            s = ggml_sum_rows(ctx0, s);                                            // [1,n_tok,n_pool]
+            s = ggml_cont(ctx0, ggml_permute(ctx0, s, 2, 1, 0, 3));                // [n_pool,n_tok,1]
+            score = ggml_add(ctx0, s, in.pool_mask);
+        }
+        score = ggml_reshape_2d(ctx0, score, n_pool, n_tokens);
+        cb(score, "qsa_score", il);
+        pxa_qsa_prof_tag(score, PXA_QSA_ST_SCORE, il, /*terminal*/ true);
+    }
+
+    //
+    // (D) the top n_top BLOCKS, expanded to their member cells, then the tail.
+    //
+    // Scoring and sorting BLOCKS and expanding only the winners is the structural half of the
+    // win: the n_kv-wide cell-score vector the reference builds is never materialised. That
+    // this lands on the same cells as the reference's cell-wise cut -- including a block that
+    // straddles the query position, and including the tie order inside a block -- is what
+    // tests/test-qsa-gather.cpp exists to assert.
+    //
+    // This tree's ggml_top_k IS ggml_argsort(DESC) viewed to the first k, so the selection is
+    // already ordered by descending score; above 1024 columns that argsort is a CUB segmented
+    // radix sort, which is stable, so equal block scores keep ascending block order and the
+    // order the gather then reduces in is reproducible run to run.
+    //
+    ggml_tensor * sel_idx;
+    {
+        // PXA_QSA_FAST_TOPK (default OFF): the same selection by a radix SELECT instead of a
+        // full sort. ggml_top_k here IS ggml_argsort(DESC) viewed to n_top, and above 1024
+        // columns that argsort is a CUB radix sort of the WHOLE row -- 21,632 keys per token
+        // per layer at 86k fill, in a dozen-plus kernel launches, to keep 512. ggml_qsa_top_k
+        // produces the identical set AND order (ties by ascending block index) in one launch;
+        // the arms must therefore be byte-identical, which is what makes it measurable as a
+        // pure speed lever. OFF until a window has measured it on a card.
+        static const bool fast_topk = [] {
+            const char * e = getenv("PXA_QSA_FAST_TOPK");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        ggml_tensor * top;
+        if (fast_topk && d.n_top <= 2048 && (int64_t) d.n_top <= score->ne[0]) {
+            top = ggml_qsa_top_k(ctx0, score, (int) d.n_top);
+        } else {
+            top = ggml_cont(ctx0, ggml_top_k(ctx0, score, (int) d.n_top));
+        }
+        cb(top, "qsa_top_k", il);
+        pxa_qsa_prof_tag(top, PXA_QSA_ST_TOPK, il, /*terminal*/ true);
+
+        sel_idx = ggml_get_rows(ctx0, in.pool_idxs,
+                ggml_reshape_1d(ctx0, top, (int64_t) d.n_top*n_tokens));   // [kpool, n_top*n_tok]
+        pxa_qsa_prof_tag(sel_idx, PXA_QSA_ST_EXPAND, il);
+        sel_idx = ggml_reshape_2d(ctx0, sel_idx, kpool*(int64_t) d.n_top, n_tokens);
+
+        if (hparams.indexer_kpool_select_tail) {
+            // the newest < r tokens belong to no complete block yet, and one of them is always
+            // the token doing the attending
+            sel_idx = ggml_concat(ctx0, sel_idx, in.tail_idxs, 0);
+        }
+    }
+    GGML_ASSERT(sel_idx->ne[0] == (int64_t) d.n_sel);
+
+    if (gather) {
+        cb(sel_idx, "qsa_sel_idx", il);
+        pxa_qsa_prof_tag(sel_idx, PXA_QSA_ST_EXPAND, il, /*terminal*/ true);
+        return sel_idx;
+    }
+
+    //
+    // The control arm: turn the selection into an additive mask of length n_kv and fold in
+    // causality. This IS the reference algorithm -- unmask the selected cells into an all -inf
+    // mask, add the causal mask, attend densely -- so arm 2 approximates nothing.
+    //
+    // The mask is built one column wide and (n_kv + 1) rows tall so ggml_set_rows can scatter
+    // along ne[1]; the extra row IS the padding sentinel the host writes into pool_idxs and
+    // tail_idxs, so a padded slot lands there and never unmasks a live cell.
+    //
+    ggml_tensor * seed = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+
+    ggml_tensor * mask_all = ggml_repeat_4d(ctx0, ggml_fill(ctx0, seed, -INFINITY),
+                                            1, n_kv + 1, n_tokens, 1);
+    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + 1, n_tokens);
+
+    ggml_tensor * zeros = ggml_repeat_4d(ctx0, ggml_fill(ctx0, seed, 0.0f),
+                                         1, d.n_sel, n_tokens, 1);
+    zeros = ggml_reshape_3d(ctx0, zeros, 1, d.n_sel, n_tokens);
+
+    ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros,
+            ggml_reshape_3d(ctx0, sel_idx, d.n_sel, n_tokens, 1));
+    sel = ggml_view_2d(ctx0, sel, n_kv, n_tokens, sel->nb[2], 0);
+
+    // The attention reads a mask of the padded height its own kernels were built for, and (with
+    // flash attention on) of the type build_inp_KQ_mask handed out. Match both, so that the only
+    // thing this arm changes about the dense path is WHICH cells are visible.
+    const int64_t n_pad = KQ_mask->ne[1];
+    GGML_ASSERT(n_pad >= n_tokens);
+    if (n_pad > n_tokens) {
+        ggml_tensor * tailpad = ggml_repeat_4d(ctx0, ggml_fill(ctx0, seed, -INFINITY),
+                                               n_kv, n_pad - n_tokens, 1, 1);
+        sel = ggml_concat(ctx0, sel, tailpad, 1);
+    }
+
+    // Causality is folded in HERE, not left to the attention: a padded selection slot points at
+    // the SENTINEL row and is dropped by the view above, but a block whose cells this token may
+    // only partly see is dropped whole by pool_mask, and every cell of another sequence has to
+    // be masked by the same rule the dense path uses. Adding the causal mask is that rule.
+    ggml_tensor * causal = KQ_mask;
+    if (causal->type != GGML_TYPE_F32) {
+        causal = ggml_cast(ctx0, causal, GGML_TYPE_F32);
+    }
+    sel = ggml_add(ctx0, sel, causal);
+    if (KQ_mask->type != GGML_TYPE_F32) {
+        sel = ggml_cast(ctx0, sel, KQ_mask->type);
+    }
+    cb(sel, "qsa_sel_mask", il);
+    // The control arm's n_kv-wide mask IS its expansion stage, and it is a terminal: the dense
+    // attention that consumes it is tagged ATTN through Q/K/V, not through the mask.
+    pxa_qsa_prof_tag(sel, PXA_QSA_ST_EXPAND, il, /*terminal*/ true);
+
+    return sel;
+}
+
+ggml_tensor * llm_build_context::build_qwen4exp_qsa_attention(
+        ggml_cgraph * gf,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        ggml_tensor * KQ_mask,
+        float         KQ_scale,
+        int           il) {
+    const auto & layer = model.layers[il];
+    const auto & d     = llama_kpool_get_dims(lctx);
+
+    // The gather only pays off, and is only correct to prefer, when the context is genuinely
+    // longer than the selection and the ubatch is decode-shaped; llama_kpool_build_plan decides
+    // that on the OCCUPIED CELL COUNT so the reserve graph and the decode graph agree.
+    const bool gather = d.gather && llama_qsa_gather_enabled();
+
+    // The same three projections, two norms and IMRoPE build_std_attention applies to this arch,
+    // spelled out here because the attention that follows is not llm_build_kqv. Every node up to
+    // and including the rope is the one the dense path builds; if that stops being true, arm 2
+    // stops being a control for arm 1.
+    auto [Qcur, Kcur, Vcur, gate] = llm_build_mul_mat_qkv_gated(gf, cur,
+            layer.wq, layer.wk, layer.wv, layer.attn_q_norm, layer.attn_k_norm, il);
+
+    int sections[GGML_MROPE_SECTIONS];
+    std::copy(hparams.rope_sections.begin(), hparams.rope_sections.begin() + GGML_MROPE_SECTIONS,
+              sections);
+    const int n_rot_l = hparams.rope_n_rot(il);
+
+    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+            n_rot_l, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+            n_rot_l, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(Qcur, "Qcur_roped", il);
+    cb(Kcur, "Kcur_roped", il);
+    // The qkv projections themselves are inside llm_build_mul_mat_qkv_gated and are identical
+    // in both arms and in the dense build, so they stay in the profiler's "other" bucket; from
+    // the rope on, the nodes are this path's own.
+    pxa_qsa_prof_tag(Qcur, PXA_QSA_ST_ATTN, il);
+    pxa_qsa_prof_tag(Kcur, PXA_QSA_ST_ATTN, il);
+    pxa_qsa_prof_tag(Vcur, PXA_QSA_ST_ATTN, il);
+
+    // The selection is built from `cur`, the block input, so it depends on none of the above; it
+    // is built here only because its own side-cache write has to precede its pooling read.
+    ggml_tensor * sel = build_qwen4exp_qsa_select(gf, cur, inp_pos, KQ_mask, gather, il);
+
+    ggml_tensor * out;
+    if (!gather) {
+        // The reference: the dense path with the selection as its mask. Node for node what
+        // PXA_QSA=0 builds, KQ_mask swapped -- so it keeps flash attention and every other
+        // lever the shipping build has, and the A/B against arm 3 isolates the gather alone.
+        out = llm_build_kv(ctx0, lctx, kv_self, gf, /*wo*/ nullptr, /*wo_b*/ nullptr,
+                Kcur, Vcur, Qcur, sel, n_tokens, kv_head, n_kv, KQ_scale, cb, il,
+                /*sinks*/ nullptr, /*n_swa*/ 0);
+    } else {
+        //
+        // The gather. The K/V store must be EXPANDED before the gather nodes are built: the
+        // gather reads rows this same ubatch has just written, and a graph's order is its
+        // expansion order, not its data dependencies.
+        //
+        GGML_ASSERT(!cparams.k_cache_hadamard && !cparams.v_cache_hadamard &&
+                    "qsa: the gather path does not implement the KV cache hadamard rotation");
+
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+        llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, Kcur, Vcur,
+                           n_tokens, kv_head, cb, il);
+
+        const int64_t n_sel    = d.n_sel;
+        const int64_t n_head_l = hparams.n_head(il);
+        const int64_t n_hkv    = hparams.n_head_kv(il);
+        const int64_t hk       = hparams.n_embd_head_k(il);
+        const int64_t hv       = hparams.n_embd_head_v(il);
+
+        GGML_ASSERT(!kv_self.v_trans && "qsa: the gather needs an untransposed V cache");
+        GGML_ASSERT(n_hkv > 0 && n_head_l % n_hkv == 0);
+
+        // One cell is ONE contiguous row across both KV heads: k_l is [n_embd_head_k,
+        // n_head_kv*kv_size] and v_l is flat n_embd_v_gqa per cell, so a selected cell is one
+        // get_rows row in each.
+        ggml_tensor * rows_k = ggml_view_2d(ctx0, kv_self.k_l[il], hk*n_hkv, kv_self.size,
+                ggml_row_size(kv_self.k_l[il]->type, hk*n_hkv), 0);
+        ggml_tensor * rows_v = ggml_view_2d(ctx0, kv_self.v_l[il], hv*n_hkv, kv_self.size,
+                ggml_row_size(kv_self.v_l[il]->type, hv*n_hkv), 0);
+
+        ggml_tensor * idx = ggml_reshape_1d(ctx0, sel, n_sel*n_tokens);
+
+        // ggml_get_rows returns F32 in this tree, so the compact K/V is staged through F32 --
+        // twice the bytes a type-preserving gather would write, and the two conts below cost
+        // more again. It is still ~7.5x less than the dense path reads at 140k; a typed gather
+        // is the first thing milestone 2 removes.
+        ggml_tensor * k_g = ggml_get_rows(ctx0, rows_k, idx);   // [hk*n_hkv, n_sel*n_tokens]
+        ggml_tensor * v_g = ggml_get_rows(ctx0, rows_v, idx);
+        cb(k_g, "qsa_k_gathered", il);
+        pxa_qsa_prof_tag(k_g, PXA_QSA_ST_GATHER, il);
+        pxa_qsa_prof_tag(v_g, PXA_QSA_ST_GATHER, il);
+
+        // within one cell the layout is head-major, hence [hk, n_hkv, n_sel, n_tokens]
+        k_g = ggml_cont(ctx0, ggml_permute(ctx0,
+                ggml_reshape_4d(ctx0, k_g, hk, n_hkv, n_sel, n_tokens), 0, 2, 1, 3));
+        v_g = ggml_cont(ctx0, ggml_permute(ctx0,
+                ggml_reshape_4d(ctx0, v_g, hv, n_hkv, n_sel, n_tokens), 0, 2, 1, 3));
+        pxa_qsa_prof_tag(k_g, PXA_QSA_ST_GATHER, il, /*terminal*/ true);
+        pxa_qsa_prof_tag(v_g, PXA_QSA_ST_GATHER, il, /*terminal*/ true);
+
+        // the token axis lives in ne[3] so ONE chain covers every token's own selection; the
+        // GQA broadcast is ne[2], n_head % n_head_kv == 0
+        ggml_tensor * q_g = ggml_permute(ctx0, Qcur, 0, 2, 3, 1);   // [hk, 1, n_head, n_tokens]
+
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_g);            // [n_sel, 1, n_head, n_tok]
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        pxa_qsa_prof_tag(kq, PXA_QSA_ST_ATTN, il);
+
+        // ggml_soft_max_ext takes a 2D mask only, and the gather mask is 4D (it varies per
+        // token, not per row), so it is added explicitly. softmax(x*scale + mask) either way.
+        // The mask is what keeps a PADDED slot -- which points at a real cell, because the
+        // gather has to stay in bounds -- from being attended to twice.
+        kq = ggml_add(ctx0, ggml_scale(ctx0, kq, KQ_scale),
+                      llama_kpool_get_inputs(lctx).gather_mask);
+        kq = ggml_soft_max(ctx0, kq);
+        cb(kq, "qsa_kq_soft_max", il);
+
+        ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_g)); // [n_sel, hv, n_hkv, n_tok]
+        pxa_qsa_prof_tag(v_t, PXA_QSA_ST_ATTN, il);
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_t, kq);                // [hv, 1, n_head, n_tok]
+        cb(kqv, "qsa_kqv", il);
+        pxa_qsa_prof_tag(kqv, PXA_QSA_ST_ATTN, il);
+
+        out = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));     // [hv, n_head, 1, n_tok]
+        out = ggml_reshape_2d(ctx0, out, hv*n_head_l, n_tokens);
+    }
+    cb(out, "kqv_out", il);
+
+    // the attention output gate qwen4exp packs into wq, then wo: the tail of
+    // build_std_attention's gated branch, unchanged
+    GGML_ASSERT(gate && "qsa: qwen4exp packs an output gate into wq");
+    out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, gate));
+    cb(out, "qkv_gated", il);
+
+    out = llm_build_lora_mm(lctx, ctx0, layer.wo, out);
+    cb(out, "attn_out", il);
+    // the end of the QSA region: everything after this is the trunk again
+    pxa_qsa_prof_tag(out, PXA_QSA_ST_ATTN, il, /*terminal*/ true);
+
+    return out;
+}
+
 ggml_cgraph * llm_build_context::build_qwen4exp() {
 
     ggml_cgraph * gf = new_graph_custom();
@@ -241,12 +769,12 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
     if (cparams.mtp_op_type != MTP_OP_NONE) {
         const int64_t hc_dim = hc*n_embd;
 
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hc_dim);
-        }
+        // PXA_MTP_BATCH_SLOTS_ROWS_v1: one hidden row per BATCH token, for every MTP op type.
+        // The draft-gen graph used to allocate a single [n_embd] row here because every draft decode
+        // was a 1-row batch; a multi-row draft step then concatenated it against [n_embd, n_tokens]
+        // token embeddings and aborted. See common/pxa-mtp-batch-slots.h. No-op at n_tokens == 1.
+        ggml_tensor * hidden_states_from_main_model =
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
         lctx.inp_mtp_states = hidden_states_from_main_model;
@@ -264,13 +792,26 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
 
     delta_net delta(lctx, batch);
 
+    // PXA_QSA. The k-pool plan for THIS batch: every QSA input is sized from it and
+    // llama_kpool_set_inputs() fills those same tensors from the same plan, so it MUST be
+    // built before anything below reads a size. Nothing is built and nothing is planned when
+    // the lever is off, which is what makes PXA_QSA=0 the shipping graph node for node.
+    const bool qsa = llama_qsa_planned(lctx);
+    if (qsa) {
+        llama_kpool_build_plan(lctx, batch, is_reserve);
+    }
+    pxa_qsa_prof_begin_graph();
+
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * KQ_mask     = build_inp_KQ_mask();
     ggml_tensor * inpL        = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
     ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
 
     // the recurrent-path inputs the fused delta-net kernel reads (same set qwen35moe builds)
-    lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+    // PXA_RS_RING: when the ring is armed the tensor carries TWO index vectors: [0, n_tokens) are
+        // the write rows (plane 0, absolute seq_id -- today's meaning) and [n_tokens, 2*n_tokens) are
+        // the read rows (rs_idx[seq]*plane_rows + seq). Ring off -> the shape is unchanged.
+        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens * (lctx.kv_self.rs_ring_armed() ? 2 : 1));
     cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
     ggml_set_input(lctx.inp_s_seq_qnext);
 
@@ -353,6 +894,16 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         }
     }
 
+    if (qsa) {
+        build_qwen4exp_inp_qsa(gf);
+
+        // The DECODE gather path reads the indexer's own gather_mask and never touches the
+        // causal mask, so without this ggml-alloc leaves inp_KQ_mask bufferless and
+        // llama_set_inputs's unconditional fill trips on it. Expanding the leaf costs one
+        // node and keeps that fill honest. (Same fix glm5next needed, same reason.)
+        ggml_build_forward_expand(gf, KQ_mask);
+    }
+
     // the wide residual starts as hc identical copies of the embedding
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
@@ -385,6 +936,11 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
             // hc_mode: no input norm (the mixer above was it), no residual add (the combine
             // below is it), sigmoid output gate instead of Qwen3.5 silu.
             cur = delta.build_layer_attn_linear(ctx0, gf, cur, nullptr, il, cb, /*hc_mode*/ true);
+        } else if (qsa && model.layers[il].index_k_proj != nullptr &&
+                   kv_self.idx_l[il] != nullptr) {
+            // PXA_QSA: the same block, attending only to the cells this layer's own trained
+            // indexer selects. See the header comment above build_qwen4exp_inp_qsa().
+            cur = build_qwen4exp_qsa_attention(gf, cur, inp_pos, KQ_mask, KQ_scale, il);
         } else {
             // a null norm weight and add_input=false reduce build_std_attention to the block
             // itself: gated Q projection, q/k norms, IMRoPE (is_multi), attention, wo.
@@ -453,6 +1009,12 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
     cb(cur, "result_output", -1);
 
     ggml_build_forward_expand(gf, cur);
+
+    if (pxa_qsa_prof_on()) {
+        const llama_kpool_dims pd = qsa ? llama_kpool_get_dims(lctx) : llama_kpool_dims();
+        pxa_qsa_prof_seal(gf, (int) n_tokens, (int) n_kv, (int) pd.n_pool, (int) pd.n_top,
+                          (int) pd.n_sel, pd.gather);
+    }
 
     return gf;
 }

@@ -4,7 +4,7 @@ gguf_raw.py -- minimal GGUF reader that does not care what the tensor types mean
 The upstream `gguf` PyPI package cannot open this file at all: GGUFReader._build_tensors
 constructs a gguf.GGMLQuantizationType for EVERY tensor in the directory, and 252 is not
 a member, so the ValueError kills the file open before a single tensor is yielded.  That
-is also why vLLM's gguf.py loader path is unusable (plan §5.1) -- not a preference, a
+is also why vLLM's gguf.py loader path is unusable -- not a preference, a
 hard stop.
 
 This reader parses the header, the KV table and the tensor directory with `struct`, then

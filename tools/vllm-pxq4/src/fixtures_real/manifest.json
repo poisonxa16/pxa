@@ -1,5 +1,5 @@
 {
- "gguf": "/mnt/models/pxa-models/Qwen3.8-27B-PXQ4.gguf",
+ "gguf": "$PXA_MODELS_DIR/pxa-models/Qwen3.8-27B-PXQ4.gguf",
  "tensors": [
   {
    "label": "attn_gate",

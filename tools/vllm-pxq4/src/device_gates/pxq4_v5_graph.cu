@@ -1,7 +1,7 @@
 // pxq4_v5_graph.cu -- the in-engine vehicle: one decode token's worth of PXQ4 linear work
 // (240 modules per rank at TP=4), captured in a CUDA graph and replayed, exactly as vLLM does.
 //
-// WHY THIS AND NOT tok/s: the serving A/B on this box is contended (the owner's four cards run
+// WHY THIS AND NOT tok/s: the serving A/B on this box is contended (four cards run
 // at 100% and share host CPU/PCIe), which puts several tok/s of noise on a ~10% effect. This
 // harness has <0.1% run-to-run spread and isolates the PXQ4 linear time inside a real graph
 // replay, which is the thing the kernel change can actually move.

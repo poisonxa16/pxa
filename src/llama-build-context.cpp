@@ -11,7 +11,26 @@
 #include "ggml.h"
 
 #include <unordered_set>
+#include <unordered_map>
 #include <algorithm>
+
+// PXA_FMOE_CLAMP (2026-09-08): let the DeepSeek-V4 / GLM-5.3-Flash asymmetric
+// SwiGLU clamp ride the FUSED MoE up/gate node (ggml_moe_up_gate_clamped) instead of forcing the
+// unfused three-MUL_MAT_ID branch. Default OFF -- it changes which CUDA driver serves the routed
+// experts, so it is a measured change. Banner printed once: an A/B without it is void.
+static bool pxa_fmoe_clamp_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_FMOE_CLAMP");
+        const bool on = e && atoi(e) != 0;
+        if (on) {
+            fprintf(stderr, "PXA_FMOE_CLAMP: armed -- DSV4/GLM clamped routed experts build a "
+                            "FUSED up/gate node (op_params[2]=1); the PXQ MoE drivers apply the "
+                            "clamp in their GLU epilogue\n");
+        }
+        return on;
+    }();
+    return v;
+}
 
 uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv_self) {
     uint32_t n_slots = 0;
@@ -737,11 +756,38 @@ ggml_tensor * llm_build_context::llm_build_norm(
     return cur;
 }
 
+// PXA 2026-09-08. PXA_SM_GRAPH_REDUCE_CONSUMER=0 restores the
+// pre-802554a19c pointer-identity-only test below. DEFAULT ON. Same variable is read by the twin
+// of this function in llama-delta-net.cpp and by the REDUCE pinning in ggml-backend.cpp, so one
+// setting moves all three together. It exists because PXA_DN_REDUCE_VIEWFIX /
+// PXA_DN_SPLIT_INPUT_FIX gate only the delta call site, and this fix alone repairs the delivery
+// defect -- without this lever the pre-fix engine is not reachable without a second full build.
+static bool pxa_sm_graph_reduce_consumer() {
+    static const bool v = [](){ const char * e = getenv("PXA_SM_GRAPH_REDUCE_CONSUMER"); return !e || atoi(e) != 0; }();
+    return v;
+}
+
 ggml_tensor * llm_build_context::get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor * input, int id) {
     auto cur = input;
     if (input->op == GGML_OP_REDUCE) {
         auto view_src = input->view_src;
         GGML_ASSERT(view_src);
+        // PXA 2026-09-08. The HOME device -- the one whose partial the reduce node
+        // aliases -- must be handed the REDUCE NODE itself, so that something in the graph
+        // actually reads the reduce. This used to be detected as `cur == view_src`, which relies
+        // on ggml_reduce's result having view_src == its last source. That identity silently
+        // fails when the last source is itself a view, because ggml_new_tensor_impl collapses one
+        // level of view onto the base (the DeltaNet partial is a bare ggml_reshape_2d at
+        // n_tokens <= 32, i.e. every decode step). When it failed, EVERY device was handed
+        // src[id] and the reduce node ended up with NO consumer at all -- its result survived
+        // only as an in-place side effect the DAG does not model.
+        //
+        // ggml_reduce always aliases the LAST non-null source, so identify the home device by
+        // that slot instead of by pointer identity. Same answer whenever the old test worked.
+        int last_id = -1;
+        for (int j = 0; j < input->op_params[1]; ++j) {
+            if (input->src[j]) last_id = j;
+        }
         cur = input->src[id];
         if (!cur) {
             GGML_ASSERT((input->op_params[4] & (1u << id)) == 0);
@@ -749,7 +795,7 @@ ggml_tensor * llm_build_context::get_input_tensor_sm_graph(ggml_context * ctx, g
             input->src[id] = cur;
             input->op_params[4] |= (1u << id);
         }
-        else if (cur == view_src) {
+        else if (cur == view_src || (id == last_id && pxa_sm_graph_reduce_consumer())) {
             cur = input;
         }
     }
@@ -1085,7 +1131,10 @@ llm_expert_gating_func_type   gating_op,
     // silu-then-clamp (that is the gpt-oss/step35 variant). Arch-gated so that no
     // other model's code path can change, and it forces the unfused up/gate branch.
     // Ported from upstream llama-graph.cpp build_moe_ffn (LLM_ARCH_DEEPSEEK4 case).
-    const float dsv4_limit = lctx.model.arch == LLM_ARCH_DEEPSEEK4 && il >= 0
+    // PXA_GLM5NEXT: GLM-5.3-Flash clamps its routed experts exactly the same way (upstream
+    // llama-graph.cpp gates DEEPSEEK4 and GLM5_NEXT on the same branch).
+    const float dsv4_limit = (lctx.model.arch == LLM_ARCH_DEEPSEEK4 ||
+                              lctx.model.arch == LLM_ARCH_GLM5NEXT) && il >= 0
         ? lctx.model.hparams.swiglu_limits[il] : 0.0f;
     const bool dsv4_clamp = dsv4_limit > 1e-6f;
 
@@ -1226,7 +1275,23 @@ llm_expert_gating_func_type   gating_op,
     }
 
     ggml_tensor * par;
-    if (can_use_fmoe && up_gate_exps) {
+    // PXA_FMOE_CLAMP (2026-09-08). The asymmetric clamp above is the ONLY
+    // reason DeepSeek-V4 / GLM-5.3-Flash took the unfused branch, and the price of that branch
+    // is severe: three standalone MUL_MAT_ID nodes reach NONE of the fused PXQ MoE drivers, so
+    // every one of them pays the generic loop's host ids readback + cudaStreamSynchronize
+    // inside graph compute (126 of them per decode token on GLM-5.3-Flash's 42 MoE blocks) and
+    // a per-expert launch triple. ggml_moe_up_gate_clamped carries the clamp in op_params[2]
+    // and the CUDA GLU epilogue (pxq4_glu_apply arm `unary == 2`) applies it, so the fused
+    // drivers can serve these architectures without changing the function they compute.
+    // Default OFF: this changes the accumulation shape of the routed experts and so is a
+    // measured, gated change, not a silent one.
+    if (dsv4_clamp && pxa_fmoe_clamp_enabled() && !up_gate_exps && !up_gate_exps_b &&
+        up_exps && gate_exps && !up_exps_b && !gate_exps_b &&
+        lctx.cparams.fused_moe_up_gate &&
+        ggml_moe_up_gate_can_fuse(up_exps->type, gate_exps->type)) {
+        par = ggml_moe_up_gate_clamped(ctx, up_exps, gate_exps, cur, selected_experts, dsv4_limit);
+        cb(par, "ffn_moe_swiglu_limited_fused", il);
+    } else if (can_use_fmoe && up_gate_exps) {
         if (up_gate_exps_b) {
             par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
@@ -1664,6 +1729,130 @@ static int pxa_fa_prefill_split_ne11_mirror() {
     return v;
 }
 
+// PXA_FA_GPU_FALLBACK (2026-09-13) — keep a declined flash-attention node ON THE CARD.
+//
+// THE DEFECT. `-fa on` makes llm_build_kqv emit ggml_flash_attn_ext unconditionally, with no
+// check that any GPU backend can run the node. The CUDA backend's head-size tables stop at 256
+// before Turing, so a model whose layers are wider than that -- Gemma 4's 8 global layers are
+// head_dim 512, DeepSeek/GLM MLA is 576/512 -- produces FLASH_ATTN_EXT nodes that
+// ggml_backend_supports_op() refuses, and ggml_backend_sched then places them on the CPU backend.
+// Silently. Every graph evaluation the scheduler has to make that layer's K and V operands
+// host-visible, which is a per-call cost proportional to the CACHE, not to the prompt.
+//
+// THE FIX. Ask, per layer, whether any non-CPU backend in this context accepts the node that is
+// about to be built. If none does, build the UNFUSED chain (mul_mat + soft_max_ext + mul_mat)
+// instead -- the same chain `-fa off` builds, which every backend supports at every head size, so
+// the layer stays on the card. That is strictly better than a host round trip, and it is what a
+// user who typed `-fa on` meant: run attention on the GPU.
+//
+// DEFAULT ON under ENHANCE since 2026-09-14, and the measurement that flipped it is on the card,
+// not argued. Gemma 4 12B PXQ4 on one P100 (sm_60), -c 16384 -fa -sm layer, np1, 5/5/3 reps, one
+// binary, three arms, prefill / decode medians at 29 / 3203 / 8252 tokens:
+//
+//   scheduler places the declined layers on the CPU (what shipped)  135.7/24.60  199.0/14.87  109.2/9.33
+//   this fallback, the unfused chain on the card                    141.1/25.84  463.2/23.36  438.2/20.74
+//
+// 4.0x the prefill and 2.2x the decode at 8k, because the cost the CPU placement pays is a host
+// round trip proportional to the CACHE rather than to the prompt. And it is not only the faster
+// arm, it is the FAITHFUL one: it accumulates in fp32 end to end, whereas the CPU flash-attention
+// it replaces keeps its P.V running sum in an FP16 accumulator whenever V is F16 (ggml.c, VKQ16),
+// which on the device test costs ~1.5e-04 of rms(v) against ~5e-06 for an fp32 accumulator. So the
+// old default was slower AND less accurate, and nothing was gaining from it.
+//
+// It still changes the emitted graph, and therefore temp-0 output, for any model with a declined
+// head size -- so it is an ENHANCE-level default like every other measured one, and
+// PXA_FA_GPU_FALLBACK=0 is the opt-out that restores the scheduler's CPU placement exactly.
+// The first layer it catches prints one line naming the layer and the head sizes, unchanged, so a
+// run can still be shown to have taken this path.
+static bool pxa_fa_gpu_fallback_armed() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_FA_GPU_FALLBACK");
+        return e != nullptr ? atoi(e) != 0 : ggml_pxa_config_level() >= 2;
+    }();
+    return v;
+}
+
+// PXA_GEMMA4_ASSISTANT, 2026-09-13. Default OFF.
+//
+// The Gemma-4 assistant drafter (arch gemma4_mtp: 4 layers, 1024 wide, no k_proj/v_proj — it reads
+// the target model's KV through the frozen-KV views) already has a complete path in this tree:
+// the graph builder build_gemma4_mtp(), the tensor creator create_gemma4_mtp_tensors(), the
+// backbone-width feature pipe (llama_mtp_state_n_embd) and the constant-draft-position
+// speculative stage. What was missing was permission: the 2026-09-10 dense lift refused the arch
+// at graph-build time because none of that had ever been run end to end, and the refusal was never
+// revisited. Arming this lever builds the assistant graph instead of refusing it; unset, the
+// refusal is byte-for-byte what it was.
+static bool pxa_gemma4_assistant_armed() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_GEMMA4_ASSISTANT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
+// Would any non-CPU backend of this context run a FLASH_ATTN_EXT node of this shape? Answered by
+// building a throwaway node with the same shapes, types and op_params and asking the backends
+// themselves, so it can never drift from the kernels the way a hand-maintained head-size table
+// does. Memoised per (context, shape) because ggml_backend_supports_op reaches into the CUDA
+// driver and this is called once per layer per ubatch.
+static bool pxa_fa_node_runs_on_gpu(
+        llama_context & lctx,
+        int64_t n_embd_head_k, int64_t n_embd_head_v, int64_t n_head, int64_t n_head_kv,
+        int64_t n_tokens, int64_t n_kv,
+        ggml_type type_k, ggml_type type_v,
+        const ggml_tensor * kq_mask, bool has_sinks, bool f32_precision, float softcap) {
+    const uint64_t key =
+          (uint64_t) (uintptr_t) &lctx
+        ^ ((uint64_t) n_embd_head_k << 1)  ^ ((uint64_t) n_embd_head_v << 11)
+        ^ ((uint64_t) n_head        << 21) ^ ((uint64_t) n_head_kv     << 29)
+        ^ ((uint64_t) type_k        << 37) ^ ((uint64_t) type_v        << 43)
+        ^ ((uint64_t) (kq_mask      ? 1 : 0) << 49)
+        ^ ((uint64_t) (has_sinks    ? 1 : 0) << 50)
+        ^ ((uint64_t) (f32_precision? 1 : 0) << 51)
+        ^ ((uint64_t) (softcap != 0.0f ? 1 : 0) << 52);
+
+    static std::unordered_map<uint64_t, bool> cache;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    struct ggml_init_params ip = { ggml_tensor_overhead()*8, nullptr, true };
+    struct ggml_context * c = ggml_init(ip);
+    if (!c) {
+        return true; // cannot tell -> leave the graph exactly as it was
+    }
+
+    ggml_tensor * pq = ggml_new_tensor_4d(c, GGML_TYPE_F32, n_embd_head_k, n_tokens, n_head,    1);
+    ggml_tensor * pk = ggml_new_tensor_4d(c, type_k,        n_embd_head_k, n_kv,     n_head_kv, 1);
+    ggml_tensor * pv = ggml_new_tensor_4d(c, type_v,        n_embd_head_v, n_kv,     n_head_kv, 1);
+    ggml_tensor * pm = kq_mask ? ggml_new_tensor_4d(c, kq_mask->type,
+                                                    kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3])
+                               : nullptr;
+    ggml_tensor * po = ggml_flash_attn_ext(c, pq, pk, pv, pm, 1.0f, 0.0f, softcap);
+    if (has_sinks) {
+        ggml_flash_attn_ext_add_sinks(po, ggml_new_tensor_1d(c, GGML_TYPE_F32, n_head));
+    }
+    if (f32_precision) {
+        ggml_flash_attn_ext_set_prec(po, GGML_PREC_F32);
+    }
+
+    bool ok = false;
+    for (auto * backend : lctx.backends) {
+        if (!backend || ggml_backend_is_cpu(backend)) {
+            continue;
+        }
+        if (ggml_backend_supports_op(backend, po)) {
+            ok = true;
+            break;
+        }
+    }
+
+    ggml_free(c);
+    cache[key] = ok;
+    return ok;
+}
+
 static ggml_tensor * llm_build_kqv(
         struct ggml_context * ctx,
        struct llama_context & lctx,
@@ -1747,7 +1936,27 @@ static ggml_tensor * llm_build_kqv(
     const int  pxa_split_ne11 = pxa_fa_prefill_split_ne11_mirror();
     const bool pxa_split_now  = cparams.flash_attn && pxa_split_ne11 > 0 && n_tokens >= pxa_split_ne11;
 
-    if (cparams.flash_attn && !pxa_split_now) {
+    // PXA_FA_GPU_FALLBACK: a node no GPU backend accepts would be placed on the CPU by the
+    // scheduler; build the unfused chain instead so the layer stays on the card.
+    bool pxa_fa_to_cpu = false;
+    if (cparams.flash_attn && !pxa_split_now && pxa_fa_gpu_fallback_armed()) {
+        const float pxa_softcap = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
+        pxa_fa_to_cpu = !pxa_fa_node_runs_on_gpu(lctx, n_embd_head_k, n_embd_head_v, n_head, n_head_kv,
+                                                 n_tokens, n_kv, k_cache->type, v_cache->type,
+                                                 kq_mask, sinks != nullptr, should_use_f32_precision, pxa_softcap);
+        if (pxa_fa_to_cpu) {
+            static bool pxa_told = false;
+            if (!pxa_told) {
+                pxa_told = true;
+                LLAMA_LOG_WARN("PXA_FA_GPU_FALLBACK: layer %d (head_k %d, head_v %d) has no GPU flash-attention "
+                               "kernel on this device; building the unfused attention chain on the card instead of "
+                               "letting the scheduler place the node on the CPU backend\n",
+                               il, (int) n_embd_head_k, (int) n_embd_head_v);
+            }
+        }
+    }
+
+    if (cparams.flash_attn && !pxa_split_now && !pxa_fa_to_cpu) {
         GGML_UNUSED(model);
         GGML_UNUSED(n_ctx);
 
@@ -2043,7 +2252,27 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
 }
 
 std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_build_mul_mat_qkv_gated(ggml_cgraph * gf, ggml_tensor * cur,
-            ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il) const {
+            ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il,
+            bool store_only) const {
+    // PXA_MTP_DRAFT_CACHE_ONLY: a K/V-only refresh never reads a query or the output gate, and the
+    // fused wq projection carries both, so the whole GEMM is skipped rather than computed and
+    // dropped. K and V are built exactly as they are on the full path.
+    if (store_only) {
+        auto Kcur = llm_build_lora_mm(lctx, ctx0, wk, cur);
+        cb(Kcur, "Kcur", il);
+        auto Vcur = llm_build_lora_mm(lctx, ctx0, wv, cur);
+        cb(Vcur, "Vcur", il);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head_k, Kcur->ne[0]/n_embd_head_k, n_tokens);
+        if (k_norm) {
+            Kcur = llm_build_norm(ctx0, Kcur, hparams, k_norm, NULL, LLM_NORM_RMS, cb, il);
+            cb(Kcur, "Kcur_normed", il);
+            ggml_build_forward_expand(gf, Kcur);
+        }
+        return {nullptr, Kcur, Vcur, nullptr};
+    }
+
     auto Qaux = llm_build_lora_mm(lctx, ctx0, wq, cur);
     cb(Qaux, "Qaux", il);
     auto Kcur = llm_build_lora_mm(lctx, ctx0, wk, cur);
@@ -2368,7 +2597,9 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     const llama_vocab * vocab = &lctx.model.vocab; //llama_get_vocab(&lctx);
     llama_token bos = vocab->token_bos();
     llama_token eos = vocab->token_eos();
-    bool is_warming_up = lctx.n_eval == 0 && (batch.n_tokens == 1 && (batch.token[0] == ((bos != -1) ? bos : eos)));
+    // batch.token is null for an embeddings batch (the MTP head is fed a fused hidden state), so
+    // the warmup probe has to test the pointer before it reads row 0.
+    bool is_warming_up = lctx.n_eval == 0 && (batch.n_tokens == 1 && batch.token != nullptr && (batch.token[0] == ((bos != -1) ? bos : eos)));
     struct llm_build_context llm(lctx, batch, cb, worst_case, is_warming_up, n_outputs);
 
     llm.init();
@@ -2546,14 +2777,48 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_MTP:
             {
-                // PXA fail-clean guard: the PXA runtime is tuned for Qwen-family MoE and does NOT
-                // support the 128-expert Gemma-4 MoE path (heap corruption on >=1024-token batches,
-                // scalar decode). Throw a clear error at graph-build time (llama_build_graph runs a
-                // worst-case build at context creation, wrapped in try/catch) instead of corrupting
-                // the heap. Denylist GEMMA4/GEMMA4_MTP only — every other arch is unaffected.
-                throw std::runtime_error(std::string("PXA runtime does not support arch '")
-                        + llama_model_arch_name(model.arch)
-                        + "' (128-expert Gemma-4 MoE); use stock llama.cpp. See docs/KNOWN-ISSUES.md.");
+                // PXA fail-clean guard, SHAPE-AWARE since 2026-09-10. The original guard (2026-07-23)
+                // was a denylist by ARCH: it refused every Gemma-4 file because the sparse variant
+                // corrupted the heap on >=1024-token batches. But the defect lives in the expert
+                // path, and the dense Gemma-4 models share none of it — they were refused untested.
+                // So the condition is now the SHAPE that actually fails:
+                //
+                //   * n_expert > 0  -> refuse. The sparse Gemma-4 MoE is still unfixed; refusing at
+                //     graph-build time (llama_build_graph runs a worst-case build at context
+                //     creation, wrapped in try/catch) turns it into a clean load-time error instead
+                //     of a corrupted heap.
+                //   * GEMMA4_MTP    -> refuse. The assistant drafter is a separate, ungated path;
+                //     it is lifted only when it has its own measurements, not as a side effect of
+                //     the dense lift.
+                //   * dense GEMMA4  -> build. Gated on one P100: greedy identity against stock
+                //     llama.cpp, needle at 8k/20k, determinism 12/12 at np1 and np2, and the
+                //     >=1024-token batch that triggered the original corruption. See
+                //     docs/KNOWN-ISSUES.md for the numbers and for what is still refused.
+                const bool is_moe       = model.hparams.n_expert > 0;
+                const bool is_assistant = model.arch == LLM_ARCH_GEMMA4_MTP;
+                // 2026-09-13: the assistant half of the guard is now a lever, not a wall — see
+                // pxa_gemma4_assistant_armed() above. The MoE half is unchanged and unconditional.
+                if (is_moe || (is_assistant && !pxa_gemma4_assistant_armed())) {
+                    throw std::runtime_error(std::string("PXA runtime does not support this '")
+                            + llama_model_arch_name(model.arch) + "' variant ("
+                            + (is_moe
+                                ? std::to_string(model.hparams.n_expert) + "-expert sparse Gemma-4 MoE"
+                                : std::string("Gemma-4 MTP assistant drafter; set PXA_GEMMA4_ASSISTANT=1 to build it"))
+                            + "); use stock llama.cpp. Dense Gemma-4 is supported."
+                              " See docs/KNOWN-ISSUES.md.");
+                }
+                if (is_assistant) {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        LLAMA_LOG_INFO("%s: PXA_GEMMA4_ASSISTANT: building the Gemma-4 assistant drafter graph"
+                                       " (%d layers, backbone width %u)\n",
+                                __func__, (int) model.hparams.n_layer, model.hparams.mtp_backbone_n_embd);
+                    }
+                    result = llm.build_gemma4_mtp();
+                } else {
+                    result = llm.build_gemma4();
+                }
             } break;
         case LLM_ARCH_STARCODER2:
             {
@@ -2702,6 +2967,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_deepseek4();
             } break;
+        case LLM_ARCH_GLM5NEXT:
+            {
+                result = llm.build_glm5next();
+            } break;
         case LLM_ARCH_DEEPSEEK4_DSPARK:
             {
                 result = llm.build_dspark();
@@ -2732,7 +3001,15 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         ggml_tensor * input, ggml_tensor * inp_pos, ggml_tensor * inp_out_ids, ggml_tensor * rope_factors_in,
         ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
         int n_swa, int il, bool do_rope, bool add_graph_split, bool add_input, bool is_norm, bool is_multi,
-        ggml_tensor * post_norm) {
+        ggml_tensor * post_norm, bool store_only,
+        const llama_kv_cache * kv_use, int32_t n_kv_use, int32_t kv_head_use) {
+
+    // PXA_GEMMA4_ISWA: the cache this layer reads and writes. With no override (every caller
+    // outside the ported sliding-window path) these three are exactly the members the body used
+    // before, so the emitted graph is unchanged.
+    const llama_kv_cache & kv_l     = kv_use ? *kv_use     : kv_self;
+    const int32_t          n_kv_l   = kv_use ?  n_kv_use   : n_kv;
+    const int32_t          kv_head_l= kv_use ?  kv_head_use: kv_head;
 
     float freq_base_l  = n_swa > 0 ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
     float freq_scale_l = n_swa > 0 ? hparams.rope_freq_scale_train_swa : hparams.rope_freq_scale_train;
@@ -2774,7 +3051,12 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                                   || model.arch == LLM_ARCH_MIMO2 || model.arch == LLM_ARCH_OPENAI_MOE; /* PXA: gpt-oss sinks need F32 fattn */
                                // || (model.arch == LLM_ARCH_DEEPSEEK2 && q->ne[1] <= 8);
 
-    if (!model.layers[il].wqkv && !model.layers[il].wqk && cparams.flash_attn &&
+    // The split-tensor (-sm graph / -sm attn) branch below addresses kv_self's per-device split
+    // tensors directly and asserts kv_self.size == n_ctx, neither of which holds for a layer served
+    // from the sliding cache. A layer with an override therefore takes the ordinary path; no arch
+    // currently reaches here with both, because the only ported arch demotes -sm graph to layer.
+    if (!kv_use &&
+        !model.layers[il].wqkv && !model.layers[il].wqk && cparams.flash_attn &&
          model.layers[il].wq->extra && model.layers[il].wk->extra && model.layers[il].wv->extra && model.layers[il].wo->extra) {
         if (kv_self.k_l[il]->extra && kv_self.v_l[il]->extra) {
             auto wq = (ggml_split_tensor_t *)model.layers[il].wq->extra;
@@ -2840,7 +3122,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_QWEN4EXP) {
                     auto [Q, K, V, G] = llm_build_mul_mat_qkv_gated(gf, cur, split_wq, split_wk, split_wv,
-                            the_q_norm, the_k_norm, il);
+                            the_q_norm, the_k_norm, il, store_only);
                     Qcur = Q; Kcur = K; Vcur = V; gate = G;
                 } else {
                     auto [Q, K, V] = llm_build_mul_mat_qkv(gf, cur, nullptr, nullptr, nullptr, nullptr,
@@ -2868,30 +3150,36 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     if (is_multi) {
                         int sections[4];
                         std::copy(hparams.rope_sections.begin(), hparams.rope_sections.begin() + GGML_MROPE_SECTIONS, sections);
-                        Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, rope_factors,
-                                n_rot_l, sections, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
-                                ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+                        if (!store_only) { // PXA_MTP_DRAFT_CACHE_ONLY: no query on a store-only pass
+                            Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, rope_factors,
+                                    n_rot_l, sections, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
+                                    ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+                        }
                         Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, rope_factors,
                                 n_rot_l, sections, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
                                 ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
                     } else {
-                        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, rope_factors, n_rot_l, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
-                                ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+                        if (!store_only) { // PXA_MTP_DRAFT_CACHE_ONLY: no query on a store-only pass
+                            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, rope_factors, n_rot_l, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
+                                    ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+                        }
                         Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, rope_factors, n_rot_l, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
                                 ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
                     }
                 }
-                cb(Qcur, "Qcur", il_cb);
+                if (!store_only) cb(Qcur, "Qcur", il_cb);
                 cb(Kcur, "Kcur", il_cb);
-                if (inp_attn_scale) {
+                if (inp_attn_scale && !store_only) {
                     Qcur = ggml_mul(ctx0, Qcur, inp_attn_scale);
                     cb(Qcur, "Qcur_temp_scaled", il_cb);
                 }
                 if (cparams.k_cache_hadamard) {
                     if (int block_size = lctx.model.hadamard_size_k(il); block_size > 0) {
-                        Qcur = ggml_hadamard(ctx0, Qcur, block_size);
+                        if (!store_only) { // PXA_MTP_DRAFT_CACHE_ONLY
+                            Qcur = ggml_hadamard(ctx0, Qcur, block_size);
+                            cb(Qcur, "Qcur_hadamard", il_cb);
+                        }
                         Kcur = ggml_hadamard(ctx0, Kcur, block_size);
-                        cb(Qcur, "Qcur_hadamard", il_cb);
                         cb(Kcur, "Kcur_hadamard", il_cb);
                     }
                 }
@@ -2901,7 +3189,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                         cb(Vcur, "Vcur_hadamard", il_cb);
                     }
                 }
-                ggml_build_forward_expand(gf, Qcur);
+                if (!store_only) ggml_build_forward_expand(gf, Qcur);
                 ggml_build_forward_expand(gf, Kcur);
                 ggml_build_forward_expand(gf, Vcur);
 
@@ -2941,6 +3229,11 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
 
                 lctx.cache_copies[idx+1].cpy  = ggml_cpy(ctx0, Vcur, v_cache_view);
                 ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
+
+                // PXA_MTP_DRAFT_CACHE_ONLY: the cache write WAS the whole job on this device
+                if (store_only) {
+                    continue;
+                }
 
                 auto q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
                 cb(q, "q", il_cb);
@@ -3036,6 +3329,10 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 attn[id] = cur;
                 last_id = id;
             }
+            // PXA_MTP_DRAFT_CACHE_ONLY: nothing was reduced and nothing downstream may be built
+            if (store_only) {
+                return nullptr;
+            }
             GGML_ASSERT(last_id >= 0);
             if (add_input) {
                 // PXA_MTP_SPLIT_RESIDUAL_FIX: the attention residual add mixes the per-device
@@ -3093,7 +3390,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_QWEN4EXP) {
         auto [Q, K, V, G] = llm_build_mul_mat_qkv_gated(gf, cur, model.layers[il].wq, model.layers[il].wk, model.layers[il].wv,
-                model.layers[il].attn_q_norm, model.layers[il].attn_k_norm, il);
+                model.layers[il].attn_q_norm, model.layers[il].attn_k_norm, il, store_only);
         Qcur = Q; Kcur = K; Vcur = V; gate = G;
     } else {
         auto [Q, K, V] = llm_build_mul_mat_qkv(gf, cur,
@@ -3116,21 +3413,34 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         if (is_multi) {
             int sections[4];
             std::copy(hparams.rope_sections.begin(), hparams.rope_sections.begin() + GGML_MROPE_SECTIONS, sections);
-            Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, rope_factors_in,
-                    n_rot_l, sections, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
-                    ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+            if (!store_only) { // PXA_MTP_DRAFT_CACHE_ONLY: no query on a store-only pass
+                Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, rope_factors_in,
+                        n_rot_l, sections, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
+                        ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+            }
             Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, rope_factors_in,
                     n_rot_l, sections, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
                     ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
         } else {
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, rope_factors_in, n_rot_l, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
-                    ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+            if (!store_only) { // PXA_MTP_DRAFT_CACHE_ONLY: no query on a store-only pass
+                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, rope_factors_in, n_rot_l, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
+                        ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+            }
             Kcur = ggml_rope_ext( ctx0, Kcur, inp_pos, rope_factors_in, n_rot_l, rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l,
                     ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
         }
     }
-    cb(Qcur, "Qcur_roped", il);
+    if (!store_only) cb(Qcur, "Qcur_roped", il);
     cb(Kcur, "Kcur_roped", il);
+
+    // PXA_MTP_DRAFT_CACHE_ONLY: write the rotated K and V into the cache and stop. This is the
+    // same store the full path performs (llm_build_kv -> llm_build_kv_store with the same K and V
+    // tensors), so the cache content is bit-identical; everything after it -- attention, the output
+    // projection, the residual, the FFN and the LM head -- is what the caller does not want.
+    if (store_only) {
+        llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_l, gf, Kcur, Vcur, n_tokens, kv_head_l, cb, il);
+        return nullptr;
+    }
 
     if (inp_attn_scale) {
         Qcur = ggml_mul(ctx0, Qcur, inp_attn_scale);
@@ -3138,9 +3448,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     }
 
     if (auto wqkv_gate = model.layers[il].wqkv_gate; wqkv_gate != nullptr) {
-        cur = llm_build_kv(ctx0, lctx, kv_self, gf,
+        cur = llm_build_kv(ctx0, lctx, kv_l, gf,
                 nullptr, nullptr,
-                Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa);
+                Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head_l, n_kv_l, KQ_scale, cb, il, sinks, n_swa);
         cb(cur, "wqkv", il);
         auto gate = llm_build_lora_mm(lctx, ctx0, wqkv_gate, input_normed); // [n_head_l, n_tokens]
         cb(gate, "attn_gate", il);
@@ -3165,8 +3475,8 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         cb(cur, "attn_out", il);
     } else {
         if (gate) {
-            cur = llm_build_kv(ctx0, lctx, kv_self, gf, nullptr, nullptr,
-                    Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa);
+            cur = llm_build_kv(ctx0, lctx, kv_l, gf, nullptr, nullptr,
+                    Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head_l, n_kv_l, KQ_scale, cb, il, sinks, n_swa);
             if (false && cur->ne[1] == 1) { // we need to add GGML_UNARY_OP_SIGMOID to the ops supported by ggml_fused_mul_unary
                 cur = ggml_fused_mul_unary(ctx0, cur, gate, GGML_UNARY_OP_SIGMOID);
             } else {
@@ -3181,9 +3491,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
             }
             cb(cur, "attn_out", il);
         } else {
-            cur = llm_build_kv(ctx0, lctx, kv_self, gf,
+            cur = llm_build_kv(ctx0, lctx, kv_l, gf,
                     model.layers[il].wo, model.layers[il].bo,
-                    Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa);
+                    Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head_l, n_kv_l, KQ_scale, cb, il, sinks, n_swa);
         }
     }
 

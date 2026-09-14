@@ -160,6 +160,21 @@ DECODERS = {
 }
 
 
+def dequant_pxq_panel(blob, type_id: int, N: int, K: int, book, sub) -> np.ndarray:
+    """Decode a PXQ2/PXQ3/PXQ4/PXQ4HQ panel tensor to float32 [N, K].
+
+    Only used when a module the policy does NOT serve happens to be a panel tier -- the
+    m2-fp16 control arm, and any tensor whose fused partners force the module dense. The
+    normal path never calls it: a served panel tensor is a byte move, not a decode.
+
+    ``book``/``sub`` are the FILE's own tables, never the compiled-in defaults; the caller
+    reads them out of the GGUF KVs. See tiers.check_book for why that matters.
+    """
+    from . import tiers as _T
+    slabs, anchor = _T.split_blob(blob, type_id, N, K)
+    return _T.dequant(slabs, anchor, type_id, book, sub)
+
+
 def dequant_any(blob, type_id: int, ne: tuple[int, ...]) -> np.ndarray:
     """Decode any non-PXQ4 tensor to float32 in torch (row-major, reversed-ne) order.
 
@@ -169,12 +184,26 @@ def dequant_any(blob, type_id: int, ne: tuple[int, ...]) -> np.ndarray:
     """
     if type_id == G.GGML_PXQ4:
         raise ValueError("pxq4 has no per-row decoder; use reference.dequant_blob")
-    fn = DECODERS.get(type_id)
-    if fn is None:
-        raise ValueError(f"no decoder for ggml type {G.type_name(type_id)} ({type_id})")
     K = ne[0]
     N = 1
     for d in ne[1:]:
         N *= d
+    if type_id in (G.GGML_PXQ2, G.GGML_PXQ3, G.GGML_PXQ4HQ):
+        # These are panel tiers too (see dequant_pxq_panel), just not the one PXQ4 gets a
+        # dedicated fast path for. Book is per-tier. The SUB LUT is the shared SUB16 for
+        # pxq2/pxq3 and the tier's OWN SUB8 for pxq4hq -- asking tiers.sub_of rather than
+        # reaching for reference.SUB is what keeps that from being an invisible mistake.
+        from . import reference as _R
+        from . import tiers as _T
+        if type_id == G.GGML_PXQ4HQ:
+            book, sub = _R.BOOK, _T.sub_of(type_id)
+        else:
+            book = _T.BOOK_PXQ2 if type_id == G.GGML_PXQ2 else _T.BOOK_PXQ3
+            sub = _R.SUB
+        out = dequant_pxq_panel(blob, type_id, N, K, book, sub)
+        return out.reshape(tuple(reversed(ne)))
+    fn = DECODERS.get(type_id)
+    if fn is None:
+        raise ValueError(f"no decoder for ggml type {G.type_name(type_id)} ({type_id})")
     out = fn(blob, N, K)
     return out.reshape(tuple(reversed(ne)))
