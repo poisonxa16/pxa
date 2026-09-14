@@ -22,7 +22,13 @@ permissions:
 jobs:
   gate-cpu:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # 45 minutes was not enough and never had been: every run of this workflow since it was written
+    # was cut off inside the needle arm at the 45-minute mark and reported `cancelled`, so the
+    # required check has never once answered. The arms themselves are cheap; the 20,801-token needle
+    # prompt at NGL=0 on a two-core hosted runner is not. Nothing about the gate is relaxed to fit a
+    # clock -- GATE_STRICT stays 1 and every arm stays at the script's own defaults; the job is
+    # simply given long enough to finish saying what it has to say.
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
