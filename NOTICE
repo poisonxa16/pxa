@@ -1,0 +1,82 @@
+pxa
+=========
+
+Copyright (c) 2026 PXA Network (https://pxanetwork.com)
+
+pxa is developed and maintained by PXA Network. It is distributed under
+the MIT License; see LICENSE for the full text and for the copyright notices of
+all upstream projects, which are preserved in full.
+
+
+Lineage
+-------
+
+    ggml-org/llama.cpp          MIT   Copyright (c) 2023-2024 the llama.cpp authors
+      ggml                      MIT   Copyright (c) 2023-2024 the ggml authors
+        ikawrakow/ik_llama.cpp  MIT   Copyright (c) 2024-2025 the ik_llama.cpp authors
+          pxa             MIT   Copyright (c) 2026 PXA Network
+
+This project forked from ikawrakow/ik_llama.cpp at commit 1520eda98056
+("prompt cache: Fix assertion ... (#1913)", 2026-06-04) and has been developed
+independently since.
+
+The repository history is flattened, so there is no git merge-base with
+upstream. To diff or cherry-pick against upstream, compare against that exact
+commit. Upstream's README is preserved at docs/README-upstream-ik_llama.md.
+
+Individual changes ported from upstream after the fork point are marked inline
+in the source with the originating upstream pull request number, so their
+provenance can be traced without relying on git history.
+
+
+What PXA Network contributes
+----------------------------
+
+The following are original to this project and are the work of PXA Network:
+
+  PXQ quantization family
+    A set of PXA-native low-bit quantization tiers, their CPU and CUDA codecs,
+    the quantizer tier-selection policy, and the GGUF metadata that describes
+    them honestly (including deriving the reported tier from the tensor-type
+    histogram rather than trusting an inherited file_type field).
+
+  Pascal / Volta MoE acceleration
+    An sm_60 fp16 GEMM gate fix, a flash-attention regime fix, MoE-path fixes,
+    and correct np>1 hybrid concurrency. These apply to any MoE on these cards
+    at any size, and scale from a single salvaged card through multi-card
+    -sm layer splits to CPU/RAM offload.
+
+  Correctness guards
+    A structural graph-split guard for gated-DeltaNet hybrids, which produce
+    degenerate output under -sm graph; the guard triggers on tensor names
+    rather than architecture names, so it protects architectures that did not
+    exist when it was written.
+
+    An imatrix provenance gate, so a quantized artifact describes the
+    importance matrix that was actually consumed rather than one merely
+    supplied or inherited from its source file.
+
+  Codebase ownership
+    Removal of upstream kernel paths this project does not use, and the
+    reowning of the retained CPU kernel surface under pxq-cpu.
+
+Everything not listed above should be assumed to originate upstream and remains
+the copyright of its respective authors.
+
+
+Third-party components
+----------------------
+
+This project bundles third-party code retained from upstream, including
+yhirose/cpp-httplib (MIT), used by llama-server. Their licenses and copyright
+notices are retained in their respective source files.
+
+
+Trademarks
+----------
+
+"PXA", "PXA Network" and "PXQ" identify this project and its maintainer. The
+MIT License grants rights to the software; it does not grant permission to use
+these names to endorse or promote derived works without permission. Nothing
+here restricts factual reference to the project, including stating that a work
+is derived from it.

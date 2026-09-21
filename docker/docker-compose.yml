@@ -1,0 +1,165 @@
+# PXA — the whole stack in one file.
+#
+#   cp .env.example .env     # edit MODEL and GPUS
+#   docker compose up -d     # the engine, on an OpenAI-compatible port
+#
+# That is the whole thing for a GGUF file. The second service, the vLLM sidecar, is
+# behind a profile because it needs a different kind of model file (a converted
+# checkpoint directory, not a .gguf) and most people will never want it:
+#
+#   docker compose --profile vllm up -d
+#
+# WHICH ENGINE YOU WANT is a real question with a measurable answer, and there is a
+# tool for it rather than a rule of thumb:
+#
+#   docker compose run --rm launcher
+#
+# It looks at the cards in this box, the model files it can find, and what you want
+# the server for, and prints the configuration it would use. See COMPOSE-README.md.
+#
+# CARD NUMBERS in this file mean what `nvidia-smi -L` means by them. Both images set
+# CUDA_DEVICE_ORDER=PCI_BUS_ID, because CUDA's own default sorts cards by compute
+# capability instead, and on a mixed box that silently starts you on a different GPU
+# than the one you named.
+
+# The project name, so the containers and network are called pxa-* whatever the
+# directory this file is saved in happens to be called.
+name: pxa
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # The engine. Reads a .gguf directly. This is the one you want unless you know
+  # otherwise.
+  # ---------------------------------------------------------------------------
+  pxa:
+    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v2026.09.20}
+    container_name: pxa
+    restart: unless-stopped
+    ports:
+      - "${PXA_PORT:-8080}:${PXA_PORT:-8080}"
+    volumes:
+      - ${MODELS_DIR:?set MODELS_DIR in .env to the directory holding your model files}:/models:ro
+    environment:
+      # The engine applies LLAMA_ARG_* AFTER the command line, so anything set here
+      # WINS over the same flag in `command:` below. Port is here because the
+      # healthcheck has to agree with it; everything else is a flag.
+      LLAMA_ARG_PORT: ${PXA_PORT:-8080}
+      LLAMA_ARG_HOST: 0.0.0.0
+      # Which cards. See the note under `runtime:` below.
+      NVIDIA_VISIBLE_DEVICES: ${GPUS:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    command: >
+      -m /models/${MODEL_FILE:?set MODEL_FILE in .env to your .gguf file name}
+      -ngl 99
+      -c ${CTX:-8192}
+      ${PXA_EXTRA_FLAGS:-}
+    # Shared memory: the multi-GPU paths move tensors through it, and the 64 MB
+    # Docker default is not enough for a real model.
+    shm_size: ${SHM_SIZE:-4gb}
+    ipc: host
+    # HOW THE CARDS GET IN. This is the `runtime: nvidia` form, and it is the one
+    # here because it is the one that works on the widest set of installs — including
+    # hosts where `--gpus` / `deploy.resources.devices` fails in the container
+    # toolkit's legacy hook with an "ldcache error" that has nothing to do with your
+    # cards. If your Docker prefers the newer form, the equivalent is:
+    #
+    #   deploy:
+    #     resources:
+    #       reservations:
+    #         devices:
+    #           - driver: nvidia
+    #             device_ids: ["0","1"]     # or  count: all
+    #             capabilities: [gpu]
+    #
+    # Either way GPUS is a plain comma-separated list of card numbers as
+    # `nvidia-smi -L` prints them: 0 or 0,1 or 2,4. "all" gives every card.
+    runtime: nvidia
+    healthcheck:
+      # The image ships its own HEALTHCHECK; this repeats it so that the start
+      # period matches YOUR model. A big model on a slow disk can take minutes to
+      # load, and a container marked unhealthy during load gets restarted forever.
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:${PXA_PORT:-8080}/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: ${START_PERIOD:-300s}
+
+  # ---------------------------------------------------------------------------
+  # The vLLM sidecar. Continuous batching, paged KV and real tensor parallelism,
+  # for when several people are using the endpoint at once. It does NOT read a
+  # .gguf: point VLLM_MODEL_DIR at a checkpoint directory produced by
+  # `python -m gguf_to_vllm.convert` (docs/VLLM.md).
+  #
+  # Two images, one per card generation. Pick with the VLLM_ARCH variable:
+  #   sm70  Volta   (V100)          — the tensor-core path, FLASH_ATTN_V100
+  #   sm60  Pascal  (P100)          — PASCAL_SDPA, and Dynamo must stay off
+  # The settings below are the measured serving configurations for each, not
+  # defaults; COMPOSE-README.md says what each one is load-bearing for.
+  # ---------------------------------------------------------------------------
+  pxa-vllm:
+    profiles: ["vllm"]
+    image: ghcr.io/poisonxa16/pxa-vllm:${VLLM_ARCH:-sm70}-${PXA_VERSION:-v2026.09.20}
+    container_name: pxa-vllm
+    restart: unless-stopped
+    ports:
+      - "${VLLM_PORT:-8000}:${VLLM_PORT:-8000}"
+    volumes:
+      - ${MODELS_DIR:?set MODELS_DIR in .env}:/models:ro
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${VLLM_GPUS:-0,1}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      PYTHONUNBUFFERED: "1"
+      # vLLM writes a compile cache and torch wants a home directory; both must be
+      # writable, and neither belongs in the read-only model mount.
+      HOME: /tmp
+      TMPDIR: /tmp
+      # Pascal only, and LOAD-BEARING there: without it vLLM compiles the model
+      # through Inductor and dies on a compute-capability-6.0 card. Harmless on
+      # Volta, so it is set unconditionally rather than hidden behind a second file.
+      TORCHDYNAMO_DISABLE: ${TORCHDYNAMO_DISABLE:-1}
+      # Routes the gate/up projection from the mono kernel to the split one.
+      PXQ4_MMV_SPLIT_MAX_BLOCKS: "300"
+    command: >
+      python -m vllm.entrypoints.openai.api_server
+      --model /models/${VLLM_MODEL_DIR:?set VLLM_MODEL_DIR in .env to a converted checkpoint directory}
+      --served-model-name ${SERVED_NAME:-pxa}
+      --quantization pxq4
+      --attention-backend ${VLLM_ATTN:-FLASH_ATTN_V100}
+      --tensor-parallel-size ${VLLM_TP:-2}
+      --dtype float16
+      --trust-remote-code
+      --gpu-memory-utilization ${VLLM_GMU:-0.88}
+      --max-model-len ${VLLM_MML:-32768}
+      --max-num-seqs ${VLLM_MNS:-16}
+      --host 0.0.0.0 --port ${VLLM_PORT:-8000}
+    shm_size: ${VLLM_SHM_SIZE:-16gb}
+    ipc: host
+    runtime: nvidia
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:${VLLM_PORT:-8000}/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      # vLLM captures CUDA graphs at start-up and that is slow on these cards —
+      # about 6 minutes on Pascal. Do not shorten this without watching a boot.
+      start_period: ${VLLM_START_PERIOD:-900s}
+
+  # ---------------------------------------------------------------------------
+  # The launcher. Not a server: it runs once, prints what it would do, and exits.
+  #   docker compose run --rm launcher
+  # It needs to SEE the cards to report on them, so it gets all of them, and it
+  # needs the model directory to read each file's header.
+  # ---------------------------------------------------------------------------
+  launcher:
+    profiles: ["tools"]
+    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v2026.09.20}
+    entrypoint: ["/opt/pxa/dist/pxa-launch"]
+    volumes:
+      - ${MODELS_DIR:?set MODELS_DIR in .env}:/models:ro
+    environment:
+      # Every card, because its whole job is to report on what is in the box.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    runtime: nvidia

@@ -1,0 +1,73 @@
+name: release-binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag to build and attach binaries to
+        required: true
+        default: v2026.07.19
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x64-cuda12:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cuda-toolkit-12-6 cmake build-essential zstd
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - name: Build (README line, sm 60;61;70;86;89)
+        run: |
+          cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70;86;89" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda"
+          cmake --build build --target llama-server llama-quantize llama-perplexity -j "$(nproc)"
+
+      - name: Package
+        run: |
+          PKG="pxa-${{ inputs.tag }}-linux-x64-cuda12"
+          mkdir -p "$PKG"
+          cp build/bin/llama-server build/bin/llama-quantize build/bin/llama-perplexity "$PKG"/
+          find build -name '*.so*' -type f -exec cp {} "$PKG"/ \;
+          cp README.md docs/lab/LEVERS.md docs/COOKBOOK.md "$PKG"/
+          {
+            echo "Prebuilt linux x86_64 CUDA 12 binaries (sm 60/61/70/86/89 — P100, 1080 Ti/P40, V100, Ampere, Ada)."
+            echo "Needs an NVIDIA driver new enough for CUDA 12 (r525+). No toolkit install required."
+            echo
+            echo "Run:"
+            echo "  cd this directory"
+            echo "  LD_LIBRARY_PATH=\$PWD ./llama-server -m model.gguf ..."
+            echo
+            echo "Recommended env per card: COOKBOOK.md. Every PXA_* lever: docs/lab/LEVERS.md."
+          } > "$PKG"/RUN.txt
+          tar --zstd -cf "$PKG.tar.zst" "$PKG"
+          sha256sum "$PKG.tar.zst" > "$PKG.tar.zst.sha256"
+          ls -la "$PKG.tar.zst"
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          Prebuilt linux x86_64 CUDA 12 binaries (`llama-server`, `llama-quantize`, `llama-perplexity` + shared libs), arches sm 60/61/70/86/89 — built by this workflow from this tag (public build log). Unpack, `LD_LIBRARY_PATH=$PWD`, run — see RUN.txt inside.
+
+          Release highlights (full details in the README and `bench/fair-battle.md`):
+          - Head-to-head vs upstream ik_llama.cpp, best config both sides: **P100 +88% prefill / +30% decode**, V100 +13%/+13%, 1080 Ti +25% decode.
+          - New opt-in int8 dp4a prefill tile for GTX 10-series: 1080 Ti cold prefill 251 → 1,001 t/s.
+          - New recommended env: `PXA_FUSE_DELTANET=3`, `PXA_G2_ADDFUSE=1`, q8_0 output head.
+          - Tier rename: PXQ6 → PXQ4 (files and type ids unchanged; old names remain aliases).
+          - Docs: `docs/lab/LEVERS.md` (every lever, measured), `docs/COOKBOOK.md` (per-card command lines).
+          EOF
+          gh release create "${{ inputs.tag }}" --target "${{ github.sha }}" \
+            --title "pxa ${{ inputs.tag }}" --notes-file notes.md \
+            *.tar.zst *.tar.zst.sha256 \
+          || gh release upload "${{ inputs.tag }}" *.tar.zst *.tar.zst.sha256 --clobber

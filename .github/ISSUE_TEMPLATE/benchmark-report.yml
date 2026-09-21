@@ -1,0 +1,54 @@
+name: Benchmark report
+description: You ran the engine on a card and want the numbers in the auto-tuning table.
+labels: [benchmark-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you — this is the most useful thing you can send. The recipe is in
+        [docs/BENCHMARK-YOUR-CARD.md](../../blob/main/docs/BENCHMARK-YOUR-CARD.md).
+        **Run with no flags you do not have to pass**: the point is what the engine picks itself.
+        Failures and regressions are as welcome as good numbers.
+  - type: input
+    id: card
+    attributes:
+      label: Card(s), VRAM and driver
+      description: "Output of: nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv"
+    validations:
+      required: true
+  - type: textarea
+    id: banner
+    attributes:
+      label: Startup banner
+      description: The `version:` line, `PXA config level:` line and the full `PXA_AUTO:` block.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model file and quant tier
+      description: File name, tier, and its sha256 if you have it.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: The exact command you ran
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers
+      description: Prefill and decode in tokens/s, median of 3, and how many runs you took.
+      placeholder: "prefill: 412 t/s   decode: 31.8 t/s   (median of 3)"
+    validations:
+      required: true
+  - type: textarea
+    id: gate
+    attributes:
+      label: Release gate result (optional)
+      description: "The summary line from: MODEL=... ./bench/gate/run-gate.sh"
+      render: text

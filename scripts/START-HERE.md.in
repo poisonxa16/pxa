@@ -1,0 +1,375 @@
+# START HERE — pxa @@TAG@@
+
+I wrote this page for one reader: you have a single **Tesla P100 16 GB**, a working NVIDIA
+driver, and either this tarball or the container image. Nothing is built, nothing is compiled,
+nothing is `pip install`ed. Most of the fifteen minutes is the model download.
+
+**You will not export a single variable.** No `PXA_*` appears in any command on this page. The
+engine reads your card at startup, fills in its own batch geometry, arms the levers that were
+measured to pay on that silicon, declines the ones that were not, and prints every one of those
+decisions before it serves. If some other page tells you to export a lever to get the speed
+below, that page is older than this one.
+
+Two ways in, same binaries, same one line: the **tarball** (below) or the **container**
+(further down). Pick either.
+
+---
+
+## What you need
+
+- **Linux, x86_64.** No macOS or Windows binaries are in this package.
+- **A Pascal or Volta NVIDIA card.** Tesla P100 (`sm_60`), GTX 10-series / 1080 Ti / P40
+  (`sm_61`), Tesla V100 (`sm_70`). This build is compiled for exactly those three
+  architectures and will not run GPU kernels on a Turing or newer card.
+- **An NVIDIA driver new enough for the bundled CUDA @@CUDA_MAJOR_MINOR@@ runtime** — driver
+  **@@DRIVER_FLOOR@@** or newer on Linux. Check with `nvidia-smi` (the driver version is in the
+  top-right of its banner). You do **not** need the CUDA *toolkit* installed: this package
+  brings its own CUDA runtime in `lib/`. It deliberately does not bring the driver, which has
+  to match your kernel. This build was packaged on driver @@BUILD_HOST_DRIVER@@.
+- **glibc >= @@GLIBC_FLOOR@@** (and the package carries its own libstdc++ >= @@GLIBCXX_FLOOR@@
+  in `lib/`, so only the glibc floor is yours to satisfy). Concretely: @@DISTRO_HINT@@. Check
+  with `ldd --version`. This is a hard floor, not a guess — an older host fails at exec with
+  `version GLIBC_x.y not found` and no flag fixes it.
+- **For the container path only:** Docker plus the NVIDIA Container Toolkit (or the older
+  `nvidia-docker2` runtime — both are covered below).
+- **Disk:** about 20 GB free — 14 GB for the model file, the rest for this package.
+- **RAM:** the weights live on the card, not in host RAM. Any box that can run a desktop is
+  enough; the loader memory-maps the file rather than reading it all into memory.
+- **`python3` on your PATH.** Used by the launcher and by the two measurement snippets below.
+  There is nothing to install into it.
+
+@@PATCHELF_NOTE@@
+
+---
+
+## Step 1 — unpack
+
+```bash
+tar xzf pxa-@@TAG@@-linux-x86_64-cuda@@CUDA_MAJOR_MINOR@@-*.tar.gz
+cd pxa-@@TAG@@
+```
+
+## Step 2 — get the model, and check what you got
+
+One file. For a single 16 GB card it is **PXA-Fusion2-35B at the PXQU-16 tier with the q8_0
+output head** — a 35B mixture-of-experts model whose per-tensor mix is sized so the whole thing
+sits in 16 GB of VRAM with room for context.
+
+| | |
+|---|---|
+| file | `fusion2-35b-U16-q8head.gguf` |
+| size | about 14 GB <!-- bench/fair-battle.md:21 "PXQU-16+q8head (14.1 GB)"; bench/HEAD-TO-HEAD.md:114 "14.0 GB" --> |
+| sha256 | `643e55b07faf8b9b359fcb050494ec9c56e51c2db8d81751b4120b97782c5779` <!-- bench/fair/weights/MANIFEST.sha256, PXQU-16 q8_0-head entry; same hash in bench/checksums.sha256 --> |
+| where | <https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/fusion2-35b-U16-q8head.gguf> |
+
+```bash
+curl -L -o fusion2-35b-U16-q8head.gguf \
+  https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/fusion2-35b-U16-q8head.gguf
+```
+
+Now check it. The hash above is also in `bench/fair/weights/MANIFEST.sha256` inside this
+package, so you can verify against the package rather than against this page:
+
+```bash
+sha256sum fusion2-35b-U16-q8head.gguf
+# 643e55b07faf8b9b359fcb050494ec9c56e51c2db8d81751b4120b97782c5779  fusion2-35b-U16-q8head.gguf
+
+# or, with the file sitting next to the manifest:
+#   cd bench/fair/weights && sha256sum -c MANIFEST.sha256 --ignore-missing
+```
+
+If the two strings differ by even one character, stop and download again — a truncated download
+is the usual cause, and every number below was measured on exactly these bytes.
+
+*On an 11 GB GTX 1080 Ti instead?* Take `PXA-Fusion2-35B-PXQ2.gguf` from the same repository
+(sha256 `c11b45ef4b6c2301137f07d9039287e0b85e0c6eb26fd3cb736d1d0c8f0fee4d`) and use that card's
+line from `docs/COOKBOOK.md`; the rest of this page still applies, but the numbers below are the
+P100's. <!-- bench/fair/weights/MANIFEST.sha256, 2-bit tier entry; docs/data/chart-data-2026-09-02.csv marks every published 1080 Ti cell "PUBLISHED tier fusion2-35b-PXQ2 (c11b45ef)" -->
+
+## Step 3 — run one line
+
+```bash
+./run-server.sh -m fusion2-35b-U16-q8head.gguf -ngl 99 -c 8192 -fa on
+```
+
+That is the whole command. No `-b`, no `-ub`, no split mode, no cache type, no environment.
+<!-- README.md:70, the 1x Tesla P100 16 GB row of "Try it in five minutes" -->
+
+It serves on **port 8080**, bound to **127.0.0.1** — from the same machine that is all you need;
+to reach it from another machine add `--host 0.0.0.0` and open the port yourself.
+<!-- common/common.h:493 port = 8080; common/common.h:499 hostname = "127.0.0.1" -->
+
+**More than one card in the box?** Then that line uses *all* of them — with `-ngl 99` the engine
+spreads the layers across every card it can see, and the numbers further down are one P100's. To
+hand it a single card, name the card in front of the command, using the index `nvidia-smi -L`
+prints:
+
+```bash
+nvidia-smi -L
+# GPU 0: Tesla P100-PCIE-16GB (UUID: GPU-aad5ef40-9b80-8fd0-4391-dfe595f42640)
+# GPU 1: Tesla V100-PCIE-16GB (UUID: GPU-9af9aaf0-3f5a-cca5-b0c1-0a5b04971db6)
+
+CUDA_VISIBLE_DEVICES=0 ./run-server.sh -m fusion2-35b-U16-q8head.gguf -ngl 99 -c 8192 -fa on
+```
+
+That index means what you think it means because `run-server.sh` and `./pxa-launch` pin
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` for you. CUDA's own default sorts cards fastest-first, so on a box
+mixing a P100 with a V100 a bare `CUDA_VISIBLE_DEVICES=0` starts on the V100 while `nvidia-smi`
+calls index 0 the P100 — I pin the order in both scripts so the two numberings are one numbering.
+The UUID form is immune to the question either way: `CUDA_VISIBLE_DEVICES=GPU-aad5ef40-...`. In a
+container it is `--gpus '"device=0"'` or `--gpus device=GPU-aad5ef40-...`; Docker counts the same
+way `nvidia-smi` does. Whichever you use, confirm what you got before you measure anything — the
+`pxa: dev 0 <card name>` line in the log below names the card the model is actually on.
+<!-- common/common.h:328 split_mode defaults to LLAMA_SPLIT_MODE_LAYER, i.e. every visible card;
+     scripts/make-release-tarball.sh (run-server.sh heredoc) and tools/pxa-launch.py device_env()
+     both set CUDA_DEVICE_ORDER=PCI_BUS_ID, and both keep an order the reader exported -->
+
+Wait for the weights to load, then prove it answers:
+
+```bash
+curl -s http://127.0.0.1:8080/health
+# {"status":"ok"}
+
+curl -s http://127.0.0.1:8080/completion -H 'Content-Type: application/json' \
+  -d '{"prompt":"The capital city of France is","n_predict":16,"temperature":0,"cache_prompt":false}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["content"])'
+```
+
+If you would rather be asked than type flags, `./pxa-launch` does the same job: it lists your
+cards, lists the model files it can find, asks what the seat is for, then prints the command and
+the measurement behind every choice before it starts anything. `./pxa-launch --explain` decides
+and runs nothing.
+
+---
+
+## This is what success looks like
+
+**The log.** These lines go to **stderr** while the server starts, while the HTTP lines
+(including `HTTP server listening`) go to stdout — so capture both, `./run-server.sh ... 2>&1 |
+tee pxa.log`, if you are going to report anything. This block is the engine telling you what it
+decided and why; it is the half of a bug report that matters most.
+
+```
+PXA config level: ENHANCE (default; PXA_ENHANCE=0 for DEFAULT, PXA_REFERENCE=1 for REFERENCE)
+PXA level=ENHANCE | dev0 Tesla P100-PCIE-16GB(sm_60): FP16_GEMM ON [2:1 hgemm] MASK_SKIP_TILE ON [bit-exact] | mode=balance [fa-on serving] | spec: SPEC_RELAXED ON [G3, spec lanes]
+pxa: engine | codec=PXQ3 (120 tensors; pxq2 41, pxq3 58, pxq4 21, pxq6 0)
+pxa: dev 0 Tesla P100-PCIE-16GB cc 6.0 -> path: sm_60 fp16-hfma2
+PXA posture: mode=balance [fa-on serving, decode-first] fa=on (explicit) ub=2048 (adaptive: dev0 free-min <N> MiB, min total 16384 MiB, model share <N> MiB (uniform split) -> headroom <N> MiB)
+PXA_AUTO: samplers arch=qwen35moe -> temp=0.70 top_k=20 top_p=0.80 min_p=0.00 (qwen no-think agent defaults (official Qwen no-think sampler set); override: the CLI flag or PXA_AUTO_SAMPLERS=0)
+PXA_AUTO: FUSE_DELTANET=53 (deltanet hybrid arch — cluster + row-absorb fusions active (bit-exact with eager; out-gate fusion off by default, guarded, see pxa/README.md); override PXA_FUSE_DELTANET)
+```
+
+<!-- wording taken verbatim from the engine source in this release:
+     ggml/src/ggml-cuda/pxa/pxa-enhance.cuh (PXA config level / PXA level= / FUSE_DELTANET),
+     src/llama.cpp (pxa: engine | codec= ... and pxa: dev N ... -> path:),
+     examples/server/server.cpp (PXA posture: ... and PXA_AUTO: samplers ...).
+     Conditions checked for THIS cell (one sm_60 card, PXQU file, arch qwen35moe, ENHANCE default):
+       - level line: always printed; "default" is the reason string when no PXA_* is set.
+       - the dev0 segment is the cc==600 branch; FP16_GEMM and MASK_SKIP_TILE both resolve ON at
+         any level above REFERENCE; ROUTER_FUSE is not appended because it resolves to 0 here.
+       - SPEC_RELAXED appears because it resolves ON at ENHANCE exactly.
+       - codec=: the headline names the tier holding the most tensors and the per-tier census
+         follows; the counts shown are the PXQU-16 tier map as read out in docs/LAUNCHER.md:1161.
+       - samplers: arch qwen35moe has a family row, and the command line above sets no sampler
+         flag, so every field is filled and printed.
+       - FA_PREFILL_SPLIT does not appear: it is opt-in only and resolves to 0. -->
+
+Hold this page to the exact values of three things only: the level (`ENHANCE`), the flags on the
+`dev0` line, and `ub=2048`. The `<N> MiB` figures belong to your card, and the tensor counts
+belong to your copy of the file.
+
+Two lines deserve a word. `codec=` names the tier this file carries — if it says `codec=off` you
+are not running a PXQ file at all. `ub=2048` is the micro-batch the engine chose for your card by
+itself; it is also the geometry the published numbers below were measured at, so if you see a
+smaller number there, something else is already resident on the card.
+
+There is **no** `PXA_AUTO: batch defaults for 1x P100` line, and its absence is correct: the
+measured per-card batch table has cells for a 2× P100 pair, a 2× V100 pair, four P100s and a
+single 1080 Ti, and a single P100 is not one of them, so the adaptive ladder does the choosing
+and the `PXA posture:` line above reports it. <!-- ggml/src/ggml-cuda.cu, ggml_backend_cuda_pxa_suggest_batch: cells are 2x sm_70, 2x sm_60, 1x sm_61, 4x sm_60 -->
+
+**One line may or may not appear**, depending on how much of your card is free — the drafter is
+armed only when the estimate leaves at least 2 GiB after the weights:
+
+```
+PXA_AUTO: spec arch=qwen35moe -> --spec-type ngram-mod:n_max=4,n_min=2 (measured +23.0% first-request decode on code traffic ...)
+```
+```
+PXA_AUTO: spec DECLINED -- only dev0 free <N> MiB, model share <N> MiB (uniform split) -> headroom <N> MiB, under the 2048 MiB a draft context needs (override with --spec-type, or PXA_AUTO_SPEC=1 to force)
+```
+
+That first line is the architecture row for a sparse `qwen35moe` file, which keeps its short
+match-gated table on every card family. On a dense file such as Qwen3.8-27B the same slot prints the
+release's fleet default instead — `the n-gram stage ALONE, chain = ngram (--spec-type
+ngram:n_max=64,n_min=2,ngram_size_n=24 ...)` — followed by a `recurrent checkpoint budget` line that
+says how long a draft this card can afford. Either is a healthy boot. On a card with nothing else on
+it, expect the first: a 14 GB file on a
+16 GB card leaves a little over 2 GiB, so the drafter usually arms, a `PXA_SPEC_RELAXED:` line
+follows it, and completion responses then carry `draft_n` / `draft_n_accepted` in their
+`timings`. It drafts only when it can match an n-gram, so it costs nothing when it cannot.
+<!-- examples/server/server.cpp: the AUTO-SPEC block, its 2 GiB headroom gate and the qwen35moe row;
+     examples/server/server-task.cpp: draft_n / draft_n_accepted appear in timings only when a stage is armed -->
+
+**The numbers.** These two are the floor this card is published at — meet them or beat them:
+
+| | floor for 1× Tesla P100 16 GB | how it was measured |
+|---|---|---|
+| **decode** | **62 t/s or better** | server-reported `timings.predicted_per_second`, 200-token generations from a short prompt, model fully GPU-resident, median of 3 <!-- published 62.4, and 63.0 with the residual-add fusion that now ships on: docs/COOKBOOK.md:96-97; bench/README.md:52-58; docs/LAUNCHER.md:174 --> |
+| **prefill** | **817 t/s or better** at `ub=2048` | one **cold ~5,800-token prompt**, same server, same geometry <!-- published 827-843: bench/README.md:58; docs/COOKBOOK.md:97. The floor is the lowest published reading on this file at ub2048, 816.8 t/s, from the session in bench/fair-battle.md:79 --> |
+| first token | *not a published number* | whatever `timings.prompt_ms` says for the prompt **you** sent; it scales with your prompt length, so it is reported here, never compared |
+
+**Prefill is measured on a long cold prompt on purpose.** A short prompt reports a much smaller
+prefill rate because the fixed per-request cost dominates — that is not a fault, and it is not
+comparable to the floor above.
+
+Measure decode with three runs and take the median. **Every run gets its own prompt**: the
+engine's n-gram drafter learns text it has already seen, so re-sending one prompt makes the rate
+climb run over run and measures the cache rather than the card (`bench/fair/protocol.md` rule 6):
+
+```bash
+for i in 1 2 3; do
+  python3 -c 'import json,random,sys; random.seed(int(sys.argv[1])); print(json.dumps({"prompt":"Write a detailed technical summary of how a GPU executes a matrix multiply. Reference case %d." % random.randrange(999999),"n_predict":200,"temperature":0,"cache_prompt":False}))' "$i" > /tmp/pxa-decode.json
+  curl -s http://127.0.0.1:8080/completion -H 'Content-Type: application/json' --data @/tmp/pxa-decode.json \
+  | python3 -c 'import json,sys; t=json.load(sys.stdin)["timings"]; print("decode %.1f t/s   first token %.0f ms" % (t["predicted_per_second"], t["prompt_ms"]))'
+done
+```
+
+Measure prefill with one long, cold prompt. The word count below is a starting point — the
+number that matters is `prompt_n` in the reply, so raise or lower `range(1800)` until it comes
+back near **5,800**, and keep it under 8,000 or it will not fit the `-c 8192` context. Change
+the seed between repeats so no two prompts are ever the same:
+
+```bash
+python3 -c 'import json,random; random.seed(11); print(json.dumps({"prompt":" ".join(f"item{random.randrange(9999)}" for _ in range(1800)),"n_predict":8,"temperature":0,"cache_prompt":False}))' > /tmp/pxa-long.json
+curl -s http://127.0.0.1:8080/completion -H 'Content-Type: application/json' --data @/tmp/pxa-long.json \
+  | python3 -c 'import json,sys; t=json.load(sys.stdin)["timings"]; print("prompt_n %d   prefill %.1f t/s" % (t["prompt_n"], t["prompt_per_second"]))'
+```
+
+**Did it reproduce?** The protocol these numbers are held to is in `bench/fair/protocol.md`:
+temperature 0 (rule 2), **one warmup run discarded and the median of 7 reported** (rule 3), a
+**unique prompt for every repeat** with `cache_prompt` false (rule 6). Do that, and your median
+decode should be **at least 62 t/s** and your median prefill **at least 817 t/s**. Higher is
+expected: those figures were taken on an earlier build, they are a floor rather than a band, and
+I re-measure them for each tag — beating them is the engine getting faster, not your run going
+wrong. A first request is always slower than the rest; that is what rule 3's discarded warmup is
+for. If a median lands *below* its floor, the next section is for you.
+
+---
+
+## The container path
+
+Same binaries, same one line, no unpacking. It needs Docker with the NVIDIA Container Toolkit.
+Step 2 still applies — models are not in the image; put the file you downloaded and checked in
+the directory you mount at `/models`.
+
+```bash
+docker run -d --name pxa \
+    --gpus '"device=0"' \
+    -p 8080:8080 \
+    -v /path/to/your/models:/models:ro \
+    ghcr.io/poisonxa16/pxa:@@TAG@@ \
+    -m /models/fusion2-35b-U16-q8head.gguf \
+    -ngl 99 -c 8192 -fa on
+```
+<!-- shape and flags from docker/README.md "Quick start — one card (P100 or V100)"; image tag pinned as in README.md's container block -->
+
+If your Docker predates the `--gpus` flag and uses the older `nvidia-docker2` runtime, swap that
+one argument: `--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0`.
+
+The image binds `0.0.0.0` inside the container, so `-p 8080:8080` is what makes it reachable —
+the same `curl http://127.0.0.1:8080/health` proves it. Read the log with `docker logs pxa`; it
+contains exactly the lines quoted above. If you move it off port 8080, change it in **two**
+places — `--port N` for the server and `-e LLAMA_ARG_PORT=N` so the image's built-in health
+check probes the same place.
+
+---
+
+## When it does not look like that
+
+**It will not start at all: `version GLIBC_2.xx not found` (or `GLIBCXX_...`).** Your distro is
+older than the floor in "What you need". `ldd --version` tells you what you have; the floor for
+the build you downloaded is in the `VERSION` file next to this page. There is no flag for this —
+it is a newer distro, or a container with a newer userspace. Nothing is wrong with your card.
+
+**It starts, then: `CUDA driver version is insufficient for CUDA runtime version`.** The driver
+is older than @@DRIVER_FLOOR@@. Upgrade the *driver*; do not install a CUDA toolkit — this
+package already carries its own CUDA runtime.
+
+**In a container: `could not select device driver "" with capabilities: [[gpu]]`, or the server
+starts but no `pxa: dev 0 ...` line ever appears and everything is glacial.** Docker did not
+hand the card through. Two different mechanisms exist and only one works on any given host:
+`--gpus '"device=0"'` (NVIDIA Container Toolkit) or `--runtime=nvidia -e
+NVIDIA_VISIBLE_DEVICES=0` (older nvidia-docker2). Try the other one. The first line of the log
+says which world you are in (`PXA_CONTAINER_AWARE_v1: runtime=container`), and `nvidia-smi`
+*inside* the container is the direct test.
+
+**The file you downloaded is not called what the recipes call it.** Everything here and in
+`docs/COOKBOOK.md` names `fusion2-35b-U16-q8head.gguf`. A browser or mirror may hand you a
+different filename — rename it, or point `-m` at whatever it is actually called; nothing reads
+the name except you. Do not confuse it with `fusion2-35b-U16.gguf` (same tier, different output
+head, different bytes) or with the `PXA-Fusion4-*` files, which are a different model.
+
+**`sha256sum` does not match.** Download it again. That mismatch means these bytes are not the
+bytes any published number was taken on, so nothing below the download is worth debugging until
+it matches. A partial download is by far the most common cause; a mirror that "helpfully"
+recompressed the file is the second.
+
+**The launcher asks something this page did not mention.** `./pxa-launch` asks three things —
+which cards, which model, and what the seat is for (chat / serving several people / long
+documents). That last one is the only performance question a human is asked, because on these
+cards it genuinely changes the answer; pick *chat* for the run described here. If it instead
+asks you to **acknowledge an unmeasured branch**, you are not on the cell this page describes:
+for one P100 plus this PXQU-16 file it matches its `1xp100-pxqu16` row and waives that
+acknowledgement, printing the reason. Check that `-m` really points at
+`fusion2-35b-U16-q8head.gguf` and that only one card is ticked. `./run-server.sh` never asks
+anything at all — use it if you want no questions.
+
+**Something answers, but not on the port you expected.** The server prints `HTTP server
+listening` with the host and port it actually bound. The tarball defaults to `127.0.0.1:8080`,
+so a `curl` from another machine gets nothing until you pass `--host 0.0.0.0`. In a container
+the bind is `0.0.0.0` and the mapping (`-p 8080:8080`) is what you change instead. If you pass
+`--port`, remember the container needs `-e LLAMA_ARG_PORT` to match, and note that on this
+engine a `LLAMA_ARG_*` variable overrides the matching command-line flag rather than the other
+way round — so set a port in one place, never in both.
+
+**It loads and then dies on the first token, or fails while loading weights.** The model tier
+does not fit alongside its context and compute buffer. Confirm the card is otherwise empty
+(`nvidia-smi`), lower `-c`, or step down a tier. On 16 GB, PXQU-16 is the tier that fits; the
+4-bit flagship (18.7 GB) does not fit one 16 GB card, whatever its filename suggests.
+
+**Everything works but a number is under its floor.** Re-read the `PXA posture:` line: if `ub` is
+not 2048, something else is resident on the card and the engine sized down to stay safe. And
+check what you measured — a short prompt cannot produce a four-figure prefill rate, only a cold
+prompt of a few thousand tokens can. A number *above* its floor needs no explanation and is not a
+fault: the floors come from an earlier build.
+
+---
+
+## Where things are
+
+```
+bin/            llama-server, llama-cli, llama-bench, llama-perplexity, llama-quantize,
+                llama-pxq-export (turns a PXQ file back into a plain GGUF any stock llama.cpp
+                reads -- docs/PXQ-EXPORT.md, and the two-command recipe in docs/COOKBOOK.md),
+                (llama-gguf-split if this build included it), and three self-test binaries.
+lib/            this engine's shared libraries + the exact CUDA/OpenMP runtime libs it needs.
+                Driver libraries are deliberately NOT here — those come from your host.
+pxa-launch      lists your cards and models, picks a configuration, prints its reasoning.
+run-server.sh   thin wrapper: sets up ./lib, execs bin/llama-server with your own flags.
+tools/pxa-launch.py   what pxa-launch runs (kept here so --explain works).
+bench/fair/     the comparison protocol + weights/MANIFEST.sha256 (file names and hashes).
+bench/gate/     the release gate — determinism, coherence, needle recall, unit tests:
+                LD_LIBRARY_PATH=./lib MODEL=/path/to/model.gguf BIN=./bin bench/gate/run-gate.sh
+                (it calls bin/llama-server directly, so it needs ./lib on the path itself;
+                pxa-launch and run-server.sh do that for you, run-gate.sh does not).
+docs/           README, this release's notes, COOKBOOK (per-card recipes), KNOWN-ISSUES,
+                PXQ-EXPORT (leaving PXQ: what bin/llama-pxq-export does and its flags),
+                LAUNCHER (the decision table and worked examples).
+VERSION         the commit, build flags, CUDA version, GPU architectures and library floors
+                of the exact build you have.
+LICENSE, LICENSING.md   MIT-family licences; LICENSING.md explains which files fall where.
+```
+
+If a number on this page does not reproduce from the same command on the same file, that is a
+bug report worth filing — with the `PXA config level:` line, the whole `PXA_AUTO:` block, your
+`nvidia-smi` output and the command you ran.

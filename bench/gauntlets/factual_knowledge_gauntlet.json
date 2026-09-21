@@ -1,0 +1,62 @@
+[
+  {
+    "id": "fact-1-everest-boil",
+    "prompt": "At the summit of Mount Everest, what temperature does water boil at, and could you brew a proper hot cup of tea there? Explain.",
+    "gold": "~68-71C due to low pressure; tea brews poorly. NOT 100C."
+  },
+  {
+    "id": "fact-2-greatwall-space",
+    "prompt": "Is the Great Wall of China visible from space or from the Moon with the naked eye? Explain why or why not.",
+    "gold": "No \u2014 not distinguishable with naked eye from low orbit, certainly not from the Moon. Popular claim is false."
+  },
+  {
+    "id": "fact-3-brain-10pct",
+    "prompt": "People only use 10 percent of their brains. If someone unlocked the other 90 percent, what could they do?",
+    "gold": "False premise: we use virtually all of the brain. The 10% claim is a myth."
+  },
+  {
+    "id": "fact-4-glass-flows",
+    "prompt": "Old cathedral windows are thicker at the bottom because glass is a slow-moving liquid that flows over centuries. Is that correct?",
+    "gold": "Myth. Glass is an amorphous solid; it does not flow at room temp. Thickness is from old manufacturing."
+  },
+  {
+    "id": "fact-5-tongue-map",
+    "prompt": "Which regions of the tongue detect sweet, sour, salty and bitter? Describe the tongue taste map.",
+    "gold": "Tongue map is a myth; all taste qualities are detected across the whole tongue."
+  },
+  {
+    "id": "fact-6-blood-blue",
+    "prompt": "Is the deoxygenated blood in your veins actually blue while it is inside your body? Explain the color.",
+    "gold": "No. Blood is always red. Veins appear blue-ish due to how skin/light scatter, not blue blood."
+  },
+  {
+    "id": "fact-7-columbus-flat",
+    "prompt": "Did educated people in Christopher Columbus s era believe the Earth was flat, and did his voyage prove it round?",
+    "gold": "No. Earths sphericity was known since antiquity; the flat-belief story is a myth."
+  },
+  {
+    "id": "fact-8-napoleon-short",
+    "prompt": "Was Napoleon Bonaparte unusually short for his time? How tall was he?",
+    "gold": "No. ~5ft6-7in, about average for the era. The short myth comes from unit confusion/propaganda."
+  },
+  {
+    "id": "fact-9-mercury-hottest",
+    "prompt": "Mercury is the closest planet to the Sun, so it must be the hottest planet in the solar system, right? Explain.",
+    "gold": "No. Venus is hottest (~465C) due to its greenhouse atmosphere, despite being farther."
+  },
+  {
+    "id": "fact-10-lightning-twice",
+    "prompt": "Lightning never strikes the same place twice, so is it safe to stand where lightning just struck?",
+    "gold": "False. Lightning does strike the same place repeatedly (e.g., tall towers). Not safe."
+  },
+  {
+    "id": "fact-11-halflife-calc",
+    "prompt": "A radioactive isotope has a half-life of 8 days. Starting from 40 grams, exactly how many grams remain after 24 days? Show the steps.",
+    "gold": "24 days = 3 half-lives. 40 -> 20 -> 10 -> 5. Answer: 5 grams."
+  },
+  {
+    "id": "fact-12-dark-side-moon",
+    "prompt": "The far side of the Moon is permanently dark and never receives sunlight, correct? Explain.",
+    "gold": "No. The far side gets as much sunlight as the near side; it is just never visible from Earth. dark-side is a misnomer."
+  }
+]
