@@ -2,6 +2,7 @@
 #include "volta-mma/fattn-mma-ml.cuh"
 
 #include <cstring>
+#include <cstdlib>
 
 // PXA_FA_MMA_VOLTA (2026-09-02) -- sm_70 flash-attention on mainline llama.cpp's
 // MMA kernel, vendored under volta-mma/ (see the provenance headers there).
@@ -17,19 +18,27 @@
 //   * cc == 7.0 only. Every other arch keeps its existing dispatch untouched.
 //   * head sizes 128 and 256 (DKQ == DV). 128 covers the MoE and P100-seat
 //     models if they are ever run on Volta; 256 is this rig's model.
-//   * f16 K and V only. mainline's launch_fattn stages a quantized KV cache into
-//     scratch obtained from ggml_cuda_flash_attn_ext_get_f16_extra_data(), which
-//     is backed by mainline's ggml_cuda_flash_attn_ext_get_alloc_size() hook in
-//     its CUDA backend. This fork has no such hook, so a non-f16 KV cache would
-//     hand the kernel an unallocated pointer. f16 is what this rig runs, so the
-//     predicate requires it rather than porting the allocator.
+//   * f16 K/V, plus matched q8_0 K/V for the measured D=256 path. The launcher stages q8_0
+//     through PXA's CUDA pool into the same f16 MMA input used by the f16 path.
+//     PXA_FA_MMA_VOLTA_Q8=0 restores the previous f16-only support predicate.
 //   * batch > 8 only; decode keeps the incumbent path until measured.
+// Q8 D=256, single V100, Qwen3.8-27B: pp16k 741.4 -> 904.6 tok/s (+22.0%)
+// and restored 100k + 1k append 149.4 -> 302.9 tok/s (+102.7%). tg64 was neutral.
+// Four 512-token KL chunks vs the old route: KLD 0.000024, same-top 100%.
 // Anything declined falls through to the tile route, which is itself a large win
 // over the WMMA kernel, so this can only change which working kernel runs.
 
 // mainline fattn.cu:183-194. ncols2 > 1 packs several Q heads into one K/V read
 // and is only valid with a mask, no ALiBi, K padded to FATTN_KQ_STRIDE, and
 // 16-byte-aligned higher-dimensional strides. Otherwise ncols2 must stay 1.
+static bool pxa_volta_mma_q8_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("PXA_FA_MMA_VOLTA_Q8");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+
 static bool pxa_volta_mma_use_gqa_opt(const ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -74,7 +83,10 @@ bool ggml_cuda_fattn_volta_mma_supported(const ggml_tensor * dst, int cc) {
     if (K->ne[0] != DKQ || V->ne[0] != DKQ) {
         return false; // DKQ == DV only
     }
-    if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+    const bool f16_kv = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+    const bool q8_kv  = DKQ == 256 && pxa_volta_mma_q8_enabled() &&
+                        K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    if (!f16_kv && !q8_kv) {
         return false; // see SCOPE above
     }
     if (!mask) {
