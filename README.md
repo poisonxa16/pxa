@@ -10,17 +10,6 @@ Models: **[ready-to-run PXQ models](#models)** · [benchmarks](#benchmarks-pxa-v
 
 > 💛 Support: **https://ko-fi.com/shatteredrealms1**
 
-<!-- bench:start -->
-## Benchmarks: PXA vs llama.cpp
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/poisonxa16/pxa/main/docs/assets/release/v2026.09.20/board-dark.png">
-  <img src="https://raw.githubusercontent.com/poisonxa16/pxa/main/docs/assets/release/v2026.09.20/board-light.png" alt="PXA vs stock llama.cpp, same cards, each at its best settings" width="100%">
-</picture>
-
-Same cards, same window, each engine at its best settings. Every number, the configurations and the head-to-head against mainline's own MTP setup are on the [v2026.09.20 release page](https://github.com/poisonxa16/pxa/releases/tag/v2026.09.20) and in [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md).
-<!-- bench:end -->
-
 <!-- models:start -->
 ## Models
 
@@ -36,6 +25,17 @@ Models quantized to PXA formats by the team. New posts in the #models channel on
 |[Gemma-4-12B-PXQ-GGUF](https://huggingface.co/mistrjirka/Gemma-4-12B-PXQ-GGUF) | mistrjirka | 2026-09-09|
 |[Ornith-1.5-9B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-9B-PXQ-GGUF) | mistrjirka | 2026-09-08|
 <!-- models:end -->
+
+<!-- bench:start -->
+## Benchmarks: PXA vs llama.cpp
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/poisonxa16/pxa/main/docs/assets/release/v2026.09.20/board-dark.png">
+  <img src="https://raw.githubusercontent.com/poisonxa16/pxa/main/docs/assets/release/v2026.09.20/board-light.png" alt="PXA vs stock llama.cpp, same cards, each at its best settings" width="100%">
+</picture>
+
+Same cards, same window, each engine at its best settings. Every number, the configurations and the head-to-head against mainline's own MTP setup are on the [v2026.09.20 release page](https://github.com/poisonxa16/pxa/releases/tag/v2026.09.20) and in [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md).
+<!-- bench:end -->
 ## Quick start — run the launcher first
 
 You do not have to know any of what follows to run a model on this engine. Build it
