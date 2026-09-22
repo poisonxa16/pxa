@@ -6,7 +6,7 @@
 
 **Community: [Discord — PXA Network](https://discord.gg/EqazvV9tf)** — support, benchmark wall, dev talk. Release notes post there automatically.
 
-Models: **https://github.com/poisonxa16/pxa** ← you are here · Weights: [huggingface.co/poisonxa](https://huggingface.co/poisonxa)
+Models: **[ready-to-run PXQ models](#models)** · [benchmarks](#benchmarks-pxa-vs-llamacpp) · Weights: [huggingface.co/poisonxa](https://huggingface.co/poisonxa)
 
 > 💛 Support: **https://ko-fi.com/shatteredrealms1**
 
