@@ -13,6 +13,18 @@ Models: **https://github.com/poisonxa16/pxa** ← you are here · Weights: [hugg
 
 > 💛 Support: **https://ko-fi.com/shatteredrealms1**
 
+<!-- models:start -->
+## Models
+
+Models quantized to PXA formats by the team. New posts in the #models channel on the [PXA Network Discord](https://discord.gg/EqazvV9tf) are added here automatically.
+
+| Model | Published by | Added |
+| --- | --- | --- |
+|[Qwen3.8-27B-PXQ-GGUF](https://huggingface.co/mistrjirka/Qwen3.8-27B-PXQ-GGUF) | mistrjirka | 2026-09-17|
+|[Ornith-1.5-35B-A3B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-35B-A3B-PXQ-GGUF) | mistrjirka | 2026-09-11|
+|[Gemma-4-12B-PXQ-GGUF](https://huggingface.co/mistrjirka/Gemma-4-12B-PXQ-GGUF) | mistrjirka | 2026-09-09|
+|[Ornith-1.5-9B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-9B-PXQ-GGUF) | mistrjirka | 2026-09-08|
+<!-- models:end -->
 ## Quick start — run the launcher first
 
 You do not have to know any of what follows to run a model on this engine. Build it
