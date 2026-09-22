@@ -9,7 +9,7 @@ here · **[I]** inferred.
 
 ## 0. The single most expensive mistake: benchmarking the wrong artifact
 
-`run-flashnext.sh:25` defaults to the **public unsloth download**, not our codec:
+`../run-flashnext.sh:25` defaults to the **public unsloth download**, not our codec:
 
     MODEL=${MODEL:-/path/to/models/qwen4exp-testfile/UD-IQ1_S/...}
 

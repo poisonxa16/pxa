@@ -1,8 +1,5 @@
 <p align="center"><img src="docs/assets/pxa-network-banner.png" alt="PXA Network" width="760"></p>
 
-<!-- GitHub README for pxa. -->
-<p align="center"><img src="banner.png" alt="pxa — PXQ quants and a MoE accelerator for landfill GPUs" width="100%"></p>
-
 # pxa — the codec + kernel pack for cards with no DP4A
 
 > Authored and maintained by **PXA Network** (https://pxanetwork.com) — the creator of pxa and the PXQ/PXA kernel family.
@@ -601,7 +598,7 @@ sidecar, not on this binary, and ship in the sidecar images. Earlier tagged rele
 `v2026.09.02`: [`RELEASE-NOTES-2026-09-02.md`](RELEASE-NOTES-2026-09-02.md).
 
 ## License & credits
-**MIT** — this fork inherits the MIT license of its base engines
+**MIT** — this engine inherits the MIT license of its base engines
 ([ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) / llama.cpp / ggml, © the ggml/llama.cpp/
 ik_llama.cpp authors), and the PXQ types + E16-row-scale kernels are contributed under the same MIT terms.
 The original LICENSE and AUTHORS are retained unchanged. PXQ quantization and the fused kernels are original
@@ -612,7 +609,7 @@ work of the PXA project, built on ikawrakow's ik_llama.cpp.
 
 ## Community bug-finders 🏅
 
-Real-hardware testing by the community makes this fork honest. Credits:
+Real-hardware testing by the community makes this engine honest. Credits:
 
 - **Last-Guitar-5924** (r/LocalLLM) — found the deepseek2/MLA fa-off context-decay cliff on a Tesla P40 (GLM-4.7-Flash decode collapsing 37 → 3.3 t/s by 36k ctx with flash attention off). His decode curve drove the automatic fa+mla posture for MLA models and the load-time warning shipping in the next release.
 - **[bradrlaw](https://github.com/bradrlaw)** — via a rigorous independent benchmark, root-caused the dual-GPU decode collapse to `-sm layer` on a no-NVLink (PHB) topology and showed `-sm graph -ts 1,1` restores full decode; also caught the missing `libnccl.so.2` in the release packaging. Both drove fixes in this release. **Scope note added 2026-09-08:** that decode result stands, and it stands for **stock GGUF** files — it does not carry over to a PXQ file. `-sm graph` splits the attention output and the expert down projections along `K`, and a PXQ tensor cannot be cut on that axis (one fp16 anchor per row lives in the 64-row panel header and covers all of `K`), so the engine now refuses that combination at load instead of running it. On a PXQ file, `-sm layer` is the supported split.

@@ -42,5 +42,5 @@ One tree -> two remotes: `origin` = public clean, the other = dirty backup.
 
 ## The law
 
-One working tree, one build, everything runs from it. Archive, don't fork. See ONE-BUILD-POLICY.md.
+One working tree, one build, everything runs from it. Archive, don't fork. See [docs/ONE-BUILD-POLICY.md](docs/ONE-BUILD-POLICY.md).
 The 8+ worktree / 2-repo sprawl was the root cause of the cross-history merge pain; it does not recur.
