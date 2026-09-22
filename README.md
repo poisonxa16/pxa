@@ -24,6 +24,7 @@ Models quantized to PXA formats by the team. New posts in the #models channel on
 |[Ornith-1.5-35B-A3B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-35B-A3B-PXQ-GGUF) | mistrjirka | 2026-09-11|
 |[Gemma-4-12B-PXQ-GGUF](https://huggingface.co/mistrjirka/Gemma-4-12B-PXQ-GGUF) | mistrjirka | 2026-09-09|
 |[Ornith-1.5-9B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-9B-PXQ-GGUF) | mistrjirka | 2026-09-08|
+Full list with download counts: [MODELS.md](MODELS.md)
 <!-- models:end -->
 
 <!-- bench:start -->
