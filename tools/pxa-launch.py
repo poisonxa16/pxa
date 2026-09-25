@@ -814,6 +814,13 @@ def resolve_auto_split(engine, sel, prof, forced_ts, recipe, fa="on"):
         return "layer", (f"{n} card selected - a tensor split needs at least two, and on one card "
                          f"'layer' and 'tensor' are the same seat with more bookkeeping")
     models = sorted({g[1] for g in sel})
+    if n > 2:
+        # Bug #206 (2026-09-25): on 4x P100, -sm tensor serves wrong tokens (token 0 already wrong)
+        # while perplexity matches -sm layer; pairs are correct. Until the 4-way serving path is
+        # fixed and gated, the default never picks the tensor split past a pair.
+        return "layer", (f"{n} cards selected - the tensor split is only a default on a PAIR: on "
+                         f"4 cards it serves wrong tokens (bug #206) though perplexity looks fine. "
+                         f"Layer split until that is fixed; --sm tensor by hand is at your own risk")
     if len(models) > 1:
         return "layer", (f"the selected cards are not the same model ({', '.join(models)}). An "
                          f"even tensor split gives both halves the same work, so a slower card "
