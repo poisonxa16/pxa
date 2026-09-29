@@ -103,7 +103,8 @@ struct server_slot {
 
     std::string oaicompat_model;
     std::string stopping_word;
-    stop_type stop;
+    // bug #216: the former `stop_type stop` member was never initialised or assigned;
+    // stopped_eos / stopped_word / stopped_limit are the source of truth.
 
     // For context rewind/ token buffer
     size_t n_buffer = 0;
@@ -157,6 +158,10 @@ struct server_slot {
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
+    // PXA_SPEC_FIXED_WIDTH: filler rows at the END of `drafted` (and of i_batch_dft / cache_tokens)
+    // that pad the verify batch to a fixed width. Never offered for acceptance; rolled back like a
+    // rejected tail. 0 when the lever is off or stood down this step.
+    int32_t n_draft_pad = 0;
     // PXA_SPEC_SAMPLED: the proposal distribution each drafted token was DRAWN from, in draft
     // order. Empty (or a different length from `drafted`) means this step is verified by exact
     // match, which is what every non-sampled drafter leaves behind.
@@ -422,6 +427,22 @@ struct server_context {
     int32_t cache_ram_n_min = 0;
     float cache_ram_similarity = 0.5f;
 
+    // ---- PXA hot swap (examples/server/pxa-hotswap.h) --------------------------------------
+    // Set only when more than one model is registered. The residency group owns this model's VRAM;
+    // park/unpark run on this model's own task loop (as queue control functions), between graph
+    // evaluations, and leave every context, slot and KV cell exactly where it was.
+    std::string           pxa_hs_name;
+    llama_pxa_residency * pxa_hs_res = nullptr;
+    bool                  pxa_hs_parked = false;
+    bool                  pxa_hs_no_cache_disk = false;   // registered models do not share the PXA_CACHE_DISK file
+    llama_pxa_residency_stats pxa_hs_last_park   = {};
+    llama_pxa_residency_stats pxa_hs_last_unpark = {};
+    // next: the group coming in; with PXA_SWAP_KEEP=1 only what it needs is released
+    bool pxa_hs_park(std::string & err, llama_pxa_residency * next);
+    bool pxa_hs_unpark(std::string & err);
+    json pxa_hs_status() const;
+    // ------------------------------------------------------------------------------------------
+
     ~server_context();
 
     bool load_model(const gpt_params& params_);
@@ -457,7 +478,10 @@ struct server_context {
 
     bool process_token(completion_token_output& result, server_slot& slot);
 
-    void populate_token_probs(const server_slot& slot, completion_token_output& result, bool post_sampling, bool special, int idx);
+    // cur_p: the post-chain window to read post-sampling probabilities from (bug #212: a speculative step
+    // passes each position's own window); nullptr reads the slot sampler's current one.
+    void populate_token_probs(const server_slot& slot, completion_token_output& result, bool post_sampling, bool special, int idx,
+            const llama_token_data_array * cur_p = nullptr);
 
     json get_formated_generation(const server_slot& slot) const;
 

@@ -98,11 +98,51 @@ void server_queue::on_new_task(std::function<void(server_task&&)> callback) {
     callback_new_task = std::move(callback);
 }
 
+void server_queue::post_control(std::function<void()> fn) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (ended) {
+        return;   // the loop is gone: dropping fn breaks its promise, so the waiter does not hang
+    }
+    queue_control.push_back(std::move(fn));
+    condition_tasks.notify_all();
+}
+
+bool server_queue::run_control() {
+    bool any = false;
+    for (;;) {
+        std::function<void()> fn;
+        {
+            std::unique_lock<std::mutex> lock(mutex_tasks);
+            if (queue_control.empty()) {
+                return any;
+            }
+            fn = std::move(queue_control.front());
+            queue_control.pop_front();
+        }
+        fn();
+        any = true;
+    }
+}
+
 
 void server_queue::start_loop() {
     running = true;
 
     while (true) {
+        // PXA hot swap: park/unpark first; a parked model runs nothing else until it is back
+        run_control();
+        if (paused) {
+            std::unique_lock<std::mutex> lock(mutex_tasks);
+            if (!running) {
+                queue_control.clear();   // a waiter on a control function sees a broken promise, not a hang
+                return;
+            }
+            condition_tasks.wait(lock, [&] {
+                return !queue_control.empty() || !running;
+            });
+            continue;
+        }
+
         LOG_VERBOSE("new task may arrive", {});
 
         while (true) {
@@ -171,6 +211,7 @@ void server_queue::start_loop() {
             if (queue_tasks.empty()) {
                 if (!running) {
                     LOG_VERBOSE("ending start_loop", {});
+                    queue_control.clear();   // PXA hot swap: never leave a park/unpark waiter hanging
                     return;
                 }
                 if (!queue_tasks_deferred.empty()) {
@@ -182,7 +223,7 @@ void server_queue::start_loop() {
                     // forever while /health stayed green, reproduced under a sustained
                     // multi-slot soak — an HTTP-hang signature).
                     condition_tasks.wait_for(lock, std::chrono::milliseconds(500), [&] {
-                        return (!queue_tasks.empty() || !running);
+                        return (!queue_tasks.empty() || !running || !queue_control.empty());
                         });
                     if (queue_tasks.empty() && !queue_tasks_deferred.empty() &&
                         callback_slot_available && callback_slot_available()) {
@@ -196,7 +237,7 @@ void server_queue::start_loop() {
                     }
                 } else {
                     condition_tasks.wait(lock, [&] {
-                        return (!queue_tasks.empty() || !running);
+                        return (!queue_tasks.empty() || !running || !queue_control.empty());
                         });
                 }
             }

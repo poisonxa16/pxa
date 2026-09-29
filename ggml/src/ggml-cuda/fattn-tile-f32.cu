@@ -395,8 +395,23 @@ void launch_fattn_tile_f32_64_128(ggml_backend_cuda_context & ctx, ggml_tensor *
             fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f32<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip>;
             launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true);
         } break;
+        case 256: {
+            // Bug #235 (2026-09-25): head 256 for the nodes nothing else on
+            // sm_60/61 serves (a K/V pair the vec kernel has no instance for, at f32 precision or
+            // without fast fp16). Only at 16 columns: at 32 the static smem (Q_f 32 KiB + KV_tmp
+            // 16.1 KiB + KQ 4 KiB) is past the 48 KiB limit; ggml_cuda_flash_attn_ext_tile_f32
+            // never asks for more.
+            if constexpr (cols_per_block <= 16) {
+                constexpr int      D = 256;
+                constexpr int nwarps = 8;
+                fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f32<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip>;
+                launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true);
+            } else {
+                GGML_ABORT("tile-f32 flash attention at head 256 runs at 16 columns per block only");
+            }
+        } break;
         default: {
-            GGML_ABORT("FlashAttention without tensor cores only supports head sizes 64 and 128.");
+            GGML_ABORT("FlashAttention without tensor cores only supports head sizes 64, 128 and 256.");
         } break;
     }
 }
@@ -449,6 +464,27 @@ void ggml_cuda_flash_attn_ext_tile_f32(ggml_backend_cuda_context & ctx, ggml_ten
     // path only, so force a single block to avoid a multi-block double-count of the sink term.
     const bool has_sinks = dst->src[4] != nullptr;
 
+    // D=256 fits the 48 KiB static-smem budget only at cols_per_block=16 (as in tile-f16).
+    if (Q->ne[0] == 256) {
+        constexpr int cols_per_block = 16;
+        if (Q->ne[1] <= 16 && !has_sinks) {
+            constexpr int parallel_blocks = 4;
+            if (softcap == 0.0f) {
+                launch_fattn_tile_f32_skip_dispatch<cols_per_block, parallel_blocks, false>(ctx, dst);
+            } else {
+                launch_fattn_tile_f32_skip_dispatch<cols_per_block, parallel_blocks, true>(ctx, dst);
+            }
+        } else {
+            constexpr int parallel_blocks = 1;
+            if (softcap == 0.0f) {
+                launch_fattn_tile_f32_skip_dispatch<cols_per_block, parallel_blocks, false>(ctx, dst);
+            } else {
+                launch_fattn_tile_f32_skip_dispatch<cols_per_block, parallel_blocks, true>(ctx, dst);
+            }
+        }
+        return;
+    }
+
     if (Q->ne[1] <= 16 && !has_sinks) {
         constexpr int cols_per_block = 16;
         constexpr int parallel_blocks = 4;
@@ -484,5 +520,5 @@ bool ggml_cuda_fattn_tile_f32_is_supported([[maybe_unused]] ggml_backend_cuda_co
     auto K = dst->src[1];
     auto V = dst->src[2];
     if (K->ne[0] != V->ne[0]) return false;
-    return K->ne[0] == 64 || K->ne[0] == 128;
+    return K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256;
 }

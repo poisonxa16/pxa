@@ -1,0 +1,995 @@
+<!doctype html>
+<!--
+  PXA Control (pxa-launch --gui). One self-contained page: no CDN, no external library, no build step.
+  It talks only to the PXA Control server that served it (/api/*); the engine is reached through that
+  server's fixed proxy (/api/engine/*). Palette = the PXA/hive design tokens (hive/ui/tokens.css).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PXA Control</title>
+<link rel="icon" href="/favicon.png">
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0F1012;--surface:#16171A;--surface-2:#1C1E22;--surface-3:#25272C;
+  --line:#24262B;--line-2:#34373E;--text:#ECEDEF;--dim:#9DA2AB;--faint:#6E737C;--on-accent:#141414;
+  --accent:#E08A3C;--accent-hover:#EC9A50;--accent-2:#2E9ACB;--accent-text:#F0A050;--link:#5AB8E0;
+  --grad:linear-gradient(90deg,var(--accent),var(--accent-2));
+  --ok:#3DD39F;--warn:#F5A623;--bad:#FF6464;--neutral:#8B94A5;
+  --ok-bg:rgba(61,211,159,.10);--warn-bg:rgba(245,166,35,.10);--bad-bg:rgba(255,100,100,.10);
+  --series-1:#2A93BD;--series-2:#D9822B;--series-3:#38D39F;--series-4:#C678DD;--series-5:#6C8CFF;--series-6:#FF6B9A;
+  --chart-grid:#25272C;--chart-text:#9DA2AB;
+  --shadow:0 1px 2px rgba(0,0,0,.35),0 8px 24px rgba(0,0,0,.18);
+  --focus:0 0 0 2px var(--bg),0 0 0 4px var(--accent-2);
+  --font:"IBM Plex Sans","Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --fs-0:12px;--fs-1:13px;--fs-2:14.5px;--fs-3:17px;--fs-4:21px;--fs-5:28px;
+  --s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:24px;--s6:32px;
+  --r1:8px;--r2:14px;--pill:999px;--header:60px;--safe:env(safe-area-inset-bottom,0px);
+}
+[data-theme=light]{
+  color-scheme:light;
+  --bg:#F4F5F7;--surface:#FFFFFF;--surface-2:#F3F4F6;--surface-3:#E7E9ED;--line:#E3E5E9;--line-2:#CBCFD6;
+  --text:#141821;--dim:#566070;--faint:#8A93A1;--accent-text:#9A520F;--link:#17698A;
+  --ok:#11795A;--warn:#8F5B00;--bad:#B3261E;--ok-bg:#E6F6F0;--warn-bg:#FDF3E1;--bad-bg:#FCEAEA;
+  --chart-grid:#E3E6EB;--chart-text:#566070;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 18px rgba(16,24,40,.06);
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:var(--fs-2)/1.5 var(--font);min-height:100vh;-webkit-font-smoothing:antialiased}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:none;box-shadow:var(--focus);border-radius:var(--r1)}
+[hidden]{display:none!important}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+/* header */
+.hd{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:var(--s4);height:var(--header);padding:0 var(--s5);background:color-mix(in srgb,var(--surface) 88%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.brand img{height:34px;width:34px;object-fit:contain}
+.brand h1{margin:0;font-size:var(--fs-3);font-weight:700;letter-spacing:.2px;white-space:nowrap;line-height:1.1}
+.brand h1 span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand small{display:block;font-size:11px;color:var(--faint);font-weight:500;letter-spacing:.3px}
+.hd .sp{flex:1}
+nav.tabs{display:flex;gap:4px;padding:4px;background:var(--surface-2);border:1px solid var(--line);border-radius:12px}
+nav.tabs button{display:inline-flex;align-items:center;gap:6px;border:0;background:none;color:var(--dim);font-weight:600;padding:6px 14px;border-radius:9px;cursor:pointer;font-size:var(--fs-1)}
+nav.tabs button svg{width:16px;height:16px;flex:none}
+nav.tabs button:hover{color:var(--text)}
+nav.tabs button[aria-selected=true]{color:var(--text);background:var(--surface);box-shadow:var(--shadow)}
+.pill{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 var(--s3);background:var(--surface-2);border:1px solid var(--line);border-radius:var(--pill);font-size:var(--fs-1);font-weight:600;white-space:nowrap;max-width:40vw;overflow:hidden;text-overflow:ellipsis}
+.dirpill{overflow:visible;max-width:100%;padding-right:4px}.dirpill .mono{min-width:0;white-space:nowrap}
+.icon{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border:1px solid var(--line);border-radius:var(--r1);background:var(--surface-2);color:var(--dim);cursor:pointer;flex:none}
+.icon:hover{color:var(--text);border-color:var(--line-2)}
+.icon svg{width:17px;height:17px}
+/* status marks: shape + colour + word, never colour alone */
+.dot{width:10px;height:10px;border-radius:50%;background:var(--faint);flex:none;display:inline-block}
+.dot.ok{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
+.dot.warn{background:var(--warn);border-radius:2px;transform:rotate(45deg) scale(.85)}
+.dot.bad{background:var(--bad);border-radius:2px}
+.dot.pulse{animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.35}}
+main{max-width:1280px;margin:0 auto;padding:var(--s5) var(--s5) calc(90px + var(--safe))}
+.ph{display:flex;align-items:flex-end;gap:var(--s3);flex-wrap:wrap;margin:0 0 var(--s4)}
+.ph h2{margin:0;font-size:var(--fs-4);font-weight:700;letter-spacing:-.2px}
+.ph p{margin:2px 0 0;color:var(--dim);font-size:var(--fs-1)}
+.ph .sp{flex:1}
+h3{margin:0 0 var(--s3);font-size:var(--fs-2);font-weight:650;display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
+h3 .sp{flex:1}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:var(--s4) var(--s4);margin-bottom:var(--s4);min-width:0;box-shadow:var(--shadow)}
+.grid{display:grid;gap:var(--s4);grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.grid>.card{margin:0}
+.cols>*,.step>*{min-width:0}
+select{max-width:100%;text-overflow:ellipsis}
+html,body{overflow-x:hidden}
+.cols{display:grid;gap:var(--s4);grid-template-columns:minmax(0,5fr) minmax(0,7fr);align-items:start}
+.cols>.card{margin:0}
+.cols.even{grid-template-columns:1fr 1fr}.cols.chat{grid-template-columns:minmax(0,4fr) minmax(0,8fr)}
+@media (max-width:980px){.cols,.cols.even,.cols.chat{grid-template-columns:1fr}.chat-set{order:2}}
+.row{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
+.kv{display:flex;justify-content:space-between;gap:var(--s3);font-size:var(--fs-1);color:var(--dim);padding:3px 0}
+.kv b{color:var(--text);font-weight:600;text-align:right;min-width:0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.tiny{font-size:var(--fs-0);color:var(--dim);font-weight:500}
+.muted{color:var(--dim)}
+.mono{font-family:var(--mono);font-size:var(--fs-1)}
+.bar{height:8px;border-radius:5px;background:var(--surface-3);overflow:hidden;margin:8px 0 6px}
+.bar>i{display:block;height:100%;background:var(--grad);border-radius:5px;transition:width .4s}
+.chip{display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border-radius:var(--pill);font-size:11px;font-weight:700;border:1px solid var(--line-2);color:var(--dim);white-space:nowrap;line-height:18px}
+.chip.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 55%,transparent);background:var(--ok-bg)}
+.chip.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 55%,transparent);background:var(--warn-bg)}
+.chip.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent);background:var(--bad-bg)}
+.chip.pxq{color:var(--accent-text);border-color:var(--accent)}.chip.pxqn{color:var(--link);border-color:var(--accent-2)}
+.find{display:flex;gap:var(--s3);align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--line);font-size:var(--fs-1)}
+.find:last-child{border-bottom:0}
+.find .chip{margin-top:1px;min-width:44px;justify-content:center}
+button.b{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 16px;border-radius:var(--r1);border:1px solid var(--line-2);background:var(--surface-2);font-weight:600;cursor:pointer;font-size:var(--fs-1);transition:background .15s,border-color .15s}
+button.b:hover{border-color:var(--dim)}
+button.b.pri{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+button.b.pri:hover{background:var(--accent-hover)}
+button.b.big{height:48px;font-size:var(--fs-3);padding:0 28px;border-radius:12px;flex:1}
+button.b.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent)}
+button.b:disabled{opacity:.45;cursor:not-allowed}
+button.link{border:0;background:none;color:var(--link);cursor:pointer;padding:0;font-weight:600;font-size:var(--fs-1)}
+input[type=text],input[type=number],select,textarea{background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--r1);padding:8px 10px;min-width:0;height:38px}
+textarea{width:100%;resize:vertical;height:auto}
+input:hover,select:hover,textarea:hover{border-color:var(--dim)}
+label.f{display:grid;gap:5px;font-size:var(--fs-0);color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+label.f>input,label.f>select,label.f>textarea{width:100%;color:var(--text);font-weight:400;text-transform:none;letter-spacing:0;font-size:var(--fs-2)}
+.form{display:grid;gap:var(--s3);grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
+.seg{display:inline-flex;border:1px solid var(--line-2);border-radius:var(--r1);overflow:hidden}
+.seg button{border:0;background:var(--surface-2);padding:6px 14px;cursor:pointer;color:var(--dim);font-weight:600;font-size:var(--fs-1)}
+.seg button+button{border-left:1px solid var(--line-2)}
+.seg button[aria-pressed=true]{background:var(--accent);color:var(--on-accent)}
+.check{display:flex;align-items:center;gap:10px;font-size:var(--fs-1);cursor:pointer}
+.check input{width:17px;height:17px;accent-color:var(--accent);flex:none}
+table{width:100%;border-collapse:collapse;font-size:var(--fs-1)}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+td{font-variant-numeric:tabular-nums}
+th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em;position:sticky;top:0;background:var(--surface)}
+tr.sel td{background:color-mix(in srgb,var(--accent) 9%,transparent)}
+tbody tr.click{cursor:pointer}tbody tr.click:hover td{background:var(--surface-2)}
+.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
+pre.log{margin:0;background:var(--bg);border:1px solid var(--line);border-radius:var(--r1);padding:var(--s2) var(--s3);height:340px;overflow:auto;font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all;color:var(--dim)}
+pre.out{margin:0;background:var(--bg);border:1px solid var(--line);border-radius:var(--r1);padding:var(--s2) var(--s3);max-height:420px;overflow:auto;font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-word}
+.cmd{background:var(--bg);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:var(--r1);padding:var(--s2) var(--s3);font:12.5px/1.55 var(--mono);word-break:break-all}
+details>summary{cursor:pointer;color:var(--dim);font-weight:600;font-size:var(--fs-1);padding:6px 0;list-style:none;display:flex;align-items:center;gap:6px}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"";width:7px;height:7px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(-45deg);transition:transform .15s;margin-right:4px}
+details[open]>summary::before{transform:rotate(45deg)}
+.lever{display:grid;grid-template-columns:minmax(0,1fr) 160px;gap:var(--s3);padding:10px 0;border-bottom:1px solid var(--line)}
+.lever .n{font:600 12.5px var(--mono);overflow-wrap:anywhere}
+.lever .r{font-size:var(--fs-0);color:var(--dim)}
+.lever input{width:100%}
+.lever.set .n{color:var(--accent-text)}
+.levers{max-height:460px;overflow:auto;padding-right:4px}
+.chartbox{position:relative}
+canvas.chart{width:100%;height:260px;display:block}
+.legend{display:flex;gap:var(--s3);flex-wrap:wrap;font-size:var(--fs-0);color:var(--dim);margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.stat{display:grid;gap:2px}.stat .v{font-size:var(--fs-5);font-weight:700;letter-spacing:-.5px;font-variant-numeric:tabular-nums;line-height:1.15}.stat .v small{font-size:var(--fs-2);color:var(--dim);font-weight:600;margin-left:4px}
+.stat .l{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+.msgs{display:flex;flex-direction:column;gap:var(--s3);min-height:320px;max-height:62vh;overflow:auto;padding:var(--s2) 2px}
+.msg{max-width:88%;padding:10px 14px;border-radius:var(--r2);border:1px solid var(--line);background:var(--surface-2);overflow-wrap:anywhere}
+.msg.user{align-self:flex-end;background:color-mix(in srgb,var(--accent) 14%,var(--surface-2));border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
+.msg.assistant{align-self:flex-start}
+.msg .meta{font-size:var(--fs-0);color:var(--dim);margin-top:6px}
+.msg p{margin:.35em 0}.msg pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r1);padding:8px 10px;overflow:auto;font:12.5px/1.45 var(--mono)}
+.msg code{font-family:var(--mono);font-size:.92em;background:var(--bg);padding:1px 4px;border-radius:4px}
+.msg pre code{background:none;padding:0}
+.msg h1,.msg h2,.msg h3,.msg h4{font-size:var(--fs-2);margin:.5em 0 .2em}
+.msg ul,.msg ol{margin:.3em 0;padding-left:1.4em}
+.think{border-left:2px solid var(--line-2);padding-left:8px;color:var(--dim);font-size:var(--fs-1);white-space:pre-wrap;margin-bottom:6px;max-height:220px;overflow:auto}
+.toast{position:fixed;left:50%;bottom:calc(28px + var(--safe));transform:translateX(-50%);background:var(--surface-3);border:1px solid var(--line-2);padding:10px 16px;border-radius:10px;font-size:var(--fs-1);z-index:50;max-width:92vw;box-shadow:var(--shadow);display:flex;gap:8px;align-items:center}
+.toast.bad{border-color:var(--bad);color:var(--bad)}
+.empty{color:var(--dim);font-size:var(--fs-1);padding:var(--s4) 0;display:flex;gap:10px;align-items:center}
+.empty.center{justify-content:center;flex-direction:column;text-align:center;padding:var(--s6) var(--s4)}
+.empty.center b{color:var(--text);font-size:var(--fs-2)}
+.spin{width:16px;height:16px;border-radius:50%;border:2px solid var(--line-2);border-top-color:var(--accent);animation:spin .8s linear infinite;flex:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.skel{background:linear-gradient(90deg,var(--surface-2),var(--surface-3),var(--surface-2));background-size:200% 100%;animation:sh 1.3s linear infinite;border-radius:var(--r2);min-height:150px;border:1px solid var(--line)}
+@keyframes sh{to{background-position:-200% 0}}
+.alert{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:var(--r1);border:1px solid;font-size:var(--fs-1);margin-top:var(--s3)}
+.alert.bad{border-color:color-mix(in srgb,var(--bad) 50%,transparent);background:var(--bad-bg)}
+.alert.ok{border-color:color-mix(in srgb,var(--ok) 50%,transparent);background:var(--ok-bg)}
+.alert.warn{border-color:color-mix(in srgb,var(--warn) 50%,transparent);background:var(--warn-bg)}
+/* quick start */
+.qs{border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
+.step{display:grid;grid-template-columns:28px minmax(0,1fr);gap:var(--s3);padding:var(--s3) 0}
+.step+.step{border-top:1px solid var(--line)}
+.step .num{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:var(--fs-1);background:var(--surface-3);color:var(--dim)}
+.step.done .num{background:var(--accent);color:var(--on-accent)}
+.step h4{margin:3px 0 8px;font-size:var(--fs-2);font-weight:650}
+.tiles{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+.tile{position:relative;display:grid;gap:2px;padding:10px 12px;border:1px solid var(--line-2);border-radius:10px;background:var(--surface-2);cursor:pointer;transition:border-color .15s,background .15s}
+.tile:hover{border-color:var(--dim)}
+.tile input{position:absolute;opacity:0;pointer-events:none}
+.tile:has(input:checked){border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--surface-2));box-shadow:inset 0 0 0 1px var(--accent)}
+.tile:has(input:focus-visible){box-shadow:var(--focus)}
+.tile .t1{font-weight:650;font-size:var(--fs-1);display:flex;gap:6px;align-items:center}
+.tile .t2{font-size:var(--fs-0);color:var(--dim)}
+.tile .tick{position:absolute;top:8px;right:10px;width:16px;height:16px;border-radius:50%;border:1.5px solid var(--line-2)}
+.tile:has(input:checked) .tick{background:var(--accent);border-color:var(--accent)}
+.tile:has(input:checked) .tick::after{content:"";position:absolute;left:4.5px;top:1.5px;width:4px;height:8px;border:solid var(--on-accent);border-width:0 2px 2px 0;transform:rotate(45deg)}
+.fit{margin-top:8px}
+.auto-note{font-size:var(--fs-0);color:var(--dim);margin-top:10px;line-height:1.5}
+@media (max-width:820px){
+  .hd{gap:var(--s2);padding:0 var(--s3);height:56px}
+  .brand small{display:none}
+  .brand img{height:30px;width:30px}
+  nav.tabs{position:fixed;left:0;right:0;bottom:0;border-radius:0;border:0;border-top:1px solid var(--line);background:var(--surface);padding:6px 6px calc(6px + var(--safe));justify-content:space-around;z-index:40;gap:2px}
+  nav.tabs button{flex:1;flex-direction:column;gap:2px;padding:6px 2px;font-size:11px}
+  nav.tabs button svg{width:20px;height:20px}
+  nav.tabs button[aria-selected=true]{box-shadow:none;background:var(--surface-3);color:var(--accent-text)}
+  .pill{max-width:52vw;height:30px}
+  main{padding:var(--s4) var(--s3) calc(96px + var(--safe))}
+  .lever{grid-template-columns:1fr}
+  .card{padding:var(--s3) var(--s3)}
+  .stat .v{font-size:var(--fs-4)}
+  .msg{max-width:96%}
+  .toast{bottom:calc(84px + var(--safe))}
+  canvas.chart{height:220px}
+  /* the model table becomes one card per model on a phone */
+  table.resp thead{display:none}
+  table.resp tr{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;padding:12px 2px;border-bottom:1px solid var(--line)}
+  table.resp td{border:0;padding:0;min-width:0!important}
+  table.resp td:first-child{flex:1 1 100%}
+  table.resp td[data-l]::before{content:attr(data-l) " ";color:var(--faint);font-size:11px;font-weight:600}
+  table.resp td:last-child{flex:1 1 100%}
+  .hide-sm{display:none}
+  .tiles{grid-template-columns:1fr 1fr}
+  .step{grid-template-columns:24px minmax(0,1fr);gap:10px}
+  .step .num{width:24px;height:24px}
+  .tile{padding:9px 10px}
+  .dirpill{max-width:100%}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<header class="hd">
+  <div class="brand"><img src="/mark.png" alt="" width="34" height="34"><h1><span>PXA</span> Control<small>your rig, one click from serving</small></h1></div>
+  <nav class="tabs" role="tablist" id="tabs" aria-label="sections">
+    <button role="tab" data-tab="rig" aria-selected="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h4v4H7zM15 10h2M15 14h2M6 18v2M18 18v2"/></svg>Rig</button>
+    <button role="tab" data-tab="models"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Models</button>
+    <button role="tab" data-tab="launch"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg>Launch</button>
+    <button role="tab" data-tab="speed"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 20h18M6 16l4-5 3 3 5-7"/></svg>Speed</button>
+    <button role="tab" data-tab="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg>Chat</button>
+  </nav>
+  <span class="sp"></span>
+  <span class="pill" id="health" title="server health" role="status" aria-live="polite"><span class="dot" id="hdot"></span><span id="htext">no server</span></span>
+  <button class="icon" id="theme" title="switch light / dark" aria-label="switch light or dark theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>
+</header>
+<main>
+
+<!-- ============================== RIG ============================== -->
+<section id="p-rig" data-page="rig">
+  <div class="ph"><div><h2>Rig <span class="tiny" id="rig-host"></span></h2><p>What this machine has, live. Nothing here changes anything.</p></div></div>
+  <div class="grid" id="rig-static"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
+  <h3 style="margin-top:var(--s5)">Cards <span class="tiny">live, every 3 s</span></h3>
+  <div class="grid" id="rig-cards"><div class="skel" style="min-height:230px"></div><div class="skel" style="min-height:230px"></div><div class="skel" style="min-height:230px"></div></div>
+  <div class="card" style="margin-top:var(--s4)">
+    <h3>Doctor <span class="tiny">pxa-launch --doctor</span><span class="sp"></span><button class="b" id="doc-run">Run again</button></h3>
+    <div id="doc-find" class="empty"><span class="spin"></span>Running the doctor ...</div>
+    <details><summary>full report</summary><pre class="out" id="doc-text"></pre></details>
+  </div>
+</section>
+
+<!-- ============================== MODELS ============================== -->
+<section id="p-models" data-page="models" hidden>
+  <div class="ph"><div><h2>Models</h2><p>Every .gguf under the folders you name. Click a model to launch it.</p></div></div>
+  <div class="card">
+    <h3>Model folders <span class="tiny">remembered in <span id="cfg-path" class="mono"></span></span></h3>
+    <div id="dirs" class="row" style="gap:6px"></div>
+    <div class="row" style="margin-top:10px">
+      <input type="text" id="dir-new" placeholder="/path/to/models" aria-label="folder to add" style="flex:1;min-width:200px">
+      <button class="b" id="dir-add">Add folder</button>
+      <button class="b" id="models-rescan">Rescan</button>
+    </div>
+    <div class="tiny" id="models-notes" style="margin-top:6px"></div>
+  </div>
+  <div class="card">
+    <h3>Library <span class="tiny" id="models-count"></span></h3>
+    <div class="tiny" style="margin-bottom:8px">"Fits on" is the launcher's own VRAM check (weights + KV estimate at one 4096-token slot) on idle cards: <span class="chip ok">&#10003; fits</span> <span class="chip warn">! tight</span> <span class="chip bad">&#10005; no</span></div>
+    <div class="tw"><table class="resp"><thead><tr><th>Model</th><th>Codec</th><th>Type</th><th>Params</th><th>Size</th><th>Family</th><th>Fits on</th></tr></thead><tbody id="models-body"><tr><td colspan="7"><div class="empty"><span class="spin"></span>Reading model headers ... the first scan of a big library on a spinning disk can take half a minute.</div></td></tr></tbody></table></div>
+  </div>
+</section>
+
+<!-- ============================== LAUNCH ============================== -->
+<section id="p-launch" data-page="launch" hidden>
+  <div class="ph"><div><h2>Launch</h2><p>Pick cards and a model. The launcher picks the engine, split, context and flags, and tells you why.</p></div></div>
+  <div class="cols">
+    <div>
+      <div class="card qs">
+        <h3>Quick start</h3>
+        <div class="step" id="st1"><span class="num">1</span><div><h4>Choose your cards</h4><div id="l-cards" class="tiles"></div></div></div>
+        <div class="step" id="st2"><span class="num">2</span><div><h4>Choose a model</h4>
+          <select id="l-model" style="width:100%" aria-label="model"></select>
+          <div class="tiny" id="l-model-info" style="margin-top:6px"></div>
+          <div id="l-fit" class="fit"></div></div></div>
+        <div class="step" id="st3"><span class="num">3</span><div><h4>Start serving</h4>
+          <div class="row"><button class="b pri big" id="b-start">Start</button><button class="b danger" id="b-stop" style="height:48px">Stop</button></div>
+          <div class="auto-note">Everything else is automatic. Settings below are optional; leave them on auto unless you know you need one.</div></div></div>
+      </div>
+      <div class="card">
+        <details id="adv-settings">
+          <summary>Advanced settings (optional)</summary>
+          <div class="form" style="margin-top:10px">
+            <label class="f">Context (0 = auto)<input type="number" id="l-ctx" min="0" step="1024" value="0"></label>
+            <label class="f">Parallel slots (0 = auto)<input type="number" id="l-np" min="0" max="64" value="0"></label>
+            <label class="f">KV cache type<select id="l-kv"></select></label>
+            <label class="f">Server port (empty = auto)<input type="number" id="l-port" min="0" max="65535" placeholder="auto"></label>
+          </div>
+          <div style="display:grid;gap:12px;margin-top:14px">
+            <div class="row"><span class="tiny" style="width:120px">Split mode</span><span class="seg" id="l-sm" data-v="auto"><button data-v="auto">auto</button><button data-v="layer">layer</button><button data-v="tensor">tensor</button></span></div>
+            <div class="row"><span class="tiny" style="width:120px">Flash attention</span><span class="seg" id="l-fa" data-v="auto"><button data-v="auto">auto</button><button data-v="on">on</button><button data-v="off">off</button></span></div>
+            <label class="check"><input type="checkbox" id="l-mtp"> MTP speculation (--spec mtp, needs MTP tensors in the file)</label>
+            <label class="check"><input type="checkbox" id="l-expose"> Serve on the network (--host 0.0.0.0)</label>
+            <label class="check"><input type="checkbox" id="l-unmeasured"> Accept UNMEASURED branches (--accept-unmeasured)</label>
+            <label class="check"><input type="checkbox" id="l-busy"> Allow busy cards (--allow-busy)</label>
+          </div>
+          <details id="adv" style="margin-top:12px">
+            <summary>PXA levers <span id="adv-count"></span></summary>
+            <div class="tiny" style="margin:6px 0">Only names from the lever catalog (<span id="adv-src" class="mono"></span>) are accepted. Empty = the engine's default. Values go into the server's environment.</div>
+            <div class="row" style="margin-bottom:6px">
+              <input type="text" id="adv-q" placeholder="filter levers" aria-label="filter levers" style="flex:1;min-width:140px">
+              <label class="check"><input type="checkbox" id="adv-all"> show diagnostics</label>
+            </div>
+            <div class="levers" id="adv-list"></div>
+          </details>
+          <h3 style="margin-top:16px">Presets</h3>
+          <div class="row">
+            <select id="p-sel" style="flex:1;min-width:120px" aria-label="preset"></select>
+            <button class="b" id="p-load">Load</button>
+            <button class="b danger" id="p-del">Delete</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <input type="text" id="p-name" placeholder="preset name" aria-label="preset name" style="flex:1;min-width:120px" maxlength="48">
+            <button class="b" id="p-save">Save current</button>
+          </div>
+        </details>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h3>Server<span class="sp"></span><span class="pill"><span class="dot" id="s-dot"></span><span id="s-phase">stopped</span></span></h3>
+        <div class="row">
+          <button class="b" id="b-plan">Show plan</button>
+          <button class="b" id="b-restart">Restart</button>
+        </div>
+        <div class="tiny" id="s-info" style="margin-top:8px"></div>
+        <div id="s-alert"></div>
+      </div>
+      <div class="card">
+        <h3>Plan <span class="tiny" id="plan-engine"></span></h3>
+        <div id="plan-empty" class="empty">Choose cards and a model, then Show plan to see the exact command. Nothing starts until you press Start.</div>
+        <div id="plan-box" hidden>
+          <div class="tiny">command</div><div class="cmd" id="plan-cmd"></div>
+          <div class="tiny" style="margin-top:8px">same thing on a command line</div><div class="cmd" id="plan-cli"></div>
+          <div id="plan-notes" style="margin-top:8px"></div>
+          <details><summary>the launcher's full report</summary><pre class="out" id="plan-text"></pre></details>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Log <span class="tiny" id="log-mode"></span><span class="sp"></span><label class="check tiny"><input type="checkbox" id="log-follow" checked> follow</label></h3>
+        <pre class="log" id="log" aria-live="off"><span class="muted">The server's output appears here once it starts.</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== SPEED ============================== -->
+<section id="p-speed" data-page="speed" hidden>
+  <div class="ph"><div><h2>Speed</h2><p id="sp-src">&nbsp;</p></div><span class="sp"></span><span class="seg" id="sp-range" data-v="3600" aria-label="time range"><button data-v="3600">1 h</button><button data-v="86400">24 h</button><button data-v="604800">7 d</button></span></div>
+  <div class="grid" id="sp-stats"></div>
+  <div class="cols even" style="margin-top:var(--s4)">
+    <div class="card"><h3>Decode speed <span class="tiny">tokens per second, per request</span></h3><div class="chartbox"><canvas class="chart" id="ch-dec" role="img" aria-label="decode tokens per second over time"></canvas></div><div class="legend" id="lg-dec"></div></div>
+    <div class="card"><h3>Prefill speed <span class="tiny">tokens per second, per request</span></h3><div class="chartbox"><canvas class="chart" id="ch-pre" role="img" aria-label="prefill tokens per second over time"></canvas></div><div class="legend" id="lg-pre"></div></div>
+  </div>
+  <div class="card" style="margin-top:var(--s4)">
+    <h3>Medians by prompt size</h3>
+    <div class="tw"><table><thead><tr><th>Model</th><th>Prompt tokens</th><th>Requests</th><th>Decode t/s</th><th>Prefill t/s</th></tr></thead><tbody id="sp-med"></tbody></table></div>
+  </div>
+  <div class="card">
+    <h3>Benchmark my rig <span class="tiny">pxa-bench prompts: prose / edit / long, greedy512 sha</span></h3>
+    <div class="row" style="align-items:flex-end">
+      <label class="f" style="width:120px">Warm-up (s)<input type="number" id="bn-warm" min="0" max="120" value="10"></label>
+      <label class="f" style="width:100px">Reps<input type="number" id="bn-reps" min="1" max="6" value="3"></label>
+      <button class="b pri" id="bn-run">Run benchmark</button>
+      <a id="sp-link" href="/api/engine/pxa/speed" target="_blank" rel="noopener" style="margin-left:auto;font-size:var(--fs-1)">server's own /pxa/speed page &#8599;</a>
+    </div>
+    <pre class="out" id="bn-lines" style="margin-top:10px;max-height:160px" hidden></pre>
+    <div class="tw" style="margin-top:10px"><table><thead><tr><th>When</th><th>Model</th><th>Cards</th><th>prose dec t/s</th><th>edit dec t/s</th><th>long dec t/s</th><th>long prefill t/s</th><th>greedy512</th></tr></thead><tbody id="bn-hist"></tbody></table></div>
+  </div>
+</section>
+
+<!-- ============================== CHAT ============================== -->
+<section id="p-chat" data-page="chat" hidden>
+  <div class="ph"><div><h2>Chat <span class="tiny" id="chat-model"></span></h2><p>Streams from the running server's OpenAI endpoint.</p></div></div>
+  <div class="cols chat">
+    <div class="card chat-set">
+      <h3>Settings</h3>
+      <label class="f">System prompt<textarea id="c-sys" rows="4" placeholder="You are a helpful assistant."></textarea></label>
+      <div class="form" style="margin-top:12px;grid-template-columns:1fr 1fr">
+        <label class="f">Temperature<input type="number" id="c-temp" min="0" max="2" step="0.1" value="0.7"></label>
+        <label class="f">Max tokens<input type="number" id="c-max" min="1" max="32768" value="1024"></label>
+      </div>
+      <label class="check" style="margin-top:12px"><input type="checkbox" id="c-think"> Thinking (chat_template_kwargs.enable_thinking)</label>
+      <div class="row" style="margin-top:14px"><button class="b" id="c-clear">New chat</button></div>
+      <div class="tiny" style="margin-top:14px">Attach to a server started elsewhere on this machine (0 = detach):</div>
+      <div class="row" style="margin-top:6px"><input type="number" id="c-attach" min="0" max="65535" placeholder="port" aria-label="port to attach to" style="width:120px"><button class="b" id="c-attach-b">Attach</button></div>
+    </div>
+    <div class="card">
+      <div class="msgs" id="msgs" aria-live="polite"><div class="empty center" id="msgs-empty"><b>No conversation yet</b><span>Start a server on the Launch tab, then say something.</span></div></div>
+      <div class="row" style="margin-top:12px;align-items:flex-end;flex-wrap:nowrap">
+        <textarea id="c-in" rows="3" placeholder="Write a prompt. Enter sends, Shift+Enter is a new line." aria-label="prompt" style="flex:1;min-width:0"></textarea>
+        <div style="display:grid;gap:6px"><button class="b pri" id="c-send">Send</button><button class="b" id="c-stop" disabled>Stop</button></div>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script>
+"use strict";
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+}
+function toast(msg, bad) {
+  const t = $("#toast"); t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); t.hidden = false;
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, bad ? 6000 : 2600);
+}
+async function api(path, opts) {
+  opts = opts || {};
+  const init = {method: opts.method || (opts.body !== undefined ? "POST" : "GET"), headers: {}};
+  if (opts.body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(opts.body); }
+  const r = await fetch(path, init);
+  let j = null; try { j = await r.json(); } catch (e) { /* non-JSON */ }
+  if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+  return j;
+}
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("pxa-control." + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem("pxa-control." + k, JSON.stringify(v)); } catch (e) { /* private mode */ } },
+};
+const fmtNum = (v, d) => (v == null || isNaN(v)) ? "-" : Number(v).toFixed(d == null ? 1 : d);
+function fmtParams(n) { if (!n) return "-"; if (n >= 1e9) return (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + "B"; if (n >= 1e6) return (n / 1e6).toFixed(0) + "M"; return String(n); }
+function fmtDur(s) { s = Math.max(0, Math.round(s)); return s < 90 ? s + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h"; }
+function fmtAgo(ts) { const s = Date.now() / 1000 - ts; if (s < 90) return Math.round(s) + " s ago"; if (s < 5400) return Math.round(s / 60) + " min ago"; if (s < 172800) return Math.round(s / 3600) + " h ago"; return Math.round(s / 86400) + " d ago"; }
+function segInit(seg, onchange) {
+  const set = v => { seg.dataset.v = v; $$("button", seg).forEach(b => b.setAttribute("aria-pressed", b.dataset.v === v)); };
+  $$("button", seg).forEach(b => b.addEventListener("click", () => { set(b.dataset.v); onchange && onchange(b.dataset.v); }));
+  set(seg.dataset.v); seg.setv = set;
+}
+
+// ---------------- theme ----------------
+function applyTheme(t, keep) { document.documentElement.dataset.theme = t; if (keep) store.set("theme", t); if (S.speedData) drawSpeed(); }
+$("#theme").addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true));
+function defaultTheme() { try { return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"; } catch (e) { return "dark"; } }
+
+// ---------------- state + tabs ----------------
+const S = {tab: "rig", rig: null, models: null, levers: [], leverVals: store.get("levers", {}), gpus: [],
+           status: null, logSeq: 0, es: null, speedData: null, chat: [], abort: null, info: null};
+function showTab(t) {
+  S.tab = t; store.set("tab", t);
+  $$("#tabs button").forEach(b => b.setAttribute("aria-selected", b.dataset.tab === t));
+  $$("main>section").forEach(s => s.hidden = s.dataset.page !== t);
+  if (t === "rig") loadRig();
+  if (t === "models") loadModels();
+  if (t === "launch") { loadModels(); renderLaunchCards(); }
+  if (t === "speed") loadSpeed();
+  if (t === "chat") $("#c-in").focus();
+  if (location.hash !== "#" + t) history.replaceState(null, "", "#" + t);
+}
+$$("#tabs button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
+const TABS = ["rig", "models", "launch", "speed", "chat"];
+// a typed or bookmarked #tab (and Back/Forward) switches the page; it used to leave the old tab showing
+window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (TABS.includes(t) && t !== S.tab) showTab(t); });
+const MARK = {ok: "\u2713", warn: "!", bad: "\u2715"};
+function badge(level, text) { return el("span", {class: "chip " + level}, el("span", {"aria-hidden": "true", text: MARK[level] || ""}), text); }
+
+// ---------------- RIG ----------------
+async function loadRig(force) {
+  try {
+    const d = await api("/api/rig" + (force ? "?force=1" : ""));
+    S.rig = d; S.gpus = d.live.cards; renderRigStatic(d.static); renderRigCards(d.live);
+  } catch (e) { toast("rig: " + e.message, true); }
+  if (!S.doctor) loadDoctor(false);
+}
+function renderRigStatic(s) {
+  $("#rig-host").textContent = s.hostname || "";
+  const shm = !s.shm_bytes ? "missing" : s.shm_bytes >= 1073741824 ? (s.shm_bytes / 1073741824).toFixed(1) + " GiB" : (s.shm_bytes / 1048576).toFixed(0) + " MiB";
+  const box = $("#rig-static"); box.replaceChildren(
+    el("div", {class: "card"}, el("div", {class: "stat"}, el("span", {class: "l", text: "Driver"}), el("span", {class: "v", text: s.driver || "?"})),
+       el("div", {class: "kv"}, "CUDA", el("b", {text: s.cuda || "?"}))),
+    el("div", {class: "card"}, el("div", {class: "stat"}, el("span", {class: "l", text: "/dev/shm"}), el("span", {class: "v", text: shm})),
+       el("div", {class: "kv"}, "container", el("b", {text: s.container || "none (host)"})),
+       s.shm_ok ? null : el("div", {class: "tiny", style: "color:var(--warn)", text: "under 1 GiB: a multi-card reduce needs more (docker --shm-size=1g)"})),
+    el("div", {class: "card"}, el("div", {class: "stat"}, el("span", {class: "l", text: "Engine"}), el("span", {class: "v", style: "font-size:var(--fs-3);margin-top:4px"}, s.engine_ok ? badge("ok", "ready") : badge("bad", s.engine_dir ? "will not start" : "not found"))),
+       el("div", {class: "kv"}, "build", el("b", {class: "mono", text: s.engine_dir || "-"})),
+       el("div", {class: "tiny", style: s.engine_ok ? "" : "color:var(--bad)", text: s.engine_note || ""})));
+}
+function renderRigCards(live) {
+  const box = $("#rig-cards");
+  if (!live.cards.length) { box.replaceChildren(el("div", {class: "empty", text: live.error || "no NVIDIA cards visible"})); return; }
+  box.replaceChildren(...live.cards.map(c => {
+    const pct = c.mem_total_mib ? Math.round(100 * c.mem_used_mib / c.mem_total_mib) : 0;
+    const link = c.pcie_width ? `x${c.pcie_width} gen${c.pcie_gen}` + ((c.pcie_width_max && (c.pcie_width_max !== c.pcie_width || c.pcie_gen_max !== c.pcie_gen)) ? ` (max x${c.pcie_width_max} gen${c.pcie_gen_max})` : "") : "?";
+    const busy = c.procs.length || c.mem_used_mib > 512;
+    const hot = c.temp_c != null && c.temp_c >= 83;
+    return el("div", {class: "card"},
+      el("h3", {}, el("span", {class: "mono", text: "#" + c.index}), c.name, busy ? badge("warn", "busy") : badge("ok", "idle")),
+      el("div", {class: "tiny", text: c.class}),
+      el("div", {class: "bar"}, el("i", {style: `width:${pct}%`})),
+      el("div", {class: "kv"}, "VRAM", el("b", {text: `${(c.mem_used_mib / 1024).toFixed(1)} / ${(c.mem_total_mib / 1024).toFixed(1)} GiB`})),
+      el("div", {class: "kv"}, "Temperature", el("b", {style: hot ? "color:var(--bad)" : "", text: c.temp_c != null ? c.temp_c + " °C" + (hot ? "  hot" : "") : "?"})),
+      el("div", {class: "kv"}, "Power", el("b", {text: c.power_w != null ? `${fmtNum(c.power_w, 0)} / ${fmtNum(c.power_limit_w, 0)} W` : "?"})),
+      el("div", {class: "kv"}, "Utilisation", el("b", {text: c.util_pct != null ? c.util_pct + " %" : "?"})),
+      el("div", {class: "kv"}, "PCIe link", el("b", {style: c.narrow ? "color:var(--warn)" : "", text: link + (c.narrow ? "  narrow" : "")})),
+      c.procs.length ? el("div", {class: "tiny", style: "margin-top:4px", text: c.procs.map(p => `pid ${p.pid} ${p.name} ${p.mib} MiB`).join(", ")}) : null);
+  }));
+}
+async function loadDoctor(force) {
+  $("#doc-find").className = "empty"; $("#doc-find").replaceChildren(el("span", {class: "spin"}), "Running the doctor ...");
+  try {
+    const d = await api("/api/doctor" + (force ? "?force=1" : ""));
+    S.doctor = d; $("#doc-text").textContent = d.text;
+    const f = $("#doc-find"); f.className = "";
+    f.replaceChildren(...(d.findings.length ? d.findings : [{level: "warn", text: "no findings parsed; see the full report"}]).map(x =>
+      el("div", {class: "find"}, badge(x.level, {ok: "OK", warn: "note", bad: "fix"}[x.level] || x.level), el("span", {text: x.text}))));
+  } catch (e) { $("#doc-find").textContent = "doctor failed: " + e.message; }
+}
+$("#doc-run").addEventListener("click", () => loadDoctor(true));
+setInterval(async () => {
+  if (document.hidden || (S.tab !== "rig" && S.tab !== "launch")) return;
+  try { const live = await api("/api/rig/live"); S.gpus = live.cards; if (S.tab === "rig") renderRigCards(live); } catch (e) { /* keep last */ }
+}, 3000);
+
+// ---------------- MODELS ----------------
+async function loadModels(force) {
+  if (S.models && !force) { renderModels(); return; }
+  try {
+    S.models = await api("/api/models" + (force ? "?force=1" : ""));
+    if (!S.gpus.length) { const live = await api("/api/rig/live"); S.gpus = live.cards; }
+    renderModels(); loadFits();
+  } catch (e) { toast("models: " + e.message, true); $("#models-body").replaceChildren(el("tr", {}, el("td", {colspan: 7, class: "empty", text: "Could not read the library: " + e.message}))); }
+}
+function cardSets() {
+  const sets = [], seen = new Set(), add = (ids, label) => { const k = ids.join(","); if (ids.length && !seen.has(k)) { seen.add(k); sets.push({ids, label}); } };
+  const sel = selectedCards(); if (sel.length) add(sel, "your pick");
+  const groups = {};
+  for (const c of S.gpus) (groups[c.name] = groups[c.name] || []).push(c.index);
+  for (const [name, ids] of Object.entries(groups)) {
+    const short = name.replace(/^(Tesla |GeForce )/, "").replace(/-PCIE.*$/, "");
+    add([ids[0]], "1x " + short); if (ids.length > 1) add(ids, ids.length + "x " + short);
+  }
+  return sets.slice(0, 8);
+}
+async function loadFits() {
+  const sets = cardSets(); S.fitSets = sets;
+  if (!sets.length || !S.models || !S.models.models.length) return;
+  try { S.fits = await api("/api/models/fits", {body: {card_sets: sets.map(s => s.ids), ctx: 0}}); renderModels(); } catch (e) { /* badges are optional */ }
+  renderFit();
+}
+function renderModels() {
+  const m = S.models; if (!m) return;
+  $("#cfg-path").textContent = (S.info && S.info.config) || "~/.config/pxa/control.json";
+  $("#dirs").replaceChildren(...(m.roots.length ? m.roots.map(r => el("span", {class: "pill dirpill", title: r}, el("span", {class: "mono", style: "overflow:hidden;text-overflow:ellipsis", text: r}),
+      el("button", {class: "icon", style: "width:22px;height:22px;border:0", title: "remove", "aria-label": "remove " + r, onclick: () => saveDirs(m.roots.filter(x => x !== r))}, "×")))
+    : [el("span", {class: "tiny", text: "No folders yet. Add the folder that holds your .gguf files."})]));
+  $("#models-notes").textContent = (m.notes || []).join(" · ");
+  $("#models-count").textContent = m.models.length + " file(s)";
+  const sel = $("#l-model").value;
+  $("#models-body").replaceChildren(...(m.models.length ? m.models.map(x => {
+    const fits = (S.fits && S.fits[x.path]) || [];
+    return el("tr", {class: "click" + (x.path === sel ? " sel" : ""), onclick: () => { $("#l-model").value = x.path; store.set("model", x.path); modelInfo(); showTab("launch"); }},
+      el("td", {}, el("div", {style: "font-weight:600;overflow-wrap:anywhere", text: x.file}), el("div", {class: "tiny mono hide-sm", style: "overflow-wrap:anywhere", text: x.path})),
+      el("td", {}, el("span", {class: "chip " + (x.codec === "PXQ" ? "pxq" : x.codec === "PXQN" ? "pxqn" : ""), text: x.codec})),
+      el("td", {class: "mono", text: x.type || (x.err ? "unreadable" : "-")}),
+      el("td", {"data-l": "params", text: x.size_label || fmtParams(x.params)}),
+      el("td", {"data-l": "size", text: x.size_h}),
+      el("td", {}, x.family, el("div", {class: "tiny hide-sm", text: x.arch || ""})),
+      el("td", {style: "min-width:150px"}, ...fits.map((f, i) => { const lv = f.verdict === "fits" ? "ok" : f.verdict === "tight" ? "warn" : "bad";
+        const b = badge(lv, (S.fitSets[i] ? S.fitSets[i].label : f.cards.join(","))); b.title = f.why || ""; b.style.margin = "1px"; return b; })));
+  }) : [el("tr", {}, el("td", {colspan: 7, class: "empty", text: m.roots.length ? "No .gguf files under these folders." : "Add a model folder above to see your models here."}))]));
+  fillModelSelect();
+}
+async function saveDirs(dirs) {
+  try { const d = await api("/api/models/dirs", {body: {model_dirs: dirs}}); S.models = d.models; renderModels(); loadFits(); toast("folders saved"); }
+  catch (e) { toast(e.message, true); }
+}
+$("#dir-add").addEventListener("click", () => { const v = $("#dir-new").value.trim(); if (!v) return; saveDirs([...(S.models ? S.models.roots : []), v]); $("#dir-new").value = ""; });
+$("#models-rescan").addEventListener("click", () => loadModels(true));
+
+// ---------------- LAUNCH ----------------
+function selectedCards() { return $$("#l-cards input:checked").map(i => +i.value); }
+function renderLaunchCards() {
+  const keep = new Set(store.get("cards", []));
+  const box = $("#l-cards");
+  if (!S.gpus.length) { api("/api/rig/live").then(l => { S.gpus = l.cards; if (l.cards.length) renderLaunchCards(); else box.replaceChildren(el("div", {class: "empty", text: "no cards visible"})); }).catch(() => {}); return; }
+  const prev = $$("#l-cards input").length ? new Set(selectedCards()) : keep;
+  box.replaceChildren(...S.gpus.map(c => {
+    const busy = c.procs.length || c.mem_used_mib > 512;
+    const short = c.name.replace(/^(Tesla |GeForce )/, "").replace(/-PCIE.*$/, "");
+    const st = busy ? badge("warn", `busy ${(c.mem_used_mib / 1024).toFixed(1)} GiB`) : badge("ok", "idle");
+    if (busy) st.title = c.procs.map(p => p.name).join(", ");
+    return el("label", {class: "tile"},
+      el("input", {type: "checkbox", value: c.index, checked: prev.has(c.index), "aria-label": `card ${c.index} ${c.name}`, onchange: () => { store.set("cards", selectedCards()); loadFits(); steps(); }}),
+      el("span", {class: "tick", "aria-hidden": "true"}),
+      el("span", {class: "t1"}, el("span", {class: "mono", text: "#" + c.index}), short),
+      el("span", {class: "t2", text: `${(c.mem_total_mib / 1024).toFixed(0)} GiB · sm_${c.sm}`}),
+      el("span", {style: "margin-top:4px"}, st));
+  }));
+  steps();
+}
+function steps() {
+  const cards = selectedCards().length > 0, model = !!$("#l-model").value, run = S.status && S.status.running;
+  $("#st1").classList.toggle("done", cards); $("#st2").classList.toggle("done", model); $("#st3").classList.toggle("done", !!run);
+  $("#b-start").disabled = !cards || !model || !!run;
+  $("#b-start").textContent = run ? "Running" : "Start";
+  renderFit();
+}
+function renderFit() {
+  const box = $("#l-fit"); if (!box) return;
+  const path = $("#l-model").value, sel = selectedCards();
+  if (!path || !sel.length) { box.replaceChildren(); return; }
+  const i = (S.fitSets || []).findIndex(s => s.label === "your pick" && s.ids.join(",") === sel.join(","));
+  const f = i >= 0 && S.fits && S.fits[path] && S.fits[path][i];
+  if (!f) {
+    box.replaceChildren(el("span", {class: "tiny", text: "checking the fit ..."}));
+    const k = sel.join(","); if (S.fitAsked !== k) { S.fitAsked = k; loadFits(); }   // the pick changed since the last fit table
+    return;
+  }
+  const lv = f.verdict === "fits" ? "ok" : f.verdict === "tight" ? "warn" : "bad";
+  const word = {ok: "fits on these cards", warn: "tight fit on these cards", bad: "does not fit on these cards"}[lv];
+  box.replaceChildren(el("div", {class: "row", style: "gap:6px"}, badge(lv, word), el("span", {class: "tiny", text: f.why || ""})));
+}
+function fillModelSelect() {
+  const s = $("#l-model"), cur = s.value || store.get("model", "");
+  s.replaceChildren(el("option", {value: "", text: "- choose a model -"}), ...(S.models ? S.models.models : []).map(m =>
+    el("option", {value: m.path, text: `${m.file}  (${m.type || m.codec}, ${m.size_h})`})));
+  if (cur) s.value = cur;
+  if (s.value !== cur) s.value = "";
+  modelInfo(); steps();
+}
+function modelInfo() {
+  const m = S.models && S.models.models.find(x => x.path === $("#l-model").value);
+  $("#l-model-info").textContent = m ? `${m.family}, arch ${m.arch || "?"}, ${m.size_label || fmtParams(m.params)} params, trained ctx ${m.n_ctx_train || "?"}${m.vision ? ", vision" : ""}` : "";
+}
+$("#l-model").addEventListener("change", () => { store.set("model", $("#l-model").value); modelInfo(); steps(); });
+segInit($("#l-sm")); segInit($("#l-fa"));
+function launchBody() {
+  const levers = {};
+  for (const [k, v] of Object.entries(S.leverVals)) if (v !== "" && v != null) levers[k] = v;
+  return {gpus: selectedCards(), model: $("#l-model").value, ctx: +$("#l-ctx").value || 0, np: +$("#l-np").value || 0,
+          kv: $("#l-kv").value, port: +$("#l-port").value || 0, sm: $("#l-sm").dataset.v, fa: $("#l-fa").dataset.v,
+          mtp: $("#l-mtp").checked, expose: $("#l-expose").checked, accept_unmeasured: $("#l-unmeasured").checked,
+          allow_busy: $("#l-busy").checked, levers};
+}
+function applyBody(b) {
+  if (!b) return;
+  store.set("cards", b.gpus || []); renderLaunchCards();
+  $$("#l-cards input").forEach(i => i.checked = (b.gpus || []).includes(+i.value));
+  if (b.model) { $("#l-model").value = b.model; store.set("model", b.model); modelInfo(); }
+  $("#l-ctx").value = b.ctx || 0; $("#l-np").value = b.np || 0; $("#l-kv").value = b.kv || "f16"; $("#l-port").value = b.port || "";
+  $("#l-sm").setv(b.sm || "auto"); $("#l-fa").setv(b.fa || "auto");
+  $("#l-mtp").checked = !!b.mtp; $("#l-expose").checked = !!b.expose; $("#l-unmeasured").checked = !!b.accept_unmeasured; $("#l-busy").checked = !!b.allow_busy;
+  S.leverVals = Object.assign({}, b.levers || {}); store.set("levers", S.leverVals); renderLevers();
+}
+function renderPlan(d) {
+  $("#plan-empty").hidden = true; $("#plan-box").hidden = false;
+  $("#plan-text").textContent = d.text || "";
+  $("#plan-cli").textContent = d.cli || "";
+  if (d.ok) {
+    $("#plan-engine").textContent = `engine ${d.engine}, cards ${d.cards}, ctx ${d.ctx}, -sm ${d.sm}`;
+    const envs = Object.entries(d.env || {}).map(([k, v]) => `${k}=${v}`).join(" ");
+    $("#plan-cmd").textContent = (envs ? envs + " " : "") + d.command;
+    $("#plan-notes").replaceChildren(...(d.notes || []).map(n => el("div", {class: "find"}, el("span", {class: "dot warn"}), el("span", {text: n}))),
+      ...(d.blockers || []).map(n => el("div", {class: "find"}, el("span", {class: "dot bad"}), el("span", {text: n}))));
+    $("#plan-box details").open = false;
+  } else {
+    $("#plan-engine").textContent = `the launcher refused (exit ${d.exit})`;
+    $("#plan-cmd").textContent = "not started: read the report below";
+    const refs = (d.text || "").split("\n").filter(l => /\[R-\d|!!|REFUSING to/.test(l)).slice(0, 12);
+    $("#plan-notes").replaceChildren(...refs.map(n => el("div", {class: "find"}, el("span", {class: "dot bad"}), el("span", {text: n.trim()}))));
+    $("#plan-box details").open = true;
+  }
+}
+async function doPlan() {
+  $("#b-plan").disabled = true;
+  try { renderPlan(await api("/api/plan", {body: launchBody()})); } catch (e) { toast(e.message, true); }
+  $("#b-plan").disabled = false;
+}
+async function doStart() {
+  $("#b-start").disabled = true;
+  try {
+    const d = await api("/api/start", {body: launchBody()});
+    if (!d.ok) { renderPlan(d); toast("the launcher refused; see the plan", true); }
+    else { toast("server starting: loading the model can take a minute or two"); openLog(); S.startedAt = Date.now();
+      if (matchMedia("(max-width: 980px)").matches) $("#s-phase").closest(".card").scrollIntoView({behavior: "smooth", block: "start"});
+      if (d.plan) renderPlan(d.plan); }
+  } catch (e) { toast(e.message, true); }
+  await pollStatus(); steps();
+}
+$("#b-plan").addEventListener("click", doPlan);
+$("#b-start").addEventListener("click", doStart);
+$("#b-stop").addEventListener("click", async () => { $("#b-stop").disabled = true; try { await api("/api/stop", {body: {}}); toast("server stopped"); } catch (e) { toast(e.message, true); } pollStatus(); });
+$("#b-restart").addEventListener("click", async () => {
+  try { const d = await api("/api/restart", {body: launchBody()}); if (!d.ok) { renderPlan(d); toast("the launcher refused", true); } else { toast("restarting"); S.startedAt = Date.now(); if (d.plan) renderPlan(d.plan); openLog(); } }
+  catch (e) { toast(e.message, true); } pollStatus();
+});
+
+// levers
+async function loadLevers() {
+  try { const d = await api("/api/levers"); S.levers = d.levers; $("#adv-src").textContent = d.src || "catalog not found"; renderLevers(); } catch (e) { /* optional */ }
+}
+function renderLevers() {
+  const q = $("#adv-q").value.trim().toUpperCase(), all = $("#adv-all").checked;
+  const set = Object.keys(S.leverVals).filter(k => S.leverVals[k] !== "");
+  $("#adv-count").textContent = S.levers.length ? `(${S.levers.length}${set.length ? ", " + set.length + " set" : ""})` : "";
+  const rows = S.levers.filter(l => (all || !["diagnostic", "site"].includes(l.status) || S.leverVals[l.name]) &&
+    (!q || l.name.includes(q) || (l.rule || "").toUpperCase().includes(q)));
+  $("#adv-list").replaceChildren(...rows.slice(0, 250).map(l => {
+    const v = S.leverVals[l.name] || "";
+    return el("div", {class: "lever" + (v ? " set" : "")},
+      el("div", {}, el("div", {class: "n"}, l.name, " ", el("span", {class: "chip " + (l.status === "default-on" ? "ok" : l.status === "lever-off" ? "" : "warn"), text: l.status})),
+        el("div", {class: "r", text: "default: " + l.default}), el("div", {class: "r", text: l.rule})),
+      el("input", {type: "text", value: v, placeholder: "default", "aria-label": l.name, maxlength: 200,
+        oninput: e => { const val = e.target.value.trim(); if (val) S.leverVals[l.name] = val; else delete S.leverVals[l.name]; store.set("levers", S.leverVals); e.target.closest(".lever").classList.toggle("set", !!val); }}));
+  }), rows.length > 250 ? el("div", {class: "tiny", text: `${rows.length - 250} more: narrow the filter`}) : "");
+}
+$("#adv-q").addEventListener("input", renderLevers);
+$("#adv-all").addEventListener("change", renderLevers);
+
+// presets
+async function loadPresets(select) {
+  try {
+    const p = await api("/api/presets"); S.presets = p;
+    const s = $("#p-sel"); s.replaceChildren(...(Object.keys(p).length ? Object.keys(p).sort().map(n => el("option", {value: n, text: n})) : [el("option", {value: "", text: "no presets yet"})]));
+    if (select) s.value = select;
+  } catch (e) { /* optional */ }
+}
+$("#p-save").addEventListener("click", async () => {
+  const name = $("#p-name").value.trim(); if (!name) { toast("name the preset", true); return; }
+  try { await api("/api/presets", {body: {name, settings: launchBody()}}); await loadPresets(name); toast("preset saved"); } catch (e) { toast(e.message, true); }
+});
+$("#p-load").addEventListener("click", () => { const p = S.presets && S.presets[$("#p-sel").value]; if (p) { applyBody(p); toast("preset loaded"); } });
+$("#p-del").addEventListener("click", async () => {
+  const n = $("#p-sel").value; if (!n) return;
+  try { await api("/api/presets", {method: "DELETE", body: {name: n}}); await loadPresets(); toast("deleted"); } catch (e) { toast(e.message, true); }
+});
+
+// status + log
+async function pollStatus() {
+  try {
+    const s = await api("/api/status"); S.status = s;
+    const h = s.health, run = s.running || s.attached;
+    const failed = !s.running && s.exit_code != null && s.exit_code !== 0 && /^exited/.test(s.phase || "");
+    const cls = h === "ok" ? "ok" : (h === "loading" || (s.running && h !== "ok")) ? "warn pulse" : (run || failed) ? "bad" : "";
+    $("#hdot").className = "dot " + cls; $("#s-dot").className = "dot " + cls;
+    const al = $("#s-alert");
+    if (failed) { if (!al.firstChild || al.dataset.pid !== String(s.pid)) { al.dataset.pid = s.pid; al.replaceChildren(el("div", {class: "alert bad"}, badge("bad", "stopped"), el("span", {text: `The server exited with code ${s.exit_code} before it was stopped. The last lines of the log below say why.`}))); } }
+    else if (s.running && h === "ok" && S.startedAt) { S.startedAt = null; al.dataset.pid = ""; al.replaceChildren(el("div", {class: "alert ok"}, badge("ok", "serving"), el("span", {}, "Ready. Try it on the ", el("button", {class: "link", onclick: () => showTab("chat"), text: "Chat tab"}), " or measure it on the ", el("button", {class: "link", onclick: () => showTab("speed"), text: "Speed tab"}), "."))); }
+    else if (!s.running && !failed) { al.replaceChildren(); al.dataset.pid = ""; }
+    const name = s.model ? s.model.split("/").pop() : (s.attached ? "attached :" + s.engine_port : "");
+    $("#htext").textContent = run ? `${h === "ok" ? "serving" : s.phase || h}${name ? " · " + name : ""}` : failed ? "server exited" : "no server";
+    $("#s-phase").textContent = s.running ? (h === "ok" ? "serving" : s.phase) : s.attached ? `attached to :${s.engine_port} (${h === "ok" ? "serving" : h})` : (s.phase || "stopped");
+    $("#s-info").textContent = s.running ? `pid ${s.pid} · port ${s.port} · cards ${s.gpus} · up ${fmtDur(Date.now() / 1000 - s.started)}` : (s.exit_code != null ? `last run: exit code ${s.exit_code}` : "Not running.");
+    $("#b-stop").disabled = !s.running; $("#b-restart").disabled = !s.running && s.exit_code == null;
+    steps();
+    $("#chat-model").textContent = name;
+    if (s.log_seq > S.logSeq && !S.es) openLog();
+  } catch (e) { $("#htext").textContent = "PXA Control unreachable"; $("#hdot").className = "dot bad"; }
+}
+function logAppend(lines) {
+  const pre = $("#log"); const txt = lines.join("\n") + "\n";
+  if (pre.firstChild && pre.firstChild.nodeType === 1) pre.replaceChildren();
+  pre.append(document.createTextNode(txt));
+  if (pre.textContent.length > 400000) pre.textContent = pre.textContent.slice(-300000);
+  if ($("#log-follow").checked) pre.scrollTop = pre.scrollHeight;
+}
+function openLog() {
+  if (S.es) return;
+  if (window.EventSource) {
+    const es = new EventSource("/api/log/stream?since=" + S.logSeq); S.es = es; $("#log-mode").textContent = "live (SSE)";
+    es.onmessage = ev => { const d = JSON.parse(ev.data); S.logSeq = d.seq; logAppend(d.lines); };
+    es.onerror = () => { es.close(); S.es = null; $("#log-mode").textContent = "polling"; pollLog(); };
+  } else pollLog();
+}
+async function pollLog() {
+  if (S.es) return;
+  try { const d = await api("/api/log?since=" + S.logSeq); if (d.lines.length) { S.logSeq = d.seq; logAppend(d.lines); } } catch (e) { /* retry */ }
+  setTimeout(pollLog, 2000);
+}
+setInterval(() => { if (!document.hidden) pollStatus(); }, 3000);
+
+// ---------------- SPEED ----------------
+segInit($("#sp-range"), () => loadSpeed());
+function bucketOf(n) { if (n == null) return "unknown"; if (n < 512) return "< 512"; if (n < 2048) return "512 - 2k"; if (n < 8192) return "2k - 8k"; return "8k +"; }
+function median(xs) { xs = xs.filter(x => x > 0).sort((a, b) => a - b); if (!xs.length) return null; const m = xs.length >> 1; return xs.length % 2 ? xs[m] : (xs[m - 1] + xs[m]) / 2; }
+async function loadSpeed() {
+  const range = +$("#sp-range").dataset.v, since = Date.now() / 1000 - range;
+  let recs = null, src = "";
+  try {
+    if (S.status && !S.status.engine_port) throw new Error("no server running");
+    const d = await api("/api/engine/pxa/stats?since=" + since.toFixed(0));
+    recs = (d.records || []).map(r => ({ts: r.ts, model: r.model, n_prompt: r.n_prompt, decode: r.decode_tps, prefill: r.prefill_tps}));
+    src = `from the server's /pxa/stats (${d.count} request(s) in range, ${d.stored} stored${d.persist ? ", persisted" : ", memory only"})`;
+    $("#sp-link").hidden = false;
+  } catch (e) {
+    const d = await api("/api/history?since=" + since.toFixed(0)).catch(() => ({records: []}));
+    recs = d.records.map(r => ({ts: r.ts, model: r.model, n_prompt: r.n_prompt, decode: r.decode_tps, prefill: r.prefill_tps}));
+    src = (/no server/.test(e.message) ? "no server running" : "this server has no /pxa/stats (older build)") + `: showing PXA Control's own history of its chat and benchmark requests (${recs.length} in range)`;
+    $("#sp-link").hidden = /no server/.test(e.message);
+  }
+  S.speedData = {recs, since, range}; $("#sp-src").textContent = src;
+  drawSpeed(); renderSpeedTables(); loadBench();
+}
+function seriesColors() { const cs = getComputedStyle(document.documentElement); return [1, 2, 3, 4, 5, 6].map(i => cs.getPropertyValue("--series-" + i).trim()); }
+function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p; }
+function drawChart(canvas, legend, recs, key, since, range) {
+  const cs = getComputedStyle(document.documentElement), dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight; if (!W || !H) return;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const g = canvas.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const colors = seriesColors(), models = [...new Set(recs.map(r => r.model || "?"))];
+  const pts = recs.filter(r => r[key] > 0);
+  const L = 58, R = 14, T = 12, B = 42, now = Date.now() / 1000;
+  const ymax = 4 * niceMax(Math.max(1, ...pts.map(r => r[key])) * 1.05 / 4);   // four even, round steps
+  const txt = cs.getPropertyValue("--chart-text").trim(), grid = cs.getPropertyValue("--chart-grid").trim();
+  g.font = "11px " + cs.getPropertyValue("--font"); g.fillStyle = txt; g.strokeStyle = grid; g.lineWidth = 1;
+  g.textAlign = "right"; g.textBaseline = "middle";
+  for (let i = 0; i <= 4; i++) { const y = Math.round(T + (H - T - B) * i / 4) + .5; g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke(); g.fillText(fmtNum(ymax * (1 - i / 4), ymax % 4 ? 1 : 0), L - 8, y); }
+  const x = ts => L + (W - L - R) * (ts - since) / (now - since), y = v => T + (H - T - B) * (1 - v / ymax);
+  g.textBaseline = "top";
+  const nx = W < 420 ? 3 : 5;
+  for (let i = 0; i < nx; i++) { const ts = since + (now - since) * i / (nx - 1), d = new Date(ts * 1000);
+    const lab = range > 86400 ? `${d.getMonth() + 1}/${d.getDate()} ${d.toTimeString().slice(0, 5)}` : d.toTimeString().slice(0, 5);
+    g.textAlign = i === 0 ? "left" : i === nx - 1 ? "right" : "center"; g.fillText(lab, x(ts), H - B + 8); }
+  // axis titles: units on the value axis, local time on the time axis
+  g.textAlign = "center"; g.fillText("local time", L + (W - L - R) / 2, H - 14);
+  g.save(); g.translate(13, T + (H - T - B) / 2); g.rotate(-Math.PI / 2); g.textBaseline = "middle"; g.fillText("tokens / s", 0, 0); g.restore();
+  if (!pts.length) { g.textAlign = "center"; g.textBaseline = "middle"; g.fillText("no requests in this range yet", L + (W - L - R) / 2, T + (H - T - B) / 2); legend.replaceChildren(); return; }
+  models.forEach((m, mi) => {
+    const col = colors[mi % colors.length], ps = pts.filter(r => (r.model || "?") === m).sort((a, b) => a.ts - b.ts);
+    g.strokeStyle = col; g.globalAlpha = .4; g.lineWidth = 1.5; g.beginPath(); ps.forEach((r, i) => i ? g.lineTo(x(r.ts), y(r[key])) : g.moveTo(x(r.ts), y(r[key]))); g.stroke();
+    g.globalAlpha = 1; g.fillStyle = col; ps.forEach(r => { g.beginPath(); g.arc(x(r.ts), y(r[key]), 3.2, 0, 7); g.fill(); });
+  });
+  legend.replaceChildren(...models.map((m, mi) => { const med = median(pts.filter(r => (r.model || "?") === m).map(r => r[key]));
+    return el("span", {}, el("i", {style: "background:" + colors[mi % colors.length]}), m, el("b", {style: "margin-left:6px;color:var(--text)", text: med ? fmtNum(med) + " t/s median" : ""})); }));
+}
+function drawSpeed() {
+  const d = S.speedData; if (!d || S.tab !== "speed") return;
+  drawChart($("#ch-dec"), $("#lg-dec"), d.recs, "decode", d.since, d.range);
+  drawChart($("#ch-pre"), $("#lg-pre"), d.recs, "prefill", d.since, d.range);
+}
+window.addEventListener("resize", () => drawSpeed());
+function renderSpeedTables() {
+  const recs = S.speedData.recs;
+  const dec = median(recs.map(r => r.decode)), pre = median(recs.map(r => r.prefill));
+  $("#sp-stats").replaceChildren(
+    el("div", {class: "card"}, el("div", {class: "stat"}, el("span", {class: "l", text: "Requests"}), el("span", {class: "v", text: recs.length}))),
+    el("div", {class: "card"}, el("div", {class: "stat"}, el("span", {class: "l", text: "Median decode"}), el("span", {class: "v"}, dec ? fmtNum(dec) : "-", dec ? el("small", {text: "t/s"}) : null))),
+    el("div", {class: "card"}, el("div", {class: "stat"}, el("span", {class: "l", text: "Median prefill"}), el("span", {class: "v"}, pre ? fmtNum(pre) : "-", pre ? el("small", {text: "t/s"}) : null))));
+  const groups = {};
+  for (const r of recs) { const k = (r.model || "?") + "\u0000" + bucketOf(r.n_prompt); (groups[k] = groups[k] || []).push(r); }
+  const order = ["< 512", "512 - 2k", "2k - 8k", "8k +", "unknown"];
+  const keys = Object.keys(groups).sort((a, b) => { const [ma, ba] = a.split("\u0000"), [mb, bb] = b.split("\u0000"); return ma.localeCompare(mb) || order.indexOf(ba) - order.indexOf(bb); });
+  $("#sp-med").replaceChildren(...(keys.length ? keys.map(k => { const [m, b] = k.split("\u0000"), g = groups[k];
+    return el("tr", {}, el("td", {text: m}), el("td", {text: b}), el("td", {text: g.length}), el("td", {text: fmtNum(median(g.map(r => r.decode)))}), el("td", {text: fmtNum(median(g.map(r => r.prefill)))})); })
+    : [el("tr", {}, el("td", {colspan: 5, class: "empty", text: "nothing measured in this range yet"}))]));
+}
+async function loadBench() {
+  try {
+    const d = await api("/api/bench"), j = d.job;
+    const box = $("#bn-lines"); box.hidden = !j.lines.length; box.textContent = j.lines.join("\n"); box.scrollTop = box.scrollHeight;
+    $("#bn-run").disabled = j.running; $("#bn-run").textContent = j.running ? "running ..." : "Run benchmark";
+    $("#bn-hist").replaceChildren(...(d.history.length ? d.history.slice().reverse().map(r => { const c = n => (r.classes || []).find(x => x.class === n) || {};
+      return el("tr", {}, el("td", {text: fmtAgo(r.ts)}), el("td", {text: (r.model || "?").split("/").pop()}), el("td", {text: (r.cards || []).join(",")}),
+        el("td", {text: fmtNum(c("prose").decode_tps)}), el("td", {text: fmtNum(c("edit").decode_tps)}), el("td", {text: fmtNum(c("long").decode_tps)}),
+        el("td", {text: fmtNum(c("long").prefill_tps)}), el("td", {class: "mono", text: r.greedy512_sha ? r.greedy512_sha.slice(0, 12) : "-"})); })
+      : [el("tr", {}, el("td", {colspan: 8, class: "empty", text: "no benchmark yet"}))]));
+    if (j.running) setTimeout(loadBench, 1500); else if (j.error) toast("benchmark: " + j.error, true);
+  } catch (e) { /* optional */ }
+}
+$("#bn-run").addEventListener("click", async () => {
+  try { await api("/api/bench", {body: {warmup: +$("#bn-warm").value, reps: +$("#bn-reps").value}}); loadBench(); } catch (e) { toast(e.message, true); }
+});
+
+// ---------------- CHAT ----------------
+function esc(s) { return s.replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c])); }
+function inline(s) {
+  // s is already escaped
+  return s.replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+}
+function md(src) {
+  const out = [], parts = src.split(/```/);
+  parts.forEach((p, i) => {
+    if (i % 2) { const nl = p.indexOf("\n"); const body = nl >= 0 ? p.slice(nl + 1) : p; out.push("<pre><code>" + esc(body.replace(/\n$/, "")) + "</code></pre>"); return; }
+    let list = null, para = [];
+    const flush = () => { if (para.length) { out.push("<p>" + inline(esc(para.join("\n"))).replace(/\n/g, "<br>") + "</p>"); para = []; } };
+    const endList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+    for (const line of p.split("\n")) {
+      let m;
+      if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); endList(); out.push(`<h4>${inline(esc(m[2]))}</h4>`); }
+      else if ((m = line.match(/^\s*[-*]\s+(.*)$/))) { flush(); if (list !== "ul") { endList(); out.push("<ul>"); list = "ul"; } out.push(`<li>${inline(esc(m[1]))}</li>`); }
+      else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flush(); if (list !== "ol") { endList(); out.push("<ol>"); list = "ol"; } out.push(`<li>${inline(esc(m[1]))}</li>`); }
+      else if (!line.trim()) { flush(); endList(); }
+      else { endList(); para.push(line); }
+    }
+    flush(); endList();
+  });
+  return out.join("");
+}
+function addMsg(role, text) {
+  $("#msgs-empty") && $("#msgs-empty").remove();
+  const body = el("div", {class: "body"}), think = el("div", {class: "think", hidden: true}), meta = el("div", {class: "meta"});
+  const m = el("div", {class: "msg " + role}, think, body, meta);
+  if (role === "user") body.textContent = text; else body.innerHTML = md(text || "");
+  $("#msgs").append(m); $("#msgs").scrollTop = $("#msgs").scrollHeight;
+  return {m, body, think, meta};
+}
+async function send() {
+  const text = $("#c-in").value.trim(); if (!text || S.abort) return;
+  $("#c-in").value = "";
+  S.chat.push({role: "user", content: text}); addMsg("user", text);
+  const ui = addMsg("assistant", ""); ui.meta.textContent = "thinking ...";
+  const msgs = []; const sys = $("#c-sys").value.trim(); if (sys) msgs.push({role: "system", content: sys});
+  msgs.push(...S.chat);
+  const body = {messages: msgs, stream: true, temperature: +$("#c-temp").value, max_tokens: +$("#c-max").value || 1024,
+                chat_template_kwargs: {enable_thinking: $("#c-think").checked}, stream_options: {include_usage: true}};
+  const ac = new AbortController(); S.abort = ac; $("#c-send").disabled = true; $("#c-stop").disabled = false;
+  let content = "", reasoning = "", timings = null, usage = null, n = 0; const t0 = performance.now(); let tFirst = null;
+  try {
+    const r = await fetch("/api/engine/v1/chat/completions", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body), signal: ac.signal});
+    if (!r.ok) { let j = null; try { j = await r.json(); } catch (e) { /* */ } throw new Error((j && (j.error && (j.error.message || j.error))) || "HTTP " + r.status); }
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const {value, done} = await rd.read(); if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i; while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith("data:")) continue; const data = line.slice(5).trim(); if (data === "[DONE]") continue;
+        let j; try { j = JSON.parse(data); } catch (e) { continue; }
+        if (j.timings) timings = j.timings; if (j.usage) usage = j.usage;
+        const d = j.choices && j.choices[0] && j.choices[0].delta; if (!d) continue;
+        if (d.reasoning_content) { reasoning += d.reasoning_content; ui.think.hidden = false; ui.think.textContent = reasoning; n++; }
+        if (d.content) { content += d.content; n++; ui.body.innerHTML = md(content); }
+        if (tFirst == null && (d.content || d.reasoning_content)) tFirst = performance.now();
+        ui.meta.textContent = `${n} tokens ...`; $("#msgs").scrollTop = $("#msgs").scrollHeight;
+      }
+    }
+  } catch (e) { if (e.name !== "AbortError") { ui.meta.textContent = "error: " + (/no server/.test(e.message) ? "no server is running: start one on the Launch tab" : e.message); ui.m.style.borderColor = "var(--bad)"; } }
+  finally {
+    S.abort = null; $("#c-send").disabled = false; $("#c-stop").disabled = true;
+    if (content || reasoning) {
+      S.chat.push({role: "assistant", content});
+      const secs = ((performance.now() - (tFirst || t0)) / 1000);
+      ui.meta.textContent = timings ? `${fmtNum(timings.predicted_per_second)} t/s decode · ${fmtNum(timings.prompt_per_second)} t/s prefill · ${timings.predicted_n} tokens`
+        : `${fmtNum(n / Math.max(secs, 1e-3))} t/s (measured in the browser) · ${usage ? usage.completion_tokens : n} tokens`;
+    }
+  }
+}
+$("#c-send").addEventListener("click", send);
+$("#c-stop").addEventListener("click", () => S.abort && S.abort.abort());
+$("#c-in").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+$("#c-clear").addEventListener("click", () => { S.chat = []; $("#msgs").replaceChildren(el("div", {class: "empty center", id: "msgs-empty"}, el("b", {text: "New chat"}), el("span", {text: "Say something."}))); });
+$("#c-attach-b").addEventListener("click", async () => {
+  try { const d = await api("/api/attach", {body: {port: +$("#c-attach").value || 0}}); toast(d.attach_port ? "attached to :" + d.attach_port : "detached"); pollStatus(); } catch (e) { toast(e.message, true); }
+});
+["c-sys", "c-temp", "c-max"].forEach(id => { const v = store.get(id); if (v != null) $("#" + id).value = v; $("#" + id).addEventListener("change", e => store.set(id, e.target.value)); });
+$("#c-think").checked = store.get("c-think", false); $("#c-think").addEventListener("change", e => store.set("c-think", e.target.checked));
+
+// ---------------- boot ----------------
+(async function boot() {
+  const params = new URLSearchParams(location.search);
+  applyTheme(params.get("theme") || store.get("theme", null) || defaultTheme());
+  try { S.info = await api("/api/info"); $("#l-kv").replaceChildren(...S.info.kv_types.map(k => el("option", {value: k, text: k}))); } catch (e) { toast(e.message, true); }
+  const last = store.get("lastBody", null);
+  loadLevers(); loadPresets(); pollStatus();
+  const tab = (location.hash || "").slice(1) || store.get("tab", "rig");
+  showTab(TABS.includes(tab) ? tab : "rig");
+  await loadModels();
+  // a running seat wins over the last form: the Launch tab shows what is actually serving
+  const st = await api("/api/status").catch(() => null);
+  if (st && st.running && st.request) applyBody(st.request); else if (last) applyBody(last);
+  window.addEventListener("beforeunload", () => store.set("lastBody", launchBody()));
+})();
+</script>
+</body>
+</html>

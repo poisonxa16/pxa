@@ -48,6 +48,9 @@ DESIGN RULE - NEVER MAGIC
     --models-dir         where to look for models (also PXA_MODELS_DIR)
     --serve-name         also write a rerunnable restart script for this seat
     --no-tui             skip the full-screen UI, use the line prompts
+    --gui                PXA Control: the same launcher as a local web app (rig, models,
+                         launch, speed charts, chat). --port is the GUI's port (7777), --lan
+                         shares it with a token. docs/LAUNCHER.md 'PXA Control (GUI)'.
     --list-chat-templates  the template names THIS engine accepts, and where the
                          list came from
 
@@ -294,6 +297,16 @@ PXQ_GGML_TYPE = {
     254: "PXQ2",     # ggml.h:489
     255: "PXQ3",     # ggml.h:490
     256: "PXQ6",     # ggml.h:511
+    # PXQN rev 1 (ggml.h GGML_TYPE_PXQN*, 257-259) and the rev-1 ladder (260-263). rel-integrate3 2026-09-26:
+    # without these rows every PXQN file (the 27B ladder, Flash-Next LDLQ) was refused as R-28 "type the
+    # tree does not define" -- 257-259 sit inside the retired-codec band below -- although the engine loads them.
+    257: "PXQN3",    # ggml.h GGML_TYPE_PXQN3
+    258: "PXQN3S8",  # ggml.h GGML_TYPE_PXQN3S8
+    259: "PXQN4",    # ggml.h GGML_TYPE_PXQN4
+    260: "PXQN2",    # ggml.h GGML_TYPE_PXQN2
+    261: "PXQN1",    # ggml.h GGML_TYPE_PXQN1
+    262: "PXQN4S8",  # ggml.h GGML_TYPE_PXQN4S8
+    263: "PXQN5",    # ggml.h GGML_TYPE_PXQN5
 }
 # Everything else a PXQ file legitimately contains (backbone carriers).
 NON_PXQ_GGML_TYPE = {0: "f32", 1: "f16", 8: "q8_0", 14: "q6_K", 30: "bf16", 39: "MXFP4"}
@@ -304,7 +317,7 @@ NON_PXQ_GGML_TYPE = {0: "f32", 1: "f16", 8: "q8_0", 14: "q6_K", 30: "bf16", 39: 
 # carries 106 tensors of type 247 and 38 of type 246 plus pxa.pxq1c.* / pxa.pxq2c.*
 # KVs - retired clustered variants this engine no longer implements. The old
 # launcher emitted a full, confident command for it. R-23 refuses it.
-KNOWN_GGML_TYPE_MAX = 256
+KNOWN_GGML_TYPE_MAX = 263   # PXQN ladder (rel-integrate3); the 240..259 retired-band check exempts PXQ_GGML_TYPE ids
 
 # LLAMA_FTYPE ids (include/llama.h). KEPT FOR ONE PURPOSE ONLY: catching the two
 # RETIRED ids. general.file_type CANNOT identify a PXQ tier - llama-quantize.cpp
@@ -320,7 +333,8 @@ FTYPE_MXFP4 = 38
 # conversion gate. No silent wrong output exists on the vLLM path."
 VLLM_SUPPORTED_PXQ = {"PXQ4"}
 # PXQ-TYPE-MATRIX.md:80-81 - these run on llama.cpp only.
-LLAMA_ONLY_PXQ = {"PXQ4-HQ", "PXQ6", "PXQ3", "PXQ2", "PXQ_UNIVERSAL"}
+LLAMA_ONLY_PXQ = {"PXQ4-HQ", "PXQ6", "PXQ3", "PXQ2", "PXQ_UNIVERSAL",
+                  "PXQN3", "PXQN3S8", "PXQN4", "PXQN2", "PXQN1", "PXQN4S8", "PXQN5"}   # PXQN: llama.cpp only
 # No CPU codec, GPU-only, open task #62 (PXQ-TYPE-MATRIX.md:67; RELEASE-GATE.md:177).
 NO_CPU_CODEC = {"PXQ1", "PXQ6"}
 
@@ -782,12 +796,31 @@ TSPLIT_AUTO_ARCHES = {"qwen35"}
 # (pxa_pxq_k_split_ok), so a lower tier is a load-time refusal waiting to happen.
 TSPLIT_AUTO_TIERS = {"PXQ4"}
 
+# PXQ-Next, 2026-09-27: the 2-card sizes join PXQ4. Measured on the dense
+# 27B, one binary (bigq-pp speedcheck), tensor leg against layer leg: P100 pair decode +17..27%,
+# prefill +44..46%; V100 pair decode +12..28%, prefill +3..4%. The 1-card sizes (PXQN1/2/3/3S8)
+# have no pair number and stay on layer. PXA_AUTO_SM_PXQN=0 is the one switch back (the engine's
+# registry reads the same variable, common/pxa-registry.cpp pxa_tsplit_auto_tier()).
+TSPLIT_AUTO_TIERS_PXQN = {"PXQN4", "PXQN4S8", "PXQN5"}
+
+
+def tsplit_auto_tiers(environ=None):
+    """The tiers '--sm auto' may put on the tensor split. PURE given `environ`."""
+    env = os.environ if environ is None else environ
+    if str(env.get("PXA_AUTO_SM_PXQN") or "").startswith("0"):
+        return set(TSPLIT_AUTO_TIERS)
+    return set(TSPLIT_AUTO_TIERS) | TSPLIT_AUTO_TIERS_PXQN
+
 # What the split is emitted WITH. fused is the only reduce route the numbers above were taken on;
 # _PREFILL=1 puts the same fused route on the prefill reduce (measured 752 -> 773 t/s at 12.7k and
 # greedy output UNCHANGED); _FALLBACK=1 makes the engine demote to '-sm layer' by itself if its
 # capability check refuses at load, instead of stopping - which is the right contract for a mode
 # the LAUNCHER chose rather than the operator.
-TSPLIT_AUTO_ENV = {"PXA_TSPLIT_REDUCE": "fused", "PXA_TSPLIT_REDUCE_PREFILL": "1"}
+# 2026-09-28: PXA_TSPLIT_REDUCE_PREFILL=1 is no longer emitted. The engine's two-device prefill
+# reduce (PXA_TSPLIT_PF, default on) is faster, and =1 pre-empted it because the fused route is
+# tried first: V100 pair, dense 27B PXQN4, llama-server, 14,800-token prompt, 822.6/824.8 t/s
+# prefill with PF against 738.8/747.9 with =1, greedy output identical, decode unchanged.
+TSPLIT_AUTO_ENV = {"PXA_TSPLIT_REDUCE": "fused"}
 TSPLIT_AUTO_FALLBACK_ENV = {"PXA_TSPLIT_FALLBACK": "1"}
 
 TSPLIT_TRADE = (
@@ -798,6 +831,36 @@ TSPLIT_TRADE = (
     "on the host CPUs, because both cards launch every step together - an identical cell read "
     "42.9 t/s on a quiet host and 26.4 t/s while other GPU jobs were running. "
     "One flag goes back: --sm layer.")
+
+
+# PAST A PAIR (2026-09-27, , todo tsplit-4card-default). Bug #206 (4-card
+# garbage) was NCCL's shared-memory group failing silently in docker's 64 MiB /dev/shm; the engine
+# now checks it and re-serves the reduce on its peer route. Measured on 4 identical P100s, dense
+# 27B, one binary, layer/tensor/layer: tensor decode +4.6..5.6% (PXQN4) / +38.5..41.1% (PXQ4), prefill @22.6k
+# +95% on both. So four
+# identical P100s take the split by default; 3 cards, 5+ cards and 4x V100 have no number and keep
+# layer. PXA_TSPLIT_ALLOW_4WAY=0 (the engine's own >2-device guard) restores the pair-only rule
+# here too - the engine's registry reads the same variable (pxa_tsplit_auto_quad()).
+TSPLIT_AUTO_QUAD_CC = 60
+
+
+def tsplit_auto_quad(sel, environ=None):
+    """True when '--sm auto' may put a >2-card set on the tensor split. PURE given `environ`."""
+    env = os.environ if environ is None else environ
+    if str(env.get("PXA_TSPLIT_ALLOW_4WAY") or "").startswith("0"):
+        return False
+    sel = sel or []
+    return len(sel) == 4 and len({g[2] for g in sel}) == 1 and sel[0][2] == TSPLIT_AUTO_QUAD_CC
+
+
+def tsplit_bug206_note(n):
+    """The past-a-pair note, as ONE function so it reads identically wherever it is printed:
+    when '--sm auto' declines the tensor split past a pair, and (#8382 problem 4) when an
+    operator forces '-sm tensor' BY HAND on a set the default does not cover. Pure so the
+    selftest can call it directly."""
+    return (f"{n} cards selected - past a pair the tensor split is a default only on 4 identical "
+            f"P100s, the one set it was measured faster on (bug #206, the 4-card wrong tokens, is "
+            f"fixed underneath it). Layer split here; --sm tensor by hand is unmeasured on this set")
 
 
 def resolve_auto_split(engine, sel, prof, forced_ts, recipe, fa="on"):
@@ -814,13 +877,10 @@ def resolve_auto_split(engine, sel, prof, forced_ts, recipe, fa="on"):
         return "layer", (f"{n} card selected - a tensor split needs at least two, and on one card "
                          f"'layer' and 'tensor' are the same seat with more bookkeeping")
     models = sorted({g[1] for g in sel})
-    if n > 2:
-        # Bug #206 (2026-09-25): on 4x P100, -sm tensor serves wrong tokens (token 0 already wrong)
-        # while perplexity matches -sm layer; pairs are correct. Until the 4-way serving path is
-        # fixed and gated, the default never picks the tensor split past a pair.
-        return "layer", (f"{n} cards selected - the tensor split is only a default on a PAIR: on "
-                         f"4 cards it serves wrong tokens (bug #206) though perplexity looks fine. "
-                         f"Layer split until that is fixed; --sm tensor by hand is at your own risk")
+    if n > 2 and not tsplit_auto_quad(sel):
+        # Past a pair only the measured set (4 identical P100s) takes the split by default; see
+        # TSPLIT_AUTO_QUAD_CC. Bug #206 itself is fixed in the engine.
+        return "layer", tsplit_bug206_note(n)
     if len(models) > 1:
         return "layer", (f"the selected cards are not the same model ({', '.join(models)}). An "
                          f"even tensor split gives both halves the same work, so a slower card "
@@ -838,10 +898,10 @@ def resolve_auto_split(engine, sel, prof, forced_ts, recipe, fa="on"):
                          f"The engine would refuse this mode after the model load; the launcher "
                          f"does not spend a load to find that out")
     tier = prof.get("tier")
-    if tier not in TSPLIT_AUTO_TIERS:
-        return "layer", (f"tier {tier or 'none'} - the split was gated and measured on "
-                         f"{'/'.join(sorted(TSPLIT_AUTO_TIERS))} only, and the panel K-split is "
-                         f"defined for that tier")
+    _tiers = tsplit_auto_tiers()
+    if tier not in _tiers:
+        return "layer", (f"tier {tier or 'none'} - the split is a default only on the tiers it "
+                         f"was measured faster on ({'/'.join(sorted(_tiers))})")
     nkv = prof.get("n_head_kv")
     if nkv and int(nkv) < n:
         return "layer", (f"this file has {nkv} KV heads and {n} cards are selected: attention "
@@ -941,9 +1001,11 @@ RECIPES = _gemma4_recipes() + [
         1, {61}, ("moe", "hybrid-moe"), {"PXQ2"},
         b=2048, ub=768, ctx=8192,
         env={"PXA_AUTO_SPEC": "0"},
-        extra=["--ctx-checkpoints", "0"],
-        numbers="cold prefill 1,363.5 t/s @-fa off  |  chat prefill 746.6 @-fa on  |  "
-                "decode 36.73 cold / 65.3 chat  (release binary, no env, auto -b/-ub)",
+        numbers="UNMEASURED under this recipe: it keeps context checkpoints since 2026-09-25, and the "
+                "published cells were taken with --ctx-checkpoints 0 (then forced by the engine on this "
+                "card): cold prefill 1,363.5 t/s @-fa off  |  chat prefill 746.6 @-fa on  |  decode 36.73 "
+                "cold / 65.3 chat (release binary, no env, auto -b/-ub). Pass --ctx-checkpoints 0 to run "
+                "the configuration those numbers describe",
         source="RELEASE-NOTES-2026-09-07.md:79 (headline table row); "
                "measured 2026-09-04 ",
         notes=["BOTH FA cells are MEASURED on this card, which is why --workload longdoc is a "
@@ -958,10 +1020,11 @@ RECIPES = _gemma4_recipes() + [
                "resident model on 11 GiB (docs/COOKBOOK.md:144-147).",
                "PXA_PXQ2_MMQ=1 changes nothing on this build (1,301 / 728.6) - the int8 path "
                "already carries that work. Not emitted.",
-               "--ctx-checkpoints 0 is part of the published protocol, not a launcher "
-               "preference: 4/4 of the arm files that produced these numbers pass it "
-               "(the campaign arm files arms-pub-n14, arms-pub-ship, arms-n14, arms-ship, "
-               "both FA regimes).",
+               "The published numbers were taken with --ctx-checkpoints 0 (4/4 campaign arm "
+               "files: arms-pub-n14, arms-pub-ship, arms-n14, arms-ship, both FA regimes). "
+               "The chat recipe no longer passes it (2026-09-25, ws6-server): checkpoints live "
+               "in host RAM, and without them a hybrid chat turn that rewinds re-prefills the "
+               "whole history. Pass --ctx-checkpoints 0 to reproduce the published protocol.",
                "PXA_AUTO_SPEC=0 IS REQUIRED HERE, AND IT IS THE ONE THING THE PUBLISHED RECIPE "
                "DOES NOT SAY. examples/server/server.cpp's PXA AUTO-SPEC block arms "
                "'--spec-type ngram-mod:n_max=4,n_min=2' automatically for arch qwen35moe "
@@ -1137,6 +1200,19 @@ def gpu_table():
     this table on any box with mixed cards. Enumerate here, pin there, or the
     number the user ticked selects a different card than the one described to
     them."""
+    fake = os.environ.get("PXA_LAUNCH_FAKE_GPUS", "").strip()
+    if fake:
+        # DRY-RUN ONLY (tools/pxa-parity.py, the container parity check): "2x600" or "700,600"
+        # describes idle cards without asking nvidia-smi. Never set this for a real launch.
+        names = {600: "Tesla P100-PCIE-16GB", 610: "NVIDIA GeForce GTX 1080 Ti",
+                 700: "Tesla V100-PCIE-16GB"}
+        mem = {600: 16384, 610: 11264, 700: 16384}
+        ccs = []
+        for part in fake.split(","):
+            n, _, cc = part.partition("x")
+            ccs += [int(cc)] * int(n) if cc else [int(n)]
+        return [(i, names.get(c, f"card sm_{c // 10}"), c // 10, mem.get(c, 16384), 0,
+                 f"GPU-fake-{i}") for i, c in enumerate(ccs)], None
     if not shutil.which("nvidia-smi"):
         return None, "nvidia-smi not found - cannot detect GPUs. Use --engine to force."
     out = _run(["nvidia-smi",
@@ -1220,6 +1296,8 @@ def resident_procs(gpus):
     """H4 -> {gpu_index: [(pid, name, mib), ...]}. This is a SHARED, LIVE box; the
     launcher must never hand a card to a second process by accident. Keyed by UUID
     because --query-compute-apps reports gpu_uuid, not index."""
+    if os.environ.get("PXA_LAUNCH_FAKE_GPUS", "").strip():
+        return {}, True   # dry-run cards are idle by definition
     by_uuid = {g[5]: g[0] for g in gpus}
     out = _run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory,gpu_uuid",
                 "--format=csv,noheader,nounits"])
@@ -1238,6 +1316,148 @@ def resident_procs(gpus):
         except ValueError:
             continue
     return res, True
+
+
+# ---------------------------------------------------------------------------
+# CONTAINER /dev/shm PREFLIGHT (2026-09-27, ; bug #206 follow-up)
+# ---------------------------------------------------------------------------
+# NCCL's shared-memory transport lives in /dev/shm, and it is what a multi-card tensor split's
+# decode reduce rides on this box (every pair is PHB, so NCCL declines P2P). Docker and podman give
+# a container 64 MiB of /dev/shm unless told otherwise: a two-card group fits, a four-card group does
+# not, and before the #206 fix the failed group was silent and every card kept its own partial
+# (wrong tokens, perplexity fine). This build detects the failure and re-serves the reduce on the
+# in-tree peer route, but the operator should still hear about the cause, with the one flag that
+# fixes it, before the model load and not from a banner in the middle of the first request.
+SHM_MIN_BYTES = 1 << 30
+
+SHM_FIX = {
+    "docker": "docker run --shm-size=1g ... (or --ipc=host; compose: shm_size: 1gb)",
+    "podman": "podman run --shm-size=1g ... (or --ipc=host)",
+    "lxc":    "add 'lxc.mount.entry: tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir,size=1G 0 0' to the "
+              "container's config (Proxmox: /etc/pve/lxc/<id>.conf) and restart it, or inside the "
+              "container: mount -o remount,size=1G /dev/shm",
+}
+
+
+def container_kind():
+    """'docker' | 'podman' | 'lxc' | another container name | None. Files only, plus one
+    systemd-detect-virt call when it exists; never raises."""
+    try:
+        if os.path.exists("/.dockerenv"):
+            return "docker"
+        if os.path.exists("/run/.containerenv"):
+            return "podman"
+        try:
+            v = open("/run/systemd/container").read().strip()
+            if v:
+                return "podman" if v == "podman" else ("lxc" if v.startswith("lxc") else v)
+        except OSError:
+            pass
+        v = (os.environ.get("container") or "").strip()
+        if v:
+            return "lxc" if v.startswith("lxc") else v
+        if os.path.exists("/dev/.lxc-boot-id") or os.path.isdir("/dev/.lxc"):
+            return "lxc"
+        try:
+            cg = open("/proc/1/cgroup").read()
+            for key, name in (("docker", "docker"), ("libpod", "podman"), ("lxc", "lxc")):
+                if key in cg:
+                    return name
+        except OSError:
+            pass
+        try:
+            if "lxcfs" in open("/proc/self/mountinfo").read():
+                return "lxc"
+        except OSError:
+            pass
+        if shutil.which("systemd-detect-virt"):
+            v = _run(["systemd-detect-virt", "--container"], timeout=5) or ""
+            v = v.strip()
+            if v and v != "none":
+                return "lxc" if v.startswith("lxc") else v
+    except Exception:
+        pass
+    return None
+
+
+def shm_bytes(path="/dev/shm"):
+    """Size of the tmpfs at `path` in bytes, 0 when it is not there."""
+    try:
+        st = os.statvfs(path)
+        return st.f_blocks * st.f_frsize
+    except OSError:
+        return 0
+
+
+def shm_warning(kind, n_cards, nbytes):
+    """PURE. The preflight's text for a container with `n_cards` selected and `nbytes` of
+    /dev/shm, or None when there is nothing to say (not a container, one card, >= 1 GiB)."""
+    if not kind or n_cards < 2 or (nbytes or 0) >= SHM_MIN_BYTES:
+        return None
+    have = f"{(nbytes or 0) / 2**20:.0f} MiB" if nbytes else "missing"
+    return (f"/dev/shm is {have} inside this {kind} container and {n_cards} cards are selected. "
+            f"The multi-card reduce (NCCL's shared-memory transport) needs more than docker's 64 MiB "
+            f"default: before the bug #206 fix a 4-card tensor split then served wrong tokens, and "
+            f"this build falls back to a slower reduce route when it happens. Fix: "
+            f"{SHM_FIX.get(kind, 'give the container a /dev/shm of at least 1 GiB')}.")
+
+
+# ---------------------------------------------------------------------------
+# PCIe LINK WIDTH PER CARD (2026-09-27, , bug #280)
+# ---------------------------------------------------------------------------
+# P100s on x1/x2 risers (mining-style boxes) are common among people who buy these cards. A narrow
+# link changes what is safe and what is fast: the tensor split reduces across the cards every step
+# (link-bound on x1), and the one field report of all-non-finite logits (a P100 pair, pipeline
+# parallelism on) came from such a box. So the launcher reads each card's link and, below x4, keeps
+# the layer split, turns pipeline parallelism off, and says so. The engine reads the same width
+# from sysfs and makes the same two choices on a bare run.
+PCIE_NARROW_BELOW = 4
+
+
+def pcie_links():
+    """{nvidia-smi index: (gen_cur, width_cur, gen_max, width_max)}; {} when unreadable."""
+    out = _run(["nvidia-smi", "--query-gpu=index,pcie.link.gen.current,pcie.link.width.current,"
+                "pcie.link.gen.max,pcie.link.width.max", "--format=csv,noheader,nounits"], timeout=20)
+    links = {}
+    for line in (out or "").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 5:
+            continue
+        try:
+            links[int(f[0])] = tuple(int(x) if x.isdigit() else 0 for x in f[1:5])
+        except ValueError:
+            continue
+    return links
+
+
+def narrow_cards(sel, links):
+    """PURE. [(index, width)] for the selected cards whose current link is below x4 (unknown = not narrow)."""
+    res = []
+    for g in (sel or []):
+        l = (links or {}).get(g[0])
+        if l and 0 < l[1] < PCIE_NARROW_BELOW:
+            res.append((g[0], l[1]))
+    return res
+
+
+def fmt_link(l):
+    if not l:
+        return "link ?"
+    s = f"x{l[1]} gen{l[0]}" if l[1] else "link ?"
+    if l[3] and (l[3] != l[1] or l[2] != l[0]):
+        s += f" (card max x{l[3]} gen{l[2]})"
+    return s
+
+
+def narrow_link_note(narrow):
+    """PURE. The one line the plan prints when a selected card is on a narrow link."""
+    if not narrow:
+        return None
+    cards = ", ".join(f"card {i} x{w}" for i, w in narrow)
+    return (f"narrow PCIe link ({cards}): layer split, pipeline parallelism OFF (PXA_PIPELINE_PP=0), no "
+            f"tensor split - on x1/x2 risers the per-step cross-card traffic is the bottleneck, and the one "
+            f"all-'!' field report came from such a box. If output is still wrong, PXA_P2P=0 forces "
+            f"host-staged copies (slower, never peer-to-peer).")
 
 
 def peer_topology():
@@ -1439,6 +1659,19 @@ def _hf_tensor_names(path):
     return []
 
 
+def gguf_shards(path):
+    """Every shard of a split GGUF (<stem>-00001-of-0000N.gguf, the llama-gguf-split naming),
+    in order, whether or not each exists; [path] for a single-file GGUF. Bug #229: sizing,
+    fit checks and the tier all used to read shard 1 only - on a stock split file that is a
+    metadata-only 0.01 GiB shard with no tensors at all."""
+    m = SHARD_RE.search(path)
+    if not m:
+        return [path]
+    n = int(m.group(2))
+    stem = path[:m.start()]
+    return [f"{stem}-{i:05d}-of-{n:05d}.gguf" for i in range(1, n + 1)]
+
+
 def model_profile(path, kind):
     """-> dict. Best effort, never raises. Every field says where it came from."""
     p = {"arch": None, "n_expert": 0, "is_moe": False, "tier": None, "tier_kv": None,
@@ -1456,7 +1689,21 @@ def model_profile(path, kind):
         if not h["ok"]:
             p["why"] = f"GGUF header UNREADABLE: {h['err']}"
             return p
-        kv, tn = h["kv"], h["tensors"]
+        kv, tn = h["kv"], list(h["tensors"])
+        # A split GGUF keeps its KV block in shard 1 and its tensors spread over all of them
+        # (bug #229): the tier, the PLE table, MTP, DeltaNet and the block count all need the
+        # WHOLE tensor directory, so every other shard's directory is merged in here.
+        shards = gguf_shards(path)
+        p["shards"] = len(shards)
+        p["shards_missing"] = [sp for sp in shards if not os.path.isfile(sp)]
+        for sp in shards:
+            if sp == path or sp in p["shards_missing"]:
+                continue
+            hs = gguf_header(sp)
+            if hs["ok"]:
+                tn.extend(hs["tensors"])
+            else:
+                p["shards_missing"].append(f"{sp} (header unreadable: {hs['err']})")
         p["arch"] = kv.get("general.architecture")
         p["ftype"] = kv.get("general.file_type")
         arch = p["arch"] or ""
@@ -1550,6 +1797,9 @@ def model_profile(path, kind):
         p["sampling"] = {k.rsplit(".", 1)[1]: v for k, v in kv.items()
                          if k.startswith("general.sampling.")}
         p["why"] = "read from GGUF header + tensor directory"
+        if len(shards) > 1:
+            p["why"] += f" (split GGUF: {len(shards)} shards merged"
+            p["why"] += (f", {len(p['shards_missing'])} MISSING)" if p["shards_missing"] else ")")
         return p
 
     if kind in ("hf_dir", "vllm_dir", "weightless_dir", "lora_dir"):
@@ -1714,10 +1964,14 @@ def kv_bytes_per_token_hf(cfg):
 
 def model_bytes(path, kind):
     if kind in ("gguf", "gguf_broken"):
-        try:
-            return os.path.getsize(path)
-        except OSError:
-            return 0
+        # every shard of a split GGUF, not the first one only (bug #229)
+        t = 0
+        for sp in gguf_shards(path):
+            try:
+                t += os.path.getsize(sp)
+            except OSError:
+                pass
+        return t
     if kind in ("hf_dir", "vllm_dir", "weightless_dir", "lora_dir", "not_a_model"):
         t = 0
         for root, _, files in os.walk(path):
@@ -1925,7 +2179,7 @@ R = {
  "R-16": ("REFUSING: {tier} has no CPU codec (GPU-only, open task #62; PXQ-TYPE-MATRIX.md:67, "
           "RELEASE-GATE.md:177). A CPU-only or partially-offloaded run ABORTS. You asked for "
           "-ngl {ngl}: offload every layer or pick another tier."),
- "R-17A": ("REFUSING: -c {ctx} exceeds this model's trained context {trained} "
+ "R-17A": ("REFUSING: {what} {ctx} exceeds this model's trained context {trained} "
            "({arch}.context_length)."),
  "R-17B": ("REFUSING: the WEIGHTS ALONE ({mb:.2f} GiB) exceed the total VRAM of the selected "
            "cards ({tb:.2f} GiB across {n}) with full offload requested. This is file-byte "
@@ -2007,6 +2261,43 @@ class Plan(object):
 
     def refuse(self, rid, code=2, **kw):
         self.refusals.append((rid, R[rid].format(**kw), code))
+
+
+def kv_unified_effective(np_, extra, environ):
+    """Will llama-server run with one shared KV ring? Mirrors the engine's order, which is NOT
+    "CLI wins": server.cpp calls gpt_params_parse_from_env() AFTER gpt_params_parse(), so an
+    environment variable overrides the emitted flag (docker/Dockerfile: "a LLAMA_ARG_* env var
+    always wins over the equivalent CLI flag"). common.cpp reads LLAMA_ARG_KV_UNIFIED and then
+    PXA_KV_UNIFIED, so PXA_KV_UNIFIED is the last word. Order here: PXA_KV_UNIFIED, then
+    LLAMA_ARG_KV_UNIFIED ("1"/"true" is on, any other value off, get_env<bool>); then an explicit
+    --kv-unified / --no-kv-unified in the emitted flags; then the PXA_KV_UNIFIED_DEFAULT=1 auto
+    rule, which engages only at -np > 1 when none of the above said anything."""
+    extra = list(extra or [])
+    for var in ("PXA_KV_UNIFIED", "LLAMA_ARG_KV_UNIFIED"):
+        if environ.get(var) is not None:
+            return environ.get(var) in ("1", "true")       # common.cpp get_env<bool>
+    if "--no-kv-unified" in extra or "-no-kvu" in extra:
+        return False
+    if "--kv-unified" in extra or "-kvu" in extra:
+        return True
+    try:
+        kvud = int(str(environ.get("PXA_KV_UNIFIED_DEFAULT") or "0").strip() or "0")
+    except ValueError:
+        kvud = 0                                             # atoi("x") == 0
+    return np_ > 1 and kvud != 0
+
+
+def slot_ctx_for_r17a(engine, ctx, np_, extra, environ):
+    """(context one sequence can reach, how to name it) for R-17A (bug #246). llama-server
+    gives each slot n_ctx/np unless the KV ring is unified (server-context.cpp n_ctx_slot);
+    vLLM's --max-model-len is already per sequence. Comparing the TOTAL -c against
+    n_ctx_train refused e.g. 4 slots x 128k on a 256k-trained model."""
+    np_ = max(1, int(np_ or 1))
+    if engine != "llama" or np_ == 1:
+        return ctx, "-c"
+    if kv_unified_effective(np_, extra, environ):
+        return ctx, f"-c (one KV ring shared by all {np_} slots, --kv-unified)"
+    return ctx // np_, f"the per-slot context (-c {ctx} / -np {np_}) ="
 
 
 def envelope_notes(plan, sel, prof, np_, per_slot_ctx, model_path):
@@ -2300,10 +2591,17 @@ def decide(sel, kind, model, forced, prof, np_, workload, elig_caps, image, prob
             and not prof.get("is_moe") and prof.get("tier") == "PXQ4"):
         p.notes.append(DENSE_V100_ENGINE_SPLIT)
     if (prof.get("arch") or "") in PIPELINE_PP_DEFAULT_ARCHES:
-        p.notes.append("PXA_PIPELINE_PP is ON by ENGINE default for arch "
-                       f"'{prof.get('arch')}' (qwen35/qwen35moe only). This launcher does not "
-                       "set or unset it; the seat inherits the engine's default. "
-                       + PIPELINE_PP_NOTE)
+        _nar = narrow_cards(sel, pcie_links()) if len(sel or []) > 1 else []
+        if _nar:
+            p.notes.append("PXA_PIPELINE_PP is ON by ENGINE default for arch "
+                           f"'{prof.get('arch')}' EXCEPT on a narrow PCIe link, and this set has one "
+                           f"({', '.join(f'card {i} x{w}' for i, w in _nar)}): the launcher emits "
+                           "PXA_PIPELINE_PP=0 (bug #280). " + PIPELINE_PP_NOTE)
+        else:
+            p.notes.append("PXA_PIPELINE_PP is ON by ENGINE default for arch "
+                           f"'{prof.get('arch')}' (qwen35/qwen35moe only; off on a card below PCIe x4). This "
+                           "launcher does not set or unset it; the seat inherits the engine's default. "
+                           + PIPELINE_PP_NOTE)
 
     envelope_notes(p, sel, prof, np_, per_slot_ctx, model)
     if p.engine == "vllm":
@@ -2322,8 +2620,9 @@ def _fa_note(p, rec, rstatus, workload):
     if rec is not None and rec.key == "1x1080ti-pxq2":
         p.evidence.append(
             f"MEASURED FA regime on this exact card: -fa {fa} for workload '{workload}'. Both "
-            f"cells were run: cold prefill 1,363.5 t/s at -fa off against chat prefill 746.6 at "
-            f"-fa on; decode 36.73 cold against 65.3 chat "
+            f"cells were run WITH --ctx-checkpoints 0 (the published protocol; this recipe no "
+            f"longer passes it, so its own numbers are UNMEASURED): cold prefill 1,363.5 t/s at "
+            f"-fa off against chat prefill 746.6 at -fa on; decode 36.73 cold against 65.3 chat "
             f"[RELEASE-NOTES-2026-09-07.md:79]")
         return
     if workload == "longdoc":
@@ -2402,7 +2701,7 @@ def vram_check(plan, sel, mbytes, ctx, prof, ngl_all):
     gpu_bytes = mbytes
     ple_note = None
     if mbytes and prof.get("ple_bytes"):
-        gpu_bytes = mbytes - prof["ple_bytes"]
+        gpu_bytes = max(0, mbytes - prof["ple_bytes"])
         ple_note = (f"PLE: {prof['ple_tensor']} is {prof['ple_bytes']/BYTES_PER_GIB:.2f} GiB and "
                     f"is pinned to host RAM by -ot, so the VRAM figures below use the "
                     f"GPU-resident remainder {gpu_bytes/BYTES_PER_GIB:.2f} GiB, not the "
@@ -2474,7 +2773,11 @@ def engine_ld_path(E):
     ('CUDA driver is a stub library'), offloads 0/33 layers, and the run is
     numerically CORRECT and ~50x SLOWER. Several existing helper scripts on this
     box still carry the stub dir. Returns (path, dropped[])."""
-    parts = [f"{E}/bin", f"{E}/src", f"{E}/ggml/src", f"{E}/examples/mtmd",
+    # {E}/lib first: the release tarball bundles the CUDA runtime (libcudart/libcublas/libnccl)
+    # there. The tarball's wrapper exports it, but a direct tools/pxa-launch.py call, and every
+    # llama-swap entry written by --emit-swap-config (its env: LD_LIBRARY_PATH replaces the
+    # proxy's), did not carry it: the backend then died on 'libcudart.so.12 not found'.
+    parts = [f"{E}/lib", f"{E}/bin", f"{E}/src", f"{E}/ggml/src", f"{E}/examples/mtmd",
              f"{E}/common", f"{E}/ggml/src/ggml-cuda"]
     existing = [p for p in parts if os.path.isdir(p)]
     prior = [x for x in os.environ.get("LD_LIBRARY_PATH", "").split(":") if x]
@@ -2532,6 +2835,270 @@ def resolve_engine_dir():
             head = "every candidate build is present but will not start:"
         return None, head + "\n      " + "\n      ".join(tried)
     return None, "no llama-server found"
+
+
+# ---------------------------------------------------------------------------
+# THE ENGINE'S OWN DEFAULTS (PXA core step 3, 2026-09-25)
+# ---------------------------------------------------------------------------
+# The engine now picks -sm / -b / -ub / -fa itself from a registry keyed on the card set and the
+# file (common/pxa-registry.cpp), so a bare `llama-server -m file` and the docker image get the
+# settings this launcher prints. To keep the two from drifting, the launcher ASKS the engine
+# (PXA_EXPLAIN=1 prints one JSON line and exits before loading anything; PXA_TOPOLOGY describes the
+# selected cards so no CUDA context is created on them) and emits the engine's answer explicitly.
+# Its own tables stay as the fallback for an engine too old to answer, and a disagreement between
+# the two is printed, never hidden.
+EXPLAIN_MARK = b"PXA_EXPLAIN_JSON"
+
+
+def engine_can_explain(E):
+    exe = f"{E}/bin/llama-server"
+    try:
+        # a binary without the registry would ignore PXA_EXPLAIN and start LOADING the model, so
+        # the capability is read off the file, not tried
+        with open(os.path.realpath(exe), "rb") as f:
+            tail = b""
+            while True:
+                chunk = f.read(1 << 22)
+                if not chunk:
+                    return False
+                if EXPLAIN_MARK in tail + chunk:
+                    return True
+                tail = chunk[-len(EXPLAIN_MARK):]
+    except OSError:
+        return False
+
+
+def engine_autoconfig(E, model, sel, a, fa_forced=None):
+    """-> (dict | None, note). The engine's picks for this model on these cards."""
+    if os.environ.get("PXA_LAUNCH_TABLES_ONLY") == "1":
+        # the launcher's own tables alone - what tools/pxa-parity.py compares the engine against
+        return None, "PXA_LAUNCH_TABLES_ONLY=1: launcher tables used"
+    if not E or E == "<ENGINE>":
+        return None, "no engine binary to ask"
+    if not engine_can_explain(E):
+        return None, "this engine build predates the registry (no PXA_EXPLAIN); launcher tables used"
+    exe = f"{E}/bin/llama-server"
+    args = [exe, "-m", model]
+    if getattr(a, "sm", "auto") not in ("auto", "", None):
+        args += ["-sm", a.sm]
+    if getattr(a, "ub", 0):
+        args += ["-b", str(a.b or a.ub), "-ub", str(a.ub)]
+    if getattr(a, "ts", ""):
+        args += ["-ts", a.ts]
+    if fa_forced:
+        args += ["-fa", fa_forced]
+    if getattr(a, "ngl", 999) not in (999, None):
+        args += ["-ngl", str(a.ngl)]
+    if getattr(a, "np", None):
+        args += ["-np", str(a.np)]   # the engine's -c pick is np * 4096, as ANCHOR_CTX_PER_SLOT here
+    if getattr(a, "ctx", None):
+        args += ["-c", str(a.ctx)]
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"], _ = engine_ld_path(E)
+    env["PXA_EXPLAIN"] = "1"
+    env["PXA_TOPOLOGY"] = ",".join(str(int(g[2]) * 10) for g in sel) if sel else "0x0"
+    env.setdefault("PXA_ENHANCE", "1")
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
+    except Exception as e:
+        return None, f"asking the engine failed ({e.__class__.__name__})"
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("PXA_EXPLAIN_JSON "):
+            try:
+                return json.loads(line[len("PXA_EXPLAIN_JSON "):]), "engine registry"
+            except ValueError:
+                break
+    return None, f"the engine did not answer (exit {r.returncode})"
+
+
+def engine_pick(eac, flag):
+    if not eac:
+        return None
+    return (eac.get("picks") or {}).get(flag)
+
+
+def _sha256_cached(path, quick=False):
+    """sha256 of a (possibly split) model, cached by (path, size, mtime) in the launcher state dir.
+    -> (hex | None, note)."""
+    import hashlib
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return None, f"unreadable ({e.strerror})"
+    key = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}"
+    cache_p = os.path.join(STATE_DIR, "sha256.json")
+    try:
+        with open(cache_p) as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    if key in cache:
+        return cache[key], "cached"
+    if quick:
+        return None, "not computed (--no-sha)"
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1 << 24)
+            if not b:
+                break
+            h.update(b)
+    hx = h.hexdigest()
+    cache[key] = hx
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(cache_p, "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+    return hx, "computed"
+
+
+def doctor(a, gpus, gpu_err):
+    """pxa-launch --doctor: one screen. Cards, driver, P2P, the model file (tier, arch, sha), and what
+    the engine would pick and why. Exit 0 = nothing found that stops a launch, 1 = problems listed."""
+    probs = []
+    W = 78
+    print("=" * W)
+    E, enote = resolve_engine_dir()
+    ver = ""
+    if E:
+        try:
+            env = dict(os.environ)
+            env["LD_LIBRARY_PATH"], _ = engine_ld_path(E)
+            r = subprocess.run([f"{E}/bin/llama-server", "--version"], capture_output=True, text=True,
+                               timeout=25, env=env)
+            ver = next((l.strip() for l in ((r.stdout or "") + (r.stderr or "")).splitlines()
+                        if l.strip().startswith("version")), "")
+        except Exception:
+            pass
+    print(f"PXA doctor   engine: {E or 'NOT FOUND'} {('(' + ver + ')') if ver else ''}")
+    if not E:
+        probs.append(f"no working llama-server: {enote}")
+    elif not engine_can_explain(E):
+        probs.append("this engine build predates the registry: its defaults cannot be shown")
+    # ---- cards / driver --------------------------------------------------------------------
+    drv = _run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]) or ""
+    drv = drv.splitlines()[0].strip() if drv.strip() else "unknown"
+    cuda = ""
+    head = _run(["nvidia-smi"]) or ""
+    m = re.search(r"CUDA Version:\s*([0-9.]+)", head)
+    if m:
+        cuda = m.group(1)
+    print(f"driver       {drv}" + (f"  (CUDA {cuda})" if cuda else ""))
+    if gpu_err:
+        probs.append(gpu_err)
+    procs, _ok = resident_procs(gpus or [])
+    cards = {int(x) for x in re.split(r"[,\s]+", a.gpus) if x.strip()} if a.gpus else set()
+    sel = [g for g in (gpus or []) if g[0] in cards] if cards else (gpus or [])
+    for g in (gpus or []):
+        busy = procs.get(g[0]) or g[4] > 512
+        mark = "*" if g in sel else " "
+        print(f" {mark}card {g[0]}     {g[1].replace('NVIDIA ', ''):<24} sm_{g[2]}  {g[3] / 1024:.0f} GiB"
+              f"  used {g[4]} MiB{'  BUSY' if busy else ''}")
+        if busy and g in sel:
+            probs.append(f"card {g[0]} is in use ({g[4]} MiB resident) - the launcher refuses it without --allow-busy")
+    if sel and len({g[2] for g in sel}) > 1:
+        print("             mixed card classes: layer split only; -ts is weighted for you on V100+P100")
+    # ---- PCIe links (bug #280) ---------------------------------------------------------------
+    _links = pcie_links()
+    if _links:
+        print("PCIe         " + ", ".join(f"card {i} {fmt_link(l)}" for i, l in sorted(_links.items())))
+        _nar = narrow_cards(sel, _links)
+        if _nar and len(sel or []) > 1:
+            print(f"             {narrow_link_note(_nar)}")
+    # ---- container /dev/shm (bug #206 follow-up) ---------------------------------------------
+    _ck = container_kind()
+    if _ck:
+        _sb = shm_bytes()
+        print(f"container    {_ck}, /dev/shm {(_sb / 2**20):.0f} MiB"
+              + ("" if _sb >= SHM_MIN_BYTES else "  (under 1 GiB)"))
+        _shm = shm_warning(_ck, len(sel or []), _sb)
+        if _shm:
+            probs.append(_shm)
+    # ---- P2P -------------------------------------------------------------------------------
+    p2p, pdesc = peer_topology()
+    rp = _run(["nvidia-smi", "topo", "-p2p", "r"], timeout=25) or ""
+    ok_pairs = len(re.findall(r"\bOK\b", rp)) // 2
+    print(f"P2P          {pdesc}; peer read OK on {ok_pairs} pair(s)"
+          + ("" if rp else " (nvidia-smi topo -p2p unreadable)"))
+    # ---- model -----------------------------------------------------------------------------
+    if a.model:
+        kind = model_kind(a.model)
+        # #8382 problem 3: model_profile() only fills hdr_err for kind in (gguf, gguf_broken), so
+        # a MISSING or otherwise unloadable path used to fall through with hdr_err left None,
+        # probs left empty, and doctor printed "OK" and exited 0 on a model that cannot load.
+        if kind == "missing":
+            probs.append(f"model file not found: {a.model}")
+        elif kind in ("not_a_model_file", "not_a_model", "weightless_dir"):
+            probs.append(f"model path is not a loadable model ({kind}): {a.model}")
+        prof = model_profile(a.model, kind)
+        mb = model_bytes(a.model, kind)
+        cls = "MoE" if prof.get("is_moe") else "dense"
+        print(f"model        {a.model}")
+        print(f"             {mb / BYTES_PER_GIB:.2f} GiB, arch {prof.get('arch') or '?'}, {cls}"
+              f"{(' ' + str(prof['n_expert']) + ' experts') if prof.get('is_moe') else ''}, "
+              f"tier {prof.get('tier') or 'not PXQ'}, kv heads {prof.get('n_head_kv') or '?'}"
+              + (f", {prof['shards']} shards" if prof.get("shards", 1) > 1 else ""))
+        if prof.get("hdr_err"):
+            probs.append(f"model header: {prof['hdr_err']}")
+        for miss in prof.get("shards_missing") or []:
+            probs.append(f"missing shard {miss}")
+        if kind in ("gguf", "gguf_broken") and not prof.get("hdr_err"):
+            h = gguf_header(a.model)
+            pk = {k: v for k, v in (h.get("kv") or {}).items() if str(k).startswith("pxa.")}
+            show = {k: v for k, v in pk.items() if not isinstance(v, list)}
+            if show:
+                print("             " + "  ".join(f"{k}={v}" for k, v in sorted(show.items())[:4])
+                      + (f"  (+{len(show) - 4} pxa.* keys)" if len(show) > 4 else ""))
+            else:
+                print("             no pxa.* provenance keys (not made by a PXA tool, or made before they existed)")
+        if os.path.isfile(a.model):
+            sha, how = _sha256_cached(a.model, quick=getattr(a, "no_sha", False))
+            side = None
+            for sp in (a.model + ".sha256", os.path.splitext(a.model)[0] + ".sha256"):
+                if os.path.isfile(sp):
+                    try:
+                        side = open(sp).read().split()[0].lower()
+                    except (OSError, IndexError):
+                        side = None
+                    break
+            verdict = ""
+            if sha and side:
+                verdict = "  MATCHES its .sha256" if sha == side else "  DOES NOT MATCH its .sha256"
+                if sha != side:
+                    probs.append("model sha256 does not match the .sha256 file next to it")
+            print(f"sha256       {sha or '-'} ({how}){verdict}")
+    else:
+        print("model        (none given: pass -m FILE to check a file and see its defaults)")
+    # ---- defaults --------------------------------------------------------------------------
+    if a.model and E and sel is not None:
+        eac, note = engine_autoconfig(E, a.model, sel, a)
+        if eac:
+            print(f"defaults     on {len(sel)} card(s), from the engine's registry "
+                  f"({eac.get('levers_declared')} levers declared, level {eac.get('level')}):")
+            for flag in ("sm", "b", "ub", "fa", "ngl", "c"):
+                pk = (eac.get("picks") or {}).get(flag) or {}
+                why = pk.get("why") or ""
+                why = why if len(why) <= W - 26 else why[:W - 29] + "..."
+                print(f"   -{flag:<3} {str(pk.get('value') or '(yours)'):<9} {pk.get('status', ''):<9} {why}")
+            for k, v in (eac.get("env") or {}).items():
+                print(f"   env  {k}={v}")
+            prof = model_profile(a.model, model_kind(a.model))
+            want, _why = resolve_auto_split("llama", sel, prof, a.ts, None, "on")
+            got = ((eac.get("picks") or {}).get("sm") or {}).get("value")
+            if got in ("layer", "tensor") and want != got:
+                probs.append(f"launcher table says -sm {want}, engine registry says -sm {got}")
+        else:
+            print(f"defaults     not shown: {note}")
+    print("-" * W)
+    if probs:
+        for p_ in probs:
+            print(f"  !! {p_}")
+    else:
+        print("  OK: nothing found that stops a launch on these cards.")
+    print("=" * W)
+    return 1 if probs else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2665,6 +3232,26 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
         a.sm = "layer"
         print("  -sm: 'auto' reached the command builder unresolved - emitting layer. This is "
               "a bug in this launcher, not a setting; please report it.")
+    # ---- -c: follow the SAME engine cell -b/-ub follow below, when nothing more specific has
+    # already claimed -c (#8382's other half; pxa-registry.cpp "---- -c ----" now derives -c from
+    # ac.batch_cell_ctx, the identical cell -b/-ub reads there, for exactly this reason - one
+    # source of truth instead of a second formula that can drift from it). A row matched BY FILE
+    # still owns -c (R.ctx set, e.g. '4xp100-flashnext' -c 150016) - it is more specific than a
+    # topology-only engine cell and is kept. A row borrowed across model classes for -b/-ub only
+    # (R.ctx unset - an INFERRED cross-arch match whose own note says "-c ... DROPPED rather than
+    # applied to a file they were not measured on") and the bare np*4096 anchor are NOT more
+    # specific than the engine's own answer, so the engine wins here too, exactly as it already
+    # does for -b/-ub just below. Without this, a file with no row of its own kept anchor -c 4096
+    # while -b/-ub already took the engine's bigger cell, and llama.cpp silently clamped n_batch
+    # down to n_ctx at load - #8382 reborn from THIS launcher instead of a bare boot (found on
+    # mix27/PXQ3-balanced/Q8_0 at 2x600/2x700: rel-integrate2 build-3 parity triage, 2026-09-25).
+    if not a.ctx and not (R is not None and R.ctx):
+        _ec = engine_pick(getattr(plan, "engine_ac", None), "c")
+        if _ec is not None and str(_ec.get("value", "")).isdigit() and int(_ec["value"]) != ctx:
+            print(f"  -c {_ec['value']} [{_ec.get('status')}] from the engine's registry (was -c "
+                  f"{ctx} from the np*4096 anchor): {_ec.get('why')}")
+            ctx = int(_ec["value"])
+
     cmd = [f"{E}/bin/llama-server", "-m", a.model, "--host", a.host, "--port", str(a.port),
            "-ngl", str(a.ngl), "-sm", a.sm, "-c", str(ctx),
            "-ctk", a.ctk, "-ctv", a.ctv, "-np", str(a.np),
@@ -2702,6 +3289,25 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
               + (f" and the '{R.key}' row measured -b {R.b} -ub {R.ub}." if R else "."))
         print("  NOTE: -ub and -ts are coupled - llama.cpp folds a compute allowance into the "
               "-ts walk, so this -ub repacks the layers. If you also passed --ts, re-derive it.")
+    elif engine_pick(getattr(plan, "engine_ac", None), "ub") is not None:
+        # THE ENGINE'S ANSWER (PXA core step 3). The registry carries every MEASURED row of the
+        # table above for -b/-ub, so on a measured cell the two agree by construction; where no
+        # cell exists the engine's VRAM ladder decides at load and nothing is passed, so this
+        # command and a bare `llama-server -m file` run the same -b/-ub.
+        _eb, _eu = engine_pick(plan.engine_ac, "b"), engine_pick(plan.engine_ac, "ub")
+        if str(_eu.get("value", "")).isdigit():
+            cmd += ["-b", str(_eb.get("value")), "-ub", str(_eu["value"])]
+            print(f"  -b {_eb.get('value')} -ub {_eu['value']} [{_eu.get('status')}] from the engine's "
+                  f"registry: {_eu.get('why')}")
+            if R is not None and (str(R.b), str(R.ub)) != (str(_eb.get("value")), str(_eu["value"])):
+                print(f"  !! DISAGREEMENT: recipe row '{R.key}' ({R.status}) says -b {R.b} -ub {R.ub}; "
+                      f"the engine's registry is used, because it is what a bare llama-server runs.")
+        else:
+            print(f"  -b/-ub: NOT PASSED - the engine's registry has no measured cell for these cards "
+                  f"and this file, so its VRAM ladder picks -ub at load (expect <= {ub_expect}); the "
+                  f"same thing a bare llama-server does."
+                  + (f" Recipe row '{R.key}' [{R.status}] would have said -b {R.b} -ub {R.ub}; its "
+                     f"hardware match is not a measurement of this file." if R is not None else ""))
     elif R is not None:
         ub = R.ub
         if ub > ub_for_card(min(g[3] for g in sel)) and R.status != "MEASURED":
@@ -2838,11 +3444,10 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
     if a.sm == "tensor":
         for k, v in TSPLIT_AUTO_ENV.items():
             env.setdefault(k, v)
-        print(f"  PXA_TSPLIT_REDUCE={env['PXA_TSPLIT_REDUCE']} "
-              f"PXA_TSPLIT_REDUCE_PREFILL={env['PXA_TSPLIT_REDUCE_PREFILL']}: the fused "
-              f"all-reduce is the route every -sm tensor number on record was taken on, and "
-              f"_PREFILL=1 puts it on the prefill reduce too (752 -> 773 t/s at a 12.7k prompt "
-              f"on a V100 pair, greedy output UNCHANGED).")
+        print(f"  PXA_TSPLIT_REDUCE={env['PXA_TSPLIT_REDUCE']}: the fused all-reduce is the "
+              f"route every -sm tensor decode number on record was taken on; prefill-width "
+              f"reduces take the engine's two-device DMA route (PXA_TSPLIT_PF), which beats the "
+              f"fused route there (824 vs 743 t/s at a 14.8k prompt on a V100 pair).")
         if plan.sm_auto:
             # ONLY when the launcher chose the mode. The engine's contract for a hand-typed
             # '-sm tensor' is REFUSE LOUDLY AND STOP, and that is right: an operator who asks
@@ -2856,6 +3461,11 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
                   f"the engine's own capability check refuses this file at load it demotes to "
                   f"'-sm layer' and serves (printing why) instead of stopping. Type "
                   f"--sm tensor yourself and this is NOT set: an explicit request stops loudly.")
+    if getattr(a, "_narrow", None) and len(sel or []) > 1 and "PXA_PIPELINE_PP" not in os.environ:
+        env.setdefault("PXA_PIPELINE_PP", "0")
+        print(f"  PXA_PIPELINE_PP=0: {', '.join(f'card {i} is on a PCIe x{w} link' for i, w in a._narrow)} "
+              f"(bug #280) - pipeline parallelism stays off there. PXA_P2P=0 is the next switch if the output "
+              f"is still wrong.")
     if a.no_mmap:
         cmd += ["--no-mmap"]
         env["PXA_PARALLEL_LOAD"] = "1"   # -25..-46% cold load; INERT under mmap (one WARN)
@@ -3168,10 +3778,30 @@ def _load_state():
 def _save_state(d):
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(STATE_FILE, "w") as f:
+        # 0600: the state file records the last command line. The API key is redacted from
+        # it (redact_cmd), but the file is still the user's own and not the box's to read.
+        fd = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)        # a file an older launcher wrote at 0644 is tightened too
+        with os.fdopen(fd, "w") as f:
             json.dump(d, f, indent=1)
     except Exception:
         pass            # a launcher must never fail because it could not remember
+
+
+API_KEY_REDACTED = "<redacted>"
+
+
+def redact_cmd(cmd):
+    """The command with the --api-key value replaced (bug #225). Used for everything the
+    launcher PRINTS or WRITES; the real cmd is only ever exec'd. --help promises 'Never
+    printed', and the plan's 'command:' line lands in container logs, CI captures and tee."""
+    out = list(cmd)
+    for i, tok in enumerate(out):
+        if tok == "--api-key" and i + 1 < len(out):
+            out[i + 1] = API_KEY_REDACTED
+        elif tok.startswith("--api-key="):
+            out[i] = "--api-key=" + API_KEY_REDACTED
+    return out
 
 
 def human_bytes(n):
@@ -3239,12 +3869,22 @@ def describe_gguf(path, cache):
         st = os.stat(path)
     except OSError:
         return None
-    key = f"v3|{path}|{st.st_size}|{int(st.st_mtime)}"
+    size = model_bytes(path, "gguf")         # all shards of a split file (bug #229)
+    # every shard's own (size, mtime): a later shard replaced by one of the same size, or a
+    # shard that went missing or came back, must not serve a stale tier / block count
+    sig = []
+    for sp in gguf_shards(path):
+        try:
+            sst = st if sp == path else os.stat(sp)
+            sig.append(f"{sst.st_size}:{sst.st_mtime_ns}")
+        except OSError:
+            sig.append("missing")
+    key = f"v5|{path}|{size}|{','.join(sig)}"
     hit = cache.get(key)
     if hit is not None:
         return hit
     prof = model_profile(path, "gguf")
-    d = {"path": path, "size": st.st_size, "blocks": prof.get("n_block", 0),
+    d = {"path": path, "size": size, "blocks": prof.get("n_block", 0),
          "family": model_family(prof), "tier": prof.get("tier"),
          "tier_kv": prof.get("tier_kv"), "arch": prof.get("arch"),
          "n_expert": prof.get("n_expert", 0), "n_ctx_train": prof.get("n_ctx_train"),
@@ -3252,6 +3892,7 @@ def describe_gguf(path, cache):
          "ple_bytes": prof.get("ple_bytes") or 0,
          "kv_bytes_tok": prof.get("kv_bytes_tok") or 0,
          "template": bool(prof.get("chat_template")),
+         "shards_missing": len(prof.get("shards_missing") or []),
          "err": prof.get("hdr_err")}
     cache[key] = d
     return d
@@ -3398,6 +4039,8 @@ def print_model_menu(entries, trail, notes):
             extra += " PLE"
         if e.get("vision"):
             extra += " vision"
+        if e.get("shards_missing"):
+            extra += f" MISSING {e['shards_missing']} SHARD(S)"
         print(f"  {n:>2}  {nm:<44}  {human_bytes(e['size']):>9}  {family_label(e):<13} "
               f"{tier}{extra}")
     print()
@@ -4181,7 +4824,7 @@ class LaunchTUI(object):
         if not picked:
             return "-", 0
         total = sum(g[3] for g in picked) * 1024 * 1024
-        gpu_bytes = (e.get("size") or 0) - (e.get("ple_bytes") or 0)
+        gpu_bytes = max(0, (e.get("size") or 0) - (e.get("ple_bytes") or 0))
         return ("yes" if gpu_bytes < total else "NO"), gpu_bytes
 
     def screen_model(self, w):
@@ -4221,7 +4864,9 @@ class LaunchTUI(object):
                         nm = nm[:37] + "..."
                     fit, _ = self._fits(e)
                     line = (f"  {nm:<40} {human_bytes(e['size']):>9}  "
-                            f"{family_label(e):<13} {(e.get('tier') or '-'):<9} {fit}")
+                            f"{family_label(e):<13} {(e.get('tier') or '-'):<9} {fit}"
+                            + (f"  MISSING {e['shards_missing']} SHARD(S)"
+                               if e.get("shards_missing") else ""))
                     self._put(w, 3 + i - self.model_top, 2, line,
                               curses.A_REVERSE if i == self.model_row else 0)
                 e = self.entries[self.model_row]
@@ -4997,7 +5642,19 @@ def selftest(gpus):
          {"arch": "qwen35moe", "tier": "PXQ4", "n_head_kv": 4}, "", None, "layer"),
         ("qwen35 but PXQ3",               "llama", _c(70, V100, 2),
          {"arch": "qwen35", "tier": "PXQ3", "n_head_kv": 4}, "", None, "layer"),
+        # PXQ-Next (2026-09-27): the 2-card sizes take the split on a pair, a 1-card size does not
+        ("V100 pair, qwen35 PXQN4",       "llama", _c(70, V100, 2),
+         {"arch": "qwen35", "tier": "PXQN4", "n_head_kv": 4}, "", None, "tensor"),
+        ("P100 pair, qwen35 PXQN5",       "llama", _c(60, P100, 2),
+         {"arch": "qwen35", "tier": "PXQN5", "n_head_kv": 4}, "", None, "tensor"),
+        ("P100 pair, qwen35 PXQN3 (1-card size)", "llama", _c(60, P100, 2),
+         {"arch": "qwen35", "tier": "PXQN3", "n_head_kv": 4}, "", None, "layer"),
         ("6 cards, 4 KV heads",           "llama", _c(60, P100, 6), qwen, "", None, "layer"),
+        # bug #226: past a pair only the MEASURED set takes the split (2026-09-27: 4 identical P100s,
+        # tensor decode +5% / prefill +95%); 3 cards and 4 V100s have no number and stay on layer
+        ("3 identical cards (bug #226)",  "llama", _c(60, P100, 3), qwen, "", None, "layer"),
+        ("4 identical P100s (measured)",  "llama", _c(60, P100, 4), qwen, "", None, "tensor"),
+        ("4 identical V100s (bug #226)",  "llama", _c(70, V100, 4), qwen, "", None, "layer"),
         ("--ts forced",                   "llama", _c(70, V100, 2), qwen, "40,60", None, "layer"),
         ("vLLM wins the seat",            "vllm",  _c(70, V100, 2), qwen, "", None, "layer"),
     ]
@@ -5022,19 +5679,164 @@ def selftest(gpus):
     a12 = not a12bad
     ok_all &= a12
     print(f"  A12 --sm auto resolves as specified over {len(a12all)} cases (pair+admitted "
-          f"-> tensor; one card / mixed cards / gemma4 / unproven arch / wrong tier / too few "
+          f"-> tensor; one card / 3+ cards / mixed cards / gemma4 / unproven arch / wrong tier / too few "
           f"KV heads / -fa off / forced --ts / a layer recipe row / vLLM -> layer), always with "
           f"a reason: {'PASS' if a12 else 'FAIL ' + str(a12bad)}")
     # A13: the tensor split's env is emitted as one table, and the fallback lever is NOT in
     #      the table that every '-sm tensor' gets - it is the auto path's own, because an
     #      explicitly typed '-sm tensor' must keep the engine's stop-loudly contract.
-    a13 = (TSPLIT_AUTO_ENV == {"PXA_TSPLIT_REDUCE": "fused", "PXA_TSPLIT_REDUCE_PREFILL": "1"}
+    a13 = (TSPLIT_AUTO_ENV == {"PXA_TSPLIT_REDUCE": "fused"}
            and TSPLIT_AUTO_FALLBACK_ENV == {"PXA_TSPLIT_FALLBACK": "1"}
            and "PXA_TSPLIT_FALLBACK" not in TSPLIT_AUTO_ENV)
     ok_all &= a13
-    print(f"  A13 -sm tensor carries reduce=fused + prefill reduce; PXA_TSPLIT_FALLBACK only "
+    print(f"  A13 -sm tensor carries reduce=fused (prefill left to PXA_TSPLIT_PF); PXA_TSPLIT_FALLBACK only "
           f"on the auto path: {'PASS' if a13 else 'FAIL'}")
+    # A14 (bug #225): the --api-key value is never printed and never persisted. redact_cmd
+    #      hides both spellings; the plan's 'command:' line and state.json's last_command go
+    #      through it; the state file is written 0600 even over an older 0644 one.
+    import tempfile
+    _sec = "sk-selftest-SECRET"
+    _r = redact_cmd(["llama-server", "--api-key", _sec, "-c", "4096", f"--api-key={_sec}"])
+    a14 = (_sec not in " ".join(_r) and _r[2] == API_KEY_REDACTED and _r[3] == "-c"
+           and redact_cmd(["x", "--api-key"]) == ["x", "--api-key"])
+    a14 &= ("print(f\"  command: {' '.join(redact_cmd(cmd))}\")" in "".join(src)
+            and 'st["last_command"] = redact_cmd(cmd)' in "".join(src))
+    global STATE_DIR, STATE_FILE
+    _sd, _sf = STATE_DIR, STATE_FILE
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            STATE_DIR, STATE_FILE = td, os.path.join(td, "state.json")
+            open(STATE_FILE, "w").close()
+            os.chmod(STATE_FILE, 0o644)
+            _save_state({"last_command": redact_cmd(["llama-server", "--api-key", _sec])})
+            with open(STATE_FILE) as f:
+                _body = f.read()
+            a14 &= _sec not in _body and (os.stat(STATE_FILE).st_mode & 0o777) == 0o600
+    finally:
+        STATE_DIR, STATE_FILE = _sd, _sf
+    ok_all &= a14
+    print(f"  A14 --api-key is redacted from the printed command and state.json, which is "
+          f"0600 (bug #225): {'PASS' if a14 else 'FAIL'}")
+    # A15 (bug #246): R-17A compares what ONE sequence can reach with n_ctx_train - c/np on a
+    #      split ring, the whole -c when the ring is unified or on vLLM (max-model-len is per
+    #      sequence) - and the unified test follows the engine's env > flag > auto order
+    #      (gpt_params_parse_from_env runs after gpt_params_parse, so the env var wins).
+    _r17 = [
+        (("llama", 524288, 4, [], {}),                              131072),
+        (("llama", 524288, 1, [], {}),                              524288),
+        (("vllm", 524288, 4, [], {}),                               524288),
+        (("llama", 524288, 4, ["--kv-unified"], {}),                524288),
+        (("llama", 524288, 4, [], {"PXA_KV_UNIFIED": "1"}),         524288),
+        (("llama", 524288, 4, [], {"LLAMA_ARG_KV_UNIFIED": "true"}), 524288),
+        (("llama", 524288, 4, [], {"PXA_KV_UNIFIED": "0",
+                                   "LLAMA_ARG_KV_UNIFIED": "1"}),   131072),
+        (("llama", 524288, 4, [], {"PXA_KV_UNIFIED_DEFAULT": "1"}), 524288),
+        (("llama", 524288, 4, ["--no-kv-unified"],
+          {"PXA_KV_UNIFIED_DEFAULT": "1"}),                         131072),
+        (("llama", 524288, 4, [], {"PXA_KV_UNIFIED_DEFAULT": "1",
+                                   "PXA_KV_UNIFIED": "0"}),         131072),
+        # flag + env conflicts: the env var wins, as in the engine
+        (("llama", 524288, 4, ["--no-kv-unified"], {"PXA_KV_UNIFIED": "1"}),       524288),
+        (("llama", 524288, 4, ["--kv-unified"], {"PXA_KV_UNIFIED": "0"}),          131072),
+        (("llama", 524288, 4, ["--no-kv-unified"], {"LLAMA_ARG_KV_UNIFIED": "1"}), 524288),
+        (("llama", 524288, 4, ["--kv-unified"], {"LLAMA_ARG_KV_UNIFIED": "0"}),    131072),
+        (("llama", 524288, 4, ["-kvu"], {"LLAMA_ARG_KV_UNIFIED": "1",
+                                         "PXA_KV_UNIFIED": "no"}),                  131072),
+        (("llama", 524288, 4, ["--kv-unified"], {"PXA_KV_UNIFIED_DEFAULT": "0"}),  524288),
+    ]
+    a15bad = [(args, slot_ctx_for_r17a(*args)[0], want) for args, want in _r17
+              if slot_ctx_for_r17a(*args)[0] != want]
+    a15 = not a15bad
+    ok_all &= a15
+    print(f"  A15 R-17A checks the per-slot context (c/np unless --kv-unified / vLLM), not the "
+          f"total -c (bug #246): {'PASS' if a15 else 'FAIL ' + str(a15bad)}")
+    # A16 (bug #229): a split GGUF is sized, tiered and block-counted over EVERY shard. Two
+    #      synthetic shards, the way llama-gguf-split writes them: shard 1 carries the KV block
+    #      and no tensors, shard 2 the tensors. Missing shards are named, not guessed at.
+    def _gguf(fp, kvs, tensors, pad):
+        def _s(x):
+            b = x.encode()
+            return struct.pack("<Q", len(b)) + b
+        with open(fp, "wb") as f:
+            f.write(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kvs)))
+            for k, v in kvs:
+                f.write(_s(k) + struct.pack("<I", 8) + _s(v))
+            for nm in tensors:
+                f.write(_s(nm) + struct.pack("<I", 1) + struct.pack("<Q", 32)
+                        + struct.pack("<I", 0) + struct.pack("<Q", 0))
+            f.write(b"\0" * pad)
+    a16 = False
+    with tempfile.TemporaryDirectory() as td:
+        s1 = os.path.join(td, "m-00001-of-00002.gguf")
+        s2 = os.path.join(td, "m-00002-of-00002.gguf")
+        _gguf(s1, [("general.architecture", "llama")], [], 0)
+        _gguf(s2, [("general.architecture", "llama")], ["blk.0.attn_q.weight"], 1 << 20)
+        _want = os.path.getsize(s1) + os.path.getsize(s2)
+        _pf = model_profile(s1, "gguf")
+        _d = describe_gguf(s1, {})
+        a16 = (gguf_shards(s1) == [s1, s2] and gguf_shards("/x/one.gguf") == ["/x/one.gguf"]
+               and model_bytes(s1, "gguf") == _want and _pf.get("n_block") == 1
+               and not _pf.get("shards_missing") and _d and _d["size"] == _want
+               and _d["blocks"] == 1)
+        # replace shard 2 with a same-size file that has no blk.* tensor: the cached describe
+        # entry must not be served (the key carries every shard's own size and mtime)
+        _cache = {}
+        describe_gguf(s1, _cache)
+        _sz2 = os.path.getsize(s2)
+        _gguf(s2, [("general.architecture", "llama")], ["output.weight"], 0)
+        with open(s2, "ab") as f:
+            f.write(b"\0" * (_sz2 - os.path.getsize(s2)))
+        _st2 = os.stat(s2)
+        os.utime(s2, ns=(_st2.st_atime_ns, _st2.st_mtime_ns + 2_000_000_000))
+        _d2 = describe_gguf(s1, _cache)
+        a16 &= (os.path.getsize(s2) == _sz2 and _d2 is not None and _d2["blocks"] == 0)
+        os.unlink(s2)
+        _pm = model_profile(s1, "gguf")
+        _dm = describe_gguf(s1, _cache)
+        a16 &= (_pm.get("shards_missing") == [s2] and model_bytes(s1, "gguf") < _want
+                and _dm is not None and _dm["shards_missing"] == 1)
+    ok_all &= a16
+    print(f"  A16 a split GGUF is sized and profiled over all its shards, and a missing shard "
+          f"is named (bug #229): {'PASS' if a16 else 'FAIL'}")
+    # A17 (#8382 problem 4): '-sm tensor' typed BY HAND on more than a pair must warn with the
+    #     SAME bug #206 text the auto resolver prints when it declines tensor past a pair - the
+    #     auto path silently avoiding the bug used to be no help to someone who overrides it.
+    a17 = (resolve_auto_split("llama", _c(70, V100, 4), qwen, "", None, "on")[1] == tsplit_bug206_note(4)
+           and resolve_auto_split("llama", _c(60, P100, 4), qwen, "", None, "on")[0] == "tensor"
+           and not tsplit_auto_quad(_c(60, P100, 4), {"PXA_TSPLIT_ALLOW_4WAY": "0"})
+           and "bug #206" in tsplit_bug206_note(3) and "unmeasured" in tsplit_bug206_note(3)
+           # wired into decide()'s manual-override path too, not just the auto resolver:
+           and "".join(src).count("tsplit_bug206_note(") >= 2)
+    ok_all &= a17
+    print(f"  A17 '-sm tensor' by hand on >2 cards warns with the auto path's own bug #206 text "
+          f"(#8382 problem 4): {'PASS' if a17 else 'FAIL'}")
+    # A18 (2026-09-27): the container /dev/shm preflight speaks only when it should - a container,
+    #     2+ cards, under 1 GiB - and names the container's own fix.
+    a18 = (shm_warning(None, 4, 64 << 20) is None
+           and shm_warning("docker", 1, 64 << 20) is None
+           and shm_warning("docker", 2, 1 << 30) is None
+           and "--shm-size=1g" in (shm_warning("docker", 2, 64 << 20) or "")
+           and "lxc.mount.entry" in (shm_warning("lxc", 2, 64 << 20) or "")
+           and "--shm-size=1g" in (shm_warning("podman", 4, 0) or "")
+           and "missing" in (shm_warning("podman", 4, 0) or "")
+           and "".join(src).count("shm_warning(container_kind()") >= 1)
+    ok_all &= a18
+    print(f"  A18 container /dev/shm preflight: warns only in a container with 2+ cards and "
+          f"/dev/shm under 1 GiB, with that container's fix: {'PASS' if a18 else 'FAIL'}")
+    # A19 (2026-09-27, bug #280): a selected card on a link below x4 is named, keeps the layer split,
+    #     and the note carries the PP and P2P switches; unknown links are never called narrow.
+    _l = {0: (3, 1, 3, 16), 1: (3, 1, 3, 16), 2: (3, 4, 3, 16), 3: (0, 0, 0, 0)}
+    _s2 = [(0, P100, 60, 16384, 0, "U0"), (1, P100, 60, 16384, 0, "U1")]
+    _s3 = [(2, P100, 60, 16384, 0, "U2"), (3, P100, 60, 16384, 0, "U3")]
+    a19 = (narrow_cards(_s2, _l) == [(0, 1), (1, 1)] and narrow_cards(_s3, _l) == []
+           and narrow_cards(_s2, {}) == [] and narrow_link_note([]) is None
+           and "PXA_PIPELINE_PP=0" in narrow_link_note([(0, 1)]) and "PXA_P2P=0" in narrow_link_note([(0, 1)])
+           and fmt_link((3, 1, 3, 16)) == "x1 gen3 (card max x16 gen3)")
+    ok_all &= a19
+    print(f"  A19 narrow PCIe links (x1/x2 risers) are named and keep layer + PP off, unknown is not narrow: "
+          f"{'PASS' if a19 else 'FAIL'}")
     print(f"  standing assertions: {'ALL PASS' if ok_all else 'FAILURES ABOVE'}")
+    return ok_all
 
 
 # ---------------------------------------------------------------------------
@@ -5054,6 +5856,21 @@ def plan_and_build(a, gpus):
         print(f"pxa-launch: --gpus asked for {missing} which are not visible", file=sys.stderr)
         sys.exit(2)
 
+    # ---- PCIe links (bug #280, 2026-09-27) ------------------------------------
+    a._links = pcie_links() if len(sel or []) > 1 else {}
+    a._narrow = narrow_cards(sel, a._links)
+    if a._links:
+        print("  PCIe links: " + ", ".join(f"card {g[0]} {fmt_link(a._links.get(g[0]))}" for g in sel))
+    if a._narrow:
+        print(f"  !! {narrow_link_note(a._narrow)}")
+
+    # ---- container /dev/shm preflight (bug #206 follow-up, 2026-09-27) ------
+    _shm = shm_warning(container_kind(), len(sel or []), shm_bytes())
+    if _shm:
+        print(f"  !! WARNING: {_shm}")
+        print(f"pxa-launch: WARNING: {_shm}", file=sys.stderr)
+
+    a.workload_explicit = a.workload is not None
     kind = model_kind(a.model)
     prof = model_profile(a.model, kind)
     if a.tier:
@@ -5114,6 +5931,10 @@ def plan_and_build(a, gpus):
     print(f"pxa-launch: ENGINE = {plan.engine}")
     size = f", {mbytes / BYTES_PER_GIB:.2f} GiB" if mbytes else ""
     print(f"  model:  {a.model}  [{kind}{size}]")
+    if prof.get("shards", 1) > 1:
+        print(f"  shards: {prof['shards']} (sized, tiered and fit-checked over all of them)")
+        for miss in prof.get("shards_missing") or []:
+            print(f"  ** MISSING SHARD: {miss} - llama-server will fail to load this model")
     if prof["arch"] or prof["n_expert"] or prof["tier"] or prof["hist"]:
         cls = "MoE" if prof["is_moe"] else "dense"
         line = f"  class:  {cls}"
@@ -5173,9 +5994,35 @@ def plan_and_build(a, gpus):
     # this line reads a CONCRETE split mode, so no branch has to learn a third value, and
     # 'auto' can never reach a command line. The reason goes on plan.notes, which prints a
     # few lines down - the whole point of a chosen default is that it says why it chose.
+    # ---- the engine's own answer (PXA core step 3) ---------------------------
+    plan.engine_ac, plan.engine_ac_note = None, "not asked (not the llama engine)"
+    if plan.engine == "llama":
+        _E, _ = resolve_engine_dir()
+        plan.engine_ac, plan.engine_ac_note = engine_autoconfig(
+            _E, a.model, sel, a, fa_forced=(plan.fa if a.workload_explicit else None))
+        _fa = engine_pick(plan.engine_ac, "fa")
+        if _fa and not a.workload_explicit and _fa.get("value") in ("on", "off") and _fa["value"] != plan.fa:
+            plan.notes.append(f"-fa {_fa['value']} (the engine's pick, not the workload table's "
+                              f"-fa {plan.fa}): {_fa.get('why')}")
+            plan.fa = _fa["value"]
+        print(f"  engine defaults: {plan.engine_ac_note}"
+              + ("" if not plan.engine_ac else
+                 "  -> " + "  ".join(f"{k} {v.get('value') or '(yours)'}"
+                                      for k, v in (plan.engine_ac.get('picks') or {}).items())))
+
     plan.sm_auto = (a.sm == "auto")
     if plan.sm_auto:
         a.sm, why = resolve_auto_split(plan.engine, sel, prof, a.ts, plan.recipe, plan.fa)
+        _sm = engine_pick(plan.engine_ac, "sm")
+        if _sm and _sm.get("value") in ("layer", "tensor"):
+            if _sm["value"] != a.sm:
+                plan.notes.append(f"DISAGREEMENT: the launcher table says -sm {a.sm} ({why}); the "
+                                  f"engine registry says -sm {_sm['value']}. The engine's answer is "
+                                  f"used - it is what a bare llama-server would run.")
+            a.sm, why = _sm["value"], f"{_sm.get('why')} [engine registry: {_sm.get('status')}]"
+        if a.sm == "tensor" and getattr(a, "_narrow", None):
+            # an engine too old to read the link itself may still have said tensor
+            a.sm, why = "layer", narrow_link_note(a._narrow)
         if a.sm == "tensor":
             row = ""
             if plan.recipe is not None and plan.recipe.sm != "tensor":
@@ -5191,6 +6038,13 @@ def plan_and_build(a, gpus):
                 f"--sm auto -> -sm layer (the engine's own default). Why: {why}. "
                 f"--sm tensor asks for the split by hand; the engine has the last word on "
                 f"whether it will run it.")
+
+    # #8382 problem 4: '--sm auto' and the engine registry both always pick 'layer' past a pair
+    # (bug #206), so a.sm can only be 'tensor' with len(sel) > 2 here when tensor was FORCED BY
+    # HAND - and that path used to print '-sm tensor' with no warning at all. Same text the auto
+    # path prints when it declines tensor for the same reason.
+    if plan.engine == "llama" and a.sm == "tensor" and len(sel or []) > 2 and not tsplit_auto_quad(sel):
+        plan.notes.append(tsplit_bug206_note(len(sel)))
 
     # The engine treats the three Gemma 4 split modes differently and so does this.
     # '-sm tensor' it REFUSES outright, after the model load; refusing here saves that
@@ -5284,8 +6138,16 @@ def plan_and_build(a, gpus):
         plan.refuse("R-16", code=3, tier=prof["tier"], ngl=a.ngl)
     if plan.engine == "vllm" and a.cudagraph_mode != "FULL_DECODE_ONLY":
         plan.refuse("R-08", code=3, mode=a.cudagraph_mode)
-    if prof.get("n_ctx_train") and ctx > int(prof["n_ctx_train"]):
-        plan.refuse("R-17A", ctx=ctx, trained=prof["n_ctx_train"], arch=prof.get("arch"))
+    if prof.get("n_ctx_train"):
+        _extra = list(plan.recipe.extra or []) if plan.recipe is not None else []
+        # the engine sees os.environ with the recipe's PXA_* levers on top (screen_launch / run)
+        _env = dict(os.environ)
+        if plan.recipe is not None and plan.recipe.env:
+            _env.update(plan.recipe.env)
+        _eff, _what = slot_ctx_for_r17a(plan.engine, ctx, a.np, _extra, _env)
+        if _eff > int(prof["n_ctx_train"]):
+            plan.refuse("R-17A", what=_what, ctx=_eff, trained=prof["n_ctx_train"],
+                        arch=prof.get("arch"))
 
     # ---- VRAM (only formula-free facts may block; see SPEC CORRECTION C4) ---
     for n in vram_check(plan, sel, mbytes, ctx, prof, a.ngl >= 99):
@@ -5451,12 +6313,146 @@ def plan_and_build(a, gpus):
         else:
             print("  CONTAINER CONTRACT: no image was named, so eligibility came from the "
                   "importable vllm_pxq4 in THIS interpreter. `vllm serve` execs here.")
-    print(f"  command: {' '.join(cmd)}")
+    print(f"  command: {' '.join(redact_cmd(cmd))}")
     print_post_boot_contract(plan.engine, cv)
     return plan, cmd, env, cv, prof, ctx
 
 
-def main():
+
+# ---- --emit-swap-config -------------------------------------------------------
+# One llama-swap config for several models, each entry the exact command this launcher would run
+# for that model on those cards (the same plan_and_build path --explain uses). The slug/render
+# helpers were written by a local seat from a spec (2026-09-22) and are inlined so the launcher
+# stays one file.
+
+_QUANT = ('pxq2','pxq3','pxq4','pxqu','pxqu96','q4_k_m','q5_k_m','q8_0','q4_0','f16','bf16','iq2_m','ud-q4_k_s')
+
+def _swap_slug(model_path):
+    base = model_path.split('/')[-1]
+    if base.lower().endswith('.gguf'):
+        base = base[:-5]
+    lower = base.lower()
+    for q in _QUANT:
+        idx = lower.rfind(q)
+        if idx != -1 and (idx == 0 or base[idx-1] in '-_.'):
+            base = base[:idx]
+            break
+    base = re.sub(r'[^a-z0-9.]+', '-', base.lower())
+    return base.strip('-')
+
+
+def _check_port(entries):
+    for i, e in enumerate(entries):
+        p = int(e['port'])
+        for o in entries[i+1:]:
+            if int(o['port']) == p:
+                raise ValueError(
+                    f'port {p} used by both {e["model"]!r} and {o["model"]!r}')
+
+
+def _swap_render(entries, ttl=None):
+    """llama-swap execs `cmd` itself (no shell), so a `VAR=value prog ...` prefix would be taken
+    as the program name. The environment goes in the model's `env:` list and `cmd` is a block
+    scalar, one flag and its value per line, so no argument can be misread as YAML."""
+    _check_port(entries)
+    lines = ['# llama-swap config written by pxa-launch --emit-swap-config',
+             'models:']
+    counts = {}
+    blocks = []
+    for e in entries:
+        argv = [str(x) for x in e['argv']]
+        if any('\n' in x for x in argv) or any('\n' in f'{k}{v}' for k, v in e['env']):
+            raise ValueError('cmd or env contains a newline')
+        p = int(e['port'])
+        m = e['model']
+        s = _swap_slug(m)
+        counts[s] = counts.get(s, 0) + 1
+        key = s if counts[s] == 1 else f'{s}-{counts[s]}'
+        # group "-flag value..." on one line; a leading '#' would be read as a comment
+        rows, cur = [], []
+        for x in argv:
+            if x.startswith('-') and cur:
+                rows.append(cur); cur = []
+            cur.append(x)
+        if cur:
+            rows.append(cur)
+        b = [f'  {json.dumps(key)}:', '    cmd: |']
+        for r in rows:
+            txt = ' '.join(x if x.startswith('${env.') else _shquote(x) for x in r)
+            if txt.startswith('#'):
+                txt = _shquote(txt)
+            b.append(f'      {txt}')
+        if e['env']:
+            b.append('    env:')
+            b += [f'      - {json.dumps(f"{k}={v}")}' for k, v in e['env']]
+        b.append(f'    proxy: http://127.0.0.1:{p}')
+        if ttl is not None:
+            b.append(f'    ttl: {ttl}')
+        blocks.append('\n'.join(b))
+    return '\n'.join(lines) + '\n' + '\n\n'.join(blocks)
+
+
+def emit_swap_config(a, gpus_table):
+    """Print a llama-swap config for every --swap MODEL:GPUS[:PORT]. Nothing is started."""
+    import copy, io, contextlib
+    specs = a.swap or []
+    if not specs:
+        print("pxa-launch: --emit-swap-config needs at least one --swap MODEL:GPUS[:PORT]", file=sys.stderr)
+        sys.exit(2)
+    parsed = []
+    for spec in specs:
+        parts = spec.split(":")
+        if len(parts) not in (2, 3) or not parts[0] or not parts[1] \
+                or (len(parts) == 3 and parts[2] and not parts[2].isdigit()):
+            print(f"pxa-launch: --swap wants MODEL:GPUS[:PORT], got {spec!r}", file=sys.stderr); sys.exit(2)
+        parsed.append((parts[0], parts[1], int(parts[2]) if len(parts) == 3 and parts[2] else None))
+    # auto ports count up from --port (8081 when it is left at 8080) and skip every port an
+    # entry named explicitly, so two entries never land on one port
+    taken = {pp for _, _, pp in parsed if pp is not None}
+    nxt = a.port if a.port != 8080 else 8081
+    entries, bad = [], 0
+    for i, (model, cards, port) in enumerate(parsed):
+        if port is None:
+            while nxt in taken:
+                nxt += 1
+            port = nxt; taken.add(port)
+        b = copy.copy(a); b.model, b.gpus, b.port, b.explain, b.serve_name = model, cards, port, True, ""
+        # nothing is started here: the proxy starts this model later, when it owns the cards, so the
+        # live busy-card refusal (R-20) is about the wrong moment for a config file
+        b.allow_busy = True
+        b.host = "127.0.0.1"   # only the proxy talks to a backend; do not expose it past the proxy
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                plan, cmd, env, cv, prof, ctx = plan_and_build(b, gpus_table)
+        except SystemExit as ex:
+            print(f"pxa-launch: {model} on cards {cards}: the launcher refused (exit {ex.code}); run it with --explain to see why", file=sys.stderr)
+            bad += 1; continue
+        if plan.blockers:
+            print(f"pxa-launch: {model} on cards {cards}: plan has blockers, entry written anyway; see --explain", file=sys.stderr); bad += 1
+        if "<ENGINE>" in " ".join(str(x) for x in cmd):
+            print(f"pxa-launch: {model}: no llama-server resolved on this host; set PXA_ENGINE_DIR "
+                  f"to the engine the proxy will run (the dir holding bin/llama-server)", file=sys.stderr)
+        # I-13: the index never travels without its order - same device_env() the run path uses
+        dev = device_env(cv)[0]
+        merged = dict(env or {}); merged.update(dev)
+        envs = sorted((k, str(v)) for k, v in merged.items() if str(v) != "")
+        argv = list(cmd)
+        if "--api-key" in argv:
+            # never write the key into a config file: llama-swap substitutes ${env.PXA_API_KEY}
+            # at load time and refuses to load if it is unset
+            argv[argv.index("--api-key") + 1] = "${env.PXA_API_KEY}"
+        entries.append({"model": model, "argv": argv, "env": envs, "port": port})
+    if entries:
+        try:
+            print(_swap_render(entries, ttl=a.swap_ttl))
+        except ValueError as ex:
+            print(f"pxa-launch: --emit-swap-config: {ex}", file=sys.stderr); sys.exit(2)
+    sys.exit(3 if bad and not entries else (5 if bad else 0))
+
+def build_parser():
+    """The launcher's whole command line. A function so that PXA Control (--gui, tools/pxa_control.py)
+    builds its plans from the SAME parser, defaults and validation as a typed command line."""
     ap = argparse.ArgumentParser(
         prog="pxa-launch",
         description="Pick your cards and your model by number; the launcher picks the engine, "
@@ -5554,7 +6550,23 @@ def main():
     ap.add_argument("--allow-busy", action="store_true")
     ap.add_argument("--accept-unmeasured", action="store_true")
     ap.add_argument("--explain", action="store_true")
+    ap.add_argument("--doctor", action="store_true",
+                    help="one screen: cards, driver, P2P, the model file (tier, arch, sha256), and "
+                         "what defaults the engine would pick on these cards and why. Starts nothing.")
+    ap.add_argument("--no-sha", action="store_true", dest="no_sha",
+                    help="--doctor: skip hashing the model (a cached hash is still shown)")
+    ap.add_argument("--emit-swap-config", action="store_true",
+                    help="print a llama-swap config for every --swap entry (runs nothing)")
+    ap.add_argument("--swap", action="append", default=[], metavar="MODEL:GPUS[:PORT]",
+                    help="a model for --emit-swap-config; repeat once per model")
+    ap.add_argument("--swap-ttl", type=int, default=None, metavar="SECONDS",
+                    help="llama-swap unloads a model idle this long (default: its own)")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--bench", action="store_true",
+                    help="run tools/pxa-bench.py's shareable result card (~2 min: warm-up, REPS 3, "
+                         "three prompt classes, greedy512 sha, markdown card + SVG/PNG badge) on "
+                         "--gpus/--model and exit. See pxa-bench.py --help for its own flags "
+                         "(--url to bench an already-running seat instead of booting one).")
     # ---- the rerunnable seat ------------------------------------------------
     ap.add_argument("--serve-name", default="", metavar="NAME",
                     help="also write an executable restart script for this exact seat. No "
@@ -5569,7 +6581,32 @@ def main():
     ap.add_argument("--no-tui", action="store_true",
                     help="skip the full-screen terminal UI and use the plain prompts "
                          "(same thing as setting PXA_NO_TUI=1)")
+    # ---- PXA Control: the browser front end (tools/pxa_control.py) -----------
+    ap.add_argument("--gui", action="store_true",
+                    help="start PXA Control, a local web app (rig, models, launch, speed, chat) that "
+                         "drives this same launcher. Binds 127.0.0.1; with --gui, --port is the "
+                         "GUI's port (default 7777). See docs/LAUNCHER.md 'PXA Control (GUI)'.")
+    ap.add_argument("--lan", action="store_true",
+                    help="--gui only: listen on every interface (0.0.0.0). A random access token is "
+                         "then required; it is printed at start and kept in a cookie after the "
+                         "first visit.")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="--gui only: do not try to open a browser")
+    return ap
+
+
+def main():
+    ap = build_parser()
     a = ap.parse_args()
+
+    if a.gui:
+        # The GUI is a front door like the TUI: it collects answers and calls plan_and_build()
+        # and the same start/stop code. Nothing in it decides engine policy.
+        import pxa_control
+        gui_port = a.port if any(x == "--port" or x.startswith("--port=")
+                                 for x in sys.argv[1:]) else pxa_control.DEFAULT_PORT
+        sys.exit(pxa_control.serve(sys.modules[__name__], port=gui_port, lan=a.lan,
+                                   open_browser=not a.no_browser, models_dirs=a.models_dir))
 
     if a.list_chat_templates:
         E, _n = resolve_engine_dir()
@@ -5585,11 +6622,45 @@ def main():
     gpus, err = gpu_table()
     if err:
         print(f"pxa-launch: {err}", file=sys.stderr)
-        if not a.engine and not a.selftest:
+        if not a.engine and not a.selftest and not a.doctor:
             sys.exit(2)
         gpus = []
     if a.selftest:
-        selftest(gpus or [])
+        # exit 1 on a failed standing assertion, so a CI step that reads only the exit code
+        # is protected by the checks (it used to exit 0 and print FAILURES ABOVE)
+        sys.exit(0 if selftest(gpus or []) else 1)
+    if a.doctor:
+        rc = doctor(a, gpus or [], err)
+        try:
+            import pxa_explain_footer
+            pxa_explain_footer.print_footer(a, gpus or [])
+        except Exception as e:
+            print(f"pxa-launch: --doctor footer skipped ({e.__class__.__name__}: {e})", file=sys.stderr)
+        sys.exit(rc)
+    if a.explain and a.model and a.gpus:
+        # showcase lane (2026-09-25): the same footer --doctor prints, ahead of the detailed plan
+        # --explain goes on to print below (plan_and_build -> build_llama_cmd already reads
+        # a.explain and prints picks/why from the identical engine registry JSON -- this only adds
+        # what is new on the /pxa page: card VRAM and the active-lever environment listing). All
+        # logic lives in tools/pxa_explain_footer.py; failure here must never break --explain.
+        try:
+            import pxa_explain_footer
+            pxa_explain_footer.print_footer(a, gpus or [])
+        except Exception as e:
+            print(f"pxa-launch: --explain footer skipped ({e.__class__.__name__}: {e})", file=sys.stderr)
+    if a.bench:
+        # showcase lane (2026-09-25): all of pxa bench's own logic is tools/pxa-bench.py (its own
+        # --url / --model+--gpus boot-orchestration, measurement, and rendering); this is a plain
+        # argv pass-through so a merge here stays a one-line diff.
+        bench_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pxa-bench.py")
+        bench_argv = [sys.executable, bench_py]
+        if a.model:
+            bench_argv += ["--model", a.model]
+        if a.gpus:
+            bench_argv += ["--gpus", a.gpus]
+        sys.exit(subprocess.run(bench_argv).returncode)
+    if a.emit_swap_config:
+        emit_swap_config(a, gpus or [])
         return
 
     # ---- THE FRONT DOOR ----------------------------------------------------
@@ -5687,7 +6758,7 @@ def main():
     st = _load_state()
     st["last_model_dir"] = os.path.dirname(os.path.abspath(a.model)) \
         if os.path.isfile(a.model) else os.path.abspath(a.model)
-    st["last_command"] = cmd
+    st["last_command"] = redact_cmd(cmd)      # bug #225: the key is never persisted
     st["last_cards"] = cv
     _save_state(st)
     e = dict(os.environ)

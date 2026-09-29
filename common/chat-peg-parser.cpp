@@ -1,6 +1,7 @@
 #include "chat-peg-parser.h"
 
 #include "chat-auto-parser.h"
+#include "chat-auto-parser-helpers.h"
 #include "ggml.h"
 #include "peg-parser.h"
 
@@ -463,8 +464,9 @@ common_peg_parser common_chat_peg_builder::standard_constructed_tools(
     // delimiter (gated to the qwen <tool_call> marker so other model families are untouched).
     common_peg_parser pxa_open = literal(section_start);
     common_peg_parser pxa_close = literal(section_end);
-    if (section_start == "<tool_call>") pxa_open  = choice({literal(section_start), literal(std::string("<tools>"))});
-    if (section_end   == "</tool_call>") pxa_close = choice({literal(section_end),  literal(std::string("</tools>"))});
+    // bug #222: compare the marker without its whitespace (Qwen templates derive "<tool_call>\n")
+    if (const auto alt = pxa_qwen_tools_variant(section_start); !alt.empty()) pxa_open  = choice({literal(section_start), literal(alt)});
+    if (const auto alt = pxa_qwen_tools_variant(section_end);   !alt.empty()) pxa_close = choice({literal(section_end),   literal(alt)});
     auto section =
         parallel_tool_calls ?
             trigger_rule("tool-call", pxa_open + space() + one_or_more(tool_choices + space()) +
@@ -872,8 +874,9 @@ common_peg_parser common_chat_peg_builder::standard_json_tools(
     // delimiter (gated to the qwen <tool_call> marker so other model families are untouched).
     common_peg_parser pxa_open = literal(section_start);
     common_peg_parser pxa_close = literal(section_end);
-    if (section_start == "<tool_call>") pxa_open  = choice({literal(section_start), literal(std::string("<tools>"))});
-    if (section_end   == "</tool_call>") pxa_close = choice({literal(section_end),  literal(std::string("</tools>"))});
+    // bug #222: compare the marker without its whitespace (Qwen templates derive "<tool_call>\n")
+    if (const auto alt = pxa_qwen_tools_variant(section_start); !alt.empty()) pxa_open  = choice({literal(section_start), literal(alt)});
+    if (const auto alt = pxa_qwen_tools_variant(section_end);   !alt.empty()) pxa_close = choice({literal(section_end),   literal(alt)});
     auto section =
         trigger_rule("tool-call", pxa_open + space() + tool_calls + space() + pxa_close);
 

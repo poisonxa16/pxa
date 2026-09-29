@@ -13,7 +13,7 @@
 //   GET_ROWS(state) + MUL(reset mask)                   2 kernels -> 1  (pxa_dn_gather_mask_f32)
 //   CONCAT(new row) + SET_ROWS(scatter to cache)        2 kernels -> 0  (written in place)
 //
-// Env gate: PXA_FUSE_DELTANET (bitmask, default 53 = bits 0|2|4|5; =0 restores the eager path)
+// Env gate: PXA_FUSE_DELTANET (bitmask, default 55 = bits 0|1|2|4|5; =0 restores the eager path)
 //   bit0 (1): the qk-norm/state-writeback cluster (anchored at the SILU node; consumes the
 //             23-node SILU..CONCAT window incl. the already-fused ADD+SOFTPLUS+MUL beta-gate).
 //             GUARDED: fires only on the exact in-place state alias (PXA_FUSE_DELTANET_WAR).
@@ -46,9 +46,9 @@
 //             tensor's storage -- i.e. there is provably no reader of the old row contents in the
 //             window the early write opens. See pxa_dn_row_window_clear(); the scan itself is
 //             printable with PXA_DN_ROWSCAN=1, which NAMES any such reader.
-//   SHIPPED DEFAULT = 53 = bits 0|2|4|5 (pxa_fuse_deltanet_default(), pxa-enhance.cuh:420;
-//   REFERENCE -> 0 = eager path). bit1 is OUT of the default since 2026-09-04 -- see the bit1
-//   note below. The historical speed number belongs to the mask it was actually measured on:
+//   SHIPPED DEFAULT = 55 = bits 0|1|2|4|5 (pxa_fuse_deltanet_default(), pxa-enhance.cuh;
+//   REFERENCE -> 0 = eager path). bit1 was OUT of the default 2026-09-04..2026-09-27 (not
+//   bit-exact); it is back in since its kernel repeats the eager arithmetic -- see Kernel C. The historical speed number belongs to the mask it was actually measured on:
 //   bits 0|1 (mask 3) measured +3.7% P100 decode on the published U16 config (docs/LEVERS.md
 //   §2), bit-exact vs the eager kernels; pattern mismatch still falls through to eager per-node.
 //
@@ -401,6 +401,46 @@ static __global__ void pxa_dn_gather_mask_f32(
     }
 }
 
+// PXA_DN_GM_LEAN (default ON): the same gather + mask with float4 accesses, and WITHOUT the GET_ROWS
+// store when the caller has proved nothing else in the graph reads the GET_ROWS output (gdst == nullptr). On the
+// SAFE state path that store is dead by construction (llama-delta-net.cpp: state_dst is consumed only by the mask
+// MUL; the in-place write-back that reads it is the other branch), so per delta-net layer per token this reads the
+// state row once and writes it once instead of writing it twice: 20 us -> ~2/3 of the bytes on a P100 at 27B.
+// Values are the same floats (v and v*m), bit-exact.
+static __global__ void pxa_dn_gather_mask_f32x4(
+        const float4 * __restrict__ src, const int32_t * __restrict__ idx,
+        const float * __restrict__ mask, float4 * __restrict__ gdst, float4 * __restrict__ dst,
+        const int64_t ncols4, const int64_t src_row_stride4, const int64_t mask_row_stride) {
+    const int64_t s = blockIdx.y;
+    const float m = mask[s*mask_row_stride];
+    const float4 * sp = src + (int64_t)idx[s]*src_row_stride4;
+    float4 * dp = dst + s*ncols4;
+    for (int64_t e = (int64_t)blockIdx.x*blockDim.x + threadIdx.x; e < ncols4;
+         e += (int64_t)gridDim.x*blockDim.x) {
+        const float4 v = sp[e];
+        if (gdst) gdst[s*ncols4 + e] = v;
+        dp[e] = make_float4(v.x * m, v.y * m, v.z * m, v.w * m);
+    }
+}
+static bool pxa_dn_gm_lean_on() {
+    static const bool on = [] { const char * e = getenv("PXA_DN_GM_LEAN"); return !(e && atoi(e) == 0); }();
+    return on;
+}
+// true when no node after the MUL (index j) reads G, directly or through a view, and G is not a graph output
+static bool pxa_dn_gm_g_dead(const ggml_cgraph * cgraph, int j, const ggml_tensor * G) {
+    if (G->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
+    for (int k = j + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n == G || n->view_src == G) return false;
+        for (int q = 0; q < GGML_MAX_SRC; ++q) {
+            const ggml_tensor * t = n->src[q];
+            if (!t) continue;
+            if (t == G || t->view_src == G) return false;
+        }
+    }
+    return true;
+}
+
 // Fires on the GET_ROWS node when the next non-no-op node is the broadcast MUL of it. Returns the
 // number of nodes consumed beyond the GET_ROWS (the caller advances by it), or 0 for no match.
 //
@@ -443,6 +483,7 @@ enum pxa_dn_gm_reason {
     PXA_DN_GM_DEVICE,     // the pair straddles two CUDA devices
     PXA_DN_GM_UNSAFE,     // a node between the pair forbids moving the multiply up to the gather
     PXA_DN_GM_FULL,       // the absorb table is full (never expected; declines rather than skips)
+    PXA_DN_GM_REFUSED,    // the driver refused the fused launch for memory; the eager pair ran instead
     PXA_DN_GM_COUNT
 };
 
@@ -459,6 +500,7 @@ static const char * pxa_dn_gm_reason_name(int r) {
         case PXA_DN_GM_DEVICE: return "cross-device";
         case PXA_DN_GM_UNSAFE: return "window-unsafe";
         case PXA_DN_GM_FULL:   return "absorb-table-full";
+        case PXA_DN_GM_REFUSED: return "launch-refused-oom";
     }
     return "?";
 }
@@ -577,6 +619,9 @@ static inline bool pxa_dn_gm_absorb_take(const ggml_tensor * t) {
 // the number of nodes consumed beyond the GET_ROWS (the caller advances by it), or 0 for no match.
 // When the MUL is not the next real node, the nodes in between still run in their own place and
 // the MUL alone is marked absorbed, so node coverage is exactly the eager set either way.
+// PXA_DN_INPLACE (defined at the end of this file): defer the gather, the fused conv reads the row
+static bool pxa_dn_carry_try(const ggml_cgraph * cgraph, int i, int j);
+
 static int pxa_try_deltanet_gather_mask(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     if (!(pxa_fuse_deltanet_mask() & 4)) return 0;
     const ggml_tensor * G = cgraph->nodes[i];      // GET_ROWS
@@ -653,16 +698,67 @@ static int pxa_try_deltanet_gather_mask(ggml_backend_cuda_context & ctx, const g
         return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_FULL);
     }
 
+    // PXA_DN_INPLACE: nothing to copy -- the fused conv cluster reads the carried state straight
+    // from the cache row (the scan that admits this is in pxa_dn_carry_try)
+    if (contiguous_pair && pxa_dn_carry_try(cgraph, i, j)) {
+        pxa_dn_gm_tally(PXA_DN_GM_FIRE);
+        pxa_dn_fire_log("gather-mask-deferred", true);
+        return j - i;
+    }
+
     const int64_t ncols = G->ne[0];
     const int64_t nseqs = G->ne[1];
     const int block = 256;
     const int64_t want = (ncols + block - 1)/block;
     dim3 grid((unsigned)(want < 65535 ? want : 65535), (unsigned)nseqs, 1);
-    pxa_dn_gather_mask_f32<<<grid, block, 0, ctx.stream()>>>(
-            (const float *)SRC->data, (const int32_t *)IDX->data,
-            (const float *)MSK->data, (float *)G->data, (float *)M->data,
-            ncols, (int64_t)(SRC->nb[1]/sizeof(float)), (int64_t)(MSK->nb[1]/sizeof(float)));
+
+    // A LAUNCH THAT IS REFUSED FOR MEMORY IS A DECLINE, NOT A CRASH (bug #207 follow-up, ws6-fix).
+    // With lazy module loading -- the CUDA 12 default -- the first launch of this kernel on a device
+    // has to load it, and loading takes device memory. On a card the context has filled to the last
+    // few MiB (-ub 1024 on the 12.46 GiB PXQ3-balanced file at -c 65536 q8_0 left 27 MiB) the driver
+    // refuses the launch with cudaErrorMemoryAllocation and this function's CUDA_CHECK aborted the
+    // server, although the eager pair it replaces could still run. A refused launch executed nothing,
+    // so declining is exact: the caller runs GET_ROWS in place and the MUL follows as its own node.
+    // (Even a launch that DID run would be safe to redo: both writes are recomputed from the same
+    // inputs by the eager pair.) An error that was already pending is not ours to swallow: it is
+    // reported first, exactly as before. Any other launch error is still fatal.
+    // PXA_DN_GM_FAULT=1 (test hook, diagnostic) makes the launch behave as refused, so the decline
+    // can be proved without filling a card: tests/test-pxa-dn-gm-refused.cpp.
+    static const bool fault = [] {
+        const char * e = getenv("PXA_DN_GM_FAULT");
+        return e != nullptr && atoi(e) != 0;
+    }();
     CUDA_CHECK(cudaGetLastError());
+    const bool lean = pxa_dn_gm_lean_on() && ncols % 4 == 0 && (SRC->nb[1] % 16) == 0 &&
+                      ((((uintptr_t)SRC->data) | ((uintptr_t)G->data) | ((uintptr_t)M->data)) & 15) == 0;
+    if (!fault && lean) {
+        // the GET_ROWS store is dropped only when the pair is contiguous (nothing runs in between) and no later
+        // node of this graph reads G
+        const bool g_dead = contiguous_pair && pxa_dn_gm_g_dead(cgraph, j, G);
+        const int64_t ncols4 = ncols/4;
+        const int64_t want4 = (ncols4 + block - 1)/block;
+        dim3 grid4((unsigned)(want4 < 65535 ? want4 : 65535), (unsigned)nseqs, 1);
+        pxa_dn_gather_mask_f32x4<<<grid4, block, 0, ctx.stream()>>>(
+                (const float4 *)SRC->data, (const int32_t *)IDX->data,
+                (const float *)MSK->data, g_dead ? nullptr : (float4 *)G->data, (float4 *)M->data,
+                ncols4, (int64_t)(SRC->nb[1]/16), (int64_t)(MSK->nb[1]/sizeof(float)));
+    } else if (!fault) {
+        pxa_dn_gather_mask_f32<<<grid, block, 0, ctx.stream()>>>(
+                (const float *)SRC->data, (const int32_t *)IDX->data,
+                (const float *)MSK->data, (float *)G->data, (float *)M->data,
+                ncols, (int64_t)(SRC->nb[1]/sizeof(float)), (int64_t)(MSK->nb[1]/sizeof(float)));
+    }
+    const cudaError_t launch_err = fault ? cudaErrorMemoryAllocation : cudaGetLastError();
+    if (launch_err == cudaErrorMemoryAllocation) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) {
+            fprintf(stderr, "PXA_FUSE_DELTANET gather-mask: the fused launch was refused for memory on device %d%s "
+                            "-- declined, the eager GET_ROWS + MUL run instead (a full card: see PXA_AUTO_UB_RESERVE_MB)\n",
+                    ctx.device, fault ? " (PXA_DN_GM_FAULT test hook)" : "");
+        }
+        return pxa_dn_gm_decline(cgraph, i, j, window, PXA_DN_GM_REFUSED);
+    }
+    CUDA_CHECK(launch_err);
     pxa_dn_gm_tally(PXA_DN_GM_FIRE);
     pxa_dn_gm_site_dump(cgraph, i, j, window, PXA_DN_GM_FIRE);
     pxa_dn_fire_log("gather-mask", true);
@@ -672,7 +768,32 @@ static int pxa_try_deltanet_gather_mask(ggml_backend_cuda_context & ctx, const g
 }
 
 // ---------------------------------------------------------------------------------------------
-// Kernel C: fused rms-norm(x)*w * silu(z) — the DeltaNet gated-output epilogue.
+// Kernel C: fused rms-norm(x)*w * silu(z) -- the DeltaNet gated-output epilogue.
+//
+// BIT-EXACT against the two eager kernels it replaces, by construction:
+//  * the reduction is fused_rms_norm_f32<block_size> (norm.cu) verbatim: same block size (chosen
+//    by pxa_dn_rms_block_size(), the eager dispatcher's rule), same per-thread strided partial
+//    sums, same warp -> shared -> warp tree;
+//  * the norm value is formed as the eager kernel stores it: scale * w[c] * x[c];
+//  * the gate is fused_mul_silu_f32 (unary.cu, no-limit) verbatim with x = z, y = norm:
+//    z * v / (1 + expf(-z)).
+// Every intermediate the eager path round-trips through memory is an f32 there and an f32
+// register here, so no rounding step is added or removed.
+// The q8_1 sidecar quantizes the value this thread just STORED (read back from dst): the row
+// loop and the sidecar loop map column c to the same thread (c = tid + k*block_size in both), so
+// the read is the thread's own write, and it stays correct when dst exactly aliases x or z.
+static inline int pxa_dn_rms_block_size(const int ncols) {
+    // mirrors fused_rms_norm_f32_cuda (norm.cu), kBlockSize = 256
+    if (ncols < 256) {
+        switch (ncols) {
+            case  32: case  64: case  96: case 128: case 160: case 192: return ncols;
+            default: return 224;
+        }
+    }
+    return ncols < 1024 ? 256 : 1024;
+}
+
+template <int block_size>
 static __global__ void pxa_dn_rms_silu_gate_f32(
         const float * __restrict__ x, const float * __restrict__ w,
         const float * __restrict__ z, float * __restrict__ dst,
@@ -682,27 +803,31 @@ static __global__ void pxa_dn_rms_silu_gate_f32(
     const float * xr = x + (int64_t)row*ncols;
     const float * zr = z + (int64_t)row*ncols;
     float       * dr = dst + (int64_t)row*ncols;
-    float sumsq = 0.0f;
-    for (int c = tid; c < ncols; c += blockDim.x) {
-        const float v = xr[c];
-        sumsq += v*v;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = xr[col];
+        tmp += xi * xi;
     }
-    sumsq = warp_reduce_sum(sumsq);
-    __shared__ float smem[8];
-    if (blockDim.x > WARP_SIZE) {
-        const int wid = tid / WARP_SIZE, lid = tid % WARP_SIZE;
-        if (lid == 0) smem[wid] = sumsq;
+    tmp = warp_reduce_sum(tmp);
+    if (block_size > WARP_SIZE) {
+        __shared__ float s_sum[32];
+        const int warp_id = tid / WARP_SIZE;
+        const int lane_id = tid % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = tmp;
+        }
         __syncthreads();
-        sumsq = tid < blockDim.x/WARP_SIZE ? smem[tid] : 0.0f;
-        sumsq = warp_reduce_sum(sumsq);
-        if (tid == 0) smem[0] = sumsq;
-        __syncthreads();
-        sumsq = smem[0];
+        tmp = lane_id < block_size/WARP_SIZE ? s_sum[lane_id] : 0.0f;
+        tmp = warp_reduce_sum(tmp);
     }
-    const float scale = rsqrtf(sumsq/ncols + eps);
-    for (int c = tid; c < ncols; c += blockDim.x) {
-        const float zi = zr[c];
-        dr[c] = xr[c]*scale*w[c] * (zi / (1.0f + expf(-zi)));
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float v  = scale * w[col] * xr[col];
+        const float zi = zr[col];
+        dr[col] = zi * v / (1.0f + expf(-zi));
     }
     // G2-F2 QUANTFOLD epilogue: emit the FLAT q8_1 sidecar of dst (bit-identical to
     // quantize_q8_1 of the flattened output; requires ncols % 32 == 0, driver-guarded).
@@ -710,10 +835,9 @@ static __global__ void pxa_dn_rms_silu_gate_f32(
     if (vq8) {
         block_q8_1 * q8 = (block_q8_1 *)vq8;
         const int wid = tid / WARP_SIZE, lid = tid % WARP_SIZE;
-        for (int cb = wid; cb < ncols/WARP_SIZE; cb += blockDim.x/WARP_SIZE) {
+        for (int cb = wid; cb < ncols/WARP_SIZE; cb += block_size/WARP_SIZE) {
             const int c = cb*WARP_SIZE + lid;
-            const float zi = zr[c];
-            const float xi = xr[c]*scale*w[c] * (zi / (1.0f + expf(-zi)));
+            const float xi = dr[c];
             float amax = fabsf(xi);
             float sum  = xi;
             amax = warp_reduce_max(amax);
@@ -747,10 +871,27 @@ static __global__ void pxa_dn_rms_silu_gate_f32(
 //   i+10 VIEW         v_in                   i+22 CONCAT  state_cpy (dst = cache row)
 //   i+11 PERMUTE      v_fused
 // Returns the number of EXTRA nodes consumed (22) or 0 for no-match (eager fallback).
-static int pxa_try_deltanet_cluster(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+// The cluster's matcher, split from its launcher (2026-09-27) so the PXA_DN_CONVFUSE / PXA_DN_INPLACE
+// handlers further down can ask "will this cluster fire, and on which shape?" from an EARLIER node
+// without launching anything. quiet = do not touch the fire/decline census (a dry run).
+struct pxa_dn_cl {
+    ggml_tensor *S, *T, *C, *R1, *Q, *LQ, *PQ, *K, *LK, *PK, *Vv, *PV, *AD, *SP, *MU, *PG, *PB, *RS, *D,
+                *NV, *NR1, *NR2, *CC, *RAW;
+    int64_t cd, dc, hd, nh, tail_off, conv_elems, ssm_elems;
+    float   epsq;
+    float *         state_base;
+    const int32_t * state_idx;
+    int64_t         state_row_stride;
+    int             extra;
+    bool            inplace_shape;
+    int             cf_scratch;   // PXA_DN_CONVFUSE: outputs written through a scratch (bit per output, see plan)
+    int             ny = 1;       // PXA_DN_CONVFUSE_NY: tokens in the batch (verify width)
+};
+
+static bool pxa_dn_cluster_match(const ggml_cgraph * cgraph, int i, pxa_dn_cl & P, bool quiet, bool conv_fused = false) {
     const int pxa_mask = pxa_fuse_deltanet_mask();
-    if (!(pxa_mask & (1 | 16))) return 0;
-    if (i + 22 >= cgraph->n_nodes) return 0;
+    if (!(pxa_mask & (1 | 16))) return false;
+    if (i + 22 >= cgraph->n_nodes) return false;
 
     ggml_tensor * S   = cgraph->nodes[i];
     ggml_tensor * T   = cgraph->nodes[i+1];
@@ -785,77 +926,77 @@ static int pxa_try_deltanet_cluster(ggml_backend_cuda_context & ctx, const ggml_
         PG->op  != GGML_OP_PERMUTE   || PB->op  != GGML_OP_PERMUTE   || RS->op  != GGML_OP_RESHAPE ||
         D->op   != GGML_OP_DELTA_NET || NV->op  != GGML_OP_VIEW      || NR1->op != GGML_OP_RESHAPE ||
         NR2->op != GGML_OP_RESHAPE   || CC->op  != GGML_OP_CONCAT) {
-        return 0;
+        return false;
     }
-    if ((ggml_unary_op)SP->op_params[0] != GGML_UNARY_OP_SOFTPLUS) return 0;
+    if ((ggml_unary_op)SP->op_params[0] != GGML_UNARY_OP_SOFTPLUS) return false;
 
     // --- SILU anchor: bs=1 slice of an SSM_CONV output ---
-    if (S->type != GGML_TYPE_F32 || S->ne[1] != 1 || S->ne[2] != 1 || S->ne[3] != 1) return 0;
-    if (!S->src[0] || S->src[0]->op != GGML_OP_VIEW) return 0;
+    if (S->type != GGML_TYPE_F32 || S->ne[1] != 1 || S->ne[2] != 1 || S->ne[3] != 1) return false;
+    if (!S->src[0] || S->src[0]->op != GGML_OP_VIEW) return false;
     ggml_tensor * RAW = S->src[0]->src[0];
-    if (!RAW || RAW->op != GGML_OP_SSM_CONV || RAW->type != GGML_TYPE_F32) return 0;
-    if (S->src[0]->data != RAW->data) return 0;         // token slice at offset 0
-    if (!ggml_is_contiguous(S)) return 0;
+    if (!RAW || RAW->op != GGML_OP_SSM_CONV || RAW->type != GGML_TYPE_F32) return false;
+    if (S->src[0]->data != RAW->data) return false;         // token slice at offset 0
+    if (!ggml_is_contiguous(S)) return false;
     const int64_t cd = S->ne[0];                        // conv_dim
 
     // --- conv-tail view + CONT + reshape ---
-    if (T->src[0] != RAW || T->type != GGML_TYPE_F32) return 0;
+    if (T->src[0] != RAW || T->type != GGML_TYPE_F32) return false;
     const int64_t dc = T->ne[0];                        // d_conv - 1
-    if (dc < 1 || dc > 8 || T->ne[1] != cd || T->ne[2] != 1 || T->ne[3] != 1) return 0;
-    if (C->src[0] != T || !ggml_is_contiguous(C) || C->ne[0] != dc || C->ne[1] != cd) return 0;
-    if (R1->src[0] != C) return 0;
-    if (T->nb[0] % sizeof(float) || T->nb[1] % sizeof(float)) return 0;
+    if (dc < 1 || dc > 8 || T->ne[1] != cd || T->ne[2] != 1 || T->ne[3] != 1) return false;
+    if (C->src[0] != T || !ggml_is_contiguous(C) || C->ne[0] != dc || C->ne[1] != cd) return false;
+    if (R1->src[0] != C) return false;
+    if (T->nb[0] % sizeof(float) || T->nb[1] % sizeof(float)) return false;
     const int64_t tail_off = ((const char *)T->data - (const char *)RAW->data);
-    if (tail_off < 0 || tail_off % sizeof(float)) return 0;
+    if (tail_off < 0 || tail_off % sizeof(float)) return false;
 
     // --- q/k views + l2 norms + permutes ---
-    if (Q->src[0] != S || K->src[0] != S || Vv->src[0] != S) return 0;
+    if (Q->src[0] != S || K->src[0] != S || Vv->src[0] != S) return false;
     const int64_t hd = Q->ne[0], nh = Q->ne[1];
-    if ((hd != 64 && hd != 128) || nh < 1 || nh > 256) return 0;
-    if (Q->ne[2] != 1 || Q->ne[3] != 1) return 0;
-    if (K->ne[0] != hd || K->ne[1] != nh || K->ne[2] != 1 || K->ne[3] != 1) return 0;
-    if (Q->nb[1] != hd*sizeof(float) || K->nb[1] != hd*sizeof(float)) return 0;
-    if (Q->data != S->data) return 0;                                   // q at offset 0
-    if ((const char *)K->data - (const char *)S->data != (int64_t)(nh*hd*sizeof(float))) return 0;
-    if ((const char *)Vv->data - (const char *)S->data != (int64_t)(2*nh*hd*sizeof(float))) return 0;
-    if (2*nh*hd + Vv->ne[0]*Vv->ne[1] != cd) return 0;                  // q+k+v tile the conv row
-    if (LQ->src[0] != Q || LK->src[0] != K) return 0;
-    if (LQ->type != GGML_TYPE_F32 || LK->type != GGML_TYPE_F32) return 0;
-    if (!ggml_is_contiguous(LQ) || !ggml_is_contiguous(LK)) return 0;
+    if ((hd != 64 && hd != 128) || nh < 1 || nh > 256) return false;
+    if (Q->ne[2] != 1 || Q->ne[3] != 1) return false;
+    if (K->ne[0] != hd || K->ne[1] != nh || K->ne[2] != 1 || K->ne[3] != 1) return false;
+    if (Q->nb[1] != hd*sizeof(float) || K->nb[1] != hd*sizeof(float)) return false;
+    if (Q->data != S->data) return false;                                   // q at offset 0
+    if ((const char *)K->data - (const char *)S->data != (int64_t)(nh*hd*sizeof(float))) return false;
+    if ((const char *)Vv->data - (const char *)S->data != (int64_t)(2*nh*hd*sizeof(float))) return false;
+    if (2*nh*hd + Vv->ne[0]*Vv->ne[1] != cd) return false;                  // q+k+v tile the conv row
+    if (LQ->src[0] != Q || LK->src[0] != K) return false;
+    if (LQ->type != GGML_TYPE_F32 || LK->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(LQ) || !ggml_is_contiguous(LK)) return false;
     float epsq, epsk;
     memcpy(&epsq, LQ->op_params, sizeof(float));
     memcpy(&epsk, LK->op_params, sizeof(float));
-    if (epsq != epsk) return 0;
-    if (PQ->src[0] != LQ || PK->src[0] != LK || PV->src[0] != Vv) return 0;
+    if (epsq != epsk) return false;
+    if (PQ->src[0] != LQ || PK->src[0] != LK || PV->src[0] != Vv) return false;
 
     // --- beta-gate chain (delegated to the existing fused kernel) ---
-    if (SP->src[0] != AD || MU->src[0] != SP) return 0;
-    if (!AD->src[1] || !MU->src[1]) return 0;
-    if (ggml_nrows(AD->src[1]) != 1 || ggml_nrows(MU->src[1]) != 1) return 0;
-    if (AD->src[1]->ne[0] != AD->src[0]->ne[0] || MU->src[1]->ne[0] != MU->src[0]->ne[0]) return 0;
+    if (SP->src[0] != AD || MU->src[0] != SP) return false;
+    if (!AD->src[1] || !MU->src[1]) return false;
+    if (ggml_nrows(AD->src[1]) != 1 || ggml_nrows(MU->src[1]) != 1) return false;
+    if (AD->src[1]->ne[0] != AD->src[0]->ne[0] || MU->src[1]->ne[0] != MU->src[0]->ne[0]) return false;
     if (AD->type != GGML_TYPE_F32 || MU->type != GGML_TYPE_F32 ||
-        AD->src[0]->type != GGML_TYPE_F32 || AD->src[1]->type != GGML_TYPE_F32) return 0;
-    if (!ggml_is_contiguous(AD->src[0])) return 0;
-    if (PG->src[0] != MU) return 0;
+        AD->src[0]->type != GGML_TYPE_F32 || AD->src[1]->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(AD->src[0])) return false;
+    if (PG->src[0] != MU) return false;
 
     // --- delta-net core: exactly the tensors produced above, plain decode only ---
     if (D->src[0] != PQ || D->src[1] != PK || D->src[2] != PV ||
         D->src[3] != PG || D->src[4] != PB || D->src[5] != RS || D->src[6] != nullptr) {
-        return 0;
+        return false;
     }
-    if (D->src[0]->ne[1] != 1 || D->src[0]->ne[3] != 1) return 0;       // n_tokens==1, n_seqs==1
+    if (D->src[0]->ne[1] != 1 || D->src[0]->ne[3] != 1) return false;       // n_tokens==1, n_seqs==1
 
     // --- state writeback: CONCAT(conv_tail_cont, new_ssm_state) into the cache row ---
-    if (NV->src[0] != D || NR1->src[0] != NV || NR2->src[0] != NR1) return 0;
-    if (CC->op_params[0] != 0) return 0;                                // concat along dim 0
-    if (CC->src[0] != R1 || CC->src[1] != NR2) return 0;
-    if (CC->type != GGML_TYPE_F32 || !ggml_is_contiguous(CC)) return 0;
+    if (NV->src[0] != D || NR1->src[0] != NV || NR2->src[0] != NR1) return false;
+    if (CC->op_params[0] != 0) return false;                                // concat along dim 0
+    if (CC->src[0] != R1 || CC->src[1] != NR2) return false;
+    if (CC->type != GGML_TYPE_F32 || !ggml_is_contiguous(CC)) return false;
     const int64_t conv_elems = ggml_nelements(R1);
     const int64_t ssm_elems  = ggml_nelements(NR2);
-    if (conv_elems != dc*cd) return 0;
-    if (ggml_nelements(CC) != conv_elems + ssm_elems) return 0;
+    if (conv_elems != dc*cd) return false;
+    if (ggml_nelements(CC) != conv_elems + ssm_elems) return false;
 
-    if (!ops_are_same_device(cgraph, i, i+22)) return 0;
+    if (!ops_are_same_device(cgraph, i, i+22)) return false;
 
     // --- shape guard (see PXA_FUSE_DELTANET_WAR above) ------------------------------------
     //
@@ -867,25 +1008,30 @@ static int pxa_try_deltanet_cluster(ggml_backend_cuda_context & ctx, const ggml_
     //
     // kernel A writes silu_out / qn / kn while reading RAW: same-index or disjoint only.
     // Common to both shapes below; unconditional, because it costs five compares.
+    // conv_fused (the PXA_DN_CONVFUSE caller): RAW's dst is never written or read -- the cluster
+    // computes the conv itself -- so an output placed over RAW is no hazard there. At 16k depth the
+    // allocator put the k-norm output over RAW and this guard sent every layer down the eager chain.
+    if (pxa_fuse_deltanet_war() && !conv_fused) {
+        if (!pxa_dn_range_safe(S->data,  ggml_nbytes(S),  RAW)) return false;
+        if (!pxa_dn_range_safe(LQ->data, ggml_nbytes(LQ), RAW)) return false;
+        if (!pxa_dn_range_safe(LK->data, ggml_nbytes(LK), RAW)) return false;
+    }
     if (pxa_fuse_deltanet_war()) {
-        if (!pxa_dn_range_safe(S->data,  ggml_nbytes(S),  RAW)) return 0;
-        if (!pxa_dn_range_safe(LQ->data, ggml_nbytes(LQ), RAW)) return 0;
-        if (!pxa_dn_range_safe(LK->data, ggml_nbytes(LK), RAW)) return 0;
-        if (!pxa_dn_range_safe(LQ->data, ggml_nbytes(LQ), S))   return 0;
-        if (!pxa_dn_range_safe(LK->data, ggml_nbytes(LK), S))   return 0;
+        if (!pxa_dn_range_safe(LQ->data, ggml_nbytes(LQ), S))   return false;
+        if (!pxa_dn_range_safe(LK->data, ggml_nbytes(LK), S))   return false;
     }
 
     // Both shapes leave the CONT's own dst unwritten (kernel B writes the conv tail straight into
     // CC). bit0 asserted that; bit1's defect was exactly an unverified claim of this form, so
     // verify it: C's only consumer must be R1, and R1's only consumer must be CC.
     if (pxa_fuse_deltanet_war()) {
-        if (!pxa_g2_sole_consumer(cgraph, i+2, C,   R1)) return 0;
-        if (!pxa_g2_sole_consumer(cgraph, i+3, R1,  CC)) return 0;
+        if (!pxa_g2_sole_consumer(cgraph, i+2, C,   R1)) return false;
+        if (!pxa_g2_sole_consumer(cgraph, i+3, R1,  CC)) return false;
         // likewise the delta-net's state half of D's dst is left unwritten; its view chain
         // NV -> NR1 -> NR2 must end at CC and have no other reader.
-        if (!pxa_g2_sole_consumer(cgraph, i+19, NV,  NR1)) return 0;
-        if (!pxa_g2_sole_consumer(cgraph, i+20, NR1, NR2)) return 0;
-        if (!pxa_g2_sole_consumer(cgraph, i+21, NR2, CC))  return 0;
+        if (!pxa_g2_sole_consumer(cgraph, i+19, NV,  NR1)) return false;
+        if (!pxa_g2_sole_consumer(cgraph, i+20, NR1, NR2)) return false;
+        if (!pxa_g2_sole_consumer(cgraph, i+21, NR2, CC))  return false;
     }
 
     const bool pxa_inplace_shape =
@@ -974,7 +1120,8 @@ static int pxa_try_deltanet_cluster(ggml_backend_cuda_context & ctx, const ggml_
     // read or write. Checked exhaustively; expect this to decline whenever the absorb declines.
     // PXA_DN_ROWSCAN: if the absorb declined, say WHY -- shape mismatch vs a reader in the window
     // are very different findings and the log must not blur them.
-    if (getenv("PXA_DN_ROWSCAN") && !pxa_extra && i + 23 < cgraph->n_nodes) {
+    static const bool pxa_dn_rowscan_on = getenv("PXA_DN_ROWSCAN") != nullptr;   // read once (was per layer per token)
+    if (!quiet && pxa_dn_rowscan_on && !pxa_extra && i + 23 < cgraph->n_nodes) {
         static thread_local int left_r = 3;
         if (left_r-- > 0) {
             const ggml_tensor * SR = cgraph->nodes[i+23];
@@ -1007,10 +1154,32 @@ static int pxa_try_deltanet_cluster(ggml_backend_cuda_context & ctx, const ggml_
         }
     }
     if (!pxa_shape_ok) {
-        pxa_dn_fire_log(pxa_inplace_shape ? "cluster-inplace" : "cluster-scratch", false);
-        pxa_dn_fire_log("row-absorb", false);
-        return 0;
+        if (!quiet) {
+            pxa_dn_fire_log(pxa_inplace_shape ? "cluster-inplace" : "cluster-scratch", false);
+            pxa_dn_fire_log("row-absorb", false);
+        }
+        return false;
     }
+
+    P = { S, T, C, R1, Q, LQ, PQ, K, LK, PK, Vv, PV, AD, SP, MU, PG, PB, RS, D, NV, NR1, NR2, CC, RAW,
+          cd, dc, hd, nh, tail_off, conv_elems, ssm_elems, epsq,
+          pxa_state_base, pxa_state_idx, pxa_state_row_stride, pxa_extra, pxa_inplace_shape };
+    return true;
+}
+
+
+static int pxa_try_deltanet_cluster(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    pxa_dn_cl P;
+    if (!pxa_dn_cluster_match(cgraph, i, P, false)) return 0;
+    ggml_tensor * S = P.S; ggml_tensor * RAW = P.RAW; ggml_tensor * LQ = P.LQ; ggml_tensor * LK = P.LK;
+    ggml_tensor * T = P.T; ggml_tensor * CC = P.CC; ggml_tensor * MU = P.MU; ggml_tensor * D = P.D;
+    const int64_t nh = P.nh, hd = P.hd, cd = P.cd, dc = P.dc, tail_off = P.tail_off, conv_elems = P.conv_elems;
+    const float epsq = P.epsq;
+    float * pxa_state_base = P.state_base;
+    const int32_t * pxa_state_idx = P.state_idx;
+    const int64_t pxa_state_row_stride = P.state_row_stride;
+    const int pxa_extra = P.extra;
+    const bool pxa_inplace_shape = P.inplace_shape;
 
     // ------------------------------------ execute ------------------------------------
     cudaStream_t stream = ctx.stream();
@@ -1149,9 +1318,24 @@ static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml
         pxa_g2_normfuse_wanted(ctx, cgraph, i + 1, M, g2_padded)) {
         g2_q8 = pxa_g2_q8_buf(ctx.device, ctx.stream(), (size_t)(g2_padded/QK8_1)*sizeof(block_q8_1));
     }
-    pxa_dn_rms_silu_gate_f32<<<nrows, 128, 0, ctx.stream()>>>(
-            (const float *)F->src[0]->data, (const float *)F->src[1]->data,
-            (const float *)M->src[0]->data, (float *)M->data, ncols, eps, g2_q8);
+    {
+        const float * gx = (const float *)F->src[0]->data;
+        const float * gw = (const float *)F->src[1]->data;
+        const float * gz = (const float *)M->src[0]->data;
+        float       * gd = (float *)M->data;
+        cudaStream_t  st = ctx.stream();
+        switch (pxa_dn_rms_block_size(ncols)) {
+            case   32: pxa_dn_rms_silu_gate_f32<  32><<<nrows,   32, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+            case   64: pxa_dn_rms_silu_gate_f32<  64><<<nrows,   64, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+            case   96: pxa_dn_rms_silu_gate_f32<  96><<<nrows,   96, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+            case  128: pxa_dn_rms_silu_gate_f32< 128><<<nrows,  128, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+            case  160: pxa_dn_rms_silu_gate_f32< 160><<<nrows,  160, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+            case  192: pxa_dn_rms_silu_gate_f32< 192><<<nrows,  192, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+            case  224: pxa_dn_rms_silu_gate_f32< 224><<<nrows,  224, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+            case  256: pxa_dn_rms_silu_gate_f32< 256><<<nrows,  256, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+            default  : pxa_dn_rms_silu_gate_f32<1024><<<nrows, 1024, 0, st>>>(gx, gw, gz, gd, ncols, eps, g2_q8); break;
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
     if (g2_q8) {
         auto & sc = pxa_g2_q8sc[ctx.device];
@@ -1161,4 +1345,695 @@ static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml
     // the graph by pxa_g2_sole_consumer, not asserted from the anchor pattern).
     pxa_dn_fire_log("outgate", true);
     return true;
+}
+
+// =============================================================================================
+// PXA_DN_CONVFUSE and PXA_DN_INPLACE (2026-09-27, decode-gap review item 2)
+//
+// On the shipped decode path (mask 53: gather+mask, cluster, row absorb) a delta-net layer still
+// launches, per card per token:
+//   pxa_dn_gather_mask   copy the ~1.6 MB recurrent row out of the cache (x mask)  ~20 us
+//   ssm_conv nc4         the causal conv over [3 carried columns | x]               ~3 us
+//   ssm_conv final_state the conv window for the next step, into the op's dst          ~3 us
+//   pxa_dn_silu_qknorm   silu + per-head q/k l2 norm                                 ~2.5 us
+//   pxa_dn_conv_tail     the conv window copied from the op's dst into the cache row ~2.7 us
+//   k_fused_softplus     the beta-gate                                               ~2 us
+//   delta_net            the recurrence (reads the gathered copy, writes the row)
+//
+// PXA_DN_CONVFUSE (default on; =0 off): the conv, final_state, conv tail, silu+q/k norm and the
+// beta-gate run as ONE kernel (pxa_dn_conv_cluster_f32, one block per q/k head, 128-channel blocks
+// for v, one block for the gate). The conv window goes straight from registers into the cache
+// row; the SSM_CONV node's own dst is never written, which is admitted only after a scan proves
+// that nothing but the cluster's SILU and conv-tail CONT reads it. Arithmetic is the eager
+// kernels' expression for expression, so the output is bit-identical.
+//
+// PXA_DN_INPLACE (default on; =0 off; needs PXA_DN_CONVFUSE): the carried state is never copied
+// out. The GET_ROWS + MUL pair launches nothing; the fused conv kernel reads the conv half of the
+// row, and the recurrence reads the ssm half, straight from the cache row (times the reset mask)
+// and write their new values back into the same elements from the same thread. This is not the
+// static-offset read that PXA_DN_NP1_FASTPATH / PXA_DN_CARRY=2 recorded as unsafe: the row is
+// resolved on the DEVICE from the same index tensor the gather and the absorbed SET_ROWS use (no
+// offset baked into the graph), and it is admitted only when a scan of this split proves that
+// between the gather and the SET_ROWS no other node touches the state storage, that the masked
+// copy M is read by nothing but the conv and the recurrence, and that the gather's own dst is
+// dead. If the conv fusion then declines for any reason the copy is made after all, at the
+// first reader, so the eager path always sees what it would have seen.
+// =============================================================================================
+static bool pxa_dn_convfuse_on() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_DN_CONVFUSE");
+        return e ? atoi(e) != 0 : pxa_config_level() != 0;
+    }();
+    return v;
+}
+static bool pxa_dn_inplace_on() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_DN_INPLACE");
+        return e ? atoi(e) != 0 : pxa_config_level() != 0;
+    }();
+    return v;
+}
+
+static __global__ void pxa_dn_conv_cluster_f32(
+        const float * x, const float * __restrict__ w,          // x, silu_out, qn, kn: may be the exact
+        const float * cs, const int32_t * __restrict__ cs_idx,   // per-channel in-place alias, so no
+        const int64_t cs_row_stride,                             // __restrict__ on them (same for the
+        const float * __restrict__ cs_mask,                      // gate over alpha, and cs over tail)
+        float * tail, const int32_t * __restrict__ tail_idx, const int64_t tail_row_stride,
+        float * silu_out, float * qn, float * kn,
+        const int hd, const int nh, const int cd, const float eps, const int n_conv_blocks,
+        const float * sp_a, const float * __restrict__ sp_b, const float * __restrict__ sp_c,
+        float * sp_dst, const int sp_ne0, const int sp_n) {
+    const int tid = threadIdx.x;
+    if ((int)blockIdx.x >= n_conv_blocks) {
+        // beta-gate: k_fused_softplus, element for element
+        for (int e = tid; e < sp_n; e += blockDim.x) {
+            const int e0 = e % sp_ne0;
+            const float v = sp_a[e] + sp_b[e0];
+            sp_dst[e] = sp_c[e0] * ((v > 20.0f) ? v : logf(1.0f + expf(v)));
+        }
+        return;
+    }
+    const int nqk = 2*nh;
+    const int c = (int)blockIdx.x < nqk ? (int)blockIdx.x*hd + tid : nqk*hd + ((int)blockIdx.x - nqk)*blockDim.x + tid;
+    float sv = 0.0f;
+    if (c < cd && ((int)blockIdx.x >= nqk || tid < hd)) {
+        const float * csr = cs_idx ? cs + (int64_t)cs_idx[0]*cs_row_stride : cs;
+        float * tr = tail_idx ? tail + (int64_t)tail_idx[0]*tail_row_stride : tail;
+        float x0 = csr[3*c + 0];
+        float x1 = csr[3*c + 1];
+        float x2 = csr[3*c + 2];
+        if (cs_mask) {
+            const float m = cs_mask[0];
+            x0 = __fmul_rn(x0, m);
+            x1 = __fmul_rn(x1, m);
+            x2 = __fmul_rn(x2, m);
+        }
+        const float x3 = x[c];
+        const float c0 = w[4*c + 0];
+        const float c1 = w[4*c + 1];
+        const float c2 = w[4*c + 2];
+        const float c3 = w[4*c + 3];
+        const float raw = x0 * c0 + x1 * c1 + x2 * c2 + x3 * c3;   // ssm_conv_single_seq_f32_nc4
+        // the next step's window [x1, x2, x3] (final_state + the conv-tail copy); in place when
+        // cs and tail are the same row: this thread read exactly these three elements above
+        tr[3*c + 0] = x1;
+        tr[3*c + 1] = x2;
+        tr[3*c + 2] = x3;
+        sv = raw / (1.0f + expf(-raw));                            // pxa_dn_silu_qknorm_f32
+        silu_out[c] = sv;
+    }
+    if ((int)blockIdx.x < nqk) {
+        // per-head l2 norm, the reduction of pxa_dn_silu_qknorm_f32 at blockDim == hd == 128
+        float sumsq = (tid < hd) ? sv*sv : 0.0f;
+        sumsq = warp_reduce_sum(sumsq);
+        __shared__ float smem[8];
+        if (blockDim.x > WARP_SIZE) {
+            const int wid = tid / WARP_SIZE, lid = tid % WARP_SIZE;
+            if (lid == 0) smem[wid] = sumsq;
+            __syncthreads();
+            sumsq = tid < blockDim.x/WARP_SIZE ? smem[tid] : 0.0f;
+            sumsq = warp_reduce_sum(sumsq);
+            if (tid == 0) smem[0] = sumsq;
+            __syncthreads();
+            sumsq = smem[0];
+        }
+        const float scale = rsqrtf(sumsq + eps);
+        if (tid < hd) {
+            float * dstp = (int)blockIdx.x < nh ? qn + blockIdx.x*hd : kn + (blockIdx.x - nh)*hd;
+            dstp[tid] = sv * scale;
+        }
+    }
+}
+
+// the deferred carry: set at the gather, consumed by the fused conv at RAW
+struct pxa_dn_carry_rec {
+    bool                active;
+    const ggml_tensor * G;
+    const ggml_tensor * M;
+    const ggml_tensor * SRC;
+    const ggml_tensor * IDX;
+    const ggml_tensor * MSK;
+    const ggml_tensor * RAW;
+};
+static thread_local pxa_dn_carry_rec pxa_dn_carry_pending = {};
+static inline void pxa_dn_carry_reset() { pxa_dn_carry_pending.active = false; }
+
+static inline bool pxa_dn_reads(const ggml_tensor * n, const ggml_tensor * t) {
+    if (n->view_src == t) return true;
+    for (int q = 0; q < GGML_MAX_SRC; ++q) {
+        const ggml_tensor * s = n->src[q];
+        if (s && (s == t || s->view_src == t)) return true;
+    }
+    return false;
+}
+
+// The deferred copy is made after all (the fused conv declined): exactly the gather + mask the
+// bit2 path would have launched at the GET_ROWS. The row is still unmodified -- the setup scan
+// proved nothing touches it before the absorbed SET_ROWS, and nothing of ours has written it.
+static void pxa_dn_carry_materialize(ggml_backend_cuda_context & ctx) {
+    pxa_dn_carry_rec & r = pxa_dn_carry_pending;
+    if (!r.active) return;
+    r.active = false;
+    const int64_t ncols = r.G->ne[0];
+    const int block = 256;
+    const int64_t want = (ncols + block - 1)/block;
+    dim3 grid((unsigned)(want < 65535 ? want : 65535), 1, 1);
+    pxa_dn_gather_mask_f32<<<grid, block, 0, ctx.stream()>>>(
+            (const float *)r.SRC->data, (const int32_t *)r.IDX->data,
+            (const float *)r.MSK->data, (float *)r.G->data, (float *)r.M->data,
+            ncols, (int64_t)(r.SRC->nb[1]/sizeof(float)), (int64_t)(r.MSK->nb[1]/sizeof(float)));
+    CUDA_CHECK(cudaGetLastError());
+    pxa_dn_fire_log("dn-inplace-materialized", true);
+}
+
+// Everything the fused conv needs from the graph, checked once and shared by the carry setup (a
+// dry run at the gather) and the launch (at the SSM_CONV), so the two cannot disagree.
+// PXA_DN_CONVFUSE_WHY=1 (diagnostic): name the first decline reason (line tag) of the first 8 declines
+static thread_local int pxa_dn_cf_why = 0;
+#define PXA_CF_NO(n) do { pxa_dn_cf_why = (n); return false; } while (0)
+static bool pxa_dn_convfuse_plan(const ggml_cgraph * cgraph, int ci, int & a, pxa_dn_cl & P) {
+    if (!pxa_dn_convfuse_on()) PXA_CF_NO(1);
+    if (!(pxa_fuse_deltanet_mask() & 32)) PXA_CF_NO(2);          // the conv window goes to the row
+    const ggml_tensor * RAW = cgraph->nodes[ci];
+    if (RAW->op != GGML_OP_SSM_CONV || RAW->type != GGML_TYPE_F32) PXA_CF_NO(3);
+    const ggml_tensor * cs = RAW->src[0];
+    const ggml_tensor * xx = RAW->src[1];
+    const ggml_tensor * ww = RAW->src[2];
+    const ggml_tensor * sq = RAW->src[3];
+    if (!cs || !xx || !ww || !sq || RAW->src[4]) PXA_CF_NO(4);   // no per-step capture
+    if (RAW->op_params[2] != 0 || RAW->op_params[3] != 0) PXA_CF_NO(5);
+    if (cs->type != GGML_TYPE_F32 || xx->type != GGML_TYPE_F32 || ww->type != GGML_TYPE_F32) PXA_CF_NO(6);
+    const int64_t cd = cs->ne[1];
+    if (cs->ne[0] != 3 || cs->ne[2] != 1 || cs->nb[0] != sizeof(float) || cs->nb[1] != 3*sizeof(float)) PXA_CF_NO(7);
+    if (ww->ne[0] != 4 || ww->ne[1] != cd || !ggml_is_contiguous(ww)) PXA_CF_NO(8);
+    if (xx->ne[0] != cd || xx->ne[1] != 1 || xx->nb[0] != sizeof(float)) PXA_CF_NO(9);
+    if (sq->ne[0] != 1) PXA_CF_NO(10);
+    if (RAW->flags & GGML_TENSOR_FLAG_OUTPUT) PXA_CF_NO(11);
+    // the cluster must be the next real node, anchored on this conv
+    a = -1;
+    for (int k = ci + 1; k < cgraph->n_nodes; ++k) {
+        if (ggml_is_noop(cgraph->nodes[k])) continue;
+        a = k; break;
+    }
+    if (a < 0) PXA_CF_NO(12);
+    const ggml_tensor * S = cgraph->nodes[a];
+    if (S->op != GGML_OP_UNARY || ggml_get_unary_op(S) != GGML_UNARY_OP_SILU) PXA_CF_NO(13);
+    if (!pxa_dn_cluster_match(cgraph, a, P, true, /*conv_fused=*/true)) PXA_CF_NO(14);
+    if (P.RAW != RAW || !P.extra || !P.state_base) PXA_CF_NO(15);   // the row absorb must be live
+    if (P.hd != 128 || P.dc != 3 || P.cd != cd || P.nh < 1) PXA_CF_NO(16);
+    // the tail view is RAW's final-state region [s0 s1 s2 x] per channel, from s1
+    if (P.tail_off != (int64_t)((cd + 1)*sizeof(float)) || P.T->nb[0] != sizeof(float) || P.T->nb[1] != 4*sizeof(float)) PXA_CF_NO(17);
+    if (!ops_are_same_device(cgraph, ci, a)) PXA_CF_NO(18);
+    // RAW's dst is not written: its only readers may be the SILU (a) and the conv-tail CONT (a+2)
+    for (int k = ci + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n == P.S || n == P.C || ggml_is_noop(n)) continue;
+        if (pxa_dn_reads(n, RAW)) PXA_CF_NO(19);
+    }
+    // the softplus the kernel replaces is the exact ggml_cuda_fused_softplus shape
+    const ggml_tensor * alpha = P.AD->src[0];
+    if (!ggml_is_contiguous(P.MU) || ggml_nelements(P.MU) != ggml_nelements(alpha)) PXA_CF_NO(20);
+    if (!ggml_is_contiguous(P.AD->src[1]) || !ggml_is_contiguous(P.MU->src[1])) PXA_CF_NO(21);
+    // Every output is disjoint from every input it does not own and from the other outputs, OR it
+    // is the exact per-channel alias ggml-alloc produces when it reuses a dying input in place: the
+    // silu output (and the q / k norm outputs) over the conv input x, the gate over alpha. An
+    // exact alias is safe because each channel's input is read and its output written by the same
+    // thread; any SHIFTED overlap would let one block overwrite another block's unread input.
+    const int64_t qk = P.nh*P.hd;
+    auto same_ch = [](const ggml_tensor * o, int64_t ch0, const ggml_tensor * in) {
+        return (const char *) o->data - ch0*(int64_t)sizeof(float) == (const char *) in->data &&
+               o->buffer == in->buffer;
+    };
+    struct oc { const ggml_tensor * o; int64_t ch0; const ggml_tensor * own; };
+    const oc outs[] = { { P.S, 0, xx }, { P.LQ, 0, xx }, { P.LK, qk, xx }, { P.MU, 0, alpha } };
+    const ggml_tensor * ins[] = { xx, ww, cs, alpha, P.AD->src[1], P.MU->src[1] };
+    //
+    // Any OTHER overlap of an output over an input (a shifted alias: at 16k depth the allocator put
+    // the k-norm output over the q channels of x and the gate over v channels of x) is not a
+    // decline: that output is written to a scratch buffer and copied to its place after the kernel,
+    // when every input has been read. The allocator placed it there because the input is dead once
+    // the output exists, so the late copy is exactly the eager chain's end state.
+    P.cf_scratch = 0;
+    int oi = 0;
+    for (const oc & e : outs) {
+        const ggml_tensor * o = e.o;
+        if (!o->data || !ggml_is_contiguous(o)) PXA_CF_NO(22);
+        for (const ggml_tensor * t : ins) {
+            if (pxa_dn_disjoint(o->data, ggml_nbytes(o), t)) continue;
+            if (t == e.own && same_ch(o, e.ch0, t)) continue;
+            P.cf_scratch |= 1 << oi;
+        }
+        ++oi;
+        for (const oc & f : outs) {
+            if (f.o != o && !pxa_dn_disjoint(o->data, ggml_nbytes(o), f.o)) PXA_CF_NO(24);
+        }
+    }
+    return true;
+}
+
+// =============================================================================================
+// PXA_DN_CONVFUSE_NY (2026-09-28; default on; =0 off) -- the conv cluster at verify
+// widths 2..8 (one sequence). The ny=1 cluster above is gated to plain decode; at the MTP verify
+// width the eager chain came back per recurrent layer per card: gather+mask copy, ssm_conv,
+// final_state, silu, two l2 norms, add, softplus, conv-tail CONT, CONCAT and SET_ROWS (P100 pair,
+// w2: ~2 ms of device time per verify per card against 0.19 ms for the ny=1 cluster).
+//
+// The width>1 graph of one layer (single sequence, PXA_LLAMA_FIX_v4 builder, DFS order from the
+// state_cpy expand) is the ny=1 window with two differences: q/k are PERMUTED before the l2 norm
+// (VIEW, PERMUTE, L2_NORM instead of VIEW, L2_NORM, PERMUTE) and the delta-net carries the per-step
+// snapshot tensor (src6). The kernel below computes, per channel, the tokens IN ORDER with the ny=1
+// cluster's arithmetic expression for expression: the conv window slides through registers, the
+// per-step conv snapshot (the window after token t, dense [t][3*cd] layout of ssm_conv's capture)
+// is written for every t, silu is the same expression, and each (head, token) q/k l2 norm is the
+// ny=1 block reduction on that token's 128 values. So every token's silu / q / k equals what the
+// ny=1 cluster (= plain decode) computes for that token given the same conv window: the verify
+// columns reproduce plain decode's values instead of the eager l2_norm_f32_nc's. The recurrence
+// then runs with the carried row in place (PXA_DN_INPLACE) and the row absorbed (bit5), exactly
+// as at ny=1; its per-step ssm snapshots are unchanged (the state is held in registers).
+// Anything that does not match op for op falls through to the eager chain.
+// =============================================================================================
+static bool pxa_dn_convfuse_ny_on() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_DN_CONVFUSE_NY");
+        return e ? atoi(e) != 0 : true;
+    }();
+    return v;
+}
+#define PXA_DN_NY_MAX 8
+
+static __global__ void pxa_dn_conv_cluster_ny_f32(
+        const float * x, const int64_t x_s1, const float * __restrict__ w,
+        const float * cs, const int32_t * __restrict__ cs_idx, const int64_t cs_row_stride,
+        const float * __restrict__ cs_mask,
+        float * tail, const int32_t * __restrict__ tail_idx, const int64_t tail_row_stride,
+        float * __restrict__ ps_conv,
+        float * silu_out, float * qn, float * kn,
+        const int hd, const int nh, const int cd, const int ny, const float eps, const int n_conv_blocks,
+        const float * sp_a, const float * __restrict__ sp_b, const float * __restrict__ sp_c,
+        float * sp_dst, const int sp_ne0, const int sp_n) {
+    const int tid = threadIdx.x;
+    if ((int)blockIdx.x >= n_conv_blocks) {
+        // beta-gate: k_fused_softplus, element for element (ADD folded as in the ny=1 cluster)
+        for (int e = tid; e < sp_n; e += blockDim.x) {
+            const int e0 = e % sp_ne0;
+            const float v = sp_a[e] + sp_b[e0];
+            sp_dst[e] = sp_c[e0] * ((v > 20.0f) ? v : logf(1.0f + expf(v)));
+        }
+        return;
+    }
+    const int nqk = 2*nh;
+    const int c = (int)blockIdx.x < nqk ? (int)blockIdx.x*hd + tid : nqk*hd + ((int)blockIdx.x - nqk)*blockDim.x + tid;
+    float sv[PXA_DN_NY_MAX];
+#pragma unroll
+    for (int t = 0; t < PXA_DN_NY_MAX; ++t) sv[t] = 0.0f;
+    if (c < cd && ((int)blockIdx.x >= nqk || tid < hd)) {
+        const float * csr = cs_idx ? cs + (int64_t)cs_idx[0]*cs_row_stride : cs;
+        float * tr = tail_idx ? tail + (int64_t)tail_idx[0]*tail_row_stride : tail;
+        float x0 = csr[3*c + 0];
+        float x1 = csr[3*c + 1];
+        float x2 = csr[3*c + 2];
+        if (cs_mask) {
+            const float m = cs_mask[0];
+            x0 = __fmul_rn(x0, m);
+            x1 = __fmul_rn(x1, m);
+            x2 = __fmul_rn(x2, m);
+        }
+        const float c0 = w[4*c + 0];
+        const float c1 = w[4*c + 1];
+        const float c2 = w[4*c + 2];
+        const float c3 = w[4*c + 3];
+#pragma unroll
+        for (int t = 0; t < PXA_DN_NY_MAX; ++t) {
+            if (t >= ny) break;
+            const float x3 = x[c + (int64_t)t*x_s1];
+            const float raw = x0 * c0 + x1 * c1 + x2 * c2 + x3 * c3;   // ssm_conv_single_seq_f32_nc4
+            x0 = x1; x1 = x2; x2 = x3;
+            if (ps_conv) {                                             // the capture, after token t
+                float * y = ps_conv + (int64_t)t*3*cd + 3*c;
+                y[0] = x0; y[1] = x1; y[2] = x2;
+            }
+            const float s = raw / (1.0f + expf(-raw));                  // pxa_dn_silu_qknorm_f32
+            sv[t] = s;
+            silu_out[c + (int64_t)t*cd] = s;
+        }
+        // the next round's window (final_state + conv tail); in place when cs and tail are one row:
+        // this thread read exactly these three elements above
+        tr[3*c + 0] = x0;
+        tr[3*c + 1] = x1;
+        tr[3*c + 2] = x2;
+    }
+    if ((int)blockIdx.x < nqk) {
+        __shared__ float smem[8];
+        float * dstb = (int)blockIdx.x < nh ? qn + (int64_t)blockIdx.x*hd*ny : kn + (int64_t)(blockIdx.x - nh)*hd*ny;
+#pragma unroll
+        for (int t = 0; t < PXA_DN_NY_MAX; ++t) {
+            if (t >= ny) break;
+            // the ny=1 cluster's reduction, per token
+            float sumsq = (tid < hd) ? sv[t]*sv[t] : 0.0f;
+            sumsq = warp_reduce_sum(sumsq);
+            if (blockDim.x > WARP_SIZE) {
+                const int wid = tid / WARP_SIZE, lid = tid % WARP_SIZE;
+                if (lid == 0) smem[wid] = sumsq;
+                __syncthreads();
+                sumsq = tid < blockDim.x/WARP_SIZE ? smem[tid] : 0.0f;
+                sumsq = warp_reduce_sum(sumsq);
+                if (tid == 0) smem[0] = sumsq;
+                __syncthreads();
+                sumsq = smem[0];
+                __syncthreads();   // every thread has read smem[0] before the next token reuses it
+            }
+            const float scale = rsqrtf(sumsq + eps);
+            if (tid < hd) dstb[(int64_t)t*hd + tid] = sv[t] * scale;
+        }
+    }
+}
+
+// The width>1 window, anchored at the SILU (i): S T C R1 Q PQ LQ K PK LK V PV AD SP MU PG PB RS D NV NR1
+// NR2 CC SR. Only the row-absorb shape is admitted (bit5 scan), which is the shipped default.
+static bool pxa_dn_cluster_match_ny(const ggml_cgraph * cgraph, int i, pxa_dn_cl & P) {
+    const int pxa_mask = pxa_fuse_deltanet_mask();
+    if (!(pxa_mask & 32) || !(pxa_mask & (1 | 16))) return false;
+    if (i + 23 >= cgraph->n_nodes) return false;
+    ggml_tensor * const * n = cgraph->nodes + i;
+    ggml_tensor *S = n[0], *T = n[1], *C = n[2], *R1 = n[3], *Q = n[4], *PQ = n[5], *LQ = n[6], *K = n[7],
+                *PK = n[8], *LK = n[9], *Vv = n[10], *PV = n[11], *AD = n[12], *SP = n[13], *MU = n[14],
+                *PG = n[15], *PB = n[16], *RS = n[17], *D = n[18], *NV = n[19], *NR1 = n[20], *NR2 = n[21],
+                *CC = n[22], *SR = n[23];
+    if (S->op != GGML_OP_UNARY || ggml_get_unary_op(S) != GGML_UNARY_OP_SILU ||
+        T->op  != GGML_OP_VIEW    || C->op   != GGML_OP_CONT    || R1->op  != GGML_OP_RESHAPE ||
+        Q->op  != GGML_OP_VIEW    || PQ->op  != GGML_OP_PERMUTE || LQ->op  != GGML_OP_L2_NORM ||
+        K->op  != GGML_OP_VIEW    || PK->op  != GGML_OP_PERMUTE || LK->op  != GGML_OP_L2_NORM ||
+        Vv->op != GGML_OP_VIEW    || PV->op  != GGML_OP_PERMUTE ||
+        AD->op != GGML_OP_ADD     || SP->op  != GGML_OP_UNARY   || MU->op  != GGML_OP_MUL     ||
+        PG->op != GGML_OP_PERMUTE || PB->op  != GGML_OP_PERMUTE || RS->op  != GGML_OP_RESHAPE ||
+        D->op  != GGML_OP_DELTA_NET || NV->op != GGML_OP_VIEW   || NR1->op != GGML_OP_RESHAPE ||
+        NR2->op != GGML_OP_RESHAPE  || CC->op != GGML_OP_CONCAT || SR->op  != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    if ((ggml_unary_op)SP->op_params[0] != GGML_UNARY_OP_SOFTPLUS) return false;
+    // SILU over the token block [cd, ny] of an SSM_CONV output
+    const int64_t ny = S->ne[1];
+    if (S->type != GGML_TYPE_F32 || ny < 2 || ny > PXA_DN_NY_MAX || S->ne[2] != 1 || S->ne[3] != 1) return false;
+    if (!S->src[0] || S->src[0]->op != GGML_OP_VIEW || !ggml_is_contiguous(S)) return false;
+    ggml_tensor * RAW = S->src[0]->src[0];
+    if (!RAW || RAW->op != GGML_OP_SSM_CONV || RAW->type != GGML_TYPE_F32) return false;
+    if (S->src[0]->data != RAW->data) return false;
+    const int64_t cd = S->ne[0];
+    if (S->src[0]->nb[1] != cd*(int64_t)sizeof(float)) return false;
+    // conv tail: RAW's final-state region [s0 s1 s2 x] per channel, from s1
+    if (T->src[0] != RAW || T->type != GGML_TYPE_F32) return false;
+    const int64_t dc = T->ne[0];
+    if (dc != 3 || T->ne[1] != cd || T->ne[2] != 1 || T->ne[3] != 1) return false;
+    if (T->nb[0] != sizeof(float) || T->nb[1] != 4*sizeof(float)) return false;
+    if ((const char *)T->data - (const char *)RAW->data != (int64_t)((cd*ny + 1)*sizeof(float))) return false;
+    if (C->src[0] != T || !ggml_is_contiguous(C) || C->ne[0] != dc || C->ne[1] != cd) return false;
+    if (R1->src[0] != C) return false;
+    // q/k/v views [hd, nh, ny] of S, q/k permuted to [hd, ny, nh] and then normed
+    if (Q->src[0] != S || K->src[0] != S || Vv->src[0] != S) return false;
+    const int64_t hd = Q->ne[0], nh = Q->ne[1];
+    if (hd != 128 || nh < 1 || nh > 256) return false;
+    if (Q->ne[2] != ny || Q->ne[3] != 1 || K->ne[0] != hd || K->ne[1] != nh || K->ne[2] != ny || K->ne[3] != 1) return false;
+    if (Q->nb[1] != hd*(int64_t)sizeof(float) || K->nb[1] != hd*(int64_t)sizeof(float)) return false;
+    if (Q->nb[2] != cd*(int64_t)sizeof(float) || K->nb[2] != cd*(int64_t)sizeof(float)) return false;
+    if (Q->data != S->data) return false;
+    if ((const char *)K->data - (const char *)S->data != (int64_t)(nh*hd*sizeof(float))) return false;
+    if ((const char *)Vv->data - (const char *)S->data != (int64_t)(2*nh*hd*sizeof(float))) return false;
+    if (Vv->ne[2] != ny || 2*nh*hd + Vv->ne[0]*Vv->ne[1] != cd) return false;
+    if (PQ->src[0] != Q || PK->src[0] != K || PV->src[0] != Vv) return false;
+    if (LQ->src[0] != PQ || LK->src[0] != PK) return false;
+    if (LQ->type != GGML_TYPE_F32 || LK->type != GGML_TYPE_F32 || !ggml_is_contiguous(LQ) || !ggml_is_contiguous(LK)) return false;
+    if (LQ->ne[0] != hd || LQ->ne[1] != ny || LQ->ne[2] != nh || LQ->ne[3] != 1) return false;
+    if (LK->ne[0] != hd || LK->ne[1] != ny || LK->ne[2] != nh || LK->ne[3] != 1) return false;
+    float epsq, epsk;
+    memcpy(&epsq, LQ->op_params, sizeof(float));
+    memcpy(&epsk, LK->op_params, sizeof(float));
+    if (epsq != epsk) return false;
+    // beta-gate chain
+    if (SP->src[0] != AD || MU->src[0] != SP || PG->src[0] != MU) return false;
+    if (!AD->src[1] || !MU->src[1]) return false;
+    if (ggml_nrows(AD->src[1]) != 1 || ggml_nrows(MU->src[1]) != 1) return false;
+    if (AD->src[1]->ne[0] != AD->src[0]->ne[0] || MU->src[1]->ne[0] != MU->src[0]->ne[0]) return false;
+    if (AD->type != GGML_TYPE_F32 || MU->type != GGML_TYPE_F32 ||
+        AD->src[0]->type != GGML_TYPE_F32 || AD->src[1]->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(AD->src[0])) return false;
+    // the recurrence: exactly the tensors above; dense capture layout (no ring), scalar gate
+    if (D->src[0] != LQ || D->src[1] != LK || D->src[2] != PV || D->src[3] != PG || D->src[4] != PB || D->src[5] != RS) return false;
+    if (D->src[0]->ne[1] != ny || D->src[0]->ne[3] != 1) return false;
+    if (D->op_params[1] != 0 || D->op_params[2] != 0 || D->op_params[3] != 0) return false;
+    // the packed row and its scatter
+    if (NV->src[0] != D || NR1->src[0] != NV || NR2->src[0] != NR1) return false;
+    if (CC->op_params[0] != 0 || CC->src[0] != R1 || CC->src[1] != NR2) return false;
+    if (CC->type != GGML_TYPE_F32 || !ggml_is_contiguous(CC)) return false;
+    const int64_t conv_elems = ggml_nelements(R1);
+    const int64_t ssm_elems  = ggml_nelements(NR2);
+    if (conv_elems != dc*cd || ggml_nelements(CC) != conv_elems + ssm_elems) return false;
+    if (CC->ne[1] != 1 || CC->ne[2] != 1 || CC->ne[3] != 1) return false;
+    if (!ops_are_same_device(cgraph, i, i+23)) return false;
+    if (!(SR->src[0] == CC && SR->src[1] && SR->src[2] && SR->src[1]->type == GGML_TYPE_I32 &&
+          SR->type == GGML_TYPE_F32 && SR->src[2]->type == GGML_TYPE_F32 && SR->data == SR->src[2]->data &&
+          SR->ne[0] == CC->ne[0] && SR->ne[2] == 1 && SR->ne[3] == 1 && SR->src[1]->ne[0] == 1 &&
+          SR->src[1]->nb[0] == sizeof(int32_t) && SR->nb[0] == sizeof(float) && (SR->nb[1] % sizeof(float)) == 0 &&
+          ggml_is_contiguous_rows(SR))) return false;
+    // nothing we leave unwritten has another reader; nothing between here and the SET_ROWS touches the row
+    if (!pxa_g2_sole_consumer(cgraph, i+2, C, R1) || !pxa_g2_sole_consumer(cgraph, i+3, R1, CC) ||
+        !pxa_g2_sole_consumer(cgraph, i+19, NV, NR1) || !pxa_g2_sole_consumer(cgraph, i+20, NR1, NR2) ||
+        !pxa_g2_sole_consumer(cgraph, i+21, NR2, CC) || !pxa_g2_sole_consumer(cgraph, i+22, CC, SR)) return false;
+    if (!pxa_dn_row_window_clear(cgraph, i, i+23, SR)) return false;
+    P.S = S; P.T = T; P.C = C; P.R1 = R1; P.Q = Q; P.LQ = LQ; P.PQ = PQ; P.K = K; P.LK = LK; P.PK = PK;
+    P.Vv = Vv; P.PV = PV; P.AD = AD; P.SP = SP; P.MU = MU; P.PG = PG; P.PB = PB; P.RS = RS; P.D = D;
+    P.NV = NV; P.NR1 = NR1; P.NR2 = NR2; P.CC = CC; P.RAW = RAW;
+    P.cd = cd; P.dc = dc; P.hd = hd; P.nh = nh; P.tail_off = (int64_t)((cd*ny + 1)*sizeof(float));
+    P.conv_elems = conv_elems; P.ssm_elems = ssm_elems; P.epsq = epsq;
+    P.state_base = (float *) SR->data;
+    P.state_idx  = (const int32_t *) SR->src[1]->data;
+    P.state_row_stride = (int64_t)(SR->nb[1]/sizeof(float));
+    P.extra = 1;
+    P.inplace_shape = false;
+    P.cf_scratch = 0;
+    P.ny = (int) ny;
+    return true;
+}
+
+// The ny>1 twin of pxa_dn_convfuse_plan (same decline tags where the check is the same).
+static bool pxa_dn_convfuse_plan_ny(const ggml_cgraph * cgraph, int ci, int & a, pxa_dn_cl & P) {
+    if (!pxa_dn_convfuse_on() || !pxa_dn_convfuse_ny_on()) PXA_CF_NO(1);
+    const ggml_tensor * RAW = cgraph->nodes[ci];
+    if (RAW->op != GGML_OP_SSM_CONV || RAW->type != GGML_TYPE_F32) PXA_CF_NO(3);
+    const ggml_tensor * cs = RAW->src[0];
+    const ggml_tensor * xx = RAW->src[1];
+    const ggml_tensor * ww = RAW->src[2];
+    const ggml_tensor * sq = RAW->src[3];
+    const ggml_tensor * pc = RAW->src[4];
+    if (!cs || !xx || !ww || !sq) PXA_CF_NO(4);
+    if (RAW->op_params[2] != 0 || RAW->op_params[3] != 0) PXA_CF_NO(5);
+    if (cs->type != GGML_TYPE_F32 || xx->type != GGML_TYPE_F32 || ww->type != GGML_TYPE_F32) PXA_CF_NO(6);
+    const int64_t cd = cs->ne[1];
+    const int64_t ny = xx->ne[1];
+    if (cs->ne[0] != 3 || cs->ne[2] != 1 || cs->nb[0] != sizeof(float) || cs->nb[1] != 3*sizeof(float)) PXA_CF_NO(7);
+    if (ww->ne[0] != 4 || ww->ne[1] != cd || !ggml_is_contiguous(ww)) PXA_CF_NO(8);
+    if (xx->ne[0] != cd || ny < 2 || ny > PXA_DN_NY_MAX || xx->nb[0] != sizeof(float) || xx->nb[1] % sizeof(float)) PXA_CF_NO(9);
+    if (sq->ne[0] != 1 || sq->ne[1] != ny) PXA_CF_NO(10);
+    if (RAW->flags & GGML_TENSOR_FLAG_OUTPUT) PXA_CF_NO(11);
+    if (pc && (pc->type != GGML_TYPE_F32 || !ggml_is_contiguous(pc) || ggml_nelements(pc) < 3*cd*ny)) PXA_CF_NO(25);
+    a = -1;
+    for (int k = ci + 1; k < cgraph->n_nodes; ++k) {
+        if (ggml_is_noop(cgraph->nodes[k])) continue;
+        a = k; break;
+    }
+    if (a < 0) PXA_CF_NO(12);
+    if (!pxa_dn_cluster_match_ny(cgraph, a, P)) PXA_CF_NO(14);
+    if (P.RAW != RAW || P.ny != ny) PXA_CF_NO(15);
+    if (P.cd != cd) PXA_CF_NO(16);
+    if (!ops_are_same_device(cgraph, ci, a)) PXA_CF_NO(18);
+    for (int k = ci + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * nn = cgraph->nodes[k];
+        // the conv-tail CONT reads RAW through its view T (as at ny=1, where C is skipped the same way):
+        // the kernel writes that tail straight into the row, so C is never run
+        if (nn == P.S || nn == P.T || nn == P.C || ggml_is_noop(nn)) continue;
+        if (pxa_dn_reads(nn, RAW)) PXA_CF_NO(19);
+    }
+    const ggml_tensor * alpha = P.AD->src[0];
+    if (!ggml_is_contiguous(P.MU) || ggml_nelements(P.MU) != ggml_nelements(alpha)) PXA_CF_NO(20);
+    if (!ggml_is_contiguous(P.AD->src[1]) || !ggml_is_contiguous(P.MU->src[1])) PXA_CF_NO(21);
+    // outputs vs inputs: exact per-element aliases are allowed where one thread reads the input and
+    // writes the output (silu over x when x is packed [cd, ny]; the gate over alpha); anything else
+    // that overlaps goes through a scratch and is copied into place after the kernel
+    auto same_elem = [](const ggml_tensor * o, const ggml_tensor * in) {
+        return (const char *) o->data == (const char *) in->data && o->buffer == in->buffer;
+    };
+    const ggml_tensor * outs[4] = { P.S, P.LQ, P.LK, P.MU };
+    const ggml_tensor * owns[4] = { xx->nb[1] == cd*(int64_t)sizeof(float) ? xx : nullptr, nullptr, nullptr, alpha };
+    const ggml_tensor * ins[]   = { xx, ww, cs, alpha, P.AD->src[1], P.MU->src[1], pc };
+    P.cf_scratch = 0;
+    for (int oi = 0; oi < 4; ++oi) {
+        const ggml_tensor * o = outs[oi];
+        if (!o->data || !ggml_is_contiguous(o)) PXA_CF_NO(22);
+        for (const ggml_tensor * t : ins) {
+            if (!t || pxa_dn_disjoint(o->data, ggml_nbytes(o), t)) continue;
+            if (t == owns[oi] && same_elem(o, t)) continue;
+            P.cf_scratch |= 1 << oi;
+        }
+        for (int fi = 0; fi < 4; ++fi) {
+            if (fi != oi && !pxa_dn_disjoint(o->data, ggml_nbytes(o), outs[fi])) PXA_CF_NO(24);
+        }
+    }
+    return true;
+}
+
+// dispatch by width: the ny=1 plan is untouched
+static bool pxa_dn_convfuse_plan_any(const ggml_cgraph * cgraph, int ci, int & a, pxa_dn_cl & P) {
+    const ggml_tensor * RAW = cgraph->nodes[ci];
+    if (RAW->op == GGML_OP_SSM_CONV && RAW->src[1] && RAW->src[1]->ne[1] > 1) {
+        return pxa_dn_convfuse_plan_ny(cgraph, ci, a, P);
+    }
+    return pxa_dn_convfuse_plan(cgraph, ci, a, P);
+}
+
+// Called from the bit2 gather site once the GET_ROWS + MUL pair has been matched: true = the copy
+// is deferred (nothing launched; the fused conv reads the row). i = GET_ROWS, j = MUL.
+static bool pxa_dn_carry_try(const ggml_cgraph * cgraph, int i, int j) {
+    if (!pxa_dn_inplace_on() || !pxa_dn_convfuse_on()) return false;
+    const ggml_tensor * G   = cgraph->nodes[i];
+    const ggml_tensor * M   = cgraph->nodes[j];
+    const ggml_tensor * SRC = G->src[0];
+    const ggml_tensor * IDX = G->src[1];
+    const ggml_tensor * MSK = M->src[1];
+    if (G->ne[1] != 1 || (M->flags & GGML_TENSOR_FLAG_OUTPUT) || (G->flags & GGML_TENSOR_FLAG_OUTPUT)) return false;
+    for (int k = i + 1; k < j; ++k) if (!ggml_is_noop(cgraph->nodes[k])) return false;
+    if (!pxa_dn_gm_g_dead(cgraph, j, G)) return false;
+    // the conv that reads the carried conv window out of M
+    int ci = -1;
+    for (int k = j + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n->op == GGML_OP_SSM_CONV && n->src[0] && (n->src[0] == M || n->src[0]->view_src == M)) { ci = k; break; }
+    }
+    if (ci < 0) return false;
+    const ggml_tensor * RAW = cgraph->nodes[ci];
+    if (RAW->src[0]->data != M->data) return false;
+    int a = -1;
+    pxa_dn_cl P;
+    if (!pxa_dn_convfuse_plan_any(cgraph, ci, a, P)) return false;
+    // the recurrence reads the ssm half of M
+    if ((const char *) P.RS->data != (const char *) M->data + P.conv_elems*sizeof(float)) return false;
+    if (ggml_nelements(M) != P.conv_elems + P.ssm_elems) return false;
+    // the absorbed SET_ROWS writes the row the gather read, through the same index
+    const int sr = a + 23;
+    const ggml_tensor * SR = cgraph->nodes[sr];
+    if (SR->op != GGML_OP_SET_ROWS || SR->data != SRC->data || SR->nb[1] != SRC->nb[1] ||
+        (float *) SR->data != P.state_base || SR->src[1] != IDX ||
+        (const int32_t *) IDX->data != P.state_idx || SR->buffer != SRC->buffer) return false;
+    // M is read by the conv (src0) and the recurrence (src5) and nothing else
+    for (int k = j + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (ggml_is_noop(n)) continue;
+        if (n->view_src == M) return false;
+        for (int q = 0; q < GGML_MAX_SRC; ++q) {
+            const ggml_tensor * s = n->src[q];
+            if (!s || !(s == M || s->view_src == M)) continue;
+            if ((n == RAW && q == 0) || (n == P.D && q == 5)) continue;
+            return false;
+        }
+    }
+    // nothing but the gather (and the SET_ROWS it pairs with) touches the state storage in between
+    {
+        const char * lo = (const char *) SR->data;
+        const char * hi = lo + ggml_nbytes(SR);
+        const auto & tv = pxa_dn_touches(cgraph, SR->buffer);
+        for (const auto & e : tv) {
+            if (e.hi <= lo || hi <= e.lo) continue;
+            if (e.idx <= i || e.idx >= sr) continue;
+            return false;
+        }
+    }
+    // the mask the kernels read later is not rewritten in the meantime
+    for (int k = i + 1; k <= sr; ++k) {
+        if (!pxa_dn_disjoint(MSK->data, ggml_nbytes(MSK), cgraph->nodes[k])) return false;
+    }
+    pxa_dn_carry_pending = { true, G, M, SRC, IDX, MSK, RAW };
+    return true;
+}
+
+// At an SSM_CONV node: the fused conv cluster. Returns the number of EXTRA nodes consumed, or 0
+// (then the caller runs the conv eagerly, after materializing a deferred carry if one is pending).
+static int pxa_try_deltanet_convfuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int ci) {
+    int a = -1;
+    pxa_dn_cl P;
+    const bool inplace = pxa_dn_carry_pending.active && pxa_dn_carry_pending.RAW == cgraph->nodes[ci];
+    if (!pxa_dn_convfuse_plan_any(cgraph, ci, a, P)) {
+        // PXA_DN_CONVFUSE_WHY=<n>: the first n (at least 8) declines; multi-token declines (check 9,
+        // a prefill ubatch) are not counted, so a deep prompt does not use the budget up.
+        static const int why_n = [] { const char * e = getenv("PXA_DN_CONVFUSE_WHY"); return e ? (atoi(e) > 8 ? atoi(e) : 8) : 0; }();
+        static std::atomic<int> left{why_n};
+        if (why_n > 0 && pxa_dn_cf_why != 9 && left.fetch_sub(1) > 0) {
+            fprintf(stderr, "PXA_DN_CONVFUSE_WHY: node %d (%s) declined at check %d, next real node %d\n",
+                    ci, cgraph->nodes[ci]->name, pxa_dn_cf_why, a);
+        }
+        pxa_dn_fire_log("dn-convfuse", false);
+        return 0;
+    }
+    const ggml_tensor * RAW = cgraph->nodes[ci];
+    const int nh = (int) P.nh, hd = (int) P.hd, cd = (int) P.cd;
+    const int nqk = 2*nh;
+    const int block = 128;
+    const int nvb = (cd - nqk*hd + block - 1)/block;
+    const int n_conv_blocks = nqk + nvb;
+    const ggml_tensor * alpha = P.AD->src[0];
+    const int sp_n = (int) ggml_nelements(alpha);
+    const float * cs; const int32_t * cs_idx; int64_t cs_stride; const float * cs_mask;
+    if (inplace) {
+        cs = P.state_base; cs_idx = P.state_idx; cs_stride = P.state_row_stride;
+        cs_mask = (const float *) pxa_dn_carry_pending.MSK->data;
+    } else {
+        cs = (const float *) RAW->src[0]->data; cs_idx = nullptr; cs_stride = 0; cs_mask = nullptr;
+    }
+    // outputs in P.cf_scratch go through a pool buffer and are copied into place after the kernel
+    const ggml_tensor * outs[4] = { P.S, P.LQ, P.LK, P.MU };
+    float * optr[4];
+    ggml_cuda_pool_alloc<float> oscr(ctx.pool());
+    {
+        size_t off[4], tot = 0;
+        for (int k = 0; k < 4; ++k) {
+            off[k] = tot;
+            if (P.cf_scratch & (1 << k)) tot += (ggml_nbytes(outs[k]) + 255)/256*64;   // floats, 256 B aligned
+        }
+        if (tot) oscr.alloc(tot);
+        for (int k = 0; k < 4; ++k) {
+            optr[k] = (P.cf_scratch & (1 << k)) ? oscr.ptr + off[k] : (float *) outs[k]->data;
+        }
+    }
+    if (P.ny > 1) {
+        const ggml_tensor * xx = RAW->src[1];
+        pxa_dn_conv_cluster_ny_f32<<<n_conv_blocks + 1, block, 0, ctx.stream()>>>(
+                (const float *) xx->data, (int64_t)(xx->nb[1]/sizeof(float)), (const float *) RAW->src[2]->data,
+                cs, cs_idx, cs_stride, cs_mask,
+                P.state_base, P.state_idx, P.state_row_stride,
+                RAW->src[4] ? (float *) RAW->src[4]->data : nullptr,
+                optr[0], optr[1], optr[2],
+                hd, nh, cd, P.ny, P.epsq, n_conv_blocks,
+                (const float *) alpha->data, (const float *) P.AD->src[1]->data, (const float *) P.MU->src[1]->data,
+                optr[3], (int) alpha->ne[0], sp_n);
+    } else {
+    pxa_dn_conv_cluster_f32<<<n_conv_blocks + 1, block, 0, ctx.stream()>>>(
+            (const float *) RAW->src[1]->data, (const float *) RAW->src[2]->data,
+            cs, cs_idx, cs_stride, cs_mask,
+            P.state_base, P.state_idx, P.state_row_stride,
+            optr[0], optr[1], optr[2],
+            hd, nh, cd, P.epsq, n_conv_blocks,
+            (const float *) alpha->data, (const float *) P.AD->src[1]->data, (const float *) P.MU->src[1]->data,
+            optr[3], (int) alpha->ne[0], sp_n);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    for (int k = 0; k < 4; ++k) {
+        if (P.cf_scratch & (1 << k)) {
+            CUDA_CHECK(cudaMemcpyAsync(outs[k]->data, optr[k], ggml_nbytes(outs[k]), cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+    }
+    ggml_cuda_op_delta_net_ex3(ctx, P.D, P.state_base + P.conv_elems, P.state_idx, P.state_row_stride,
+                               inplace ? (const float *) pxa_dn_carry_pending.MSK->data : nullptr);
+    if (inplace) pxa_dn_carry_pending.active = false;
+    pxa_dn_fire_log(P.ny > 1 ? "dn-convfuse-ny" : "dn-convfuse", true);
+    pxa_dn_fire_log("dn-inplace", inplace);
+    pxa_dn_fire_log("row-absorb", true);
+    return (a - ci) + 22 + P.extra;
 }

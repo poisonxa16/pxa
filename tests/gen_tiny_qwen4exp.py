@@ -85,6 +85,11 @@ class Writer:
         body += b"".join(struct.pack("<i", int(v)) for v in vs)
         self.kv.append((k, body))
 
+    def arr_u64(self, k, vs):
+        body = struct.pack("<I", T_ARRAY) + struct.pack("<I", T_UINT64) + struct.pack("<Q", len(vs))
+        body += b"".join(struct.pack("<Q", int(v)) for v in vs)
+        self.kv.append((k, body))
+
     def arr_f32(self, k, vs):
         body = struct.pack("<I", T_ARRAY) + struct.pack("<I", T_FLOAT32) + struct.pack("<Q", len(vs))
         body += b"".join(struct.pack("<f", float(v)) for v in vs)
@@ -138,7 +143,7 @@ class Writer:
 
 # --- the model ------------------------------------------------------------------------
 
-def build(path, seed):
+def build(path, seed, ple=False):
     rng = np.random.default_rng(seed)
 
     ARCH     = "qwen4exp"
@@ -237,6 +242,24 @@ def build(path, seed):
     w.u32(f"{ARCH}.expert_feed_forward_length", N_FF_EXP)
     w.u32(f"{ARCH}.expert_shared_feed_forward_length", N_FF_SHEXP)
 
+    # --ple: the PLE side path on one layer (the shipped model's layout, reduced). Off by
+    # default so the QSA fixture stays attributable; the KV/state tests turn it on to cover the
+    # per-sequence PLE conv window and n-gram tail (bug #214).
+    PLE_LAYER, PLE_NGRAM, PLE_HPN, PLE_KERN = 1, 3, 2, 4
+    PLE_HEADS = (PLE_NGRAM - 1) * PLE_HPN            # 4
+    PLE_HEAD_DIM = N_EMBD // PLE_HEADS               # 32: heads * head_dim must be n_embd
+    PLE_VOCAB = [61, 67, 71, 73]
+    if ple:
+        w.arr_u32(f"{ARCH}.ple.layers", [PLE_LAYER])
+        w.u32(f"{ARCH}.ple.ngram_size", PLE_NGRAM)
+        w.u32(f"{ARCH}.ple.heads_per_ngram", PLE_HPN)
+        w.u32(f"{ARCH}.ple.conv_kernel", PLE_KERN)
+        w.u32(f"{ARCH}.embedding_length_per_layer_input", PLE_HEAD_DIM)
+        w.arr_u64(f"{ARCH}.ple.layer_multipliers", [1, 1000003, 998244353][:PLE_NGRAM])
+        w.arr_u64(f"{ARCH}.ple.head_offsets", [sum(PLE_VOCAB[:h]) for h in range(PLE_HEADS)])
+        w.arr_u64(f"{ARCH}.ple.head_vocab_sizes", PLE_VOCAB)
+        w.u32(f"{ARCH}.ple.eos_token_id", 2)
+
     # --- vocab. A byte-fallback SPM vocab: 3 control pieces, the 256 single-byte tokens, and
     # filler, so every printable ASCII prompt tokenises to one token per byte and a prompt of a
     # known length produces a context of a known length -- which is what lets the fixture put
@@ -273,6 +296,8 @@ def build(path, seed):
 
     w.tensor("token_embd.weight", [N_EMBD, N_VOCAB], R(N_EMBD, N_VOCAB, s=0.2))
     w.tensor("output.weight",     [N_EMBD, N_VOCAB], R(N_EMBD, N_VOCAB, s=0.2))
+    if ple:
+        w.tensor("per_layer_token_embd.weight", [PLE_HEAD_DIM, sum(PLE_VOCAB)], R(PLE_HEAD_DIM, sum(PLE_VOCAB), s=0.5))
 
     # there is no output_norm for this arch: the final low-rank hc mixer carries it
     w.tensor("output_hc_norm.weight", [HC_DIM],         ONES(HC_DIM))
@@ -316,6 +341,14 @@ def build(path, seed):
             w.tensor(p + "ssm_norm.weight",  [D_STATE],           ONES(D_STATE))
             w.tensor(p + "ssm_out.weight",   [VALUE_DIM, N_EMBD], R(VALUE_DIM, N_EMBD))
 
+        if ple and il == PLE_LAYER:
+            w.tensor(p + "ple_key.weight",        [N_EMBD, HC_DIM], R(N_EMBD, HC_DIM, s=0.2))
+            w.tensor(p + "ple_value.weight",      [N_EMBD, N_EMBD], R(N_EMBD, N_EMBD, s=0.2))
+            w.tensor(p + "ple_norm_key.weight",   [HC_DIM], ONES(HC_DIM))
+            w.tensor(p + "ple_norm_query.weight", [HC_DIM], ONES(HC_DIM))
+            w.tensor(p + "ple_norm_conv.weight",  [HC_DIM], ONES(HC_DIM))
+            w.tensor(p + "ple_conv1d.weight",     [PLE_KERN, HC_DIM], R(PLE_KERN, HC_DIM, s=0.5))
+
         # MoE on every layer, plus one shared expert
         w.tensor(p + "ffn_gate_inp.weight",   [N_EMBD, N_EXPERT], R(N_EMBD, N_EXPERT, s=0.2))
         w.tensor(p + "ffn_gate_exps.weight",  [N_EMBD, N_FF_EXP, N_EXPERT], R(N_EMBD, N_FF_EXP, N_EXPERT))
@@ -335,8 +368,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--ple", action="store_true", help="add the PLE side path on layer 1")
     a = ap.parse_args()
-    build(a.out, a.seed)
+    build(a.out, a.seed, a.ple)
     return 0
 
 

@@ -62,6 +62,28 @@ foreach(asset ${ALT_PUBLIC_ASSETS})
 
 endforeach()
 
+# PXA_EXPLAIN_PAGE_v1 (2026-09-25, showcase lane): the /pxa page, embedded the same way (plain
+# HTML+JS, no build toolchain -- xxd.cmake turns it into a byte array + length at build time, just
+# like loading.html above). Its own directory so this never touches the llamacpp webui's assets.
+set(PXA_ASSETS
+    pxa.html
+    speed.html   # PXA_SPEED_STATS_v1: GET /pxa/speed
+)
+
+foreach(asset ${PXA_ASSETS})
+    set(input "${CMAKE_CURRENT_SOURCE_DIR}/public_pxa/${asset}")
+    set(output "${CMAKE_CURRENT_BINARY_DIR}/${asset}.hpp")
+    list(APPEND TARGET_SRCS ${output})
+    add_custom_command(
+        DEPENDS "${input}"
+        OUTPUT "${output}"
+        COMMAND "${CMAKE_COMMAND}" "-DINPUT=${input}" "-DOUTPUT=${output}" -P "${PROJECT_SOURCE_DIR}/scripts/xxd.cmake"
+    )
+    message("TARGET_SRCS contains: ${input}")
+    set_source_files_properties(${output} PROPERTIES GENERATED TRUE)
+
+endforeach()
+
 
 add_executable(${TARGET} ${TARGET_SRCS})
 install(TARGETS ${TARGET} RUNTIME)
@@ -101,3 +123,5 @@ if (WIN32)
 endif()
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+pxa_add_alias(${TARGET} pxa-server)

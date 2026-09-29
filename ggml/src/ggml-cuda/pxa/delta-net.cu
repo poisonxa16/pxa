@@ -18,7 +18,10 @@
 //                                    destination ROW on the device from the
 //                                    index tensor the fused-away SET_ROWS would
 //                                    have read.
-// Both take nullptr to mean "do exactly what upstream does". Every edited site
+//   * ggml_cuda_op_delta_net_ex3  -- PXA_DN_INPLACE, additionally READS the
+//                                    carried state from that same row, times
+//                                    the per-sequence reset mask.
+// All take nullptr to mean "do exactly what upstream does". Every edited site
 // names the lever it belongs to in a comment; see ggml-cuda/pxa/README.md and
 // pxa-deltanet-fuse.cuh for what drives them.
 // -----------------------------------------------------------------------------
@@ -81,6 +84,7 @@ __device__ __forceinline__ void delta_net_recurrent_body(
     float * __restrict__ state_ext,       // PXA_FUSE_DELTANET: optional external new-state destination
     const int32_t * __restrict__ state_ext_idx, // PXA_DN_SCATTER_FUSE: optional DEVICE-side row index
     const int64_t state_ext_row_stride,         //   (elements) row stride of the destination buffer
+    const float * __restrict__ state_in_mask,   // PXA_DN_INPLACE: read the state IN PLACE from the destination row, times mask[0]
     const int64_t n_heads,
     const int64_t gqa_ratio,
     const int repeat_type,
@@ -164,9 +168,20 @@ __device__ __forceinline__ void delta_net_recurrent_body(
 
     // Keep the state in registers, copy the final state to its destination at the end
     float state_local[HEAD_DIM/num_warps];
-    for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
-        int col = num_warps*i + col_idx_0;
-        state_local[i] = state_src[col*HEAD_DIM + row_out];
+    if (state_in_mask) {
+        // PXA_DN_INPLACE: the carried state is read from the very row this thread writes at the end
+        // (same thread, same element: an exact in-place alias), times the per-seq reset mask -- the
+        // value the eager GET_ROWS + MUL would have staged, so the arithmetic is unchanged.
+        const float sm = state_in_mask[0];
+        for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
+            int col = num_warps*i + col_idx_0;
+            state_local[i] = __fmul_rn(state_dst[col*HEAD_DIM + row_out], sm);
+        }
+    } else {
+        for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
+            int col = num_warps*i + col_idx_0;
+            state_local[i] = state_src[col*HEAD_DIM + row_out];
+        }
     }
 
     constexpr int WARP_SIZE_S = WARP_SIZE + 1;
@@ -281,13 +296,14 @@ __global__ void delta_net_recurrent_f32(
     // PXA_RS_RING: strides (in elements) of the per-step capture destination; <= 0 = derive.
     const int64_t sv_row_stride, const int64_t sv_step_stride,
     float * __restrict__ state_ext, const int32_t * __restrict__ state_ext_idx,
-    const int64_t state_ext_row_stride, const int64_t n_heads, const int64_t gqa_ratio,
+    const int64_t state_ext_row_stride, const float * __restrict__ state_in_mask,
+    const int64_t n_heads, const int64_t gqa_ratio,
     const int repeat_type, const int64_t n_tokens, const int64_t n_seqs,
     const int64_t output_offset, size_t vnb1, size_t vnb2, size_t vnb3) {
     delta_net_recurrent_body<HEAD_DIM, block_size, g_per_channel>(
         q, k, v, g, beta_in, state_in, dst, saved_states, sv_row_stride, sv_step_stride,
         state_ext, state_ext_idx,
-        state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset,
+        state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset,
         vnb1, vnb2, vnb3);
 }
 
@@ -303,13 +319,14 @@ __global__ __launch_bounds__(block_size, MIN_BLOCKS) void delta_net_recurrent_f3
     // PXA_RS_RING: strides (in elements) of the per-step capture destination; <= 0 = derive.
     const int64_t sv_row_stride, const int64_t sv_step_stride,
     float * __restrict__ state_ext, const int32_t * __restrict__ state_ext_idx,
-    const int64_t state_ext_row_stride, const int64_t n_heads, const int64_t gqa_ratio,
+    const int64_t state_ext_row_stride, const float * __restrict__ state_in_mask,
+    const int64_t n_heads, const int64_t gqa_ratio,
     const int repeat_type, const int64_t n_tokens, const int64_t n_seqs,
     const int64_t output_offset, size_t vnb1, size_t vnb2, size_t vnb3) {
     delta_net_recurrent_body<HEAD_DIM, block_size, g_per_channel>(
         q, k, v, g, beta_in, state_in, dst, saved_states, sv_row_stride, sv_step_stride,
         state_ext, state_ext_idx,
-        state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset,
+        state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset,
         vnb1, vnb2, vnb3);
 }
 
@@ -357,6 +374,7 @@ static void delta_net_f32_cuda(
     float * state_ext,
     const int32_t * state_ext_idx,
     const int64_t state_ext_row_stride,
+    const float * state_in_mask,
     const int64_t head_dim,
     const int64_t n_tokens,
     const int64_t n_heads,
@@ -388,18 +406,18 @@ static void delta_net_f32_cuda(
         if (head_dim == 64) {
             if (g_per_channel) {
                 delta_net_dispatch<64, threads_per_block, true>(dn_occ, num_blocks, smem_size, stream,
-                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
             } else {
                 delta_net_dispatch<64, threads_per_block, false>(dn_occ, num_blocks, smem_size, stream,
-                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
             }
         } else {
             if (g_per_channel) {
                 delta_net_dispatch<128, threads_per_block, true>(dn_occ, num_blocks, smem_size, stream,
-                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
             } else {
                 delta_net_dispatch<128, threads_per_block, false>(dn_occ, num_blocks, smem_size, stream,
-                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
             }
         }
     } else {
@@ -407,18 +425,18 @@ static void delta_net_f32_cuda(
         if (head_dim == 64) {
             if (g_per_channel) {
                 delta_net_dispatch<64, threads_per_block, true>(dn_occ, num_blocks, smem_size, stream,
-                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
             } else {
                 delta_net_dispatch<64, threads_per_block, false>(dn_occ, num_blocks, smem_size, stream,
-                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
             }
         } else {
             if (g_per_channel) {
                 delta_net_dispatch<128, threads_per_block, true>(dn_occ, num_blocks, smem_size, stream,
-                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
             } else {
                 delta_net_dispatch<128, threads_per_block, false>(dn_occ, num_blocks, smem_size, stream,
-                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
+                        q, k, v, g, beta, state_in, dst, saved_states, sv_row_stride, sv_step_stride, state_ext, state_ext_idx, state_ext_row_stride, state_in_mask, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, output_offset, vnb1, vnb2, vnb3);
             }
         }
     }
@@ -437,6 +455,12 @@ void ggml_cuda_op_delta_net_ex(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
 void ggml_cuda_op_delta_net_ex2(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_dst_override,
                                 const int32_t * state_dst_row_idx, int64_t state_dst_row_stride) {
+    ggml_cuda_op_delta_net_ex3(ctx, dst, state_dst_override, state_dst_row_idx, state_dst_row_stride, nullptr);
+}
+
+void ggml_cuda_op_delta_net_ex3(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_dst_override,
+                                const int32_t * state_dst_row_idx, int64_t state_dst_row_stride,
+                                const float * state_in_mask) {
     const ggml_tensor * src0 = dst->src[0];  // q
     const ggml_tensor * src1 = dst->src[1];  // k
     const ggml_tensor * src2 = dst->src[2];  // v
@@ -455,6 +479,11 @@ void ggml_cuda_op_delta_net_ex2(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int64_t n_seqs = src0->ne[3];
     GGML_ASSERT(n_heads % n_heads_kq == 0);
     const int64_t gqa_ratio = n_heads / n_heads_kq;
+    // PXA_DN_INPLACE: the in-place masked read needs a device-resolved destination row and one sequence.
+    // A per-step capture is allowed (PXA_DN_CONVFUSE_NY, verify widths): each thread loads its state
+    // elements into registers ONCE before the token loop, the per-step snapshots go to the separate
+    // capture buffer, and the row is written once after the loop -- no step reads the row back.
+    GGML_ASSERT(!state_in_mask || (state_dst_override && state_dst_row_idx && n_seqs == 1));
 
     // Dimension validation
     // Q/K: [head_dim, n_tokens, n_heads, n_seqs]
@@ -515,6 +544,7 @@ void ggml_cuda_op_delta_net_ex2(ggml_backend_cuda_context & ctx, ggml_tensor * d
         state_dst_override,
         state_dst_row_idx,
         state_dst_row_stride,
+        state_in_mask,
         head_dim, n_tokens, n_heads, gqa_ratio, repeat_type, n_seqs,
         src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
         g_per_channel,

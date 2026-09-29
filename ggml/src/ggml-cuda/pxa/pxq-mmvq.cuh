@@ -134,6 +134,9 @@ struct pxq_mmvq_pol_p6hq {
     }
 };
 
+// PXQN4S8: its policy is defined in the closed libggml-pxqn instance TU (the only TU that instantiates it)
+struct pxqn_mmvq_pol_n4s8;
+
 // PXQ2: 2-bit codes, 8 B rows, one u32 per 16 elems -- so ONE word carries two groups and a
 // thread's whole VDR run is one 4 B (VDR 2) or 8 B (VDR 4) load, half of what the 4-bit tiers
 // move. iqs is always even (it is VDR * a thread index and VDR is 2 or 4), so group l takes the
@@ -205,6 +208,28 @@ struct pxq_mmvq_scales {
     }
     __device__ int byte(int i) const { return (w[i >> 2] >> (8*(i & 3))) & 0xff; }
 };
+
+// PXA_SPEC_FAST_VERIFY (2026-09-28): 0 (default) = every decode GEMV at 2..8 columns (the MTP /
+// draft verify widths) is bit-identical to the same column decoded alone (batch-invariant); 1 = the verify-width
+// GEMVs take cheaper per-column arithmetic (V100 MMVQ: one int->float per 16-group and the row anchor hoisted). Deterministic run to run (fixed order, no
+// atomics); greedy output with speculation on may then differ from speculation off. ONE definition shared by the
+// PXQN kernel header and the MMVQ header (guarded: both may be in one TU).
+#ifndef PXA_SPEC_FAST_VERIFY_DEFINED
+#define PXA_SPEC_FAST_VERIFY_DEFINED
+#include <cstdio>
+#include <cstdlib>
+inline int pxa_spec_fast_verify_env() {
+    static const int v = [](){
+        const char * e = getenv("PXA_SPEC_FAST_VERIFY");
+        const int r = e ? atoi(e) : 0;
+        if (r) fprintf(stderr, "PXA_SPEC_FAST_VERIFY: 1 (verify-width PXQN4 GEMVs use fast arithmetic: deterministic, "
+                               "NOT bit-identical to 1-column decode)\n");
+        return r ? 1 : 0;
+    }();
+    return v;
+}
+static inline bool pxa_spec_fast_verify(int cc) { (void) cc; return pxa_spec_fast_verify_env() != 0; }
+#endif
 
 #define VDR_PXQ_Q8_1_MMVQ 2      // MMVQ's own table wants a constant; the live value is templated
 
@@ -315,6 +340,32 @@ static __device__ __forceinline__ float pxq_mmvq_dot_frag(
     return anch * __low2float(bq8_1->ds) * sum;
 }
 
+// PXA_SPEC_FAST_VERIFY (default 0 = off): the per-column half at verify widths (2..8 columns) with
+// cheaper arithmetic. NOT bit-identical to pxq_mmvq_dot_frag and NOT batch-invariant against the 1-column launch
+// (a verify column differs from the same token decoded alone in the last bits); deterministic run to run (fixed
+// order, no atomics). Two relaxations:
+//   (1) the thread's two code words of one 16-group share ONE sub-scale (tiers with one SUB16 per 16 elements,
+//       NEFF == 2, iqs even), so their 4 dp4a run as one integer chain and take one int->float and one fma
+//       (exact: eff*s0 + eff*s1 in fp32; fast: eff*(s0 + s1), the integer sum is exact);
+//   (2) the row anchor leaves the per-k-block product: the caller multiplies the finished row sum by it once.
+template <class POL, int VDR, int ROWS>
+static __device__ __forceinline__ float pxq_mmvq_dot_frag_fast(
+        const pxq_mmvq_wfrag<POL, VDR, ROWS> & w, const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+    static_assert(POL::NEFF == 2 && VDR % 2 == 0, "fast verify: one sub-scale per code-word pair");
+    const int * q8 = (const int *) bq8_1->qs;
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR; l += 2) {
+        const int m = iqs + l;
+        int s = ggml_cuda_dp4a(w.v[l    ].x, q8[2*m + 0], 0);
+        s     = ggml_cuda_dp4a(w.v[l    ].y, q8[2*m + 1], s);
+        s     = ggml_cuda_dp4a(w.v[l + 1].x, q8[2*m + 2], s);
+        s     = ggml_cuda_dp4a(w.v[l + 1].y, q8[2*m + 3], s);
+        sum   = fmaf(w.eff[l], (float) s, sum);
+    }
+    return __low2float(bq8_1->ds) * sum;
+}
+
 
 // ---------------------------------------------------------------------------------------------
 // host gates
@@ -323,6 +374,14 @@ static __device__ __forceinline__ float pxq_mmvq_dot_frag(
 // built for); the two LOW tiers may when PXA_PXQ23_MMVQ admits them — see the lever, its two
 // refusals and the s8 self-check in pxa-enhance.cuh. Every caller that routes a node to MMVQ
 // asks this one question, so one predicate moves the whole dispatch.
+// PXA_PXQN_MMVQ: 1 (default) = PXQN4 / PXQN4S8 decode GEMVs (width <= 8, not the fused up/gate) on
+// sm_70 take the PXQ4 / PXQ4-HQ q8_1 MMVQ kernel -- the stored bytes, book and SUB table are PXQ4's, so it computes
+// the same w; x is q8_1-quantized (not the PXQN GEMV's staging), so numerics are the PXQ4 MMVQ class. Measured cause
+// (V100 tg64 nvprof): PXQN GEMVs 1250 ms vs PXQ4 MMVQ 1152 ms for the same bytes; 0 = the PXQN GEMV.
+static inline bool pxqn_mmvq_route_on() {
+    static const bool v = [](){ const char * e = getenv("PXA_PXQN_MMVQ"); return !(e && atoi(e) == 0); }();
+    return v;
+}
 static inline bool pxa_pxq_mmvq_type(ggml_type t) {
     if (t == GGML_TYPE_PXQ4 || t == GGML_TYPE_PXQ4HQ) return true;
     const int m23 = pxa_pxq23_mmvq_mask();
@@ -370,7 +429,7 @@ static inline int pxa_pxq_mmvq_rows() {
     return rows;
 }
 
-// MULTI-COLUMN TILE HEIGHT (PXA_PXQ_MMVQ_COLS, default off).
+// MULTI-COLUMN TILE HEIGHT (PXA_PXQ_MMVQ_COLS, default on at sm_70+ since 2026-09-27, see below).
 //
 // The multi-column MMVQ block - the one a speculative verify batch of 2..8 tokens lands on - used
 // to be clamped to 2 rows at ncols_y > 2, on the reasoning that ncols_y*ROWS accumulators would
@@ -410,19 +469,38 @@ static inline int pxa_pxq_mmvq_rows() {
 //
 // ncols_y <= 2 is declined outright, so plain decode and a width-2 verify cannot move whatever
 // this is set to.
+//
+// DEFAULT (2026-09-27, , plan item S7a): unset = ON on sm_70 and newer at ENHANCE, OFF below
+// (sm_61 fleets, the only other arch this kernel runs on, never measured it). Measured +4.4% greedy
+// decode on the V100 pair under MTP verify (58.64 -> 61.21 t/s, same acceptance; RESEARCH-NEW-LEVERS
+// row 2); re-probed 2026-09-27 on the release build (impl s7a-mmvq-cols-sm70), 2x V100, 27B PXQ4, MTP,
+// REPS 3: -sm layer off/on/off 44.39/49.14/44.60 control, 64.81/77.12/67.12 repetition (+10.2%/+14.9%
+// on the close bracket), under the pair's default -sm tensor a wash inside a drifting bracket, inert at
+// width 1 (plain decode), greedy shas identical in every arm. =0 turns it off everywhere (the old
+// default), =1 arms it on every card the kernel runs on.
 inline void pxa_pxq_mmvq_cols_arm();            // defined below, next to the counter it reports
-static inline bool pxa_pxq_mmvq_cols() {
-    static const bool on = [](){
+static inline int pxa_pxq_mmvq_cols_env() {
+    static const int v = [](){
         const char * e = getenv("PXA_PXQ_MMVQ_COLS");
-        const bool v = e && atoi(e) != 0;
-        if (v) {
-            fprintf(stderr, "PXA_PXQ_MMVQ_COLS: multi-column PXQ MMVQ tile = 8 rows at 3-4 columns, 4 at 5-8 "
-                            "(default: 2; PXA_PXQ_MMVQ_ROWS is not consulted above 2 columns)\n");
-            pxa_pxq_mmvq_cols_arm();   // banner and exit report always come as a pair
-        }
-        return v;
+        return e ? (atoi(e) != 0 ? 1 : 0) : -1;
     }();
-    return on;
+    return v;
+}
+static inline bool pxa_pxq_mmvq_cols(int cc) {
+    const int  e = pxa_pxq_mmvq_cols_env();
+    // the default follows the config level like every ENHANCE lever: PXA_ENHANCE=0 / PXA_REFERENCE=1 keep the clamp
+    const bool v = e >= 0 ? e == 1 : (cc >= CC_VOLTA && ggml_pxa_config_level() >= 2);
+    if (v) {
+        static const bool said = [e](){
+            fprintf(stderr, "PXA_PXQ_MMVQ_COLS: multi-column PXQ MMVQ tile = 8 rows at 3-4 columns, 4 at 5-8 "
+                            "(%s; =0 restores 2; PXA_PXQ_MMVQ_ROWS is not consulted above 2 columns)\n",
+                            e == 1 ? "armed by PXA_PXQ_MMVQ_COLS=1" : "default on sm_70+");
+            pxa_pxq_mmvq_cols_arm();   // banner and exit report always come as a pair
+            return true;
+        }();
+        (void) said;
+    }
+    return v;
 }
 
 // How many multi-column launches actually took the lever's tile, reported at exit so a run that
@@ -469,12 +547,12 @@ inline void pxa_pxq_mmvq_cols_arm() {
 // ffn up/gate runs as two PLAIN launches and gets exactly those numbers, and the twin's halved
 // tile is taken on trust. The twin's branch is reachable on sm_70 only with
 // PXA_PXQ_MMVQ_FUGSPLIT=0, and it has no number: measure it there, or drop the fused arm.
-static inline int pxa_pxq_mmvq_tile(int ncols_y, bool fused) {
+static inline int pxa_pxq_mmvq_tile(int ncols_y, bool fused, int cc) {
     const int r = pxa_pxq_mmvq_rows();
     // Read the lever at EVERY width, before the early return, so the banner and the exit report
     // are armed by the first PXQ MMVQ launch of any width. The pair is then a usable signal:
     // banner without report is impossible, and no banner at all means this kernel never ran.
-    const bool lever = pxa_pxq_mmvq_cols();
+    const bool lever = pxa_pxq_mmvq_cols(cc);
     if (ncols_y <= 2) {
         return r;
     }

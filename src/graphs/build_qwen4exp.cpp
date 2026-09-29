@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <unordered_set>
 
 #include "../llama-build-context.h"
 #include "../llama-model.h"
@@ -20,6 +21,47 @@
 // Both helpers normally fold in their own norm and residual add; hc_mode / a null norm weight /
 // add_input=false turn those off so the hyper-connection owns them.
 
+// PXA_TSPLIT_QWEN4EXP_PAIRLOCAL (lever, default OFF; 2026-09-25 ). Under
+// '-sm tensor --max-gpu 2' the loader puts each layer's blocks on ONE PAIR of cards (layers 0-23 on
+// one pair, 24-47 on the other: PP2 x TP2), but the replicated hc trunk ran on EVERY card holding an
+// hc mirror (all four). The idle pair's copy of the trunk was pure host enqueue (~5.4k nodes/token)
+// and, worse, combine_all asked the idle pair for the block output, which late-filled every block
+// reduce (op_params[4] != 0) and so refused the fused 2-way reduce route and added two peer copies
+// per reduce. Pair-local: the trunk lives only on the cards of the block it feeds; the residual is
+// handed over (one [n_embd, hc] copy per new card) where the group changes. Off = byte-identical.
+static bool pxa_qwen4exp_pairlocal() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_TSPLIT_QWEN4EXP_PAIRLOCAL");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+// the devices that hold a split of `t`; empty when `t` is not split (no information)
+static std::vector<int> pxa_split_devs(const ggml_tensor * t) {
+    std::vector<int> g;
+    if (!t || !t->extra) return g;
+    auto sp = (const ggml_split_tensor_t *) t->extra;
+    for (int d = 0; d < sp->n_device; ++d) if (sp->splits[d]) g.push_back(d);
+    return g;
+}
+
+// PXA_QWEN4EXP_HC_FUSED (lever, default OFF; 2026-09-25): the hc mixer's stream
+// mean and the combine + next norm run as two fused ops (ggml_hc_gate_mix, ggml_hc_combine_norm)
+// instead of ~13 elementwise kernels per sublayer. Rows <= PXA_QWEN4EXP_HC_FUSED_MAXNT (default 8,
+// i.e. decode and short verify) only; prefill keeps the stock chain.
+bool llm_build_context::qwen4exp_hc_fused(int64_t n_tokens) {
+    static const bool on = [] {
+        const char * e = getenv("PXA_QWEN4EXP_HC_FUSED");
+        return e && atoi(e) != 0;
+    }();
+    static const int64_t maxnt = [] {
+        const char * e = getenv("PXA_QWEN4EXP_HC_FUSED_MAXNT");
+        return (int64_t) (e ? atoi(e) : 8);
+    }();
+    return on && n_tokens <= maxnt;
+}
+
 ggml_tensor * llm_build_context::build_qwen4exp_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -27,20 +69,38 @@ ggml_tensor * llm_build_context::build_qwen4exp_hc_mix(
         ggml_tensor *  w_up,
         ggml_tensor *  w_inject,
         ggml_tensor ** inject,
-        int            il) {
+        int            il,
+        ggml_tensor *  xn_pre) {
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc*n_embd;
     const int64_t nt     = x->ne[2];
+    const bool    fused  = qwen4exp_hc_fused(nt);
 
     // Grouped RMSNorm: the reduction is over ONE stream (ne[0] == n_embd), then a single
     // [hc_dim] gamma scales all of them. The converter folded each gamma to (1 + w).
-    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
+    ggml_tensor * xn;
+    if (fused && xn_pre) {
+        xn = xn_pre;
+    } else {
+        xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+        xn = ggml_mul(ctx0, xn, w_norm);
+    }
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo   = llm_build_lora_mm(lctx, ctx0, w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f/(float) hc));
+    if (fused) {
+        ggml_tensor * g = llm_build_lora_mm(lctx, ctx0, w_up, lo);
+        cb(g, "hc_gate_pre", il);
+        ggml_tensor * mixed = ggml_hc_gate_mix(ctx0, xn, g, (int) hc);
+        cb(mixed, "hc_mixed", il);
+        if (inject) {
+            *inject = llm_build_lora_mm(lctx, ctx0, w_inject, xn);
+            cb(*inject, "hc_inject", il);
+        }
+        return mixed;
+    }
     ggml_tensor * gate = ggml_sigmoid(ctx0, llm_build_lora_mm(lctx, ctx0, w_up, lo));
     cb(gate, "hc_gate", il);
 
@@ -69,12 +129,29 @@ ggml_tensor * llm_build_context::build_qwen4exp_hc_mix(
 }
 
 ggml_tensor * llm_build_context::build_qwen4exp_hc_combine(
-        ggml_tensor * residual,
-        ggml_tensor * block_out,
-        ggml_tensor * inject,
-        int           il) {
+        ggml_tensor *  residual,
+        ggml_tensor *  block_out,
+        ggml_tensor *  inject,
+        int            il,
+        ggml_tensor *  gamma_next,
+        ggml_tensor ** xn_next) {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
+
+    if (xn_next) *xn_next = nullptr;
+    if (qwen4exp_hc_fused(nt) && block_out->type == GGML_TYPE_F32 && inject->type == GGML_TYPE_F32 &&
+        ggml_nelements(block_out) == n_embd*nt && residual->nb[0] == sizeof(float)) {
+        ggml_tensor * g = xn_next ? gamma_next : nullptr;
+        ggml_tensor * both = ggml_hc_combine_norm(ctx0, residual, block_out, inject, g, hparams.f_norm_rms_eps);
+        cb(both, "hc_combine_norm", il);
+        ggml_tensor * cur = ggml_view_3d(ctx0, both, n_embd, hc, nt, both->nb[1], both->nb[2], 0);
+        cb(cur, "hc_combine", il);
+        if (g) {
+            *xn_next = ggml_view_2d(ctx0, both, n_embd*hc, nt, both->nb[2], both->nb[3]);
+            cb(*xn_next, "hc_norm_next", il);
+        }
+        return cur;
+    }
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add.
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f/(float) hc));
@@ -98,7 +175,17 @@ ggml_tensor * llm_build_context::build_qwen4exp_hc_combine(
 // six cards put together - so it is meant to be pinned to host RAM with
 //   -ot per_layer_token_embd=CPU
 // The row indices come from inp_ple_rows, hashed host-side in llama_set_inputs.
-ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tensor * hidden, int il) {
+ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tensor * hidden, int il, int dev) {
+    // dev >= 0: tensor-split build; the PLE weights are mirrored per device (->extra) and the
+    // side path runs on device `dev` only, reading that device's copy.
+    auto PW = [&](ggml_tensor * t) -> ggml_tensor * {
+        if (dev >= 0 && t && t->extra) {
+            ggml_tensor * s = ((ggml_split_tensor_t *) t->extra)->splits[dev];
+            GGML_ASSERT(s && "PLE weight has no copy on the PLE home device");
+            return s;
+        }
+        return t;
+    };
     const int64_t hc      = hparams.dsv4_hc_mult;
     const int64_t hc_dim  = hc*n_embd;
     const int64_t n_heads = hparams.ple_n_heads;
@@ -108,11 +195,38 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
 
     // gather, then flatten the heads: get_rows lays the head dimension out slowest
     ggml_tensor * emb = ggml_get_rows(ctx0, model.tok_embd_per_layer, lctx.inp_ple_rows);
+
+    // PXA_PLE_F16=1 (lever, default off): when the table lives in host RAM (the
+    // `-ot per_layer_token_embd=CPU` recipe) the gather runs in a CPU split and its f32
+    // output [ple_head_dim*n_heads, n_tokens] crosses PCIe to the device that owns layer
+    // `il`. Casting to f16 on the CPU halves those bytes; the device casts back to f32 so
+    // every consumer sees the same type as before. The rows are q8_0 in the shipped file
+    // (int8 * f16 scale), so the f16 round trip loses at most the f32->f16 rounding of the
+    // product. Both casts are pinned: left to the scheduler, the first cast would be pulled
+    // up onto the GPU by the consumer and the f32 tensor would cross the bus anyway.
+    static const bool pxa_ple_f16 = [] {
+        const char * e = getenv("PXA_PLE_F16");
+        return e && atoi(e) != 0;
+    }();
+    if (pxa_ple_f16 && lctx.backend_cpu && model.tok_embd_per_layer->buffer &&
+        ggml_backend_buffer_is_host(model.tok_embd_per_layer->buffer)) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            LLAMA_LOG_INFO("%s: PXA_PLE_F16 engaged: PLE gather crosses host->device as f16\n", __func__);
+        }
+        ggml_backend_sched_set_tensor_backend(lctx.sched, emb, lctx.backend_cpu);
+        ggml_tensor * emb16 = ggml_cast(ctx0, emb, GGML_TYPE_F16);
+        cb(emb16, "ple_embd_f16", il);
+        ggml_backend_sched_set_tensor_backend(lctx.sched, emb16, lctx.backend_cpu);
+        emb = ggml_cast(ctx0, emb16, GGML_TYPE_F32);
+    }
+
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim*n_heads, n_tokens);
     cb(emb, "ple_embd", il);
 
-    ggml_tensor * key   = llm_build_lora_mm(lctx, ctx0, model.layers[il].ple_key,   emb);
-    ggml_tensor * value = llm_build_lora_mm(lctx, ctx0, model.layers[il].ple_value, emb);
+    ggml_tensor * key   = llm_build_lora_mm(lctx, ctx0, PW(model.layers[il].ple_key),   emb);
+    ggml_tensor * value = llm_build_lora_mm(lctx, ctx0, PW(model.layers[il].ple_value), emb);
 
     // both norms reduce over ONE hc stream and scale with a weight over the whole hc*n_embd
     auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
@@ -123,8 +237,8 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
         return ggml_reshape_3d(ctx0, t, n_embd, hc, n_tokens);
     };
 
-    key = grouped_norm(key, model.layers[il].ple_norm_key);
-    ggml_tensor * query = grouped_norm(hidden, model.layers[il].ple_norm_query);
+    key = grouped_norm(key, PW(model.layers[il].ple_norm_key));
+    ggml_tensor * query = grouped_norm(hidden, PW(model.layers[il].ple_norm_query));
 
     // per-stream dot product, then a SIGNED square root before the sigmoid
     ggml_tensor * sc = ggml_sum_rows(ctx0, ggml_mul(ctx0, key, query));
@@ -139,7 +253,7 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
     cb(gated, "ple_gated_value", il);
 
     ggml_tensor * normalized = grouped_norm(
-            ggml_reshape_2d(ctx0, gated, hc_dim, n_tokens), model.layers[il].ple_norm_conv);
+            ggml_reshape_2d(ctx0, gated, hc_dim, n_tokens), PW(model.layers[il].ple_norm_conv));
     normalized = ggml_reshape_2d(ctx0, normalized, hc_dim, n_tokens);
 
     // The conv input of the PREVIOUS `hist` positions is not recomputable here: it depends on
@@ -178,8 +292,8 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
 
         // column k of the [kern, hc_dim] kernel is one weight per channel
         ggml_tensor * wk = ggml_cont(ctx0,
-                ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
-                        model.layers[il].ple_conv1d->nb[1], k*model.layers[il].ple_conv1d->nb[0]));
+                ggml_view_2d(ctx0, PW(model.layers[il].ple_conv1d), 1, hc_dim,
+                        PW(model.layers[il].ple_conv1d)->nb[1], k*PW(model.layers[il].ple_conv1d)->nb[0]));
         wk = ggml_reshape_1d(ctx0, wk, hc_dim);
         if (wk->type != GGML_TYPE_F32) {
             wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
@@ -826,10 +940,25 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
     const float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head))
                                                              : hparams.f_attention_scale;
 
+    // PXA_TSPLIT_QWEN4EXP_PAIRLOCAL: the cards that run layer il's attention/DeltaNet block
+    // (ffn=false) or its MoE block (ffn=true) -- exactly the devices the split builders loop over.
+    const bool pxa_pairlocal = pxa_qwen4exp_pairlocal() &&
+            model.layers[0].hc_attn_norm && model.layers[0].hc_attn_norm->extra;
+    auto block_group = [&](int il, bool ffn) -> std::vector<int> {
+        const auto & L = model.layers[il];
+        if (ffn) return pxa_split_devs(L.ffn_down_exps);
+        if (hparams.is_recurrent(il)) {
+            return il < (int) kv_self.s_l.size() ? pxa_split_devs(kv_self.s_l[il]) : std::vector<int>();
+        }
+        return pxa_split_devs(L.wq);
+    };
+
     const bool has_ple = hparams.ple_n_heads > 0;
     if (has_ple) {
         const int64_t hc_dim = hc*n_embd;
-        const int64_t hist   = (hparams.ple_conv_kernel - 1)*hparams.ple_ngram_size;
+        // the taps need (kernel-1)*ngram positions; LLAMA_PLE_RB_SLACK more survive a
+        // speculative rollback (bug #214)
+        const int64_t hist   = (hparams.ple_conv_kernel - 1)*hparams.ple_ngram_size + LLAMA_PLE_RB_SLACK;
 
         lctx.inp_ple_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hparams.ple_n_heads*n_tokens);
         cb(lctx.inp_ple_rows, "inp_ple_rows", -1);
@@ -877,6 +1006,20 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
             ggml_backend_buffer_type_t cap_buft = ggml_backend_cpu_buffer_type();
             for (int lp = 0; lp < n_layer; ++lp) {
                 ggml_tensor * probe = model.layers[lp].ple_norm_conv;
+                // tensor split: the base of a mirrored tensor is a split-buffer placeholder;
+                // the window lives with the PLE home device's copy (first device holding one)
+                if (probe && probe->extra) {
+                    auto sp = (ggml_split_tensor_t *) probe->extra;
+                    probe = nullptr;
+                    // pair-local: the window lives on the first card of the PLE layer's own
+                    // block group, the same card trunk_split picks as the PLE home
+                    if (pxa_pairlocal) {
+                        for (int d : block_group(lp, false)) {
+                            if (d < sp->n_device && sp->splits[d]) { probe = sp->splits[d]; break; }
+                        }
+                    }
+                    for (int d = 0; d < sp->n_device && !probe; ++d) probe = sp->splits[d];
+                }
                 if (probe && probe->buffer) {
                     cap_buft = ggml_backend_buffer_get_type(probe->buffer);
                     break;
@@ -904,15 +1047,273 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         ggml_build_forward_expand(gf, KQ_mask);
     }
 
-    // the wide residual starts as hc identical copies of the embedding
-    ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
-    cb(res_hc, "hc_init", -1);
-
     // the NextN/MTP tail layer(s) belong to the companion graph above, never to the trunk
     const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
-    for (int il = 0; il < n_transformer_layers; ++il) {
+
+    // Tensor split (-sm tensor / graph with PXA_TSPLIT_QWEN4EXP_HC=1): split_qwen4exp_tensors()
+    // MIRRORS every hyper-connection and PLE weight (->extra, one full copy per device; the base
+    // is a split-buffer placeholder that must never be read). So the wide residual is carried
+    // REPLICATED: each device keeps its own res_hc and runs the hc mixer / combine locally on its
+    // own copies, and the split attention / DeltaNet / MoE builders get the per-device mixed
+    // inputs through a reduce-OFF container (op_params[3] = 1, src[id] = that device's tensor),
+    // the same container PXA_REPLICATE_RECURRENT uses. Their REDUCE output is an all-reduce:
+    // src[id] holds the full block output on every device, so the combine needs no broadcast.
+    // PLE (layer 1 only) runs on ONE home device - its conv window is a single device buffer -
+    // and the updated residual is copied to the others once per ubatch.
+    const bool hc_split = model.layers[0].hc_attn_norm && model.layers[0].hc_attn_norm->extra;
+    auto trunk_split = [&]() -> ggml_tensor * {
+        GGML_ASSERT(!qsa && "PXA_QSA has no tensor-split path on qwen4exp");
+        auto sp0 = (ggml_split_tensor_t *) model.layers[0].hc_attn_norm->extra;
+        const int n_dev = sp0->n_device;
+        auto WS = [&](ggml_tensor * t, int id) -> ggml_tensor * {
+            if (t && t->extra) {
+                ggml_tensor * r = ((ggml_split_tensor_t *) t->extra)->splits[id];
+                GGML_ASSERT(r);
+                return r;
+            }
+            return t;
+        };
+        std::vector<ggml_backend_t> be(n_dev, nullptr);
+        std::vector<int> devs;
+        for (int id = 0; id < n_dev; ++id) {
+            ggml_tensor * w = sp0->splits[id];
+            if (!w) continue;
+            GGML_ASSERT(w->buffer);
+            auto buft = ggml_backend_buffer_get_type(w->buffer);
+            for (auto * b : lctx.backends) {
+                if (b != lctx.backend_cpu && ggml_backend_supports_buft(b, buft)) { be[id] = b; break; }
+            }
+            GGML_ASSERT(be[id] && "no backend for a hyper-connection mirror");
+            devs.push_back(id);
+        }
+        GGML_ASSERT(devs.size() > 1);
+        int ple_home = devs[0];
+        for (int lp = 0; lp < n_layer; ++lp) {
+            ggml_tensor * probe = model.layers[lp].ple_norm_conv;
+            if (probe && probe->extra) {
+                auto sp = (ggml_split_tensor_t *) probe->extra;
+                int pick = -1;
+                if (pxa_pairlocal) {
+                    for (int d : block_group(lp, false)) {
+                        if (d < sp->n_device && sp->splits[d]) { pick = d; break; }
+                    }
+                }
+                for (int d = 0; d < sp->n_device && pick < 0; ++d) if (sp->splits[d]) pick = d;
+                if (pick >= 0) ple_home = pick;
+                break;
+            }
+        }
+        // The cards the trunk runs on for a sublayer. Off: every mirror holder (all of them).
+        // Pair-local: the sublayer's block group, restricted to cards that hold an hc mirror.
+        auto group_for = [&](int il, bool ffn) -> std::vector<int> {
+            if (!pxa_pairlocal) return devs;
+            std::vector<int> g;
+            for (int d : block_group(il, ffn)) {
+                if (std::find(devs.begin(), devs.end(), d) != devs.end()) g.push_back(d);
+            }
+            return g.empty() ? devs : g;
+        };
+        // Pin every non-view node of a per-device chain to its device. Left to the scheduler,
+        // weightless nodes (rms_norm, sigmoid, adds) are placed by adjacency in graph order,
+        // i.e. on whichever device's chain was emitted just before, and the chains interleave.
+        auto pin = [&](ggml_tensor * out, int id, std::initializer_list<ggml_tensor *> inputs) {
+            std::unordered_set<ggml_tensor *> seen(inputs.begin(), inputs.end());
+            std::vector<ggml_tensor *> st{out};
+            while (!st.empty()) {
+                ggml_tensor * t = st.back(); st.pop_back();
+                if (!t || seen.count(t)) continue;
+                seen.insert(t);
+                if (t->buffer || t->op == GGML_OP_NONE || t->op == GGML_OP_REDUCE) continue;
+                if (ggml_backend_sched_get_tensor_backend(lctx.sched, t) != nullptr) continue;
+                if (t->op == GGML_OP_GET_ROWS && t->src[0] && t->src[0]->buffer &&
+                    ggml_backend_buffer_is_host(t->src[0]->buffer)) continue;
+                if (!t->view_src) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, t, be[id]);
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) if (t->src[j]) st.push_back(t->src[j]);
+            }
+        };
+        auto mark_boundary = [&](ggml_tensor * t) {
+            t->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
+        };
+        auto container = [&](std::vector<ggml_tensor *> & v) {
+            ggml_tensor * c = ggml_reduce(ctx0, v.data(), n_dev, GGML_OP_ADD);
+            c->op_params[3] = 1;
+            // Pair-local: leaving the container unexpanded here lets the split builders expand
+            // each device's result in device order, so every card's combine -> mix -> block chain
+            // comes out CONTIGUOUS instead of interleaved [mix x N][block x N]. That reordering is
+            // a confirmed cross-device RACE (bug #271), not a math bug: it changes which device's
+            // split gets submitted to the host-side stream-enqueue loop first, and
+            // PXA_TSPLIT_REDUCE's fused route is a raw P2P spin/poll rendezvous (reduce.cu), not a
+            // CUDA-event wait -- a poller enqueued well before its peer's producer kernel can run
+            // out its ~100M-poll budget and abort ("cross-device arrival spin timed out",
+            // reduce.cu:882) instead of quietly reading garbage. (A) 2026-09-25 (mailbox thread
+            // 8710): D0 (contig=1, X4 tensor+HC_FUSED) FAILS 32/32 non-finite; D2 (contig=0) and D3
+            // (contig=1 + NaN probe, extra host read-backs) PASS; D1 (contig=1 +
+            // CUDA_LAUNCH_BLOCKING=1, which serialises host-side kernel enqueue across every
+            // stream/device) does not silently pass OR silently fail -- it turns the race into a
+            // hard deadlock/timeout abort in the same spin rendezvous, which is what a genuine
+            // producer-after-consumer submission-order bug looks like once launches stop
+            // overlapping. The missing ordering guarantee between the container's deferred
+            // expansion and the split that services it is not fixed here (needs a scheduler- or
+            // reduce-level fix, see #271) -- ship the known-safe emission as the default and keep
+            // the faster, racy one opt-in for whoever picks the real fix back up.
+            // PXA_TSPLIT_QWEN4EXP_CONTIG=1 opts back into the contiguous-but-racy emission; default
+            // (0, i.e. unset or "0") keeps the old, safe [mix x N][block x N] emission under PAIRLOCAL.
+            static const bool contig = [] {
+                const char * e = getenv("PXA_TSPLIT_QWEN4EXP_CONTIG");
+                return e && atoi(e) != 0;
+            }();
+            if (!pxa_pairlocal || !contig) {
+                ggml_build_forward_expand(gf, c);
+            }
+            return c;
+        };
+
+        std::vector<ggml_tensor *> res(n_dev, nullptr), mixed(n_dev, nullptr), inj(n_dev, nullptr);
+        std::vector<ggml_tensor *> xnp(n_dev, nullptr);   // PXA_QWEN4EXP_HC_FUSED carried norms
+        // `hold` = the cards currently carrying a copy of the wide residual
+        std::vector<int> hold = group_for(0, false);
+        // hand the residual to exactly the cards in S (one [n_embd, hc, n_tokens] copy per new card)
+        auto ensure = [&](const std::vector<int> & S) {
+            if (S == hold) return;
+            const int src = hold[0];
+            for (int id : S) {
+                if (res[id]) continue;
+                ggml_tensor * r = ggml_cont(ctx0, res[src]);
+                ggml_backend_sched_set_tensor_backend(lctx.sched, r, be[id]);
+                mark_boundary(r);
+                cb(r, "hc_handoff", -1);
+                res[id] = r;
+            }
+            for (int id : hold) {
+                if (std::find(S.begin(), S.end(), id) == S.end()) { res[id] = nullptr; inj[id] = nullptr; }
+            }
+            std::fill(xnp.begin(), xnp.end(), nullptr);
+            hold = S;
+        };
+        for (int id : hold) {
+            ggml_tensor * r = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                    n_embd, hc, n_tokens, 1);
+            cb(r, "hc_init", -1);
+            pin(r, id, {inpL});
+            mark_boundary(r);
+            res[id] = r;
+        }
+
+        // gamma_next: the next mixer's norm weight when it runs on the same cards (fused glue only)
+        auto combine_all = [&](ggml_tensor * block, int il, ggml_tensor * gamma_next) {
+            for (int id : hold) {
+                ggml_tensor * b = get_input_tensor_sm_graph(ctx0, block, id);
+                ggml_tensor * b_in = b;
+                if (b->type != GGML_TYPE_F32) {
+                    b = ggml_cast(ctx0, b, GGML_TYPE_F32);
+                }
+                ggml_tensor * prev = res[id];
+                res[id] = build_qwen4exp_hc_combine(prev, b, inj[id], il,
+                        gamma_next ? WS(gamma_next, id) : nullptr, gamma_next ? &xnp[id] : nullptr);
+                pin(res[id], id, {prev, b_in, inj[id]});
+            }
+        };
+        auto mix_all = [&](ggml_tensor * const llama_layer::* nrm, ggml_tensor * const llama_layer::* dn,
+                           ggml_tensor * const llama_layer::* up, ggml_tensor * const llama_layer::* ij, int il,
+                           bool ffn) {
+            const auto & L = model.layers[il];
+            ensure(group_for(il, ffn));
+            std::fill(mixed.begin(), mixed.end(), nullptr);
+            for (int id : hold) {
+                ggml_tensor * xpre = xnp[id];
+                xnp[id] = nullptr;
+                mixed[id] = build_qwen4exp_hc_mix(res[id], WS(L.*nrm, id), WS(L.*dn, id), WS(L.*up, id),
+                        WS(L.*ij, id), &inj[id], il, xpre);
+                pin(mixed[id], id, {res[id]});
+                pin(inj[id], id, {res[id]});
+            }
+            return container(mixed);
+        };
+
+        static const bool pxa_no_ple_s = getenv("PXA_QWEN4EXP_NO_PLE") != nullptr;
+        for (int il = 0; il < n_transformer_layers; ++il) {
+            const auto & layer = model.layers[il];
+            if (has_ple && hparams.is_ple(il) && !pxa_no_ple_s) {
+                if (!res[ple_home]) {
+                    // pair-local with the PLE home outside the current group: one hand-off in
+                    ggml_tensor * r = ggml_cont(ctx0, res[hold[0]]);
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, r, be[ple_home]);
+                    mark_boundary(r);
+                    res[ple_home] = r;
+                    hold.push_back(ple_home);
+                    std::sort(hold.begin(), hold.end());
+                }
+                ggml_tensor * prev = res[ple_home];
+                res[ple_home] = build_qwen4exp_ple(gf, prev, il, ple_home);
+                pin(res[ple_home], ple_home, {prev});
+                for (int id : hold) {
+                    if (id == ple_home) continue;
+                    ggml_tensor * r = ggml_cont(ctx0, res[ple_home]);
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, r, be[id]);
+                    mark_boundary(r);
+                    res[id] = r;
+                }
+            }
+
+            ggml_tensor * cin = mix_all(&llama_layer::hc_attn_norm, &llama_layer::hc_attn_down,
+                    &llama_layer::hc_attn_up, &llama_layer::hc_attn_inject, il, false);
+            ggml_tensor * cur;
+            if (hparams.is_recurrent(il)) {
+                cur = delta.build_layer_attn_linear(ctx0, gf, cin, nullptr, il, cb, /*hc_mode*/ true);
+            } else {
+                cur = build_std_attention(gf, /*attn_norm*/ nullptr, cin, inp_pos, /*inp_out_ids*/ nullptr,
+                        /*rope_factors*/ nullptr, KQ_mask, /*sinks*/ nullptr, /*inp_attn_scale*/ nullptr,
+                        KQ_scale, 0.0f, /*n_swa*/ 0, il,
+                        /*do_rope*/ true, /*add_graph_split*/ false, /*add_input*/ false,
+                        /*is_norm*/ false, /*is_multi*/ true);
+            }
+            cb(cur, "attn_block_out", il);
+            combine_all(cur, il, qwen4exp_hc_fused(n_tokens) && group_for(il, true) == hold ? layer.hc_ffn_norm : nullptr);
+
+            cin = mix_all(&llama_layer::hc_ffn_norm, &llama_layer::hc_ffn_down,
+                    &llama_layer::hc_ffn_up, &llama_layer::hc_ffn_inject, il, true);
+            cur = llm_build_std_moe_ffn(ctx0, lctx, /*ffn_norm*/ nullptr, cin,
+                    layer.ffn_gate_inp,   nullptr,
+                    layer.ffn_up_exps,    nullptr,
+                    layer.ffn_gate_exps,  nullptr,
+                    layer.ffn_down_exps,  nullptr,
+                    nullptr,
+                    layer.ffn_up_shexp,   nullptr,
+                    layer.ffn_gate_shexp, nullptr,
+                    layer.ffn_down_shexp, nullptr,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, true, false, 0.0f,
+                    LLM_EXPERT_GATING_FUNC_SOFTMAX,
+                    LLM_FFN_SILU, cb, il, gf, /*add_input*/ false,
+                    layer.ffn_up_gate_exps, nullptr, layer.ffn_gate_inp_shexp);
+            cb(cur, "ffn_out", il);
+            {
+                const bool next_ok = qwen4exp_hc_fused(n_tokens) && il + 1 < n_transformer_layers &&
+                        !(has_ple && hparams.is_ple(il + 1) && !pxa_no_ple_s) && group_for(il + 1, false) == hold;
+                combine_all(cur, il, next_ok ? model.layers[il + 1].hc_attn_norm : nullptr);
+            }
+            for (int id : hold) {
+                cb(res[id], "l_out", il);
+            }
+        }
+        return pxa_pairlocal ? res[hold[0]] : res[ple_home];
+    };
+
+    ggml_tensor * res_hc = nullptr;
+    if (hc_split) {
+        res_hc = trunk_split();
+    } else {
+        // the wide residual starts as hc identical copies of the embedding
+        res_hc = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(res_hc, "hc_init", -1);
+    }
+
+    ggml_tensor * xn_carry = nullptr;   // PXA_QWEN4EXP_HC_FUSED: next mixer's normed input
+    for (int il = 0; !hc_split && il < n_transformer_layers; ++il) {
         const auto & layer = model.layers[il];
 
         // Second A/B rung for attribution: PXA_QWEN4EXP_NO_PLE=1 skips the whole PLE side
@@ -929,7 +1330,8 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         ggml_tensor * inject = nullptr;
         ggml_tensor * cur = build_qwen4exp_hc_mix(res_hc,
                 layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
-                &inject, il);
+                &inject, il, xn_carry);
+        xn_carry = nullptr;
         ggml_build_forward_expand(gf, cur);
 
         if (hparams.is_recurrent(il)) {
@@ -952,11 +1354,12 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         }
         cb(cur, "attn_block_out", il);
 
-        res_hc = build_qwen4exp_hc_combine(res_hc, cur, inject, il);
+        res_hc = build_qwen4exp_hc_combine(res_hc, cur, inject, il, layer.hc_ffn_norm, &xn_carry);
 
         cur = build_qwen4exp_hc_mix(res_hc,
                 layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject,
-                &inject, il);
+                &inject, il, xn_carry);
+        xn_carry = nullptr;
 
         cur = llm_build_std_moe_ffn(ctx0, lctx, /*ffn_norm*/ nullptr, cur,
                 layer.ffn_gate_inp,   nullptr,
@@ -974,7 +1377,14 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
                 layer.ffn_up_gate_exps, nullptr, layer.ffn_gate_inp_shexp);
         cb(cur, "ffn_out", il);
 
-        res_hc = build_qwen4exp_hc_combine(res_hc, cur, inject, il);
+        {
+            // fuse the NEXT attention mixer's norm into this combine, unless something touches the
+            // residual in between (a PLE layer, a control vector) or this is the last layer
+            const bool next_ok = il + 1 < n_transformer_layers && !(has_ple && hparams.is_ple(il + 1)) &&
+                                 lctx.cvec.tensor_for(il) == nullptr;
+            res_hc = build_qwen4exp_hc_combine(res_hc, cur, inject, il,
+                    next_ok ? model.layers[il + 1].hc_attn_norm : nullptr, next_ok ? &xn_carry : nullptr);
+        }
 
         res_hc = lctx.cvec.apply_to(ctx0, res_hc, il);
         cb(res_hc, "l_out", il);

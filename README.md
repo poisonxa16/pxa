@@ -1,14 +1,42 @@
 <p align="center"><img src="docs/assets/pxa-network-banner.png" alt="PXA Network" width="760"></p>
 
-# pxa — the codec + kernel pack for cards with no DP4A
+# pxa — own codec, own kernels, own route planner, built on ggml/llama.cpp (MIT)
 
-> Authored and maintained by **PXA Network** (https://pxanetwork.com) — the creator of pxa and the PXQ/PXA kernel family.
+> Authored and maintained by **PXA Network** (https://pxanetwork.com) — the creator of the PXQ
+> codec and the PXA kernel family for Pascal and Volta. pxa is derived from **llama.cpp (MIT)**,
+> by way of **ikawrakow/ik_llama.cpp (MIT)** — full lineage, every upstream credit and the exact
+> fork commit live in [`NOTICE`](NOTICE), never shortened or deleted there.
 
 **Community: [Discord — PXA Network](https://discord.gg/EqazvV9tf)** — support, benchmark wall, dev talk. Release notes post there automatically.
 
 Models: **[ready-to-run PXQ models](#models)** · [benchmarks](#benchmarks-pxa-vs-llamacpp) · Weights: [huggingface.co/poisonxa](https://huggingface.co/poisonxa)
 
 > 💛 Support: **https://ko-fi.com/shatteredrealms1**
+
+**Latest release: v2026.10** — [release notes](RELEASE-NOTES-v2026.10.md).
+
+## What's actually in the engine
+
+Four things carry the "own engine" claim below, each scoped to what is shipped and gated today —
+nothing here is a number to quote past its own scope (see [`RELEASE-NOTES`](RELEASE-NOTES-2026-09-20.md)
+for the exact brackets):
+
+- **The PXQ panel codec.** Its own GGUF tensor types (`PXQ1`…`PXQ6`, `PXQ_UNIVERSAL`), a
+  panel-addressed layout — not a `ggml` trait — with CPU and CUDA codecs for every tier.
+- **Tensor split for PXQ files.** `-sm tensor` admits every PXQ tier's `ssm_out` tensor through a
+  panel-aware row-range slicer, where it used to refuse every PXQ hybrid file by name. Measured
+  **+23.5% to +43.2%** decode on a matched **two-card** pair; four identical P100s take the split by
+  default too (bug #206 fixed; decode +5% to +41%, prefill about 2x over layer), and an architecture with no split evidence is refused by name, not
+  offered (`qwen35moe`/Ornith fails its own KLD gate on this split — see Known Issues).
+- **A fused all-reduce for the split** — one launch with a staged peer copy instead of a
+  cross-device handshake, armed automatically whenever the split is picked for you.
+- **Weight streaming and auto-config.** Weights can stream from pinned host RAM through a
+  double-buffered VRAM ring instead of sitting fully resident — its real win is **capacity** (a
+  file bigger than the card) and wide-micro-batch MoE experts, plus a measured **+6%** on a
+  resident-fitting 27B at a 64k-token bracket. Auto-config is new this release: `-sm`, `-b`/`-ub`,
+  `-ts` and the flash-attention regime now have engine-side defaults read from one lever registry,
+  so a bare `llama-server` invocation and the launcher pick the same settings on the same cards.
+  See [`docs/LAUNCHER.md`](docs/LAUNCHER.md) and [`docs/LEVERS.md`](docs/LEVERS.md).
 
 <!-- models:start -->
 ## Models
@@ -66,9 +94,10 @@ written out as commands, for when you would rather drive it by hand.
 
 ### Three ways to get PXA
 
-- **Tarball.** A prebuilt binary release with a `START-HERE` script, glibc **2.35** floor
-  (built in an Ubuntu 22.04 container, not the 24.04 dev image), proven booting on both
-  22.04 and 24.04. No Docker, no build toolchain. Grab it from the release's assets.
+- **Tarball.** A prebuilt binary release with a `START-HERE` script, glibc **2.38** floor
+  (Ubuntu 24.04, Debian 13, Fedora 39 or newer; `START-HERE.md` says how to check), proven
+  booting in a bare Ubuntu 24.04 container. No Docker, no build toolchain. On an older distro
+  use the container image below. Grab it from the release's assets.
 - **Container image.** `ghcr.io/poisonxa16/pxa` — the same binaries, packaged with
   `libgomp`, the CUDA driver stub and the `LLAMA_ARG_*` environment surface already
   wired up. Rebuilt from the tag commit for every release, gated in-image before it
@@ -83,11 +112,39 @@ written out as commands, for when you would rather drive it by hand.
 Whichever one you pick, run the launcher first (above) rather than hand-assembling
 flags.
 
+### New this release: the engine picks its own settings too
+
+`-sm`, `-b`/`-ub`, `-ts` and the flash-attention regime now have engine-side defaults read from one
+lever registry, not just launcher-side ones. A bare `llama-server`/`pxa-server` invocation — no
+launcher, no `PXA_*` set by hand, in a container or out of one — resolves the same settings the
+launcher would have picked, and prints the decision as a `PXA_REGISTRY:` line at boot so it is
+auditable, not inferred. The container's no-argument `ENTRYPOINT` uses this to start a sensible
+server from `docker run <image>` alone (model and cards autodetected, or set with `PXA_MODEL`/
+`PXA_GPUS`); `pxa-launch --doctor` (or `docker run <image> doctor`) prints the same table — cards,
+driver, peer access, the model file, every default it would pick and why — and starts nothing. See
+[`docs/LAUNCHER.md`](docs/LAUNCHER.md).
+
+**Without the launcher, the model path is all you need to give:**
+
+```bash
+./build/bin/llama-server -m Qwen3.8-27B-PXQN4.gguf      # add --host/--port, --jinja, sampling as usual
+```
+
+On two identical P100s or V100s this picks the tensor split, the fused all-reduce, the measured
+`-b`/`-ub`/`-c` and n-gram speculation by itself. Leave out `-sm`, `-ts`, `-ub` and the
+`PXA_TSPLIT_*` variables unless you have measured something better. If you set a value that was
+measured slower (for example `PXA_TSPLIT_REDUCE=off` or `-sm layer` on a pair), the engine keeps
+it and prints one warning line with what it costs. The per-card table is in
+[`docs/DEFAULTS.md`](docs/DEFAULTS.md).
+
 ## Where this sits
 
 - **ik_llama.cpp** — best CPU/hybrid/new-quant support on Turing and newer.
 - **llama.cpp** — broadest compatibility, the master CUDA backend.
-- **pxa** — the codec + kernel pack for cards with HBM2 and no DP4A: **Pascal (P100)**, and Volta.
+- **pxa** — own codec, own kernels, own route planner (`common/pxa-registry.cpp`) for cards with
+  HBM2 and no DP4A: **Pascal (P100)**, and Volta. Built on the ggml/llama.cpp lineage — see
+  "Origin" below for exactly how much is original versus inherited, measured in files and lines,
+  not asserted.
 
 The pitch in one sentence: **run real models fully in VRAM on a used Tesla P100** — kernels
 written for a chip with no DP4A and no tensor cores, not ported from one that has them. Volta
@@ -178,6 +235,9 @@ the card set it finds.
 ```bash
 ./build/bin/llama-server -m Qwable-27B-PXQ4core.gguf -ngl 99 -c 32768 -t 16 -fa on -sm layer
 ```
+
+(That is the command the 2026-09-07 table was measured with. Today's default on a same-card pair
+is the tensor split, so leave `-sm` out to get it; see [`docs/DEFAULTS.md`](docs/DEFAULTS.md).)
 
 Against each competitor's best cell: V100 decode **+5.6%** over ik. On the 1080 Ti, chat prefill
 is a tie by the campaign's own rule (both spreads overlap) and decode is **+22%** over ik. On the
@@ -480,6 +540,12 @@ tutorials, what it does for you and how to turn it off: [`docs/LEVERS.md`](docs/
 
 ## Origin
 
+pxa is its own engine — own codec (PXQ), own kernels, own route planner — built on the
+ggml/llama.cpp lineage under the MIT license, the same license this project ships under. Full
+lineage, every upstream author, and the exact fork commit are recorded permanently in
+[`NOTICE`](NOTICE); this section is the working detail behind that credit, in files and lines, not
+adjectives.
+
 **Do they rebase? No.** This is the Pascal/Volta engine, not a fork that tracks `ik_llama.cpp`
 main: ikawrakow/ik_llama.cpp @ `1520eda98056` is treated as a parts bin — model graphs and bug
 fixes are cherry-picked from it on a case-by-case basis, nothing more.
@@ -564,6 +630,21 @@ a parent model's imatrix is off-distribution exactly on the tensors a merge chan
 target the question does not arise: the tiers ignore the matrix either way.) Full detail, the PXQU tier-map
 format, and known traps: [`docs/PXQU-CONVERT.md`](docs/PXQU-CONVERT.md), [`docs/QUANTIZING.md`](docs/QUANTIZING.md), [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md).
 
+### Binary names, and where PXQ-Next stands
+
+`pxa-server`, `pxa-bench`, `pxa-quantize` (this repo's quantizer — every stock type, plus
+reading/requantizing an *existing* PXQ file; see above) and `pxa-perplexity` are this release's
+primary binary names. The `llama-*` names stay as compatibility symlinks for this release. New
+files carry a `Copyright (c) 2026 PXA Network` header under this repository's MIT license; files
+carried over from upstream keep their original header unchanged.
+
+**PXQ-Next** — a rotated, Hessian-rounded evolution of the PXQ codec, produced by a second-generation
+`pxq-quantize` — is in development behind two gates (a CPU fidelity check, then a kernel speed
+check) and is **not in this release's quantizer** yet. If it clears both gates in time, this
+section and the zoo above get a real entry with real numbers; if not, it is named here as coming,
+not dropped quietly. Do not quote a bpw or KLD number for it from anywhere but a dated, gated
+result.
+
 ## Changelog
 
 Per-release notes: `RELEASE-NOTES-*.md` in the repo root and `docs/`. Latest release,
@@ -600,14 +681,20 @@ sidecar, not on this binary, and ship in the sidecar images. Earlier tagged rele
 `v2026.09.02`: [`RELEASE-NOTES-2026-09-02.md`](RELEASE-NOTES-2026-09-02.md).
 
 ## License & credits
-**MIT** — this engine inherits the MIT license of its base engines
+
+**MIT** — pxa inherits the MIT license of its base engines
 ([ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) / llama.cpp / ggml, © the ggml/llama.cpp/
-ik_llama.cpp authors), and the PXQ types + E16-row-scale kernels are contributed under the same MIT terms.
-The original LICENSE and AUTHORS are retained unchanged. PXQ quantization and the fused kernels are original
-work of the PXA project, built on ikawrakow's ik_llama.cpp.
+ik_llama.cpp authors), and the PXQ codec, the PXA kernel family and the route planner are
+contributed under the same MIT terms. The original LICENSE and AUTHORS are retained unchanged.
+Full lineage, what PXA Network contributes versus what remains upstream, and the fork commit:
+[`NOTICE`](NOTICE) — never trimmed, never deleted.
 
 > Note: the **model weights** published on HuggingFace are a *separate* work under **Apache-2.0** (Qwen3.6
 > lineage via Ornith-1.0-35B-AEON / SIQ-1-35B) — see the model card. This repo (code) is MIT; the weights are Apache-2.0.
+> **Not yet confirmed to cover every model in the zoo** — check the specific model card before
+> assuming Apache-2.0 for a file this note doesn't name by lineage.
+
+Trademark note (name usage, not a license term) is in [`NOTICE`](NOTICE).
 
 ## Community bug-finders 🏅
 

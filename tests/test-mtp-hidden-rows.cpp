@@ -198,6 +198,71 @@ static void case_invariant() {
     }
 }
 
+// PXA_MTP_RESUME_ROW_BY_SEQ_v1 (bug #43): a sequence resuming its MTP hidden at the top of a tick
+// must read its OWN row of the last decode, never the last row of a batch another slot shared.
+static int32_t resume(const std::vector<int32_t> & seq, const std::vector<int32_t> & pos,
+                      int32_t sole, int32_t s, int32_t p) {
+    return llama_spec_resume_row_for_seq(seq.data(), pos.data(), (int32_t) seq.size(), sole, s, p);
+}
+
+static void case_resume_row_by_seq() {
+    begin("resume: -np 1, the batch is all this seq -> exact row, else legacy last row");
+    {
+        const std::vector<int32_t> seq = { 0, 0, 0 }, pos = { 10, 11, 12 };
+        CHECK(resume(seq, pos, 0, 0, 12) == 2, "np1 exact last");
+        CHECK(resume(seq, pos, 0, 0, 11) == 1, "np1 exact mid");
+        CHECK(resume(seq, pos, 0, 0, 99) == LLAMA_SPEC_RESUME_ROW_LAST, "np1 miss keeps legacy last row");
+        CHECK(resume({}, {}, 0, 0, 12) == LLAMA_SPEC_RESUME_ROW_LAST, "np1 sparse keeps legacy last row");
+    }
+
+    begin("resume: -np 2 shared batch -> each slot gets its own row, never the other's");
+    {
+        // slot 0 decodes pos 40, slot 1 decodes pos 7 (went in last): the old -1 gave slot 0 row 1.
+        const std::vector<int32_t> seq = { 0, 1 }, pos = { 40, 7 };
+        const int32_t sole = LLAMA_SPEC_BATCH_SEQ_MIXED;
+        CHECK(resume(seq, pos, sole, 0, 40) == 0, "slot 0 must read row 0");
+        CHECK(resume(seq, pos, sole, 1, 7) == 1, "slot 1 must read row 1");
+        CHECK(resume(seq, pos, sole, 0, 39) == LLAMA_SPEC_RESUME_ROW_NONE, "slot 0 wrong pos -> none");
+        CHECK(resume(seq, pos, sole, 2, 5) == LLAMA_SPEC_RESUME_ROW_NONE, "absent slot -> none");
+        // verify batch: slot 0 rows 0..2 (pos 40..42), slot 1 rows 3..4
+        const std::vector<int32_t> vs = { 0, 0, 0, 1, 1 }, vp = { 40, 41, 42, 7, 8 };
+        CHECK(resume(vs, vp, sole, 0, 41) == 1, "partial accept reads the accepted row");
+        CHECK(resume(vs, vp, sole, 1, 8) == 4, "slot 1 last row");
+        // sparse (lazy-warmup clamp) mixed batch: no row description -> refuse, not the last row
+        CHECK(resume({}, {}, sole, 0, 40) == LLAMA_SPEC_RESUME_ROW_NONE, "sparse mixed -> none");
+    }
+
+    begin("resume: last batch was only ANOTHER slot's -> none");
+    {
+        const std::vector<int32_t> seq = { 1 }, pos = { 7 };
+        CHECK(resume(seq, pos, 1, 0, 40) == LLAMA_SPEC_RESUME_ROW_NONE, "foreign single-seq batch -> none");
+        CHECK(resume({}, {}, 1, 0, 40) == LLAMA_SPEC_RESUME_ROW_NONE, "foreign sparse batch -> none");
+    }
+
+    begin("resume: undescribed buffer (state restore / aborted decode) keeps the legacy answer");
+    {
+        CHECK(resume({}, {}, LLAMA_SPEC_BATCH_SEQ_UNKNOWN, 0, 1) == LLAMA_SPEC_RESUME_ROW_LAST, "unknown -> legacy");
+    }
+
+    begin("resume: every answer >= 0 names a row holding exactly (seq, pos)");
+    for (int32_t n = 1; n <= 8; ++n) {
+        for (int32_t mask = 0; mask < (1 << n); ++mask) {
+            std::vector<int32_t> seq(n), pos(n);
+            for (int32_t i = 0; i < n; ++i) { seq[i] = (mask >> i) & 1; pos[i] = 100 + i; }
+            for (int32_t s = 0; s < 3; ++s) {
+                for (int32_t p = 99; p <= 100 + n; ++p) {
+                    const int32_t r = resume(seq, pos, LLAMA_SPEC_BATCH_SEQ_MIXED, s, p);
+                    if (r >= 0) {
+                        CHECK(r < n && seq[r] == s && pos[r] == p, "n=%d mask=%d s=%d p=%d -> %d", n, mask, s, p, r);
+                    } else {
+                        CHECK(r == LLAMA_SPEC_RESUME_ROW_NONE, "mixed batch must never fall back to the last row");
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main() {
     printf("test-mtp-hidden-rows: PXA_MTP_HIDDEN_BY_BATCH_ROW_v1 -- addressing the target's MTP hidden rows\n");
 
@@ -206,6 +271,7 @@ int main() {
     case_negative_sentinel();
     case_degenerate();
     case_invariant();
+    case_resume_row_by_seq();
 
     if (g_fail) {
         printf("FAILED (%d)\n", g_fail);

@@ -1,4 +1,5 @@
 #include "llama-delta-net.h"
+#include "ggml-pxqn.h"
 #include "llama-hparams.h"
 #include "llama-cparams.h"
 #include "llama-model.h"
@@ -736,7 +737,8 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
 }
 
 ggml_tensor * delta_net::build_gated_output(llama_context & lctx, ggml_context * ctx0, ggml_tensor * ssm_norm, ggml_tensor * ssm_out, ggml_tensor * output, ggml_tensor * z,
-        int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb, bool sigmoid_gate) {
+        int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb, bool sigmoid_gate,
+        int il_rot, const std::vector<std::pair<int,int>> * rot_ranges) {
 
     ggml_tensor * attn_out_2d = ggml_reshape_2d(ctx0, output, head_v_dim, num_v_heads * n_tok);
     ggml_tensor * z_2d        = ggml_reshape_2d(ctx0, z,      head_v_dim, num_v_heads * n_tok);
@@ -751,9 +753,30 @@ ggml_tensor * delta_net::build_gated_output(llama_context & lctx, ggml_context *
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim*num_v_heads, n_tok);
     cb(final_output, "final_output", il);
 
-    ggml_tensor * out = llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_out, final_output);
+    // PXQN out_in: the gated-norm output feeds ssm_out, which is stored rotated when the site is ON.
+    // il_rot is the REAL layer (il may be a per-device callback id); rot_ranges = this device's global
+    // K ranges of ssm_out under a head split (null / empty = the whole K from 0).
+    if (il_rot >= 0) {
+        final_output = rot_ranges
+            ? llm_build_context::build_pxqn_rht_ranges(ctx0, lctx.model.hparams, final_output, il_rot, PXQN_SITE_OUT_IN, *rot_ranges)
+            : llm_build_context::build_pxqn_rht(ctx0, lctx.model.hparams, final_output, il_rot, PXQN_SITE_OUT_IN);
+    } else if (lctx.model.hparams.pxqn_rot_sites & PXQN_SITE_BIT(PXQN_SITE_OUT_IN)) {
+        GGML_ABORT("PXQN: build_gated_output called without the layer index while out_in is rotated");
+    }
+
+    ggml_tensor * out = llm_build_context::pxqn_rht_keep_input(llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_out, final_output));
     cb(out, "linear_attn_out", il);
 
+    // PXA_DN_OUT_NOVIEW (default on, =0 the reshape view as before): ssm_out's product already has the shape
+    // [n_embd, n_tok]; the reshape only made it a VIEW, which the tensor split then had to CONT (PXA_DN_REDUCE_VIEWFIX)
+    // on every device that does not add the residual -- one extra copy kernel per delta layer on that card, and a
+    // partial that is not a MUL_MAT output, so the PXA_TSPLIT_EPI producer push declined on it (48 of 64 partials
+    // per token on the second P100, 2026-09-28). Returning the product itself is the same bytes.
+    static const bool noview = [] { const char * e = getenv("PXA_DN_OUT_NOVIEW"); return !(e && *e && atoi(e) == 0); }();
+    if (noview && out->ne[0] == (int64_t) lctx.model.hparams.n_embd && out->ne[1] == n_tok && out->ne[2] == 1 && out->ne[3] == 1 &&
+        ggml_is_contiguous(out)) {
+        return out;
+    }
     return ggml_reshape_2d(ctx0, out, lctx.model.hparams.n_embd, n_tok);
 }
 
@@ -835,7 +858,8 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             GGML_ASSERT(split_smm_in->n_device == n_device);
         }
         GGML_ASSERT(n_device > 1);
-        GGML_ASSERT(!hc_mode && "qwen4exp hyper-connections have no split-device linear path yet");
+        // hc_mode (qwen4exp hyper-connections): the mixer has already normed the input and owns the
+        // residual, exactly as in the single-device path below: skip attn_norm and the residual add.
         std::vector<ggml_tensor *> results(n_device, nullptr);
         bool input_added = false;
         // PXA_REPLICATE_RECURRENT (Lever C): when set, every device holds a FULL mirror of the
@@ -850,9 +874,13 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         for (int id = 0; id < n_device; ++id) {
             if (!split_s_l->splits[id]) continue;
             auto input = get_input_tensor_sm_graph(ctx0, delta_input, id);
-            auto split_norm = (ggml_split_tensor_t *)l.attn_norm->extra;
-            GGML_ASSERT(split_norm && split_norm->splits[id]);
-            auto cur = llm_build_context::llm_build_norm(ctx0, input, hparams, split_norm->splits[id], nullptr, LLM_NORM_RMS, cb, il);
+            ggml_tensor * cur = input;
+            ggml_split_tensor_t * split_norm = nullptr;
+            if (!hc_mode) {
+                split_norm = (ggml_split_tensor_t *)l.attn_norm->extra;
+                GGML_ASSERT(split_norm && split_norm->splits[id]);
+                cur = llm_build_context::llm_build_norm(ctx0, input, hparams, split_norm->splits[id], nullptr, LLM_NORM_RMS, cb, il);
+            }
             // PXA 2026-09-08 -- PXA_DN_SPLIT_INPUT_FIX, mirroring
             // PXA_MTP_SPLIT_INPUT_FIX in build_std_attention (llama-build-context.cpp:2862-2872)
             // and the same marker in the MoE and FFN split paths.
@@ -869,6 +897,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             if (pxa_dn_split_input_fix() && input->op != GGML_OP_REDUCE) {
                 cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
             }
+            cur = llm_build_context::build_pxqn_rht(ctx0, hparams, cur, il, PXQN_SITE_ATTN_IN);   // PXQN attn_in (whole K per device)
             int qnext_state_slots = split_s_l->splits[id]->ne[1];
             int il_cb = 1000*il + id;
             int64_t num_k_heads_id, num_v_heads_id;
@@ -925,15 +954,17 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             split_norm = (ggml_split_tensor_t *)l.ssm_norm->extra;
             GGML_ASSERT(split_norm && split_norm->splits[id]);
             auto split_ssm_out = (ggml_split_tensor_t *)l.ssm_out->extra;
-            GGML_ASSERT(split_ssm_out && split_ssm_out->splits[id] && split_ssm_out->splits[id]->ne[0] == head_k_dim*num_v_heads_id);
-            auto gated_output = build_gated_output(lctx, ctx0, split_norm->splits[id], split_ssm_out->splits[id], output, z, head_v_dim, num_v_heads_id, n_tok, il_cb, cb);
+            GGML_ASSERT(split_ssm_out && split_ssm_out->splits[id] && split_ssm_out->splits[id]->ne[0] == head_v_dim*num_v_heads_id);  // bug #202: ssm_out K = value dim
+            const auto & pxqn_ranges = l.split_ssm_out.ranges;
+            auto gated_output = build_gated_output(lctx, ctx0, split_norm->splits[id], split_ssm_out->splits[id], output, z, head_v_dim, num_v_heads_id, n_tok, il_cb, cb,
+                    hc_mode, il, (int) pxqn_ranges.size() > id ? &pxqn_ranges[id] : nullptr);
             if (inp_out_ids) {
                 gated_output = ggml_get_rows(ctx0, gated_output, inp_out_ids);
             }
             // PXA_REPLICATE_RECURRENT: under replication each device produces the FULL output, so the
             // residual must be added on EVERY device (not once). In the head-split path the residual is
             // added exactly ONCE (the cross-device reduce sums the partial outputs + the single residual).
-            if (pxa_replicate_recurrent || !input_added) {
+            if (!hc_mode && (pxa_replicate_recurrent || !input_added)) {
                 if (inp_out_ids) {
                     input = ggml_get_rows(ctx0, input, inp_out_ids);
                 }
@@ -998,6 +1029,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     } else {
         auto norm = model.layers[il].attn_norm->extra ? ((ggml_split_tensor_t *)model.layers[il].attn_norm->extra)->splits[idx] : model.layers[il].attn_norm;
         cur = llm_build_context::llm_build_norm(ctx0, input, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
+        cur = llm_build_context::build_pxqn_rht(ctx0, hparams, cur, il, PXQN_SITE_ATTN_IN);   // PXQN attn_in
     }
 
     auto [qkv_mixed, z] = build_qkvz(lctx, ctx0, model.layers[il].wqkv, model.layers[il].wqkv_gate, model.layers[il].ssm_in,
@@ -1022,7 +1054,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv, pxa_static_slot,
         rs_plane_rows, state_row_idx_w);
 
-    auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb, hc_mode);
+    auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb, hc_mode, il);
     if (inp_out_ids) {
         gated_output = ggml_get_rows(ctx0, gated_output, inp_out_ids);
         input        = ggml_get_rows(ctx0, input, inp_out_ids);

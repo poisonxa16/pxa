@@ -33,6 +33,10 @@ python3 tools/pxa-launch.py --models-dir /path/to/models
 export PXA_MODELS_DIR=/path/to/models:/another/path
 ```
 
+Prefer a browser? `python3 tools/pxa-launch.py --gui` opens **PXA Control**, the same launcher as a
+local web app with rig telemetry, a model library, start/stop, live speed charts and a chat box.
+See [PXA Control (GUI)](#pxa-control-gui).
+
 ## The full-screen version, and the plain one
 
 With a terminal at least 80x24 you get a full-screen UI: arrow keys (or `j`/`k`)
@@ -169,7 +173,7 @@ the launcher actually does.
 |---|---|---|---|---|
 | 2× V100 (sm_70) | dense 27B, PXQ4 | `-b 8192 -ub 2048 -fa on -c 32768 -sm layer` | prefill **1,369** t/s @3,121 · **1,300** @20,801 · decode **39.5** @fill 8 (release binary, quiet box, no env) | `RELEASE-NOTES-2026-09-07.md:77` (measured 2026-09-05) |
 | 2× P100 (sm_60) | dense 27B, PXQ4 | `-b 8192 -ub 256 -fa on -c 32768 -sm layer` | prefill **337.6** t/s @3,121 · **315.3** @20,801 · decode **18.1** @fill 8 (release binary, quiet box, no env; fold n=7 reference 340.16 / 316.84 / 17.83) | `RELEASE-NOTES-2026-09-07.md:78`; `bench/fair-battle.md:303` (measured 2026-09-05) |
-| 1× GTX 1080 Ti (sm_61, 11 GB) | 35B MoE, PXQ2 | `-b 2048 -ub 768 -c 8192 --ctx-checkpoints 0`, `-fa on` for chat / `-fa off` for long documents, `PXA_AUTO_SPEC=0` | cold prefill **1,363.5** t/s (fa off) · chat prefill **746.6** (fa on) · decode **36.73** cold / **65.3** chat (release binary, no env) | `RELEASE-NOTES-2026-09-07.md:79` (measured 2026-09-04) |
+| 1× GTX 1080 Ti (sm_61, 11 GB) | 35B MoE, PXQ2 | `-b 2048 -ub 768 -c 8192`, `-fa on` for chat / `-fa off` for long documents, `PXA_AUTO_SPEC=0` | **unmeasured with this recipe**, which keeps context checkpoints since 2026-09-25; the published cells were taken with `--ctx-checkpoints 0`: cold prefill 1,363.5 t/s (fa off) · chat prefill 746.6 (fa on) · decode 36.73 cold / 65.3 chat (release binary, no env). Add `--ctx-checkpoints 0` to run that configuration | `RELEASE-NOTES-2026-09-07.md:79` (measured 2026-09-04) |
 | 4× P100 (sm_60) | Qwen3.8 Flash-Next hybrid MoE @150k | `-c 150016 -np 2 --kv-unified -t 16 -wgt 8 -ts 5079,12612,12612,11897 -ot per_layer_token_embd\.weight=CPU --no-context-shift` — **no `PXA_*` levers and no `-b`/`-ub`**: the engine's `4x sm_60` row picks `-b 2048 -ub 2048` and ENHANCE sets all eleven published levers itself | prefill **487.6** t/s @3,121 · **376.7** @20,801 · decode **24.57** at low fill (release binary, auto, no env; n=3, worst half-spread 1.55%) | `RELEASE-NOTES-2026-09-07.md`, "Config default" (measured 2026-09-06) |
 | 1× P100 (sm_60) | 35B MoE, PXQU-16 + q8_0 head | `-b 2048 -ub 2048 -c 8192 -fa on` | decode 62.4 t/s · prefill 827-843 t/s | `docs/COOKBOOK.md:65-73` |
 | 1× V100 (sm_70) | 35B MoE, PXQU-16 + q8_0 head | `-b 2048 -ub 2048 -c 8192 -fa on` | decode ~101-102 t/s · prefill ~1,800-1,900 t/s | `docs/COOKBOOK.md:75-78` |
@@ -266,6 +270,107 @@ differently tomorrow, and a restart script that quietly changes the seat is wors
 than no script. Run `pxa-launch` again when you want a fresh decision. An API key
 is never written into it; the script reads `PXA_API_KEY` from the environment
 instead.
+
+## Several models behind one proxy (llama-swap)
+
+```bash
+PXA_ENGINE_DIR=/path/to/engine python3 tools/pxa-launch.py --emit-swap-config \
+    --swap /models/qwen38-27b-pxq4.gguf:0,1 \
+    --swap /models/gemma-4-26B-A4B-PXQ3.gguf:3 \
+    --swap-ttl 300 > llama-swap.yaml
+```
+
+runs the same decision as `--explain` once per `--swap MODEL:GPUS[:PORT]` and prints
+a [llama-swap](https://github.com/mostlygeek/llama-swap) config. Nothing is started, so
+the busy-card check is skipped: the proxy starts each model later, when it owns the
+cards. Ports count up from 8081 (or from `--port`) and skip any port an entry names.
+Backends bind 127.0.0.1 so only the proxy reaches them.
+
+llama-swap runs `cmd` without a shell, so the environment the launcher would have set
+(`CUDA_DEVICE_ORDER=PCI_BUS_ID` next to `CUDA_VISIBLE_DEVICES`, the engine's library
+path, the ENHANCE and tensor-split levers) goes in each model's `env:` list, not in
+front of the command. An `--api-key` is written as `${env.PXA_API_KEY}`, which
+llama-swap fills at load time and refuses to load without. Exit 0 = every entry is
+clean; 5 = some entries carry blockers or were refused (see `--explain` for each);
+3 = no entry could be written; 2 = bad arguments or two entries on one port.
+
+## PXA Control (GUI)
+
+The same launcher in a browser: pick cards and a model, see the plan, start and stop the server,
+watch its log, chart its speed and talk to it, from a desk or a phone.
+
+```bash
+python3 tools/pxa-launch.py --gui                     # http://127.0.0.1:7777/ on this machine
+python3 tools/pxa-launch.py --gui --port 8800         # another port
+python3 tools/pxa-launch.py --gui --lan               # on your network, behind a token
+docker run --runtime=nvidia -p 7777:7777 -v /models:/models IMAGE gui   # in the container
+```
+
+![PXA Control, Launch tab](assets/pxa-control-launch-dark.png)
+
+It needs Python 3 and nothing else: a standard-library HTTP server
+(`tools/pxa_control.py`) and one self-contained page (`tools/pxa_control_ui/`), with no
+CDN, no pip packages and no build step. With `--gui`, `--port` is the GUI's own port
+(default 7777). The server's port is chosen on the Launch tab (default 8080). A browser opens
+when the machine has a display; `--no-browser` stops that.
+
+**It decides nothing itself.** Each tab collects the answers a command line would carry and
+passes them to the launcher's own parser and `plan_and_build()`, the same code `--explain`
+and the terminal UI use. The Launch tab therefore shows the same evidence, refusals and command,
+and prints the `pxa-launch ...` line that would do the same thing from a shell.
+
+| Tab | What it shows |
+|---|---|
+| **Rig** | Every card: name, VRAM used/total, temperature, power, utilisation, PCIe link generation and width (a narrow link is flagged), and the processes resident on it. Also the driver and CUDA version, `/dev/shm` and the container kind, the engine build it found, and the `--doctor` findings in colour (red stops a launch, amber is a warning). Refreshed every 3 s. |
+| **Models** | The folders you add, remembered in `~/.config/pxa/control.json` (or `$XDG_CONFIG_HOME/pxa/`; `--models-dir` and `PXA_MODELS_DIR` add to it). One row per `.gguf` with the codec (PXQ / PXQN / other), the type (the PXQ tier from the tensor directory, else the dominant ggml type), parameters, size, family and arch, all read from the file's header the way the launcher reads it. **Fits on** badges come from the launcher's own VRAM check (`vram_check`: weights plus the KV estimate at one 4096-token slot, on idle cards) for your current pick, one card of each kind, and all cards of each kind. Click a row to use it. |
+| **Launch** | Cards, model, context, parallel slots, KV cache type, MTP on/off (`--spec mtp`), split mode auto/layer/tensor, flash attention auto/on/off (on = the chat/serve regime, off = long documents, which is how the launcher expresses it), port, serve on the network, `--accept-unmeasured`, `--allow-busy`. **Show plan** runs the decision and starts nothing. **Start / Restart / Stop** run the planned command the way the CLI does (the same environment, `CUDA_DEVICE_ORDER` pinned next to the card list); Stop sends SIGTERM to that PID, then kills it. The log streams live (server-sent events, falling back to polling), and the header shows the health (`/health`: loading, ok, down). **Presets** save the whole form by name into `control.json`. |
+| **Advanced** | Every lever in the catalog (`common/pxa-lever-catalog.inc`, generated from `docs/LEVERS.md`) with its default, status and rule. Diagnostics are hidden until you tick "show diagnostics". A value typed here goes into the server's environment; an empty box means the engine's default. |
+| **Speed** | Decode and prefill t/s over the last hour, day or week, one colour per model, with medians by prompt size. It reads the server's `/pxa/stats` when the build has it. On an older build it says so, and charts PXA Control's own record of the chat and benchmark requests it has proxied (`~/.config/pxa/history.jsonl`). **Benchmark my rig** runs `tools/pxa-bench.py`'s three fixed prompts (prose, edit, long) REPS 3 after a short warm-up, plus the greedy-512 identity hash, through the running server. Results are kept in `bench.jsonl`. There is also a link to the server's own `/pxa/speed` page. |
+| **Chat** | A prompt box that streams from the server's `/v1/chat/completions`: system prompt, temperature, max tokens, and a thinking toggle (`chat_template_kwargs.enable_thinking`). Replies are rendered as Markdown by a small built-in renderer (code, lists, bold, links). Each reply shows decode and prefill t/s from the server's own timings. **Attach** points Chat and Speed at a server you started some other way, on a local port. |
+
+Dark theme by default, light on the sun button (remembered per browser). The layout works at
+phone width, with the tabs moving to a bottom bar.
+
+![Chat on a phone, light theme](assets/pxa-control-chat-phone-light.png)
+
+### What it will and will not do
+
+- **Binds 127.0.0.1** unless `--lan`. With `--lan` it listens on every interface and requires
+  a random token, printed at start with the addresses to open. The first visit with
+  `?token=...` swaps it for an `HttpOnly; SameSite=Strict` cookie, and scripts can send
+  `X-PXA-Token`. On a local bind, the Host header must name localhost, which stops DNS-rebinding
+  pages. A POST from another origin is refused either way.
+- **No shell anywhere.** The only process it starts is the launcher's planned command, as an
+  argv list. The engine proxy forwards a fixed set of paths (`/health`, `/props`,
+  `/v1/models`, `/pxa/stats`, `/pxa/speed`, `/pxa/explain`, `/slots` GET,
+  `/v1/chat/completions` and `/completion` POST), and only to a port on 127.0.0.1.
+- **Checks every input.** Card numbers must exist. The model must be a `.gguf` inside one of
+  your folders (symlinks are resolved first). Numbers are range-checked, and the KV type, split
+  mode and flash attention come from fixed lists. A lever override must be a catalog name
+  (`PXA_*`/`PXQ_*`) with a value of at most 200 characters from `A-Z a-z 0-9 _ . , : = + - /`,
+  so `LD_PRELOAD`, `PATH` or `1; rm -rf` are refused with the reason.
+- **One server at a time**, and it belongs to the GUI. Closing PXA Control (Ctrl-C) stops the
+  server it started. For a server that outlives it, use `--serve-name` from the CLI, then
+  **Attach**.
+- The launcher's refusals are shown as they are. A busy card is refused (R-20) unless you tick
+  *Allow busy cards*, and an UNMEASURED branch unless you tick *Accept UNMEASURED*.
+
+### In a container
+
+`docker run ... IMAGE gui` runs `pxa-launch --gui --lan --no-browser --models-dir /models`. A
+127.0.0.1 bind inside a container cannot be reached from the host, so it listens on all
+interfaces and prints the token. Publish the port with `-p 7777:7777`, or use
+`--network host`. Model folders you add in the GUI are paths inside the container.
+
+### Tests
+
+`tests/test-pxa-control.py` (CTest `test-pxa-control`) covers the HTTP handlers, the Host and
+Origin guards, token auth (header, query-to-cookie, cookie, wrong token), lever validation
+against the catalog, launch validation and the argv it builds (checked against the
+launcher's own parser), preset and folder persistence (`control.json` at mode 0600), and the
+engine proxy (a stub server that streams SSE, including the timings being recorded). It also
+checks that the server process starts, streams its log, stops and refuses a second copy. It
+uses fake cards (`PXA_LAUNCH_FAKE_GPUS`), and needs no GPU and no model.
 
 ---
 
@@ -512,8 +617,8 @@ model, chat workload.
   use `--reasoning-tokens none` to disable.
   INFO [                    init] new slot | tid="22502421118976" timestamp=1788493431 id_slot=0 n_ctx_slot=32768
   pxa_reserve_real_graph: reserved the real-path graph at n_tokens = 256, n_kv = 32768 (nodes = 3080)
-  prompt cache is enabled, size limit: 8192 MiB
-  use `--cache-ram 0` to disable the prompt cache
+  prompt cache is off by default for a model with recurrent state (bug seat-ram-prompt-cache-degrades-hybrid) - pass `--cache-ram N` to enable it
+  prompt cache is disabled - use `--cache-ram N` to enable it
   init: chat template, example_format: '<|im_start|>system
   You are a helpful assistant<|im_end|>
   <|im_start|>user
@@ -555,8 +660,8 @@ The same screen a few minutes later, serving.
   use `--reasoning-tokens none` to disable.
   INFO [                    init] new slot | tid="22502421118976" timestamp=1788493431 id_slot=0 n_ctx_slot=32768
   pxa_reserve_real_graph: reserved the real-path graph at n_tokens = 256, n_kv = 32768 (nodes = 3080)
-  prompt cache is enabled, size limit: 8192 MiB
-  use `--cache-ram 0` to disable the prompt cache
+  prompt cache is off by default for a model with recurrent state (bug seat-ram-prompt-cache-degrades-hybrid) - pass `--cache-ram N` to enable it
+  prompt cache is disabled - use `--cache-ram N` to enable it
   init: chat template, example_format: '<|im_start|>system
   You are a helpful assistant<|im_end|>
   <|im_start|>user
@@ -861,11 +966,8 @@ host and are bind-mounted at run time — `pip list` inside it shows pip and not
 else. Every number attributed to such a tag was really produced by the image
 **plus** those host paths.
 
-Those paths are site-local, so **none are hardcoded**. The shape below is the JSON descriptor
-they are declared in. **Nothing in this release reads it**: `PXA_VLLM_HOST_ENV` is not wired into
-the launcher, and the image table it would override is a fixed list in the script. It is written
-down here because the numbers in the serving documents were produced with these mounts, and a
-reader reproducing them needs to know what was mounted where.
+Those paths are site-local, so **none are hardcoded**. Declare them in a JSON
+descriptor and point `PXA_VLLM_HOST_ENV` at it:
 
 ```json
 {"pxa-sm60-dev": {
@@ -901,13 +1003,54 @@ plus a runtime the tag alone does not describe.
 > selects a runtime, and a reader who believes that will attribute a measurement
 > to an image that was never involved.
 
+### 5a. The engine's own defaults (v2026.10)
+
+The engine now picks `-sm`, `-b`, `-ub`, `-fa` and `-ngl` itself when they are not on the
+command line, from one registry (`common/pxa-registry.cpp`, PXA core step 3) keyed on
+the card set and the file. The launcher **asks the engine** for that answer
+(`PXA_EXPLAIN=1 llama-server -m FILE` prints one JSON line and exits before loading;
+`PXA_TOPOLOGY=2x600` describes the selected cards so no CUDA context is created on
+them) and emits it explicitly, so the printed command, a bare `llama-server -m FILE`
+and the docker image run the same flags. Where the engine is too old to answer, the
+launcher's own tables below are used and it says so. A disagreement between the two
+is printed as `DISAGREEMENT`, never hidden.
+
+What the engine picks, and at which level:
+
+| flag | picked when unset | level |
+|---|---|---|
+| `-sm` | tensor on two identical cards (or four identical P100s) with a qwen35 PXQ4 / PXQN4 / PXQN4S8 / PXQN5 file, `-fa` on and no `-ts`; layer elsewhere | ENHANCE |
+| `-b`/`-ub` | a MEASURED cell (card count x card type x file); no cell -> `-ub` from the VRAM ladder at load. A launcher row marked INFERRED is not a cell | ENHANCE |
+| `-fa` | by posture (`PXA_MODE`), with the MLA exception | as before |
+| `-ngl` | 999 (every layer on the cards) when a CUDA card is present | ENHANCE |
+| `-c` | `-np` x 4096, capped at the trained window (the launcher's per-slot anchor). A recipe row's own `-c` is passed by the launcher explicitly | ENHANCE |
+
+`PXA_ENHANCE=0` (DEFAULT) and `PXA_REFERENCE=1` keep the old behaviour end to end: none
+of the picks above is applied, so a bare `llama-server -m FILE` offloads nothing and uses
+the trained window, exactly as before v2026.10. `PXA_AUTO_SM=0` turns the split rule off alone.
+
+Known difference: when a recipe row matches, pxa-launch passes the row's `-c` (for example
+32768 on the 2x P100 / 2x V100 27B rows) while a bare engine picks `-np` x 4096. Every
+other flag is the same on the same cards (`tools/pxa-parity.py`).
+
+Before v2026.10 the launcher's hardware-only fallback borrowed `-b 2048 -ub 512` from the
+Gemma 4 rows (they come first in the table and are INFERRED on most cards) for any file
+whose own row did not match, overriding the engine's measured card cell (for example on a
+2x P100 or 2x V100 pair with a non-PXQ4 27B, or the dense 27B on four P100s). Asking the
+engine removes that: those seats now run the measured card cell or the VRAM ladder.
+
+`pxa-launch --doctor [-m FILE] [--gpus N,N]` prints one screen: the cards, the driver,
+P2P, the model file (size, arch, tier, KV heads, `pxa.*` provenance keys, sha256,
+checked against a `.sha256` file next to it when there is one) and the defaults the
+engine would pick with the reason for each. It starts nothing. `--no-sha` skips the hash.
+
 ### 5b. Which split mode, and who chooses
 
 Since v2026.09.20 `--sm` defaults to **`auto`**, and on the right pair of cards `auto`
 asks for the **PXA tensor split** rather than llama.cpp's layer split.
 
-The **engine's** own default has not moved: a bare `llama-server` with no `-sm` still
-runs `layer`, and no binary changed for this. What changed is that the launcher will
+Since v2026.10 the **engine** applies the same rule itself when `-sm` is not given
+(section 5a); before that a bare `llama-server` ran `layer`. What changed is that the launcher will
 now make the choice for you, print it, and say why — because on a pair of identical
 cards holding a file the engine admits, the tensor split is simply where the decode
 speed is.
@@ -915,7 +1058,11 @@ speed is.
 **`auto` resolves to `tensor` only when every one of these holds:**
 
 1. the engine that wins the seat is **llama.cpp** (vLLM has its own parallelism);
-2. **two or more cards** are selected, and they are **the same card model** — an even
+2. **exactly two cards** (a pair) of **the same card model** are selected — or **four identical
+   P100s**, the one larger set the split is measured faster on (2026-09-27, dense 27B: decode +5%
+   on PXQN4 and +41% on PXQ4, prefill about 2x over `layer`; bug #206 is fixed underneath it). Three cards, five or more,
+   and four V100s stay on `layer` (no measurement; `PXA_TSPLIT_ALLOW_4WAY=0` keeps four P100s on
+   `layer` too); an even
    tensor split gives both halves the same work every step, so a slower card would set
    the pace of the whole seat;
 3. the architecture is one the engine's own tensor-split table carries **evidence** for.
@@ -923,7 +1070,8 @@ speed is.
    split builder but has never been *run* through it here, so the engine refuses it at
    load unless you set `PXA_TSPLIT_UNPROVEN_ARCH=1` — and a default that emits a mode
    the engine then refuses is a default that wastes a model load;
-4. the codec is **PXQ4**, which is what the gate and every number below were taken on;
+4. the codec is **PXQ4** or a PXQ-Next 2-card size (**PXQN4, PXQN4S8, PXQN5**; measured tensor over
+   layer on both pairs, 2026-09-26/27; `PXA_AUTO_SM_PXQN=0` restores PXQ4 only);
 5. the file has at least as many **KV heads** as there are cards (the split's unit is one
    KV head, so attention cannot divide more ways than that);
 6. flash attention is **on** — i.e. not `--workload longdoc`, which deliberately runs
@@ -941,7 +1089,7 @@ for it by hand with `--sm tensor` and that lever.
 
 ```
 -sm tensor -ts 1,1
-PXA_TSPLIT_REDUCE=fused PXA_TSPLIT_REDUCE_PREFILL=1 PXA_TSPLIT_FALLBACK=1
+PXA_TSPLIT_REDUCE=fused PXA_TSPLIT_FALLBACK=1
 ```
 
 - **`-ts` is EVEN, not capacity-proportional.** §6 below derives a capacity split because
@@ -950,8 +1098,9 @@ PXA_TSPLIT_REDUCE=fused PXA_TSPLIT_REDUCE_PREFILL=1 PXA_TSPLIT_FALLBACK=1
   device and the halves run in lockstep, so an uneven ratio does not give one card less
   work — it gives one card work the other waits for, every step.
 - **`PXA_TSPLIT_REDUCE=fused`** is the only reduce route the numbers below were taken on.
-  **`PXA_TSPLIT_REDUCE_PREFILL=1`** puts the same fused route on the prefill reduce
-  (752 → 773 t/s at a 12.7k prompt, greedy output unchanged).
+  `PXA_TSPLIT_REDUCE_PREFILL` is no longer emitted: the engine's two-device prefill route
+  (`PXA_TSPLIT_PF`, on by default) is faster than the fused route at prefill width, and `=1`
+  pre-empted it (824 vs 743 t/s at a 14.8k prompt on a V100 pair, greedy output unchanged).
 - **`PXA_TSPLIT_FALLBACK=1` is set only on the `auto` path.** If the engine's own
   capability check refuses the file at load, the engine demotes itself to `-sm layer`,
   prints why, and serves. A split the launcher *chose* must never be the reason a seat
@@ -986,6 +1135,34 @@ Two more things worth knowing before you leave it on:
 
 **One flag goes back:** `--sm layer`. `--explain` prints the mode, the reason and this
 trade before anything starts.
+
+### 5c. Narrow PCIe links (x1 / x2 risers) and `/dev/shm` in containers
+
+Mining-style boxes put each card on a **x1 riser**. What works there, and what is slow:
+
+- **Works:** one card per model (the link only carries the prompt in and the tokens out), and
+  the **layer split** across cards (one activation row crosses per token).
+- **Slow or unsafe:** the **tensor split** reduces every layer's output across the cards each step
+  (on x1 that traffic is the whole cost), and **pipeline parallelism** (two copy slots overlapping
+  across cards). The one field report of all-`!` output (non-finite logits from token 1, a P100
+  pair, bug #280) came from such a box with pipeline parallelism on; the same command is correct on
+  x4 links here.
+- **What PXA does:** the launcher reads each card's link (`nvidia-smi` `pcie.link.width.current`)
+  and prints it in the plan and in `--doctor`. With a selected card below x4 it keeps `-sm layer`,
+  emits `PXA_PIPELINE_PP=0`, and says so in one line. The engine reads the same width from sysfs
+  and makes the same two choices on a bare `llama-server` / `llama-cli` run.
+- **Switches:** `PXA_PIPELINE_PP=1` forces pipeline parallelism back on; `PXA_P2P=0` never enables
+  CUDA peer access (cross-card copies are staged through host memory, NCCL runs without P2P) -
+  slower, and the next thing to try if output is still wrong on a riser or IOMMU box;
+  `PXA_PCIE_LINK_WIDTH=<n>` overrides the width the engine reads (diagnostics).
+- **P2P self-test:** before trusting peer access between two cards the engine copies a 4 MiB
+  pattern between them (DMA and direct peer reads) and checks it on the host. A pair that returns
+  corrupted data keeps peer access off and copies through system memory, with one warning line
+  naming the two cards; the other pairs are unaffected. It costs well under a second at startup.
+  `PXA_P2P_SELFTEST=0` skips it; `PXA_P2P=0` forces the safe path for every pair.
+- **Containers:** give a multi-card container `--shm-size=1g` (or `--ipc=host`); docker's default
+  64 MiB `/dev/shm` is too small for NCCL's shared-memory transport on four cards. The launcher,
+  `--doctor` and the image entrypoint warn when it is smaller.
 
 ### 6. Derive the tensor split from free VRAM
 
@@ -1117,7 +1294,7 @@ block.** It warns, labelled `[INFERRED]`.
 
 Only two facts need no formula, and only those two block:
 
-- **R-17A** — `-c` exceeds `<arch>.context_length` (a KV field, read directly).
+- **R-17A** — the context one sequence can reach exceeds `<arch>.context_length` (a KV field, read directly): `-c / -np` on llama.cpp, the whole `-c` with `--kv-unified` or on vLLM. The ring is judged the way the engine settles it: `PXA_KV_UNIFIED`, then `LLAMA_ARG_KV_UNIFIED` (an env var overrides the flag, because the engine reads the environment after the command line), then the emitted flag, then `PXA_KV_UNIFIED_DEFAULT=1` at `-np` > 1.
 - **R-17B** — GPU-resident weights *alone* exceed the total VRAM of the selection
   under full offload. File-byte arithmetic.
 
@@ -1268,7 +1445,7 @@ than enforced, because this process `exec`s the server and cannot observe it.
 |---|---|
 | **R-08** | `cudagraph_mode` other than `FULL_DECODE_ONLY`. `FULL_AND_PIECEWISE` captures **prefill** graphs and returns fluent garbage from character zero on short raw completions. Its best aggregate (88.4) is *below* the correct config's (88.7) — there is no speed argument for it. |
 | **R-16** | A partial offload (`--ngl` < 99) on PXQ1 or PXQ6. The launcher still refuses this pending validation of the CPU dequant path — the codec itself now covers all six tiers (`docs/PXQ-CPU-DOT.md`); this is a launcher policy hold, not a technical "would abort." |
-| **R-17A** | `-c` beyond the model's trained context. |
+| **R-17A** | per-slot context (`-c / -np`, or `-c` with `--kv-unified`) beyond the model's trained context. |
 | **R-17B** | GPU-resident weights alone exceeding total VRAM under full offload. |
 | **R-21** | `--np` above the measured cudagraph capture ladder `[1,2,4,8]`. A too-short ladder has cliffed before — a hardcoded `[1,2]` ladder cliffed at 3+ concurrent. Escape: `--accept-unmeasured`. |
 | **R-24** | Guessing among multiple mmproj candidates when nothing ranks them. |
@@ -1596,15 +1773,48 @@ owns the instance must run:
 
 ---
 
+## Speed history (`/pxa/speed`)
+
+Every `llama-server` keeps a short history of how fast it served you, so you can see a slowdown
+(a hot card, a changed flag, a long context) instead of guessing. Open
+`http://<host>:<port>/pxa/speed` in a browser (it is also linked from `/pxa`): decode and prefill
+t/s over time as dots per request plus a rolling median per model, a 1h / 24h / 7d / all range
+switch, tooltips with the request's prompt size, cache hits, draft acceptance, slot, split mode and
+card count, and a table of medians per model and prompt size (<1k, 1-4k, 4-16k, >16k tokens).
+
+- **Local only.** The page is embedded in the binary, loads no outside script or font, and reads
+  only `GET /pxa/stats` on the same server. No record leaves the machine.
+- **The same numbers as the response.** Each record copies the request's own `timings`
+  (`prompt_per_second`, `predicted_per_second`, `draft_n` / `draft_n_accepted`); nothing is
+  re-timed. The prefill chart and prefill medians skip requests that prefilled fewer than 64
+  tokens (a prompt-cache hit re-evaluates one token: that is latency, not prefill throughput).
+- **`GET /pxa/stats`** returns `{now, capacity, stored, persist, count, summary, records}`.
+  Query parameters: `since=<unix seconds>`, `model=<file name>`, `limit=<newest n>`. `summary` holds
+  per-model medians (`decode_tps_median`, `prefill_tps_median`, `draft_accept_median`), overall and
+  `by_prompt_size`.
+- **`--api-key`** protects both routes like every other endpoint (send `Authorization: Bearer <key>`
+  or `X-Api-Key`); a plain browser tab cannot send that header, so with a key set, read
+  `/pxa/stats` from a client or put the server behind your own authenticating proxy.
+- **History in memory by default.** 10,000 records (`PXA_STATS_MAX`), lost on restart. File writes
+  are opt-in because the server may run from a read-only container or a shared account:
+  `PXA_STATS_FILE=<path>` (or `PXA_STATS_FILE=default` for `~/.cache/pxa/speed-stats.jsonl`) appends
+  one JSON line per request and reloads the tail at start; the file rotates to `<path>.1` at
+  `PXA_STATS_FILE_MB` (8 MB, about 30,000 records).
+- **`PXA_STATS=0`** turns the whole thing off: no history is kept and both routes return 404.
+  With it on, the cost is one mutex-guarded append per finished request, off the token loop
+  (measured within noise, see the release notes).
+- With several models behind the hot-swap front, records carry each model's file name, so one
+  chart shows all of them in their own colours.
+
 ## Environment variables
 
 ### Read by the launcher
 
 | Variable | Effect |
 |---|---|
-| `PXA_ENGINE_DIR` | Directory containing `bin/llama-server`. Wins over auto-detection — and if that build will not start, that is **reported**, never quietly stepped over. |
+| `PXA_ENGINE_DIR` (alias `PXQ_ENGINE_DIR`) | Directory containing `bin/llama-server`. Wins over auto-detection — and if that build will not start, that is **reported**, never quietly stepped over. |
 | `PXA_VLLM_IMAGE` | Same as `--vllm-image`. |
-| `PXA_VLLM_HOST_ENV` | Documented shape only — **not read by this release's launcher**; see the vLLM host-runtime section. |
+| `PXA_VLLM_HOST_ENV` | Path to the JSON descriptor of site-local host runtimes. Unreadable or non-object content is reported and treated as **absent**, which refuses rather than proceeding on a half-read file. |
 | `PXA_PXQ4_LIB` | Bare-metal fallback probe; the `libpxq4_sm<cc>_v<n>.so` name supplies the arch set. |
 | `PXA_MODELS_DIR` | `:`-separated list of directories to search for models. Same as repeating `--models-dir`. |
 | `PXA_LAUNCH_STATE` | Where the launcher remembers the directory of your last launch and the last command. Default `~/.cache/pxa-launch`. Losing it costs you nothing but a re-typed `--models-dir`. |
@@ -1612,8 +1822,11 @@ owns the instance must run:
 | `PXA_NO_TUI` | Any non-empty value skips the full-screen UI and uses the line prompts. |
 | `PXA_API_KEY` | Read by a saved restart script, never by the launcher itself. The key is deliberately not stored in the script. |
 
-Engine auto-detection, when `PXA_ENGINE_DIR` is unset, looks in this order:
-`./build-unified`, `./build`, `./build-cuda`, then `llama-server` on `PATH`. **Every candidate
+Engine auto-detection, when `PXA_ENGINE_DIR` is unset, looks in this order: build
+directories inside the repo (`build`, `build-cuda`, `build-unified`,
+`build-release`, `build-sm60`, `build-sm70`, `build-all`), the same names as
+siblings of the checkout, then install prefixes (`/usr/local`, `/usr`, `/opt/pxa`,
+`/opt/pxa`, `~/.local`), then `llama-server` on `PATH`. **Every candidate
 that exists but will not start is printed with its reason** — never skipped in
 silence. There is no site-specific build list in the file: a hardcoded absolute
 path is a machine's private detail.

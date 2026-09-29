@@ -17,7 +17,12 @@
 // path) -- the positive control on the negative, proving the fallback still runs and still adds up.
 //
 // Route is chosen by argv so the per-process env reads resolve before the first reduce:
-//   test-reduce-pinned intree | pinned | nccl
+//   test-reduce-pinned intree | pinned | nccl | fused-nopeer | p2p-nopeer | nccl-all | nccl-fault
+// nccl-all / nccl-fault (bug #206) take EVERY visible device, the only shape the NCCL route serves;
+// see run_case_n below.
+// The two *-nopeer routes (bug #208) arm the tensor-split reduce (PXA_TSPLIT_REDUCE=fused / p2p)
+// on backends whose peer access is switched off (enable-p2p=0), i.e. a group that does not peer:
+// the reduce must decline to the stock staged route and still add up, where it used to abort.
 // Needs two CUDA devices; skips cleanly with one.
 
 #include "ggml.h"
@@ -34,6 +39,10 @@
 // Defined in ggml/src/ggml-cuda/reduce.cu. The single place route eligibility is decided; the
 // scheduler asks the same function before it drops the drain.
 extern "C" bool pxa_reduce_pinned_handles(const struct ggml_tensor * dst);
+// Bug #206: 0 = NCCL not built in, 1 = no communicator, 2 = the NCCL route is live, 3 = a failed
+// group has switched it off for this process. WEAK, so this test still loads against a libggml that
+// predates the fix -- which is exactly the library the nccl-all case has to be able to FAIL on.
+extern "C" int pxa_reduce_nccl_state(void) __attribute__((weak));
 
 static int g_fail = 0;
 
@@ -150,8 +159,154 @@ static void run_case(ggml_backend_t back[2], int64_t ne0, int64_t ne1,
     ggml_free(ctx);
 }
 
+// BUG #206 (2026-09-25): the same all-reduce over EVERY visible device -- the only shape the NCCL
+// route takes (its communicator spans all of them) and the shape a four-card tensor split decodes
+// with. Each device starts with its own partial; afterwards every device must hold the SAME bytes
+// (an all-reduce leaves identical replicas on every route) and they must be the sum, checked
+// against a host double-precision sum. Past two devices the routes sum in different orders, so the
+// value check is a tolerance, not bit-identity; what it exists to catch is "each device still holds
+// its own partial", which is off by the whole of the other partials. That was #206: inside a
+// container with docker's 64 MB /dev/shm the four-device NCCL group failed, its status was thrown
+// away, and nothing was summed.
+static void run_case_n(std::vector<ggml_backend_t> & back, int64_t ne0, int64_t ne1, const char * label) {
+    const int    n      = (int)back.size();
+    const size_t nelem  = (size_t)(ne0 * ne1);
+    const size_t nbytes = nelem * sizeof(float);
+
+    std::mt19937 rng(7654321u ^ (unsigned)(ne0 * 1000003u + ne1));
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    std::vector<std::vector<float>> h(n, std::vector<float>(nelem));
+    std::vector<double> want(nelem, 0.0);
+    for (int d = 0; d < n; ++d) {
+        for (size_t i = 0; i < nelem; ++i) { h[d][i] = dist(rng); want[i] += (double)h[d][i]; }
+    }
+
+    ggml_init_params ip = {};
+    ip.mem_size   = 16u * 1024u * 1024u;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    ggml_context * ctx = ggml_init(ip);
+
+    std::vector<ggml_tensor *> part(n);
+    std::vector<ggml_backend_buffer_t> buf(n);
+    for (int d = 0; d < n; ++d) {
+        part[d] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+        char nm[32]; snprintf(nm, sizeof(nm), "partial%d", d);
+        ggml_set_name(part[d], nm);
+        buf[d] = ggml_backend_alloc_buffer(back[d], nbytes + 256);
+        part[d]->buffer = buf[d];
+        part[d]->data   = ggml_backend_buffer_get_base(buf[d]);
+    }
+    // ggml_reduce aliases its LAST non-null source: the home device is n-1, and the node is
+    // evaluated on that backend, exactly as the scheduler pins it.
+    ggml_tensor * r = ggml_reduce(ctx, part.data(), n, GGML_OP_ADD);
+    r->buffer = part[n - 1]->buffer;
+    r->data   = part[n - 1]->data;
+    ggml_set_name(r, "reduced");
+
+    for (int d = 0; d < n; ++d) {
+        ggml_backend_tensor_set(part[d], h[d].data(), 0, nbytes);
+    }
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, r);
+    const bool ok_compute = ggml_backend_graph_compute(back[n - 1], gf) == GGML_STATUS_SUCCESS;
+    for (int d = 0; d < n; ++d) {
+        ggml_backend_synchronize(back[d]);
+    }
+    char what[200];
+    snprintf(what, sizeof(what), "%s: reduce over %d devices computed", label, n);
+    check(ok_compute, what);
+
+    std::vector<float> got0(nelem), got(nelem);
+    ggml_backend_tensor_get(part[0], got0.data(), 0, nbytes);
+    for (int d = 0; d < n; ++d) {
+        ggml_backend_tensor_get(part[d], got.data(), 0, nbytes);
+        size_t bad = 0, own = 0, differ0 = 0;
+        double maxrel = 0.0;
+        for (size_t i = 0; i < nelem; ++i) {
+            const double err = fabs((double)got[i] - want[i]);
+            const double rel = err / (fabs(want[i]) + 1e-3);
+            if (rel > maxrel) { maxrel = rel; }
+            if (err > 1e-5 * (fabs(want[i]) + 1.0)) { bad++; }
+            if (got[i] == h[d][i]) { own++; }
+            if (memcmp(&got[i], &got0[i], sizeof(float)) != 0) { differ0++; }
+        }
+        snprintf(what, sizeof(what), "%s: device %d holds the sum (%zu/%zu off, %zu still own partial)", label, d, bad, nelem, own);
+        check(bad == 0, what);
+        snprintf(what, sizeof(what), "%s: device %d replica equals device 0 (%zu/%zu differ)", label, d, differ0, nelem);
+        check(differ0 == 0, what);
+        if (bad) {
+            printf("   device %d: max relative error vs the host sum = %.3g\n", d, maxrel);
+        }
+    }
+
+    for (int d = 0; d < n; ++d) {
+        ggml_backend_buffer_free(buf[d]);
+    }
+    ggml_free(ctx);
+}
+
+static int main_all_devices(const std::string & route) {
+    // nccl-all:   the NCCL route armed (the default), over every visible device. Where NCCL works it
+    //             serves the reduce; where its group fails (#206) the reduce must still add up.
+    // nccl-fault: the same, with PXA_REDUCE_NCCL_FAULT=1 -- the NCCL branch behaves as a failed group
+    //             on any machine, so the demotion and the fallback are exercised everywhere.
+    setenv("PXA_REDUCE_NCCL", "1", 1);
+    unsetenv("PXA_REDUCE_PINNED");
+    unsetenv("PXA_TSPLIT_REDUCE");
+    if (route == "nccl-fault") {
+        setenv("PXA_REDUCE_NCCL_FAULT", "1", 1);
+    }
+    setenv("PXA_RDBG", "64", 1);
+
+    const int ndev = ggml_backend_cuda_get_device_count();
+    printf("test-reduce-pinned: route=%s devices=%d (all of them take part)\n", route.c_str(), ndev);
+    if (ndev < 2) {
+        printf("SKIP: needs two CUDA devices, found %d\n", ndev);
+        return 0;
+    }
+    std::vector<ggml_backend_t> back(ndev);
+    for (int d = 0; d < ndev; ++d) {
+        back[d] = ggml_backend_cuda_init(d, nullptr);
+        if (!back[d]) {
+            printf("FAIL: could not initialise CUDA backend %d\n", d);
+            return 1;
+        }
+    }
+
+    const int64_t n_embd = 5120;   // Qwen3.8-27B
+    run_case_n(back, n_embd, 1, "decode       [5120,1] ");
+    run_case_n(back, n_embd, 4, "verify batch [5120,4] ");
+    run_case_n(back,     37, 3, "tail         [37,3]   ");
+    run_case_n(back, n_embd, 1, "decode again [5120,1] ");   // after a demotion: the route stays off and still adds up
+
+    const int st = pxa_reduce_nccl_state ? pxa_reduce_nccl_state() : -1;
+    static const char * k_state[] = { "not built in", "built, no communicator", "LIVE (NCCL served the reduces)",
+                                      "DEMOTED (a group failed; the in-tree peer route served the reduces)" };
+    printf("test-reduce-pinned: NCCL route %s\n", st >= 0 && st <= 3 ? k_state[st]
+                                                  : "unknown (this libggml predates the bug #206 fix)");
+    if (route == "nccl-fault") {
+        if (st < 0) {
+            check(false, "nccl-fault: this libggml has no NCCL failure handling (predates the #206 fix)");
+        } else if (st <= 1) {
+            printf("SKIP (nccl-fault): there is no NCCL communicator in this build/process to fail\n");
+        } else {
+            check(st == 3, "nccl-fault: a failed group switches the NCCL route off");
+        }
+    }
+
+    for (int d = 0; d < ndev; ++d) {
+        ggml_backend_free(back[d]);
+    }
+    printf("test-reduce-pinned: route=%s failures=%d\n", route.c_str(), g_fail);
+    return g_fail == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     const std::string route = argc > 1 ? argv[1] : "intree";
+    if (route == "nccl-all" || route == "nccl-fault") {
+        return main_all_devices(route);
+    }
 
     // Resolved before the first reduce, because every route selector is a per-process static.
     bool lever_on = false;
@@ -162,10 +317,15 @@ int main(int argc, char ** argv) {
     } else if (route == "nccl") {
         setenv("PXA_REDUCE_NCCL",   "1", 1);
         unsetenv("PXA_REDUCE_PINNED");
+    } else if (route == "fused-nopeer" || route == "p2p-nopeer") {
+        setenv("PXA_REDUCE_NCCL",   "0", 1);
+        unsetenv("PXA_REDUCE_PINNED");
+        setenv("PXA_TSPLIT_REDUCE", route == "fused-nopeer" ? "fused" : "p2p", 1);
     } else {
         setenv("PXA_REDUCE_NCCL",   "0", 1);
         unsetenv("PXA_REDUCE_PINNED");
     }
+    const bool nopeer = route == "fused-nopeer" || route == "p2p-nopeer";
     setenv("PXA_RDBG", "400", 1);   // every branch this run takes is named in the log
 
     const int ndev = ggml_backend_cuda_get_device_count();
@@ -175,7 +335,8 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    ggml_backend_t back[2] = { ggml_backend_cuda_init(0, nullptr), ggml_backend_cuda_init(1, nullptr) };
+    const char * bparams = nopeer ? "enable-p2p=0" : nullptr;
+    ggml_backend_t back[2] = { ggml_backend_cuda_init(0, bparams), ggml_backend_cuda_init(1, bparams) };
     if (!back[0] || !back[1]) {
         printf("FAIL: could not initialise both CUDA backends\n");
         return 1;

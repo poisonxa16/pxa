@@ -198,6 +198,22 @@ struct engine {
 
         return commit_row_pos;
     }
+
+    // Bug #234: the np>1 plain (non-draft) decode sync in the server. The target just decoded the
+    // token at pos_decoded (x_p) and sampled x_{p+1} from it; the sync hands the companion h_p.
+    // Fixed: the same commit a verify with one accepted id makes, (h_p, x_{p+1}) at p+1.
+    // Legacy: on_target_seq_batch(batch_view, false) wrote the decoded row as it stood, (h_p, x_p)
+    // at p (mtp_update_kv_cache drops from p first), and left p+1 empty.
+    void plain_decode_sync(int32_t pos_decoded) {
+        if (!legacy) {
+            commit(pos_decoded, 1);
+            return;
+        }
+        if (c.pos_max() >= pos_decoded) {
+            c.rm_from(pos_decoded);
+        }
+        c.store(pos_decoded, pos_decoded, pos_decoded);
+    }
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -435,6 +451,72 @@ static void case_legacy_arithmetic_breaks_it() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Bug #234: at -np > 1 the uniform-batch equalizer drops drafting slots to plain decodes, and a slot
+// can also decode without a usable draft. Those decodes keep the companion in step through a sync
+// that must obey the same invariant as the verify commit, so a mixed run of verify cycles and plain
+// decodes has to leave the cache exactly as an all-verify run would.
+// ---------------------------------------------------------------------------------------------
+static void run_mixed(engine & e, bool check) {
+    e.warm_up(6);
+    int32_t n_past = 6;                                   // x_6 sampled, not yet decoded
+    n_past = cycle(e, n_past, false, 3, 2, check, "mixed: verify 1");
+    if (check) check_invariant(e.c, n_past, "mixed: after verify 1");
+
+    // three plain decodes: decode x_{n_past}, sample the next token, sync
+    for (int j = 0; j < 3; ++j) {
+        e.plain_decode_sync(n_past);
+        n_past += 1;
+        if (check) {
+            char where[64];
+            snprintf(where, sizeof(where), "mixed: after plain decode %d", j + 1);
+            check_invariant(e.c, n_past, where);
+        }
+    }
+
+    // the next draft starts with the free token the sync's commit left behind
+    n_past = cycle(e, n_past, true, 3, 1, check, "mixed: verify 2 after plain decodes");
+    if (check) check_invariant(e.c, n_past, "mixed: after verify 2");
+
+    e.plain_decode_sync(n_past);
+    n_past += 1;
+    if (check) check_invariant(e.c, n_past, "mixed: after the last plain decode");
+}
+
+// A MODEL of the bug #234 sync against the (h_{q-1}, x_q) invariant, on the simulated engine above:
+// it documents the arithmetic and never calls the server, so it passes on rc-base too. The regression
+// test that runs the real server (and fails on rc-base) is tests/spec-server-np2-test.py plainsync.
+static void case_np_plain_decode_sync() {
+    begin("np>1 plain decodes between verify steps keep (h_{q-1}, x_q) at q (bug #234)");
+
+    engine e;
+    run_mixed(e, true);
+
+    // the pre-fix sync must break the invariant (the test has teeth)
+    engine legacy;
+    legacy.legacy = true;
+    legacy.warm_up(6);
+    int32_t n_past = 6;
+    // a correct verify cycle first, so only the sync is legacy
+    legacy.legacy = false;
+    n_past = cycle(legacy, n_past, false, 3, 2, false, "legacy sync: verify");
+    legacy.legacy = true;
+    legacy.plain_decode_sync(n_past);
+    n_past += 1;
+    int violations = 0;
+    for (const auto & kv : legacy.c.cells) {
+        if (kv.second.tok != kv.first || kv.second.h != kv.first - 1) {
+            ++violations;
+        }
+    }
+    if (legacy.c.pos_max() != n_past) {
+        ++violations;
+    }
+    CHECK(violations > 0, "the pre-fix plain-decode sync produced a cache this invariant accepts");
+    printf("    pre-fix sync: %d violated cell(s)/end position, cache ends at %d, newest token at %d\n",
+           violations, legacy.c.pos_max(), n_past);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Greedy losslessness of the acceptance policy: at temperature 0 the target's own token stream must
 // come out of the speculative loop unchanged, whatever the drafter proposes.
 // ---------------------------------------------------------------------------------------------
@@ -508,6 +590,7 @@ int main() {
     case_zero_output_commit_writes_exactly_the_verified_rows();
     case_zero_output_commit_matches_the_free_token_flow();
     case_legacy_arithmetic_breaks_it();
+    case_np_plain_decode_sync();
     case_greedy_losslessness();
 
     if (g_fail) {

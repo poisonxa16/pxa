@@ -1817,6 +1817,14 @@ class GGMLQuantizationType(IntEnum):
     PXQ3      = 255   # 3-bit LM8, bit-plane packed, x E16-row scales
     PXQ6      = 256   # 5-bit LM32 x E16-row scales — the quality tier (~5.27 bpw)
     PXQ1      = 248   # 1-bit sign x E16-row scales — the sub-2-bit PXQ-UNIVERSAL tier (~1.26 bpw)
+    # PXQN (PXQ-Next revision 1), decoded by the closed libggml-pxqn
+    PXQN3     = 257   # PXQN, 3.25 + 16/K bpw
+    PXQN3S8   = 258   # PXQN, 3.50 + 16/K bpw
+    PXQN4     = 259   # PXQN, 4.25 + 16/K bpw
+    PXQN2     = 260   # PXQN, 2.25 + 16/K bpw
+    PXQN1     = 261   # PXQN, 1.25 + 16/K bpw
+    PXQN4S8   = 262   # PXQN, 4.50 + 16/K bpw
+    PXQN5     = 263   # PXQN, 5.25 + 16/K bpw
     Q8_0_X4   =  97
     Q8_1_X4   =  98
     Q8_2_X4   =  99
@@ -2055,6 +2063,13 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.PXQ3        : (  32,   13),  # + 2 B/row anchor meta
     GGMLQuantizationType.PXQ6        : (  32,   21),  # + 2 B/row anchor meta (matches ggml.c traits: blck 32, type_size 21, row_meta 2)
     GGMLQuantizationType.PXQ1        : (  32,    5),  # + 2 B/row anchor meta (128 B / 64-row panel) — NOT representable here
+    GGMLQuantizationType.PXQN3       : ( 128,   52),  # + 2 B/row anchor meta (128 B / 64-row panel) — NOT representable here
+    GGMLQuantizationType.PXQN3S8     : ( 128,   56),  # + 2 B/row anchor meta
+    GGMLQuantizationType.PXQN4       : (  32,   17),  # + 2 B/row anchor meta
+    GGMLQuantizationType.PXQN2       : ( 128,   36),  # + 2 B/row anchor meta
+    GGMLQuantizationType.PXQN1       : ( 128,   20),  # + 2 B/row anchor meta
+    GGMLQuantizationType.PXQN4S8     : (  32,   18),  # + 2 B/row anchor meta
+    GGMLQuantizationType.PXQN5       : ( 128,   84),  # + 2 B/row anchor meta
     GGMLQuantizationType.Q4_0_4_4    : (  32,   18),
     GGMLQuantizationType.Q4_0_4_8    : (  32,   18),
     GGMLQuantizationType.Q4_0_8_8    : (  32,   18),

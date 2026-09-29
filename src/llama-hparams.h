@@ -118,6 +118,13 @@ struct llama_hparams {
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
 
+    // PXQN revision 1 (ggml-pxqn.h): the rotation contract of the file, from pxa.pxqn.*.
+    // pxqn_rev 0 = not a PXQN file (no key); pxqn_rot_sites = OR of PXQN_SITE_BIT(site) of the
+    // activation sites that are rotated (every consumer of such a site is stored rotated).
+    uint32_t pxqn_rev       = 0;
+    uint64_t pxqn_rot_seed  = 0;
+    uint32_t pxqn_rot_sites = 0;
+
     // for hybrid state-space models (e.g. qwen3next)
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
 

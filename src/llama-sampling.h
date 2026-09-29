@@ -99,6 +99,9 @@ struct llama_sampler_adaptive_p * llama_clone_adaptive_p(const struct llama_samp
 
 void llama_free_adaptive_p(struct llama_sampler_adaptive_p * adapt_p_ctx);
 
+// bug #209: copy only the RNG (a speculative rollback restores the rest from a checkpoint clone)
+void llama_adaptive_p_copy_rng(struct llama_sampler_adaptive_p * dst, const struct llama_sampler_adaptive_p * src);
+
 void llama_prep_adaptive_p_impl(
               struct llama_sampling * smpl,
              llama_token_data_array * candidates,

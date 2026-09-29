@@ -320,6 +320,10 @@ struct gpt_params {
     int32_t n_ctx                 =       0; // context size
     int32_t n_batch               =    2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =     512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    // PXA (bug #207 follow-up): where n_ubatch came from, for llama_init_from_gpt_params' fit check --
+    // pxa_ub_origin in common/pxa-registry.h. 0 = the user's -ub or a measured cell (never touched);
+    // 1 = a registry RULE, 2 = the VRAM ladder (the engine picked it, so it may step it down to fit).
+    int32_t pxa_ub_origin         =       0;
     int32_t n_keep                =       0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =      -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =       1; // number of parallel sequences to decode
@@ -376,6 +380,7 @@ struct gpt_params {
 
     std::string model                = ""; // model path
     std::string model_alias          = "unknown"; // model alias
+    std::vector<std::string> hot_models;          // PXA hot swap: --hot-model 'NAME=PATH [flags]' (server)
     std::string model_url            = ""; // model url to download
     std::string hf_token             = ""; // HF token
     std::string hf_repo              = ""; // HF repo
@@ -586,6 +591,7 @@ struct gpt_params {
     int32_t ctx_checkpoints_tolerance = 5;    // the number of tokens before the full prompt to create the checkpoint
     common_checkpoint_eviction ctx_checkpoint_eviction = COMMON_CHECKPOINT_EVICTION_VARIANCE; // eviction strategy when the checkpoint ring is full
     int32_t cache_ram_mib = 8192;   // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    cache_ram_set = false;  // --cache-ram given explicitly (a recurrent/hybrid model defaults the RAM prompt cache off otherwise)
     int32_t cache_ram_n_min = 0;     // min number of tokens required to save in the ram
     float cache_ram_similarity = 0.5f; // similarity of tokens to cached tokens
 

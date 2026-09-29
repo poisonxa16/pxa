@@ -1,5 +1,6 @@
 #include "llama-spec-features.h"
 
+#include <algorithm>
 #include <random>
 
 #include "llama-model.h"
@@ -136,6 +137,16 @@ bool llama_spec_get_hidden_feature_view_for_seq(
 // llama-spec-features.h for why these take a BATCH ROW and refuse when the buffer is not dense.
 bool llama_spec_hidden_rows_are_batch_dense(const struct llama_context * ctx) {
     return ctx != nullptr && ctx->n_embd_rows_batch_dense > 0;
+}
+
+int32_t llama_spec_resume_row_for_seq_ctx(const struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    if (ctx == nullptr) {
+        return LLAMA_SPEC_RESUME_ROW_NONE;
+    }
+    const int32_t n_meta = std::min<int32_t>((int32_t) ctx->embd_rows_seq.size(), ctx->n_embd_rows_batch_dense);
+    return llama_spec_resume_row_for_seq(
+        ctx->embd_rows_seq.data(), ctx->embd_rows_pos.data(), n_meta,
+        ctx->embd_batch_sole_seq, seq_id, pos);
 }
 
 bool llama_spec_get_hidden_feature_view_from_batch_row(

@@ -4,3 +4,6 @@ void mul_mat_vec_q8_0_q8_1_cuda(const mmvq_args & args, cudaStream_t stream) {
     mul_mat_vec_q_cuda<GGML_TYPE_Q8_0>(args, stream);
 }
 
+bool mul_mat_vec_q8_0_q8_1_group_cuda(mmvq_group_args & g, cudaStream_t stream) {
+    return mul_mat_vec_q_group_cuda<GGML_TYPE_Q8_0>(g, stream);
+}

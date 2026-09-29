@@ -1251,7 +1251,7 @@ whole correctness argument.
 | [`docs/PXA-SM70-SERVING.md`](PXA-SM70-SERVING.md) | the full V100 sweep and every trap |
 | [`docs/PXA-SM60-SERVING.md`](PXA-SM60-SERVING.md) | the full P100 sweep and every trap |
 | [`docs/LAUNCHER.md`](LAUNCHER.md) | `pxa-launch.py`: the decision table, refusals and evidence |
-| [`docs/LEVERS.md`](LEVERS.md) | the `PXA_*` levers on the llama.cpp engine |
+| [`docs/lab/LEVERS.md`](lab/LEVERS.md) | the `PXA_*` levers on the llama.cpp engine |
 | [`pxa/pxq4/README.md`](../pxa/pxq4/README.md) | kernel libraries, the `PXQ4_LIB` rule, rebuilding |
 | `tools/vllm-pxq4/docs/01-pxq4-format-spec.md` | the PXQ4 on-disk format |
 | `tools/vllm-pxq4/docs/09-chosen-design.md` | the design that was built, and its gates |

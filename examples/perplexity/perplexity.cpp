@@ -19,6 +19,8 @@
 #include <atomic>
 #include <vector>
 #include <array>
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 
@@ -317,12 +319,12 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
 
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
-        float * kld_values, float * p_diff_values) {
+        float * kld_values, float * p_diff_values, const int8_t * keep = nullptr, kl_divergence_result * kld_role = nullptr) {
     std::mutex mutex;
     const int nv = 2*((n_vocab + 1)/2) + 4;
     int counter = 0;
-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
-        kl_divergence_result local_kld;
+    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values, keep, kld_role] () {
+        kl_divergence_result local_kld, local_role;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
             int i = counter++;
@@ -340,10 +342,27 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 kld.n_same_top       += local_kld.n_same_top;
                 kld.max_p_diff        = std::max(kld.max_p_diff, local_kld.max_p_diff);
                 kld.count            += local_kld.count;
+                if (kld_role) {
+                    kld_role->sum_nll      += local_role.sum_nll;
+                    kld_role->sum_nll_base += local_role.sum_nll_base;
+                    kld_role->sum_kld      += local_role.sum_kld;
+                    kld_role->sum_kld2     += local_role.sum_kld2;
+                    kld_role->n_same_top   += local_role.n_same_top;
+                    kld_role->count        += local_role.count;
+                }
                 break;
             }
             lock.unlock();
+            const kl_divergence_result before = local_kld;
             std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
+            if (keep && keep[i] && kld_role) {   // PXA_KLD_ROLE: this position's own terms into the role sums too
+                local_role.sum_nll      += local_kld.sum_nll - before.sum_nll;
+                local_role.sum_nll_base += local_kld.sum_nll_base - before.sum_nll_base;
+                local_role.sum_kld      += v.first;
+                local_role.sum_kld2     += v.first*v.first;
+                local_role.n_same_top   += local_kld.n_same_top - before.n_same_top;
+                local_role.count        += 1;
+            }
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
         }
@@ -559,12 +578,23 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
 
     llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
 
+    // PXA_PPL_STREAM=1 (tool option, ws6-fix 2026-09-25): score every batch's rows as soon as that
+    // batch is decoded, instead of holding the chunk's logits until its end. The held logits are
+    // n_ctx/2 x n_vocab floats -- 32 GB at -c 65536 on a 248k vocabulary, and the base file's
+    // staging another 16 GB -- which no long-context KLD run on this box can afford. Same rows, same
+    // order, same arithmetic and the same --kl-divergence-base file layout; one sequence per chunk.
+    const bool pxa_stream = getenv("PXA_PPL_STREAM") != nullptr && atoi(getenv("PXA_PPL_STREAM")) != 0;
+    if (pxa_stream) {
+        GGML_ASSERT(n_seq == 1 && "PXA_PPL_STREAM needs -b <= -c (one sequence per chunk)");
+    }
+
     std::vector<float> logits;
-    if (num_batches > 1) {
+    if (num_batches > 1 && !pxa_stream) {
         logits.reserve((size_t)n_ctx * n_vocab);
     }
 
-    fprintf(stderr, "%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
+    fprintf(stderr, "%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d%s\n", __func__, n_chunk, n_ctx, n_batch, n_seq,
+            pxa_stream ? " (PXA_PPL_STREAM: rows scored per batch)" : "");
 
     std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
@@ -574,7 +604,7 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
         logits_stream.write((const char *)tokens.data(), (size_t)n_chunk*n_ctx*sizeof(tokens[0]));
         const int nv = 2*((n_vocab + 1)/2) + 4;
-        log_probs.resize((size_t)n_ctx * nv);
+        log_probs.resize((size_t)(pxa_stream ? std::min(n_batch, n_ctx) : n_ctx) * nv);
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -641,7 +671,23 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
                 return {tokens, -1, logit_history, prob_history};
             }
 
-            if (num_batches > 1 && n_outputs > 0) {
+            if (pxa_stream && n_outputs > 0) {
+                // this batch's scored rows are positions [p0, p1); the chunk's last position has no
+                // next token, exactly as the whole-chunk path's n_ctx - 1 - first rows leave it out
+                const int p0 = std::max(first, j*n_batch);
+                const int p1 = std::min(n_ctx - 1, j*n_batch + batch_size);
+                if (p1 > p0) {
+                    const float * lg = llama_get_logits(ctx);   // outputs in order: row 0 is position p0
+                    llama_token * tk = tokens.data() + start + p0;
+                    if (!params.logits_file.empty()) {
+                        process_logits(logits_stream, n_vocab, lg, tk, p1 - p0, workers, log_probs, nll, nll2);
+                    } else {
+                        process_logits(n_vocab, lg, tk, p1 - p0, workers, nll, nll2,
+                                       logit_history.data() + start + p0, prob_history.data() + start + p0);
+                    }
+                    count += p1 - p0;
+                }
+            } else if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + int64_t(n_outputs) * n_vocab);
             }
@@ -662,6 +708,7 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
         }
 
         for (int seq = 0; seq < n_seq_batch; seq++) {
+          if (!pxa_stream) {   // streamed rows were scored batch by batch above
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
@@ -677,6 +724,7 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
                         prob_history.data()  + start + seq*n_ctx + first);
             }
             count += n_ctx - first - 1;
+          }
 
             // perplexity is e^(average negative log-likelihood)
             if (params.ppl_output_type == 0) {
@@ -1757,17 +1805,62 @@ static void kl_divergence(llama_context * ctx, const gpt_params & params) {
         return;
     }
 
+    // PXA_KLD_ROLE=assistant|user: score only the positions whose PREDICTED token belongs to that chat role
+    // (tools/pxqn-probe rolediff.py definition: after '<|im_start|>ROLE' until '<|im_end|>'; the template
+    // tokens themselves -- <|im_start|>, the role name, <|im_end|>, <think>, </think> -- are never scored).
+    // Adds one 'pxa_role_chunk' line per chunk with that chunk's own sums (exact paired per-chunk stats).
+    std::vector<int8_t> role_keep;
+    const char * role_env = getenv("PXA_KLD_ROLE");
+    if (role_env && *role_env) {
+        const llama_model * mdl = llama_get_model(ctx);
+        auto tok1 = [&](const char * s) {
+            llama_token t[4];
+            const int n = llama_tokenize(mdl, s, (int) strlen(s), t, 4, false, true);
+            return n == 1 ? t[0] : (llama_token) -1;
+        };
+        const llama_token ims = tok1("<|im_start|>"), ime = tok1("<|im_end|>"), th0 = tok1("<think>"), th1 = tok1("</think>");
+        const int want = strcmp(role_env, "user") == 0 ? 2 : 1;
+        role_keep.assign(tokens.size(), 0);
+        int cur = 3;
+        for (size_t k = 0; k < tokens.size(); ++k) {
+            const llama_token t = tokens[k];
+            if (t == ims && k + 1 < tokens.size()) {
+                char buf[64];
+                const int n = llama_token_to_piece(mdl, tokens[k + 1], buf, sizeof(buf) - 1, 0, false);
+                std::string name(buf, n > 0 ? n : 0);
+                while (!name.empty() && isspace((unsigned char) name.front())) name.erase(name.begin());
+                while (!name.empty() && isspace((unsigned char) name.back()))  name.pop_back();
+                cur = name == "assistant" ? 1 : name == "user" ? 2 : 3;
+                ++k;                                  // the role name is template too
+                continue;
+            }
+            const bool tpl = t == ims || t == ime || t == th0 || t == th1;
+            role_keep[k] = (!tpl && cur == want) ? 1 : 0;
+            if (t == ime) cur = 3;
+        }
+        size_t nk = 0; for (int8_t v : role_keep) nk += v;
+        fprintf(stderr, "%s: PXA_KLD_ROLE=%s: %zu of %zu tokens belong to the role (im_start %d im_end %d)\n", __func__,
+                role_env, nk, role_keep.size(), ims, ime);
+        if (ims < 0 || ime < 0) {
+            fprintf(stderr, "%s: PXA_KLD_ROLE needs <|im_start|>/<|im_end|> single tokens; scoring every position\n", __func__);
+            role_keep.clear();
+        }
+    }
+
     const int n_batch = params.n_batch;
     const int num_batches = (n_ctx + n_batch - 1)/n_batch;
     const int nv = 2*((n_vocab + 1)/2) + 4;
     const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
     GGML_ASSERT(llama_add_eos_token(llama_get_model(ctx)) != 1);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
+    // PXA_PPL_STREAM=1: compare batch by batch (see perplexity() above); the base rows are read in
+    // the same sequential order they were written in.
+    const bool pxa_stream = getenv("PXA_PPL_STREAM") != nullptr && atoi(getenv("PXA_PPL_STREAM")) != 0;
+    std::vector<uint16_t> log_probs_uint16(size_t(pxa_stream ? std::min(n_batch, (int) n_ctx) : n_ctx - 1 - n_ctx/2) * nv);
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
-    if (num_batches > 1) {
+    if (num_batches > 1 && !pxa_stream) {
         logits.reserve((size_t)n_ctx * n_vocab);
     }
 
@@ -1791,7 +1884,7 @@ static void kl_divergence(llama_context * ctx, const gpt_params & params) {
         return var;
     };
 
-    kl_divergence_result kld;
+    kl_divergence_result kld, role_total;
     auto    kld_ptr =    kld_values.data();
     auto p_diff_ptr = p_diff_values.data();
 
@@ -1801,7 +1894,7 @@ static void kl_divergence(llama_context * ctx, const gpt_params & params) {
 
         const auto t_start = std::chrono::high_resolution_clock::now();
 
-        if (in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
+        if (!pxa_stream && in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
             fprintf(stderr, "%s: failed reading log-probs for chunk %d\n", __func__, i);
             return;
         }
@@ -1830,7 +1923,23 @@ static void kl_divergence(llama_context * ctx, const gpt_params & params) {
             // restore the original token in case it was set to BOS
             tokens[batch_start] = token_org;
 
-            if (num_batches > 1) {
+            if (pxa_stream) {
+                const int first = n_ctx/2;
+                const int p0 = std::max(first, j*n_batch);
+                const int p1 = std::min((int) n_ctx - 1, j*n_batch + batch_size);
+                if (p1 > p0) {
+                    if (in.read((char *)log_probs_uint16.data(), size_t(p1 - p0)*nv*sizeof(uint16_t)).fail()) {
+                        fprintf(stderr, "%s: failed reading log-probs for chunk %d\n", __func__, i);
+                        return;
+                    }
+                    // logits_all: every row of the batch is an output, row k is position j*n_batch + k
+                    const float * lg = llama_get_logits(ctx) + size_t(p0 - j*n_batch)*n_vocab;
+                    process_logits(n_vocab, lg, tokens.data() + start + p0, p1 - p0,
+                            workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+                    p_diff_ptr += p1 - p0;
+                    kld_ptr    += p1 - p0;
+                }
+            } else if (num_batches > 1) {
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + batch_size * n_vocab);
             }
@@ -1851,12 +1960,25 @@ static void kl_divergence(llama_context * ctx, const gpt_params & params) {
             printf("\nchunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p\n");
         }
 
+        if (!pxa_stream) {
         const int first = n_ctx/2;
         const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits(ctx);
+        kl_divergence_result kld_role_chunk;
         process_logits(n_vocab, all_logits + size_t(first)*n_vocab, tokens.data() + start + first, n_ctx - 1 - first,
-                workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+                workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr,
+                role_keep.empty() ? nullptr : role_keep.data() + start + first + 1, &kld_role_chunk);
+        if (!role_keep.empty()) {
+            // one line per chunk with that chunk's OWN sums over the role's positions (exact paired stats)
+            printf("pxa_role_chunk %d n %zu nll %.9g nll_base %.9g kld %.9g kld2 %.9g same_top %zu\n", i + 1,
+                   kld_role_chunk.count, kld_role_chunk.sum_nll, kld_role_chunk.sum_nll_base, kld_role_chunk.sum_kld,
+                   kld_role_chunk.sum_kld2, kld_role_chunk.n_same_top);
+            role_total.count += kld_role_chunk.count; role_total.sum_nll += kld_role_chunk.sum_nll;
+            role_total.sum_nll_base += kld_role_chunk.sum_nll_base; role_total.sum_kld += kld_role_chunk.sum_kld;
+            role_total.sum_kld2 += kld_role_chunk.sum_kld2; role_total.n_same_top += kld_role_chunk.n_same_top;
+        }
         p_diff_ptr += n_ctx - 1 - first;
         kld_ptr    += n_ctx - 1 - first;
+        }
 
         printf("%4d", i+1);
 
@@ -1890,6 +2012,13 @@ static void kl_divergence(llama_context * ctx, const gpt_params & params) {
         logits.clear();
     }
     printf("\n");
+
+    if (!role_keep.empty() && role_total.count > 0) {
+        const double n = (double) role_total.count;
+        printf("pxa_role_total %s n %zu KLD %.6f dNLL %+.6f PPL(Q)/PPL(base) %.6f same_top %.3f%%\n", role_env, role_total.count,
+               role_total.sum_kld/n, (role_total.sum_nll - role_total.sum_nll_base)/n,
+               exp((role_total.sum_nll - role_total.sum_nll_base)/n), 100.0*role_total.n_same_top/n);
+    }
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 

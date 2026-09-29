@@ -513,7 +513,9 @@ static inline bool pxa_moe_grouped_gateup(ggml_backend_cuda_context & ctx,
     if (pxa_moe_grouped_shadow()) {
         const size_t need = (size_t)Ny*dst_nb2_f*sizeof(float);
         if (sh.cap < need) {
-            if (sh.scratch) cudaFree(sh.scratch);
+            // bug #230: the expert-shard path captures this same per-device scratch; bump the
+            // allocator generation so no captured graph replays into the freed buffer.
+            if (sh.scratch) { ggml_cuda_alloc_generation_bump(); cudaFree(sh.scratch); }
             cudaMalloc(&sh.scratch, need); sh.cap = need;
         }
         if (!sh.viol) { cudaMalloc(&sh.viol, sizeof(int)); }

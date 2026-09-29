@@ -7,6 +7,51 @@ pull the image, mount a GGUF, run.
 Models are **not** part of the image. Mount a directory containing your `.gguf` file(s)
 at `/models` and point `-m` at the file inside the container.
 
+## The entrypoint: one command, the engine picks its settings
+
+The image's `ENTRYPOINT` is `pxa-entrypoint`. It has one rule, so a `docker run` line
+you already use keeps its meaning:
+
+| You run | What starts |
+|---|---|
+| `docker run IMAGE` (no arguments) | **pxa-launch** picks the cards, the model and the flags, prints why, and starts the server. The model is `$PXA_MODEL`, or the only `.gguf` under `/models`; the cards are `$PXA_GPUS`, or every card the container can see. |
+| `docker run IMAGE -m /models/x.gguf ...` | Anything that starts with `-` is an **engine argument** and goes straight to `llama-server`, unchanged. |
+| `docker run IMAGE doctor` | `pxa-launch --doctor`: cards, driver, P2P, the model file (tier, arch, sha256) and the defaults the engine would pick, with the reason for each. Starts nothing. |
+| `docker run -p 7777:7777 IMAGE gui` | **PXA Control**, the launcher in a browser (rig, models, launch, speed, chat). In a container it listens on every interface and prints an access token; open the printed `?token=` address. See docs/LAUNCHER.md, "PXA Control (GUI)". |
+| `docker run IMAGE launch --gpus 0,1 ...` | pxa-launch with your own arguments. |
+| `docker run IMAGE llama-bench ...` (any program) | That program. |
+
+Both of the first two get the same settings on the same cards. Since v2026.10 the engine
+picks `-sm`, `-b`, `-ub`, `-fa`, `-ngl` (every layer on the cards) and `-c` (`-np` x 4096)
+itself when you do not pass them, from the same registry pxa-launch reads (on two identical cards with a Qwen3.8 dense
+PXQ4 or PXQ-Next 4 / 4S8 / 5 file, and on four identical P100s, it picks `-sm tensor`; other card sets stay on
+`-sm layer`). A flag you pass always wins. The boot log prints every choice as a `PXA_REGISTRY:` line.
+
+**More than one card: give the container a bigger `/dev/shm`.** Docker and podman give a container
+64 MiB of `/dev/shm`; the multi-card reduce (NCCL's shared-memory transport) needs more on four
+cards. Pass `--shm-size=1g` (or `--ipc=host`; compose: `shm_size: 1gb`). In LXC, mount a 1 GiB
+tmpfs on `/dev/shm` (`lxc.mount.entry: tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir,size=1G 0 0`).
+The entrypoint and `pxa-launch` print a warning when a multi-card container has less; the engine
+itself falls back to a slower reduce route rather than serve wrong tokens (bug #206).
+
+```bash
+# no arguments: the launcher does everything (one model under /models)
+docker run -d --name pxa --gpus '"device=0,1"' --shm-size=1g -p 8080:8080 \
+    -v /path/to/your/models:/models:ro ghcr.io/poisonxa16/pxa:latest
+
+# what would it pick, and why? (starts nothing)
+docker run --rm --gpus '"device=0,1"' -v /path/to/your/models:/models:ro \
+    ghcr.io/poisonxa16/pxa:latest doctor -m /models/your-model.gguf
+```
+
+`PXA_LAUNCH_EXTRA="--explain"` on the no-argument path prints what the launcher would run
+and starts nothing. With engine arguments, the one difference from the launcher is `-c`:
+a launcher recipe row passes its own context (for example 32768), the bare engine picks
+`-np` x 4096 - pass `-c` yourself for more.
+
+The same binaries answer to `pxa-server`, `pxa-bench`, `pxa-quantize`, `pxa-perplexity`
+and `pxa-cli`; the `llama-*` names keep working.
+
 ## Quick start — one card (P100 or V100)
 
 ```bash

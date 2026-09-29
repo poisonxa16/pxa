@@ -206,6 +206,16 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL = 256, // mixed PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)
         LLAMA_FTYPE_MOSTLY_PXQ6          = 257, // 5-bit quality tier: LM32 5-bit codes x E16-row scales, ~5.27 bpw (gguf tensor type id 256)
         LLAMA_FTYPE_MOSTLY_PXQ1          = 248, // sub-2-bit tier: 1-bit sign codes x E16-row scales, ~1.26 bpw (PXQ-UNIVERSAL Tier0)
+        // PXQN (PXQ-Next revision 1), decoded by the closed libggml-pxqn
+        LLAMA_FTYPE_MOSTLY_PXQN3         = 258, // PXQN, 3.25 + 16/K bpw
+        LLAMA_FTYPE_MOSTLY_PXQN3S8       = 259, // PXQN, 3.50 + 16/K bpw
+        LLAMA_FTYPE_MOSTLY_PXQN4         = 260, // PXQN, 4.25 + 16/K bpw
+        LLAMA_FTYPE_MOSTLY_PXQN          = 261, // PXQN allocator mix over {N3, N3S8, N4, q8_0} at a byte budget
+        // PXQN ladder tiers
+        LLAMA_FTYPE_MOSTLY_PXQN2         = 262, // PXQN, 2.25 + 16/K bpw
+        LLAMA_FTYPE_MOSTLY_PXQN1         = 263, // PXQN, 1.25 + 16/K bpw
+        LLAMA_FTYPE_MOSTLY_PXQN4S8       = 264, // PXQN, 4.50 + 16/K bpw
+        LLAMA_FTYPE_MOSTLY_PXQN5         = 265, // PXQN, 5.25 + 16/K bpw
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_KV         = 149, // except 1d tensors
@@ -843,6 +853,13 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    // PXA_STREAM_WEIGHTS placement (src/llama-pxa-place.h): the planner's decision as one JSON
+    // object ("" when nothing was planned), and the bytes of weights that live in host RAM
+    // instead of VRAM (streamed or CPU-computed). Estimators that size VRAM from the file must
+    // subtract the latter: those bytes are not on any card.
+    LLAMA_API const char * llama_model_pxa_placement(const struct llama_model * model);
+    LLAMA_API uint64_t     llama_model_host_weight_bytes(const struct llama_model * model);
+
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
@@ -1029,6 +1046,11 @@ extern "C" {
     // PXA_CKPT_BUDGET=0 disables it; PXA_CKPT_BUDGET_MARGIN_MB sets the headroom (default 256).
     LLAMA_API int llama_spec_ckpt_budget_max_tokens(struct llama_context * ctx, int want_max_tokens);
 
+    // The fixed per-step checkpoint capacity (drafted + 1 tokens) chosen at speculative init, or 0
+    // when the context's fixed mode is not per-step (gpu-fallback / cpu / none). A verify batch
+    // wider than this cannot be checkpointed. Used by PXA_SPEC_FIXED_WIDTH.
+    LLAMA_API int llama_spec_ckpt_fixed_capacity(const struct llama_context * ctx);
+
     // Save the current recurrent state as a speculative checkpoint.
     LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
 
@@ -1134,6 +1156,54 @@ extern "C" {
     // PXA_HOST_TIMING=N (house custom, default OFF): per-decode-step host timing buckets, one
     // summary line to stderr every N steps (see the block comment in src/llama.cpp). The
     // sampler reports its own bucket through add_sample; enabled() is a static check.
+    // PXA HOT SWAP -- residency groups (engine side: ggml/src/pxa-residency.h). A group owns every
+    // VRAM allocation made while it is the active group (process-wide; one model runs at a time): a
+    // model's weights at load, the KV cache and compute buffers of every context created for it,
+    // and their later growth. park()
+    // frees all of that VRAM and keeps what must survive in pinned host RAM -- the weights once (a
+    // mirror taken at the first park), the KV cache and every other non-compute buffer each time;
+    // unpark() maps it back at the SAME device addresses, one host thread per card, so the model,
+    // its contexts, their KV and their captured graphs resume exactly where they were. Park only
+    // between graph evaluations. Needs CUDA VMM on every device; on a build without CUDA the calls
+    // succeed and move nothing (all memory is host memory already).
+    struct llama_pxa_residency_stats {
+        double   ms_total;          // wall time of the call
+        double   ms_map;            // slowest device: create+map (unpark) or unmap (park)
+        double   ms_copy;           // slowest device: copy time
+        double   ms_dev[16];
+        uint64_t bytes_weights;     // held by the group
+        uint64_t bytes_state;
+        uint64_t bytes_scratch;
+        uint64_t bytes_copied;      // moved over PCIe by this call
+        uint64_t bytes_dev[16];
+        uint64_t bytes_mirror_new;  // weight bytes mirrored for the first time
+        uint64_t bytes_released;    // park: physical bytes given back to the cards
+        uint64_t bytes_resident;    // bytes of the group still on the cards after the call
+        uint64_t verify_bad;        // PXA_SWAP_VERIFY=1: weight bytes that no longer match the mirror
+        int      n_dev;
+        char     err[256];
+    };
+    typedef struct llama_pxa_residency llama_pxa_residency;
+    LLAMA_API bool                  llama_pxa_residency_supported(void);
+    LLAMA_API llama_pxa_residency * llama_pxa_residency_new(const char * name);
+    LLAMA_API void                  llama_pxa_residency_free(llama_pxa_residency * r);
+    // make r the active group, process-wide (nullptr: none); returns the previous one
+    LLAMA_API llama_pxa_residency * llama_pxa_residency_bind(llama_pxa_residency * r);
+    // take the weight mirror now and keep everything on the cards (so the first swap-out is not slower)
+    LLAMA_API bool                  llama_pxa_residency_prime (llama_pxa_residency * r, struct llama_pxa_residency_stats * st);
+    LLAMA_API bool                  llama_pxa_residency_park  (llama_pxa_residency * r, struct llama_pxa_residency_stats * st);
+    // partial park (PXA_SWAP_KEEP): release only what `next` needs to come in, plus `headroom`
+    // bytes on every card it uses; the rest of r stays on the cards until someone needs the room
+    LLAMA_API bool                  llama_pxa_residency_park_for(llama_pxa_residency * r, llama_pxa_residency * next,
+                                                                  uint64_t headroom, struct llama_pxa_residency_stats * st);
+    LLAMA_API bool                  llama_pxa_residency_unpark(llama_pxa_residency * r, struct llama_pxa_residency_stats * st);
+    LLAMA_API void                  llama_pxa_residency_sizes (llama_pxa_residency * r, uint64_t * weights, uint64_t * state,
+                                                                uint64_t * scratch, uint64_t * pinned, uint64_t * resident);
+    // process-wide cap on pinned host bytes all groups may hold for mirrors (0 = no cap)
+    LLAMA_API void                  llama_pxa_residency_set_pin_budget(uint64_t bytes);
+    // forget the context's reusable graphs, so the next decode builds and sets every input afresh
+    LLAMA_API void                  llama_pxa_context_drop_graphs(struct llama_context * ctx);
+
     LLAMA_API bool llama_pxa_host_timing_enabled(void);
     LLAMA_API void llama_pxa_host_timing_add_sample(int64_t us);
 
@@ -1345,6 +1415,32 @@ extern "C" {
     // Negative indicies can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // PXA_VERIFY_ARGMAX (2026-09-28). Ask the NEXT llama_decode on this context to
+    // copy back only the head's device-side argmax (plus max logit and softmax mass) per output row
+    // instead of the full logit rows. Honoured only when the context's graph carries the argmax
+    // nodes (PXA_VERIFY_ARGMAX lever on, qwen35/qwen35moe target) and the decode is one ubatch;
+    // otherwise the decode copies the logits as usual. The request is cleared by the decode.
+    LLAMA_API void llama_set_argmax_only(struct llama_context * ctx, bool on);
+    // true when the context's graph carries the argmax nodes (the lever is live for this context)
+    LLAMA_API bool llama_argmax_available(struct llama_context * ctx);
+    // After an argmax-only decode: the greedy token of output i (same indexing as
+    // llama_get_logits_ith), lowest id on exact ties; -1 when the last decode was not argmax-only
+    // (then the logits are there instead). p_top (optional) = softmax probability of that token.
+    LLAMA_API int32_t llama_get_argmax_ith(struct llama_context * ctx, int32_t i, float * p_top);
+
+    // PXA_MTP_FOLD (2026-09-28). Attach the MTP companion to its target so a single-sequence
+    // pure-greedy verify can run the head's update pass over every verify row inside the verify graph.
+    LLAMA_API void llama_set_mtp_fold_ctx(struct llama_context * ctx, struct llama_context * ctx_mtp);
+    // ask the next llama_decode on the target to fold (ignored when it cannot: no companion, not one
+    // sequence, lever off); cleared by the decode
+    LLAMA_API void llama_set_mtp_fold_request(struct llama_context * ctx, bool on);
+    // After a folded verify: when the accepted run (tokens[0..n) starting at position pos0 of seq_id) is
+    // exactly the target argmax the fold rows were fed, hand back the head's conditioning hidden row and
+    // its argmax draft token for row n-1, drop the rejected fold rows from the companion, and return
+    // true (the commit decode is then not needed). false = run the commit as before.
+    LLAMA_API bool llama_mtp_fold_take(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, int32_t n,
+            const llama_token * tokens, const float ** hidden, llama_token * draft, float * p_draft);
 
     // How many logits per row the LAST decode actually wrote. This is n_vocab everywhere except
     // a shortlisted MTP draft graph (PXA_MTP_SHORTLIST), whose head scores only the shortlist

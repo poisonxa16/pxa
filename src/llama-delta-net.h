@@ -99,6 +99,9 @@ private:
             // and state_row_idx_w is where the new state is scattered.
             uint32_t rs_plane_rows = 0, ggml_tensor * state_row_idx_w = nullptr);
 
+    // il_rot: the REAL layer index for the PXQN out_in rotation (-1 = caller does not rotate; refused
+    // when the model rotates out_in); rot_ranges: this device's global K ranges of ssm_out (split path).
     static ggml_tensor * build_gated_output(llama_context & lctx, ggml_context * ctx0, ggml_tensor * ssm_norm, ggml_tensor * ssm_out,
-            ggml_tensor * output, ggml_tensor * z, int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb, bool sigmoid_gate = false);
+            ggml_tensor * output, ggml_tensor * z, int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb, bool sigmoid_gate = false,
+            int il_rot = -1, const std::vector<std::pair<int,int>> * rot_ranges = nullptr);
 };

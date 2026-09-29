@@ -6,6 +6,8 @@
 #include "pxa-spec-sampled.h"
 #include "spec-tuner.h"
 
+#include <memory>
+
 struct common_speculative;
 
 using common_speculative_feature_kind = llama_spec_feature_kind;
@@ -28,9 +30,20 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // note: clears the memory of the context
 bool common_speculative_is_compat(llama_context * ctx_tgt);
 
+// Bug #232 (PXA_SPEC_PERSLOT_v2): the MTP companion context, shareable between several
+// common_speculative objects. A server that gives every slot its OWN speculative object (required
+// whenever the chain has a non-MTP stage: n-gram tables, reset streaks and draft ramps are not
+// seq-keyed) still wants ONE companion -- it is built with n_seq_max = n_parallel and every call into
+// it is routed by seq id. Pass the same handle to every common_speculative_init; the first MTP stage
+// that builds a companion (eagerly or on lazy first use) stores it here and every other one binds to
+// it instead of building its own. The companion is freed with the last object holding the handle.
+struct common_speculative_mtp_companion;
+std::shared_ptr<common_speculative_mtp_companion> common_speculative_mtp_companion_new();
+
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt);
+        llama_context             * ctx_tgt,
+        const std::shared_ptr<common_speculative_mtp_companion> & companion = nullptr);
 
 void common_speculative_free(common_speculative * spec);
 
@@ -102,6 +115,12 @@ bool common_speculative_take_draft_q(common_speculative * spec, llama_seq_id seq
 // sequences, so per-sequence state must be told which one this is.
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted, llama_seq_id seq_id);
 
+// Bug #228: how many of this sequence's drafted tokens the caller actually VERIFIED, after its own
+// truncation (n_draft_max, the np>1 uniform-batch equalizer). Accept feedback measures acceptance
+// against this length -- a token the caller cut off was never tested, so it can be neither accepted
+// nor rejected. Call it after draft() and before accept() for the same seq; unset = the full draft.
+void common_speculative_set_verified_len(common_speculative * spec, llama_seq_id seq_id, size_t n_verified);
+
 // PXA_SPEC_MTP_LAZY_v1 (2026-09-15): true when the chain carries an MTP stage whose companion
 // context has been deferred to first use -- the caller must behave exactly as it would for a
 // chain with no MTP stage at all until common_speculative_mtp_is_live() turns true.
@@ -138,6 +157,12 @@ bool common_speculative_mtp_zero_output_commit();
 // Arm (or disarm) the zero-output commit as a DEFAULT for a model family that measured it. An
 // explicit PXA_MTP_ZERO_OUTPUT_COMMIT in the environment always wins. Call before the first decode.
 void common_speculative_mtp_zero_output_commit_set_default(bool on);
+
+// PXA_SPEC_DEPTH_NMAX: arm a context-depth -> MTP draft-depth cap ("D0:N0,D1:N1,...") as the DEFAULT
+// for a device the PXA_AUTO layer measured it on. An explicit PXA_SPEC_DEPTH_NMAX always wins.
+void common_speculative_mtp_depth_nmax_set_default(const char * spec);
+// The resolved cap as text ("off" when none), for the server's startup line.
+std::string common_speculative_mtp_depth_nmax_desc();
 
 // Commit an accepted verify step into the MTP head's K/V cache.
 //

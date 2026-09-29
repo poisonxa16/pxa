@@ -47,13 +47,10 @@ fork adds are what it is actually for. PXA's own weights are at
 your browser, `wget`, or `huggingface-cli`, and note where it landed. The rest of this page
 calls it `your-model.gguf`.
 
-> **Keep PXQ models on the card.** PXQ is decoded by GPU kernels written for these cards, so
-> `-ngl 99` — every layer on the GPU — is what you want and what every number here was measured
-> at. A PXQ file will also run fully on the CPU if you ask it to (`-ngl 0`, no card visible),
-> which is handy for checking that a file you just made is sound while the card is busy; expect
-> it to be slow, and slowest at the PXQ2, PXQ3 and PXQ6 tiers, which fall back to a plain
-> unpacking loop rather than the tuned one PXQ4 gets. It is a way to check a file, not a way to
-> serve one.
+> **The one hard rule for PXQ models.** PXQ has **no CPU codec**. A PXQ model must be fully
+> GPU-resident: always pass `-ngl 99`, and never `--n-cpu-moe` or a partial `-ngl`. The engine
+> aborts at the first expert op otherwise. This does not apply to ordinary Q4_K_M / MXFP4 /
+> Q8_0 files, which run partially offloaded as usual.
 
 ---
 

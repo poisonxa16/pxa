@@ -80,97 +80,6 @@ both competitor files on NVMe beside this engine's file.
 | prefill, 8,192 tok | **1,013.01** | 982.01 | 421.63 | +3.2% | 🟢 |
 | prefill, 20,801 tok | **946.96** | 929.03 | 371.82 | +1.9% | 🟢 |
 
-### Decode, launcher's tensor-split default — capture `main`, 2026-09-21 (`release/rc4/logs/board-v100-tsdefault.txt`)
-
-Cards 2/4, REPS 6, greedy (temp 0, top-k 1), `-np 1`, `n_predict` 256, first-pass medians, host
-load average under 8 for every arm below. **The launcher's `--sm auto` now resolves to `-sm tensor
--ts 1,1` on this pair**, with the fused reduce at both decode and prefill
-(`PXA_TSPLIT_REDUCE=fused PXA_TSPLIT_REDUCE_PREFILL=1`, `PXA_TSPLIT_FALLBACK=1` — see
-`docs/LEVERS.md`) and the engine's automatic speculation armed — that bare command line, no flags,
-is what an operator gets by default on a matched V100 pair now. Gate on this exact packaged
-binary, this exact path, `--sm auto`: **PASS=13 FAIL=0 SKIP=0**, plus a two-slot needle at 0/8 bad
-(`release/rc4/logs/gate-qwen-v100-tensor-fused.md`).
-
-| class | shipped default NOW (`-sm tensor`, auto spec) | previous default (`-sm layer`, auto spec) | tensor split + cascade | layer split + cascade | mainline, plain | mainline, best arm |
-|---|---|---|---|---|---|---|
-| prose | **68.58** | 50.99 | 80.18 | 64.67 | 45.22 | 58.86 |
-| repetition (code edit) | **107.37** | 85.70 | 139.79 | 101.62 | 41.74 | 80.49 |
-| long context (~15k) | **43.58** | 35.53 | 37.61 | **47.78** | 26.94 | 46.07 |
-| prefill, short/mid/long (t/s) | 120 / 526 / 850 | 104 / 656 / 1,020 | — | — | — | — |
-
-- *shipped default NOW* = the bare `./pxa-launch` command line on this pair: `--sm auto` picks
-  `tensor`, fused reduce at decode and prefill, the n-gram stage armed automatically.
-- *previous default* = the same bare command line under the prior release's launcher (`-sm layer`),
-  same window — kept as a labelled comparison row, no longer what ships.
-- *tensor split + cascade* = `-sm tensor` plus
-  `--spec-type ngram:n_max=64,n_min=2,ngram_size_n=24 --spec-type mtp:n_max=2` — the fastest arm on
-  this page for prose and repetition.
-- *layer split + cascade* = the same cascade under `-sm layer` (rc5pack's same-bracket
-  measurement) — the fastest arm for long context, see below.
-- *mainline, plain / best arm* = stock llama.cpp at its own best on this pair, `-sm tensor` with
-  `GGML_CUDA_ALLREDUCE=internal` (mainline's own tensor split is its best configuration here too),
-  plain and its own `ngram-mod,draft-mtp` cascade; same-bracket capture `rc5pack`, drift 0.26–0.88%
-  against a 1.50% band. Acceptance beside the speculative cells: ours 0.79 prose / 0.77 edit / 0.65
-  long; mainline 0.58 / 0.78 / 0.60.
-
-**Best arm against best arm is not the same arm in every cell, and every board cell above already
-reflects that.** Prose and repetition are won by the **tensor split + cascade** (80.18, 139.79)
-against mainline's best (58.86, 80.49) — 🟢 +36.1% / +73.7%. Long context is won by the **layer
-split + cascade** (47.78) against mainline's own best cascade (46.07) — 🟢 +3.7%, the release-gate
-cell above — **not** by the tensor split's own cascade (37.61), which trails mainline outright at
-this class. **Say it plainly: for long-context speculative work, run `-sm layer` with the cascade,
-not the launcher's own `-sm auto` default.** The tensor split's MTP verify step gets slower at
-depth under the split — every verify batch has to cross both cards before the next one can start,
-and that cost compounds with the longer KV cache this class exercises — while `-sm layer`'s verify
-step stays on one card. `--sm auto` still picks `tensor` for this pair because the default is
-tuned for plain decode, not for the speculative long-context case; pass `-sm layer` by hand for
-that one.
-
-**Prefill is the tensor split's honest trade, on this box's PCIe.** Over the x4 risers this rig
-uses, the tensor-split default reads 850 t/s at long-context prefill against the layer split's
-1,020 — the split's activation reduce crosses the link every layer, and that costs more than
-prefill's larger batches make back. It is still faster than stock llama.cpp's own tensor split on
-this file class: 817 t/s against mainline's 590 in the comparable window. **Decode also gives back
-some of its lead when other jobs load the host's CPUs** — both cards must launch every step
-together under the split, and a busy host desynchronises that handshake in a way `-sm layer` does
-not suffer; every number in the table above was taken on a quiet host (load average under 8) and a
-loaded host will read lower.
-
-### 2× V100 (sm_70) — Gemma 4 26B-A4B, re-measured on the package — capture `rc4pack3`, 2026-09-21
-
-Same window, same shapes. This engine on the PXQ4 file; stock llama.cpp on Google's own QAT
-`q4_0` file, `-sm tensor` with the internal all-reduce, `--jinja`. Gemma 4 is `-sm layer` only on
-this engine, which is what the launcher picks.
-
-| class | this engine, plain | this engine, shipped default | stock llama.cpp, q4_0 | |
-|---|---|---|---|---|
-| prose | 107.03 | **159.33** | 93.14 | 🟢 +71.1% |
-| repetition (code edit) | 104.64 | 102.92 | 91.62 | 🟢 +14.2% |
-| long context (~15k) | 91.73 | **104.59** | 86.54 | 🟢 +20.9% |
-
-Plain control 107.03 open / 106.64 close (−0.36%). The repetition class is the one place the
-drafter does not pay on this model: 102.92 with it against 104.64 without, i.e. inside a point and a
-half of each other, and the plain figure is the one quoted as the engine's floor.
-
-### Competitor arms measured on 2026-09-20, kept for the record
-
-These five numbers appear in the README's head-to-head section. They are **stock llama.cpp**
-(`@4c9233c0`, 2026-09-15) and this engine on the competitor's own file, measured on the V100 pair at
-REPS 3, `n_predict` 256, `-c 16384`, `-np 1`, a distinct salted prompt per rep, shapes `s-g0`
-(greedy) and `s-t1` (temp 1.0, top-p 0.95, top-k 20). Where a cell above re-measures the same thing
-at REPS 6 in a bracket, **the re-measured cell is the one that counts**; these stay because a
-published number is not deleted.
-
-| arm | shape | median t/s | what it is |
-|---|---|---|---|
-| `ml-tensor-plain-i` | s-g0 | 46.64 | mainline, `-sm tensor`, `GGML_CUDA_ALLREDUCE=internal`, no drafting |
-| `ml-tensor-mtp3` | s-g0 | 56.33 | mainline, same, `--spec-type draft-mtp --spec-draft-n-max 3` |
-| `ml-tensor-mtp3` | s-t1 | 60.17 | the same arm at temperature 1.0 |
-| `m-plain` | long-g | 42.0 | mainline plain, the long-context class, rep 2 of 3 |
-| `q4ks-ours-split-plain` | s-g0 | 47.51 | **this engine on mainline's own Q4_K_S file**, tensor split, no drafting |
-
----
-
 **Decode, at this release's new Volta default, same-bracket against the current head** — capture
 `pair-settle`, 2026-09-14, cards 2/4, bracket drift **−0.63%** (control 38.25 open / 38.01 close)
 
@@ -322,46 +231,34 @@ at a near-tie.
 batch crosses that kernel-selection boundary, so the speculation multiplier on four P100s is smaller
 than the one on two V100s. Narrowing it is a kernel question, and it is on the next-release list.
 
-**Equal codec — this engine on the competitors' `Q4_K_S` file.** Informational only, not a release
-gate: this engine is built and tuned for its own PXQ format, and the rows below show it running
-someone else's — a decomposition of where the codec's own effect ends and the engine's begins, kept
-for transparency, not a product claim.
-
-Capture `rc5pack`, 2026-09-21, on the packaged binary, same window/same bracket for each pair of
-rows unless noted.
+**Equal codec — this engine on the competitors' `Q4_K_S` file** (decomposition, not a product number):
 
 | class | this engine on their file | mainline, best | what it says |
 |---|---|---|---|
-| prefill, 3,121 tok, bare | **248.78** | 213.72 | this engine 16.4% faster |
-| prefill, 3,121 tok, `-b 2048 -ub 1024` | 195.93 | 206.32 | mainline 5.3% faster at this shape; **bare stays the better arm for both engines here** |
-| prefill, 20,801 tok, bare | 233.71 | 266.57 | mainline 12.3% faster |
-| prefill, 20,801 tok, `-b 2048 -ub 1024` | 201.00 | **286.34** | mainline 42.4% faster at this shape; **`-ub 1024` is mainline's best arm at this length, and this engine's worst** |
-| decode, control | **43.39** | 35.97 | this engine 20.6% faster (same-bracket) |
-| decode, repetition | 14.18 | **19.51** | mainline 37.6% faster (same-bracket) |
-| decode, prose | **24.63** | 14.36 | this engine 71.6% faster (same-bracket) |
+| prefill, 3,121 tok | 198.52 | 212.83 | mainline **7.2% faster** |
+| prefill, 20,801 tok | 172.63 | 266.28 | mainline **54.2% faster** |
+| decode, control | **43.49** | 35.92 | this engine 21.1% faster (same-bracket) |
+| decode, repetition | 14.15 | **19.54** | mainline 38.1% faster (same-bracket) |
+| decode, prose | **25.14** | 14.33 | this engine 75.4% faster (same-bracket) |
 
-**Best-arm-vs-best-arm, each engine free to pick its own shape:** prefill/3,121 — this engine's
-bare (248.78) beats mainline's best, also bare (213.72), **+16.4%**. prefill/20,801 — this engine's
-bare (233.71) is beaten by mainline's best, `-ub 1024` (286.34), **mainline 22.5% faster** — wider
-than the bare-vs-bare gap (12.3%), because `-ub 1024` helps mainline's file at this length and hurts
-this engine's read of the same file at both lengths (195.93 and 201.00, both below its own bare
-numbers). The lever main's llama-bench probe pointed at narrows one cell and widens the other; both
-are reported as measured.
+Both prefill rows are a clean, same-bracket decomposition from `lb4-quad-clean`: no batch flags on
+either side, so the `-b`/`-ub` confound this page used to carry here is gone. **All three decode rows
+are now a clean, same-bracket decomposition too** — capture `quadrep2-w1` (2026-09-14, REPS 6, drift
+0.34%) measured this engine's bare-boot arm (`ours-mlfile`, unforced, auto-arms the n-gram stage alone)
+and mainline's own best cascade (`ml-casc`, `ngram-mod,draft-mtp`) on `Q4_K_S` inside one continuous
+window, closing the same-bracket arm and the missing prose class both owed on the last cut. **This
+engine leads two of the three decode classes at equal codec** (control, prose) **and trails on
+repetition** — the row still never wins a cell against the PXQ4 headline above, that was never the
+point of it. **Speculation is not inert on `Q4_K_S` on these four cards** — the cascade buys +118% on
+the control class over this engine's own plain arm there (29.23 against 13.43) — which is worth
+knowing beside the PXQ4 rows above.
 
-All three decode rows and both bare prefill rows are a clean, same-bracket decomposition (captures
-`rc5pack-lb4-quad` and `rc5pack-lb4-decode-rep`, drift 0.29% and 0.04%); the two `-ub 1024` rows are
-their own same-bracket pair (capture `rc5pack-lb4-ub1024b`, drift 0.06%). **This engine leads two of
-the three decode classes at equal codec** (control, prose) **and trails on repetition** — the row
-still never wins a cell against the PXQ4 headline above, that was never the point of it.
-**Speculation is not inert on `Q4_K_S` on these four cards** — mainline's own cascade arm (`ml-casc`)
-reads 35.97 control against 12.90 for its own plain bracket control — which is worth knowing beside
-the PXQ4 rows above.
 
-The equal-codec rows deserve their own sentence, because they are the ones most likely to be read as
-an evasion if not said plainly: **at equal codec, this engine leads mainline at prefill/3,121 and
-decode/control and decode/prose, and trails at prefill/20,801 and decode/repetition** — a mixed
-picture, not a clean win, on a format this engine does not target. Every number here is on the page
-because it was measured, and none of them end by being left out.
+The equal-codec prefill row deserves its own sentence, because it is the one most likely to be read as
+an evasion if it is not said plainly: **on the numbers measured so far, this engine is slower than
+mainline at running mainline's own quantisation format** — 7.2% slower at 3,121 tokens and 54.2%
+slower at 20,801. It is on this page because, gap and all, it is what was measured, and it will not
+end by being left out.
 
 **Two competitor facts these windows confirmed:**
 
@@ -479,20 +376,14 @@ See `bench/fair-battle.md` for the values and the windows that produced them.
 
 ## Open red cells — the release gate
 
-**No product cell is red in this cut.** Every row on this page that measures this engine on its
-own PXQ format — the format it is built for — is green. The equal-codec rows (this engine reading
-the competitors' own `Q4_K_S` file) are **not release gates**: they are a decomposition kept for
-transparency, answering "is the engine or the codec doing the work," not a product claim, and they
-are not held to green-or-exhausted the way a shipping cell is. See the "Equal codec" section above
-for their current numbers.
+Each is **red-open** until the work beside it is finished and measured, at which point it becomes green
+or **red-exhausted** with its cause written out. No cell on this list is closed by a deadline.
 
-A cell on this list is **red-open** until the work beside it is finished and measured, at which
-point it becomes green or **red-exhausted** with its cause written out. No cell is closed by a
-deadline. **There is nothing on the list this cut.**
+| cell | card set | standing | what is being tried |
+|---|---|---|---|
+| **prefill, equal codec** | 4× P100 | this engine on the competitor's own file: 198.52 vs 212.83 at 3,121 tok (mainline 7.2% faster), 172.63 vs 266.28 at 20,801 tok (mainline 54.2% faster) | the batching confound is resolved — both sides are now the bare command line. No lever has yet been tried against this specific codec/kernel gap |
 
-**Six cells left this list this cut** and are not on it: the four-card equal-codec prefill and
-decode rows, moved to "not a release gate" above rather than closed (see the "Equal codec" section
-for the current numbers); the four-card prefill headline (420.23 vs
+**Five cells left this list this cut** and are not on it: the four-card prefill headline (420.23 vs
 266.28 at 20,801 tokens), the four-card decode control cell (95.57 vs 46.17, red-open for one day on a
 diagnosis that turned out to be wrong — see the section above), the pair's np1 decode
 control/repetition/prose row against the current head, which was *settling* and is now closed green on

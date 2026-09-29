@@ -314,7 +314,10 @@ static inline bool pxa_moe_shard_gateup(ggml_backend_cuda_context & ctx,
     const int64_t dst_nb2_f = (int64_t)(dst->nb[2]/sizeof(float));
     const size_t need = (size_t)Ny*dst_nb2_f*sizeof(float);
     auto & sh = pxa_moe_shadow_st(ctx.device);
-    if (sh.cap < need) { if (sh.scratch) cudaFree(sh.scratch); cudaMalloc(&sh.scratch, need); sh.cap = need; }
+    if (sh.cap < need) {
+        if (sh.scratch) { ggml_cuda_alloc_generation_bump(); cudaFree(sh.scratch); }   // bug #230
+        cudaMalloc(&sh.scratch, need); sh.cap = need;
+    }
     // seed staging with the current dst so untouched rows (SER -1) survive the copy-back
     // Fix B: non-shadow writes DIRECTLY into dst (zeroed first); home writes its rows,
     // each peer's disjoint rows arrive via a device-local staging gathered + added home.

@@ -588,6 +588,10 @@ struct parser_executor {
         }
 
         if (result.need_more_input()) {
+            if (p.settled) {
+                // The child may still match once more input arrives: treat it as a match (bug #222).
+                return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start_pos);
+            }
             // Propagate - need to know what child would match before negating
             return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos);
         }
@@ -1038,7 +1042,7 @@ std::string common_peg_arena::dump_impl(common_peg_parser_id                    
         } else if constexpr (std::is_same_v<T, common_peg_and_parser>) {
             return "And(" + dump_impl(p.child, visited) + ")";
         } else if constexpr (std::is_same_v<T, common_peg_not_parser>) {
-            return "Not(" + dump_impl(p.child, visited) + ")";
+            return std::string(p.settled ? "NotSettled(" : "Not(") + dump_impl(p.child, visited) + ")";
         } else if constexpr (std::is_same_v<T, common_peg_atomic_parser>) {
             return "Atomic(" + dump_impl(p.child, visited) + ")";
         } else if constexpr (std::is_same_v<T, common_peg_gbnf_parser>) {
@@ -1854,6 +1858,9 @@ static nlohmann::json serialize_parser_variant(const common_peg_parser_variant &
         } else if constexpr (std::is_same_v<T, common_peg_and_parser>) {
             return json{{"type", "and"}, {"child", p.child}};
         } else if constexpr (std::is_same_v<T, common_peg_not_parser>) {
+            if (p.settled) {
+                return json{{"type", "not"}, {"child", p.child}, {"settled", true}};
+            }
             return json{{"type", "not"}, {"child", p.child}};
         } else if constexpr (std::is_same_v<T, common_peg_any_parser>) {
             return json{{"type", "any"}};
@@ -1973,7 +1980,8 @@ static common_peg_parser_variant deserialize_parser_variant(const nlohmann::json
         if (!j.contains("child")) {
             throw std::runtime_error("not parser missing 'child' field");
         }
-        return common_peg_not_parser{j["child"].get<common_peg_parser_id>()};
+        return common_peg_not_parser{j["child"].get<common_peg_parser_id>(),
+                                     j.contains("settled") && j["settled"].get<bool>()};
     }
     if (type == "any") {
         return common_peg_any_parser{};

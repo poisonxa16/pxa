@@ -18,7 +18,7 @@ Pick the **tarball** path or the **Docker** path. They end up in the same place.
 
 ```bash
 mkdir -p ~/pxa && cd ~/pxa
-curl -L -O https://github.com/poisonxa16/pxa/releases/download/v2026.09.20/pxa-v2026.09.20-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+curl -L -O <<RELEASE-URL>>
 tar xzf pxa-v2026.09.20-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
 cd pxa-v2026.09.20
 ```

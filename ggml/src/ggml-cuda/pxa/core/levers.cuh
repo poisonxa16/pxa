@@ -34,6 +34,9 @@ enum pxa_lever_id {
     PXA_LEVER_FA_SWA_KEEP,       // keep n_swa in op_params[4] for the mask-driven KV scan
     PXA_LEVER_SM60_FA_VEC_F32,   // sm_60 decode -> fp32-accumulating vec kernel
     PXA_LEVER_CORE_ROUTES,       // print the route census at exit
+    PXA_LEVER_FA_QKV_DIRECT,     // sm_60 narrow FA reads a q4_0/q8_0 K/V cache in place, GQA group per block
+    PXA_LEVER_FA_QKV_TILE,       // sm_60 wide FA reads a q4_0/q8_0 K/V cache in place (no f16 conversion)
+    PXA_LEVER_FA_QKV_DIRECT_VOLTA, // sm_70 narrow FA takes the QKV_DIRECT kernel too (no whole-cache f16 conversion)
     PXA_LEVER_COUNT
 };
 

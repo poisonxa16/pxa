@@ -706,6 +706,36 @@ static inline int pxa_fa_gqa_pack() {
     return nh;
 }
 
+// PXA_FA_GQA_FIRE (2026-09-01) — engagement instrument, host-side only, no device code touched.
+//
+// docs/LEVERS.md:902 VOIDED a complete A/B of PXA_FA_GQA_PACK because the resolver banner above
+// proves only that the environment variable was PARSED. It says nothing about whether the packed
+// kernel was ever DISPATCHED: the launch gate additionally requires cols_per_block == 1, Dk == Dv
+// == 256, K == V == f16, no logit softcap, and NH to divide BOTH n_head and gqa_ratio. On this
+// seat (qwen4exp, n_head 24 / n_head_kv 2 -> gqa_ratio 12) NH=8 fails that last test silently and
+// runs the stock kernel, so an "NH=8" banner would have described a control arm.
+//
+// These two hooks sit on the actual dispatch path and report the resolved decision plus a live
+// launch count on a logarithmic ladder (1/10/100/1k/10k then every 100k). At 12 attention layers
+// this is ~12 launches per decoded token, i.e. one line per ~8.3k tokens after the ladder.
+static inline void pxa_fa_gqa_fire(int nh, int n_head, int gqa_ratio, bool qsmem) {
+    static long long n = 0;
+    ++n;
+    if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 || (n % 100000) == 0) {
+        fprintf(stderr, "PXA_FA_GQA_FIRE: FIRED launches=%lld NH=%d n_head=%d gqa_ratio=%d qsmem=%d\n",
+                n, nh, n_head, gqa_ratio, qsmem ? 1 : 0);
+    }
+}
+
+static inline void pxa_fa_gqa_decline(int nh_env, int n_head, int gqa_ratio) {
+    static bool once = false;
+    if (!once) {
+        once = true;
+        fprintf(stderr, "PXA_FA_GQA_FIRE: DECLINED nh_env=%d n_head=%d gqa_ratio=%d -> stock per-head vec kernel\n",
+                nh_env, n_head, gqa_ratio);
+    }
+}
+
 // PXA_FA_GQA_QSMEM: stage the NH query rows in shared memory instead of registers, trading a
 // shared load per dot term for ~64 registers at NH=8 (the difference between 1 and 2 blocks/SM).
 // Only the NH=4 and NH=8 kernels carry the twin.
@@ -740,20 +770,26 @@ void ggml_cuda_flash_attn_ext_vec_f32_case_impl(ggml_backend_cuda_context & ctx,
             constexpr size_t nbytes_shared_g = 0;
             switch (nh) {
                 case 2:
+                    pxa_fa_gqa_fire(2, n_head, gqa_ratio, false);
                     launch_fattn<Dv, cols_per_block, 2>(ctx, dst, flash_attn_vec_ext_f32_gqa<Dv, 2, false>,
                             nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
                     return;
                 case 4:
+                    pxa_fa_gqa_fire(4, n_head, gqa_ratio, qs);
                     launch_fattn<Dv, cols_per_block, 4>(ctx, dst,
                             qs ? flash_attn_vec_ext_f32_gqa<Dv, 4, true> : flash_attn_vec_ext_f32_gqa<Dv, 4, false>,
                             nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
                     return;
                 case 8:
+                    pxa_fa_gqa_fire(8, n_head, gqa_ratio, qs);
                     launch_fattn<Dv, cols_per_block, 8>(ctx, dst,
                             qs ? flash_attn_vec_ext_f32_gqa<Dv, 8, true> : flash_attn_vec_ext_f32_gqa<Dv, 8, false>,
                             nwarps, nbytes_shared_g, Dv, need_f16_K_g, need_f16_V_g);
                     return;
                 default:
+                    if (nh_env) {
+                        pxa_fa_gqa_decline(nh_env, n_head, gqa_ratio);
+                    }
                     break;
             }
         }
@@ -762,7 +798,7 @@ void ggml_cuda_flash_attn_ext_vec_f32_case_impl(ggml_backend_cuda_context & ctx,
         // twin, so compile cost is one extra kernel.
         static const bool vilp = [](){
             const char * e = getenv("PXA_FA_VEC_ILP");
-            const bool on = !(e && atoi(e) == 0);
+            const bool on = e ? atoi(e) != 0 : pxa_gate_default(true);   // bug #281: off at REFERENCE
             fprintf(stderr, "PXA_FA_VEC_ILP: %s (D=256 decode V-pass 4-way ILP; PXA_FA_VEC_ILP=0 reverts)\n", on ? "ON" : "OFF");
             return on;
         }();

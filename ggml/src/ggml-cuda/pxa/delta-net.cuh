@@ -24,3 +24,11 @@ void ggml_cuda_op_delta_net_ex(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 // exactly ggml_cuda_op_delta_net_ex.
 void ggml_cuda_op_delta_net_ex2(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_dst_override,
                                 const int32_t * state_dst_row_idx, int64_t state_dst_row_stride);
+
+// PXA_DN_INPLACE (2026-09-27): as ex2, and when state_in_mask is not null the carried state is READ from
+// the same device-resolved row it is written to (each element read and written by the same thread),
+// multiplied by state_in_mask[0] -- the reset mask the eager GET_ROWS + MUL would have applied. The
+// private gathered copy (and its full-row round trip) is gone; n_seqs must be 1.
+void ggml_cuda_op_delta_net_ex3(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_dst_override,
+                                const int32_t * state_dst_row_idx, int64_t state_dst_row_stride,
+                                const float * state_in_mask);

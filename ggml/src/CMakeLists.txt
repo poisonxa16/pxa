@@ -346,6 +346,17 @@ if (GGML_CUDA)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "ggml-cuda/pxa/template-instances/mmvq-instance*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        # the closed PXQN sources never go into libggml: they build libggml-pxqn below
+        set(GGML_SOURCES_PXQN_CUDA
+            ggml-cuda/pxa/pxqn.cu
+            ggml-cuda/pxa/pxqn-epi.cu
+            ggml-cuda/pxa/pxqn-api-impl.cu
+            ggml-cuda/pxa/pxq4-rb.cu
+            ggml-cuda/pxa/template-instances/mmvq-instance-pxqn4.cu
+            ggml-cuda/pxa/template-instances/mmvq-instance-pxqn4s8.cu)
+        foreach(_pxqn_src ${GGML_SOURCES_PXQN_CUDA})
+            list(REMOVE_ITEM GGML_SOURCES_CUDA ${CMAKE_CURRENT_SOURCE_DIR}/${_pxqn_src})
+        endforeach()
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-wmma*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-mma*.cu")
@@ -1173,7 +1184,7 @@ endif()
 set(CUDA_CXX_FLAGS "")
 
 if (GGML_CUDA)
-    set(CUDA_FLAGS -use_fast_math -extended-lambda -lineinfo)
+    set(CUDA_FLAGS -use_fast_math -extended-lambda)
 	message("-- CUDA Toolkit: ${CUDAToolkit_VERSION}")
     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
         # Options are:
@@ -1536,6 +1547,8 @@ add_library(ggml
             pxq-dot.h
             pxq-cpu-ops.cpp
             pxq-cpu-ops.h
+            ggml-pxqn-api.h
+            ggml-pxqn-loader.cpp
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}
@@ -1580,4 +1593,39 @@ endif()
 if (BUILD_SHARED_LIBS)
     set_target_properties(ggml PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(ggml PRIVATE GGML_SHARED GGML_BUILD)
+endif()
+target_link_libraries(ggml PRIVATE ${CMAKE_DL_LIBS})   # ggml-pxqn-loader.cpp
+
+# libggml-pxqn: the closed PXQN library, built from source only in the private tree. Same
+# directory scope as ggml, so it gets ggml's compile options, definitions and CUDA flags; loaded by libggml at run
+# time from its own directory, so it is a separate shared object that exports ONE symbol (ggml_pxqn_get_api).
+if (PXA_PXQN_CLOSED_SRC)
+    if (NOT BUILD_SHARED_LIBS)
+        message(WARNING "PXA_PXQN_CLOSED_SRC=ON needs BUILD_SHARED_LIBS=ON (libggml-pxqn is loaded next to libggml.so); "
+                        "this static build has no PXQN support")
+    else()
+        set(_pxqn_srcs pxqn-cpu.c pxqn-lib.cpp)
+        if (GGML_CUDA)
+            list(APPEND _pxqn_srcs ${GGML_SOURCES_PXQN_CUDA})
+        endif()
+        add_library(ggml-pxqn SHARED ${_pxqn_srcs})
+        execute_process(COMMAND git -c safe.directory=* rev-parse --short=10 HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                        OUTPUT_VARIABLE _pxqn_rev OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if (NOT _pxqn_rev)
+            set(_pxqn_rev "unknown")
+        endif()
+        target_compile_definitions(ggml-pxqn PRIVATE ${GGML_CDEF_PUBLIC} GGML_SHARED GGML_BUILD
+                                   $<$<CONFIG:Release>:NDEBUG> PXA_PXQN_BUILD_ID="${_pxqn_rev}")
+        target_include_directories(ggml-pxqn PRIVATE . ../include ${GGML_EXTRA_INCLUDES})
+        target_compile_features(ggml-pxqn PRIVATE c_std_11)
+        set_target_properties(ggml-pxqn PROPERTIES POSITION_INDEPENDENT_CODE ON
+                              C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden)
+        target_link_libraries(ggml-pxqn PRIVATE ggml Threads::Threads ${GGML_EXTRA_LIBS})
+        target_link_options(ggml-pxqn PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/ggml-pxqn.map"
+                            "LINKER:-Bsymbolic" "LINKER:--no-undefined")
+        set_target_properties(ggml-pxqn PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ggml-pxqn.map)
+        if (MATH_LIBRARY)
+            target_link_libraries(ggml-pxqn PRIVATE ${MATH_LIBRARY})
+        endif()
+    endif()
 endif()

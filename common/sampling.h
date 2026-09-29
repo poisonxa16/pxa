@@ -292,6 +292,14 @@ void llama_sampling_set_rng_seed(struct common_sampler * ctx, uint32_t seed);
 // Copy the sampler context
 void common_sampler_clone(common_sampler * src, common_sampler * dst);
 
+// Rewind dst to the checkpoint ckpt after a speculative rejection (bug #209). Everything a
+// rejected draft may have advanced comes back from the checkpoint (grammar, penalties/prev, DRY,
+// adaptive-p history, reasoning budget, mirostat), EXCEPT the random generators -- the sampler's
+// own and the adaptive-p sampler's separate one: the verify's random draws are spent.
+// Restoring the RNG as well made the next step reuse the same uniforms after every rejection, so
+// at temperature > 0 the output stopped sampling the model's distribution.
+void common_sampler_rewind_keep_rng(common_sampler * ckpt, common_sampler * dst);
+
 // Get the last sampled token
 llama_token llama_sampling_last(common_sampler * ctx);
 
@@ -366,8 +374,23 @@ std::vector<llama_token> llama_sampling_sample_and_accept_n(struct common_sample
 // probability min(1, p/q), otherwise emit a draw from the residual -- instead of by exact match. A
 // position with an empty entry (an n-gram stage, say, which proposes tokens with no distribution)
 // falls back to exact matching, so a mixed chain stays correct.
+//
+// Bug #212: `cur_p_out`, when set, receives a copy of the post-chain candidate window of EVERY
+// position sampled (one entry per returned token, in order), so a caller reporting post-sampling
+// probabilities can give each emitted token its own window instead of the last position's.
+// PXA_VERIFY_ARGMAX (2026-09-28): true when this request's draw is the plain argmax of
+// the raw logit row -- temp == 0, no grammar, no active penalties, no logit bias / server bias /
+// expiring bias, no reasoning budget still able to force, no probabilities asked for -- so a verify can
+// be decided from the device-side argmax alone (llama_set_argmax_only).
+bool common_sampler_pure_greedy(const struct common_sampler * gsmpl);
+// The exact-match verify of common_sampler_sample_and_accept_n for a pure-greedy request whose verify
+// decode was argmax-only: same acceptance, same accept() side effects. Empty result = the argmax rows
+// are not available (the caller falls back; the decode then copied logits and nothing was consumed).
+std::vector<llama_token> common_sampler_accept_n_argmax(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const std::vector<llama_token> & draft);
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const std::vector<llama_token> & draft, bool grammar_first = false,
-        const std::vector<std::vector<pxa_spec_cand>> * draft_q = nullptr);
+        const std::vector<std::vector<pxa_spec_cand>> * draft_q = nullptr,
+        std::vector<std::vector<llama_token_data>> * cur_p_out = nullptr);
 
 // Greedy argmax sampling for speculative drafting
 // PXA_MTP_PMIN_TOPK_v1: the largest top-k window the renormaliser will keep on the stack.
@@ -387,7 +410,7 @@ float common_sampler_prob_topk_renorm(int n, const float * logits, float max_val
 // The top-k form is also cheaper: k exponentials instead of n_vocab.
 llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob = nullptr, int p_min_top_k = 0);
 
-// PXA_SPEC_SAMPLED (default OFF): draw the draft token from the draft head's own distribution,
+// PXA_SPEC_SAMPLED (default ON since v2026.10): draw the draft token from the draft head's own distribution,
 // filtered with this request's sampler parameters, and hand that distribution back in `q_out` so the
 // verifier can run the lossless accept/residual rule on it. Returns the drawn token, or -1 when this
 // request's sampler chain cannot be mirrored onto the draft head (the caller then keeps its greedy
@@ -403,6 +426,10 @@ bool common_sampler_spec_sampled_ok(const struct common_sampler * gsmpl, struct 
 
 // PXA_SPEC_SAMPLED as the sampler resolves it. Read-only; for the startup banner and ledgers.
 bool common_sampler_spec_sampled_active();
+
+// PXA_SPEC_BLOCK_VERIFY (default off) as the sampler resolves it (PXA_SPEC_SAMPLED and the block switch both on):
+// a sampled draft of two or more tokens is accepted jointly. Read-only; for the startup banner.
+bool common_sampler_spec_block_verify_active();
 
 // PXA_SPEC_RELAXED as the sampler resolves it (env, else the config level): true means a draft
 // token inside the target's post-filter candidate set with p >= pmin is kept at temp>0 instead of

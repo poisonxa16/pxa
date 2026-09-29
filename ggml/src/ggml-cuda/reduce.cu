@@ -480,18 +480,24 @@ static bool pxa_reduce_pinned_run(ggml_backend_cuda_context & ctx, ggml_tensor *
 // the next reduce. A wrong number that announces itself beats a wedged card.
 // ---------------------------------------------------------------------------
 
-#define PXA_TS_POOL          4                   // staging slots per device
+// PXA_TS_POOL / PXA_TS_FLAG_STRIDE / PXA_TS_SPIN_MAX, pxa_ts_task and the epilogue kernel: pxa/pxa-tsplit-epi.cuh
+#include "pxa/pxa-tsplit-epi.cuh"
 #define PXA_TS_BLOCKS        8
 #define PXA_TS_THREADS       256
-#define PXA_TS_FLAG_STRIDE   64                  // bytes: one line per (slot, block)
-#define PXA_TS_SPIN_MAX      100000000ll
 
 enum pxa_ts_route { PXA_TS_OFF = 0, PXA_TS_FUSED, PXA_TS_P2P, PXA_TS_PINNED, PXA_TS_NCCL };
 
 static int pxa_tsplit_route() {
     static const int v = [](){
         const char * e = getenv("PXA_TSPLIT_REDUCE");
-        if (!e || !*e)                 return (int)PXA_TS_OFF;
+        // Unset: fused is the engine default for -sm tensor (it was only set by the launcher, so a bare
+        // llama-server/llama-bench ran the slower staged ring: PXQN4 2x P100 27.3 vs 30.1 t/s). Every
+        // group that does not peer end to end (incl. pairs the P2P self-test marked bad) still takes the
+        // staged route in pxa_tsplit_reduce_handles(). PXA_REFERENCE=1 keeps the stock route.
+        if (!e || !*e) {
+            const char * r = getenv("PXA_REFERENCE");
+            return (r && atoi(r) != 0) ? (int)PXA_TS_OFF : (int)PXA_TS_FUSED;
+        }
         if (!strcmp(e, "fused"))       return (int)PXA_TS_FUSED;
         if (!strcmp(e, "p2p"))         return (int)PXA_TS_P2P;
         if (!strcmp(e, "pinned"))      return (int)PXA_TS_PINNED;
@@ -530,7 +536,26 @@ static bool pxa_ts_pull()     { static const bool v = pxa_ts_env_int("PXA_TSPLIT
 // that only looked at a fixed list of environment names would silently stop guarding at exactly the
 // moment it was needed. One capture-status query per half is cheap against a route whose GPU span
 // is ~20 us.
+// PXA_TSPLIT_GRAPH (2026-09-27): default ON. The arrival token and the ring slot
+// move into DEVICE memory: every device of a group keeps its own reduce counter next to its arrival
+// lines, each fused-reduce kernel reads it to derive (slot, token) and the last block to arrive
+// advances it. Both devices run the same reduce sequence, so their counters stay in lockstep without
+// the host, and a captured reduce replays with the NEXT token rather than the one it was captured
+// with -- which is what lets the scheduler capture a whole tensor-split decode token per device (see
+// the PXA_TSPLIT_GRAPH block in ggml-backend.cpp). =0 restores the host-counter kernels exactly.
+// DEFAULT OFF since 2026-09-28: once the replay actually fired under llama-bench (PXA_TSPLIT_GRAPH_TAIL),
+// 2x P100 PXQN4 tg128 REPS 3 measured 0 (host counter, eager, no producer push) 35.40, 2 (device counter + push, eager)
+// 34.25, 1 (capture + replay) 33.44 t/s. =1 turns replay back on, =2 keeps the device counter without capture.
+extern "C" bool pxa_tsplit_graph_enabled(void) {
+    static const bool v = [] {
+        const char * e = getenv("PXA_TSPLIT_GRAPH");
+        return e && *e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 static void pxa_ts_refuse_capture(cudaStream_t stream) {
+    if (pxa_tsplit_graph_enabled()) return;   // device-side counter: a replay reads the live token
     cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) { (void)cudaGetLastError(); return; }
     if (st == cudaStreamCaptureStatusActive) {
@@ -559,31 +584,8 @@ static void pxa_ts_refuse_capture(cudaStream_t stream) {
 // the link at all.
 //
 // One kernel serves both: only the pointer wiring differs.
-struct pxa_ts_task {
-    void *       wdata[GGML_CUDA_MAX_DEVICES];   // where my payload goes   (nwrite entries)
-    int  *       wflag[GGML_CUDA_MAX_DEVICES];   // where my token goes     (nwrite entries)
-    const void * rdata[GGML_CUDA_MAX_DEVICES];   // where peer r's payload is, indexed by RANK
-    const int  * rflag[GGML_CUDA_MAX_DEVICES];   // where peer r's token is,   indexed by RANK
-    int          nwrite = 0;
-    int          nrank  = 0;
-    int          rank   = 0;
-    int          nelem  = 0;
-};
+// pxa_ts_task, pxa_ts_pause, pxa_ts_poison: pxa/pxa-tsplit-epi.cuh (shared with the closed epilogue tail)
 
-static __device__ __forceinline__ void pxa_ts_pause() {
-#if __CUDA_ARCH__ >= CC_VOLTA
-    __nanosleep(100);
-#else
-    // sm_60 has no __nanosleep. A short clock64() backoff keeps the poll off the
-    // PCIe BAR between reads without spinning the SM at full rate.
-    const long long t0 = clock64();
-    while (clock64() - t0 < 128) { __threadfence_block(); }
-#endif
-}
-
-template <typename T> static __device__ __forceinline__ T pxa_ts_poison();
-template <> __device__ __forceinline__ float pxa_ts_poison<float>() { return __int_as_float(0x7fffffff); }
-template <> __device__ __forceinline__ half  pxa_ts_poison<half >() { return __ushort_as_half(0x7fff);   }
 
 template <typename T, int NRANK>
 static __global__ void k_pxa_tsplit_fused(
@@ -605,15 +607,40 @@ static __global__ void k_pxa_tsplit_fused(
     const int tail  = nvec * VEC;
 
     __shared__ int s_bad;
-    if (tid == 0) { s_bad = 0; }
+    __shared__ int s_tok;
+    __shared__ long long s_slot;
+    if (tid == 0) {
+        s_bad = 0;
+        if (task.ctr) {
+            // Read the device-local counter, then count this block in; the last block to arrive
+            // advances the counter for the NEXT reduce on this stream (kernel order makes it
+            // visible there). Every block has read the counter before the advance happens.
+            const unsigned c = (unsigned)*(volatile int *)task.ctr;
+            __threadfence();
+            const int prev = atomicAdd(task.ctr + 1, 1);
+            if (prev == (int)gridDim.x - 1) {
+                *(volatile int *)(task.ctr + 1) = 0;
+                *(volatile int *)task.ctr = (int)(c + 1u);
+                __threadfence();
+            }
+            s_tok  = (int)(c + 1u);
+            s_slot = (long long)(c % (unsigned)PXA_TS_POOL);
+        } else {
+            s_tok  = token;
+            s_slot = 0;
+        }
+    }
     __syncthreads();
+    token = s_tok;
+    const long long soff_b = s_slot * task.slot_bytes;
+    const long long soff_i = s_slot * task.slot_ints;
 
     // Phase 1 -- publish this device's partial where its consumers will read it. Every block writes
     // exactly the elements it will later read back, so the per-block flag below covers precisely
     // the bytes that block depends on and the blocks stay independent of each other.
     #pragma unroll 1
     for (int w = 0; w < task.nwrite; ++w) {
-        T * dstb = (T *)task.wdata[w];
+        T * dstb = (T *)((char *)task.wdata[w] + soff_b);
         for (int i = gtid; i < nvec; i += gnt) {
             const int off = i * VEC;
             *(int4 *)(dstb + off) = *(const int4 *)(sendbuf + off);
@@ -630,7 +657,7 @@ static __global__ void k_pxa_tsplit_fused(
     if (tid == 0) {
         #pragma unroll 1
         for (int w = 0; w < task.nwrite; ++w) {
-            *(volatile int *)(task.wflag[w] + bid * ARR_INTS) = token;
+            *(volatile int *)(task.wflag[w] + soff_i + bid * ARR_INTS) = token;
         }
         __threadfence_system();
         long long spins = 0;
@@ -638,7 +665,7 @@ static __global__ void k_pxa_tsplit_fused(
         #pragma unroll 1
         for (int r = 0; r < NRANK && !bad; ++r) {
             if (r == task.rank) continue;
-            const volatile int * other = (const volatile int *)(task.rflag[r] + bid * ARR_INTS);
+            const volatile int * other = (const volatile int *)(task.rflag[r] + soff_i + bid * ARR_INTS);
             while (*other != token) {
                 pxa_ts_pause();
                 if (++spins > PXA_TS_SPIN_MAX) { bad = true; break; }
@@ -660,7 +687,7 @@ static __global__ void k_pxa_tsplit_fused(
         for (int r = 0; r < NRANK; ++r) {
             if (r == task.rank) continue;
             T o[VEC];
-            *(int4 *)o = *(const int4 *)((const T *)task.rdata[r] + off);
+            *(int4 *)o = *(const int4 *)((const T *)((const char *)task.rdata[r] + soff_b) + off);
             #pragma unroll
             for (int k = 0; k < VEC; ++k) acc[k] += o[k];
         }
@@ -672,7 +699,7 @@ static __global__ void k_pxa_tsplit_fused(
         #pragma unroll
         for (int r = 0; r < NRANK; ++r) {
             if (r == task.rank) continue;
-            acc += ((const T *)task.rdata[r])[tail + tid];
+            acc += ((const T *)((const char *)task.rdata[r] + soff_b))[tail + tid];
         }
         recvbuf[tail + tid] = bad ? pxa_ts_poison<T>() : acc;
     }
@@ -684,6 +711,7 @@ struct pxa_ts_dev {
     int       dev   = -1;
     uint8_t * stage = nullptr;   // [PXA_TS_POOL][nrank] payload areas of buf_bytes, on `dev`
     int     * flag  = nullptr;   // [PXA_TS_POOL][nrank][blocks][PXA_TS_FLAG_STRIDE/4] arrival lines
+    int     * ctr   = nullptr;   // PXA_TSPLIT_GRAPH: {reduce counter, blocks-read count}, on `dev`
 };
 
 struct pxa_ts_pipeline {
@@ -831,6 +859,8 @@ static pxa_ts_pipeline * pxa_ts_get(const int * idx, int nhave, size_t need_byte
         // against them -- zero on the device's own compute stream and drain it below, inside the
         // build, which no half of this group can overtake because the build holds the mutex.
         if (ok) ok = cudaMemsetAsync(q->d[i].flag, 0, flag_bytes, info.all_ctx[d]->stream()) == cudaSuccess;
+        ok = ok && ggml_cuda_device_malloc((void **)&q->d[i].ctr, 64, d) == cudaSuccess;
+        if (ok) ok = cudaMemsetAsync(q->d[i].ctr, 0, 64, info.all_ctx[d]->stream()) == cudaSuccess;
     }
     for (int i = 0; i < nhave && ok; ++i) {
         const int d = idx[i];
@@ -887,9 +917,38 @@ void pxa_tsplit_reduce_check_fault(void) {
 // The one place eligibility is decided. If this says yes the route MUST run: the caller aborts
 // rather than falling through, exactly as the pinned route does, because a "yes" here is the same
 // promise the scheduler's drain-skip is allowed to trust.
+// PXA_TSPLIT_REDUCE=off on a pair that peers: say so once, loudly. Before v2026.10 an unset variable
+// meant the staged ring, so "=off" in an old config or old notes was harmless; since fused became the
+// engine default it silently costs decode speed on every pair that could take the fused route
+// (2x P100, Qwen3.8-27B PXQ4, -c 262144, 2026-09-28: 24.7 t/s with =off vs 26.5-26.9 unset).
+// Decided on the first reduce the fused route would have taken, so the peer check sees the real group.
+static void pxa_tsplit_warn_explicit_off(const struct ggml_tensor * dst) {
+    static std::atomic<bool> done{false};
+    if (done.load(std::memory_order_relaxed)) return;
+    const char * e = getenv("PXA_TSPLIT_REDUCE");
+    if (!e || (strcmp(e, "off") != 0 && strcmp(e, "0") != 0)) { done.store(true); return; }
+    if (!dst || dst->op != GGML_OP_REDUCE || dst->op_params[2] < 2 || dst->ne[1] >= 32) return;
+    int grp[GGML_CUDA_MAX_DEVICES];
+    int ngrp = 0;
+    for (int i = 0; i < dst->op_params[1] && ngrp < GGML_CUDA_MAX_DEVICES; ++i) {
+        if (dst->src[i]) grp[ngrp++] = i;
+    }
+    if (ngrp < 2 || done.exchange(true)) return;
+    if (pxa_tsplit_p2p_group(grp, ngrp)) {
+        fprintf(stderr,
+            "PXA_TSPLIT_REDUCE=off: WARNING -- this device group peers end to end, so the faster fused "
+            "tensor-split reduce (the engine default since v2026.10) would run here; =off forces the staged "
+            "ring and costs decode speed (2x P100 27B: about 7%%). Unset PXA_TSPLIT_REDUCE unless you are "
+            "A/B-testing the reduce route.\n");
+    }
+}
+
 static bool pxa_tsplit_reduce_handles(const struct ggml_tensor * dst) {
     const int _r = pxa_tsplit_route();
-    if (_r != PXA_TS_FUSED && _r != PXA_TS_P2P)             return false;
+    if (_r != PXA_TS_FUSED && _r != PXA_TS_P2P) {
+        if (_r == PXA_TS_OFF) pxa_tsplit_warn_explicit_off(dst);
+        return false;
+    }
     if (!dst || dst->op != GGML_OP_REDUCE)                  return false;
     if ((ggml_op)dst->op_params[0] != GGML_OP_ADD)          return false;
     if (dst->op_params[3] == 1)                             return false;  // reduce-OFF container
@@ -916,7 +975,36 @@ static bool pxa_tsplit_reduce_handles(const struct ggml_tensor * dst) {
         if (!ggml_is_contiguous(dst->src[i]))               return false;
         if (((uintptr_t)dst->src[i]->data & 15) != 0)       return false;
     }
+    // Both routes dereference peer device memory from inside a kernel, and pxa_ts_get() /
+    // pxa_tsplit_reduce_run_p2p() abort on a group that does not peer end to end (bug #208: the
+    // launcher's --sm auto emits -sm tensor + PXA_TSPLIT_REDUCE=fused without a per-pair check, so
+    // a non-peering pair -- dual-socket SYS topology, IOMMU/VM, GeForce, p2p off -- aborted at the
+    // first reduce). Decide it HERE, where no promise has been made yet: the stock staged route
+    // takes the reduce. op_params[4] == 0 was checked above, so every present src is a member.
+    {
+        int grp[GGML_CUDA_MAX_DEVICES];
+        int ngrp = 0;
+        for (int i = 0; i < dst->op_params[1] && ngrp < GGML_CUDA_MAX_DEVICES; ++i) {
+            if (dst->src[i]) grp[ngrp++] = i;
+        }
+        if (!pxa_tsplit_p2p_group(grp, ngrp)) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                fprintf(stderr, "PXA_TSPLIT_REDUCE: this device group does not peer end to end -- the stock "
+                                "staged route takes its reduces (no fused/p2p reduce on this group)\n");
+                pxa_tsplit_p2p_dump("PXA_TSPLIT_REDUCE");
+            }
+            return false;
+        }
+    }
     return true;
+}
+
+// PXA_TSPLIT_GRAPH: true when this reduce node will run on the fused route with the device-side
+// counter, i.e. it may sit inside a captured tensor-split token graph.
+extern "C" bool pxa_tsplit_reduce_graph_safe(const struct ggml_tensor * dst) {
+    return pxa_tsplit_graph_enabled() && pxa_tsplit_route() == PXA_TS_FUSED && !pxa_reduce_pinned_handles(dst) &&
+           pxa_tsplit_reduce_handles(dst);
 }
 
 // The seam's per-device HALF. Enqueued only onto device dev_i's compute stream -- the stream of the
@@ -963,7 +1051,8 @@ extern "C" void pxa_tsplit_reduce_half(ggml_backend_cuda_context & ctx_i, ggml_t
     for (int c = 0; c < nchunk; ++c) {
         const int64_t start = (int64_t)c * max_chunk;
         const int64_t chunk = nelem > 0 ? std::min(max_chunk, nelem - start) : 0;
-        const int this_slot  = (slot + c) % PXA_TS_POOL;
+        const bool dyn       = pxa_tsplit_graph_enabled();
+        const int this_slot  = dyn ? 0 : (slot + c) % PXA_TS_POOL;
         const int this_token = token + c;
 
         // area(dev, slot, src_rank) -- the payload written by src_rank, living on `dev`
@@ -999,6 +1088,11 @@ extern "C" void pxa_tsplit_reduce_half(ggml_backend_cuda_context & ctx_i, ggml_t
             }
         }
         task.nelem = (int)chunk;
+        if (dyn) {
+            task.ctr        = p->d[rank].ctr;
+            task.slot_bytes = (long long)n_dev * (long long)p->buf_bytes;
+            task.slot_ints  = (long long)flag_stride_slot;
+        }
 
         char * data = (char *)dst->src[dev_i]->data + (size_t)start * type_size;
 
@@ -1026,6 +1120,440 @@ extern "C" void pxa_tsplit_reduce_half(ggml_backend_cuda_context & ctx_i, ggml_t
         CUDA_CHECK(cudaGetLastError());
     }
     GGML_UNUSED(reduce_index);
+}
+
+// =============================================================================================
+static int pxa_ts_collect_idx(const ggml_tensor * dst, int * idx);
+
+// PXA_TSPLIT_EPI (2026-09-27) -- the fused tensor-split reduce EPILOGUE.
+// Default ON; PXA_TSPLIT_EPI=0 restores the separate kernels exactly.
+//
+// A 2-card tensor-split decode phase used to end in three to four dependent launches per card:
+//   [ADD residual]   k_add on the one card that owns the residual (the partial's own ADD node)
+//   REDUCE           k_pxa_tsplit_fused, 8 blocks: push, flag, poll, sum own + peer in place
+//   norm [+ RHT]     the next site's input (FUSED_RMS_NORM, and PXQN_RHT on PXQN files)
+// 128 times per token. The epilogue does all of it in ONE single-block launch per card:
+//   A  read the partial (and, when the partial is that ADD, both of its operands, summed exactly as
+//      k_add sums them), keep it in shared memory and push it into the peer's staging slot;
+//   B  flag, poll, then sum own + peer in the old kernel's order (own first, peers by rank) and
+//      write the residual stream in place, as the old reduce did;
+//   C  RMS norm of the summed row in the norm kernel's exact instruction order (same 1024-thread
+//      sum-of-squares tree, same (scale*w)*x); on PXQN files the closed library's tail then finishes the
+//      row (pxa/pxa-tsplit-epi.cuh), else the norm output is written (PXA_TSPLIT_EPI_NORM).
+// Every value is computed by the same float operations in the same order as before, so the output
+// is BIT-IDENTICAL to the unfused sequence; only launches and the dependent gaps between them go.
+//
+// PLAN. The pattern spans three scheduler splits on two cards, so it is found once per graph, on
+// the host, before any split runs (ggml_cuda_pxa_epi_plan, called by the scheduler): a fused-route
+// REDUCE over exactly two cards at decode width (one row) whose FIRST real node after it on EVERY
+// card is a FUSED_RMS_NORM of that card's reduced copy, followed directly by the PXQN_RHT that is
+// the norm's only consumer. Because nothing else runs on either card between the reduce and the
+// RHT, writing the RHT's output early cannot clobber a buffer anything still reads. The partial's
+// ADD is folded in when it is the last real node on its card before the reduce. The planned nodes
+// are then skipped at dispatch (ggml_cuda_pxa_epi_take); the graph keeps them, so PXA_REFERENCE,
+// the staged/p2p routes and PXA_TSPLIT_EPI=0 run the graph exactly as built.
+//
+// Safety of the in-place write: one block, and every graph-tensor read (partial, ADD operands)
+// happens in phase A, before the block barrier; every graph-tensor write (residual stream, RHT
+// output, sidecar) happens after it. So any aliasing the allocator chose between inputs and outputs
+// is harmless, and the peer only ever reads its own staging slot.
+// A folded ADD that an earlier fusion already computed (the dispatcher never reached it) is simply
+// read as the partial: the half checks, per token, whether the ADD node was skipped.
+// =============================================================================================
+#include "pxa/pxqn.cuh"
+#include "pxa/pxa-epi-push.cuh"
+#include <deque>
+#include <unordered_map>
+
+static bool pxa_ts_epi_on() {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI"); return !(e && *e && atoi(e) == 0); }();
+    return v;
+}
+// PXA_TSPLIT_EPI_Q8 (default 0 = the old rule; 1 = on): on a card whose sm_70 q8_1 sidecar is live the
+// epilogue used to decline outright (it did not write the sidecar), so V100 kept reduce + [add] + norm + RHT as separate
+// launches. Now it plans there too and, when a PXQN4 / PXQN4S8 MUL_MAT reads the RHT output (pxa_pxqn_q8_wanted's
+// rule), also writes the q8_1 of that output into the sidecar (the same bytes the unfused kernel writes); the skipped RHT
+// node stamps the record in the consumers' graph eval. Bit-identical. MEASURED A LOSS on the V100 pair (2026-09-28,
+// PXQN4 -sm tensor tg128 close: 52.86 vs 53.28 off; with RR_Q8 53.45 vs 54.90): the one-block epilogue is slower on the
+// sm_70 critical path than the 8-block reduce + multi-block norm/RHT it replaces, so it stays opt-in.
+static bool pxa_ts_epi_q8_on() {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_Q8"); return e && *e && atoi(e) != 0; }();
+    return v;
+}
+// ggml-cuda.cu pxa_pxqn_q8_wanted's rule on a split graph: a PXQN4 / PXQN4S8 MUL_MAT within 16 nodes reads rht
+static bool pxa_epi_q8_wanted(const ggml_cgraph * g, int i_rht) {
+    const ggml_tensor * r = g->nodes[i_rht];
+    for (int j = i_rht + 1; j < g->n_nodes && j <= i_rht + 16; ++j) {
+        const ggml_tensor * n = g->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT && n->src[0] && n->src[1] && (n->src[1] == r || n->src[1]->view_src == r) &&
+            (n->src[0]->type == GGML_TYPE_PXQN4 || n->src[0]->type == GGML_TYPE_PXQN4S8)) return true;
+    }
+    return false;
+}
+
+// ---- the plan ----------------------------------------------------------------------------
+struct pxa_epi_half {
+    ggml_tensor *       part = nullptr;   // R->src[dev]: the partial, and where the residual stream lands
+    const ggml_tensor * add  = nullptr;   // the partial's own ADD when it is folded in
+    const ggml_tensor * norm = nullptr;
+    ggml_tensor *       rht  = nullptr;
+    int                 stage = 0;        // planning: 0 = expect the norm, 1 = expect the RHT, 2 = done
+    std::atomic<int>    add_skipped{0};   // this graph's dispatch reached the ADD and skipped it
+    const ggml_tensor * gemv     = nullptr;   // producer push: the MUL_MAT whose output is the partial
+    const ggml_tensor * push_add = nullptr;   //   and the folded ADD's other operand (or nullptr)
+    std::atomic<int>    pushed{0};        // this graph's GEMV dispatch pushed the payload itself
+    bool                q8 = false;       // PXA_TSPLIT_EPI_Q8: also write the sm_70 q8_1 sidecar of the RHT output
+    bool                norm_only = false;   // PXA_TSPLIT_EPI_NORM: no RHT follows the norm; the epilogue writes the norm
+};
+struct pxa_epi_plan {
+    const ggml_tensor * R = nullptr;
+    int                 ndev = 0;
+    int                 dev[2] = { -1, -1 };
+    bool                ok = true;
+    pxa_epi_half        h[2];
+};
+enum { PXA_EPI_ADD = 1, PXA_EPI_NORM = 2, PXA_EPI_RHT = 3 };
+struct pxa_epi_skip { pxa_epi_plan * p; int kind; int rank; };
+
+static std::deque<pxa_epi_plan>                                   g_epi_plans;
+static std::unordered_map<const ggml_tensor *, pxa_epi_plan *>    g_epi_by_reduce;
+static std::unordered_map<const ggml_tensor *, pxa_epi_skip>      g_epi_skip;
+static std::unordered_map<const ggml_tensor *, pxa_epi_skip>      g_epi_push;   // GEMV node -> (plan, rank)
+
+// PXA_TSPLIT_EPI_NORM (2026-09-28; 1 = default: sm_60 cards, 2 = any arch, 0 = off): a planned
+// reduce whose norm is NOT followed by a PXQN_RHT (classic PXQ4 / k-quant / q8_0 graphs, where the norm output feeds
+// the GEMVs directly) still takes the fused epilogue: [add] + reduce + RMS norm in one launch, the norm output written
+// by the epilogue (fused_rms_norm_f32<1024>'s exact order: bit-identical) and the norm node skipped. Before this, only
+// PXQN graphs (norm + RHT) had the epilogue and every classic-tier split decode ran reduce, norm and add separately.
+static int pxa_ts_epi_norm_mode() {
+    static const int v = [] { const char * e = getenv("PXA_TSPLIT_EPI_NORM"); return e && *e ? atoi(e) : 1; }();
+    return v;
+}
+static bool pxa_ts_epi_norm_ok(int device) {
+    const int m = pxa_ts_epi_norm_mode();
+    if (m <= 0) return false;
+    return m >= 2 || ggml_cuda_info().devices[device].cc == 600;
+}
+
+// PXA_TSPLIT_EPI_PUSH (default ON with the epilogue): the partial's PXQN GEMV writes the peer's staging slot
+static bool pxa_ts_epi_push_on() {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_PUSH"); return !(e && *e && atoi(e) == 0); }();
+    return v;
+}
+static_assert(PXQN_PUSH_POOL == PXA_TS_POOL, "the GEMV push and the reduce ring must agree on the slot count");
+
+// the MUL_MAT whose output `t` is (through views that keep its data and layout), or nullptr
+static const ggml_tensor * pxa_epi_gemv_of(const ggml_tensor * t) {
+    const ggml_tensor * u = t;
+    for (int k = 0; k < 4 && u && (u->op == GGML_OP_VIEW || u->op == GGML_OP_RESHAPE); ++k) u = u->src[0];
+    if (!u || u->op != GGML_OP_MUL_MAT || u->data != t->data || u->type != GGML_TYPE_F32) return nullptr;
+    if (!ggml_is_contiguous(u) || ggml_nelements(u) != ggml_nelements(t)) return nullptr;
+    return u;
+}
+static std::atomic<int>                                           g_epi_n{0};
+
+static inline bool pxa_epi_noop(const ggml_tensor * t) {
+    return ggml_is_noop(t) || t->op == GGML_OP_FAKE_CPY || (t->op == GGML_OP_REDUCE && t->op_params[3] == 1);
+}
+
+static inline bool pxa_epi_f32_row(const ggml_tensor * t, const ggml_tensor * like) {
+    return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_are_same_shape(t, like) &&
+           ((uintptr_t)t->data & 15) == 0;
+}
+
+// devs[k]: the CUDA device of split graph k, or -1 (not a CUDA split). Runs on the scheduler thread
+// before any split of this graph is computed.
+extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int * devs) {
+    g_epi_plans.clear();
+    g_epi_by_reduce.clear();
+    g_epi_skip.clear();
+    g_epi_push.clear();
+    g_epi_n.store(0, std::memory_order_release);
+    if (!pxa_ts_epi_on() || pxa_tsplit_route() != PXA_TS_FUSED) return;
+
+    struct open_t { pxa_epi_plan * p; int rank; };
+    std::vector<open_t> open[GGML_CUDA_MAX_DEVICES];
+    const ggml_tensor * last[GGML_CUDA_MAX_DEVICES] = {};
+
+    for (int k = 0; k < n; ++k) {
+        const int d = devs[k];
+        if (d < 0 || d >= GGML_CUDA_MAX_DEVICES) continue;
+        const ggml_cgraph * g = graphs[k];
+        for (int i = 0; i < g->n_nodes; ++i) {
+            ggml_tensor * t = g->nodes[i];
+            if (pxa_epi_noop(t)) continue;
+            // the first real nodes on this card after a planned reduce must be its norm, then its RHT
+            if (!open[d].empty()) {
+                for (auto & o : open[d]) {
+                    pxa_epi_half & h = o.p->h[o.rank];
+                    if (!o.p->ok) continue;
+                    if (h.stage == 0) {
+                        if (t->op == GGML_OP_FUSED_RMS_NORM && (t->src[0] == o.p->R || t->src[0] == h.part) &&
+                            ggml_are_same_shape(t, o.p->R)) {
+                            h.norm = t; h.stage = 1;
+                        } else {
+                            o.p->ok = false;
+                        }
+                    } else if (h.stage == 1) {
+                        if (t->op == GGML_OP_PXQN_RHT && t->src[0] == h.norm &&
+                            ggml_cuda_pxqn_rms_rht_ok(nullptr, h.norm, t) && pxa_epi_f32_row(t, o.p->R)) {
+                            h.rht = t; h.stage = 2;
+                            h.q8 = pxa_ts_epi_q8_on() && ggml_cuda_pxqn_q8sc_active(d) &&
+                                   ggml_cuda_pxqn_q8sc_buf(d, t->ne[0], nullptr) != nullptr && pxa_epi_q8_wanted(g, i);
+                        } else if (t->op != GGML_OP_PXQN_RHT && pxa_ts_epi_norm_ok(d) &&
+                                   pxa_epi_f32_row(h.norm, o.p->R) && h.norm->src[1] &&
+                                   h.norm->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(h.norm->src[1]) &&
+                                   h.norm->src[1]->ne[0] == o.p->R->ne[0]) {
+                            // PXA_TSPLIT_EPI_NORM: the norm output is consumed as is; t is an ordinary node
+                            h.norm_only = true; h.stage = 2;
+                        } else {
+                            o.p->ok = false;
+                        }
+                    }
+                }
+                std::vector<open_t> keep;
+                for (auto & o : open[d]) if (o.p->ok && o.p->h[o.rank].stage < 2) keep.push_back(o);
+                open[d].swap(keep);
+            }
+            if (t->op == GGML_OP_REDUCE && t->op_params[2] == 2 && t->op_params[4] == 0 &&
+                t->type == GGML_TYPE_F32 && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
+                t->ne[0] % 128 == 0 && t->ne[0] >= 1024 && t->ne[0] <= 11264 &&
+                !pxa_reduce_pinned_handles(t) && pxa_tsplit_reduce_handles(t)) {
+                int idx[GGML_CUDA_MAX_DEVICES];
+                const int nd = pxa_ts_collect_idx(t, idx);
+                bool ok = nd == 2;
+                for (int r = 0; r < nd && ok; ++r) {
+                    ok = (pxa_ts_epi_q8_on() || !ggml_cuda_pxqn_q8sc_active(idx[r])) && pxa_epi_f32_row(t->src[idx[r]], t);
+                }
+                if (ok) {
+                    g_epi_plans.emplace_back();
+                    pxa_epi_plan & p = g_epi_plans.back();
+                    p.R = t; p.ndev = nd;
+                    for (int r = 0; r < nd; ++r) {
+                        const int j = idx[r];
+                        p.dev[r] = j;
+                        pxa_epi_half & h = p.h[r];
+                        h.part = t->src[j];
+                        const ggml_tensor * a = h.part;
+                        if (a->op == GGML_OP_ADD && last[j] == a &&
+                            pxa_epi_f32_row(a->src[0], a) && pxa_epi_f32_row(a->src[1], a)) {
+                            h.add = a;
+                        }
+                        open[j].push_back({ &p, r });
+                    }
+                }
+            }
+            last[d] = t;
+        }
+    }
+
+    // the norm's only consumer is its RHT
+    std::unordered_map<const ggml_tensor *, pxa_epi_plan *> norms;
+    for (auto & p : g_epi_plans) {
+        for (int r = 0; r < p.ndev; ++r) if (p.h[r].stage != 2) p.ok = false;
+        if (!p.ok) continue;
+        for (int r = 0; r < p.ndev; ++r) if (!p.h[r].norm_only) norms[p.h[r].norm] = &p;
+    }
+    if (!norms.empty()) {
+        auto check = [&](const ggml_tensor * t, const ggml_tensor * user) {
+            if (!t) return;
+            auto it = norms.find(t);
+            if (it == norms.end()) return;
+            pxa_epi_plan * p = it->second;
+            for (int r = 0; r < p->ndev; ++r) if (p->h[r].norm == t && p->h[r].rht == user) return;
+            p->ok = false;
+        };
+        for (int k = 0; k < n; ++k) {
+            const ggml_cgraph * g = graphs[k];
+            for (int i = 0; i < g->n_nodes; ++i) {
+                const ggml_tensor * t = g->nodes[i];
+                check(t->view_src, t);
+                for (int s = 0; s < GGML_MAX_SRC; ++s) check(t->src[s], t);
+            }
+        }
+    }
+    int nok = 0;
+    for (auto & p : g_epi_plans) {
+        if (!p.ok) continue;
+        ++nok;
+        g_epi_by_reduce[p.R] = &p;
+        for (int r = 0; r < p.ndev; ++r) {
+            if (p.h[r].add) g_epi_skip[p.h[r].add] = { &p, PXA_EPI_ADD, r };
+            g_epi_skip[p.h[r].norm] = { &p, PXA_EPI_NORM, r };
+            if (p.h[r].rht) g_epi_skip[p.h[r].rht] = { &p, PXA_EPI_RHT, r };
+            // producer push: the partial (or the folded ADD's partial operand) is a MUL_MAT's output
+            pxa_epi_half & h = p.h[r];
+            if (pxa_ts_epi_push_on() && pxa_tsplit_graph_enabled() && !pxa_ts_pull()) {
+                if (h.add) {
+                    const ggml_tensor * g0 = pxa_epi_gemv_of(h.add->src[0]);
+                    const ggml_tensor * g1 = g0 ? nullptr : pxa_epi_gemv_of(h.add->src[1]);
+                    h.gemv     = g0 ? g0 : g1;
+                    h.push_add = g0 ? h.add->src[1] : g1 ? h.add->src[0] : nullptr;
+                } else {
+                    h.gemv = pxa_epi_gemv_of(h.part);
+                }
+                if (h.gemv && h.gemv->ne[1] == 1 && ggml_nelements(h.gemv) == h.part->ne[0]) {
+                    g_epi_push[h.gemv] = { &p, 0, r };
+                } else {
+                    // PXA_TSPLIT_EPI_WHY=1 (diagnostic): name the partials whose producer push declines
+                    static const bool why = getenv("PXA_TSPLIT_EPI_WHY") != nullptr;
+                    static std::atomic<int> left{12};
+                    if (why && left.fetch_sub(1) > 0) {
+                        const ggml_tensor * a = h.part;
+                        auto nm = [](const ggml_tensor * t) { return t ? t->name : "-"; };
+                        auto op = [](const ggml_tensor * t) { return t ? ggml_op_name(t->op) : "-"; };
+                        fprintf(stderr, "PXA_TSPLIT_EPI_WHY: dev %d rank %d part %s (%s) add=%d src0 %s (%s) src1 %s (%s) gemv=%s\n",
+                                p.dev[r], r, nm(a), op(a), h.add != nullptr, nm(a->src[0]), op(a->src[0]), nm(a->src[1]), op(a->src[1]),
+                                nm(h.gemv));
+                    }
+                    h.gemv = nullptr; h.push_add = nullptr;
+                }
+            }
+        }
+    }
+    static std::atomic<bool> said{false};
+    if (nok > 0 && !said.exchange(true)) {
+        fprintf(stderr, "PXA_TSPLIT_EPI: %d of %d reduces take the fused epilogue ([add] + reduce + RMS norm [+ RHT128] in one "
+                        "launch per card, bit-identical; PXA_TSPLIT_EPI=0 turns it off)\n", nok, (int) g_epi_plans.size());
+    }
+    g_epi_n.store(nok, std::memory_order_release);
+}
+
+// Dispatch hook: true when this node's work is done by a planned epilogue (the node is skipped).
+extern "C" bool ggml_cuda_pxa_epi_take(int device, const ggml_tensor * t) {
+    if (g_epi_n.load(std::memory_order_acquire) == 0) return false;
+    if (t->op != GGML_OP_ADD && t->op != GGML_OP_FUSED_RMS_NORM && t->op != GGML_OP_PXQN_RHT) return false;
+    auto it = g_epi_skip.find(t);
+    if (it == g_epi_skip.end()) return false;
+    const pxa_epi_skip & s = it->second;
+    if (s.kind == PXA_EPI_ADD) {
+        s.p->h[s.rank].add_skipped.store(1, std::memory_order_release);
+    } else if (s.kind == PXA_EPI_RHT) {
+        ggml_cuda_pxqn_xmax_stamp(device, t);   // the sidecar the epilogue wrote belongs to this node now
+        if (s.p->h[s.rank].q8) ggml_cuda_pxqn_q8sc_stamp(device, t);   // PXA_TSPLIT_EPI_Q8: and the q8_1 one
+    }
+    return true;
+}
+
+// GEMV dispatch hook (pxqn.cu): where a planned partial's GEMV pushes its output. Only once the group's
+// pipeline exists (never built from here: a build synchronises, which a capture cannot).
+extern "C" bool ggml_cuda_pxa_epi_push_args(int device, const ggml_tensor * dst, pxqn_push_args * out) {
+    if (g_epi_n.load(std::memory_order_acquire) == 0 || g_epi_push.empty()) return false;
+    auto it = g_epi_push.find(dst);
+    if (it == g_epi_push.end()) return false;
+    pxa_epi_plan * ep = it->second.p;
+    const int r = it->second.rank;
+    if (ep->dev[r] != device || ep->ndev != 2) return false;
+    const int idx[2] = { ep->dev[0], ep->dev[1] };
+    pxa_ts_pipeline * p = nullptr;
+    const int ng = g_pxa_ts_ngroup.load(std::memory_order_acquire);
+    for (int k = 0; k < ng && !p; ++k) if (pxa_ts_same_group(g_pxa_ts_pipe[k], idx, 2)) p = g_pxa_ts_pipe[k];
+    if (!p || (size_t)ggml_nbytes(ep->R) > p->buf_bytes) return false;
+    const int rank = p->rank_of[device];
+    const int peer = 1 - rank;
+    if (rank < 0 || rank > 1) return false;
+    out->y2          = (float *)(p->d[peer].stage + ((size_t)0 * 2 + rank) * p->buf_bytes);
+    out->add         = ep->h[r].push_add ? (const float *)ep->h[r].push_add->data : nullptr;
+    out->ctr         = p->d[rank].ctr;
+    out->slot_floats = (long long)(2 * p->buf_bytes / sizeof(float));
+    return true;
+}
+extern "C" void ggml_cuda_pxa_epi_pushed(const ggml_tensor * dst) {
+    auto it = g_epi_push.find(dst);
+    if (it == g_epi_push.end()) return;
+    it->second.p->h[it->second.rank].pushed.store(1, std::memory_order_release);
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) {
+        fprintf(stderr, "PXA_TSPLIT_EPI: producer push ON -- the partial's GEMV writes the peer's staging slot "
+                        "(PXA_TSPLIT_EPI_PUSH=0 -> the epilogue pushes)\n");
+    }
+}
+
+static pxa_epi_plan * pxa_epi_find(const ggml_tensor * R) {
+    if (g_epi_n.load(std::memory_order_acquire) == 0) return nullptr;
+    auto it = g_epi_by_reduce.find(R);
+    return it == g_epi_by_reduce.end() ? nullptr : it->second;
+}
+
+// One card's epilogue half; the wiring of pxa_tsplit_reduce_half with a single chunk.
+static void pxa_tsplit_epi_half(ggml_backend_cuda_context & ctx_i, pxa_ts_pipeline * p, pxa_epi_plan * ep, int r_plan,
+                                int n_dev, int dev_i, int slot, int token) {
+    pxa_tsplit_reduce_check_fault();
+    const int rank = p->rank_of[dev_i];
+    GGML_ASSERT(rank >= 0 && n_dev == 2);
+    pxa_epi_half & h = ep->h[r_plan];
+    GGML_ASSERT(ctx_i.device == dev_i && ep->dev[r_plan] == dev_i);
+    const int64_t ncols = h.part->ne[0];
+    GGML_ASSERT((size_t)ncols*sizeof(float) <= p->buf_bytes);
+
+    ggml_cuda_set_device(dev_i);
+    cudaStream_t stream = ctx_i.stream();
+    pxa_ts_refuse_capture(stream);
+
+    const bool dyn = pxa_tsplit_graph_enabled();
+    const int  this_slot = dyn ? 0 : slot % PXA_TS_POOL;
+    const int  flag_ints = PXA_TS_FLAG_STRIDE / (int)sizeof(int);
+    const size_t flag_stride_rank = (size_t)p->blocks * flag_ints;
+    const size_t flag_stride_slot = (size_t)n_dev * flag_stride_rank;
+    auto area = [&](int d_rank, int src_rank) {
+        return p->d[d_rank].stage + ((size_t)this_slot * n_dev + src_rank) * p->buf_bytes;
+    };
+    auto line = [&](int d_rank, int src_rank) {
+        return p->d[d_rank].flag + (size_t)this_slot * flag_stride_slot + (size_t)src_rank * flag_stride_rank;
+    };
+    pxa_ts_task task;
+    task.nrank = n_dev;
+    task.rank  = rank;
+    if (pxa_ts_pull()) {
+        task.nwrite   = 1;
+        task.wdata[0] = area(rank, 0);
+        task.wflag[0] = line(rank, 0);
+        for (int r = 0; r < n_dev; ++r) { task.rdata[r] = area(r, 0); task.rflag[r] = line(r, 0); }
+    } else {
+        int w = 0;
+        for (int r = 0; r < n_dev; ++r) {
+            if (r == rank) continue;
+            task.wdata[w] = area(r, rank);
+            task.wflag[w] = line(r, rank);
+            ++w;
+        }
+        task.nwrite = w;
+        for (int r = 0; r < n_dev; ++r) { task.rdata[r] = area(rank, r); task.rflag[r] = line(rank, r); }
+    }
+    task.nelem = (int)ncols;
+    if (dyn) {
+        task.ctr        = p->d[rank].ctr;
+        task.slot_bytes = (long long)n_dev * (long long)p->buf_bytes;
+        task.slot_ints  = (long long)flag_stride_slot;
+    }
+
+    const bool fold = h.add && h.add_skipped.load(std::memory_order_acquire) != 0;
+    const float * pa = fold ? (const float *)h.add->src[0]->data : (const float *)h.part->data;
+    const float * pb = fold ? (const float *)h.add->src[1]->data : nullptr;
+    float eps;
+    memcpy(&eps, h.norm->op_params, sizeof(float));
+    const ggml_tensor * rht = h.rht;
+    if (h.norm_only) {
+        GGML_ASSERT(rht == nullptr);
+        k_pxa_tsplit_epi<2, pxa_epi_tail_norm><<<1, 1024, (size_t)ncols*sizeof(float), stream>>>(
+            pa, pb, (float *)h.part->data, task, token, (int *)p->err_dev,
+            (const float *)h.norm->src[1]->data, (float *)h.norm->data, nullptr, (int)ncols, eps,
+            0, 0, 0, 0, h.pushed.load(std::memory_order_acquire) ? 0 : 1, nullptr, 0);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const uint64_t seed = (uint64_t)(uint32_t) rht->op_params[0] | ((uint64_t)(uint32_t) rht->op_params[1] << 32);
+    float * mx = ggml_cuda_pxqn_xmax_buf(dev_i, ncols, 1);
+    int64_t kpad = 0;
+    void * q8 = h.q8 ? ggml_cuda_pxqn_q8sc_buf(dev_i, ncols, &kpad) : nullptr;
+    GGML_ASSERT(!h.q8 || q8);
+    // the PXQN tail (norm + RHT128 [+ q8_1 sidecar]) is launched by libggml-pxqn on this same kernel body
+    ggml_cuda_pxqn_epi_rht_launch(stream, (size_t)ncols*sizeof(float),
+        pa, pb, (float *)h.part->data, task, token, (int *)p->err_dev,
+        (const float *)h.norm->src[1]->data, (float *)rht->data, mx, (int)ncols, eps,
+        seed, rht->op_params[2], rht->op_params[3], (int64_t)rht->op_params[4],
+        h.pushed.load(std::memory_order_acquire) ? 0 : 1, q8, (int)kpad);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // The SINGLE-THREAD DRIVER. Calls half 0..N-1 in order so the new route is measurable under
@@ -1064,6 +1592,18 @@ static bool pxa_tsplit_reduce_run(ggml_backend_cuda_context & ctx, ggml_tensor *
         GGML_ABORT("PXA_TSPLIT_REDUCE: a peer never published its partial for this reduce index");
     }
 
+    // PXA_TSPLIT_EPI: a planned reduce runs as the fused epilogue on every card (one geometry for
+    // the whole group: the halves' arrival lines must match)
+    if (pxa_epi_plan * ep = pxa_epi_find(dst)) {
+        for (int ii = 0; ii < nhave; ++ii) {
+            int rp = -1;
+            for (int r = 0; r < ep->ndev; ++r) if (ep->dev[r] == idx[ii]) rp = r;
+            GGML_ASSERT(rp >= 0 && "PXA_TSPLIT_EPI: plan and reduce group disagree");
+            pxa_tsplit_epi_half(*info.all_ctx[idx[ii]], p, ep, rp, nhave, idx[ii], slot, token);
+        }
+        ggml_cuda_set_device(ctx.device);
+        return true;
+    }
     for (int ii = 0; ii < nhave; ++ii) {
         pxa_tsplit_reduce_half(*info.all_ctx[idx[ii]], dst, seq, nhave, idx[ii], idx, slot, token);
     }
@@ -1226,7 +1766,7 @@ static int pxa_ts_collect_idx(const ggml_tensor * dst, int * idx) {
 // ---------------------------------------------------------------------------
 
 enum { PXA_RT_NONE = 0, PXA_RT_NCCL, PXA_RT_RING, PXA_RT_P2P, PXA_RT_STAGED, PXA_RT_PINNED,
-       PXA_RT_TSPLIT, PXA_RT_TSPLIT_P2P, PXA_RT_N };
+       PXA_RT_TSPLIT, PXA_RT_TSPLIT_P2P, PXA_RT_PF, PXA_RT_N };
 
 static const char * pxa_rt_name(int r) {
     switch (r) {
@@ -1237,6 +1777,7 @@ static const char * pxa_rt_name(int r) {
         case PXA_RT_PINNED: return "pinned-host";
         case PXA_RT_TSPLIT:     return "pxa-fused";
         case PXA_RT_TSPLIT_P2P: return "pxa-p2p";
+        case PXA_RT_PF:         return "pxa-pf";
         default:            return "unrouted";
     }
 }
@@ -1374,13 +1915,231 @@ static struct pxa_reduce_pinned_registrar {
     }
 } g_pxa_reduce_pinned_registrar;
 
+// ---------------------------------------------------------------------------
+// BUG #206 (2026-09-25) -- a failed NCCL group used to be a silent no-op.
+//
+// Inside a group, ncclAllReduce() only RECORDS the request; the transports are connected and the
+// kernels launched by ncclGroupEnd(), and its status was thrown away. On this box NCCL takes the
+// SHM transport (every pair is PHB, so it declines P2P: speed-campaign/pxa-tsplit/understand/
+// comm.md section 4), and SHM lives in /dev/shm. Docker's default /dev/shm is 64 MB; a two-device
+// group fits in it, a four-device group does not. The group then fails, no kernel runs, every
+// device keeps its OWN partial, and a four-card tensor split decodes garbage -- while perplexity,
+// whose prefill reduces take the ring route (ne[1] >= 32 never reaches NCCL past two devices),
+// matches the layer split exactly. That is the whole of #206's signature.
+//
+// A failed group is now a loud, ONE-TIME demotion of the NCCL route for the rest of the process,
+// and the reduce that hit it falls through to the in-tree peer routes below. Nothing was summed
+// (a group that fails to set up launches nothing), so serving the same reduce again from the
+// untouched partials is the entire repair. Per-call argument errors inside the group still abort:
+// those are programming errors, and a group with only some of its members recorded must not be
+// launched.
+//
+// PXA_REDUCE_NCCL_FAULT=1 is a TEST lever: the NCCL branch behaves exactly as a failed group does
+// (no NCCL call, nothing summed) so the fallback can be exercised on a machine where NCCL works
+// (tests/test-reduce-pinned.cu, route nccl-fault). Never set it anywhere else.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_pxa_nccl_dead{false};
+
+// For tests and diagnostics: 0 = NCCL not built in, 1 = built but no communicator (init failed or
+// one device), 2 = the route is live, 3 = a failed group has switched it off for this process.
+extern "C" int pxa_reduce_nccl_state(void) {
+#ifdef GGML_USE_NCCL
+    if (g_pxa_nccl_dead.load(std::memory_order_acquire)) {
+        return 3;
+    }
+    return ggml_cuda_info().have_nccl ? 2 : 1;
+#else
+    return 0;
+#endif
+}
+
+#ifdef GGML_USE_NCCL
+static bool pxa_nccl_fault_injected() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_REDUCE_NCCL_FAULT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
+static void pxa_nccl_route_fail(const char * where, const char * why, int nreduce, size_t nbytes) {
+    if (g_pxa_nccl_dead.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    fprintf(stderr,
+        "\n==================================================================\n"
+        "PXA_REDUCE: the NCCL all-reduce FAILED (%s: %s; %d devices, %zu bytes).\n"
+        "  The NCCL route is off for the rest of this process and the in-tree peer route serves\n"
+        "  every reduce from here. NCCL summed nothing, and the reduce that failed is re-run on the\n"
+        "  peer route, so the output is correct (bug #206: this used to be silent garbage).\n"
+        "  Inside a container the usual cause is /dev/shm: NCCL's SHM transport needs more than\n"
+        "  docker's 64 MB default for 4+ cards -- run with --ipc=host or --shm-size=1g, or set\n"
+        "  NCCL_P2P_LEVEL=SYS on cards that peer. NCCL_DEBUG=WARN prints NCCL's own reason.\n"
+        "==================================================================\n\n",
+        where, why, nreduce, nbytes);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// PXA_TSPLIT_PF_v1 (2026-09-28) -- the two-device PREFILL all-reduce as one DMA push per direction.
+//
+// WHAT PREFILL DID. At ne[1] >= 32 the partials are already f16 (cparams.reduce_type defaults to
+// f16 and the builders cast at ne[1] > 32), the fused route refuses them, and a two-card process
+// hands them to NCCL, which on this class of board takes the SHM transport with the LL protocol:
+// 2.9 ms for a 5120x512 f16 reduce (1.8 GB/s), on the compute stream, 126 times per 512-token
+// ubatch -- a quarter of the prefill wall on a P100 pair. The in-tree ring moves the same bytes
+// with cudaMemcpyPeerAsync but in two dependent phases with a host-visible rendezvous between.
+//
+// THE ROUTE. Each device pushes its whole partial into a staging buffer on the peer with the
+// copy engine, on a dedicated copy stream, in K chunks. Both directions run at once, so each link
+// direction carries exactly S bytes -- the all-reduce floor for two devices -- with no flag words
+// in the payload. On each device's compute stream, chunk c is summed in place (own += peer) as soon
+// as the peer's chunk c and my own chunk c push have landed, so the add of chunk c overlaps the
+// copy of chunk c+1 and nothing waits on the host. Ordering is cross-device events only.
+//
+// NUMERICS. own + peer is one correctly rounded addition in the destination type on both cards
+// (IEEE addition is commutative), which is the value NCCL's two-rank ring and the in-tree ring
+// produce for every element. Bit-identical to them; decode (ne[1] < 32) never reaches this route.
+//
+// SLOT SAFETY. The staging buffer on device d is written only by the peer's pushes of reduce N and
+// read only by d's adds of reduce N. The peer's copy stream waits, before pushing reduce N, on an
+// event recorded on d's compute stream at the start of reduce N, which is ordered after d's adds of
+// reduce N-1. My own partial is overwritten in place only after my own push of that chunk landed.
+//
+// PXA_TSPLIT_PF=0 restores the previous route selection exactly. PXA_TSPLIT_PF_CHUNKS (1..8,
+// default 4) sets K.
+// ---------------------------------------------------------------------------
+#define PXA_PF_MAX_CHUNKS 8
+
+static bool pxa_pf_enabled() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_TSPLIT_PF");
+        if (e && *e) return atoi(e) != 0;
+        const char * r = getenv("PXA_REFERENCE");
+        return !(r && atoi(r) != 0);
+    }();
+    return v;
+}
+static int pxa_pf_chunks() {
+    static const int v = [](){
+        const char * e = getenv("PXA_TSPLIT_PF_CHUNKS");
+        int k = (e && *e) ? atoi(e) : 4;
+        return std::max(1, std::min(PXA_PF_MAX_CHUNKS, k));
+    }();
+    return v;
+}
+
+struct pxa_pf_dev {
+    cudaStream_t copy   = nullptr;
+    char *       stage  = nullptr;
+    size_t       size   = 0;
+    cudaEvent_t  ready  = nullptr;                    // compute stream reached this reduce
+    cudaEvent_t  pushed[PXA_PF_MAX_CHUNKS] = {};      // my chunk c landed on the peer
+};
+static pxa_pf_dev g_pxa_pf[GGML_CUDA_MAX_DEVICES];
+
+static bool pxa_pf_handles(const ggml_tensor * dst) {
+    if (!pxa_pf_enabled())                                  return false;
+    if (dst->op_params[1] != 2 || dst->op_params[2] != 2)   return false;  // nreduce == nhave == 2
+    if (dst->op_params[4] != 0)                             return false;
+    if (dst->ne[1] < 32)                                    return false;  // prefill only
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) return false;
+    if (!ggml_is_contiguous(dst))                           return false;
+    if (!dst->src[0] || !dst->src[1])                       return false;
+    for (int i = 0; i < 2; ++i) {
+        if (dst->src[i]->type != dst->type)                 return false;
+        if (!ggml_are_same_shape(dst, dst->src[i]))         return false;
+        if (!ggml_is_contiguous(dst->src[i]))               return false;
+    }
+    const int grp[2] = {0, 1};
+    return pxa_tsplit_p2p_group(grp, 2);
+}
+
+static void pxa_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    auto & info = ggml_cuda_info();
+    const size_t nbytes = ggml_nbytes(dst);
+    const int64_t nelem = ggml_nelements(dst);
+    const size_t esz    = ggml_element_size(dst);
+    const int K = (int)std::min<int64_t>(pxa_pf_chunks(), std::max<int64_t>(1, nelem / 4096));
+    // chunk boundaries in elements, multiples of 256 so every chunk start is 512-byte aligned
+    int64_t per = ((nelem + K - 1) / K + 255) / 256 * 256;
+
+    for (int d = 0; d < 2; ++d) {
+        auto & s = g_pxa_pf[d];
+        ggml_cuda_set_device(info.all_ctx[d]->device);
+        if (!s.copy) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&s.copy, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&s.ready, cudaEventDisableTiming));
+            for (int c = 0; c < PXA_PF_MAX_CHUNKS; ++c) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&s.pushed[c], cudaEventDisableTiming));
+            }
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                fprintf(stderr, "PXA_TSPLIT_PF: prefill reduce = DMA push per direction, %d chunk(s), copy stream "
+                                "per device (PXA_TSPLIT_PF=0 restores the previous route)\n", pxa_pf_chunks());
+            }
+        }
+        if (s.size < nbytes) {
+            // the staging buffer is only touched by this route, whose work is all stream-ordered;
+            // drain the device before replacing it
+            CUDA_CHECK(cudaDeviceSynchronize());
+            if (s.stage) CUDA_CHECK(cudaFree(s.stage));
+            CUDA_CHECK(cudaMalloc(&s.stage, nbytes));
+            s.size = nbytes;
+        }
+        CUDA_CHECK(cudaEventRecord(s.ready, info.all_ctx[d]->stream()));
+    }
+    // pushes: device d's copy engine writes d's partial into the peer's staging buffer
+    for (int d = 0; d < 2; ++d) {
+        const int p = 1 - d;
+        auto & s = g_pxa_pf[d];
+        ggml_cuda_set_device(info.all_ctx[d]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(s.copy, s.ready, 0));             // my partial is final
+        CUDA_CHECK(cudaStreamWaitEvent(s.copy, g_pxa_pf[p].ready, 0));   // peer finished its last adds
+        for (int c = 0; c < K; ++c) {
+            const int64_t e0 = c * per;
+            if (e0 >= nelem) break;
+            const int64_t n = std::min<int64_t>(per, nelem - e0);
+            CUDA_CHECK(cudaMemcpyPeerAsync(g_pxa_pf[p].stage + e0*esz, info.all_ctx[p]->device,
+                                           (const char *)dst->src[d]->data + e0*esz, info.all_ctx[d]->device,
+                                           n*esz, s.copy));
+            CUDA_CHECK(cudaEventRecord(s.pushed[c], s.copy));
+        }
+    }
+    // adds: on each compute stream, own += peer, chunk by chunk, in place
+    for (int d = 0; d < 2; ++d) {
+        const int p = 1 - d;
+        auto & s = g_pxa_pf[d];
+        cudaStream_t st = info.all_ctx[d]->stream();
+        ggml_cuda_set_device(info.all_ctx[d]->device);
+        for (int c = 0; c < K; ++c) {
+            const int64_t e0 = c * per;
+            if (e0 >= nelem) break;
+            const int n = (int)std::min<int64_t>(per, nelem - e0);
+            CUDA_CHECK(cudaStreamWaitEvent(st, g_pxa_pf[p].pushed[c], 0));  // peer's chunk is in my staging
+            CUDA_CHECK(cudaStreamWaitEvent(st, s.pushed[c], 0));            // my chunk was read before I overwrite it
+            const int nb = (n + CUDA_REDUCE_BLOCK_SIZE - 1) / CUDA_REDUCE_BLOCK_SIZE;
+            if (dst->type == GGML_TYPE_F16) {
+                k_add<half, CUDA_REDUCE_BLOCK_SIZE><<<nb, CUDA_REDUCE_BLOCK_SIZE, 0, st>>>(n,
+                        (const half *)s.stage + e0, (half *)dst->src[d]->data + e0);
+            } else {
+                k_add<float, CUDA_REDUCE_BLOCK_SIZE><<<nb, CUDA_REDUCE_BLOCK_SIZE, 0, st>>>(n,
+                        (const float *)s.stage + e0, (float *)dst->src[d]->data + e0);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    ggml_cuda_set_device(ctx.device);
+}
+
 void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     auto op = (ggml_op)dst->op_params[0];
     GGML_ASSERT(op == GGML_OP_ADD);
     int nreduce = dst->op_params[1];
     int nhave   = dst->op_params[2];
-    if (getenv("PXA_REDUCE_CAPTURE")) { // PXA_REDUCE_PATH diag: shape + p2p + is-this-reduce-being-captured
+    static const bool pxa_reduce_capture_diag = getenv("PXA_REDUCE_CAPTURE") != nullptr;   // read once (was per reduce)
+    if (pxa_reduce_capture_diag) { // PXA_REDUCE_PATH diag: shape + p2p + is-this-reduce-being-captured
         static long _n=0;
         cudaStreamCaptureStatus _st=cudaStreamCaptureStatusNone; cudaStreamIsCapturing(ctx.stream(),&_st);
         if ((_n++ % 500)==0)
@@ -1445,6 +2204,18 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         return;
     }
 
+    // PXA_TSPLIT_PF_v1: two-device prefill all-reduce as one DMA push per direction (see above).
+    if (pxa_pf_handles(dst)) {
+        cudaStreamCaptureStatus _cs = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &_cs));
+        if (_cs == cudaStreamCaptureStatusNone) {
+            if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH pxa-pf\n");
+            _rt.route(PXA_RT_PF);
+            pxa_pf_run(ctx, dst);
+            return;
+        }
+    }
+
     auto & info = ggml_cuda_info();
 #ifdef GGML_USE_NCCL
     // Somehow I'm not able to figure out how to use NCCL correctly.
@@ -1470,27 +2241,50 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
     // island shape: tensor-parallel inside one island, pipelined between islands) has
     // nreduce < device_count and used to hit the assert below and abort the run. Skip the route in
     // that case instead, and let the in-tree peer routes take it.
-    if (_pxa_nccl_ok && info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
+    // Bug #206: once a group has failed in this process the route stays off (see pxa_nccl_route_fail).
+    if (_pxa_nccl_ok && !g_pxa_nccl_dead.load(std::memory_order_acquire) &&
+        info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
         info.device_count == nreduce &&
        (dst->type != GGML_TYPE_BF16 || bf16_supported)) {
         GGML_ASSERT(info.have_nccl);
         GGML_ASSERT(info.device_count == nreduce);
+        if (_rdbg) fprintf(stderr, "PXA_RDBG   -> BRANCH nccl%s\n", pxa_nccl_fault_injected() ? " (PXA_REDUCE_NCCL_FAULT)" : "");
         _rt.route(PXA_RT_NCCL);
         auto data_type = dst->type == GGML_TYPE_F32 ? ncclFloat : dst->type == GGML_TYPE_BF16 ? ncclBfloat16 : ncclHalf;
-        ncclGroupStart();
-        for (int i = 0; i < nreduce; ++i) {
-            ggml_cuda_set_device(i);
-            auto status = ncclAllReduce(dst->src[i] ? dst->src[i]->data : nullptr,
-                    dst->src[i] ? dst->src[i]->data : nullptr,
-                    ggml_nelements(dst), data_type, ncclSum, info.nccl_coms[i], info.all_ctx[i]->stream());
-            if (status != ncclSuccess) {
-                fprintf(stderr, "%s: ncclAllReduce failed with status %d\n", __func__, (int)status);
-                GGML_ABORT("Fatal error");
+        ncclResult_t gst   = ncclSuccess;
+        const char * where = "ncclGroupEnd";
+        if (pxa_nccl_fault_injected()) {
+            // Test lever: exactly what a group that fails to set up leaves behind -- nothing summed.
+            gst   = ncclSystemError;
+            where = "PXA_REDUCE_NCCL_FAULT=1 (test)";
+        } else {
+            gst = ncclGroupStart();
+            if (gst != ncclSuccess) {
+                where = "ncclGroupStart";
+            } else {
+                for (int i = 0; i < nreduce; ++i) {
+                    ggml_cuda_set_device(i);
+                    auto status = ncclAllReduce(dst->src[i] ? dst->src[i]->data : nullptr,
+                            dst->src[i] ? dst->src[i]->data : nullptr,
+                            ggml_nelements(dst), data_type, ncclSum, info.nccl_coms[i], info.all_ctx[i]->stream());
+                    if (status != ncclSuccess) {
+                        fprintf(stderr, "%s: ncclAllReduce failed with status %d (%s)\n", __func__, (int)status,
+                                ncclGetErrorString(status));
+                        GGML_ABORT("Fatal error");
+                    }
+                }
+                // The group is where the work happens: connection setup (lazy since NCCL 2.22) and
+                // the kernel launches. Its status is the one that says whether anything was summed.
+                gst = ncclGroupEnd();
             }
         }
-        ncclGroupEnd();
         ggml_cuda_set_device(ctx.device);
-        return;
+        if (gst == ncclSuccess) {
+            return;
+        }
+        pxa_nccl_route_fail(where, ncclGetErrorString(gst), nreduce, ggml_nbytes(dst));
+        if (_rdbg) fprintf(stderr, "PXA_RDBG   -> nccl group failed, falling through to the in-tree routes\n");
+        // Fall through: the in-tree routes below take this reduce from the untouched partials.
     }
 #endif
     GGML_ASSERT(dst->data == dst->src[ctx.device]->data);

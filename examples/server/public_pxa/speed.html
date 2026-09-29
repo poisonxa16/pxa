@@ -1,0 +1,318 @@
+<!doctype html>
+<!--
+  PXA_SPEED_STATS_v1 (2026-09-27, speed-graph lane). The /pxa/speed page: plain HTML+JS, inline SVG,
+  no build toolchain, no external resources (embedded into llama-server via the PXA_ASSETS block in
+  examples/server/CMakeLists.txt). It only ever reads GET /pxa/stats on this same server; nothing
+  leaves the machine and nothing on this page can change a generated token.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PXA speed history</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f4f4f2; --panel: #fcfcfb; --border: #e2e1dc; --text: #0b0b0b; --dim: #52514e; --grid: #ecebe7;
+    --accent: #2a78d6; --bad: #d03b3b;
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #111110; --panel: #1a1a19; --border: #2e2e2c; --text: #ffffff; --dim: #c3c2b7; --grid: #262624;
+      --accent: #3987e5; --bad: #e66767;
+      --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #111110; --panel: #1a1a19; --border: #2e2e2c; --text: #ffffff; --dim: #c3c2b7; --grid: #262624;
+    --accent: #3987e5; --bad: #e66767;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px 16px; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 14px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    background: var(--panel); color: var(--text); border: 0; padding: 6px 12px; font: inherit; cursor: pointer;
+    border-right: 1px solid var(--border);
+  }
+  .seg button:last-child { border-right: 0; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .count { color: var(--dim); font-size: 13px; }
+  .spacer { flex: 1; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 14px 8px; margin-bottom: 14px; position: relative; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--dim); margin: 0 0 14px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+  .tip {
+    position: absolute; pointer-events: none; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 9px; font-size: 12px; line-height: 1.4; box-shadow: 0 4px 14px rgba(0,0,0,.18);
+    white-space: nowrap; display: none; z-index: 2;
+  }
+  .tip b { font-weight: 600; }
+  .tip .m { color: var(--dim); }
+  .empty { color: var(--dim); padding: 30px 0; text-align: center; }
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  td .n { color: var(--dim); font-size: 11px; }
+  .err { color: var(--bad); margin-bottom: 10px; }
+  footer { color: var(--dim); font-size: 12px; margin-top: 18px; }
+  a { color: var(--accent); }
+  code { font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Speed history</h1>
+  <div class="sub" id="sub">loading &hellip;</div>
+  <div class="err" id="err"></div>
+
+  <div class="bar">
+    <div class="seg" id="range" role="group" aria-label="time range">
+      <button data-r="3600">1h</button><button data-r="86400" aria-pressed="true">24h</button><button data-r="604800">7d</button><button data-r="0">all</button>
+    </div>
+    <span class="count" id="count"></span>
+    <span class="spacer"></span>
+    <div class="seg" id="theme" role="group" aria-label="theme">
+      <button data-t="auto" aria-pressed="true">auto</button><button data-t="light">light</button><button data-t="dark">dark</button>
+    </div>
+  </div>
+
+  <div class="legend" id="legend"></div>
+
+  <div class="card"><h2>Decode t/s</h2><div id="c-decode"></div><div class="tip"></div></div>
+  <div class="card"><h2>Prefill t/s</h2><div id="c-prefill"></div><div class="tip"></div></div>
+
+  <div class="card">
+    <h2>Medians by prompt size</h2>
+    <div class="tablewrap"><table id="tbl"><thead></thead><tbody></tbody></table></div>
+  </div>
+
+  <footer>
+    Dots are single requests; the line is a rolling median of the last 15 per model. Prefill only counts
+    requests that prefilled at least 64 tokens (a prompt-cache hit is latency, not throughput). Raw JSON: <a href="/pxa/stats">/pxa/stats</a>
+    &middot; <a href="/pxa">/pxa</a> &middot; data never leaves this server &middot; refreshes every 10 s.
+  </footer>
+</main>
+<script>
+(function () {
+  "use strict";
+  var SERIES = 8, WIN = 15, MIN_PREFILL = 64;
+  var BUCKETS = [["<1k", 0, 1024], ["1-4k", 1024, 4096], ["4-16k", 4096, 16384], [">16k", 16384, Infinity]];
+  var all = [], lastTs = 0, range = 86400, models = [], nowS = Date.now() / 1000;
+
+  function $(id) { return document.getElementById(id); }
+  function ns(tag, attrs) {
+    var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function colorOf(m) { var i = models.indexOf(m); return "var(--s" + ((i < 0 ? 0 : i) % SERIES + 1) + ")"; }
+  function fmt(v) { return v === 0 ? "0" : v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2); }
+  function median(a) {
+    if (!a.length) return 0;
+    var s = a.slice().sort(function (x, y) { return x - y; }), m = s.length >> 1;
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+  function when(ts) {
+    var d = new Date(ts * 1000);
+    return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  function tickLabel(ts, span) {
+    var d = new Date(ts * 1000);
+    if (span <= 2 * 86400) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+  function niceMax(v) {
+    if (v <= 0) return 1;
+    var p = Math.pow(10, Math.floor(Math.log10(v))), f = v / p;
+    return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p;
+  }
+
+  function visible() {
+    var from = range ? nowS - range : 0;
+    return all.filter(function (r) { return r.ts >= from; });
+  }
+
+  function chart(hostId, recs, key) {
+    var host = $(hostId), tip = host.parentNode.querySelector(".tip");
+    host.innerHTML = "";
+    var pts = recs.filter(function (r) { return r[key] > 0 && (key !== "prefill_tps" || r.prompt_n >= MIN_PREFILL); });
+    if (!pts.length) { host.innerHTML = '<div class="empty">No requests in this range yet.</div>'; return; }
+    var W = Math.max(320, host.clientWidth || 600), H = W < 520 ? 200 : 240;
+    var L = 46, R = 10, T = 8, B = 24, iw = W - L - R, ih = H - T - B;
+    var t0 = range ? nowS - range : Math.min.apply(null, pts.map(function (r) { return r.ts; }));
+    var t1 = nowS;
+    if (t1 - t0 < 60) t0 = t1 - 60;
+    var ymax = niceMax(Math.max.apply(null, pts.map(function (r) { return r[key]; })) * 1.05);
+    function x(t) { return L + (t - t0) / (t1 - t0) * iw; }
+    function y(v) { return T + ih - v / ymax * ih; }
+    var svg = ns("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": key + " over time" });
+    // grid + y labels
+    for (var i = 0; i <= 4; i++) {
+      var v = ymax * i / 4, yy = y(v);
+      svg.appendChild(ns("line", { x1: L, x2: W - R, y1: yy, y2: yy, stroke: "var(--grid)", "stroke-width": 1 }));
+      var tx = ns("text", { x: L - 6, y: yy + 4, "text-anchor": "end", fill: "var(--dim)", "font-size": 11 });
+      tx.textContent = fmt(v); svg.appendChild(tx);
+    }
+    var nt = W < 520 ? 3 : 6;
+    for (var j = 0; j <= nt; j++) {
+      var tt = t0 + (t1 - t0) * j / nt;
+      var lx = ns("text", { x: x(tt), y: H - 6, "text-anchor": j === 0 ? "start" : j === nt ? "end" : "middle", fill: "var(--dim)", "font-size": 11 });
+      lx.textContent = tickLabel(tt, t1 - t0); svg.appendChild(lx);
+    }
+    svg.appendChild(ns("line", { x1: L, x2: W - R, y1: T + ih, y2: T + ih, stroke: "var(--border)", "stroke-width": 1 }));
+    // per model: points then rolling median
+    var hits = [];
+    models.forEach(function (m) {
+      var mp = pts.filter(function (r) { return r.model === m; });
+      if (!mp.length) return;
+      var c = colorOf(m), g = ns("g", {});
+      mp.forEach(function (r) {
+        var cx = x(r.ts), cy = y(r[key]);
+        g.appendChild(ns("circle", { cx: cx.toFixed(1), cy: cy.toFixed(1), r: 3, fill: c, "fill-opacity": 0.45 }));
+        hits.push({ x: cx, y: cy, r: r, c: c });
+      });
+      svg.appendChild(g);
+      if (mp.length >= 3) {
+        var d = "", win = [];
+        mp.forEach(function (r, k) {
+          win.push(r[key]); if (win.length > WIN) win.shift();
+          d += (k ? "L" : "M") + x(r.ts).toFixed(1) + " " + y(median(win)).toFixed(1);
+        });
+        svg.appendChild(ns("path", { d: d, fill: "none", stroke: c, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      }
+    });
+    var ring = ns("circle", { r: 5, fill: "none", stroke: "var(--text)", "stroke-width": 2, visibility: "hidden" });
+    svg.appendChild(ring);
+    host.appendChild(svg);
+
+    function move(ev) {
+      var box = svg.getBoundingClientRect(), sx = W / box.width;
+      var px = (ev.clientX - box.left) * sx, py = (ev.clientY - box.top) * sx;
+      var best = null, bd = 30 * 30 * sx * sx;
+      hits.forEach(function (h) {
+        var dd = (h.x - px) * (h.x - px) + (h.y - py) * (h.y - py);
+        if (dd < bd) { bd = dd; best = h; }
+      });
+      if (!best) { tip.style.display = "none"; ring.setAttribute("visibility", "hidden"); return; }
+      var r = best.r;
+      ring.setAttribute("cx", best.x); ring.setAttribute("cy", best.y); ring.setAttribute("visibility", "visible");
+      var html = '<b>' + fmt(r[key]) + ' t/s</b> <span class="m">' + (key === "decode_tps" ? "decode" : "prefill") + '</span><br>' +
+        esc(r.model) + '<br><span class="m">' + when(r.ts) + ' &middot; slot ' + r.slot + '</span><br>' +
+        'prompt ' + r.n_prompt + (r.n_cached ? ' (' + r.n_cached + ' cached)' : '') + ' &middot; gen ' + r.n_gen +
+        (r.draft_n ? '<br>draft ' + r.draft_acc + '/' + r.draft_n + ' (' + Math.round(100 * r.draft_acc / r.draft_n) + '%)' : '') +
+        '<br><span class="m">' + r.split + ' &middot; ' + r.n_gpu + ' GPU' + (r.n_gpu === 1 ? '' : 's') + '</span>';
+      tip.innerHTML = html; tip.style.display = "block";
+      var card = host.parentNode.getBoundingClientRect();
+      var lx = best.x / sx + box.left - card.left + 12, ly = best.y / sx + box.top - card.top - 10;
+      if (lx + tip.offsetWidth > card.width - 4) lx = best.x / sx + box.left - card.left - tip.offsetWidth - 12;
+      tip.style.left = Math.max(4, lx) + "px"; tip.style.top = Math.max(4, ly) + "px";
+    }
+    svg.addEventListener("pointermove", move);
+    svg.addEventListener("pointerdown", move);
+    svg.addEventListener("pointerleave", function () { tip.style.display = "none"; ring.setAttribute("visibility", "hidden"); });
+  }
+
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+
+  function table(recs) {
+    var head = "<tr><th>model</th><th>requests</th>" + BUCKETS.map(function (b) { return "<th>" + esc(b[0]) + " prompt<br>decode / prefill</th>"; }).join("") + "<th>all<br>decode / prefill</th></tr>";
+    $("tbl").querySelector("thead").innerHTML = head;
+    var rows = models.map(function (m) {
+      var mr = recs.filter(function (r) { return r.model === m; });
+      if (!mr.length) return "";
+      function cell(list) {
+        if (!list.length) return "<td>&ndash;</td>";
+        var d = median(list.filter(function (r) { return r.decode_tps > 0; }).map(function (r) { return r.decode_tps; }));
+        var p = median(list.filter(function (r) { return r.prefill_tps > 0 && r.prompt_n >= MIN_PREFILL; }).map(function (r) { return r.prefill_tps; }));
+        return "<td>" + (d ? fmt(d) : "&ndash;") + " / " + (p ? fmt(p) : "&ndash;") + ' <span class="n">n=' + list.length + "</span></td>";
+      }
+      return '<tr><td><i style="display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:' + colorOf(m) + '"></i>' + esc(m) +
+        "</td><td>" + mr.length + "</td>" +
+        BUCKETS.map(function (b) { return cell(mr.filter(function (r) { return r.n_prompt >= b[1] && r.n_prompt < b[2]; })); }).join("") +
+        cell(mr) + "</tr>";
+    }).join("");
+    $("tbl").querySelector("tbody").innerHTML = rows || '<tr><td colspan="7" class="empty">No requests in this range yet.</td></tr>';
+  }
+
+  function render() {
+    var recs = visible();
+    $("count").textContent = recs.length + " request" + (recs.length === 1 ? "" : "s") + " in range";
+    $("legend").innerHTML = models.filter(function (m) { return recs.some(function (r) { return r.model === m; }); })
+      .map(function (m) { return '<span><i style="background:' + colorOf(m) + '"></i>' + esc(m) + "</span>"; }).join("");
+    chart("c-decode", recs, "decode_tps");
+    chart("c-prefill", recs, "prefill_tps");
+    table(recs);
+  }
+
+  function load() {
+    fetch("/pxa/stats?since=" + lastTs, { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (j) {
+        nowS = j.now || Date.now() / 1000;
+        var fresh = (j.records || []).filter(function (r) { return r.ts > lastTs; });
+        fresh.forEach(function (r) {
+          all.push(r); lastTs = Math.max(lastTs, r.ts);
+          if (models.indexOf(r.model) < 0) models.push(r.model); // color follows the model, first seen first
+        });
+        if (all.length > (j.capacity || 10000)) all = all.slice(all.length - j.capacity);
+        $("sub").textContent = j.stored + " of " + j.capacity + " records kept" +
+          (j.persist ? " · saved to disk across restarts" : " · memory only (set PXA_STATS_FILE to keep history across restarts)");
+        $("err").textContent = "";
+        render();
+      })
+      .catch(function (e) { $("err").textContent = "Could not read /pxa/stats: " + e.message; });
+  }
+
+  Array.prototype.forEach.call($("range").querySelectorAll("button"), function (b) {
+    b.addEventListener("click", function () {
+      range = +b.getAttribute("data-r");
+      Array.prototype.forEach.call($("range").querySelectorAll("button"), function (o) { o.setAttribute("aria-pressed", o === b ? "true" : "false"); });
+      try { localStorage.setItem("pxa-speed-range", String(range)); } catch (e) {}
+      render();
+    });
+  });
+  Array.prototype.forEach.call($("theme").querySelectorAll("button"), function (b) {
+    b.addEventListener("click", function () {
+      var t = b.getAttribute("data-t");
+      if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.setAttribute("data-theme", t);
+      Array.prototype.forEach.call($("theme").querySelectorAll("button"), function (o) { o.setAttribute("aria-pressed", o === b ? "true" : "false"); });
+      try { localStorage.setItem("pxa-speed-theme", t); } catch (e) {}
+    });
+  });
+  try {
+    var sr = localStorage.getItem("pxa-speed-range");
+    if (sr !== null) { var rb = $("range").querySelector('[data-r="' + sr + '"]'); if (rb) rb.click(); }
+    var st = localStorage.getItem("pxa-speed-theme");
+    if (st) { var tb = $("theme").querySelector('[data-t="' + st + '"]'); if (tb) tb.click(); }
+  } catch (e) {}
+
+  // Link-able view: /pxa/speed#range=1h&theme=dark (range 1h|24h|7d|all, theme auto|light|dark).
+  (function () {
+    var q = {}; location.hash.replace(/^#/, "").split("&").forEach(function (kv) { var p = kv.split("="); if (p[0]) q[p[0]] = p[1]; });
+    var rmap = { "1h": "3600", "24h": "86400", "7d": "604800", "all": "0" };
+    if (q.range && rmap[q.range]) $("range").querySelector('[data-r="' + rmap[q.range] + '"]').click();
+    if (q.theme) { var tb = $("theme").querySelector('[data-t="' + q.theme + '"]'); if (tb) tb.click(); }
+  })();
+
+  var rt; window.addEventListener("resize", function () { clearTimeout(rt); rt = setTimeout(render, 150); });
+  load();
+  setInterval(function () { nowS += 10; load(); }, 10000);
+})();
+</script>
+</body>
+</html>

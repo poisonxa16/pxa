@@ -84,12 +84,71 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 # allocation table and the tier policy, all under src/pxq-encoder/) and the `pxq-quantize`
 # tool that exposes it. OFF builds a tree that reads and runs PXQ files exactly as before but
 # cannot write one: llama-quantize refuses a PXQ target and every other type is unaffected.
-# OFF is the default here because this repository does not carry the encoder sources: the tier
-# codecs and their search live with the separate `pxq-quantize` download, and turning this option
-# ON in a checkout that has no src/pxq-encoder/ only produces a build error.
-option(PXA_PXQ_ENCODER "pxa: build the PXQ encoder and the pxq-quantize tool" OFF)
-set(PXA_PXQ_QUANTIZER_URL "https://github.com/poisonxa16/pxq-quantize/releases" CACHE STRING
+option(PXA_PXQ_ENCODER "pxa: build the PXQ encoder and the pxq-quantize tool" ON)
+set(PXA_PXQ_QUANTIZER_URL "<<QUANTIZER-URL>>" CACHE STRING
     "pxa: where a build without the encoder tells the user to get pxq-quantize")
+
+# PXQN (PXQ-Next) encoder: the private half of the quantizer (src/pxq-encoder/pxqn-*). ON is our own
+# build; OFF is the PUBLIC pxq-quantize, which writes the classic PXQ tiers only. The public build
+# is made from a tree that does not contain these files at all (release/v2026.10/quantizer/), so
+# OFF is not a switch over code that is still in the binary: the code is not compiled.
+# Copyright (c) 2026 PXA Network.
+option(PXA_PXQN_ENCODER "pxa: build the private PXQN encoder into the quantizer" ${PXA_PXQ_ENCODER})
+# PXQN kernels (owner decision 2026-09-28): the PXQN decode (CUDA kernels, the CPU reference
+# decoder, the PXQN tail of the tensor-split epilogue and the PXQ4 row-block GEMV) is CLOSED. ON = this private tree
+# builds it from source into libggml-pxqn.so (next to libggml.so, loaded at run time); the public tree has no such
+# sources and builds only the open forwards, which run classic PXQ / k-quants and refuse PXQN files at load.
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/pxqn-cpu.c)
+    set(_pxa_pxqn_closed_default ON)
+else()
+    set(_pxa_pxqn_closed_default OFF)
+endif()
+option(PXA_PXQN_CLOSED_SRC "pxa: build the closed PXQN library (libggml-pxqn) from source" ${_pxa_pxqn_closed_default})
+if (PXA_PXQN_CLOSED_SRC AND NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/pxqn-cpu.c)
+    message(FATAL_ERROR "PXA_PXQN_CLOSED_SRC=ON but this tree has no closed PXQN sources (the public tree): "
+                        "configure with -DPXA_PXQN_CLOSED_SRC=OFF")
+endif()
+set(PXA_QUANTIZER_VERSION "dev" CACHE STRING "pxa: the release tag the quantizer reports and writes")
+# Which PXQN quantizer this is (docs/QUANTIZER-TIERS-AND-SERVICE-2026-09-26.md), only with PXA_PXQN_ENCODER=ON:
+#   owner  PXA's own build (the supporter quant service): every PXQN path incl. LDLQ, no license check.
+#   pro    the distributed Pro build: PXQN tiers, allocator, tier maps and measure mode with RTN rounding,
+#          each run needs a signed Pro license token; the LDLQ code is not compiled in at all.
+# PXA_LICENSE_PUBKEYS ("kid:hex32;kid2:hex32", printed by PXACLAW tools/pxa-license pubkey) is the set of
+# Ed25519 public keys a pro build trusts; it is compiled in, never read from a path.
+set(PXA_QUANTIZER_EDITION "owner" CACHE STRING "pxa: PXQN quantizer edition, owner or pro")
+set(PXA_LICENSE_PUBKEYS "" CACHE STRING "pxa: license public keys a pro quantizer trusts (kid:hex;...)")
+if (PXA_PXQN_ENCODER)
+    if (NOT PXA_PXQ_ENCODER)
+        message(FATAL_ERROR "PXA_PXQN_ENCODER=ON needs PXA_PXQ_ENCODER=ON")
+    endif()
+    if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/pxq-encoder/pxqn-quantize.inc.cpp)
+        message(FATAL_ERROR "PXA_PXQN_ENCODER=ON but this tree has no src/pxq-encoder/pxqn-quantize.inc.cpp "
+                            "(the public quantizer tree): configure with -DPXA_PXQN_ENCODER=OFF")
+    endif()
+    if (NOT PXA_QUANTIZER_EDITION STREQUAL "owner" AND NOT PXA_QUANTIZER_EDITION STREQUAL "pro")
+        message(FATAL_ERROR "PXA_QUANTIZER_EDITION must be owner or pro (got '${PXA_QUANTIZER_EDITION}')")
+    endif()
+    if (PXA_QUANTIZER_EDITION STREQUAL "pro")
+        # each entry kid:<64 lowercase hex> (CMake regex has no {n}: check the hex length apart)
+        set(_pxa_pk_ok FALSE)
+        foreach(_pk IN LISTS PXA_LICENSE_PUBKEYS)
+            set(_pxa_pk_ok TRUE)
+            if (NOT _pk MATCHES "^[A-Za-z0-9._-]+:([0-9a-f]+)$")
+                set(_pxa_pk_ok FALSE)
+                break()
+            endif()
+            string(LENGTH "${CMAKE_MATCH_1}" _pk_len)
+            if (NOT _pk_len EQUAL 64)
+                set(_pxa_pk_ok FALSE)
+                break()
+            endif()
+        endforeach()
+        if (NOT _pxa_pk_ok)
+            message(FATAL_ERROR "PXA_QUANTIZER_EDITION=pro needs PXA_LICENSE_PUBKEYS=kid:<64 hex>[;...] "
+                                "(PXACLAW tools/pxa-license pubkey)")
+        endif()
+    endif()
+endif()
 
 # 3rd party libs
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
@@ -248,7 +307,22 @@ if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
     add_subdirectory(tests)
 endif ()
 
+# PXA binary names (2026-09-25). pxa-server, pxa-bench, pxa-quantize, pxa-perplexity and pxa-cli
+# are created next to the llama-* binaries as symlinks, so both names run the same file and every
+# existing script, recipe and docker line keeps working. Called from each tool's own CMakeLists
+# (a POST_BUILD step has to live in the directory that creates the target).
+# Copyright (c) 2026 PXA Network.
+function(pxa_add_alias target alias)
+    if (NOT WIN32)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:${target}> $<TARGET_FILE_DIR:${target}>/${alias}
+            VERBATIM)
+        install(CODE "execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink ${target} \$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/${alias})")
+    endif()
+endfunction()
+
 if (LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
     add_subdirectory(pocs)
 endif()
+

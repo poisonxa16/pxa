@@ -167,6 +167,43 @@ common_peg_parser analyze_content::build_optional_wrapped(parser_build_context &
     return p.eps();
 }
 
+// PXA tool-tag fix (bug #222): a per-call marker that also accepts the <tools> / </tools> spelling
+// when the template's marker is Qwen's <tool_call> / </tool_call> (whitespace included, e.g.
+// "<tool_call>\n"); any other marker parses exactly as before.
+static common_peg_parser pxa_call_marker(common_chat_peg_builder & p, const std::string & marker) {
+    const std::string alt = pxa_qwen_tools_variant(marker);
+    if (alt.empty()) {
+        return p.literal(marker);
+    }
+    return p.choice({ p.literal(marker), p.literal(alt) });
+}
+
+// Content ends at the first tool marker. The template's own marker ends content unconditionally, as
+// before. Its <tools> spelling (see pxa_call_marker) is NOT committing: plain text may legitimately
+// mention "<tools>" (e.g. explaining a prompt format), so content only ends there when the tool call
+// section (`tail`, the parser that follows the content) matches from that point to the end, or could
+// still match once more input arrives (streaming); otherwise the "<tools>" text stays content and the
+// scan continues. A "<tools>" that may still become a call is therefore handed to the tail, exactly
+// like a "<tool_call>".
+static common_peg_parser pxa_content_until(common_chat_peg_builder & p, const std::string & marker,
+                                           const common_peg_parser & tail) {
+    if (marker.empty()) {
+        return p.eps();
+    }
+    const std::string alt = pxa_qwen_tools_variant(marker);
+    if (alt.empty()) {
+        return p.until(marker);
+    }
+    // Only a "<tools>" can continue the content: check the literal first, so at the template's own
+    // marker the (possibly long) tail lookahead never runs. The lookahead is SETTLED: content
+    // continues past "<tools>" only when the tail definitively fails there. A plain negate() would
+    // propagate need-more-input whenever the tail reaches the end of the input (e.g. parallel calls,
+    // where "</tool_call>\n" could still be followed by another call), which turned the whole
+    // content parser need-more and dropped every parsed call (bug #222 review).
+    auto stop = p.until_one_of({ marker, alt });
+    return stop + p.zero_or_more(p.peek(p.literal(alt)) + p.negate_settled(tail) + p.literal(alt) + stop);
+}
+
 common_peg_parser analyze_tools::build_parser(parser_build_context & ctx) const {
     switch (format.mode) {
         case tool_format::JSON_NATIVE:
@@ -220,16 +257,15 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
     std::string tool_start = "{";
     if (!format.section_start.empty()) {
         tool_start = format.section_start;
-        // PXA tool-tag fix: the model intermittently emits <tools> (the tool-DEFINITIONS tag)
-        // instead of <tool_call>; both share the prefix "<tool". Stop the content parser at the
-        // shared prefix so the (patched) standard_json_tools tool parser can match either variant
-        // instead of the content greedily swallowing the whole <tools>{...}</tools> block.
-        if (tool_start == "<tool_call>") tool_start = "<tool";
     } else if (!format.per_call_start.empty()) {
         tool_start = format.per_call_start;
     }
 
-    return ctx.reasoning_parser + p.optional(p.content(p.until(tool_start))) + tools_parser + p.end();
+    // PXA tool-tag fix (bug #222): the model intermittently emits <tools> (the tool-DEFINITIONS
+    // tag) instead of <tool_call>. Stop the content parser at either marker so the (patched)
+    // standard_json_tools parser can match both, instead of content swallowing the whole block.
+    auto tail = tools_parser + p.end();
+    return ctx.reasoning_parser + p.optional(p.content(pxa_content_until(p, tool_start, tail))) + tail;
 }
 
 common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, const std::string & name,
@@ -311,7 +347,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
     common_peg_parser tool_calls = p.eps();
 
     if (!format.per_call_start.empty()) {
-        auto wrapped_call = format.per_call_start + tool_choice + format.per_call_end;
+        auto wrapped_call = pxa_call_marker(p, format.per_call_start) + tool_choice + pxa_call_marker(p, format.per_call_end);
         if (inputs.parallel_tool_calls) {
             tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call));
         } else {
@@ -337,8 +373,9 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
     }
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
-    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
+    auto        tail                 = tool_calls + p.end();
+    auto        content_before_tools = pxa_content_until(p, trigger_marker, tail);
+    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tail;
 }
 
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
@@ -457,7 +494,8 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
     common_peg_parser tool_calls = p.eps();
 
     if (!format.per_call_start.empty()) {
-        auto wrapped_call = format.per_call_start + p.space() + tool_choice + p.space() + format.per_call_end;
+        auto wrapped_call = pxa_call_marker(p, format.per_call_start) + p.space() + tool_choice + p.space() +
+                            pxa_call_marker(p, format.per_call_end);
         if (inputs.parallel_tool_calls) {
             tool_calls = p.trigger_rule("tool-call", wrapped_call + p.zero_or_more(p.space() + wrapped_call) + p.space());
         } else {
@@ -486,8 +524,9 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
     }
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
-    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
+    auto        tail                 = tool_calls + p.end();
+    auto        content_before_tools = pxa_content_until(p, trigger_marker, tail);
+    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tail;
 }
 
 }  // namespace autoparser

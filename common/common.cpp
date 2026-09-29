@@ -10,6 +10,7 @@
 #endif
 
 #include "common.h"
+#include "pxa-registry.h"
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
 #include "llama-vocab.h"
@@ -1621,6 +1622,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.model_alias = argv[i];
         return true;
     }
+    if (arg == "--hot-model") {
+        // PXA hot swap: register another model the server can switch to (examples/server/pxa-hotswap.h)
+        CHECK_ARG
+        params.hot_models.push_back(argv[i]);
+        return true;
+    }
     if (arg == "-mu" || arg == "--model-url") {
         CHECK_ARG
         params.model_url = argv[i];
@@ -2800,6 +2807,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-cram" || arg == "--cache-ram") {
         CHECK_ARG
         params.cache_ram_mib = std::stoi(argv[i]);
+        params.cache_ram_set = true;
         return true;
     }
     if (arg == "-crs" || arg == "--cache-ram-similarity") {
@@ -3356,6 +3364,11 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "server" });
     options.push_back({ "server",      "       --host HOST",            "ip address to listen (default: %s)", params.hostname.c_str() });
     options.push_back({ "server",      "       --port PORT",            "port to listen (default: %d)", params.port });
+    options.push_back({ "server",      "       --hot-model 'NAME=PATH [flags]'",
+                                                                        "PXA hot swap: register one more model (repeatable). All registered models stay\n"
+                                                                        "in pinned host RAM, one is on the cards; the request's model field picks it and\n"
+                                                                        "a switch re-uploads it in parallel over every card, parking the other model's KV\n"
+                                                                        "cache in RAM. Flags after PATH apply to that model only (e.g. -c 8192 -sm layer)." });
     options.push_back({ "server",      "       --path PATH",            "path to serve static files from (default: %s)", params.public_path.c_str() });
     options.push_back({ "server",      "       --embedding(s)",         "restrict to only support embedding use case; use only with dedicated embedding models (default: %s)", params.embedding ? "enabled" : "disabled" });
     options.push_back({ "server",        "       --webui NAME",
@@ -4093,6 +4106,78 @@ static llama_context * pxa_auto_ctx_retry(llama_model * model, gpt_params & para
     return nullptr;
 }
 
+// PXA_AUTO_UB_FIT (bug #207 follow-up, ws6-fix 2026-09-25): an -ub the ENGINE picked is verified
+// here, by building the context and then reading the cards' free VRAM -- the retry-not-estimate
+// approach PXA_AUTO_CTX takes above, for the same reason: the allocator is the only thing that knows.
+// The rule's -ub 1024 on one V100 with the 12.46 GiB Qwen3.8-27B PXQ3-balanced file at -c 65536 q8_0
+// allocated with 27 MiB left and the server then died on its first decode; the walk steps it down to
+// the largest rung that leaves PXA_AUTO_UB_RESERVE_MB (default 512) free, or refuses cleanly. A -ub
+// the user gave, and a measured batch cell, never reach this (pxa_ub_origin 0).
+static llama_context * pxa_auto_ub_init(llama_model * model, gpt_params & params, llama_context_params cparams) {
+    const int    origin  = params.pxa_ub_origin;
+    const int    ub0     = (int) cparams.n_ubatch;
+    const size_t reserve = pxa_registry_ub_reserve_bytes();
+    const int    only    = params.split_mode == LLAMA_SPLIT_MODE_NONE ? params.main_gpu : -1;
+    llama_context * lctx = nullptr;
+    size_t kept_free = 0;
+    int    kept_dev  = -1;
+    std::string trail;
+    auto build = [&](int ub) {
+        pxa_ub_attempt a;
+        cparams.n_ubatch = (uint32_t) ub;
+        if (cparams.n_batch < (uint32_t) ub) {
+            cparams.n_batch = (uint32_t) ub;
+        }
+        lctx = llama_init_from_model(model, cparams);
+        if (lctx == nullptr) {
+            a.alloc_failure = llama_context_creation_failed_on_alloc();
+            return a;
+        }
+        a.allocated = true;
+        a.free_min  = SIZE_MAX;
+        pxa_registry_cuda_free_min(params.devices, only, &a.free_min, &a.worst_dev);
+        kept_free = a.free_min;
+        kept_dev  = a.worst_dev;
+        return a;
+    };
+    auto discard = [&]() {
+        llama_free(lctx);
+        lctx = nullptr;
+    };
+    const char * who = origin == PXA_UB_RULE ? "a registry rule (PXA_AUTO_UB_VOLTA_Q8)" : "the VRAM ladder";
+    const int ub = pxa_registry_ub_walk(ub0, origin, reserve, build, discard, &trail);
+    if (ub <= 0) {
+        if (lctx != nullptr) {   // never expected: the walk keeps no context when it refuses
+            llama_free(lctx);
+            lctx = nullptr;
+        }
+        if (!trail.empty()) {
+            fprintf(stderr,
+                    "PXA_AUTO: UB gave up - the engine picked -ub %d (%s) and no rung down to 256 fits at "
+                    "-c %d: %severy card needs %zu MiB free after load (PXA_AUTO_UB_RESERVE_MB). The weights and "
+                    "the KV cache leave too little: a smaller -c, a q8_0 KV cache (-ctk/-ctv q8_0), fewer layers "
+                    "on the GPU (-ngl) or more cards may fit; an explicit -ub N is taken as given\n",
+                    ub0, who, params.n_ctx, trail.c_str(), reserve >> 20);
+        }
+        return nullptr;
+    }
+    if (ub != ub0) {
+        params.n_ubatch = ub;
+        if (params.n_batch < ub) {
+            params.n_batch = ub;
+        }
+        fprintf(stderr,
+                "PXA_AUTO: UB=%d (the engine picked -ub %d from %s; %s-ub %d leaves %zu MiB free on CUDA%d, "
+                "over the %zu MiB runtime reserve - pass -ub N to choose, PXA_AUTO_UB_RESERVE_MB=M to move the "
+                "reserve, 0 to turn the check off)\n",
+                ub, ub0, who, trail.c_str(), ub, kept_free >> 20, kept_dev, reserve >> 20);
+    } else if (origin == PXA_UB_RULE && reserve > 0 && kept_dev >= 0) {
+        fprintf(stderr, "PXA_AUTO: UB=%d fits (%zu MiB free on CUDA%d after load, reserve %zu MiB)\n",
+                ub, kept_free >> 20, kept_dev, reserve >> 20);
+    }
+    return lctx;
+}
+
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
 
@@ -4115,7 +4200,8 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     auto cparams = common_context_params_to_llama(params);
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context * lctx = params.pxa_ub_origin != PXA_UB_KEPT ? pxa_auto_ub_init(model, params, cparams)
+                                                               : llama_init_from_model(model, cparams);
 
     // PXA_AUTO_CTX_v1: only ever reached on a boot that has already failed, and only
     // when the caller named no context size of their own.

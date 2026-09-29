@@ -16,6 +16,7 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
+#include <regex>
 #include <vector>
 #include <fstream>
 #include <unordered_map>
@@ -415,6 +416,24 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
     const float * data = is_host ? (const float *) src1->data : (const float *)m_src1_data.data();
 
+    // PXQN activation dump (private probe hook): PXQN_DUMP_DIR + PXQN_DUMP_RE select weights whose
+    // input rows are appended as fp16 to <dir>/<weight>.f16 (row length = src1->ne[0]).
+    if (t->op != GGML_OP_MUL_MAT_ID && t->op != GGML_OP_MOE_FUSED_UP_GATE) {
+        static const char * ddir = getenv("PXQN_DUMP_DIR");
+        static const char * dre  = getenv("PXQN_DUMP_RE");
+        if (ddir && dre) {
+            static const std::regex re(dre);
+            if (std::regex_search(wname, re) && src1->nb[1] == src1->ne[0]*sizeof(float)) {
+                const int64_t n = ggml_nrows(src1)*src1->ne[0];
+                std::vector<ggml_fp16_t> h(n);
+                ggml_fp32_to_fp16_row(data, h.data(), n);
+                std::string fn = std::string(ddir) + "/" + wname + ".f16";
+                FILE * f = fopen(fn.c_str(), "ab");
+                if (f) { fwrite(h.data(), sizeof(ggml_fp16_t), n, f); fclose(f); }
+            }
+        }
+    }
+
     if (m_collect_lsim) {
         if (wname.find(".ffn_") != std::string::npos) {
             if (auto index = layer_index(wname); index.has_value() && *index == m_last_layer && *index != m_last_ffn) {
@@ -617,6 +636,20 @@ void IMatrixCollector::save_imatrix(int ncall) const {
     if (ncall > 0) {
         fname += ".at_";
         fname += std::to_string(ncall);
+    }
+
+    // PXA_MOE_COUNTS_CSV=<file>: per-expert routing counts (tokens routed to each expert) of every
+    // expert tensor, for sizing a hot-expert placement (stream-next probe, 2026-09-25).
+    if (const char * csv = getenv("PXA_MOE_COUNTS_CSV")) {
+        if (FILE * f = fopen(csv, "w")) {
+            fprintf(f, "tensor,expert,count\n");
+            for (const auto & kv : m_stats) {
+                if (kv.second.n_as <= 1 || kv.second.counts.empty()) continue;
+                const size_t per = kv.second.counts.size() / kv.second.n_as;
+                for (int ex = 0; ex < kv.second.n_as; ++ex) fprintf(f, "%s,%d,%d\n", kv.first.c_str(), ex, kv.second.counts[ex*per]);
+            }
+            fclose(f);
+        }
     }
 
     // avoid writing imatrix entries that do not have full data
@@ -950,7 +983,7 @@ static bool compute_imatrix(llama_context * ctx, const gpt_params & params, llam
     auto tim1 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = ::common_tokenize(ctx, params.prompt, true);
+    std::vector<llama_token> tokens = ::common_tokenize(ctx, params.prompt, true, getenv("PXA_PPL_PARSE_SPECIAL") != nullptr);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -1091,6 +1124,12 @@ static bool compute_imatrix(llama_context * ctx, const gpt_params & params, llam
 
 int main(int argc, char ** argv) {
     gpt_params params;
+
+    // PXA_XCACHE splits each routed-expert tensor into hot/cold stacks named "<tensor>.xh" /
+    // "<tensor>.xc" with stack-local expert ids: the collected statistics (and the routing counts
+    // PXA_MOE_COUNTS_CSV writes) would no longer match the file's tensors. Whole-layer placement
+    // keeps the file's tensors, so the imatrix tool never takes the expert-granular split.
+    setenv("PXA_XCACHE", "0", 0);
 
     params.n_ctx = 512;
     params.logits_all = true;

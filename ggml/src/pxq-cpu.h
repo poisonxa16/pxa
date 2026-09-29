@@ -50,6 +50,7 @@ bool pxa_pxq_is_cpu_supported(enum ggml_type type);
 //   sub8   : 16-entry SUB8 subs   (PXQ4-HQ's per-8-element sub-scale)
 void pxa_pxq_float_tables(const float ** book16, const float ** sub16, const float ** sub8);
 
+
 // dequant one row (global row index into the panel-interleaved 2D matrix) to k floats.
 // data = base of the 2D [k x nrows] slice (e.g. expert base = tensor->data + e*nb[2]).
 void pxa_pxq_dequant_row(enum ggml_type type, const void * data, int64_t row, int64_t k, float * dst);
@@ -150,6 +151,9 @@ void pxa_mul_multi_add(struct ggml_tensor * dst, int ith, int nth);
 // GGML_OP_HADAMARD -- in-place fast Walsh-Hadamard transform over every op_params[0]-wide
 // chunk of every row, f32 or any quantized source with a to_float. No stock ggml body exists.
 void pxa_hadamard(struct ggml_tensor * dst, int ith, int nth);
+
+// GGML_OP_PXQN_RHT on the CPU (forwards to the closed libggml-pxqn; aborts with one message without it)
+void pxa_pxqn_rht(struct ggml_tensor * dst, int ith, int nth);
 
 // GGML_OP_FUSED_RMS_RMS_ADD -- two independent RMS norms of the same shape, added.
 // src0/src2 are f32/f16/bf16 and share a type; src1/src3 are f32 gain rows. No stock body.

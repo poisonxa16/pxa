@@ -23,6 +23,21 @@ static inline bool pxa_tsplit_fallback_to_layer(void) {
     return pxa_tsplit_env_flag("PXA_TSPLIT_FALLBACK", false);
 }
 
+// PXA_TSPLIT_ALLOW_4WAY -- default ON since 2026-09-27 (was OFF from 2026-09-25, bug #206).
+// A tensor split over MORE than two devices served wrong tokens on 4x P100 while perplexity matched
+// the layer split. The root cause was not the split: NCCL's SHM transport could not fit a 4-rank
+// group in docker's 64 MB /dev/shm, ncclGroupEnd failed and its status was thrown away, so every
+// card kept its own partial. That failure is now checked and demotes the NCCL route to the in-tree
+// peer route for the rest of the process (ggml-cuda/reduce.cu, pxa_nccl_route_fail), and the 4-way
+// arms are byte-identical to the NCCL-off route. Measured 2026-09-27 on 4x P100, dense
+// 27B PXQN4, one binary, layer/tensor/layer: tensor decode +4.6..5.6%, prefill @22.6k +95%; dense 27B PXQ4:
+// decode +38.5..41.1%, prefill +95.6% (lane
+// launch-defaults, impl tsplit-4card-default). Set it to 0 to get the old guard back: a request for a
+// >2-device split (typed or auto-picked) is warned about and runs '-sm layer' instead.
+static inline bool pxa_tsplit_allow_4way(void) {
+    return pxa_tsplit_env_flag("PXA_TSPLIT_ALLOW_4WAY", true);
+}
+
 // PXA_TSPLIT_FORCE_FA -- default ON. The split attention builder requires flash attention: with the
 // weights carrying ->extra and flash attention off, the builder falls through to a generic path
 // that reads the split tensor's dummy base pointer. That is undefined behaviour, not an error. So
@@ -43,13 +58,25 @@ static inline bool pxa_tsplit_allow_unproven_arch(void) {
     return pxa_tsplit_env_flag("PXA_TSPLIT_UNPROVEN_ARCH", false);
 }
 
-// PXA_TSPLIT_LMHEAD -- default OFF in this wave. Splits the LM head vocab-parallel across the
-// participating devices instead of leaving it, and the final projection of every token, on one
-// card. It CHANGES OUTPUT: each device produces its own slice of the vocabulary and the slices are
-// concatenated, so the logits are computed in a different order from the single-device head. Off by
-// default until the decode number and the fidelity reading are on the ledger.
+// PXA_TSPLIT_LMHEAD -- default ON (2026-09-27; was OFF). Splits the LM head vocab-parallel
+// across the participating devices instead of leaving it, and the final projection of every token, on one
+// card: the head is a serial tail after the last all-reduce (ledger tsplit-k-head-device), so halving it
+// is the only way to shorten it. Each logit row is still one device's full-K dot product, so the values
+// are the single-device head's (greedy sha identical, ledger pxa-tsplit-lmhead-vocab-parallel). Its one
+// measured cost was the concat gather in build_output; PXA_TSPLIT_LMHEAD_DIRECT below removes it. The
+// loader's guards (arch list, MTP, -ot, granularity) still decide; =0 keeps the head on one device.
 static inline bool pxa_tsplit_lmhead_split(void) {
-    return pxa_tsplit_env_flag("PXA_TSPLIT_LMHEAD", false);
+    return pxa_tsplit_env_flag("PXA_TSPLIT_LMHEAD", true);
+}
+
+// PXA_TSPLIT_LMHEAD_DIRECT -- default ON. With a vocab-parallel head, build_output no
+// longer concatenates the per-device logit slices into one tensor on one device (a cross-device copy of
+// half the logits plus a concat kernel, every token, and a second full-width logits buffer in the compute
+// reserve). Each slice stays on its own device as a graph output and the host read-back copies every
+// slice straight into its column range of the logits buffer. =0 restores the concat.
+#define PXA_HEAD_PART_NAME "pxa_head_part"
+static inline bool pxa_tsplit_lmhead_direct(void) {
+    return pxa_tsplit_env_flag("PXA_TSPLIT_LMHEAD_DIRECT", true);
 }
 
 // PXA_TSPLIT_GEMMA4 -- default OFF. Gemma 4 is the one arch whose split graph builder has never

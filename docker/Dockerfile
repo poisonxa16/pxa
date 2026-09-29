@@ -5,8 +5,8 @@
 # libraries they need, and the CUDA 12.8 runtime libs (cudart/cublas/cublasLt) — no
 # compiler, no headers, no build tooling.
 #
-# The image carries TWO engines: this one, as /usr/local/bin/llama-server (the
-# ENTRYPOINT), and the upstream engine every published comparison was measured
+# The image carries TWO engines: this one, as /usr/local/bin/llama-server (run by the
+# ENTRYPOINT, pxa-entrypoint), and the upstream engine every published comparison was measured
 # against, as /opt/pxa/bin/upstream-ik-server, pinned to one commit and labelled
 # with it. An engine-only comparison is then one `docker run --entrypoint` away,
 # on the same card, the same driver, the same CUDA runtime and the same weight
@@ -69,7 +69,7 @@ RUN cmake -S . -B build \
         -DLLAMA_CURL=OFF \
         -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
         -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
-    && cmake --build build --target llama-server llama-cli llama-bench \
+    && cmake --build build --target llama-server llama-cli llama-bench llama-quantize llama-perplexity \
         -j "$([ "${BUILD_JOBS}" != "0" ] && [ -n "${BUILD_JOBS}" ] && echo "${BUILD_JOBS}" || nproc)"
 
 # ---------------------------------------------------------------------------
@@ -146,8 +146,10 @@ LABEL org.opencontainers.image.source="https://github.com/poisonxa16/pxa" \
       org.pxa.upstream.ik.sha="${IK_SHA}" \
       org.pxa.upstream.ik.url="${IK_URL}"
 
+# python3 is for pxa-launch (standard library only, no pip): the entrypoint runs it when the image is
+# started with no arguments, and for `docker run IMAGE doctor`.
 RUN apt-get update -qq && \
-    apt-get install -y -qq --no-install-recommends curl ca-certificates libgomp1 && \
+    apt-get install -y -qq --no-install-recommends curl ca-certificates libgomp1 python3 && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r pxq && useradd -r -g pxq -d /work -m pxq
 
@@ -156,6 +158,18 @@ WORKDIR /work
 COPY --from=build /src/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=build /src/build/bin/llama-cli    /usr/local/bin/llama-cli
 COPY --from=build /src/build/bin/llama-bench  /usr/local/bin/llama-bench
+COPY --from=build /src/build/bin/llama-quantize   /usr/local/bin/llama-quantize
+COPY --from=build /src/build/bin/llama-perplexity /usr/local/bin/llama-perplexity
+COPY tools/pxa-launch.py     /usr/local/bin/pxa-launch
+COPY tools/pxa-entrypoint.sh /usr/local/bin/pxa-entrypoint
+# PXA Control (`docker run -p 7777:7777 IMAGE gui`): the launcher's web front end, stdlib only.
+COPY tools/pxa_control.py tools/pxa-bench.py tools/pxa_explain_footer.py /usr/local/bin/
+COPY tools/pxa_control_ui /usr/local/bin/pxa_control_ui
+COPY common/pxa-lever-catalog.inc /usr/local/share/pxa/pxa-lever-catalog.inc
+# The PXA names next to the llama-* ones: one binary behind both.
+RUN set -e; for t in server cli bench quantize perplexity; do \
+        ln -sf "llama-$t" "/usr/local/bin/pxa-$t"; \
+    done; chmod 0755 /usr/local/bin/pxa-launch /usr/local/bin/pxa-entrypoint
 COPY --from=build /src/build/src/libllama.so           /usr/local/lib/
 COPY --from=build /src/build/ggml/src/libggml.so       /usr/local/lib/
 COPY --from=build /src/build/examples/mtmd/libmtmd.so  /usr/local/lib/
@@ -206,4 +220,9 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
     CMD curl -f "http://127.0.0.1:${LLAMA_ARG_PORT:-8080}/health" || exit 1
 
-ENTRYPOINT ["/usr/local/bin/llama-server"]
+# pxa-entrypoint (2026-09-25): with NO arguments the image runs pxa-launch, which picks the cards,
+# the model under /models and the flags. With arguments that start with '-' they are ENGINE
+# arguments and go straight to llama-server, unchanged - every existing `docker run ... -m ...`
+# line means what it meant; the engine fills the flags you did not give (-sm/-b/-ub/-fa) from the
+# same registry pxa-launch reads. `docker run IMAGE doctor` prints the one-screen check.
+ENTRYPOINT ["/usr/local/bin/pxa-entrypoint"]

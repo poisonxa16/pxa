@@ -23,6 +23,7 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include "ggml.h"
 #include "ggml-backend-impl.h"
 #include "pxa-pxq-slice.h"
+#include "pxa-residency.h"   // PXA hot swap: residency groups (header-only core)
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/pxa/pxa-enhance.cuh"
@@ -47,7 +48,20 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include "ggml-cuda/qsa-topk.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-args.h"
 #include "ggml-cuda/pxa/pxq-mmvq.cuh"
+#include "ggml-cuda/pxa/pxqn.cuh"
+#include "ggml-cuda/pxa/pxq4-rb.cuh"        // PXA_PXQ4_RB: sm_60 PXQ4 row-block decode GEMV          // PXQ-Next rev 1 (PXQN3/PXQN3S8/PXQN4 + GGML_OP_PXQN_RHT)
+// k-quant / Q8_0 decode GEMV (PXA_KQMMV), pxa/kq-mmv.cu; the kernels and these declarations live in
+// pxa/kq-mmv.cuh, which this TU does not include so that kernel edits do not rebuild it.
+bool ggml_cuda_kqmmv_take(int device, int type, int64_t K, int64_t ny);
+bool ggml_cuda_kqmmv_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+bool ggml_cuda_kqmmv_group_on(void);
+bool ggml_cuda_kqmmv_mul_mats(int device, cudaStream_t stream, const ggml_tensor * src1,
+                              const ggml_tensor * const * src0, ggml_tensor * const * dst, int n);
+int  ggml_cuda_kqmmv_up_gate(int device, cudaStream_t stream, ggml_tensor * dst);
+bool ggml_cuda_kqmmv_mul_mat_bias(int device, cudaStream_t stream, const ggml_tensor * src1, const ggml_tensor * src0,
+                                  ggml_tensor * add, const ggml_tensor * bias);
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
@@ -78,6 +92,7 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/pxa/delta-net.cuh"
 #include "ggml-cuda/dsv4.cuh"
+#include "ggml-cuda/hc-fused.cuh"
 
 #include <algorithm>
 #include <array>
@@ -273,13 +288,56 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_ABORT("CUDA error");
 }
 
+// PXA_CUDA_DEVCACHE: see common.cuh. g_pxa_devcache_dev is the runtime's current device for this
+// thread as last set or read through this file (-1 = unknown); it is trusted only while
+// g_pxa_devcache_depth > 0, i.e. inside ggml_backend_cuda_graph_compute().
+static thread_local int g_pxa_devcache_dev   = -1;
+static thread_local int g_pxa_devcache_depth = 0;
+
+static bool pxa_devcache_enabled() {
+#if defined(GGML_USE_HIPBLAS) || defined(GGML_USE_MUSA)
+    return false;   // the vendor headers map cudaSetDevice themselves; no tracked wrapper there
+#else
+    static const bool v = [] {
+        const char * e = getenv("PXA_CUDA_DEVCACHE");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    return v;
+#endif
+}
+
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+cudaError_t pxa_cuda_set_device_tracked(int device) {
+    const cudaError_t err = (cudaSetDevice)(device);   // parenthesised: the real runtime call
+    g_pxa_devcache_dev = err == cudaSuccess ? device : -1;
+    return err;
+}
+#endif
+
+struct pxa_devcache_scope {
+    bool on;
+    pxa_devcache_scope() : on(pxa_devcache_enabled()) {
+        if (!on) return;
+        if (g_pxa_devcache_depth++ == 0) {
+            // re-read once per graph compute: anything outside the backend may have switched it
+            int d = -1;
+            g_pxa_devcache_dev = cudaGetDevice(&d) == cudaSuccess ? d : -1;
+        }
+    }
+    ~pxa_devcache_scope() { if (on) --g_pxa_devcache_depth; }
+};
+
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
 void ggml_cuda_set_device(int device) {
+    if (g_pxa_devcache_depth > 0 && g_pxa_devcache_dev == device) {
+        return;
+    }
     int current_device;
     CUDA_CHECK(cudaGetDevice(&current_device));
 
     if (device == current_device) {
+        g_pxa_devcache_dev = device;
         return;
     }
 
@@ -287,8 +345,12 @@ void ggml_cuda_set_device(int device) {
 }
 
 int ggml_cuda_get_device() {
+    if (g_pxa_devcache_depth > 0 && g_pxa_devcache_dev >= 0) {
+        return g_pxa_devcache_dev;
+    }
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
+    g_pxa_devcache_dev = id;
     return id;
 }
 
@@ -319,6 +381,212 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
 #endif // !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
 
 #endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// PCIe link width per device (2026-09-27, , bug #280). Read from Linux sysfs
+// (/sys/bus/pci/devices/<domain:bus:dev.0>/current_link_width and current_link_speed), which needs
+// no NVML and works inside docker and LXC. 0 = unknown (not Linux, no sysfs, a VM that hides it).
+// PXA_PCIE_LINK_WIDTH=<n> overrides the reading for every device (diagnostic: lets a x4/x16 box
+// exercise the narrow-link rules). A card below x4 changes two defaults, both one switch away:
+// pipeline parallelism stays off (src/llama.cpp) and the registry never auto-picks '-sm tensor'.
+// ---------------------------------------------------------------------------------------------
+// kept beside (not inside) ggml_cuda_device_info so common.cuh -- and every CUDA TU -- is untouched
+static int g_pxa_pcie_width[GGML_CUDA_MAX_DEVICES] = {};
+static int g_pxa_pcie_gen[GGML_CUDA_MAX_DEVICES]   = {};
+
+static bool pxa_p2p_off() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_P2P");
+        return e != nullptr && e[0] == '0';
+    }();
+    return v;
+}
+
+// ---- PXA_P2P_SELFTEST (2026-09-27) ------------------------------------------------------------
+// Some boards (risers, IOMMU/ACS left on, some virtualised hosts) report peer access as available
+// while direct GPU-to-GPU transfers silently corrupt data: the model then produces garbage on
+// multi-GPU runs only, and nothing in the log says why. Before a device pair's peer access is
+// trusted, prove it: a 4 MiB known pattern is DMA'd a->b with peer access on, read directly by a
+// kernel on b from a's memory, and read directly by a kernel on a from b's memory; all three
+// results are copied to the host over each device's own link and compared with the pattern.
+// A pair that fails keeps peer access OFF (its copies are staged through system memory by the
+// driver, like PXA_P2P=0 but for that pair only) and the tensor-split / hot-swap peer matrices
+// record it as unreachable; NCCL is started with NCCL_P2P_DISABLE=1 when any pair failed.
+// PXA_P2P_SELFTEST=0 skips the test (trust the driver, the old behaviour). Cost: well under a
+// second at startup. PXA_P2P_SELFTEST_CORRUPT=1 is a test hook that flips one received word so
+// the fallback branch can be exercised on a healthy system (tests/test-pxa-p2p-selftest).
+static bool pxa_p2p_selftest_on() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_P2P_SELFTEST");
+        return !(e && atoi(e) == 0);
+    }();
+    return v;
+}
+
+static __global__ void k_pxa_p2p_fill(uint32_t * p, size_t n, uint32_t seed) {
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x*blockDim.x) {
+        p[i] = (uint32_t) (i * 2654435761u) ^ seed;
+    }
+}
+
+static __global__ void k_pxa_p2p_copy(const uint32_t * __restrict__ src, uint32_t * __restrict__ dst, size_t n) {
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x*blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// 1 = the pair moved the pattern intact, 0 = corrupted, -1 = could not be tested (no peer path,
+// an allocation or enable failed): the caller then keeps the driver's own answer.
+static int pxa_p2p_selftest_pair_run(int a, int b) {
+    const size_t n     = (size_t) 1 << 20;          // 4 MiB of uint32
+    const size_t bytes = n * sizeof(uint32_t);
+    const uint32_t seed = 0x5a17c0deu ^ (uint32_t) (a * 131 + b);
+    int prev = 0;
+    (void) cudaGetDevice(&prev);
+
+    int can_ab = 0, can_ba = 0;
+    if (cudaDeviceCanAccessPeer(&can_ab, a, b) != cudaSuccess || cudaDeviceCanAccessPeer(&can_ba, b, a) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    if (!can_ab || !can_ba) {
+        return -1;
+    }
+
+    bool en_ab = false, en_ba = false;
+    uint32_t * pa = nullptr, * pa2 = nullptr, * pb = nullptr, * pb2 = nullptr;
+    int result = -1;
+    auto enable = [](int from, int to, bool * we) -> bool {
+        if (cudaSetDevice(from) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        const cudaError_t e = cudaDeviceEnablePeerAccess(to, 0);
+        if (e == cudaSuccess) { *we = true; return true; }
+        (void) cudaGetLastError();
+        return e == cudaErrorPeerAccessAlreadyEnabled;
+    };
+    do {
+        if (!enable(a, b, &en_ab) || !enable(b, a, &en_ba)) break;
+        if (cudaSetDevice(a) != cudaSuccess || cudaMalloc(&pa, bytes) != cudaSuccess || cudaMalloc(&pa2, bytes) != cudaSuccess) break;
+        if (cudaSetDevice(b) != cudaSuccess || cudaMalloc(&pb, bytes) != cudaSuccess || cudaMalloc(&pb2, bytes) != cudaSuccess) break;
+
+        // pattern on a
+        cudaSetDevice(a);
+        k_pxa_p2p_fill<<<256, 256>>>(pa, n, seed);
+        if (cudaDeviceSynchronize() != cudaSuccess) break;
+        // 1) DMA a -> b with peer access on
+        if (cudaMemcpyPeer(pb, b, pa, a, bytes) != cudaSuccess) break;
+        // 2) b reads a's memory directly
+        cudaSetDevice(b);
+        k_pxa_p2p_copy<<<256, 256>>>(pa, pb2, n);
+        if (cudaDeviceSynchronize() != cudaSuccess) break;
+        // 3) a reads b's memory directly (what arrived by DMA)
+        cudaSetDevice(a);
+        k_pxa_p2p_copy<<<256, 256>>>(pb, pa2, n);
+        if (cudaDeviceSynchronize() != cudaSuccess) break;
+
+        // every result comes home over its owner's own link
+        std::vector<uint32_t> h_b(n), h_b2(n), h_a2(n);
+        cudaSetDevice(b);
+        if (cudaMemcpy(h_b.data(),  pb,  bytes, cudaMemcpyDeviceToHost) != cudaSuccess) break;
+        if (cudaMemcpy(h_b2.data(), pb2, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) break;
+        cudaSetDevice(a);
+        if (cudaMemcpy(h_a2.data(), pa2, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) break;
+
+        if (const char * c = getenv("PXA_P2P_SELFTEST_CORRUPT"); c && atoi(c) != 0) {
+            h_b[12345] ^= 0x10u;   // test hook: behave as a board whose peer DMA flips a bit
+        }
+        result = 1;
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t want = (uint32_t) (i * 2654435761u) ^ seed;
+            if (h_b[i] != want || h_b2[i] != want || h_a2[i] != want) {
+                result = 0;
+                break;
+            }
+        }
+    } while (false);
+    (void) cudaGetLastError();
+
+    if (pa)  { cudaSetDevice(a); cudaFree(pa); }
+    if (pa2) { cudaSetDevice(a); cudaFree(pa2); }
+    if (pb)  { cudaSetDevice(b); cudaFree(pb); }
+    if (pb2) { cudaSetDevice(b); cudaFree(pb2); }
+    // leave peer access exactly as found; the enable path decides afresh with the verdict
+    if (en_ab) { cudaSetDevice(a); (void) cudaDeviceDisablePeerAccess(b); }
+    if (en_ba) { cudaSetDevice(b); (void) cudaDeviceDisablePeerAccess(a); }
+    (void) cudaGetLastError();
+    cudaSetDevice(prev);
+    return result;
+}
+
+static std::mutex g_pxa_p2p_st_mu;
+static int8_t     g_pxa_p2p_st[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};   // 0 untested, 1 ok, -1 corrupt, 2 untestable
+
+// Whether peer access between a and b may be trusted. Tests each unordered pair once per process.
+static bool pxa_p2p_pair_trusted(int a, int b) {
+    if (a == b || !pxa_p2p_selftest_on()) return true;
+    if (a < 0 || b < 0 || a >= GGML_CUDA_MAX_DEVICES || b >= GGML_CUDA_MAX_DEVICES) return true;
+    const int lo = a < b ? a : b, hi = a < b ? b : a;
+    std::lock_guard<std::mutex> lk(g_pxa_p2p_st_mu);
+    int8_t & v = g_pxa_p2p_st[lo][hi];
+    if (v == 0) {
+        const int64_t t0 = ggml_time_us();
+        const int r = pxa_p2p_selftest_pair_run(lo, hi);
+        v = r == 1 ? 1 : (r == 0 ? -1 : 2);
+        if (v == -1) {
+            GGML_CUDA_LOG_WARN("PXA: GPU-to-GPU (P2P) copies between cards %d and %d returned corrupted data on this "
+                               "system (IOMMU/ACS?); falling back to copies through system memory. See docs: PXA_P2P.\n", lo, hi);
+        } else if (v == 1) {
+            GGML_CUDA_LOG_INFO("PXA_P2P_SELFTEST: cards %d<->%d peer copies verified (%.1f ms; PXA_P2P_SELFTEST=0 skips)\n",
+                               lo, hi, (ggml_time_us() - t0) / 1000.0);
+        }
+    }
+    return v != -1;
+}
+
+bool ggml_backend_cuda_p2p_pair_trusted(int a, int b) {
+    return pxa_p2p_pair_trusted(a, b);
+}
+
+int ggml_backend_cuda_p2p_selftest(int a, int b) {
+    return pxa_p2p_selftest_pair_run(a, b);
+}
+
+static void pxa_pcie_probe(int id, int domain, int bus, int dev, int * width, int * gen) {
+    *width = 0;
+    *gen   = 0;
+    if (const char * e = getenv("PXA_PCIE_LINK_WIDTH")) {
+        *width = atoi(e);
+        return;
+    }
+#if defined(__linux__)
+    char path[160];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.0/current_link_width", domain, bus, dev);
+    if (FILE * f = fopen(path, "r")) {
+        int w = 0;
+        if (fscanf(f, "%d", &w) == 1 && w > 0 && w <= 32) {
+            *width = w;
+        }
+        fclose(f);
+    }
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.0/current_link_speed", domain, bus, dev);
+    if (FILE * f = fopen(path, "r")) {
+        double gts = 0.0;
+        if (fscanf(f, "%lf", &gts) == 1) {
+            *gen = gts >= 31.0 ? 5 : gts >= 15.0 ? 4 : gts >= 7.5 ? 3 : gts >= 4.5 ? 2 : gts > 0.0 ? 1 : 0;
+        }
+        fclose(f);
+    }
+#else
+    GGML_UNUSED(domain); GGML_UNUSED(bus); GGML_UNUSED(dev);
+#endif
+    if (*width > 0) {
+        GGML_CUDA_LOG_INFO("  Device %d: PCIe x%d%s%s\n", id, *width, *gen ? " gen" : "",
+                           *gen ? std::to_string(*gen).c_str() : "");
+        if (*width < 4) {
+            GGML_CUDA_LOG_WARN("  Device %d: PCIe x%d is a NARROW link (riser?): multi-card runs keep the layer split "
+                               "without pipeline parallelism by default; PXA_P2P=0 forces host-staged copies\n", id, *width);
+        }
+    }
 }
 
 static ggml_cuda_device_info ggml_cuda_init() {
@@ -389,6 +657,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].cc = 100*prop.major + 10*prop.minor;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
         pxa_ccs[id] = info.devices[id].cc;
+        if (id < GGML_CUDA_MAX_DEVICES) {
+            pxa_pcie_probe(id, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, &g_pxa_pcie_width[id], &g_pxa_pcie_gen[id]);
+        }
         snprintf(pxa_names[id], sizeof(pxa_names[id]), "%s", prop.name);
     }
 
@@ -413,6 +684,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
 #ifdef GGML_USE_NCCL
     info.have_nccl = false;
+    if (pxa_p2p_off() && info.device_count > 1) {
+        // PXA_P2P=0: no peer-to-peer anywhere. NCCL reads this at init and takes its shared-memory
+        // / host transports instead (an explicit NCCL_P2P_DISABLE the user set is kept).
+#if !defined(_WIN32)
+        setenv("NCCL_P2P_DISABLE", "1", 0);
+#endif
+    } else if (info.device_count > 1 && pxa_p2p_selftest_on()) {
+        // PXA_P2P_SELFTEST: NCCL builds its peer transports right below, so the pairs are proven
+        // here, before it; any corrupted pair starts NCCL without P2P.
+        bool any_bad = false;
+        for (int a = 0; a < info.device_count; ++a) {
+            for (int b = a + 1; b < info.device_count; ++b) {
+                if (!pxa_p2p_pair_trusted(a, b)) any_bad = true;
+            }
+        }
+#if !defined(_WIN32)
+        if (any_bad) setenv("NCCL_P2P_DISABLE", "1", 0);
+#endif
+    }
     if (info.device_count > 1) {
         int gpu_list[GGML_CUDA_MAX_DEVICES];
         for(int i = 0; i < info.device_count; ++i) gpu_list[i] = i;
@@ -584,9 +874,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 };
 
+std::atomic<size_t> g_pxa_pool_idle[GGML_CUDA_MAX_DEVICES];
+
 // pool with virtual memory
 #if !defined(GGML_USE_HIPBLAS) && !defined(GGML_CUDA_NO_VMM) && !defined(GGML_USE_MUSA)
-struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+struct ggml_cuda_pool_vmm : public ggml_cuda_pool, public pxa_res::pool_hook {
     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
 
     int device;
@@ -595,19 +887,168 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     size_t pool_size = 0;
     size_t granularity;
 
+    // PXA hot swap: a pool created while a residency group is active belongs to it. Parking
+    // drops the pool's physical memory and keeps its address range and size, so graphs captured
+    // against pool addresses stay valid; unparking maps the same size back at the same address.
+    pxa_res::residency * pxa_owner = nullptr;
+    bool                 pxa_parked = false;
+
     explicit ggml_cuda_pool_vmm(int device) :
         device(device),
         granularity(ggml_cuda_info().devices[device].vmm_granularity) {
+        pxa_owner = pxa_res::active().load();
+        if (pxa_owner) {
+            pxa_owner->add_pool(this);
+        }
     }
 
     ~ggml_cuda_pool_vmm() {
+        if (pxa_owner) {
+            pxa_owner->remove_pool(this);
+        }
         if (pool_addr != 0) {
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            if (!pxa_parked && pool_size > 0) {
+                CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            }
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
     }
 
+    // Map `reserve_size` (a multiple of the granularity) of new physical memory at the end of
+    // the pool. fatal=false: report failure instead of aborting (bug #266 pre-grow).
+    bool grow(size_t reserve_size, bool fatal) {
+        GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
+
+        // allocate more physical memory
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device;
+        CUmemGenericAllocationHandle handle;
+        CUresult r = cuMemCreate(&handle, reserve_size, &prop, 0);
+        if (r == CUDA_ERROR_OUT_OF_MEMORY && pxa_owner) {
+            // PXA hot swap: the card is shared with parked models that kept memory; take it back
+            pxa_res::residency::reclaim(device, reserve_size, pxa_owner);
+            r = cuMemCreate(&handle, reserve_size, &prop, 0);
+        }
+        if (r != CUDA_SUCCESS) {
+            size_t free_b = 0, total_b = 0;
+            ggml_cuda_set_device(device);
+            cudaMemGetInfo(&free_b, &total_b);
+            GGML_CUDA_LOG_ERROR("CUDA pool (device %d): could not grow by %.1f MiB (pool %.1f MiB, %.1f MiB free on the card). "
+                    "The dequant/GEMM temporaries of the widest ubatch do not fit next to the weights, KV and compute buffer: "
+                    "use a smaller -ub or -c, quantize the KV cache, or stream weights (PXA_STREAM_WEIGHTS).\n",
+                    device, reserve_size/1048576.0, pool_size/1048576.0, free_b/1048576.0);
+            if (fatal) CU_CHECK(r);
+            return false;
+        }
+
+        // reserve virtual address space (if not already reserved)
+        if (pool_addr == 0) {
+            r = cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0);
+            if (r != CUDA_SUCCESS) { pool_addr = 0; cuMemRelease(handle); if (fatal) CU_CHECK(r); return false; }
+        }
+
+        // map at the end of the pool
+        r = cuMemMap(pool_addr + pool_size, reserve_size, 0, handle, 0);
+        if (r != CUDA_SUCCESS) { cuMemRelease(handle); if (fatal) CU_CHECK(r); return false; }
+
+        // the memory allocation handle is no longer needed after mapping
+        CU_CHECK(cuMemRelease(handle));
+
+        // set access
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = device;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        r = cuMemSetAccess(pool_addr + pool_size, reserve_size, &access, 1);
+        if (r != CUDA_SUCCESS) { cuMemUnmap(pool_addr + pool_size, reserve_size); if (fatal) CU_CHECK(r); return false; }
+
+        // add to the pool
+        pool_size += reserve_size;
+        g_pxa_pool_idle[device].store(pool_size - pool_used, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool reserve(size_t size) override {
+        if (pxa_parked) return false; // hot swap: a parked pool has no physical memory to grow next to
+        const size_t avail = pool_size - pool_used;
+        if (size <= avail) return true;
+        size_t reserve_size = size - avail;
+        reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
+        return grow(reserve_size, /*fatal=*/false);
+    }
+
+    size_t reserved() const override { return pool_size; }
+
+    int    pool_dev()       const override { return device; }
+    size_t pool_mapped()    const override { return pool_size; }
+    bool   pool_in_use()    const override { return pool_used != 0; }
+    bool   pool_is_parked() const override { return pxa_parked; }
+
+    bool pool_park(std::string & err) override {
+        if (pxa_parked) {
+            return true;
+        }
+        if (pool_used != 0) {
+            err = "pool has live allocations";
+            return false;
+        }
+        if (pool_addr != 0 && pool_size > 0) {
+            ggml_cuda_set_device(device);
+            const CUresult r = cuMemUnmap(pool_addr, pool_size);
+            if (r != CUDA_SUCCESS) {
+                const char * es = nullptr;
+                cuGetErrorString(r, &es);
+                err = std::string("cuMemUnmap: ") + (es ? es : "?");
+                return false;
+            }
+        }
+        pxa_parked = true;
+        return true;
+    }
+
+    bool pool_unpark(std::string & err) override {
+        if (!pxa_parked) {
+            return true;
+        }
+        if (pool_addr != 0 && pool_size > 0) {
+            ggml_cuda_set_device(device);
+            CUmemAllocationProp prop = {};
+            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = device;
+            CUmemGenericAllocationHandle handle;
+            CUresult r = cuMemCreate(&handle, pool_size, &prop, 0);
+            if (r == CUDA_SUCCESS) {
+                r = cuMemMap(pool_addr, pool_size, 0, handle, 0);
+                cuMemRelease(handle);
+            }
+            if (r == CUDA_SUCCESS) {
+                CUmemAccessDesc access = {};
+                access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                access.location.id = device;
+                access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                r = cuMemSetAccess(pool_addr, pool_size, &access, 1);
+                if (r != CUDA_SUCCESS) {
+                    cuMemUnmap(pool_addr, pool_size);
+                }
+            }
+            if (r != CUDA_SUCCESS) {
+                const char * es = nullptr;
+                cuGetErrorString(r, &es);
+                err = "pool remap of " + std::to_string(pool_size >> 20) + " MiB: " + (es ? es : "?");
+                return false;
+            }
+        }
+        pxa_parked = false;
+        return true;
+    }
+
     void * alloc(size_t size, size_t * actual_size) override {
+        if (pxa_parked) {
+            GGML_ABORT("pxa hot swap: scratch pool on device %d used while its model is parked", device);
+        }
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
@@ -618,41 +1059,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // round up to the next multiple of the granularity
             size_t reserve_size = size - avail;
             reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
-
-            GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
-
-            // allocate more physical memory
-            CUmemAllocationProp prop = {};
-            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = device;
-            CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
-
-            // reserve virtual address space (if not already reserved)
-            if (pool_addr == 0) {
-                CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
-            }
-
-            // map at the end of the pool
-            CU_CHECK(cuMemMap(pool_addr + pool_size, reserve_size, 0, handle, 0));
-
-            // the memory allocation handle is no longer needed after mapping
-            CU_CHECK(cuMemRelease(handle));
-
-            // set access
-            CUmemAccessDesc access = {};
-            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            access.location.id = device;
-            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            CU_CHECK(cuMemSetAccess(pool_addr + pool_size, reserve_size, &access, 1));
-
-            // add to the pool
-            pool_size += reserve_size;
-
-            //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
-            //       device, (unsigned long long) (pool_size/1024/1024),
-            //       (unsigned long long) (reserve_size/1024/1024));
+            grow(reserve_size, /*fatal=*/true);
         }
 
         GGML_ASSERT(pool_addr != 0);
@@ -660,6 +1067,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         void * ptr = (void *) (pool_addr + pool_used);
         *actual_size = size;
         pool_used += size;
+        g_pxa_pool_idle[device].store(pool_size - pool_used, std::memory_order_relaxed);
 
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
@@ -674,6 +1082,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif
 
         pool_used -= size;
+        g_pxa_pool_idle[device].store(pool_size - pool_used, std::memory_order_relaxed);
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) (pool_addr + pool_used));
@@ -703,6 +1112,8 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     } else{
         info->all_ctx[device] = this;
     }
+    // PXQN: the decode GEMV K-split workspace, zeroed here -- never inside a graph capture (bug #274)
+    ggml_cuda_pxqn_ctx_init(device);
     // PXA_CUBLAS_EAGER_INIT (default ON, =0 rollback): create this device's cuBLAS handle (and
     // its PXA_CUBLAS_EAGER_WS workspace) at backend init, BEFORE weights fill VRAM. Some decode
     // configs first touch cuBLAS mid-inference via a rare fallback shape; lazy handle+workspace
@@ -757,6 +1168,10 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    // PXA hot swap: memory that came out of a residency group goes back to it (a whole buffer) or
+    // stays with it until the group is freed (a split-tensor slice packed into the group's slab)
+    pxa_res::residency * pxa_owner = nullptr;
+    bool                 pxa_slice = false;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -764,6 +1179,13 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        if (pxa_slice) {
+            return;
+        }
+        if (pxa_owner) {
+            pxa_owner->free_buffer(dev_ptr);
+            return;
+        }
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -904,6 +1326,18 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffe
     size = std::max(size, (size_t)1); // cudaMalloc returns null for size 0
 
     void * dev_ptr;
+    // PXA hot swap: with a residency group active the buffer gets its own reserved
+    // address range inside the group (see ggml/src/pxa-residency.h); otherwise plain cudaMalloc.
+    pxa_res::residency * pxa_owner = pxa_res::active().load();
+    if (pxa_owner) {
+        std::string pxa_err;
+        if (!pxa_owner->alloc_buffer(buft_ctx->device, size, &dev_ptr, pxa_err)) {
+            cudaGetLastError();
+            GGML_CUDA_LOG_ERROR("%s: allocating %.2f MiB on device %d in residency group '%s' failed: %s\n", __func__,
+                                size / 1024.0 / 1024.0, buft_ctx->device, pxa_owner->name().c_str(), pxa_err.c_str());
+            return nullptr;
+        }
+    } else {
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
@@ -911,10 +1345,16 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffe
         GGML_CUDA_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
         return nullptr;
     }
+    }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+    ctx->pxa_owner = pxa_owner;
 
-    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    if (pxa_owner) {
+        pxa_owner->set_owner(dev_ptr, buffer);
+    }
+    return buffer;
 }
 
 GGML_CALL static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -970,6 +1410,45 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// PXA_STREAM_WEIGHTS: pinned-host weight buffer per device, streamed through a VRAM ring per graph
+#include "ggml-cuda/pxa/pxa-stream.cuh"
+// PXA_XCACHE: expert-granular hot cache (split ids / merge ops)
+#include "ggml-cuda/pxa/pxa-xcache.cuh"
+
+static ggml_backend_buffer_type_i pxa_stream_buft_interface = {
+    /* .get_name         = */ ggml_backend_cuda_buffer_type_name,
+    /* .alloc_buffer     = */ pxa_stream_buft_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size     = */ NULL,
+    /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .is_host          = */ NULL,
+};
+
+GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_stream_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+    if (!initialized) {
+        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; i++) {
+            types[i] = {
+                /* .iface    = */ pxa_stream_buft_interface,
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_Stream"},
+            };
+        }
+        initialized = true;
+    }
+    return &types[device];
+}
+
+GGML_CALL void ggml_backend_cuda_stream_set_ring(int device, size_t bytes) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return;
+    if (bytes > g_pxa_stream_ring_req[device]) g_pxa_stream_ring_req[device] = bytes;
 }
 
 // cuda split buffer
@@ -1040,7 +1519,17 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_init_tensor([[maybe_unused]
         }
         ggml_cuda_set_device(i);
         char * buf;
+        // PXA hot swap: slices of a model in a residency group are packed into the group's slab
+        pxa_res::residency * pxa_owner = pxa_res::active().load();
+        if (pxa_owner) {
+            std::string pxa_err;
+            if (!pxa_owner->alloc_slice(i, padded_size, (void **) &buf, pxa_err)) {
+                GGML_ABORT("pxa hot swap: split slice of %zu bytes on device %d in residency group '%s': %s",
+                           padded_size, i, pxa_owner->name().c_str(), pxa_err.c_str());
+            }
+        } else {
         CUDA_CHECK(ggml_cuda_device_malloc((void**)&buf, padded_size, i));
+        }
         if (padded_size > size) {
             CUDA_CHECK(cudaMemset(buf + size, 0, padded_size - size));
         }
@@ -1048,12 +1537,28 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_init_tensor([[maybe_unused]
         //        split->ne[0], split->ne[1], split->ne[2], padded_size - size);
         split->data = buf;
         auto ctx = new ggml_backend_cuda_buffer_context(i, buf);
+        ctx->pxa_slice = pxa_owner != nullptr;
         auto buft = ggml_backend_cuda_buffer_type(i);
         split->buffer = ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, padded_size);
         ggml_backend_buffer_set_usage(split->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
     return;
 
+}
+
+// A dim-1 (row) cut given as explicit row ranges: for a panel type every range must start and end
+// on a 64-row panel boundary, or the shard's panel headers are some other rows' anchors. prepare_
+// split_tensors() enforces this for the contiguous form; the ranges form (wqkv_gate, ssm_beta_alpha,
+// the gate/up expert split) is checked here, by the shared validator the unit test also runs.
+static void pxa_dim1_ranges_check(const ggml_tensor * tensor, const std::vector<std::pair<int,int>> & r, int dev) {
+    if (!pxa_pxq_type_is_panel_ggml(tensor->type)) return;
+    std::vector<int> flat;
+    for (auto & p : r) { flat.push_back(p.first); flat.push_back(p.second); }
+    const int64_t n = pxa_pxq_row_ranges_check(tensor->ne[1], flat.data(), int(r.size()), 64);
+    if (n < 0) {
+        GGML_ABORT("split_dim 1: tensor '%s' (type %s), device %d: %s (row ranges must be whole 64-row panels)",
+                   tensor->name, ggml_type_name(tensor->type), dev, pxa_pxq_slice_strerror(n));
+    }
 }
 
 GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]] ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -1172,6 +1677,15 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
         { GGML_TYPE_PXQ4,   64 },   // rows per panel == PXQ4_BM (pxa/pxq4.cuh:27)
         { GGML_TYPE_PXQ4HQ, 64 },
         { GGML_TYPE_PXQ6,   64 },
+        // PXQN rev 1: same 64-row panel + 128 B anchor header. N3/N3S8 slabs are 128 K wide
+        // (blck_size 128), so the generic slicer below lands on 128-K boundaries by construction.
+        { GGML_TYPE_PXQN3,   64 },
+        { GGML_TYPE_PXQN3S8, 64 },
+        { GGML_TYPE_PXQN4,   64 },
+        { GGML_TYPE_PXQN2,   64 },   // ladder: blck 128 (N2, N1, N5) / 32 (N4S8), same panel + header
+        { GGML_TYPE_PXQN1,   64 },
+        { GGML_TYPE_PXQN4S8, 64 },
+        { GGML_TYPE_PXQN5,   64 },
     };
 
     // split tensors must always be set in their entirety at once
@@ -1202,24 +1716,25 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
         GGML_ASSERT(ggml_is_contiguous(tensor));
         int nrows = ggml_nrows(tensor);
         auto bs = tt.blck_size;
-        auto ts = tt.type_size;
         void * extra_ptr;
         memcpy(&extra_ptr, tensor->op_params, sizeof(extra_ptr));
         if (extra_ptr) {
             auto & ranges = *(const std::vector<std::vector<std::pair<int,int>>> *)extra_ptr;
             GGML_ASSERT(extra->n_device == int(ranges.size()));
-            GGML_ASSERT(tensor->ne[2]*tensor->ne[3] == 1);
-            if (n_interleave != 1) {
-                // The row-range uploader below copies whole rows and cannot land on a panel slab, so
-                // a panel type must never arrive here. Name the tensor: a bare "n_interleave == 1"
-                // abort is unattributable without a rebuild, and this is the one path where a wrong
-                // slice would be wrong WITHOUT being detectably wrong.
-                GGML_ABORT("split_dim 0: tensor '%s' (type %s) is panel-interleaved (n_interleave %d) but "
-                           "reached the row-range uploader. This panel type cannot be K-split by ranges; "
-                           "see the k_map comment above.",
-                           tensor->name, ggml_type_name(tensor->type), n_interleave);
+            // 3D: a panel type whose per-matrix rows are whole panels is one run of panels (the K-straddled PXQN
+            // expert down of ), so the 2D slicer below cuts every expert at once
+            GGML_ASSERT(tensor->ne[2]*tensor->ne[3] == 1 || (n_interleave > 1 && tensor->ne[1] % n_interleave == 0));
+            // The explicit-ranges arm: the DeltaNet armer cuts ssm_out on dim 0 into one or more K
+            // ranges per device (gqa_ratio separated head groups with repeat_type 1). For a panel
+            // type this is the same panel-aware permutation as the contiguous arm below -- header
+            // verbatim, then the slabs of each range in order -- and for a row-addressed type it
+            // reduces to the plain per-row range copy (panel_rows 1). The arithmetic lives in
+            // ggml/src/pxa-pxq-slice.h (pxa_pxq_k_slice_ranges_2d) so that tests/test-pxq-ksplit.cpp
+            // proves THIS code per tier and per range shape, not a copy of it.
+            if (n_interleave == 1) {
+                GGML_ASSERT(tt.row_meta_size == 0);
             }
-            GGML_ASSERT(tt.row_meta_size == 0);
+            std::vector<int> flat;
             for (int i = 0; i < extra->n_device; ++i) {
                 auto split = extra->splits[i];
                 if (!split) {
@@ -1227,22 +1742,40 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
                     continue;
                 }
                 GGML_ASSERT(!ranges[i].empty());
+                GGML_ASSERT(split->type == tensor->type);
                 GGML_ASSERT((int)ggml_nrows(split) == nrows);
+                // The ranges must describe exactly this shard BEFORE anything is written: the host
+                // buffer is sized from split->ne[0], so a sum that disagreed would overrun it.
+                int64_t k_sum = 0;
+                for (auto & p : ranges[i]) k_sum += p.second;
+                if (k_sum != split->ne[0]) {
+                    GGML_ABORT("split_dim 0: tensor '%s' (type %s): the explicit K ranges for device %d sum to "
+                               "%lld but the shard has K %lld", tensor->name, ggml_type_name(tensor->type), i,
+                               (long long) k_sum, (long long) split->ne[0]);
+                }
+                if (n_interleave != 1 && split->ne[0] < PXA_PXQ_MIN_SHARD_K) {
+                    GGML_ABORT("split_dim 0: tensor '%s' (type %s): device %d would get a K shard of %lld, below "
+                               "the %d-element minimum the panel mat-vec kernels read unconditionally",
+                               tensor->name, ggml_type_name(tensor->type), i, (long long) split->ne[0],
+                               PXA_PXQ_MIN_SHARD_K);
+                }
                 auto split_row_size = ggml_row_size(split->type, split->ne[0]);
                 if (host_buffer.size() < nrows*split_row_size) host_buffer.resize(nrows*split_row_size);
-                auto dst = host_buffer.data();
-                for (int64_t i01 = 0; i01 < split->ne[1]; i01 += n_interleave) {
-                    for (auto & p : ranges[i]) {
-                        GGML_ASSERT(p.first  % bs == 0);
-                        GGML_ASSERT(p.second % bs == 0);
-                        auto src = (const char *)data + i01*tensor->nb[1] + (p.first/bs)*ts;
-                        auto size = (p.second/bs)*ts;
-                        memcpy(dst, src, size);
-                        dst += size;
-                    }
+                flat.clear();
+                for (auto & p : ranges[i]) { flat.push_back(p.first); flat.push_back(p.second); }
+                const int64_t k_got = pxa_pxq_k_slice_ranges_2d(tensor->type, data, host_buffer.data(), host_buffer.size(),
+                        nrows, tensor->ne[0], flat.data(), int(ranges[i].size()), n_interleave);
+                if (k_got < 0) {
+                    GGML_ABORT("split_dim 0: tensor '%s' (type %s), device %d: %s (%lld-element block, %d-row panel, "
+                               "%d rows); refusing to upload a silently wrong slice",
+                               tensor->name, ggml_type_name(tensor->type), i, pxa_pxq_slice_strerror(k_got),
+                               (long long) bs, n_interleave, nrows);
                 }
+                GGML_ASSERT(k_got == split->ne[0]);
                 ggml_cuda_set_device(i);
                 CUDA_CHECK(cudaMemcpyAsync(split->data, host_buffer.data(), nrows*split_row_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                // the host buffer is reused for the next device: finish this copy first
+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
             }
         } else {
             int ne = 0;
@@ -1283,6 +1816,9 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
                 ggml_cuda_set_device(i);
                 auto size = ggml_nbytes(split);
                 if (host_buffer.size() < size) host_buffer.resize(size);
+                if (extra_ptr) {
+                    pxa_dim1_ranges_check(tensor, (*(const std::vector<std::vector<std::pair<int,int>>> *)extra_ptr)[i], i);
+                }
                 for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
                     auto dst = host_buffer.data() + i02*split->ne[1]*row_size;
                     if (extra_ptr) {
@@ -1323,6 +1859,7 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
                         continue;
                     }
                     GGML_ASSERT(!ranges[i].empty());
+                    pxa_dim1_ranges_check(tensor, ranges[i], i);
                     ggml_cuda_set_device(i);
                     auto dst = (char *)split->data;
                     for (auto & p : ranges[i]) {
@@ -1689,6 +2226,11 @@ GGML_CALL static void pxa_expert_shard_buffer_init_tensor(ggml_backend_buffer_t 
     // can never over/under-count -> the capacity assert is gone. One malloc per
     // device per tensor, once at load; net-neutral VRAM (~half-mass/device).
     std::vector<void *> bs(n, nullptr);
+    if (pxa_res::active().load()) {
+        // s_pxa_shard_slices is keyed by tensor NAME for the whole process: a second model with the
+        // same tensor names would read the first model's experts. Hot swap refuses this lever.
+        GGML_ABORT("pxa hot swap: PXA_EXPERT_SHARD cannot be combined with several registered models");
+    }
     for (int k = 0; k < n; ++k) {
         const int dev = ctx->group[k];
         ggml_cuda_set_device(dev);
@@ -2094,7 +2636,7 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
 }
 
 // =================================================================================================
-// PXA_DQ (2026-09-02, layer-major prefill work): instrumentation for the per-ubatch weight dequant.
+// PXA_DQ (2026-09-02, spd/layer-major-prefill): instrumentation for the per-ubatch weight dequant.
 //
 // Every prefill ubatch re-dequantizes EVERY quantized weight matrix to fp16 into a scratch pool
 // buffer before the cuBLAS tensor-core GEMM, then throws it away. A 20k prompt at -ub 2048 pays
@@ -2163,11 +2705,17 @@ static void * g_pxa_dq_zero[GGML_CUDA_MAX_DEVICES]     = { nullptr };
 static size_t g_pxa_dq_zero_sz[GGML_CUDA_MAX_DEVICES]  = { 0 };
 static std::mutex g_pxa_dq_zero_mtx;
 
+// Bug #230: the persistent growth-on-demand buffers in this file (the dq-zero buffer below, the
+// G2 q8 sidecar, X_CACHE, MMQ A-cache, the expert-shard staging buffer) and the PXQ KSPLIT
+// workspace in pxq6.cuh are baked into captured CUDA graphs as kernel arguments. Freeing one on
+// growth must bump the allocator generation so no exec replays into freed memory.
+extern "C" void ggml_cuda_alloc_generation_bump(void);
+
 static const half * pxa_dq_zero_buf(int device, size_t ne, cudaStream_t stream) {
     std::lock_guard<std::mutex> lk(g_pxa_dq_zero_mtx);
     const size_t need = ne*sizeof(half);
     if (g_pxa_dq_zero_sz[device] < need) {
-        if (g_pxa_dq_zero[device]) cudaFree(g_pxa_dq_zero[device]);
+        if (g_pxa_dq_zero[device]) { ggml_cuda_alloc_generation_bump(); cudaFree(g_pxa_dq_zero[device]); }   // bug #230
         if (cudaMalloc(&g_pxa_dq_zero[device], need) != cudaSuccess) { g_pxa_dq_zero_sz[device] = 0; return nullptr; }
         cudaMemsetAsync(g_pxa_dq_zero[device], 0, need, stream);
         g_pxa_dq_zero_sz[device] = need;
@@ -2402,6 +2950,70 @@ static void ggml_cuda_op_mul_mat_cublas(
     const bool pxa_fp16_gemm_ok = compute_capability >= CC_VOLTA ||
         (pxa_p100_fp16_gemm() && compute_capability < CC_VOLTA && fast_fp16_available(compute_capability));
     if (pxa_fp16_gemm_ok && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && (dst->op_params[0] == GGML_PREC_DEFAULT || pxa_f32prec_take || pxa_volta_f32out)) {
+        // PXA_CUBLAS_SRC0_SLICE (2026-09-25): a quantized src0 whose whole f16
+        // copy is larger than PXA_CUBLAS_SRC0_SLICE_MIB (default 256) is converted and multiplied
+        // in row slices of at most that size, fp32 accumulate + F32 output straight into dst (the
+        // Volta form above). Why: on sm_60 (no dp4a -> no MMQ) a q8_0 output head at width > 8
+        // (the MTP prompt catch-up asks for every row) went through here as ONE 2.4 GiB f16 copy
+        // (248320 x 5120) and OOMed the pool at the first request on a 16 GB card at 64k/131k
+        // (crash config on a P100; bug #205 on the P100 side). Tensors under the threshold keep
+        // the exact incumbent path. PXA_CUBLAS_SRC0_SLICE_MIB=0 disables.
+        {
+            static const size_t pxa_slice_bytes = [](){
+                const char * e = getenv("PXA_CUBLAS_SRC0_SLICE_MIB");
+                const long v = e && *e ? atol(e) : 256;
+                return v > 0 ? (size_t) v << 20 : (size_t) 0;
+            }();
+            const size_t whole = (size_t) row_diff*ne00*sizeof(half);
+            if (pxa_slice_bytes && ggml_is_quantized(src0->type) && whole > pxa_slice_bytes && id == ctx.device) {
+                const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
+                GGML_ASSERT(to_fp16_cuda != nullptr);
+                const int64_t blck = ggml_blck_size(src0->type);
+                GGML_ASSERT(ne00 % blck == 0);
+                // ggml_row_size, not type_size*ne00/blck: PXQN rows carry row_meta_size bytes (the fp16 anchor), so the
+                // traits-only stride drifted 2 B per row and every slice after the first decoded misaligned panels
+                // (NaN logits from a PXQN5 lm-head at prefill width on sm_70; )
+                const size_t row_bytes = ggml_row_size(src0->type, ne00);
+                int64_t rows = (int64_t) (pxa_slice_bytes/((size_t) ne00*sizeof(half)));
+                rows = std::max<int64_t>(64, rows - rows % 64);
+                {
+                    static std::atomic<bool> told{false};
+                    if (!told.exchange(true)) {
+                        fprintf(stderr, "PXA_CUBLAS_SRC0_SLICE: engaged (%s %lld x %lld, f16 copy %.1f MiB -> %lld-row slices, "
+                                        "fp32 accumulate; PXA_CUBLAS_SRC0_SLICE_MIB=0 reverts)\n", src0->name,
+                                (long long) row_diff, (long long) ne00, whole/1048576.0, (long long) rows);
+                    }
+                }
+                ggml_cuda_pool_alloc<half> src1_h(ctx.pool(id));
+                const half * src1_p = (const half *) src1_ddf_i;
+                if (src1->type != GGML_TYPE_F16) {
+                    const to_fp16_cuda_t to_fp16_1 = ggml_get_to_fp16_cuda(src1->type);
+                    GGML_ASSERT(to_fp16_1 != nullptr);
+                    src1_h.alloc((size_t) src1_ncols*ne10);
+                    to_fp16_1(src1_ddf_i, src1_h.get(), src1_ncols, ne10, stream);
+                    src1_p = src1_h.get();
+                }
+                ggml_cuda_pool_alloc<half> slice(ctx.pool(id), (size_t) rows*ne00);
+                CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+                const float alpha_f32 = 1.0f;
+                const float beta_f32  = 0.0f;
+                for (int64_t r0 = 0; r0 < row_diff; r0 += rows) {
+                    const int64_t nr = std::min<int64_t>(rows, row_diff - r0);
+                    to_fp16_cuda(src0_dd_i + (size_t) r0*row_bytes, slice.get(), nr, ne00, stream);
+                    CUBLAS_CHECK(
+                        cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                                nr, src1_ncols, ne10,
+                                &alpha_f32, slice.get(), CUDA_R_16F, ne00,
+                                            src1_p,      CUDA_R_16F, ne10,
+                                &beta_f32,  dst_dd_i + r0, CUDA_R_32F, ldc,
+                                CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
+                GGML_UNUSED(src1_ddq_i);
+                GGML_UNUSED(src1_padded_row_size);
+                return;
+            }
+        }
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         const half * pxa_dq_sub = nullptr;
@@ -2569,6 +3181,10 @@ static bool ggml_cuda_set_peer_access(int main_device) {
 
         int can_access_peer;
         CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, main_device, id_other));
+        if (can_access_peer && !pxa_p2p_pair_trusted(main_device, id_other)) {
+            can_access_peer = 0;   // PXA_P2P_SELFTEST: this pair corrupts data; never enable it
+        }
+        ggml_cuda_set_device(main_device);   // the self-test may have moved the current device
         if (main_device < GGML_CUDA_MAX_DEVICES && id_other < GGML_CUDA_MAX_DEVICES) {
             g_pxa_p2p[main_device][id_other] = can_access_peer ? 1 : 0;
         }
@@ -3224,6 +3840,11 @@ static inline bool pxa_g2_quantfold() {
     return on;
 }
 
+// : the per-device graph-eval serial, for the PXQN q8_1 sidecar (pxqn.cu) -- same validity rule as G2-F3
+uint64_t ggml_cuda_pxa_eval_serial(int device) {
+    return (device >= 0 && device < GGML_CUDA_MAX_DEVICES) ? pxa_g2_eval_serial[device] : 0;
+}
+
 static char * pxa_g2_q8_buf(int device, cudaStream_t stream, size_t need) {
     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return nullptr;
     auto & sc = pxa_g2_q8sc[device];
@@ -3231,7 +3852,7 @@ static char * pxa_g2_q8_buf(int device, cudaStream_t stream, size_t need) {
     cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
     cudaStreamIsCapturing(stream, &st);
     if (st != cudaStreamCaptureStatusNone) return nullptr;   // can't grow mid-capture -> decline
-    if (sc.buf) cudaFree(sc.buf);
+    if (sc.buf) { ggml_cuda_alloc_generation_bump(); cudaFree(sc.buf); }   // bug #230
     sc.buf = nullptr; sc.sz = 0;
     if (cudaMalloc(&sc.buf, need) != cudaSuccess) { sc.buf = nullptr; cudaGetLastError(); return nullptr; }
     sc.sz = need;
@@ -3251,12 +3872,170 @@ static const char * pxa_g2_q8_lookup(int device, const ggml_tensor * src1, int64
     return sc.buf;
 }
 
+// : the fused [ADD +] norm + PXQN_RHT writes its q8_1 sidecar (pxqn.cu, sm_70 decode) only when one of the
+// next nodes is a PXQN4 / PXQN4S8 MUL_MAT reading the RHT output (attn_in q/k/v, qkvz/ba) -- not at ffn_in, whose
+// FUSED_UP_GATE reads f32 x. A miss only costs the per-GEMV quantize (the lookup never hits an unwritten sidecar).
+static bool pxa_pxqn_q8_wanted(const ggml_cgraph * cgraph, int i_rht) {
+    const ggml_tensor * r = cgraph->nodes[i_rht];
+    for (int j = i_rht + 1; j < cgraph->n_nodes && j <= i_rht + 16; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT && n->src[0] && n->src[1] && (n->src[1] == r || n->src[1]->view_src == r) &&
+            (n->src[0]->type == GGML_TYPE_PXQN4 || n->src[0]->type == GGML_TYPE_PXQN4S8)) return true;
+    }
+    return false;
+}
+
+// PXA_KQMMV (pxa/kq-mmv.cu): a Q4_K / Q5_K / Q6_K / Q8_0 decode GEMV node (and the MUL_MATs right after it
+// that read the same src1) on the k-quant decode GEMV. True when this node is one it serves; the tensors
+// must sit in plain CUDA buffers of ctx.device.
+// PXA_KQMMV_WHY=1 (diagnostic): name, once per tensor name, every quantized decode GEMV that did NOT take the
+// k-quant decode GEMV and the first predicate that refused it
+static void pxa_kqmmv_why(const char * why, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const bool on = getenv("PXA_KQMMV_WHY") && atoi(getenv("PXA_KQMMV_WHY")) != 0;
+    if (!on) return;
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!seen.insert(std::string(dst->name) + "|" + why).second) return;
+    fprintf(stderr, "PXA_KQMMV_WHY %-24s dst=%s src0=%s(%s) [%lld,%lld] src1=%s [%lld,%lld,%lld] nb1=%zu data%%16=%d\n",
+            why, dst->name, src0->name, ggml_type_name(src0->type), (long long) src0->ne[0], (long long) src0->ne[1],
+            src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], src1->nb[1],
+            (int) (((uintptr_t) src1->data) & 15));
+}
+
+static bool pxa_kqmmv_node(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                           const ggml_tensor * dst) {
+    if (!ggml_cuda_kqmmv_take(ctx.device, src0->type, src1->ne[0], src1->ne[1])) { pxa_kqmmv_why("take", src0, src1, dst); return false; }
+    auto on_dev = [&](const ggml_tensor * t) {
+        return t && t->buffer && ggml_backend_buffer_is_cuda(t->buffer)
+            && ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == ctx.device;
+    };
+    if (!(on_dev(src0) && on_dev(src1) && on_dev(dst))) { pxa_kqmmv_why("on_dev", src0, src1, dst); return false; }
+    if (!ggml_cuda_kqmmv_shape_ok(src0, src1, dst)) { pxa_kqmmv_why("shape", src0, src1, dst); return false; }
+    return true;
+}
+
+// PXA_MMVQ_GROUP (sm_70 decode): the ny = 1 MUL_MATs that follow `head` in the graph, read the same src1 and have
+// the same weight type (DeltaNet qkv / z / alpha / beta, attention q / k / v) run as ONE q8_1 MMVQ launch
+// (mmvq-templates.cuh, mul_mat_vec_q_group): bit-identical to one launch per matrix, minus the per-launch floor
+// of the small members. Only view-like nodes may sit between members, so no other computation is reordered.
+//   PXA_MMVQ_GROUP  auto (default: on at cc 700) | 0 = off | 1 = on at any NVIDIA cc >= 700
+// Returns the index of the last node served, or -1 when fewer than two nodes qualify (the caller launches
+// `head` alone exactly as before).
+static bool pxa_mmvq_group_on(int cc) {
+    static const int mode = [](){
+        const char * e = getenv("PXA_MMVQ_GROUP");
+        if (!e || !*e || !strcmp(e, "auto")) return -1;
+        return atoi(e) != 0 ? 1 : 0;
+    }();
+    if (mode == 0 || cc >= CC_OFFSET_AMD) return false;
+    return mode == 1 ? cc >= CC_VOLTA : cc == CC_VOLTA;
+}
+
+static int pxa_mmvq_group(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int head_n,
+                          const ggml_tensor * src1, const char * q8v, int64_t ne10_padded, bool fusion, cudaStream_t stream) {
+    if (!cgraph || head_n < 0 || head_n >= cgraph->n_nodes || !q8v) return -1;
+    if (!pxa_mmvq_group_on(ggml_cuda_info().devices[ctx.device].cc)) return -1;
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return -1;
+    const ggml_tensor * head = cgraph->nodes[head_n];
+    const ggml_type type = head->src[0]->type;
+    if (type != GGML_TYPE_Q6_K && type != GGML_TYPE_Q8_0 && type != GGML_TYPE_PXQN4 && type != GGML_TYPE_PXQN4S8) return -1;
+    auto member_ok = [&](const ggml_tensor * n) {
+        const ggml_tensor * w = n->src[0];
+        return n->op == GGML_OP_MUL_MAT && n->src[1] == src1 && w && w->type == type &&
+               w->ne[0] == src1->ne[0] && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) &&
+               w->ne[1] > 0 && w->ne[1] < (1 << 30) &&
+               n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && n->ne[0] == w->ne[1] && ggml_nrows(n) == 1 &&
+               w->data && n->data;
+    };
+    auto bias_next = [&](int j, const ggml_tensor * t) {   // the incumbent fuses a following bias ADD: leave it that way
+        return fusion && j + 1 < cgraph->n_nodes && cgraph->nodes[j+1]->op == GGML_OP_ADD && cgraph->nodes[j+1]->src[0] == t;
+    };
+    if (!member_ok(head) || bias_next(head_n, head)) return -1;
+    mmvq_group_args g{};
+    g.vx[0] = head->src[0]->data; g.dst[0] = (float *) head->data; g.nrows[0] = (int) head->src[0]->ne[1];
+    g.n = 1;
+    int last = head_n;
+    for (int j = head_n + 1; j < cgraph->n_nodes && g.n < MMVQ_GROUP_MAX; ++j) {
+        const ggml_tensor * nd = cgraph->nodes[j];
+        if (ggml_is_empty(nd) || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_TRANSPOSE || nd->op == GGML_OP_VIEW
+                              || nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_NONE) continue;
+        if (!member_ok(nd) || bias_next(j, nd)) break;
+        g.vx[g.n] = nd->src[0]->data; g.dst[g.n] = (float *) nd->data; g.nrows[g.n] = (int) nd->src[0]->ne[1];
+        ++g.n; last = j;
+    }
+    if (g.n < 2) return -1;
+    g.vy = q8v; g.ncols_x = (int) src1->ne[0]; g.nrows_y = (int) ne10_padded;
+    if (!ggml_cuda_mmvq_group(type, g, stream)) return -1;
+    CUDA_CHECK(cudaGetLastError());
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        fprintf(stderr, "PXA_MMVQ_GROUP: dev%d first grouped decode GEMV (%d x %s, one launch; PXA_MMVQ_GROUP=0 -> one launch per matrix)\n",
+                ctx.device, g.n, ggml_type_name(type));
+    }
+    return last;
+}
+
 static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n, bool is_gemv) {
 
     auto stream = ctx.stream();
 
     auto fusion = ctx.fusion && src1->ne[1] == 1;
+
+    // PXA_KQMMV: no q8_1 quantize launch, the activation is staged once per block from the f32 src1, and the
+    // chain of MUL_MATs reading the same src1 (DeltaNet qkv/z/alpha/beta, attention q/k/v) is collected here
+    // and launched in groups (PXA_KQMMV_GROUP). A node whose result the incumbent would fuse with a bias ADD
+    // stays on the incumbent (no bias form in this kernel); the chain stops at the first node it does not take.
+    if (!is_gemv && src1->ne[1] == 1) pxa_kqmmv_why("not-gemv", src0, src1, dst);
+    if (is_gemv && pxa_kqmmv_node(ctx, src0, src1, dst)) {
+        auto bias_next = [&](int j, const ggml_tensor * t) {
+            return fusion && cgraph && j + 1 < cgraph->n_nodes && cgraph->nodes[j+1]->op == GGML_OP_ADD &&
+                   cgraph->nodes[j+1]->src[0] == t;
+        };
+        if (bias_next(node_n, dst)) pxa_kqmmv_why("bias-next", src0, src1, dst);
+        if (!bias_next(node_n, dst)) {
+            constexpr int KQ_CHAIN_MAX = 16;
+            const ggml_tensor * kq_src0[KQ_CHAIN_MAX];
+            ggml_tensor       * kq_dst [KQ_CHAIN_MAX];
+            int n = 0;
+            kq_src0[n] = src0; kq_dst[n] = dst; ++n;
+            int last = node_n;
+            if (cgraph && ggml_cuda_kqmmv_group_on()) {
+                int j = node_n;
+                while (j + 1 < cgraph->n_nodes && n < KQ_CHAIN_MAX) {
+                    ggml_tensor * nd = cgraph->nodes[j+1];
+                    if (ggml_is_empty(nd) || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_TRANSPOSE || nd->op == GGML_OP_VIEW
+                                          || nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_NONE) {
+                        ++j; continue;
+                    }
+                    if (nd->op != GGML_OP_MUL_MAT || nd->src[1] != src1 || !nd->src[0] ||
+                        !pxa_kqmmv_node(ctx, nd->src[0], src1, nd) || bias_next(j + 1, nd)) break;
+                    kq_src0[n] = nd->src[0]; kq_dst[n] = nd; ++n;
+                    ++j; last = j;
+                }
+            }
+            if (ggml_cuda_kqmmv_mul_mats(ctx.device, stream, src1, kq_src0, kq_dst, n)) {
+                return last;
+            }
+            pxa_kqmmv_why("mul_mats-declined", src0, src1, dst);
+        } else {
+            // the incumbent's single-bias form (next node = ADD(dst, per-row vector)): on the tensor split's
+            // last device that is the residual add after every partial wo / ssm_out / ffn_down
+            ggml_tensor * add = cgraph->nodes[node_n+1];
+            const ggml_tensor * bias = add->src[1];
+            if (add->src[0] == dst && bias && dst->ne[0] == bias->ne[0] && bias->type == GGML_TYPE_F32 &&
+                ggml_nrows(bias) == 1 && ggml_are_same_shape(add, dst) && ggml_is_contiguous(add) &&
+                bias->buffer && ggml_backend_buffer_is_cuda(bias->buffer) &&
+                ((ggml_backend_cuda_buffer_context *) bias->buffer->context)->device == ctx.device &&
+                add->buffer && ggml_backend_buffer_is_cuda(add->buffer) &&
+                ((ggml_backend_cuda_buffer_context *) add->buffer->context)->device == ctx.device &&
+                ggml_cuda_kqmmv_mul_mat_bias(ctx.device, stream, src1, src0, add, bias)) {
+                return node_n + 1;
+            }
+            pxa_kqmmv_why("bias-declined", src0, src1, dst);
+        }
+    }
 
     auto ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
     auto nb10_padded = ne10_padded*sizeof(block_q8_1)/QK8_1;
@@ -3268,6 +4047,7 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
     const char * q8v = nullptr;   // G2-F3: sidecar from a fused norm+quantize producer, if valid
     if (is_gemv) {
         q8v = pxa_g2_q8_lookup(ctx.device, src1, ne10_padded);
+        if (!q8v && ggml_cuda_pxqn_type(src0->type)) q8v = ggml_cuda_pxqn_q8_lookup(ctx.device, src1, ne10_padded);   // 
         if (!q8v) {
             quantize_row_q8_1_cuda((const float *)src1->data, (void *)src1_quantized.get(), src1->ne[0], src1->ne[1], src1->ne[2], ne10_padded,
                     src0->type, stream);
@@ -3308,9 +4088,15 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                  0, dst->src[0]->ne[1], src1->ne[1], ne10_padded, stream);
             ++node_n;
         } else {
-            ggml_cuda_op_mul_mat_vec_q(ctx, src0, src1, dst, (const char *)src0->data, nullptr, q8v, (float *)dst->data,
-                    0, src0->ne[1], src1->ne[1], ne10_padded, stream);
-            CUDA_CHECK(cudaGetLastError());
+            const int gl = (cgraph && node_n < cgraph->n_nodes && cgraph->nodes[node_n] == dst)
+                         ? pxa_mmvq_group(ctx, cgraph, node_n, src1, q8v, ne10_padded, fusion, stream) : -1;
+            if (gl >= 0) {
+                node_n = gl;
+            } else {
+                ggml_cuda_op_mul_mat_vec_q(ctx, src0, src1, dst, (const char *)src0->data, nullptr, q8v, (float *)dst->data,
+                        0, src0->ne[1], src1->ne[1], ne10_padded, stream);
+                CUDA_CHECK(cudaGetLastError());
+            }
         }
     } else {
         quantize_mmq_q8_1_cuda((const float *)src1->data, src1_quantized.get(), src1->ne[0], src1->ne[1], 1, ne10_padded, src0->type, stream);
@@ -3349,8 +4135,13 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                         0, dst->src[0]->ne[1], src1->ne[1], ne10_padded, stream);
                 ++node_n;
             } else {
-                ggml_cuda_op_mul_mat_vec_q(ctx, dst->src[0], src1, dst, (const char *)dst->src[0]->data, nullptr, q8v,
-                        (float *)dst->data, 0, dst->src[0]->ne[1], src1->ne[1], ne10_padded, stream);
+                const int gl = pxa_mmvq_group(ctx, cgraph, node_n + 1, src1, q8v, ne10_padded, fusion, stream);
+                if (gl >= 0) {
+                    node_n = gl - 1;   // the ++node_n below lands on the last node served
+                } else {
+                    ggml_cuda_op_mul_mat_vec_q(ctx, dst->src[0], src1, dst, (const char *)dst->src[0]->data, nullptr, q8v,
+                            (float *)dst->data, 0, dst->src[0]->ne[1], src1->ne[1], ne10_padded, stream);
+                }
             }
         } else {
             ggml_cuda_op_mul_mat_q(ctx, dst->src[0], src1, dst, (const char *)dst->src[0]->data, nullptr, src1_quantized.get(),
@@ -3898,7 +4689,7 @@ static inline int pxa_gemv_rpb_table(int64_t K, int64_t R) {
 static bool ggml_cuda_small_gemv_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     static const bool on = [] {
         const char * e = getenv("PXA_F16_GEMV");
-        return !(e && atoi(e) == 0);
+        return e ? atoi(e) != 0 : pxa_gate_default(true);   // bug #281: off at REFERENCE
     }();
     if (!on) return false;
     if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
@@ -4065,7 +4856,7 @@ static __global__ void __launch_bounds__(PXA_WIDE_WARPS*WARP_SIZE) k_pxa_gemv_f1
 static bool ggml_cuda_wide_gemv_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     static const bool on = [] {
         const char * e = getenv("PXA_F16_GEMV_WIDE");
-        return !(e && atoi(e) == 0);
+        return e ? atoi(e) != 0 : pxa_gate_default(true);   // bug #281: off at REFERENCE
     }();
     if (!on) return false;
     // This preamble is a deliberate copy of ggml_cuda_small_gemv_f16's rather than a shared
@@ -4226,6 +5017,7 @@ static bool ggml_cuda_router_gemv_f32(ggml_backend_cuda_context & ctx, const ggm
 
 
 // forward decl: definition lives with the other PXQ drivers (needs pxa_pxq4_bufs_on_device etc.)
+static bool pxa_pxq4_bufs_on_device(ggml_backend_cuda_context & ctx, std::initializer_list<const ggml_tensor *> ts);
 static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                           const ggml_tensor * src1, ggml_tensor * dst);
 static int pxa_pxq_gemm_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
@@ -4254,6 +5046,45 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // transpose of the family above, which the R <= 512 cap there declines. See
     // k_pxa_gemv_f16_wide; the two predicates are disjoint, that cap is untouched.
     if (ggml_cuda_wide_gemv_f16(ctx, src0, src1, dst)) {
+        return node_n;
+    }
+
+    // PXQN (PXQ-Next rev 1) decode GEMV, ny <= PXQN_MMV_MAX_NY. Wider batches and declines fall
+    // through: no PXQ/MMVQ/MMQ driver claims these types, so they reach dequant (convert.cu) ->
+    // cuBLAS below.
+    if (ggml_cuda_pxqn_type(src0->type)) {
+        auto on_dev = [&](const ggml_tensor * t) {
+            return t && t->buffer && ggml_backend_buffer_is_cuda(t->buffer)
+                && ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == ctx.device;
+        };
+        // PXA_PXQN_GROUP: the next MUL_MAT on the same src1 with a PXQN weight of the same type (DeltaNet
+        // attn_qkv then attn_gate) goes out in the same launch when pxqn.cu finds the pair bit-identical to two launches
+        if (cgraph && on_dev(src0) && on_dev(src1) && on_dev(dst)) {
+            int j = node_n;
+            while (j + 1 < cgraph->n_nodes) {
+                const ggml_tensor * nd = cgraph->nodes[j+1];
+                if (ggml_is_empty(nd) || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_TRANSPOSE || nd->op == GGML_OP_VIEW ||
+                    nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_NONE) { ++j; continue; }
+                break;
+            }
+            if (j + 1 < cgraph->n_nodes) {
+                ggml_tensor * nd = cgraph->nodes[j+1];
+                if (nd->op == GGML_OP_MUL_MAT && nd->src[1] == src1 && nd->src[0] && nd->src[0]->type == src0->type &&
+                    on_dev(nd->src[0]) && on_dev(nd) &&
+                    ggml_cuda_pxqn_mul_mat_pair(ctx, src0, dst, nd->src[0], nd, src1) == 0) {
+                    return j + 1;
+                }
+            }
+        }
+        if (on_dev(src0) && on_dev(src1) && on_dev(dst) && ggml_cuda_pxqn_mul_mat(ctx, src0, src1, dst) == 0) {
+            return node_n;
+        }
+    }
+
+    // PXA_PXQ4_RB: sm_60 one-column PXQ4 decode on the row-block half2 GEMV (pxa/pxq4-rb.cu);
+    // declines (other arch/type/width, lever off) fall through to the fp32 PXQ driver below unchanged.
+    if (src0->type == GGML_TYPE_PXQ4 && src1->ne[1] == 1 && pxa_pxq4_bufs_on_device(ctx, {src0, src1, dst}) &&
+        ggml_cuda_pxq4_rb_mul_mat(ctx.device, ctx.stream(), src0, src1, dst) == 0) {
         return node_n;
     }
 
@@ -4290,6 +5121,9 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // (V100 sm_70, tensor cores) prefers MMVQ. Decided per DEVICE by cc, so a mixed P100+V100 -sm-layer
     // rig automatically uses the best matmul kernel on EACH card in ONE binary (no -DGGML_CUDA_FORCE_DMMV).
     const int cc            = ggml_cuda_info().devices[ctx.device].cc;
+    // : PXQN4 / PXQN4S8 reach MMVQ only on sm_70 (the PXQN decode GEMV declines them there, see
+    // pxqn.cu); on every other arch a PXQN node that gets here keeps its incumbent route exactly
+    if (ggml_cuda_pxqn_type(src0->type) && cc != CC_VOLTA) use_mul_mat_vec_q = false;
     if (cc >= CC_VOLTA) {
         // mmvq (DP4A / tensor-core path) beats dmmv on Volta+; on Pascal we keep dmmv (no fast int8).
         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && !use_mul_mat_vec_q;
@@ -4355,6 +5189,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1 && !pxa_dmmv_take) {
         return ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
     }
+    if (src1->ne[1] == 1 && ggml_is_quantized(src0->type)) pxa_kqmmv_why("not-mul_mat_q", src0, src1, dst);
 
     // PXA_SPEC_1ROW (default ON, =0 rollback to the ne11==1-only dispatch): single-output-row
     // GEMV, now also at spec-verify batch sizes (Ny<=8, the MMVQ_MAX_BATCH_SIZE convention).
@@ -4412,6 +5247,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_dequantize_mul_mat_vec, nullptr);
     } else if (use_mul_mat_vec_q) {
         if (debug) printf("%s(%s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_vec_q)\n", __func__, dst->name);
+        pxa_kqmmv_why("generic-op-mmvq", src0, src1, dst);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
         if (debug) printf("%s(%s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_q)\n", __func__, dst->name);
@@ -4574,6 +5410,18 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     CUDA_CHECK(cudaMemsetAsync((char *)dst->data, 0, ggml_nbytes(dst), ctx.stream()));
 
+    // PXQN routed experts: the PXQN id-GEMV, direct at decode widths, over a device-built
+    // expert row map above them. Declines (-1) fall through to the generic per-expert path below.
+    if (ggml_cuda_pxqn_type(src0->type)) {
+        auto on_dev = [&](const ggml_tensor * t) {
+            return t && t->buffer && ggml_backend_buffer_is_cuda(t->buffer)
+                && ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == ctx.device;
+        };
+        if (on_dev(src0) && on_dev(src1) && on_dev(ids) && on_dev(dst) && ggml_cuda_pxqn_mul_mat_id(ctx, dst) == 0) {
+            return false;
+        }
+    }
+
     // PXQ routed-expert decode, one launch over (panels, n_ids, ny) with the ids read on the
     // device. Serves architectures whose up/gate do NOT fuse (glm5next clamps its SwiGLU halves,
     // so llm_build_moe_ffn takes the unfused branch) and which therefore reach none of the fused
@@ -4587,6 +5435,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_is_quantized(src0->type) &&
         ggml_cuda_mmvq_type_supported(src0->type) &&   // no mmvq kernel (e.g. PXQ slabs) -> per-expert dequant/cublas loop below
         !pxa_pxq_mmvq_type(src0->type) &&              // PXQ MMVQ is dense-decode only; MoE keeps its grouped drivers
+        !ggml_cuda_pxqn_type(src0->type) &&            // : likewise PXQN (its MMVQ route is dense sm_70 decode)
         ggml_backend_buffer_is_cuda(src0->buffer) &&
         ggml_backend_buffer_is_cuda(src1->buffer) &&
         ggml_backend_buffer_is_cuda(dst->buffer) &&
@@ -4937,7 +5786,8 @@ static bool pxa_pxq4_2d_ksplit() {
 static bool pxa_pxq4_2d_split() {
     static const bool v = [] {
         const char * e = getenv("PXA_PXQ4_2D_SPLIT");
-        return !(e && atoi(e) == 0);
+        // bug #281: level-aware like the PXQ6 gate family -- PXA_REFERENCE=1 -> unsplit form.
+        return e ? atoi(e) != 0 : pxa_gate_default(true);
     }();
     return v;
 }
@@ -5169,7 +6019,8 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     const int  pair = pxa_pxq6_decode_mode();
     const bool vecx = pxa_pxq6_vecx();
-    // PXA_PXQ_MMV_H2 (2026-09-10): the half2 pair-LUT decode twins for PXQ2/PXQ3 on cc == 600.
+    // PXA_PXQ_MMV_H2 (2026-09-10; PXQ4 added 2026-09-13): the half2 pair-LUT decode twins for
+    // PXQ2/PXQ3/PXQ4 on cc == 600, each behind its own mask bit.
     // Resolved once, here, and it takes precedence over the R2/Q1/TOK experimental twins, none of
     // which has an h2 form -- otherwise an armed lever would be silently displaced by a
     // default-off one and the A/B would measure nothing. Dense only; the MoE grouped drivers
@@ -5234,7 +6085,8 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         // occupancy target sees ny/TOK grid-z slices, so S both starts higher (fit) and climbs
         // higher (fill) than the per-token S. Declines (lever off, ny==1, no instantiation,
         // smem cap unmeetable) fall through to the per-token launches unchanged.
-        const int tok_req = pxa_pxq_mmv_tok();
+        int tok_req = pxa_pxq_mmv_tok();
+        if (tok_req < 0) tok_req = ggml_cuda_info().devices[ctx.device].cc < 700 ? 3 : 0;   // per-card default
         if (tok_req >= 2 && ny >= 2 && !h2) {   // no h2 form of the TOK twin: the armed lever wins
             const int tok = ny < (int64_t)tok_req ? (int)ny : tok_req;
             auto * kt = pxq6_pick_mmv_ksplit_gen_tok(fmt, pair, vecx, tok);
@@ -5538,7 +6390,7 @@ static inline half * pxa_x_cache_get(int device, cudaStream_t stream,
         cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
         cudaStreamIsCapturing(stream, &st);
         if (st != cudaStreamCaptureStatusNone) return nullptr;   // cannot grow mid-capture
-        if (c.ptr) cudaFree(c.ptr);
+        if (c.ptr) { ggml_cuda_alloc_generation_bump(); cudaFree(c.ptr); }   // bug #230
         c.ptr = nullptr; c.sz = 0;
         if (cudaMalloc(&c.ptr, need) != cudaSuccess) { c.ptr = nullptr; (void)cudaGetLastError(); return nullptr; }
         c.sz = need;
@@ -5621,6 +6473,7 @@ static inline bool pxa_aq_cache_get(int device, cudaStream_t stream, const ggml_
         cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
         cudaStreamIsCapturing(stream, &st);
         if (st != cudaStreamCaptureStatusNone) return false;     // cannot grow mid-capture
+        if (c.q || c.d) ggml_cuda_alloc_generation_bump();       // bug #230
         if (c.q) cudaFree(c.q);
         if (c.d) cudaFree(c.d);
         c.q = nullptr; c.d = nullptr; c.qsz = 0; c.dsz = 0;
@@ -6254,7 +7107,7 @@ static int pxa_pxq4_moe_fast_tg(ggml_backend_cuda_context & ctx, ggml_tensor * d
 static inline bool pxa_pxq_moe_mmv_id_on() {
     static const bool v = [] {
         const char * e = getenv("PXA_PXQ_MOE_MMV_ID");
-        return !(e && atoi(e) == 0);
+        return e ? atoi(e) != 0 : pxa_gate_default(true);   // bug #281: off at REFERENCE
     }();
     return v;
 }
@@ -6776,6 +7629,30 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     // PXA_A1 (2026-07-01): fast-TG per-token iy-loop re-reads each routed expert once PER TOKEN of a
     // K-token MTP verify batch. Env-tunable gate: PXA_MOE_FASTTG_MAX_NY=1 routes Ny>1 verify batches to
     // the expert-grouped batched path below (weights read once per traversal). Default 8 = unchanged.
+    // PXQN routed experts: up/gate as one id-GEMV (silu(g)*u epilogue) and, when the next node
+    // is the down MUL_MAT_ID reading this output, the down in the same pass over the same row map.
+    if (ggml_cuda_pxqn_type(src0_1->type)) {
+        auto on_dev = [&](const ggml_tensor * t) {
+            return t && t->buffer && ggml_backend_buffer_is_cuda(t->buffer)
+                && ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == ctx.device;
+        };
+        ggml_tensor * down = next && next->op == GGML_OP_MUL_MAT_ID && next->src[0] && ggml_cuda_pxqn_type(next->src[0]->type) &&
+                             on_dev(next->src[0]) && on_dev(next) ? next : nullptr;
+        // K-straddle: this output -> its dim-0 zero pad (the K window) -> the down over the pad
+        ggml_tensor * kpad = nullptr;
+        if (!down && next && next->op == GGML_OP_PAD && next->src[0] == dst && on_dev(next) && i + 2 < graph->n_nodes) {
+            ggml_tensor * n2 = graph->nodes[i + 2];
+            if (n2->op == GGML_OP_MUL_MAT_ID && n2->src[1] == next && n2->src[0] && ggml_cuda_pxqn_type(n2->src[0]->type) &&
+                on_dev(n2->src[0]) && on_dev(n2)) {
+                down = n2; kpad = next;
+            }
+        }
+        if (on_dev(src0_1) && on_dev(src0_2) && on_dev(src1) && on_dev(ids) && on_dev(dst)) {
+            const int r = ggml_cuda_pxqn_moe_up_gate(ctx, dst, down, kpad);
+            if (r >= 0) return r == 1 ? i + (kpad ? 2 : 1) : i;
+        }
+    }
+
     static const int pxa_fast_tg_max_ny = getenv("PXA_MOE_FASTTG_MAX_NY") ? atoi(getenv("PXA_MOE_FASTTG_MAX_NY")) : 8;
     static const bool pxa_moe_dbg = getenv("PXA_MOE_DEBUG") != nullptr;
 
@@ -7364,10 +8241,13 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
 }
 
 static inline bool pxa_is_pxq_type(ggml_type t) {
+    // PXQN rev 1 rides the same per-operand branch of ggml_cuda_up_gate_unary: pxa_pxq_gateup_2d
+    // declines it (no PXQ fmt), each operand reaches ggml_cuda_pxqn_mul_mat, then the fused GLU.
     return t == GGML_TYPE_PXQ4 ||
            t == GGML_TYPE_PXQ4HQ || t == GGML_TYPE_PXQ2 || t == GGML_TYPE_PXQ3 ||
            t == GGML_TYPE_PXQ1 ||
-           t == GGML_TYPE_PXQ6;
+           t == GGML_TYPE_PXQ6 ||
+           ggml_cuda_pxqn_type(t);
 }
 
 // ================= DENSE FUSED up+gate+GLU decode driver (PXA_PXQ_DENSE_GATEUP) =================
@@ -7390,7 +8270,8 @@ static inline bool pxa_is_pxq_type(ggml_type t) {
 static bool pxa_pxq_dense_gateup() {
     static const bool v = [] {
         const char * e = getenv("PXA_PXQ_DENSE_GATEUP");
-        return !(e && atoi(e) == 0);
+        // bug #281: PXA_REFERENCE=1 -> split up/gate mul_mat (the reference path).
+        return e ? atoi(e) != 0 : pxa_gate_default(true);
     }();
     return v;
 }
@@ -7586,6 +8467,19 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * src0_2 = dst->src[1];
     const ggml_tensor * src1 = dst->src[2];
 
+    // PXQN (PXQ-Next rev 1): same-type up/gate at decode width -> ONE fused decode launch (x staged
+    // once, silu(gate)*up epilogue; bit-identical to the per-operand path below, which it falls
+    // back to for any shape/op it declines).
+    if (ggml_cuda_pxqn_type(src0_1->type) && src0_1->type == src0_2->type) {
+        auto on_dev = [&](const ggml_tensor * t) {
+            return t && t->buffer && ggml_backend_buffer_is_cuda(t->buffer)
+                && ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == ctx.device;
+        };
+        if (on_dev(src0_1) && on_dev(src0_2) && on_dev(src1) && on_dev(dst) && ggml_cuda_pxqn_up_gate(ctx, dst) == 0) {
+            return;
+        }
+    }
+
     // Dense FUSED_UP_GATE with PXQ-slab-typed up/gate tensors. The stock q8_1 mmvq/mmq calls
     // below have NO PXQ kernels and would fault; divert to a per-operand ggml_cuda_mul_mat
     // (which reaches the PXQ 2D drivers, and the dequant->cublas fallback beyond their ny
@@ -7669,9 +8563,39 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         return;
     }
     if (!pxq_mmvq_fug && (pxa_is_pxq_type(src0_1->type) || pxa_is_pxq_type(src0_2->type))) {
+        // PXA_PXQ_GATEUP_H2SPLIT (2026-09-25, , default OFF): on GP100 the dense
+        // PXQ2/PXQ3 decode mmv has a half2 pair-LUT loop (PXA_PXQ_MMV_H2, default on at cc 600) but
+        // the fused up/gate kernel (k_pxq6_gateup_mmv_ksplit_gen) has no h2 form, so the largest
+        // weight chunk of every layer decodes on the fp32 loop: nvprof, Qwen3.8-27B PXQ3-balanced,
+        // one P100, 0.388 ms per layer for the fused up+gate against 0.150 ms for the same-size
+        // ffn_down through the h2 kernel (36% of a 69.6 ms token). Armed, a width-1 up/gate whose
+        // tier the h2 mask covers skips the fused form and takes the split below: two mmv launches
+        // (each on the h2 loop) plus the fused GLU epilogue. Numerics follow the h2 loop (not
+        // bit-exact vs the fp32 fused kernel, same class as ffn_down already is).
+        static const bool gu_h2split = [](){
+            const char * e = getenv("PXA_PXQ_GATEUP_H2SPLIT");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        const int h2_tier_bit = src0_1->type == GGML_TYPE_PXQ2 ? 1 : src0_1->type == GGML_TYPE_PXQ3 ? 2 : src0_1->type == GGML_TYPE_PXQ4 ? 4 : 0;
+        const bool take_h2split = gu_h2split && src0_1->type == src0_2->type && h2_tier_bit != 0 &&
+                                  (pxa_pxq_mmv_h2_mask() & h2_tier_bit) != 0 &&
+                                  ggml_cuda_info().devices[ctx.device].cc == 600 &&
+                                  src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
+        {
+            static std::atomic<bool> told{false};
+            if (gu_h2split && !told.exchange(true)) {
+                fprintf(stderr, "PXA_PXQ_GATEUP_H2SPLIT: armed -- width-1 PXQ2/PXQ3 up/gate on cc 600 runs as two "
+                                "h2 mmv + GLU instead of the fused fp32 gateup kernel (first node: %s, %s)\n",
+                        take_h2split ? "TAKEN" : "declined", ggml_type_name(src0_1->type));
+            }
+        }
         // Fused single-launch decode form first; it declines to the split path below for any
         // shape/op/geometry it cannot serve.
-        if (pxa_pxq_gateup_2d(ctx, dst) == 0) return;
+        // PXA_PXQ4_RB: a one-column PXQ4 up/gate on sm_60 -> ONE row-block half2 launch with the silu epilogue
+        if (!take_h2split && src0_1->type == GGML_TYPE_PXQ4 && src0_2->type == GGML_TYPE_PXQ4 && src1->ne[1] == 1 &&
+            pxa_pxq4_bufs_on_device(ctx, {src0_1, src0_2, src1, dst}) &&
+            ggml_cuda_pxq4_rb_up_gate(ctx.device, ctx.stream(), dst) == 0) return;
+        if (!take_h2split && pxa_pxq_gateup_2d(ctx, dst) == 0) return;
         const float limit_px = *(const float *)(dst->op_params + 1);
         // PXA_DENSE_FUG_PREC_v1: op_params[0] on a FUSED_UP_GATE node is the UNARY OP id
         // (GGML_UNARY_OP_SILU == 10), NOT a ggml_prec. Both ggml_cuda_op_mul_mat_cublas (which
@@ -7695,6 +8619,20 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
                         (const float *)dst->data, dst_up_px.get(), (float *)dst->data, limit_px);
         CUDA_CHECK(cudaGetLastError());
         return;
+    }
+
+    // PXA_KQMMV + PXA_KQMMV_GU: same-type Q4_K / Q5_K / Q6_K / Q8_0 up/gate at ny <= 8 -> ONE launch (activation
+    // staged once, up and gate rows in the same warp, silu(gate)*up epilogue). Declines (bias, other GLU, shapes,
+    // lever off) fall through to the incumbent below unchanged.
+    if (src1->ne[1] <= 8) {
+        auto on_dev = [&](const ggml_tensor * t) {
+            return t && t->buffer && ggml_backend_buffer_is_cuda(t->buffer)
+                && ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == ctx.device;
+        };
+        if (on_dev(src0_1) && on_dev(src0_2) && on_dev(src1) && on_dev(dst) &&
+            ggml_cuda_kqmmv_up_gate(ctx.device, ctx.stream(), dst) == 0) {
+            return;
+        }
     }
 
     GGML_ASSERT(ggml_is_quantized(src0_1->type));
@@ -7890,6 +8828,7 @@ static bool pxa_g2_normfuse_wanted(ggml_backend_cuda_context & ctx, const ggml_c
         if (ggml_nelements(s1) != ggml_nelements(dst)) continue;
         const ggml_tensor * w = n->src[0];
         if (!w || !ggml_is_quantized(w->type) || !ggml_cuda_mmvq_type_supported(w->type)) continue;
+        if (ggml_cuda_pxqn_type(w->type)) continue;   // : PXQN consumers never read a q8_1 sidecar
         if (!n->buffer || !ggml_backend_buffer_is_cuda(n->buffer)) continue;
         if (((ggml_backend_cuda_buffer_context *)n->buffer->context)->device != ctx.device) continue;
         padded_out = GGML_PAD(s1->ne[0], MATRIX_ROW_PADDING);
@@ -7997,6 +8936,93 @@ static bool pxa_g2_sole_consumer(const ggml_cgraph * cgraph, int i, const ggml_t
 }
 
 
+extern "C" bool ggml_cuda_pxa_epi_take(int device, const ggml_tensor * t);
+extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int * devs);
+
+// (PXA_PXQN_RB_RHT): the head-split out_in chain build_pxqn_rht_ranges makes -- n PXQN_RHT nodes over
+// consecutive views of one contiguous F32 row x, concatenated along dim 0 (and reshaped) into a PXQN MUL_MAT's src1 --
+// starting at the first RHT (node i). Returns the MUL_MAT's node index and fills the ranges, or -1. Only views,
+// reshapes, the chain's RHT / CONCAT nodes and nothing else may sit between i and the MUL_MAT, and no chain tensor may
+// have a consumer outside the chain, so serving the chain there lets the caller skip every node up to the MUL_MAT.
+static bool pxa_rr_flatten(const ggml_tensor * t, const ggml_tensor ** leaf, int & n, const ggml_tensor ** inner, int & ni) {
+    if (t->op == GGML_OP_PXQN_RHT) { if (n >= 4) return false; leaf[n++] = t; return true; }
+    if (t->op == GGML_OP_CONCAT && t->op_params[0] == 0 && t->src[0] && t->src[1] && ni < 8) {
+        inner[ni++] = t;
+        return pxa_rr_flatten(t->src[0], leaf, n, inner, ni) && pxa_rr_flatten(t->src[1], leaf, n, inner, ni);
+    }
+    return false;
+}
+static int pxa_pxqn_rht_ranges_match(const ggml_cgraph * cgraph, int i, const float ** x_out, int & n,
+                                     int64_t * off, int64_t * k0, ggml_tensor ** cat_out) {
+    const ggml_tensor * r0 = cgraph->nodes[i];
+    if (r0->op != GGML_OP_PXQN_RHT || !r0->src[0] || r0->src[0]->op != GGML_OP_VIEW) return -1;
+    int jm = -1;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 16; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_MUL_MAT) { jm = j; break; }
+        if (t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PXQN_RHT && t->op != GGML_OP_CONCAT) return -1;
+    }
+    if (jm < 0) return -1;
+    const ggml_tensor * mm = cgraph->nodes[jm];
+    if (!mm->src[0] || !ggml_cuda_pxqn_type(mm->src[0]->type) || !mm->src[1]) return -1;
+    ggml_tensor * top = mm->src[1];
+    const ggml_tensor * rs = nullptr;
+    if (top->op == GGML_OP_RESHAPE) { rs = top; top = top->src[0]; }
+    if (!top || top->op != GGML_OP_CONCAT) return -1;
+    const ggml_tensor * leaf[4]; const ggml_tensor * inner[8]; int ni = 0; n = 0;
+    if (!pxa_rr_flatten(top, leaf, n, inner, ni) || n < 2 || leaf[0] != r0) return -1;
+    // x = the ranges' bytes: consecutive F32 row views of one tensor, matched by address (the views' root is the
+    // norm output's own shape, e.g. [head_v_dim, n_v_heads, 1], not the 2D row the graph reshaped it to)
+    const ggml_tensor * base = r0->src[0]->view_src;
+    if (!base) return -1;
+    const char * x0 = (const char *) r0->src[0]->data;
+    int64_t o = 0;
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * r = leaf[k], * v = r->src[0];
+        if (!v || v->op != GGML_OP_VIEW || v->view_src != base || v->type != GGML_TYPE_F32 || v->nb[0] != sizeof(float)) return -1;
+        if (ggml_nelements(v) != v->ne[0] || (const char *) v->data != x0 + o*(int64_t)sizeof(float) || v->ne[0] % 128) return -1;
+        if (r->ne[0] != v->ne[0] || ggml_nelements(r) != r->ne[0] || (r->flags & GGML_TENSOR_FLAG_OUTPUT)) return -1;
+        for (int q = 0; q < 4; ++q) if (r->op_params[q] != r0->op_params[q]) return -1;   // seed, layer, site
+        if (r->op_params[4] % 128) return -1;
+        off[k] = o; k0[k] = r->op_params[4]; o += v->ne[0];
+    }
+    if (top->ne[0] != o || ggml_nelements(top) != o) return -1;
+    // every RHT / CONCAT between i and the MUL_MAT belongs to the chain, and every chain tensor feeds only the chain
+    for (int j = i; j < jm; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op != GGML_OP_PXQN_RHT && t->op != GGML_OP_CONCAT) continue;
+        bool in = false;
+        for (int k = 0; k < n && !in; ++k) in = leaf[k] == t;
+        for (int k = 0; k < ni && !in; ++k) in = inner[k] == t;
+        if (!in) return -1;
+    }
+    auto sole = [&](const ggml_tensor * t, const ggml_tensor * user) {
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
+        for (int j = i; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * u = cgraph->nodes[j];
+            if (u == user) continue;
+            if (u->view_src == t) return false;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) if (u->src[s] == t) return false;
+        }
+        return true;
+    };
+    for (int k = 0; k < ni; ++k) {                       // inner[k] feeds its CONCAT parent, or (top) the reshape / mm
+        const ggml_tensor * t = inner[k];
+        const ggml_tensor * user = t == top ? (rs ? rs : mm) : nullptr;
+        for (int q = 0; q < ni && !user; ++q) if (inner[q]->src[0] == t || inner[q]->src[1] == t) user = inner[q];
+        if (!user || !sole(t, user)) return -1;
+    }
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * user = nullptr;
+        for (int q = 0; q < ni && !user; ++q) if (inner[q]->src[0] == leaf[k] || inner[q]->src[1] == leaf[k]) user = inner[q];
+        if (!user || !sole(leaf[k], user)) return -1;
+    }
+    if (rs && !sole(rs, mm)) return -1;
+    *x_out = (const float *) x0;
+    *cat_out = top;
+    return jm;
+}
+
 #include "ggml-cuda/pxa/pxa-deltanet-fuse.cuh"
 #include "ggml-cuda/pxa/pxa-ew-fuse.cuh"
 #include "ggml-cuda/pxa/pxa-sibling-fuse.cuh"
@@ -8008,6 +9034,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 #endif
 
     if (ggml_is_noop(dst)) {
+        return true;
+    }
+    // A reduce-OFF container (REDUCE, op_params[3] == 1) is a no-op. Return before the fusion
+    // matchers below: they key on (dst, next) and must never treat the container -- whose data is
+    // a view of ONE device's source, not the output of an op -- as a fusable producer. Harmless
+    // when the container sits alone in its split (next == nullptr), which is the only shape the
+    // scheduler produced before PXA_TSPLIT_CONTAINER_INLINE.
+    if (dst->op == GGML_OP_REDUCE && dst->op_params[3] == 1) {
         return true;
     }
 
@@ -8026,6 +9060,16 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     // preceding tick" rule is unchanged. Not reachable at the default window, where the fused pair
     // is always adjacent and the caller simply advances past it.
     if (pxa_dn_gm_absorbed_n && pxa_dn_gm_absorb_take(dst)) {
+        return true;
+    }
+    // PXA_DN_INPLACE: a deferred carry copy is made before any eager reader of it (never expected:
+    // the setup proved the fused conv at the SSM_CONV is the only one, and that site handles itself)
+    if (pxa_dn_carry_pending.active && dst->op != GGML_OP_SSM_CONV && pxa_dn_reads(dst, pxa_dn_carry_pending.M)) {
+        pxa_dn_carry_materialize(ctx);
+    }
+    // PXA_TSPLIT_EPI: an [ADD], FUSED_RMS_NORM or PXQN_RHT whose work the fused tensor-split reduce
+    // epilogue already did (reduce.cu). Also after the clock tick, for the same reason.
+    if (ggml_cuda_pxa_epi_take(ctx.device, dst)) {
         return true;
     }
 
@@ -8123,7 +9167,21 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             }
             break;
         case GGML_OP_ADD:
+            // PXQN attn_in site: residual ADD + FUSED_RMS_NORM + PXQN_RHT in one kernel (bit-identical
+            // to the ADD+RMS fusion below followed by the RHT kernel; the norm output is never read).
             if (fusion && i + 2 < cgraph->n_nodes &&
+                pxa_g2_addfuse() && pxa_g2_addfuse_rms() &&
+                ggml_cuda_pxqn_rms_rht_ok(dst, cgraph->nodes[i+1], cgraph->nodes[i+2]) &&
+                ops_are_same_device(cgraph, i, i+2) &&
+                pxa_g2_sole_consumer(cgraph, i+1, cgraph->nodes[i+1], cgraph->nodes[i+2]) &&
+                pxa_g2_addfuse_no_shifted_overlap(cgraph->nodes[i+2], dst->src[0]) &&
+                pxa_g2_addfuse_no_shifted_overlap(cgraph->nodes[i+2], dst->src[1]) &&
+                pxa_g2_addfuse_no_shifted_overlap(dst, dst->src[0]) &&
+                pxa_g2_addfuse_no_shifted_overlap(dst, dst->src[1])) {
+                ggml_cuda_pxqn_rms_rht(ctx, dst, cgraph->nodes[i+1], cgraph->nodes[i+2], pxa_pxqn_q8_wanted(cgraph, i+2));
+                i += 2;
+            }
+            else if (fusion && i + 2 < cgraph->n_nodes &&
                 cgraph->nodes[i+1]->op == GGML_OP_ADD &&
                 cgraph->nodes[i+2]->op == GGML_OP_FUSED_RMS_NORM &&
                 ggml_is_contiguous(dst->src[0]) &&
@@ -8428,7 +9486,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             }
             break;
         case GGML_OP_FUSED_RMS_NORM:
-            if (fusion && pxa_try_deltanet_outgate(ctx, cgraph, i)) {
+            if (fusion && next && ggml_cuda_pxqn_rms_rht_ok(nullptr, dst, next) &&
+                ops_are_same_device(cgraph, i, i+1) &&
+                pxa_g2_sole_consumer(cgraph, i, dst, next) &&
+                pxa_g2_addfuse_no_shifted_overlap(next, dst->src[0])) {
+                // PXQN attn_in site: FUSED_RMS_NORM + PXQN_RHT in one kernel (bit-identical)
+                ggml_cuda_pxqn_rms_rht(ctx, nullptr, dst, next, pxa_pxqn_q8_wanted(cgraph, i+1));
+                i += 1;
+            }
+            else if (fusion && pxa_try_deltanet_outgate(ctx, cgraph, i)) {
                 // PXA_FUSE_DELTANET bit1: DeltaNet out-gate rms+silu fusion
                 i += 1;
             }
@@ -8497,6 +9563,49 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FUSED_UP_GATE:
             ggml_cuda_up_gate_unary(ctx, dst);
             break;
+        case GGML_OP_PXQN_RHT: {
+            // out_in site: the RHT feeds exactly one PXQN MUL_MAT -> rotate inside its GEMV staging
+            bool fused = false;
+            if (fusion && next && next->op == GGML_OP_MUL_MAT && next->src[1] == dst &&
+                ggml_cuda_pxqn_type(next->src[0]->type) && ops_are_same_device(cgraph, i, i+1) &&
+                !(dst->flags & GGML_TENSOR_FLAG_OUTPUT) && pxa_g2_sole_consumer(cgraph, i, dst, next)) {
+                auto on_dev = [&](const ggml_tensor * t) {
+                    return t && t->buffer && ggml_backend_buffer_is_cuda(t->buffer)
+                        && ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == ctx.device;
+                };
+                if (on_dev(next->src[0]) && on_dev(dst->src[0]) && on_dev(next) &&
+                    ggml_cuda_pxqn_rht_mul_mat(ctx, dst, next) == 0) {
+                    fused = true;
+                    ++i;
+                }
+            }
+            if (!fused && fusion) {
+                // (PXA_PXQN_RB_RHT): the head-split form (n RHT + concat -> MUL_MAT): the RHTs write the
+                // concat's output (+ max sidecar) in place, the MUL_MAT runs next on the row-block GEMV
+                const float * xb = nullptr; int nr = 0; int64_t off[4], k0[4]; ggml_tensor * cat = nullptr;
+                const int jm = pxa_pxqn_rht_ranges_match(cgraph, i, &xb, nr, off, k0, &cat);
+                static const bool why = getenv("PXA_PXQN_RR_WHY") != nullptr;
+                static int nwhy = 0;
+                if (why && nwhy < 24) {
+                    ++nwhy;
+                    fprintf(stderr, "PXA_PXQN_RR_WHY: node %d %s src0 %s(%s) -> match %d n=%d; next:", i, dst->name,
+                            dst->src[0] ? ggml_op_name(dst->src[0]->op) : "-", dst->src[0] ? dst->src[0]->name : "-", jm, nr);
+                    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 10; ++j) fprintf(stderr, " %s", ggml_op_name(cgraph->nodes[j]->op));
+                    fprintf(stderr, "\n");
+                }
+                if (jm > i && ops_are_same_device(cgraph, i, jm)) {
+                    const uint64_t seed = (uint64_t)(uint32_t) dst->op_params[0] | ((uint64_t)(uint32_t) dst->op_params[1] << 32);
+                    if (ggml_cuda_pxqn_rht_ranges_place(ctx, xb, nr, off, k0, seed, dst->op_params[2], dst->op_params[3], cat,
+                                                        cgraph->nodes[jm]) == 0) {
+                        fused = true;
+                        i = jm - 1;   // the chain's RHT / CONCAT / view nodes are served; the MUL_MAT runs as the next node
+                    }
+                }
+            }
+            if (!fused) {
+                ggml_cuda_op_pxqn_rht(ctx, dst);
+            }
+        } break;
         case GGML_OP_SCALE:
             ggml_cuda_op_scale(ctx, dst);
             break;
@@ -8664,6 +9773,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_grouped_topk(ctx, dst);
             break;
         case GGML_OP_SSM_CONV:
+            // PXA_DN_CONVFUSE: conv + conv window + silu/q-k norm + beta-gate + recurrence (+ the
+            // PXA_DN_INPLACE carry): pxa-deltanet-fuse.cuh
+            if (fusion) {
+                const int pxa_cf = pxa_try_deltanet_convfuse(ctx, cgraph, i);
+                if (pxa_cf > 0) { i += pxa_cf; break; }
+            }
+            if (pxa_dn_carry_pending.active) pxa_dn_carry_materialize(ctx);
             ggml_cuda_op_ssm_conv(ctx, dst);
             break;
         case GGML_OP_TRI:
@@ -8687,6 +9803,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_EXPAND:
             ggml_cuda_op_dsv4_hc_expand(ctx, dst);
             break;
+        case GGML_OP_HC_COMBINE_NORM:
+            ggml_cuda_op_hc_combine_norm(ctx, dst);
+            break;
+        case GGML_OP_HC_GATE_MIX:
+            ggml_cuda_op_hc_gate_mix(ctx, dst);
+            break;
         case GGML_OP_MASK_TO_IDX:
             ggml_cuda_op_mask_to_idx(ctx, dst);
             break;
@@ -8695,6 +9817,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_KPOOL_SCORE:
             ggml_cuda_op_kpool_score(ctx, dst);
+            break;
+        case GGML_OP_MOE_SPLIT_IDS:
+            ggml_cuda_op_moe_split_ids(ctx, dst);
+            break;
+        case GGML_OP_MOE_MERGE:
+            ggml_cuda_op_moe_merge(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
@@ -8927,6 +10055,10 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 // and the per-node property compare cannot see a re-reserve: it compares the freshly built graph
 // against the stored properties, and a re-reserve that lands at the same base leaves both equal.
 static std::atomic<uint64_t> pxa_cuda_alloc_gen{0};
+
+extern "C" uint64_t ggml_cuda_alloc_generation_get(void) {
+    return pxa_cuda_alloc_gen.load(std::memory_order_acquire);
+}
 
 extern "C" void ggml_cuda_alloc_generation_bump(void) {
     pxa_cuda_alloc_gen.fetch_add(1, std::memory_order_release);
@@ -9235,6 +10367,15 @@ static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & 
     return g;
 }
 
+// mirror of pxa_sched_container_inline() in ggml-backend.cpp -- keep the two in lockstep
+static bool pxa_cuda_container_inline(void) {
+    static const bool v = [] {
+        const char * e = getenv("PXA_TSPLIT_CONTAINER_INLINE");   // default OFF (see ggml-backend.cpp)
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cuda_context * cuda_ctx,
     ggml_cuda_graph * graph, ggml_cgraph * cgraph, bool use_cuda_graph, cudaStream_t stream) {
 
@@ -9251,6 +10392,10 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
         ggml_tensor * node = cgraph->nodes[i];
 
         if (ggml_is_noop(node)) continue;
+
+        // PXA_TSPLIT_CONTAINER_INLINE: a reduce-OFF container is a no-op (ggml_cuda_op_reduce
+        // returns before touching a stream), so it does not stop a segment from being captured.
+        if (node->op == GGML_OP_REDUCE && node->op_params[3] == 1 && pxa_cuda_container_inline()) continue;
 
         if (node->op == GGML_OP_REDUCE) {
             // PXA_REDUCE_CAPTURE: allow capturing the cross-device ring/direct reduce once
@@ -9348,6 +10493,10 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
                     auto next = cgraph->nodes[i+1];
                     if (next->op == GGML_OP_MUL_MAT_ID && ggml_is_quantized(next->src[0]->type)) {
                         ++i;
+                    } else if (next->op == GGML_OP_PAD && next->src[0] == node && i < cgraph->n_nodes-2 &&
+                               cgraph->nodes[i+2]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i+2]->src[1] == next &&
+                               ggml_cuda_pxqn_type(cgraph->nodes[i+2]->src[0]->type)) {
+                        i += 2;                                      // the K-straddle pad + down
                     }
                 }
             }
@@ -9672,6 +10821,9 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     // PXA_NODE_PROF per-graph wall summary
     int64_t _pxa_gt0 = 0;
     if (g_pxa_prof_on > 0) { cudaStreamSynchronize(cuda_ctx->stream()); _pxa_gt0 = ggml_time_us(); }
+    // PXA_STREAM_WEIGHTS: plan this graph's streamed-weight copies (eager evaluation only)
+    const bool pxa_stream_on = !use_cuda_graph && g_pxa_stream_any.load(std::memory_order_relaxed);
+    if (pxa_stream_on) pxa_stream_begin(*cuda_ctx, cgraph);
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -9690,6 +10842,8 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                     if (g_pxa_sub_dev) cudaStreamSynchronize(cuda_ctx->stream());
                     _pxs0 = ggml_time_us();
                 }
+                if (pxa_stream_on) pxa_stream_walk(*cuda_ctx, i);
+                else
                 pxa_dqc_walk(*cuda_ctx, cgraph, i, use_cuda_graph);
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
                 if (g_pxa_sub_on > 0) {
@@ -9793,6 +10947,7 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
     }
+    if (pxa_stream_on) pxa_stream_end(*cuda_ctx);
     if (g_pxa_prof_on > 0 && _pxa_gt0 && cgraph->n_nodes >= 64) {
         cudaStreamSynchronize(cuda_ctx->stream());
         fprintf(stderr, "PXA_GRAPH dev=%d nodes=%d us=%lld\n", cuda_ctx->device, cgraph->n_nodes, (long long)(ggml_time_us() - _pxa_gt0));
@@ -10052,11 +11207,303 @@ extern "C" void ggml_cuda_timeline_epoch(void) {
     if (pxa_tl_epoch >= pxa_tl_epochs()) pxa_tl_flush();
 }
 
+// =============================================================================================
+
+// PXA_TSPLIT_GRAPH (2026-09-27) -- WHOLE-TOKEN CUDA-graph replay of a tensor-split
+// decode, one graph per device. The scheduler (ggml-backend.cpp, PXA_TSPLIT_GRAPH block) decides
+// when; this is the device half: per-device graph objects, the capture bracket around every split
+// of the token, and the per-token launch.
+//
+// Why whole-token and not the per-segment replay of PXA_TSPLIT_REPLAY (measured wash): a segment
+// graph still needs one host round per split (~190 graph launches plus property compares per
+// device per token) and could never cross a reduce. With the fused reduce's slot and token moved
+// into device memory (reduce.cu, pxa_tsplit_graph_enabled) a reduce half is an ordinary event-free
+// kernel on its own device's stream, so each device's whole token -- every compute segment and
+// every reduce half -- is one capture on one stream, and the two graphs never touch through the
+// API: they meet only in device memory, exactly as the eager kernels do.
+//
+// What changes per token and how it reaches a replay: the KV-cache write destinations go through
+// the existing cpy-indirection table (uploaded before every launch); every other per-token value
+// (positions, mask, token ids) is a graph INPUT copied into a fixed buffer before the launch. Any
+// change in a node's op, shape, strides, op_params or addresses is caught by the scheduler's
+// token-level property compare and sends that token back to eager.
+// =============================================================================================
+// A token is cut into CHUNKS at the splits that carry host inputs (token embeddings and state maps
+// at the top, positions and the mask at the first attention layer): the scheduler copies a chunk's
+// inputs right before launching it, exactly where the eager loop copies them, because the allocator
+// may reuse an input's buffer for earlier intermediates. Each chunk is one graph per device.
+struct pxa_tsg_chunk {
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_graph                 g[GGML_CUDA_MAX_DEVICES];
+#endif
+    std::vector<char *>             ptrs[GGML_CUDA_MAX_DEVICES];
+    pxa_tsg_chunk() {
+#ifdef USE_CUDA_GRAPH
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) { g[d].dest_ptrs_d = nullptr; g[d].dest_ptrs_size = 0; }
+#endif
+    }
+    ~pxa_tsg_chunk() {
+#ifdef USE_CUDA_GRAPH
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            if (g[d].dest_ptrs_d) { ggml_cuda_set_device(d); (void) cudaFree(g[d].dest_ptrs_d); g[d].dest_ptrs_d = nullptr; }
+        }
+#endif
+    }
+};
+
+struct pxa_tsg {
+    std::vector<std::unique_ptr<pxa_tsg_chunk>> ch;
+    ggml_backend_cuda_context *     ctx[GGML_CUDA_MAX_DEVICES] = {};
+    uint64_t                        pool_gen[GGML_CUDA_MAX_DEVICES] = {};
+    bool                            used[GGML_CUDA_MAX_DEVICES] = {};
+    bool                            captured = false;
+    bool                            bad = false;
+    long                            n_capture = 0, n_replay = 0;
+};
+
+static thread_local pxa_tsg * pxa_tsg_capturing = nullptr;
+static thread_local int       pxa_tsg_capturing_chunk = 0;
+
+extern "C" bool pxa_tsplit_graph_enabled(void);
+extern "C" bool pxa_tsplit_reduce_graph_safe(const struct ggml_tensor * dst);
+
+extern "C" void * ggml_cuda_tsg_new(void) {
+    return new pxa_tsg();
+}
+
+extern "C" void ggml_cuda_tsg_free(void * hv) {
+    delete (pxa_tsg *) hv;
+}
+
+// Host-side capturability of one node inside a token graph. Conservative: anything that may reach a
+// host-synchronising path (MoE grouping, weight streaming) or an uncapturable reduce says no.
+extern "C" bool ggml_cuda_tsg_node_ok(const struct ggml_tensor * node) {
+#ifdef USE_CUDA_GRAPH
+    if (ggml_is_noop(node)) return true;
+    if (node->op == GGML_OP_REDUCE) {
+        if (node->op_params[3] == 1 && pxa_cuda_container_inline()) return true;
+        // decode-sized reduces only: a prefill ubatch never replays and its kernels may sync
+        return node->ne[1] <= 8 && pxa_tsplit_reduce_graph_safe(node);
+    }
+    if (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE) return false;
+    if (node->op == GGML_OP_FAKE_CPY) return false;
+    if (node->op == GGML_OP_CPY) {
+        return ggml_cuda_cpy_fn(node->src[0], node->src[1]) != nullptr;
+    }
+    return true;
+#else
+    GGML_UNUSED(node);
+    return false;
+#endif
+}
+
+// Start a token of `nchunk` chunks: forget last token's indirection tables.
+extern "C" void ggml_cuda_tsg_begin_token(void * hv, int nchunk) {
+    auto * h = (pxa_tsg *) hv;
+    h->bad = false;
+    if ((int) h->ch.size() != nchunk) {
+        h->ch.clear();
+        for (int c = 0; c < nchunk; ++c) h->ch.emplace_back(new pxa_tsg_chunk());
+        h->captured = false;
+    }
+    for (auto & c : h->ch) for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) c->ptrs[d].clear();
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) h->used[d] = false;
+}
+
+// One split of the token, in scheduler order: note its device and append its KV-write destinations
+// in exactly the order the cpy kernels consume indirection slots (the same walk
+// check_node_graph_compatibility_and_refresh_copy_ops does).
+extern "C" void ggml_cuda_tsg_add_split(void * hv, int chunk, ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    auto * h = (pxa_tsg *) hv;
+    auto * c = (ggml_backend_cuda_context *) backend->context;
+    const int d = c->device;
+    if (d < 0 || d >= GGML_CUDA_MAX_DEVICES || chunk < 0 || chunk >= (int) h->ch.size()) { h->bad = true; return; }
+    if (h->used[d] && h->ctx[d] != c) { h->bad = true; return; }   // two contexts on one device
+    h->used[d] = true;
+    h->ctx[d]  = c;
+    if (pxa_stream_graph_uses(cgraph)) { h->bad = true; return; }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_noop(node)) continue;
+        if (node->op == GGML_OP_CPY) h->ch[chunk]->ptrs[d].push_back((char *) node->src[1]->data);
+    }
+}
+
+extern "C" bool ggml_cuda_tsg_is_bad(void * hv) { return ((pxa_tsg *) hv)->bad; }
+extern "C" bool ggml_cuda_tsg_captured(void * hv) { return ((pxa_tsg *) hv)->captured; }
+
+// True if any device's pool freed memory since the last call (a captured exec may hold pointers
+// into what was returned); refreshes the stored generations.
+extern "C" bool ggml_cuda_tsg_pool_moved(void * hv) {
+    auto * h = (pxa_tsg *) hv;
+    bool moved = false;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        if (!h->used[d]) continue;
+        const uint64_t gen = h->ctx[d]->pool().generation();
+        if (gen != h->pool_gen[d]) moved = true;
+        h->pool_gen[d] = gen;
+    }
+    return moved;
+}
+
+// Upload one chunk's KV-write destinations to every device (before its capture or its launch).
+extern "C" void ggml_cuda_tsg_upload(void * hv, int chunk) {
+#ifdef USE_CUDA_GRAPH
+    auto * h = (pxa_tsg *) hv;
+    auto & c = *h->ch[chunk];
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        if (!h->used[d]) continue;
+        ggml_cuda_set_device(d);
+        if (!c.ptrs[d].empty()) {
+            ggml_cuda_cpy_dest_ptrs_copy(&c.g[d], c.ptrs[d].data(), (int) c.ptrs[d].size(), h->ctx[d]->stream());
+        }
+        c.g[d].graph_cpynode_index = 0;
+        c.g[d].use_cpy_indirection = true;
+    }
+#else
+    GGML_UNUSED(hv); GGML_UNUSED(chunk);
+#endif
+}
+
+extern "C" void ggml_cuda_tsg_drop(void * hv) {
+#ifdef USE_CUDA_GRAPH
+    auto * h = (pxa_tsg *) hv;
+    for (auto & c : h->ch) {
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            if (c->g[d].instance) { (void) cudaGraphExecDestroy(c->g[d].instance); c->g[d].instance = nullptr; }
+            if (c->g[d].graph)    { (void) cudaGraphDestroy(c->g[d].graph);        c->g[d].graph    = nullptr; }
+        }
+    }
+    (void) cudaGetLastError();
+    h->captured = false;
+#else
+    GGML_UNUSED(hv);
+#endif
+}
+
+extern "C" bool ggml_cuda_tsg_begin_capture(void * hv, int chunk) {
+#ifdef USE_CUDA_GRAPH
+    auto * h = (pxa_tsg *) hv;
+    int begun[GGML_CUDA_MAX_DEVICES]; int nb = 0;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        if (!h->used[d]) continue;
+        ggml_cuda_set_device(d);
+        if (cudaStreamBeginCapture(h->ctx[d]->stream(), cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+            (void) cudaGetLastError();
+            for (int k = 0; k < nb; ++k) {
+                cudaGraph_t tmp = nullptr;
+                ggml_cuda_set_device(begun[k]);
+                (void) cudaStreamEndCapture(h->ctx[begun[k]]->stream(), &tmp);
+                if (tmp) (void) cudaGraphDestroy(tmp);
+            }
+            (void) cudaGetLastError();
+            return false;
+        }
+        begun[nb++] = d;
+    }
+    // the chunk's cpy kernels index this chunk's table from 0
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        if (h->used[d]) { h->ch[chunk]->g[d].graph_cpynode_index = 0; h->ch[chunk]->g[d].use_cpy_indirection = true; }
+    }
+    pxa_tsg_capturing = h;
+    pxa_tsg_capturing_chunk = chunk;
+    return true;
+#else
+    GGML_UNUSED(hv); GGML_UNUSED(chunk);
+    return false;
+#endif
+}
+
+// Close every device's capture of one chunk. On success instantiate (or update in place) and return
+// true. On any failure nothing was executed, every partial graph is dropped, and the caller runs the
+// token eagerly.
+extern "C" bool ggml_cuda_tsg_end_capture(void * hv, int chunk) {
+#ifdef USE_CUDA_GRAPH
+    auto * h = (pxa_tsg *) hv;
+    auto & c = *h->ch[chunk];
+    pxa_tsg_capturing = nullptr;
+    bool ok = true;
+    cudaGraph_t fresh[GGML_CUDA_MAX_DEVICES] = {};
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        if (!h->used[d]) continue;
+        ggml_cuda_set_device(d);
+        const cudaError_t e = cudaStreamEndCapture(h->ctx[d]->stream(), &fresh[d]);
+        if (e != cudaSuccess || fresh[d] == nullptr) {
+            fprintf(stderr, "PXA_TSPLIT_GRAPH: capture of chunk %d on device %d failed (%s) -- token runs eager\n",
+                    chunk, d, cudaGetErrorString(e));
+            ok = false;
+        }
+    }
+    (void) cudaGetLastError();
+    if (ok) {
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES && ok; ++d) {
+            if (!h->used[d]) continue;
+            if ((int) c.ptrs[d].size() != c.g[d].graph_cpynode_index) {
+                fprintf(stderr, "PXA_TSPLIT_GRAPH: chunk %d device %d listed %zu KV-write slots but the kernels "
+                                "consumed %d -- refusing the capture\n", chunk, d, c.ptrs[d].size(), c.g[d].graph_cpynode_index);
+                ok = false;
+            }
+        }
+    }
+    if (!ok) {
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) if (fresh[d]) (void) cudaGraphDestroy(fresh[d]);
+        ggml_cuda_tsg_drop(h);
+        return false;
+    }
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        if (!h->used[d]) continue;
+        ggml_cuda_set_device(d);
+        if (c.g[d].graph) (void) cudaGraphDestroy(c.g[d].graph);
+        c.g[d].graph = fresh[d];
+        if (c.g[d].instance) { (void) cudaGraphExecDestroy(c.g[d].instance); c.g[d].instance = nullptr; }
+        CUDA_CHECK(cudaGraphInstantiate(&c.g[d].instance, c.g[d].graph, NULL, NULL, 0));
+    }
+    if (chunk == (int) h->ch.size() - 1) {
+        h->captured = true;
+        h->n_capture++;
+    }
+    return true;
+#else
+    GGML_UNUSED(hv); GGML_UNUSED(chunk);
+    return false;
+#endif
+}
+
+extern "C" void ggml_cuda_tsg_launch(void * hv, int chunk, bool is_replay) {
+#ifdef USE_CUDA_GRAPH
+    auto * h = (pxa_tsg *) hv;
+    auto & c = *h->ch[chunk];
+    // highest device first: on a tensor split the last device also carries the output head, so it
+    // is the critical path and should not wait for a peer's launch
+    for (int d = GGML_CUDA_MAX_DEVICES - 1; d >= 0; --d) {
+        if (!h->used[d]) continue;
+        ggml_cuda_set_device(d);
+        CUDA_CHECK(cudaGraphLaunch(c.g[d].instance, h->ctx[d]->stream()));
+    }
+    if (chunk == (int) h->ch.size() - 1) {
+        if (is_replay) h->n_replay++;
+        if (pxa_cuda_graph_log_enabled() && is_replay && (h->n_replay == 1 || h->n_replay % 500 == 0)) {
+            fprintf(stderr, "PXA_TSPLIT_GRAPH: captures=%ld replays=%ld\n", h->n_capture, h->n_replay);
+        }
+    }
+#else
+    GGML_UNUSED(hv); GGML_UNUSED(chunk); GGML_UNUSED(is_replay);
+#endif
+}
+
+// read once: this sat on the per-split path (about 380 getenv calls per decode token)
+static bool pxa_cuda_graphs_pascal_env() {
+    static const bool v = getenv("PXA_CUDA_GRAPHS_PASCAL") != nullptr;
+    return v;
+}
+
 GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    pxa_devcache_scope pxa_devcache;   // PXA_CUDA_DEVCACHE: device queries answered from the per-thread copy
     // PXA_FUSE_DELTANET bit2: nothing may be carried across graph-compute calls. An entry is only
     // ever registered for a node ahead of the current one in THIS pass, so an aborted pass is the
     // only way one could survive; clear here so it cannot.
     pxa_dn_gm_absorb_reset();
+    pxa_dn_carry_reset();
     // PXA_SCHED_TIMELINE: bracket this split's enqueue on the split device's own stream
     ggml_backend_cuda_context * pxa_tl_ctx = (ggml_backend_cuda_context *)backend->context;
     bool pxa_tl_rec_on = pxa_tl_path() && !pxa_tl_done && pxa_tl_epoch >= 0;
@@ -10083,6 +11530,21 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // PXA_TSPLIT_GRAPH: inside the scheduler's whole-token capture bracket every split is recorded
+    // eagerly into its device's capturing stream, with that device's token graph as the
+    // cpy-indirection table. No per-split graph logic, no timeline events.
+#ifdef USE_CUDA_GRAPH
+    if (pxa_tsg_capturing != nullptr) {
+        pxa_tsg * h = pxa_tsg_capturing;
+        GGML_ASSERT(h->used[cuda_ctx->device] && h->ctx[cuda_ctx->device] == cuda_ctx);
+        cuda_ctx->cur_graph = &h->ch[pxa_tsg_capturing_chunk]->g[cuda_ctx->device];
+        bool done = false, use_graph = false, upd = false;
+        evaluate_and_capture_cuda_graph(cuda_ctx, cgraph, done, use_graph, upd);
+        cuda_ctx->cur_graph = nullptr;
+        return GGML_STATUS_SUCCESS;
+    }
+#endif
 
     // PXA_MTP_REDUCE_CTX_FIX: ggml_cuda_op_reduce synchronizes its cross-device peer copies using
     // the GLOBAL ggml_cuda_info().all_ctx[i] streams/events. all_ctx[i] is set ONLY by the FIRST
@@ -10116,6 +11578,8 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     // or previous graph capture failure.
     // Also disable for multi-gpu for now. TO DO investigate
     bool use_cuda_graph = !disable_cuda_graphs_due_to_env && cuda_ctx->use_cuda_graph;
+    // PXA_STREAM_WEIGHTS: the per-graph ring copies are host-driven; never capture them
+    if (use_cuda_graph && pxa_stream_graph_uses(cgraph)) use_cuda_graph = false;
 
     ggml_cuda_graph * graph = nullptr;
     if (use_cuda_graph) {
@@ -10150,7 +11614,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
         // armed AND the dispatcher inside a per-device split segment.
         const int pxa_graph_min_cc = (pxa_tsplit_replay || pxa_cuda_graph_prefill_enabled()) ? CC_PASCAL
                                    : (pxa_cuda_graph_decode_enabled() ? CC_VOLTA : CC_AMPERE);
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < pxa_graph_min_cc && !getenv("PXA_CUDA_GRAPHS_PASCAL")) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < pxa_graph_min_cc && !pxa_cuda_graphs_pascal_env()) {
             if (!graph->disable_due_to_gpu_arch) {
                 pxa_cgraph_stats().disables_arch++;
                 if (pxa_glog) fprintf(stderr, "PXA_CGRAPH DISABLE gpu-arch dev=%d key=%p\n", cuda_ctx->device, pxa_gkey);
@@ -10473,10 +11937,22 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_PXQ6:     // ADD
                     case GGML_TYPE_IQ4_XS:
                         return true;
+                    // PXQN rev 1: dense MUL_MAT / FUSED_UP_GATE and, since , the routed experts
+                    // (MUL_MAT_ID / MOE_FUSED_UP_GATE: the PXQN id-GEMV, else the generic per-expert path)
+                    case GGML_TYPE_PXQN3:
+                    case GGML_TYPE_PXQN3S8:
+                    case GGML_TYPE_PXQN4:
+                    case GGML_TYPE_PXQN2:     // the PXQN ladder (spec section 8)
+                    case GGML_TYPE_PXQN1:
+                    case GGML_TYPE_PXQN4S8:
+                    case GGML_TYPE_PXQN5:
+                        return true;
                     default:
                         return false;
                 }
             } break;
+        case GGML_OP_PXQN_RHT:
+            return ggml_cuda_pxqn_rht_supported(op);
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -10699,6 +12175,13 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                    op->src[3]->ne[0] == op->src[0]->ne[2];
         case GGML_OP_DELTA_NET:
             return true;
+        case GGML_OP_HC_COMBINE_NORM:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                   (!op->src[3] || op->src[3]->type == GGML_TYPE_F32);
+        case GGML_OP_HC_GATE_MIX:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
@@ -10707,6 +12190,16 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_SPLIT_IDS:
+            // I32 ids (any strides) through a contiguous I32 map into a contiguous I32 result
+            return op->type == GGML_TYPE_I32 && ggml_is_contiguous(op) &&
+                   op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op->src[1]);
+        case GGML_OP_MOE_MERGE:
+            // F32 rows (nb0 == 4) with I32 ids of any strides; one block per (slot, token)
+            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) &&
+                   op->src[2]->type == GGML_TYPE_I32 && op->src[3]->type == GGML_TYPE_I32;
         case GGML_OP_QSA_TOPK:
             // the gate and the implementation must agree: one block per row, F32 in, I32 out,
             // contiguous rows, and the k survivors are sorted in shared memory so k is capped
@@ -11040,11 +12533,23 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
     }
 
 #ifdef GGML_USE_NCCL
-    if (!enable_p2p) {
+    if (!enable_p2p && !pxa_p2p_off()) {
         printf("================== P2P disabled, but needed for NCCL\n");
         enable_p2p = true;
     }
 #endif
+    // PXA_P2P=0 (2026-09-27, bug #280): never enable CUDA peer access. Cross-card copies are then
+    // staged through host memory by the driver, the PXA fused/p2p tensor-split reduces decline
+    // (no probed peer group) and take the staged route, and NCCL runs with NCCL_P2P_DISABLE=1.
+    // Slower, never wrong on a link whose peer-to-peer path is not trustworthy (risers, IOMMU).
+    if (pxa_p2p_off()) {
+        enable_p2p = false;
+        static bool said = false;
+        if (!said) {
+            said = true;
+            GGML_CUDA_LOG_INFO("PXA_P2P=0: CUDA peer access stays off; cross-card copies are host-staged\n");
+        }
+    }
 
 #if !defined(GGML_CUDA_NO_PEER_COPY)
     if (enable_p2p) {
@@ -11057,6 +12562,103 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
 
 GGML_CALL bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+// Bug #266 (pool headroom). The compute-buffer reservation (gallocr) never sees the temporaries
+// the dense GEMM route draws from the per-device pool at run time: on the dequant->cuBLAS route
+// (every PXQ weight beyond the 2D kernels' ny window, any quantized type MMQ declines) that is the
+// f16 copy of the whole weight + the f16 copy of src1 (+ an f16 dst below Volta), and the dense
+// PXQ up/gate pair holds its f32 `up` result in the pool while `gate` runs. On a card filled to the
+// brim the VMM pool then fails to grow in cuMemCreate and the process aborts mid-prefill.
+// These entry points let the context size that worst case and pre-grow the pool once, so the
+// failure (if any) is a clean load-time error.
+GGML_CALL bool ggml_backend_cuda_buffer_is_stream(ggml_backend_buffer_t buffer) {
+    return pxa_stream_buffer_is(buffer);
+}
+
+// PXA_CKPT_RESTORE_BATCH (2026-09-28). The rejection restore of a speculative round copies
+// one ssm-state and one conv-state row back from its per-step snapshot for every recurrent layer: 96
+// same-device copies per card on the 27B, each its own cudaMemcpyAsync. On the P100 pair they measured
+// 0.44 ms of device time spread over a 2.0 ms span (the host enqueue is the critical path). One launch
+// per 64 segments moves the same bytes; a copy is a copy, so the state is bit-identical.
+#define PXA_CB_MAX 64
+struct pxa_cb_seg { char * d; const char * s; unsigned long long n; };
+struct pxa_cb_tab { pxa_cb_seg seg[PXA_CB_MAX]; };
+static __global__ void k_pxa_copy_batch(const pxa_cb_tab t) {
+    const pxa_cb_seg g = t.seg[blockIdx.y];
+    const unsigned long long stride = (unsigned long long) gridDim.x * blockDim.x;
+    const unsigned long long i0 = (unsigned long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if ((((uintptr_t) g.d | (uintptr_t) g.s) & 15) == 0) {
+        const unsigned long long n16 = g.n >> 4;
+        int4 * d = (int4 *) g.d; const int4 * s = (const int4 *) g.s;
+        for (unsigned long long i = i0; i < n16; i += stride) d[i] = s[i];
+        for (unsigned long long i = (n16 << 4) + i0; i < g.n; i += stride) g.d[i] = g.s[i];
+    } else if ((((uintptr_t) g.d | (uintptr_t) g.s) & 3) == 0) {
+        const unsigned long long n4 = g.n >> 2;
+        float * d = (float *) g.d; const float * s = (const float *) g.s;
+        for (unsigned long long i = i0; i < n4; i += stride) d[i] = s[i];
+        for (unsigned long long i = (n4 << 2) + i0; i < g.n; i += stride) g.d[i] = g.s[i];
+    } else {
+        for (unsigned long long i = i0; i < g.n; i += stride) g.d[i] = g.s[i];
+    }
+}
+
+extern "C" GGML_API GGML_CALL bool ggml_backend_cuda_copy_batch_async(ggml_backend_t backend, int n, void * const * dst,
+                                                  const void * const * src, const size_t * bytes);
+GGML_CALL bool ggml_backend_cuda_copy_batch_async(ggml_backend_t backend, int n, void * const * dst,
+                                                  const void * const * src, const size_t * bytes) {
+    if (!ggml_backend_is_cuda(backend) || n < 0) return false;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    for (int b = 0; b < n; b += PXA_CB_MAX) {
+        pxa_cb_tab t;
+        const int m = n - b < PXA_CB_MAX ? n - b : PXA_CB_MAX;
+        size_t mx = 0;
+        for (int k = 0; k < m; ++k) {
+            t.seg[k] = { (char *) dst[b + k], (const char *) src[b + k], (unsigned long long) bytes[b + k] };
+            mx = bytes[b + k] > mx ? bytes[b + k] : mx;
+        }
+        if (mx == 0) continue;
+        const int block = 256;
+        // enough blocks per segment for ~4 int4 per thread on the largest one, at most 128
+        size_t gx = (mx + (size_t) block*16*4 - 1) / ((size_t) block*16*4);
+        gx = gx < 1 ? 1 : (gx > 128 ? 128 : gx);
+        k_pxa_copy_batch<<<dim3((unsigned) gx, (unsigned) m, 1), block, 0, ctx->stream()>>>(t);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
+}
+
+GGML_CALL int ggml_backend_cuda_backend_device(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) return -1;
+    return ((ggml_backend_cuda_context *)backend->context)->device;
+}
+
+GGML_CALL size_t ggml_backend_cuda_mul_mat_pool_need(int device, const struct ggml_tensor * w, int64_t n_tokens, bool holds_f32_out) {
+    if (!w || device < 0 || device >= ggml_backend_cuda_get_device_count() || n_tokens <= 0) return 0;
+    if (w->ne[1] < 2 || w->ne[2] != 1 || w->ne[3] != 1) return 0;     // dense 2D weights only
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const size_t K = (size_t) w->ne[0], N = (size_t) w->ne[1], T = (size_t) n_tokens;
+    size_t need = 0;
+    const bool pxq = pxa_is_pxq_type(w->type);
+    if (!pxq && ggml_is_quantized(w->type) && ggml_cuda_should_use_mmq(w->type, cc, n_tokens)) {
+        need = T*K/32*36 + (size_t(1) << 20);                          // q8_1 copy of src1
+    } else if (w->type == GGML_TYPE_F32) {
+        need = 0;
+    } else {
+        need = (w->type == GGML_TYPE_F16 ? 0 : 2*K*N) + 2*T*K + (cc == CC_VOLTA ? 0 : 2*T*N);
+    }
+    if (holds_f32_out) need += 4*T*N;
+    return need;
+}
+
+GGML_CALL bool ggml_backend_cuda_pool_reserve(ggml_backend_t backend, size_t bytes, size_t * pool_bytes) {
+    if (!ggml_backend_is_cuda(backend)) return true;
+    auto * ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_set_device(ctx->device);
+    const bool ok = ctx->pool().reserve(bytes);
+    if (pool_bytes) *pool_bytes = ctx->pool().reserved();
+    return ok;
 }
 
 GGML_CALL int ggml_backend_cuda_get_device_count() {
@@ -11080,6 +12682,13 @@ GGML_CALL int ggml_backend_cuda_get_device_cc(int device) {
         return -1;
     }
     return ggml_cuda_info().devices[device].cc;
+}
+
+GGML_CALL int ggml_backend_cuda_get_device_pcie_width(int device) {
+    if (device < 0 || device >= ggml_cuda_info().device_count) {
+        return 0;
+    }
+    return device < GGML_CUDA_MAX_DEVICES ? g_pxa_pcie_width[device] : 0;
 }
 
 GGML_CALL const char * ggml_backend_cuda_get_device_pxa_path(int device) {
@@ -11317,6 +12926,335 @@ GGML_CALL bool ggml_backend_cuda_all_pairs_can_peer(void) {
     return all_peer;
 }
 
+// =============================================================================================
+// PXA HOT SWAP -- residency groups on CUDA (core: ggml/src/pxa-residency.h)
+// Physical memory: cuMemCreate/cuMemMap under an address range reserved per allocation, access
+// granted to the owning device and to every device that can reach it peer-to-peer (what a
+// cudaMalloc'd buffer offers once peer access is on). Copies: cudaMemcpyAsync from pinned host
+// memory on one non-blocking stream per device, each device driven by its own host thread.
+// =============================================================================================
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_CUDA_NO_VMM) && !defined(GGML_USE_MUSA)
+struct pxa_res_cuda_ops : public pxa_res::dev_ops {
+    std::mutex   mu;
+    cudaStream_t streams[GGML_CUDA_MAX_DEVICES] = {};
+    int          peer[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};   // -1 unknown, 0 no, 1 yes
+    bool         peer_known = false;
+
+    static std::string cu_err(const char * what, CUresult r) {
+        const char * es = nullptr;
+        cuGetErrorString(r, &es);
+        return std::string(what) + ": " + (es ? es : "?");
+    }
+
+    void learn_peers() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (peer_known) return;
+        const int n = ggml_backend_cuda_get_device_count();
+        for (int a = 0; a < n; ++a) {
+            for (int b = 0; b < n; ++b) {
+                int can = 0;
+                if (a != b && cudaDeviceCanAccessPeer(&can, a, b) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    can = 0;
+                }
+                // PXA_P2P=0 / a pair that failed the P2P self-test never gets a peer mapping
+                if (can && (pxa_p2p_off() || !pxa_p2p_pair_trusted(a, b))) can = 0;
+                peer[a][b] = can ? 1 : 0;
+            }
+        }
+        // PXA_SWAP_PEER_ACCESS=0 keeps every mapping private to its own device
+        const char * e = getenv("PXA_SWAP_PEER_ACCESS");
+        if (e && atoi(e) == 0) {
+            for (int a = 0; a < n; ++a) for (int b = 0; b < n; ++b) peer[a][b] = 0;
+        }
+        peer_known = true;
+    }
+
+    cudaStream_t stream(int dev) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!streams[dev]) {
+            ggml_cuda_set_device(dev);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[dev], cudaStreamNonBlocking));
+        }
+        return streams[dev];
+    }
+
+    size_t granularity(int dev) override {
+        return ggml_cuda_info().devices[dev].vmm_granularity;
+    }
+
+    bool va_reserve(int dev, size_t size, uint64_t * va, std::string & err) override {
+        ggml_cuda_set_device(dev);
+        CUdeviceptr p = 0;
+        const CUresult r = cuMemAddressReserve(&p, size, 0, 0, 0);
+        if (r != CUDA_SUCCESS) {
+            err = cu_err("cuMemAddressReserve", r);
+            return false;
+        }
+        *va = (uint64_t) p;
+        return true;
+    }
+
+    void va_free(int dev, uint64_t va, size_t size) override {
+        GGML_UNUSED(dev);
+        cuMemAddressFree((CUdeviceptr) va, size);
+    }
+
+    bool phys_map(int dev, uint64_t va, size_t size, std::string & err) override {
+        learn_peers();
+        ggml_cuda_set_device(dev);
+        CUmemAllocationProp prop = {};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = dev;
+        CUmemGenericAllocationHandle h;
+        CUresult r = cuMemCreate(&h, size, &prop, 0);
+        if (r != CUDA_SUCCESS) {
+            err = cu_err("cuMemCreate", r) + " (" + std::to_string(size >> 20) + " MiB)";
+            return false;
+        }
+        r = cuMemMap((CUdeviceptr) va, size, 0, h, 0);
+        cuMemRelease(h);   // the mapping keeps the memory alive
+        if (r != CUDA_SUCCESS) {
+            err = cu_err("cuMemMap", r);
+            return false;
+        }
+        CUmemAccessDesc acc[GGML_CUDA_MAX_DEVICES] = {};
+        int nacc = 0;
+        const int n = ggml_backend_cuda_get_device_count();
+        for (int d = 0; d < n && nacc < GGML_CUDA_MAX_DEVICES; ++d) {
+            if (d != dev && peer[d][dev] != 1) continue;
+            acc[nacc].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            acc[nacc].location.id   = d;
+            acc[nacc].flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            ++nacc;
+        }
+        r = cuMemSetAccess((CUdeviceptr) va, size, acc, nacc);
+        if (r != CUDA_SUCCESS && nacc > 1) {
+            // a peer refused: fall back to the owning device alone
+            CUmemAccessDesc own = {};
+            own.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            own.location.id   = dev;
+            own.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            r = cuMemSetAccess((CUdeviceptr) va, size, &own, 1);
+        }
+        if (r != CUDA_SUCCESS) {
+            cuMemUnmap((CUdeviceptr) va, size);
+            err = cu_err("cuMemSetAccess", r);
+            return false;
+        }
+        return true;
+    }
+
+    void phys_unmap(int dev, uint64_t va, size_t size) override {
+        ggml_cuda_set_device(dev);
+        const CUresult r = cuMemUnmap((CUdeviceptr) va, size);
+        if (r != CUDA_SUCCESS) {
+            GGML_CUDA_LOG_WARN("pxa hot swap: %s on device %d\n", cu_err("cuMemUnmap", r).c_str(), dev);
+        }
+    }
+
+    void * host_alloc(size_t size) override {
+        void * p = nullptr;
+        if (cudaHostAlloc(&p, size, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        return p;
+    }
+
+    void host_free(void * p, size_t size) override {
+        GGML_UNUSED(size);
+        if (p) cudaFreeHost(p);
+    }
+
+    bool copy(int dev, const std::vector<pxa_res::copy_op> & ops, bool to_host, std::string & err) {
+        ggml_cuda_set_device(dev);
+        cudaStream_t st = stream(dev);
+        for (const auto & op : ops) {
+            cudaError_t e = to_host
+                ? cudaMemcpyAsync(op.host, (const void *) (uintptr_t) op.va, op.size, cudaMemcpyDeviceToHost, st)
+                : cudaMemcpyAsync((void *) (uintptr_t) op.va, op.host, op.size, cudaMemcpyHostToDevice, st);
+            if (e != cudaSuccess) {
+                err = std::string(to_host ? "D2H" : "H2D") + " cudaMemcpyAsync: " + cudaGetErrorString(e);
+                (void) cudaGetLastError();
+                cudaStreamSynchronize(st);
+                return false;
+            }
+        }
+        const cudaError_t e = cudaStreamSynchronize(st);
+        if (e != cudaSuccess) {
+            err = std::string("cudaStreamSynchronize: ") + cudaGetErrorString(e);
+            (void) cudaGetLastError();
+            return false;
+        }
+        return true;
+    }
+
+    bool d2h(int dev, const std::vector<pxa_res::copy_op> & ops, std::string & err) override { return copy(dev, ops, true,  err); }
+    bool h2d(int dev, const std::vector<pxa_res::copy_op> & ops, std::string & err) override { return copy(dev, ops, false, err); }
+
+    bool sync(int dev, std::string & err) override {
+        ggml_cuda_set_device(dev);
+        const cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+            err = std::string("cudaDeviceSynchronize: ") + cudaGetErrorString(e);
+            (void) cudaGetLastError();
+            return false;
+        }
+        return true;
+    }
+
+    size_t mem_free(int dev) override {
+        ggml_cuda_set_device(dev);
+        size_t fr = 0, tot = 0;
+        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return 0;
+        }
+        return fr;
+    }
+
+    int owner_class(const void * owner) override {
+        const ggml_backend_buffer * b = (const ggml_backend_buffer *) owner;
+        switch (b->usage) {
+            case GGML_BACKEND_BUFFER_USAGE_WEIGHTS: return pxa_res::CLS_WEIGHTS;
+            case GGML_BACKEND_BUFFER_USAGE_COMPUTE: return pxa_res::CLS_SCRATCH;
+            default:                                return pxa_res::CLS_STATE;
+        }
+    }
+};
+
+static pxa_res_cuda_ops & pxa_res_cuda() {
+    static pxa_res_cuda_ops ops;
+    return ops;
+}
+
+static void pxa_res_fill_stats(const pxa_res::op_stats & s, struct ggml_cuda_residency_stats * st) {
+    if (!st) return;
+    memset(st, 0, sizeof(*st));
+    st->ms_total = s.ms_total;
+    st->ms_map   = s.ms_map;
+    st->ms_copy  = s.ms_copy;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES && d < pxa_res::MAX_DEV; ++d) {
+        st->ms_dev[d]    = s.ms_dev[d];
+        st->bytes_dev[d] = s.bytes_dev[d];
+    }
+    st->bytes_weights    = s.bytes_cls[pxa_res::CLS_WEIGHTS];
+    st->bytes_state      = s.bytes_cls[pxa_res::CLS_STATE];
+    st->bytes_scratch    = s.bytes_cls[pxa_res::CLS_SCRATCH];
+    st->bytes_copied     = s.bytes_copied;
+    st->bytes_mirror_new = s.bytes_mirror_new;
+    st->bytes_released   = s.bytes_released;
+    st->bytes_resident   = s.bytes_resident;
+    st->verify_bad       = s.verify_bad;
+    st->n_dev            = s.n_dev;
+    snprintf(st->err, sizeof(st->err), "%s", s.err);
+}
+
+GGML_CALL bool ggml_backend_cuda_residency_supported(void) {
+    const int n = ggml_backend_cuda_get_device_count();
+    if (n <= 0) return false;
+    for (int d = 0; d < n; ++d) {
+        if (!ggml_cuda_info().devices[d].vmm) return false;
+    }
+    return true;
+}
+
+GGML_CALL void * ggml_backend_cuda_residency_new(const char * name) {
+    if (!ggml_backend_cuda_residency_supported()) return nullptr;
+    return new pxa_res::residency(name ? name : "model", &pxa_res_cuda());
+}
+
+GGML_CALL void ggml_backend_cuda_residency_free(void * r) {
+    delete (pxa_res::residency *) r;
+}
+
+GGML_CALL void * ggml_backend_cuda_residency_bind(void * r) {
+    return pxa_res::active().exchange((pxa_res::residency *) r);
+}
+
+GGML_CALL int ggml_backend_cuda_residency_load_phase(int on) {
+    const int prev = pxa_res::tl_phase();
+    pxa_res::tl_phase() = on ? pxa_res::PHASE_LOAD : pxa_res::PHASE_RUNTIME;
+    return prev;
+}
+
+GGML_CALL bool ggml_backend_cuda_residency_prime(void * r, struct ggml_cuda_residency_stats * st) {
+    pxa_res::op_stats s;
+    const bool ok = r && ((pxa_res::residency *) r)->prime(&s);
+    pxa_res_fill_stats(s, st);
+    return ok;
+}
+
+GGML_CALL bool ggml_backend_cuda_residency_park(void * r, struct ggml_cuda_residency_stats * st) {
+    pxa_res::op_stats s;
+    const bool ok = r && ((pxa_res::residency *) r)->park(&s);
+    pxa_res_fill_stats(s, st);
+    return ok;
+}
+
+GGML_CALL bool ggml_backend_cuda_residency_park_for(void * r, void * next, size_t headroom, struct ggml_cuda_residency_stats * st) {
+    pxa_res::op_stats s;
+    bool ok = false;
+    if (r) {
+        size_t want[pxa_res::MAX_DEV] = {};
+        if (next) {
+            ((pxa_res::residency *) next)->need(want);
+        }
+        for (int d = 0; d < pxa_res::MAX_DEV; ++d) {
+            if (want[d]) want[d] += headroom;
+        }
+        ok = ((pxa_res::residency *) r)->park(&s, want);
+    }
+    pxa_res_fill_stats(s, st);
+    return ok;
+}
+
+GGML_CALL void ggml_backend_cuda_residency_need(void * r, uint64_t * per_dev, int n) {
+    size_t need[pxa_res::MAX_DEV] = {};
+    if (r) ((pxa_res::residency *) r)->need(need);
+    for (int d = 0; d < n; ++d) per_dev[d] = d < pxa_res::MAX_DEV ? need[d] : 0;
+}
+
+GGML_CALL bool ggml_backend_cuda_residency_unpark(void * r, struct ggml_cuda_residency_stats * st) {
+    pxa_res::op_stats s;
+    const bool ok = r && ((pxa_res::residency *) r)->unpark(&s);
+    pxa_res_fill_stats(s, st);
+    return ok;
+}
+
+GGML_CALL void ggml_backend_cuda_residency_sizes(void * r, uint64_t * weights, uint64_t * state, uint64_t * scratch, uint64_t * pinned, uint64_t * resident) {
+    uint64_t b[pxa_res::CLS_N] = {};
+    uint64_t pin = 0, res = 0;
+    if (r) ((pxa_res::residency *) r)->sizes(b, &pin, &res);
+    if (weights)  *weights  = b[pxa_res::CLS_WEIGHTS];
+    if (state)    *state    = b[pxa_res::CLS_STATE];
+    if (scratch)  *scratch  = b[pxa_res::CLS_SCRATCH];
+    if (pinned)   *pinned   = pin;
+    if (resident) *resident = res;
+}
+
+GGML_CALL void ggml_backend_cuda_residency_set_pin_budget(uint64_t bytes) {
+    pxa_res::pinned_limit() = bytes;
+}
+#else
+GGML_CALL bool   ggml_backend_cuda_residency_supported(void) { return false; }
+GGML_CALL void * ggml_backend_cuda_residency_new(const char * name) { GGML_UNUSED(name); return nullptr; }
+GGML_CALL void   ggml_backend_cuda_residency_free(void * r) { GGML_UNUSED(r); }
+GGML_CALL void * ggml_backend_cuda_residency_bind(void * r) { GGML_UNUSED(r); return nullptr; }
+GGML_CALL int    ggml_backend_cuda_residency_load_phase(int on) { GGML_UNUSED(on); return 0; }
+GGML_CALL bool   ggml_backend_cuda_residency_prime(void * r, struct ggml_cuda_residency_stats * st) { GGML_UNUSED(r); if (st) memset(st, 0, sizeof(*st)); return false; }
+GGML_CALL bool   ggml_backend_cuda_residency_park(void * r, struct ggml_cuda_residency_stats * st) { GGML_UNUSED(r); if (st) memset(st, 0, sizeof(*st)); return false; }
+GGML_CALL bool   ggml_backend_cuda_residency_unpark(void * r, struct ggml_cuda_residency_stats * st) { GGML_UNUSED(r); if (st) memset(st, 0, sizeof(*st)); return false; }
+GGML_CALL bool   ggml_backend_cuda_residency_park_for(void * r, void * n, size_t h, struct ggml_cuda_residency_stats * st) { GGML_UNUSED(r); GGML_UNUSED(n); GGML_UNUSED(h); if (st) memset(st, 0, sizeof(*st)); return false; }
+GGML_CALL void   ggml_backend_cuda_residency_need(void * r, uint64_t * per_dev, int n) { GGML_UNUSED(r); for (int d = 0; d < n; ++d) per_dev[d] = 0; }
+GGML_CALL void   ggml_backend_cuda_residency_sizes(void * r, uint64_t * w, uint64_t * s, uint64_t * c, uint64_t * p, uint64_t * res) {
+    GGML_UNUSED(r); if (w) *w = 0; if (s) *s = 0; if (c) *c = 0; if (p) *p = 0; if (res) *res = 0;
+}
+GGML_CALL void   ggml_backend_cuda_residency_set_pin_budget(uint64_t bytes) { GGML_UNUSED(bytes); }
+#endif
+
 GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;
@@ -11369,4 +13307,16 @@ GGML_CALL int ggml_backend_cuda_reg_devices() {
         ggml_backend_register(name, ggml_backend_reg_cuda_init, ggml_backend_cuda_buffer_type(i), (void *) (intptr_t) i);
     }
     return device_count;
+}
+
+// PXA_TSPLIT_EPI: the scheduler's per-graph planning call; resolves each split's
+// backend to its CUDA device (-1 for any other backend) and hands the split graphs to reduce.cu.
+extern "C" void ggml_cuda_pxa_epi_plan_sched(int n, ggml_backend_t * backends, ggml_cgraph ** graphs) {
+    std::vector<int> devs((size_t) (n > 0 ? n : 0), -1);
+    for (int i = 0; i < n; ++i) {
+        if (backends[i] && ggml_backend_is_cuda(backends[i])) {
+            devs[i] = ((ggml_backend_cuda_context *) backends[i]->context)->device;
+        }
+    }
+    ggml_cuda_pxa_epi_plan(n, graphs, devs.data());
 }

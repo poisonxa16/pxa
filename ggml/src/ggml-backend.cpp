@@ -1352,6 +1352,7 @@ struct ggml_backend_sched {
     // PXA_TSPLIT_WORKERS: persistent per-device enqueue workers, created on the first graph that
     // qualifies and torn down with the scheduler. nullptr when the lever is off.
     struct pxa_tp_pool * tp_pool = nullptr;
+    struct pxa_tsg_state * tsg = nullptr;   // PXA_TSPLIT_GRAPH whole-token replay state
 };
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -1369,6 +1370,26 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
     } else {
         sched->op_offload[i] &= (~(1u << j));
     }
+}
+
+// PXA_VERIFY_GRAPH_CACHE (2026-09-28): a second scheduler over the SAME backends and
+// buffer types with the same scheduling policy as `src` (op offload mask, active-experts, split-mode
+// graph + async, extra-alloc cap, pipeline copies). It owns its own graph copy, splits and compute
+// buffers, so a graph allocated on it stays valid while `src` builds and runs other graphs. Declared
+// at its one caller (src/llama.cpp) so the public header is unchanged.
+extern "C" GGML_API ggml_backend_sched_t pxa_ggml_backend_sched_clone(ggml_backend_sched_t src, size_t graph_size);
+extern "C" GGML_API ggml_backend_sched_t pxa_ggml_backend_sched_clone(ggml_backend_sched_t src, size_t graph_size) {
+    if (!src) return nullptr;
+    ggml_backend_sched_t s = ggml_backend_sched_new(src->backends, src->bufts, src->n_backends, graph_size, src->n_copies > 1);
+    if (!s) return nullptr;
+    memcpy(s->op_offload, src->op_offload, sizeof(src->op_offload));
+    s->only_active_experts = src->only_active_experts;
+    s->split_mode_graph    = src->split_mode_graph;
+    s->is_async            = src->is_async;
+    s->max_extra_alloc     = src->max_extra_alloc;
+    s->callback_eval           = src->callback_eval;
+    s->callback_eval_user_data = src->callback_eval_user_data;
+    return s;
 }
 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
@@ -1501,8 +1522,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         }
         if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-            // check if a backend with higher prio wants to offload the op
-            if (offload_enabled && src_backend_id == sched->n_backends - 1) {
+            // check if a backend with higher prio wants to offload the op (never for a weight
+            // flagged NO_OFFLOAD: the CPU alias of a streamed weight, whose placement
+            // PXA_STREAM_WEIGHTS already chose by graph width)
+            if (offload_enabled && src_backend_id == sched->n_backends - 1 &&
+                    !(src->flags & GGML_TENSOR_FLAG_NO_OFFLOAD)) {
                 for (int b = 0; b < src_backend_id; b++) {
                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");
@@ -1636,6 +1660,27 @@ static bool ggml_pxa_sm_graph_reduce_consumer(void) {
         return !e || atoi(e) != 0;
     }();
     return v;
+}
+
+// PXA_TSPLIT_CONTAINER_INLINE (lever, default OFF; lane
+// fn-decode 2026-09-25). A reduce-OFF container (GGML_OP_REDUCE with op_params[3] == 1) moves no
+// data: ggml_cuda_op_reduce returns on it before touching a stream. It still cut a scheduler split
+// of its own and, being a REDUCE, made that split driver-owned under PXA_TSPLIT_WORKERS (a full
+// worker rendezvous) and ineligible for PXA_TSPLIT_REPLAY. Inline, it rides in the current split
+// like any other no-op node. Only op_params[3] == 1 containers are affected; every real reduce
+// still starts its own split.
+static bool pxa_sched_container_inline(void) {
+    static const bool v = [] {
+        // DEFAULT OFF, and NOT implied by PAIRLOCAL: on the Flash-Next quad (PAIRLOCAL=1, p2p or
+        // fused route) an inline container produced non-finite logits from the first token
+        // (fn-decode bisect 2026-09-25 X1/X2/X3); cause not found yet. Lab knob only.
+        const char * e = getenv("PXA_TSPLIT_CONTAINER_INLINE");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+static inline bool pxa_is_inline_container(const struct ggml_tensor * t) {
+    return t->op == GGML_OP_REDUCE && t->op_params[3] == 1 && pxa_sched_container_inline();
 }
 
 static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -1977,7 +2022,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 sched->has_reduce = true;
             }
             if ((node->op == GGML_OP_ADD && node->op_params[0] == 0xff) ||
-                 node->op == GGML_OP_REDUCE ||
+                 (node->op == GGML_OP_REDUCE && !pxa_is_inline_container(node)) ||
                  node->op == GGML_OP_FAKE_CPY ||
                  node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == 0xff) {
                 need_new_split = true;
@@ -2399,6 +2444,22 @@ extern "C" bool ggml_cuda_stage_h2d(ggml_backend_t backend, ggml_tensor * dst, c
 extern "C" void ggml_cuda_stage_report(void);
 extern "C" void ggml_cuda_timeline_epoch(void);
 extern "C" void ggml_cuda_tsplit_segment_set(int on);
+extern "C" bool  pxa_tsplit_graph_enabled(void);
+extern "C" uint64_t ggml_cuda_alloc_generation_get(void);
+extern "C" void * ggml_cuda_tsg_new(void);
+extern "C" void  ggml_cuda_tsg_free(void * h);
+extern "C" bool  ggml_cuda_tsg_node_ok(const struct ggml_tensor * node);
+extern "C" void  ggml_cuda_tsg_begin_token(void * h, int nchunk);
+extern "C" void  ggml_cuda_tsg_add_split(void * h, int chunk, ggml_backend_t backend, struct ggml_cgraph * cgraph);
+extern "C" bool  ggml_cuda_tsg_is_bad(void * h);
+extern "C" bool  ggml_cuda_tsg_captured(void * h);
+extern "C" bool  ggml_cuda_tsg_pool_moved(void * h);
+extern "C" void  ggml_cuda_tsg_upload(void * h, int chunk);
+extern "C" void  ggml_cuda_tsg_drop(void * h);
+extern "C" bool  ggml_cuda_tsg_begin_capture(void * h, int chunk);
+extern "C" bool  ggml_cuda_tsg_end_capture(void * h, int chunk);
+extern "C" void  ggml_cuda_tsg_launch(void * h, int chunk, bool is_replay);
+extern "C" void  ggml_cuda_pxa_epi_plan_sched(int n, ggml_backend_t * backends, struct ggml_cgraph ** graphs);
 #endif
 
 // MEASURED UNSAFE AS A DEFAULT, 2026-09-03. It removes the per-split host block, so a
@@ -2658,6 +2719,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                             int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                            if (id < 0 || id >= n_expert) continue;   // SER / PXA_XCACHE slot served elsewhere
                             unique_ids[id >> 5] |= (1u << (id & 31));
                         }
                     }
@@ -2871,6 +2933,9 @@ static bool pxa_tsplit_is_segment(ggml_backend_sched_t sched, const ggml_backend
     }
     for (int k = 0; k < split->graph.n_nodes; ++k) {
         const enum ggml_op op = split->graph.nodes[k]->op;
+        if (op == GGML_OP_REDUCE && pxa_is_inline_container(split->graph.nodes[k])) {
+            continue;   // a reduce-OFF container touches no stream and no peer
+        }
         if (op == GGML_OP_REDUCE || op == GGML_OP_FAKE_CPY) {
             return false;
         }
@@ -3222,6 +3287,425 @@ static int pxa_tp_assign(ggml_backend_sched_t sched, pxa_tp_pool * p) {
     return n_worker;
 }
 
+// =============================================================================================
+// PXA_TSPLIT_GRAPH (2026-09-27, ; DEFAULT OFF since 2026-09-28, see reduce.cu) -- whole-token CUDA-graph replay of a tensor-split
+// decode. PXA_TSPLIT_GRAPH=1 turns it on (default 0 = the host-counter fused reduce, measured faster on 2x P100).
+//
+// THE PROBLEM. A 2x P100 tensor-split decode token is ~384 scheduler splits and ~1777 kernel
+// launches per card. The host takes ~21 ms to enqueue them, and on the GPU side every one of the
+// ~1345 small ops per card pays a launch gap. PXA_TSPLIT_REPLAY replayed the per-device compute
+// SEGMENTS and washed: ~190 graph launches plus property compares per device per token, and it
+// could never cross a reduce because the fused reduce's slot and token were kernel arguments.
+//
+// WHAT THIS DOES. The fused reduce now takes its slot and token from a device-side counter
+// (reduce.cu), so each device's WHOLE token -- compute segments and reduce halves alike -- is one
+// stream capture per device, and a decode token becomes one cudaGraphLaunch per device.
+//   * Region: the tail of the split list with no CPU split and no input that comes from another
+//     device (a host-sourced input is copied up front, before the launch, into its fixed buffer).
+//   * Admission (mainline's rule): the token-level properties of every node in the region (op,
+//     shape, strides, op_params, data and source addresses; a CPY's moving KV destination is
+//     exempt and goes through the cpy-indirection table instead) must be identical on two
+//     consecutive tokens before a capture; any later change runs eager and re-arms. The compute
+//     arena's allocation generation and every device pool's generation force a recapture.
+//   * Capture failure (an op that is not capturable) turns the lever off for that signature and
+//     the token runs eager; nothing was executed during the capture.
+// Only in the plain sequential dispatcher (no enqueue workers, no async inputs, no eval callback,
+// one copy), only with every region node capturable, and never with the per-op diagnostics that
+// synchronise inside a graph.
+// =============================================================================================
+struct pxa_tsg_prop {
+    void *   data;
+    void *   src[GGML_MAX_SRC];
+    int64_t  ne[GGML_MAX_DIMS];
+    size_t   nb[GGML_MAX_DIMS];
+    int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+    int32_t  op;
+    int32_t  backend;
+};
+
+struct pxa_tsg_state {
+    void *                    h        = nullptr;
+    std::vector<pxa_tsg_prop> props;
+    int                       r0       = -1;
+    int                       n_splits = 0;
+    int                       stable   = 0;
+    bool                      refused  = false;
+    uint64_t                  alloc_gen = 0;
+    std::vector<int>          starts;
+    long                      n_tok = 0, n_eager = 0, n_cap = 0, n_rep = 0;
+    double                    us_prep = 0, us_launch = 0;
+};
+
+struct ggml_backend_sched;
+// true when every split in [from, to] carries inputs and no two of them share a device
+static bool pxa_tsg_all_input_run(ggml_backend_sched * sched, int from, int to);
+
+static void pxa_tsg_state_free(pxa_tsg_state * st) {
+    if (!st) return;
+#ifdef GGML_USE_CUDA
+    if (st->h) ggml_cuda_tsg_free(st->h);
+#endif
+    delete st;
+}
+
+static bool pxa_tsg_log(void) {
+    static const bool v = getenv("PXA_TSPLIT_GRAPH_LOG") != nullptr || getenv("PXA_CUDA_GRAPH_LOG") != nullptr;
+    return v;
+}
+
+// Lever plus every diagnostic that synchronises or records events inside a graph eval.
+static bool pxa_tsg_armed(void) {
+#ifdef GGML_USE_CUDA
+    static const bool v = [] {
+        if (!pxa_tsplit_graph_enabled()) return false;
+        // =2: device-side reduce counter only, no capture (a diagnostic arm)
+        if (const char * e = getenv("PXA_TSPLIT_GRAPH"); e && atoi(e) == 2) return false;
+        const char * diag[] = { "PXA_SCHED_TIMELINE", "PXA_PROFILE", "PXA_OP_SYNC_CHECK", "PXA_OP_SUBMIT",
+                                "GGML_CUDA_DISABLE_GRAPHS", "PXA_TSPLIT_REPLAY", "PXA_REDUCE_TIME",
+                                "PXA_REDUCE_CAPTURE", "PXA_RDBG" };
+        for (const char * d : diag) {
+            const char * e = getenv(d);
+            if (e && *e && strcmp(e, "0") != 0) {
+                fprintf(stderr, "PXA_TSPLIT_GRAPH: off because %s is set\n", d);
+                return false;
+            }
+        }
+        return true;
+    }();
+    return v;
+#else
+    return false;
+#endif
+}
+
+static void pxa_tsg_fill(pxa_tsg_prop & p, const ggml_tensor * n, int backend) {
+    p.data = n->data;
+    for (int k = 0; k < GGML_MAX_SRC; ++k) p.src[k] = n->src[k] ? n->src[k]->data : nullptr;
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) { p.ne[k] = n->ne[k]; p.nb[k] = n->nb[k]; }
+    memcpy(p.op_params, n->op_params, sizeof(p.op_params));
+    p.op = (int32_t) n->op;
+    p.backend = backend;
+}
+
+static bool pxa_tsg_same(const pxa_tsg_prop & a, const pxa_tsg_prop & b) {
+    if (a.op != b.op || a.backend != b.backend) return false;
+    const bool cpy  = a.op == GGML_OP_CPY;
+    const bool view = a.op == GGML_OP_VIEW;
+    if (a.data != b.data && !cpy && !view) return false;
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) if (a.ne[k] != b.ne[k] || a.nb[k] != b.nb[k]) return false;
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        if (a.src[k] != b.src[k] && !view && !(cpy && k == 1)) return false;
+    }
+    return memcmp(a.op_params, b.op_params, sizeof(a.op_params)) == 0;
+}
+
+static bool pxa_tsg_all_input_run(ggml_backend_sched * sched, int from, int to) {
+    for (int i = from; i <= to; ++i) {
+        if (sched->splits[i].n_inputs < 1) return false;
+        for (int j = from; j < i; ++j) if (sched->splits[j].backend_id == sched->splits[i].backend_id) return false;
+    }
+    return true;
+}
+
+// First split of the capturable tail, or -1.
+// PXA_TSPLIT_GRAPH_TAIL (default on, =0 off): the vocab-parallel LM head (PXA_TSPLIT_LMHEAD) puts a split at the very
+// end of the token whose result_norm reads the last layer's output from the other device, which ended the region
+// scan at the tail -- the region came out empty and llama-bench / llama-server never replayed a single token. Such
+// trailing splits (at most PXA_TSG_TAIL_MAX from the end) are now left OUT of the region and run eagerly after the
+// graphs, in stream order (their cross-device input copy follows the graph launch on the producer's stream).
+#define PXA_TSG_TAIL_MAX 3
+static bool pxa_tsg_tail_on(void) {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_GRAPH_TAIL"); return !(e && *e && atoi(e) == 0); }();
+    return v;
+}
+static int pxa_tsg_region_start(ggml_backend_sched_t sched, int * r_end) {
+    int r0 = sched->n_splits;
+    *r_end = sched->n_splits;
+    for (int i = sched->n_splits - 1; i >= 0; --i) {
+        const ggml_backend_sched_split * split = &sched->splits[i];
+        const int b = split->backend_id;
+        if (b < 0 || b >= sched->n_backends || ggml_backend_is_cpu(sched->backends[b])) break;
+        if (strncmp(ggml_backend_name(sched->backends[b]), "CUDA", 4) != 0) break;
+        bool host_only = true;
+        for (int j = 0; j < split->n_inputs && host_only; ++j) {
+            const ggml_tensor * input = split->inputs[j];
+            ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(input));
+            ggml_backend_buffer_t buf = input->view_src ? input->view_src->buffer : input->buffer;
+            host_only = (input->flags & GGML_TENSOR_FLAG_INPUT) || ib == NULL || buf == NULL ||
+                        ggml_backend_buffer_is_host(buf);
+        }
+        if (!host_only) {
+            static int said = 0;
+            if (pxa_tsg_log() && said++ < 2) {
+                for (int j = 0; j < split->n_inputs; ++j) {
+                    const ggml_tensor * input = split->inputs[j];
+                    ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(input));
+                    fprintf(stderr, "PXA_TSPLIT_GRAPH: region scan stops at split %d of %d (backend %d, %d nodes, first %s): input %s from %s\n",
+                            i, sched->n_splits, b, split->graph.n_nodes, split->graph.n_nodes ? split->graph.nodes[0]->name : "-",
+                            input->name, ib ? ggml_backend_name(ib) : "?");
+                }
+            }
+            if (pxa_tsg_tail_on() && sched->n_splits - i <= PXA_TSG_TAIL_MAX) {
+                *r_end = i;                     // this split and every one after it run eager
+                r0 = i;
+                continue;
+            }
+            break;
+        }
+        r0 = i;
+    }
+    if (r0 > *r_end) r0 = *r_end;
+    if (pxa_tsg_log()) { static int said2 = 0; if (said2++ < 2) fprintf(stderr, "PXA_TSPLIT_GRAPH: region %d..%d of %d\n", r0, *r_end, sched->n_splits); }
+    // worth a graph only if the region is the bulk of the token and holds a reduce
+    if (*r_end - r0 < 8) return -1;
+    bool has_reduce = false;
+    for (int i = r0; i < *r_end && !has_reduce; ++i) {
+        const ggml_backend_sched_split * split = &sched->splits[i];
+        for (int k = 0; k < split->graph.n_nodes; ++k) {
+            if (split->graph.nodes[k]->op == GGML_OP_REDUCE) { has_reduce = true; break; }
+        }
+    }
+    return has_reduce ? r0 : -1;
+}
+
+// Compare one node against its stored properties and store the node's. True when they matched.
+static inline bool pxa_tsg_check(pxa_tsg_prop & p, const ggml_tensor * n, int backend) {
+    pxa_tsg_prop q;
+    pxa_tsg_fill(q, n, backend);
+    const bool same = pxa_tsg_same(q, p);
+    if (!same) p = q;
+    return same;
+}
+
+// Splits per chunk after the input chunks (PXA_TSPLIT_GRAPH_SPLITS, default 32). Chunks are what
+// lets the launch overlap the GPU: chunk k+1 is validated and launched while chunk k runs, so the
+// cards start after one small launch instead of after the whole token's.
+static int pxa_tsg_chunk_splits(void) {
+    static const int v = [] { const char * e = getenv("PXA_TSPLIT_GRAPH_SPLITS"); int t = e ? atoi(e) : 32; return t < 4 ? 4 : t; }();
+    return v;
+}
+
+static void pxa_tsg_chunks(ggml_backend_sched_t sched, int r0, std::vector<int> & starts) {
+    starts.clear();
+    const int per = pxa_tsg_chunk_splits();
+    for (int i = r0; i < sched->n_splits; ++i) {
+        const ggml_backend_sched_split * split = &sched->splits[i];
+        const ggml_backend_sched_split * prev  = i > r0 ? &sched->splits[i - 1] : nullptr;
+        bool boundary = i == r0;
+        if (!boundary && split->n_inputs > 0) {
+            // a split with host inputs starts a chunk, unless it continues a run of input splits on
+            // distinct devices that already started one (copying both sets first reorders nothing
+            // on any one device)
+            boundary = !(prev->n_inputs > 0 && pxa_tsg_all_input_run(sched, starts.back(), i));
+        }
+        // size cap; the first chunk is kept small so the cards start early
+        const int cap = starts.size() == 1 ? std::max(4, per / 4) : per;
+        if (!boundary && i - starts.back() >= cap && split->n_inputs == 0) boundary = true;
+        if (boundary) starts.push_back(i);
+    }
+}
+
+// Run splits [r0, n_splits) as graphs, one per device per chunk. Returns the split index the eager
+// loop continues from: r0 when nothing was launched, n_splits when the whole region was, or the
+// first split of a chunk whose properties changed mid-token (the chunks before it ran as graphs,
+// which is the same work the eager loop would have enqueued).
+static int pxa_tsg_token(ggml_backend_sched_t sched, int r0,
+                         std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
+#ifdef GGML_USE_CUDA
+    if (!sched->tsg) sched->tsg = new pxa_tsg_state();
+    pxa_tsg_state * st = sched->tsg;
+    if (pxa_tsg_log() && st->n_tok > 0 && st->n_tok % 100 == 0) {
+        fprintf(stderr, "PXA_TSPLIT_GRAPH: tokens=%ld eager=%ld captured=%ld replayed=%ld host us/replay: prep %.0f launch %.0f\n",
+                st->n_tok, st->n_eager, st->n_cap, st->n_rep, st->n_rep ? st->us_prep / st->n_rep : 0.0,
+                st->n_rep ? st->us_launch / st->n_rep : 0.0);
+    }
+    st->n_tok++;
+    const int64_t pxa_t0 = ggml_time_us();
+    if (!st->h) st->h = ggml_cuda_tsg_new();
+    void * h = st->h;
+
+    size_t total = 0;
+    for (int i = r0; i < sched->n_splits; ++i) total += (size_t) sched->splits[i].graph.n_nodes;
+    const uint64_t gen = ggml_cuda_alloc_generation_get();
+    bool structure = st->r0 == r0 && st->n_splits == sched->n_splits && st->props.size() == total && gen == st->alloc_gen;
+    std::vector<int> & starts = st->starts;
+    const size_t old_nchunk = starts.size();
+    pxa_tsg_chunks(sched, r0, starts);
+    const int nchunk = (int) starts.size();
+    auto chunk_end = [&](int c) { return c + 1 < nchunk ? starts[c + 1] : sched->n_splits; };
+    if ((size_t) nchunk != old_nchunk) structure = false;
+
+    // this token's devices and KV-write destinations
+    ggml_cuda_tsg_begin_token(h, nchunk);
+    for (int c = 0; c < nchunk; ++c) {
+        for (int i = starts[c]; i < chunk_end(c); ++i) {
+            ggml_backend_sched_split * split = &sched->splits[i];
+            ggml_cuda_tsg_add_split(h, c, sched->backends[split->backend_id], &split->graph);
+        }
+    }
+    const bool pool_moved = ggml_cuda_tsg_pool_moved(h);
+    const bool bad        = ggml_cuda_tsg_is_bad(h);
+
+    // REPLAY: a captured token of the same structure. Validate chunk by chunk, launching each as soon
+    // as it is known to match, so validation of chunk k+1 overlaps the cards running chunk k.
+    if (structure && !bad && !pool_moved && ggml_cuda_tsg_captured(h) && !st->refused) {
+        size_t off = 0;
+        int64_t t_first = 0;
+        for (int c = 0; c < nchunk; ++c) {
+            bool same = true;
+            size_t k = off;
+            for (int i = starts[c]; i < chunk_end(c); ++i) {
+                const ggml_backend_sched_split * split = &sched->splits[i];
+                for (int j = 0; j < split->graph.n_nodes; ++j, ++k) {
+                    same &= pxa_tsg_check(st->props[k], split->graph.nodes[j], split->backend_id);
+                }
+            }
+            if (!same) {
+                // store the rest of this token's properties, re-arm, and hand the rest to the eager loop
+                for (int i = chunk_end(c); i < sched->n_splits; ++i) {
+                    const ggml_backend_sched_split * split = &sched->splits[i];
+                    for (int j = 0; j < split->graph.n_nodes; ++j, ++k) {
+                        pxa_tsg_check(st->props[k], split->graph.nodes[j], split->backend_id);
+                    }
+                }
+                if (pxa_tsg_log()) fprintf(stderr, "PXA_TSPLIT_GRAPH: re-arm (properties changed in chunk %d of %d)\n", c, nchunk);
+                st->stable = 0;
+                ggml_cuda_tsg_drop(h);
+                st->n_eager++;
+                return starts[c];
+            }
+            off = k;
+            for (int i = starts[c]; i < chunk_end(c); ++i) {
+                ggml_backend_sched_split * split = &sched->splits[i];
+                if (split->n_inputs < 1) break;          // inputs only lead a chunk
+                ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+                if (!sched->own_cpy[split->backend_id]) {
+                    sched->needs_sync[split->backend_id] = true;
+                } else {
+                    for (int j = 0; j < split->n_inputs; ++j) {
+                        if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) sched->needs_sync[split->backend_id] = true;
+                    }
+                }
+            }
+            ggml_cuda_tsg_upload(h, c);
+            if (c == 0) t_first = ggml_time_us();
+            ggml_cuda_tsg_launch(h, c, true);
+        }
+        st->n_rep++;
+        st->us_prep   += (double)(t_first - pxa_t0);
+        st->us_launch += (double)(ggml_time_us() - t_first);
+        return sched->n_splits;
+    }
+
+    // ADMISSION: full property compare and store
+    bool same = structure;
+    if (pxa_tsg_log() && !structure && st->n_tok <= 8) {
+        fprintf(stderr, "PXA_TSPLIT_GRAPH: tok %ld structure differs (r0 %d/%d n_splits %d/%d props %zu/%zu alloc_gen %llu/%llu)\n",
+                st->n_tok, st->r0, r0, st->n_splits, sched->n_splits, st->props.size(), total,
+                (unsigned long long) st->alloc_gen, (unsigned long long) gen);
+    }
+    if (st->props.size() != total) { st->props.resize(total); same = false; }
+    {
+        size_t k = 0;
+        int n_diff_logged = 0;
+        for (int i = r0; i < sched->n_splits; ++i) {
+            const ggml_backend_sched_split * split = &sched->splits[i];
+            for (int j = 0; j < split->graph.n_nodes; ++j, ++k) {
+                const bool m = pxa_tsg_check(st->props[k], split->graph.nodes[j], split->backend_id);
+                if (!m && structure && pxa_tsg_log() && st->n_tok <= 8 && n_diff_logged++ < 4) {
+                    fprintf(stderr, "PXA_TSPLIT_GRAPH: tok %ld node %s (%s) split %d changed since the last token\n", st->n_tok,
+                            split->graph.nodes[j]->name, ggml_op_name(split->graph.nodes[j]->op), i);
+                }
+                same &= m;
+            }
+        }
+    }
+    st->r0 = r0;
+    st->n_splits = sched->n_splits;
+    st->alloc_gen = gen;
+    st->n_eager++;
+    if (!same) {
+        if (pxa_tsg_log() && ggml_cuda_tsg_captured(h)) fprintf(stderr, "PXA_TSPLIT_GRAPH: re-arm (structure or allocation changed)\n");
+        st->stable  = 0;
+        st->refused = false;
+        ggml_cuda_tsg_drop(h);
+        return r0;
+    }
+    if (st->refused) return r0;
+    st->stable++;
+    if (bad) { st->refused = true; ggml_cuda_tsg_drop(h); return r0; }
+
+    // CAPTURE: the token is property-identical to the one before it
+    for (int i = r0; i < sched->n_splits && !st->refused; ++i) {
+        const ggml_backend_sched_split * split = &sched->splits[i];
+        for (int k = 0; k < split->graph.n_nodes; ++k) {
+            if (!ggml_cuda_tsg_node_ok(split->graph.nodes[k])) {
+                if (pxa_tsg_log()) {
+                    fprintf(stderr, "PXA_TSPLIT_GRAPH: not capturable at split %d node %s (%s)\n", i,
+                            split->graph.nodes[k]->name, ggml_op_name(split->graph.nodes[k]->op));
+                }
+                st->refused = true;
+                break;
+            }
+        }
+    }
+    if (st->refused) { ggml_cuda_tsg_drop(h); return r0; }
+
+    // capture every chunk first (nothing executes during a capture), then run them in order
+    ggml_cuda_tsg_drop(h);
+    for (int c = 0; c < nchunk; ++c) {
+        ggml_cuda_tsg_upload(h, c);
+        if (!ggml_cuda_tsg_begin_capture(h, c)) {
+            st->refused = true;
+            ggml_cuda_tsg_drop(h);
+            return r0;
+        }
+        enum ggml_status ec = GGML_STATUS_SUCCESS;
+        for (int i = starts[c]; i < chunk_end(c) && ec == GGML_STATUS_SUCCESS; ++i) {
+            ggml_backend_sched_split * split = &sched->splits[i];
+            ec = ggml_backend_graph_compute_async(sched->backends[split->backend_id], &split->graph);
+        }
+        const bool ok = ggml_cuda_tsg_end_capture(h, c);
+        if (!ok || ec != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "PXA_TSPLIT_GRAPH: whole-token capture refused (%s) -- this signature runs eager\n",
+                    ok ? "a split failed during capture" : "capture error");
+            st->refused = true;
+            ggml_cuda_tsg_drop(h);
+            return r0;
+        }
+    }
+    static bool banner = false;
+    if (!banner) {
+        banner = true;
+        fprintf(stderr, "PXA_TSPLIT_GRAPH: whole-token CUDA-graph replay armed -- splits %d..%d of %d, "
+                        "%zu nodes, %d chunks, one graph per device per chunk (PXA_TSPLIT_GRAPH=0 turns it off)\n",
+                r0, sched->n_splits - 1, sched->n_splits, st->props.size(), nchunk);
+    }
+    for (int c = 0; c < nchunk; ++c) {
+        for (int i = starts[c]; i < chunk_end(c); ++i) {
+            ggml_backend_sched_split * split = &sched->splits[i];
+            if (split->n_inputs < 1) break;
+            ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+            if (!sched->own_cpy[split->backend_id]) {
+                sched->needs_sync[split->backend_id] = true;
+            } else {
+                for (int j = 0; j < split->n_inputs; ++j) {
+                    if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) sched->needs_sync[split->backend_id] = true;
+                }
+            }
+        }
+        ggml_cuda_tsg_upload(h, c);
+        ggml_cuda_tsg_launch(h, c, false);
+    }
+    st->n_eager--;
+    st->n_cap++;
+    return sched->n_splits;
+#else
+    GGML_UNUSED(sched); GGML_UNUSED(ids); GGML_UNUSED(unique_ids); GGML_UNUSED(last_ids_tensor);
+    return r0;
+#endif
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
 
     // PXA_SCHED_TIMELINE / PXA_SCHED_ASYNC_INPUTS: one epoch per scheduler graph
@@ -3230,6 +3714,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_backend_sync_epoch();
 #ifdef GGML_USE_CUDA
     ggml_cuda_timeline_epoch();
+    // PXA_TSPLIT_EPI: plan the fused reduce epilogues of this graph before any split runs (or is captured)
+    if (sched->has_reduce) {
+        std::vector<ggml_backend_t> pxa_epi_be((size_t) sched->n_splits);
+        std::vector<struct ggml_cgraph *> pxa_epi_g((size_t) sched->n_splits);
+        for (int i = 0; i < sched->n_splits; ++i) {
+            pxa_epi_be[i] = sched->backends[sched->splits[i].backend_id];
+            pxa_epi_g[i]  = &sched->splits[i].graph;
+        }
+        ggml_cuda_pxa_epi_plan_sched(sched->n_splits, pxa_epi_be.data(), pxa_epi_g.data());
+    } else {
+        ggml_cuda_pxa_epi_plan_sched(0, nullptr, nullptr);
+    }
 #endif
     pxa_stage_graph_scope pxa_stage_scope(pxa_async_graph);
 
@@ -3619,7 +4115,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     } pxa_tp_drain{ tp, sched->n_splits };
 
+    // PXA_TSPLIT_GRAPH: see the block above ggml_backend_sched_compute_splits.
+    int pxa_tsg_end = sched->n_splits;
+    const int pxa_tsg_r0 = (!tp && pxa_tsplit_here && !moe_prefetch && !pxa_async_graph && !pxa_replay_on &&
+                            pxa_tsg_armed()) ? pxa_tsg_region_start(sched, &pxa_tsg_end) : -1;
+    if (pxa_tsg_log()) {
+        static int pxa_tsg_gate_said = 0;
+        if (sched->has_reduce && pxa_tsg_gate_said++ < 3) {
+            fprintf(stderr, "PXA_TSPLIT_GRAPH gate: r0=%d tp=%d tsplit_here=%d (n_backends %d n_copies %d is_async %d cb %d) moe_prefetch=%d async=%d replay=%d armed=%d n_splits=%d\n",
+                    pxa_tsg_r0, tp != nullptr, (int) pxa_tsplit_here, sched->n_backends, sched->n_copies, (int) sched->is_async,
+                    sched->callback_eval != nullptr, (int) moe_prefetch, (int) pxa_async_graph, (int) pxa_replay_on, (int) pxa_tsg_armed(), sched->n_splits);
+        }
+    }
+
     for (int i = 0; i < sched->n_splits; i++) {
+        if (i == pxa_tsg_r0) {
+            // the region is [r0, pxa_tsg_end): pxa_tsg_token sees only that many splits (it compares, captures and
+            // launches up to n_splits), and the eager loop continues at pxa_tsg_end when the region ran as graphs
+            const int pxa_tsg_all = sched->n_splits;
+            sched->n_splits = pxa_tsg_end;
+            const int k = pxa_tsg_token(sched, i, ids, unique_ids, last_ids_tensor);
+            sched->n_splits = pxa_tsg_all;
+            if (k >= sched->n_splits) {
+                break;                          // the rest of the token was launched as graphs
+            }
+            i = k;                              // continue eagerly from here
+        }
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
@@ -3862,6 +4383,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     // the only place they are joined. sched->splits is freed below and they hold a pointer to it.
     pxa_tp_pool_free(sched->tp_pool);
     sched->tp_pool = nullptr;
+    pxa_tsg_state_free(sched->tsg);
+    sched->tsg = nullptr;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);

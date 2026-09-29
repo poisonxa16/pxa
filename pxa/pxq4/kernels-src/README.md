@@ -29,7 +29,7 @@ one, and behind the collapse of per-stream throughput at concurrency 2. The same
 the remedy — "port `k_pxq4_mmv_part`/`_reduce` here" — and this is that port.
 
 **The claim is bit-exactness, not closeness.** Every arm preserves the monolithic kernel's fold
-exactly: per-lane left-associated chunk chain, then ascending k-segment, one final
+exactly: per-chunk chain, then ascending k-segment, one final
 `__float2half_rn`. The atomic is an arrival counter, never an accumulator. So a difference is a
 defect, and the gates demand max-abs-diff 0 rather than a tolerance —
 `pxq23_selftest()`'s split differential, and `tests_pxq23/gpu_split_gate.py` on real checkpoint

@@ -756,14 +756,36 @@ static __global__ void flash_attn_combine_results(
 // the same class of claim as PXA_FA_KEYS_PER_SPLIT -- not identical. Gate it with the
 // logit-spread determinism check at depth, not a greedy-sha comparison.
 //
-// DEFAULT OFF for this RC. `PXA_FA_F16_KV_CHUNK=0` (default) is today's whole-tensor conversion.
+// DEFAULT AUTO since 2026-09-25 (see PXA_FA_F16_KV_CHUNK_AUTO below): unset chunks only past a
+// 128 MiB whole-tensor scratch. `PXA_FA_F16_KV_CHUNK=0` is the old whole-tensor conversion.
 // =================================================================================================
 #define PXA_FA_KV_CHUNK_GRAN FATTN_KQ_STRIDE // KV tile granularity a chunk boundary must respect
 
+// PXA_FA_F16_KV_CHUNK_AUTO (2026-09-25): with the variable UNSET the lever is
+// AUTO -- it chunks (8192 tokens) only where the whole-tensor f16 K/V conversion scratch would
+// exceed 128 MiB, i.e. a quantized cache deeper than 32768 tokens on Qwen3.8-27B (4 KV heads x
+// 256). Below that the call is the untouched whole-tensor route, bit for bit. Why: on one 16 GB
+// card at -c 65536/131072 with a q4_0 cache the whole-cache conversion (256 / 512 MiB) is the
+// first allocation that does not fit, so the server died on the first deep request (bug #205;
+// the MTP crash config on a P100). PXA_FA_F16_KV_CHUNK=0 restores whole-tensor conversion
+// everywhere; any N > 0 forces N-token chunks at every depth past N as before.
+#define PXA_FA_F16_KV_CHUNK_AUTO_TOKENS 8192
+#define PXA_FA_F16_KV_CHUNK_AUTO_BYTES  ((size_t) 128 << 20)
+// ws6-fix (2026-09-25): AUTO is also MEMORY-AWARE -- past the 128 MiB threshold it chunks only when
+// the whole-tensor staging would not fit (pxa_fa_whole_staging_fits, pxa/core/fa-route.cu), so a
+// card with room keeps the v2026.09.20 whole-tensor arithmetic bit for bit and only the bug #205
+// configuration (a conversion that cannot be allocated) pays the chunked merge. See the measurement
+// at pxa_fa_deep_qkv_tile_takes.
+bool pxa_fa_whole_staging_fits(size_t need);
+
+// Returns the requested chunk (> 0), 0 for explicitly off, or -1 for AUTO (variable unset).
 static inline int pxa_fa_f16_kv_chunk() {
     static const int v = [](){
         const char * e = getenv("PXA_FA_F16_KV_CHUNK");
-        int n = e ? atoi(e) : 0;
+        if (!e || !*e) {
+            return -1;
+        }
+        int n = atoi(e);
         if (n < 0) {
             fprintf(stderr, "PXA_FA_F16_KV_CHUNK: %d is negative -- treated as 0 (whole-tensor conversion)\n", n);
             return 0;
@@ -787,13 +809,13 @@ static inline int pxa_fa_f16_kv_chunk() {
 
 // Fires once per (n_kv bucket) so an A/B can prove engagement rather than assume it; an arm
 // without this banner in the run log is void.
-static inline void pxa_fa_f16_kv_chunk_log(int n_kv, int chunk, int n_chunks, size_t scratch_bytes) {
+static inline void pxa_fa_f16_kv_chunk_log(bool is_auto, int n_kv, int chunk, int n_chunks, size_t scratch_bytes) {
     static std::atomic<int> fired{0};
     const int f = fired.fetch_add(1);
     if (f < 4 || (f % 4096) == 0) {
-        fprintf(stderr, "PXA_FA_F16_KV_CHUNK: ENGAGED n_kv=%d chunk=%d -> %d chunks, "
+        fprintf(stderr, "PXA_FA_F16_KV_CHUNK%s: ENGAGED n_kv=%d chunk=%d -> %d chunks, "
                         "K+V conversion scratch %.1f MiB (was %.1f MiB whole-tensor) [fire #%d]\n",
-                n_kv, chunk, n_chunks, scratch_bytes/1048576.0,
+                is_auto ? " (AUTO: unset, whole-tensor scratch > 128 MiB and it does not fit; =0 reverts)" : "", n_kv, chunk, n_chunks, scratch_bytes/1048576.0,
                 (scratch_bytes*(double)n_chunks)/1048576.0, f + 1);
     }
 }
@@ -963,7 +985,11 @@ void launch_fattn(
     ggml_cuda_pool_alloc<float>  pxa_acc(pool);
     ggml_cuda_pool_alloc<float2> pxa_acc_meta(pool);
 
-    const int  pxa_chunk_req = pxa_fa_f16_kv_chunk();
+    int        pxa_chunk_req  = pxa_fa_f16_kv_chunk();
+    const bool pxa_chunk_auto = pxa_chunk_req < 0;
+    if (pxa_chunk_auto) {
+        pxa_chunk_req = PXA_FA_F16_KV_CHUNK_AUTO_TOKENS;
+    }
     bool       pxa_chunked   = false;
     int64_t    pxa_chunk     = 0;
 
@@ -986,20 +1012,40 @@ void launch_fattn(
         // The tile kernel indexes V with K's strides, so the two have to agree.
         const bool same_kv = nb11 == nb21 && nb12 == nb22 && K->ne[1] == V->ne[1];
 
-        pxa_chunked = convert && dense && same_kv &&
+        // AUTO: only where the whole-tensor conversion would be the large allocation.
+        const size_t whole_bytes = (size_t) K->ne[1]*sizeof(half)*(
+            (need_f16_K && K->type != GGML_TYPE_F16 ? (size_t) K->ne[0]*K->ne[2] : 0) +
+            (need_f16_V && V->type != GGML_TYPE_F16 ? (size_t) V->ne[0]*V->ne[2] : 0));
+        const bool auto_ok = !pxa_chunk_auto || (whole_bytes > PXA_FA_F16_KV_CHUNK_AUTO_BYTES &&
+                                                 !pxa_fa_whole_staging_fits(whole_bytes));
+
+        pxa_chunked = convert && dense && same_kv && auto_ok &&
                       Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
                       K->ne[1] > (int64_t) pxa_chunk_req &&
                       (!mask || mask->ne[0] >= K->ne[1]);
 
         if (pxa_chunked) {
             pxa_chunk = pxa_chunk_req;
-            pxa_fa_f16_kv_chunk_log((int) K->ne[1], (int) pxa_chunk,
+            pxa_fa_f16_kv_chunk_log(pxa_chunk_auto, (int) K->ne[1], (int) pxa_chunk,
                                     (int) ((K->ne[1] + pxa_chunk - 1)/pxa_chunk),
                                     (size_t) pxa_chunk*((size_t) K->ne[0]*K->ne[2] +
                                                         (size_t) V->ne[0]*V->ne[2])*sizeof(half));
         }
     }
 
+    // PXA_FA_CHUNK_POOL_ORDER (2026-09-25): the VMM pool is a stack -- buffers must be
+    // freed in the reverse order they were allocated, and these RAII holders free in reverse
+    // DECLARATION order (pxa_acc_meta first ... K_f16 last). The chunked route used to allocate
+    // its K/V chunk scratch AFTER dst_tmp/pxa_acc, so the first free (pxa_acc_meta) was not the
+    // top of the stack: GGML_ASSERT(ptr == pool_addr + pool_used) on the first chunked call
+    // (V100, PXA_FA_TILE_VOLTA=1 PXA_FA_F16_KV_CHUNK=8192, 8k-deep prompt). Allocate the chunk
+    // scratch here, in declaration order, like the whole-tensor route does.
+    if (pxa_chunked && need_f16_K && K->type != GGML_TYPE_F16) {
+        K_f16.alloc((size_t) pxa_chunk*K->ne[0]*K->ne[2]);
+    }
+    if (pxa_chunked && need_f16_V && V->type != GGML_TYPE_F16) {
+        V_f16.alloc((size_t) pxa_chunk*V->ne[0]*V->ne[2]);
+    }
     if (need_f16_K && !pxa_chunked && K->type != GGML_TYPE_F16) {
         K_f16.alloc(ggml_nelements(K));
         to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
@@ -1076,12 +1122,7 @@ void launch_fattn(
         const bool conv_K = need_f16_K && K->type != GGML_TYPE_F16;
         const bool conv_V = need_f16_V && V->type != GGML_TYPE_F16;
 
-        if (conv_K) {
-            K_f16.alloc(pxa_chunk*elems_tok_K);
-        }
-        if (conv_V) {
-            V_f16.alloc(pxa_chunk*elems_tok_V);
-        }
+        // (K_f16 / V_f16 were allocated ahead of dst_tmp -- see PXA_FA_CHUNK_POOL_ORDER above.)
 
         const dim3 fold_blocks(Q->ne[1], Q->ne[2], 1);
         const dim3 fold_block_dim(Dv, 1, 1);

@@ -20,6 +20,8 @@
 #include "../fattn-volta-tile.cuh"
 #include "../fattn-tile-v2.cuh"
 #include "../fattn-tile-big.cuh"
+#include "../fattn-qkv-direct.cuh"
+#include "../fattn-qkv-tile.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -282,6 +284,102 @@ static bool pxa_fa_tile_volta_take(const ggml_tensor * Q) {
     return take;
 }
 
+// PXA_FA_DEEP_QKV_TILE (2026-09-25): sm_70 wide attention over a QUANTIZED K/V
+// cache converts the whole cache to f16 in the pool before the WMMA / Volta-MMA kernels run --
+// 360 MiB at 90k and 512 MiB at 131k for Qwen3.8-27B q4_0 -- which is the allocation that OOMs
+// a 131k context on one 16 GB V100 (bug #205, 118k-token prompt died at ~90k). The tile-f16
+// kernel has the chunked conversion (PXA_FA_F16_KV_CHUNK, AUTO by default), so route exactly
+// those nodes to it: dispatch only, Volta only, any width (width <= 8 -> vec in place, wider -> tile), a non-f16 K or V, and a whole-tensor
+// f16 scratch above the same 128 MiB the chunk AUTO uses. Every smaller node keeps its route.
+// PXA_FA_DEEP_QKV_TILE=0, or PXA_FA_F16_KV_CHUNK=0, turns it off.
+// MEMORY-AWARE since ws6-fix (2026-09-25). The route above took every deep node past a fixed 128 MiB
+// scratch, and on one V100 where the whole-tensor staging FITS that was measured to lose on both
+// axes (Qwen3.8-27B PXQ3, q8_0, same card, same window): 64k prefill 110.9 s -> 192.4 s (-42%), and
+// llama-perplexity at -c 65536 (wikitext-2, every scored row past the threshold) PPL 6.4439 ->
+// 6.4554, ln ratio +0.00178 +- 0.00021, mean KLD 4.8e-4, same top-1 99.25% -- while it also changed
+// the long-context greedy output against v2026.09.20 (verify-ws6-server #8472). What the route is FOR
+// is bug #205: the whole-cache conversion that does not fit (131k q4_0 on one 16 GB card). So AUTO now
+// takes a deep node only when that conversion would NOT fit; where it fits, the node keeps the
+// release route (bit-identical to v2026.09.20). PXA_FA_DEEP_QKV_TILE=2 restores the unconditional
+// 128 MiB rule (A/B only), =0 turns the route off.
+static constexpr size_t PXA_FA_STAGING_MARGIN = (size_t) 256 << 20;
+
+bool pxa_fa_whole_staging_fits(size_t need) {
+    const int dev = ggml_cuda_get_device();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    static std::atomic<size_t> admitted_hwm[GGML_CUDA_MAX_DEVICES];
+    if (need <= admitted_hwm[dev].load(std::memory_order_relaxed)) {
+        return true; // the pool already holds at least this much for a whole-tensor staging
+    }
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (need + PXA_FA_STAGING_MARGIN > free_bytes) {
+        return false;
+    }
+    size_t seen = admitted_hwm[dev].load(std::memory_order_relaxed);
+    while (seen < need && !admitted_hwm[dev].compare_exchange_weak(seen, need, std::memory_order_relaxed)) {
+    }
+    return true;
+}
+
+static bool pxa_fa_deep_qkv_tile_takes(const ggml_tensor * dst, int cc) {
+    // 0 off, 1 AUTO (memory-aware, the default), 2 the unconditional 128 MiB rule
+    static const int mode = [](){
+        const char * e = getenv("PXA_FA_DEEP_QKV_TILE");
+        const char * c = getenv("PXA_FA_F16_KV_CHUNK");
+        if (c && *c && atoi(c) <= 0) return 0;
+        if (e && *e) return atoi(e) <= 0 ? 0 : (atoi(e) >= 2 ? 2 : 1);
+        return 1;
+    }();
+    if (mode == 0 || !(fp16_mma_available(cc) && !new_mma_available(cc))) return false;
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    // Width 1 is included (2026-09-25 repair): on sm_70 a width-1 node over a quantized cache is
+    // not a "bs1 vector kernel" node (that row requires f16 K/V), so it fell to WMMA ncols 8, which
+    // converts the WHOLE cache to f16 every decode step -- 376 MiB at n_kv 96k, the allocation that
+    // OOMed the MTP draft context's prompt catch-up on one V100 (b-mix27 #8224). The narrow branch
+    // of the planner sends it to the vec kernel, which reads the quantized cache in place.
+    if (dst->src[4] != nullptr) return false; // no sinks
+    const bool qk = K->type != GGML_TYPE_F16, qv = V->type != GGML_TYPE_F16;
+    if (!qk && !qv) return false;
+    const size_t whole = (size_t) K->ne[1]*2*((qk ? (size_t) K->ne[0]*K->ne[2] : 0) +
+                                              (qv ? (size_t) V->ne[0]*V->ne[2] : 0));
+    // PXA_FA_QKV_NARROW_VEC (2026-09-25, , default OFF): the 128 MiB threshold exists
+    // for the wide (prefill) nodes, whose tile route pays a chunked conversion. A narrow node's vec
+    // route converts nothing, while its default WMMA route converts the whole cache every step at
+    // any depth (100 MiB per attention layer per token at n_kv 25k), so =1 takes narrow nodes over
+    // a quantized cache at every depth. Speed lever; A/B before any default change.
+    static const bool narrow_any = [](){
+        const char * e = getenv("PXA_FA_QKV_NARROW_VEC");
+        return e && *e && atoi(e) != 0;
+    }();
+    const bool deep = whole > ((size_t) 128 << 20);
+    const bool fits = deep && mode == 1 && pxa_fa_whole_staging_fits(whole);
+    const bool take = (deep && !fits) || (narrow_any && Q->ne[1] <= 8);
+    if (take) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) {
+            fprintf(stderr, "PXA_FA_DEEP_QKV_TILE: engaged (sm_70, quantized K/V n_kv=%d, whole f16 scratch %.1f MiB%s, width %d -> "
+                            "vec (width <= 8, in place) or tile (chunked conversion); PXA_FA_DEEP_QKV_TILE=0 reverts)\n",
+                    (int) K->ne[1], whole/1048576.0, mode == 1 ? " does not fit" : " (=2: unconditional)", (int) Q->ne[1]);
+        }
+    } else if (fits) {
+        static std::atomic<bool> told_fit{false};
+        if (!told_fit.exchange(true)) {
+            fprintf(stderr, "PXA_FA_DEEP_QKV_TILE: AUTO keeps the release route (quantized K/V n_kv=%d, whole f16 scratch "
+                            "%.1f MiB fits with a 256 MiB margin; the tile/vec reroute is for a card where it does not)\n",
+                    (int) K->ne[1], whole/1048576.0);
+        }
+    }
+    return take;
+}
+
 static bool pxa_fa_tile256_enabled() {
     return pxa_lever(PXA_LEVER_FA_TILE256) != 0;
 }
@@ -367,6 +465,14 @@ static pxa_fa_plan_t pxa_fa_take(pxa_fa_route route, bool supported, const char 
     return plan;
 }
 
+static bool pxa_fa_narrow_tile_fallback() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_FA_NARROW_TILE_FALLBACK");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
 pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_query_t & q) {
     const ggml_tensor * dst  = q.node;
     const ggml_tensor * Q    = dst->src[0];
@@ -435,6 +541,36 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
         return pxa_fa_take(PXA_FA_ROUTE_D256_TILE, true, "PXA_FA_D256_VOLTA_TILE");
     }
 
+    // ---- PXA_FA_DEEP_QKV_TILE (dispatch only) -----------------------------------------------
+    // Narrow (decode width 1 and speculative-verify widths 2..8) deep nodes go to the vec kernel, which reads the
+    // quantized cache in place (no conversion at all); WMMA there converted 416 MiB at n_kv 98560
+    // and OOMed the MTP verify right after a 100k prompt (V100, 2026-09-25).
+    if (dispatch && precision == GGML_PREC_DEFAULT && pxa_fa_deep_qkv_tile_takes(dst, cc)) {
+        if (Q->ne[1] <= 8 && ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)) {
+            return pxa_fa_take(PXA_FA_ROUTE_VEC_F16, true, "PXA_FA_DEEP_QKV_TILE narrow -> vec");
+        }
+        if (ggml_cuda_fattn_tile_f16_is_supported(ctx, dst)) {
+            return pxa_fa_take(PXA_FA_ROUTE_TILE_F16, true, "PXA_FA_DEEP_QKV_TILE");
+        }
+    }
+
+    // ---- PXA_FA_QKV_DIRECT (dispatch only) ---------------------------------------------------
+    // sm_60 narrow nodes (width 1..8, head 256) over a q4_0 / q8_0 cache: one block per GQA group
+    // reads the quantized tiles in place. A SUBSTITUTION for the vec row below (which supports the
+    // same shapes), so the support answer is unchanged. On at the ENHANCE level.
+    if (dispatch && ggml_cuda_fattn_qkv_direct_supported(dst, cc)) {
+        return pxa_fa_take(PXA_FA_ROUTE_QKV_DIRECT, true, "PXA_FA_QKV_DIRECT");
+    }
+
+    // ---- PXA_FA_QKV_TILE (dispatch only) -----------------------------------------------------
+    // sm_60 wide nodes (width > 8, head 256, default precision) over a q4_0 / q8_0 cache: the same
+    // kernel with a column tile, reading the quantized tiles in place instead of converting the
+    // cache to f16. A SUBSTITUTION for the tile-f16 row below, taken only where that row is the
+    // route (PXA_FA_TILE256 on), so the support answer is unchanged. Default off (=1 arms it).
+    if (dispatch && pxa_fa_tile256_enabled() && ggml_cuda_fattn_qkv_tile_supported(dst, cc)) {
+        return pxa_fa_take(PXA_FA_ROUTE_QKV_TILE, true, "PXA_FA_QKV_TILE");
+    }
+
     // ---- PXA_FA_MMA_VOLTA (dispatch only) ----------------------------------------------------
     // A SUBSTITUTION: every shape it declines falls through to the route the support query names,
     // so the support answer does not depend on it and never has.
@@ -450,6 +586,44 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
         }
         if (ggml_cuda_fattn_tile_f32_is_supported(ctx, dst)) {
             return pxa_fa_take(PXA_FA_ROUTE_TILE_F32, true, "PXA_FA_TILE_VOLTA");
+        }
+    }
+
+    // ---- PXA_FA_NARROW_TILE_FALLBACK (2026-09-25) ---------------------------------
+    // Pre-Volta narrow batches go to the vec kernels, which are compiled for a short list of
+    // (head size, K type, V type) triples. A triple outside that list (e.g. head 256 with q4_1 /
+    // q5_x caches) used to be answered "unsupported" here, which sends the node to the CPU backend
+    // (0.44 t/s decode measured for head 256 + q4_0 on a P100 before that triple got its vec
+    // instance) or, in a context whose first probe was narrow, makes the graph builder emit the
+    // unfused chain, whose V transpose cannot run on a quantized cache (ggml_cuda_cpy q4_0 -> q4_0
+    // abort on the first MTP draft). The tile kernels convert any K/V type to f16 first, so they
+    // serve every such triple; take them instead of declining. PXA_FA_NARROW_TILE_FALLBACK=0 restores
+    // the old answer.
+    //
+    // Bug #235 (2026-09-25): sm_61 sends EVERY head-256 node to the vec kernel,
+    // not only narrow ones (the "no fast fp16" branch below), so a wide head-256 node with a K/V
+    // pair the vec kernel lacks landed on the CPU backend on a 1080 Ti (prefill too). And on sm_61
+    // neither earlier fallback applies at head 256 (tile-f16 was gated on fast fp16, tile-f32 serves
+    // only head 64/128), so the fallback declined there as well. The window now covers the sm_61
+    // head-256 rows at any width, and tile-f32 serves head 256 (16 columns per block), so the
+    // fallback also holds at f32 precision, where tile-f16 cannot run.
+    const bool pxa_pre_volta = !fp16_mma_available(cc);
+    // rel-integrate3 (R25): + the f32-precision head-256 rows at any width on sm_60 too (fast fp16, so the
+    // second clause never held there): tile-f16 cannot serve f32 precision, and without this a vec-less
+    // K/V pair (q5_0, q4_1) at width > 8 was declined to the CPU backend (test-fa-route-qkv, cc 600).
+    const bool pxa_vec_row   = Q->ne[1] <= 8 || (!fast_fp16_available(cc) && Q->ne[0] == 256) ||
+                               (precision != GGML_PREC_DEFAULT && Q->ne[0] == 256);
+    if (pxa_pre_volta && pxa_vec_row && pxa_fa_narrow_tile_fallback()) {
+        const bool f32_route = precision != GGML_PREC_DEFAULT || !fast_fp16_available(cc) || pxq_use_sm60_vec_f32(cc, Q);
+        const bool vec_ok = f32_route ? ggml_cuda_fattn_vec_f32_is_supported(ctx, dst)
+                                      : ggml_cuda_fattn_vec_f16_is_supported(ctx, dst);
+        if (!vec_ok) {
+            if (precision == GGML_PREC_DEFAULT && fast_fp16_available(cc) && ggml_cuda_fattn_tile_f16_is_supported(ctx, dst)) {
+                return pxa_fa_take(PXA_FA_ROUTE_TILE_F16, true, "narrow, no vec instance for these K/V types");
+            }
+            if (ggml_cuda_fattn_tile_f32_is_supported(ctx, dst)) {
+                return pxa_fa_take(PXA_FA_ROUTE_TILE_F32, true, "narrow, no vec instance for these K/V types");
+            }
         }
     }
 
@@ -570,6 +744,8 @@ const char * pxa_fa_route_name(pxa_fa_route route) {
         case PXA_FA_ROUTE_WMMA_F16:     return "wmma-f16";
         case PXA_FA_ROUTE_MMA_F16:      return "mma-f16";
         case PXA_FA_ROUTE_MMA_NEW:      return "mma-new";
+        case PXA_FA_ROUTE_QKV_DIRECT:   return "qkv-direct";
+        case PXA_FA_ROUTE_QKV_TILE:     return "qkv-tile";
         default:                        return "?";
     }
 }

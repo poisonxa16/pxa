@@ -3,6 +3,8 @@
 #include "../llama-context.h"
 #include "../llama-delta-net.h"
 
+bool pxa_verify_argmax_on();   // llama-build-context.cpp
+
 // PXA_MTP_LAZY_WARMUP_v1 (level resolved by llama_pxa_mtp_lazy_warmup(), include/llama.h):
 // with lazy warmup on, nothing consumes all-token MTP hidden rows on prompt-sized batches (the
 // companion warmup is skipped), so the out_ids row-slice can be re-enabled — restoring "last layer + output norm +
@@ -131,8 +133,13 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
         cb(cur, "result_output", -1);
+        lctx.pxa_res_t = cur;   // PXA_VERIFY_ARGMAX: the decode finds the logits here, not by position
     }
 
+    // PXA_TSPLIT_LMHEAD_DIRECT: the vocab-parallel head's leading slices go in ahead of the last one,
+    // which stays the graph's last node (llama_decode reads "result_output" from there)
+    for (auto * t : lctx.pxa_head_extra) ggml_build_forward_expand(gf, t);
+    lctx.pxa_head_extra.clear();
     ggml_build_forward_expand(gf, cur);
 
     return gf;
@@ -228,8 +235,18 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
         cb(cur, "result_output", -1);
+        lctx.pxa_res_t = cur;   // PXA_VERIFY_ARGMAX: the decode finds the logits here, not by position
+        if (lctx.pxa_fold_active) {
+            // the same row the commit is fed: the read-back finds "result_norm" (the head's normed
+            // input) ahead of "result_mtp_embd" by name, so that is what every commit has used
+            pxa_build_mtp_fold(lctx.pxa_result_norm_t ? lctx.pxa_result_norm_t : inpL, gf);   // PXA_MTP_FOLD
+        }
     }
 
+    // PXA_TSPLIT_LMHEAD_DIRECT: the vocab-parallel head's leading slices go in ahead of the last one,
+    // which stays the graph's last node (llama_decode reads "result_output" from there)
+    for (auto * t : lctx.pxa_head_extra) ggml_build_forward_expand(gf, t);
+    lctx.pxa_head_extra.clear();
     ggml_build_forward_expand(gf, cur);
 
     return gf;
@@ -409,7 +426,9 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     struct ggml_tensor * prev_embeddings,
     int64_t n_embd_head,
     struct ggml_cgraph * gf,
-    struct ggml_tensor * inp_pos) {
+    struct ggml_tensor * inp_pos,
+    struct ggml_tensor * tok_emb_in,
+    struct ggml_tensor ** hid_out) {
 
     const int il = hparams.n_layer - 1;
 
@@ -418,11 +437,11 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
 
     struct ggml_tensor * KQ_mask = store_only ? nullptr : build_inp_KQ_mask();
 
-    const bool want_out_ids = !store_only && n_outputs > 0 &&
+    const bool want_out_ids = tok_emb_in == nullptr && !store_only && n_outputs > 0 &&
                               (pxa_mtp_stable_out_ids() ? true : (n_tokens > 1 && n_outputs < n_tokens));
     struct ggml_tensor * inp_out_ids = want_out_ids ? build_inp_out_ids() : nullptr;
 
-    ggml_tensor * token_emb = build_inp_embd_mtp(model.tok_embd);
+    ggml_tensor * token_emb = tok_emb_in ? tok_emb_in : build_inp_embd_mtp(model.tok_embd);
 
     ggml_tensor * token_emb_norm = llm_build_norm(ctx0, token_emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il);
     ggml_tensor * hidden_state_norm = llm_build_norm(ctx0, prev_embeddings, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il);
@@ -499,9 +518,10 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     // and every chain conditioned on it collapsed. The trunk graph already protects its own feature
     // row this way (build_qwen35moe/build_qwen35: ggml_set_output(inpL) under "result_mtp_embd");
     // the head's row was the one left unprotected.
-    if (llama_pxa_mtp_head_output()) { // PXA_MTP_HEAD_OUTPUT=0 reproduces the stale read-back (debug only)
+    if (llama_pxa_mtp_head_output() || hid_out) { // PXA_MTP_HEAD_OUTPUT=0 reproduces the stale read-back (debug only)
         ggml_set_output(cur);
     }
+    if (hid_out) *hid_out = cur;   // PXA_MTP_FOLD
 
     //cur = build_output(lctx, ctx0, cur, model.output, nullptr, cb);
     // PXA_MTP_SHORTLIST: the DRAFT head may score a frequency-ranked subset of the head's
@@ -513,4 +533,66 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     cb(cur, "result_output", -1);
 
     return cur;
+}
+
+// PXA_MTP_FOLD (2026-09-28). Called by the TARGET's builder right after its head, while the
+// decode holds the companion prepared (its K/V slot for the fold rows found, its n_outputs = rows, its op
+// type set to the update pass and its input pointers cleared -- see llama_decode_internal). Row j of the
+// fold is the MTP head's update step at position P+1+j fed with (trunk hidden j, target argmax j): the
+// same computation as the separate commit decode's row j whenever the target accepts through row j and
+// samples greedily. Built with a builder over the COMPANION (its K/V, its head width, its cache-copy
+// records) sharing this graph's ggml context; everything it produces is a node of this graph.
+extern ggml_tensor * pxa_ggml_argmax_val(ggml_context * ctx, ggml_tensor * a);
+extern ggml_tensor * pxa_ggml_argmax_combine(ggml_context * ctx, const std::vector<ggml_tensor *> & parts);
+
+ggml_tensor * llm_build_context::pxa_build_mtp_fold(ggml_tensor * trunk_hidden, ggml_cgraph * gf) {
+    llama_context * comp = lctx.pxa_fold_ctx;
+    if (comp == nullptr || !lctx.pxa_fold_active || lctx.pxa_amax_parts.empty() ||
+            lctx.pxa_amax_parts.size() > 4 || lctx.pxa_amax_parts[0]->ne[1] != n_tokens) {
+        return nullptr;
+    }
+    ggml_tensor * ids = pxa_ggml_argmax_combine(ctx0, lctx.pxa_amax_parts);
+    ggml_set_name(ids, "pxa_fold_ids");
+    ggml_set_output(ids);
+    ggml_tensor * tok_emb = ggml_get_rows(ctx0, model.tok_embd, ids);
+    ggml_set_name(tok_emb, "pxa_fold_tok_emb");
+
+    llama_batch fb = {};
+    fb.n_tokens = (int32_t) lctx.pxa_fold_bpos.size();
+    fb.token    = lctx.pxa_fold_btok.data();
+    fb.pos      = lctx.pxa_fold_bpos.data();
+    fb.n_seq_id = lctx.pxa_fold_bnseq.data();
+    fb.seq_id   = lctx.pxa_fold_bseqp.data();
+    fb.logits   = lctx.pxa_fold_blog.data();
+    GGML_ASSERT(fb.n_tokens == n_tokens);
+
+    llm_build_context mb(*comp, fb, cb, false, false);
+    mb.ctx0 = ctx0;   // this graph's context; mb is never init()ed or free()d
+    ggml_tensor * inp_pos_f = mb.build_inp_pos();
+    ggml_tensor * hid = nullptr;
+    const int il_mtp = hparams.n_layer - 1;
+    ggml_tensor * logits = mb.build_qwen35_mtp(model.layers[il_mtp], trunk_hidden, hparams.n_embd_head_v(0), gf,
+                                               inp_pos_f, tok_emb, &hid);
+    if (logits == nullptr || hid == nullptr) {
+        return nullptr;
+    }
+    // the target's readers look for result_norm / result_output by name: the fold's must not match
+    ggml_set_name(hid, "pxa_fold_hid");
+    ggml_set_name(logits, "pxa_fold_logits");
+    ggml_tensor * amax = pxa_ggml_argmax_val(ctx0, logits);
+    ggml_set_name(amax, "pxa_fold_amax");
+    ggml_set_output(amax);
+    ggml_build_forward_expand(gf, ids);
+    ggml_build_forward_expand(gf, hid);
+    ggml_build_forward_expand(gf, amax);
+
+    lctx.pxa_fold_hid_t    = hid;
+    lctx.pxa_fold_amax_t   = amax;
+    lctx.pxa_fold_ids_t    = ids;
+    lctx.pxa_fold_inp_pos  = inp_pos_f;
+    lctx.pxa_fold_inp_mask = comp->inp_KQ_mask;
+    lctx.pxa_fold_cc       = comp->cache_copies;
+    lctx.pxa_fold_nkv      = (int32_t) comp->kv_self.n;
+    lctx.pxa_fold_built    = true;
+    return amax;
 }

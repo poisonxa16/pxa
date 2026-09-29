@@ -269,10 +269,6 @@ points across 48 layers. **[S]**
 - **No imatrix.** Owner: it is a net negative on our quants. Tier assignment
   therefore stays on the depth x kind sensitivity proxy. Task #40 is closed by
   this decision, not by being done.
-  *Superseded, 2026-09-21:* that reading was taken on raw text. Re-measured on
-  chat-templated text an importance matrix is a win at PXQ3/PXQ4 and ships as a
-  documented option (`PXA_PXQ_IMX=1`, default off) — see `docs/QUANTIZING.md`.
-  The recipes in this document were still built without one.
 - **`-ub` must be at least 1024.** The ub512 configuration is rejected even
   though it has the most headroom.
 - Push only to `private`, never `origin`. No model identifier in any artifact.

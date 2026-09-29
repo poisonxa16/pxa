@@ -2,13 +2,20 @@
 #include <atomic>
 #include <stdexcept>
 #include "llama-build-context.h"
+bool pxa_verify_argmax_on();
 #include "llama-hparams.h"
 #include "llama-cparams.h"
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-delta-net.h"
+#include "ggml-pxqn.h"
+#include "pxa-pxq-split.h"
+#include "pxa-tsplit.h"
 
 #include "ggml.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <unordered_set>
 #include <unordered_map>
@@ -264,9 +271,23 @@ ggml_cgraph * llm_build_context::build_s_copy() {
         }
 
         if (kv_self.s_l.size() > (size_t) il && kv_self.s_l[il] != nullptr) {
+            struct ggml_tensor * qnext_state_copy = ggml_view_1d(ctx0, state_copy, qnext_state_slots, 0);
+            if (kv_self.s_l[il]->extra) {
+                // bug #219: under -sm tensor/graph/attn the s_l container lives in the split buffer
+                // and has no bytes of its own (placeholder base); permute every device's head-split
+                // state rows in place instead.
+                auto split = (const ggml_split_tensor_t *) kv_self.s_l[il]->extra;
+                for (int id = 0; id < split->n_device; ++id) {
+                    ggml_tensor * t = split->splits[id];
+                    if (!t) continue;
+                    GGML_ASSERT((uint32_t) t->ne[1] == qnext_state_slots);
+                    ggml_tensor * rows = ggml_get_rows(ctx0, t, qnext_state_copy);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, rows, t));
+                }
+                continue;
+            }
             struct ggml_tensor * qnext_states_all = ggml_reshape_2d(ctx0, kv_self.s_l[il], hparams.n_embd_v_s(), kv_self.s_l[il]->ne[1]);
             GGML_ASSERT((uint32_t) qnext_states_all->ne[1] == qnext_state_slots);
-            struct ggml_tensor * qnext_state_copy = ggml_view_1d(ctx0, state_copy, qnext_state_slots, 0);
             struct ggml_tensor * qnext_states = ggml_get_rows(ctx0, qnext_states_all, qnext_state_copy);
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, qnext_states, kv_self.s_l[il]));
@@ -278,6 +299,11 @@ ggml_cgraph * llm_build_context::build_s_copy() {
 
 ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids) {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
+
+    // bug #211: the moves of a split KV cache's layers (-sm tensor/graph/attn), emitted below
+    struct defrag_move { uint32_t i, id, nm; };
+    std::vector<defrag_move> moves;
+    bool split_moves = false;
 
     for (uint32_t i = 0; i < ids.size(); ++i) {
         const uint32_t id = ids[i];
@@ -299,6 +325,11 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
             if (kv_self.k_l[il] == nullptr) {
                 continue;
             }
+            if (kv_self.k_l[il]->extra) {
+                // bug #211: split layers are moved after this loop, device by device
+                split_moves = true;
+                continue;
+            }
             const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
             const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -317,7 +348,10 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
 
             if (kv_self.v_l.size() > il && kv_self.v_l[il] != nullptr) {
                 // Note: with MLA the V cache may not be present.
-                if (flash_attn) {
+                // The layout is the one the cache was written with: kv_self.v_trans, which is
+                // also false for hybrids WITHOUT flash attention (keying this on flash_attn
+                // moved a hybrid's V rows as if transposed: wrong tokens after any defrag).
+                if (!kv_self.v_trans) {
                     // NOTE: the V cache is not transposed when using flash attention
                     view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
                             n_embd_v_gqa, nm,
@@ -347,7 +381,65 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
             }
         }
 
+        moves.push_back({ i, id, nm });
         i += nm - 1;
+    }
+
+    if (split_moves) {
+        // bug #211: a split KV cache keeps its bytes in the per-device slices; the parent
+        // k_l/v_l only carry the split buffer's placeholder base. Move the rows inside every
+        // device's slice, each with that slice's own row width (a slice holds kv_self.size
+        // rows). DEVICE-MAJOR order: the scheduler opens a new split every time consecutive
+        // nodes change backend, so interleaving the devices per move and layer made thousands
+        // of splits and tripped GGML_SCHED_MAX_SPLITS on the first real compaction. One device
+        // after the other is one split per device.
+        auto move_rows = [&](ggml_tensor * t, bool transposed, const defrag_move & m) {
+            if (t == nullptr) return;
+            GGML_ASSERT(ggml_nelements(t) % kv_self.size == 0);
+            const int64_t w = ggml_nelements(t) / kv_self.size;
+            ggml_tensor * src;
+            ggml_tensor * dst;
+            if (!transposed) {
+                src = ggml_view_2d(ctx0, t, w, m.nm, ggml_row_size(t->type, w), ggml_row_size(t->type, w*m.i));
+                dst = ggml_view_2d(ctx0, t, w, m.nm, ggml_row_size(t->type, w), ggml_row_size(t->type, w*m.id));
+            } else {
+                src = ggml_view_2d(ctx0, t, m.nm, w, ggml_row_size(t->type, kv_self.size), ggml_row_size(t->type, m.i));
+                dst = ggml_view_2d(ctx0, t, m.nm, w, ggml_row_size(t->type, kv_self.size), ggml_row_size(t->type, m.id));
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        };
+        int n_device = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            if (kv_self.k_l[il] && kv_self.k_l[il]->extra) {
+                n_device = std::max(n_device, ((const ggml_split_tensor_t *) kv_self.k_l[il]->extra)->n_device);
+            }
+        }
+        for (int is = 0; is < n_device; ++is) {
+            for (int il = 0; il < n_layer; ++il) {
+                if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
+                    continue;
+                }
+                if (kv_self.k_l[il] == nullptr || kv_self.k_l[il]->extra == nullptr) {
+                    continue;
+                }
+                auto kx = (const ggml_split_tensor_t *) kv_self.k_l[il]->extra;
+                const ggml_split_tensor_t * vx = nullptr;
+                if (kv_self.v_l.size() > (size_t) il && kv_self.v_l[il] != nullptr) {
+                    vx = (const ggml_split_tensor_t *) kv_self.v_l[il]->extra;
+                    GGML_ASSERT(vx != nullptr);
+                }
+                for (const auto & m : moves) {
+                    if (is < kx->n_device) {
+                        move_rows(kx->splits[is], false, m);
+                    }
+                    if (vx && is < vx->n_device) {
+                        // the split V writer (build_std_attention) transposes exactly when
+                        // flash attention is off, so the move follows the same rule
+                        move_rows(vx->splits[is], !flash_attn, m);
+                    }
+                }
+            }
+        }
     }
 
     //LLAMA_LOG_INFO("gf->n_nodes = %d\n", gf->n_nodes);
@@ -820,6 +912,90 @@ ggml_tensor * llm_build_context::do_split_norm(ggml_context * ctx, ggml_tensor *
     return cur;
 }
 
+// ---------------------------------------------------------------------------------------------
+// PXQN: the activation-site rotation a rotated PXQN file needs (GGML_OP_PXQN_RHT, closed library). Inserted
+// once per site, where the site is produced; identity when the model does not rotate the site.
+// ---------------------------------------------------------------------------------------------
+ggml_tensor * llm_build_context::build_pxqn_rht(ggml_context * ctx, const llama_hparams & hp, ggml_tensor * x,
+        int il, int site, int64_t k0) {
+    if (!(hp.pxqn_rot_sites & PXQN_SITE_BIT(site))) {
+        return x;
+    }
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    if (x->nb[0] != sizeof(float)) {
+        x = ggml_cont(ctx, x);
+    }
+    GGML_ASSERT(x->ne[0] % PXQN_RHT_BLOCK == 0 && k0 % PXQN_RHT_BLOCK == 0);
+    ggml_tensor * y = ggml_pxqn_rht(ctx, x, hp.pxqn_rot_seed, il, site, (int) k0);
+    ggml_format_name(y, "pxqn_rht_%s-%d", site == PXQN_SITE_ATTN_IN ? "attn_in" : site == PXQN_SITE_FFN_IN ? "ffn_in" :
+                                          site == PXQN_SITE_DOWN_IN ? "down_in" : "out_in", il);
+    return y;
+}
+
+// The decode GEMV that absorbs a PXQN_RHT (ggml_cuda_pxqn_rht_mul_mat) reads the RHT's INPUT x while it
+// writes the MUL_MAT's output. In the plain graph x's last consumer is the RHT node, so ggml-alloc may hand
+// x's bytes to the MUL_MAT output, and the fusion has to decline on that overlap (it did on the common
+// path: 184 unfused RHT launches per card per token on 2x P100 tensor split). Naming x as an extra source
+// of the MUL_MAT keeps it live through the GEMV, so the allocator can never place the output over it.
+// Plain MUL_MAT ignores src[2] on every backend; the unfused route computes exactly what it did.
+ggml_tensor * llm_build_context::pxqn_rht_keep_input(ggml_tensor * mm) {
+    if (mm && mm->op == GGML_OP_MUL_MAT && !mm->src[2] &&
+        mm->src[1] && mm->src[1]->op == GGML_OP_PXQN_RHT && mm->src[1]->src[0]) {
+        mm->src[2] = mm->src[1]->src[0];
+    }
+    // : the head-split form (build_pxqn_rht_ranges: [reshape of] concat(RHT(view_0 x), RHT(view_1 x), ..)),
+    // whose RHTs the CUDA decode path runs straight into the concat's output (ggml_cuda_pxqn_rht_ranges_place): keep x --
+    // the views' root -- live through the MUL_MAT the same way, so that output is never placed over x
+    if (mm && mm->op == GGML_OP_MUL_MAT && !mm->src[2] && mm->src[1]) {
+        const ggml_tensor * t = mm->src[1];
+        if (t->op == GGML_OP_RESHAPE) t = t->src[0];
+        while (t && t->op == GGML_OP_CONCAT) t = t->src[0];
+        if (t && t->op == GGML_OP_PXQN_RHT && t->src[0] && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src) {
+            mm->src[2] = t->src[0]->view_src;
+        }
+    }
+    return mm;
+}
+
+ggml_tensor * llm_build_context::build_pxqn_rht_ranges(ggml_context * ctx, const llama_hparams & hp, ggml_tensor * x,
+        int il, int site, const std::vector<std::pair<int,int>> & ranges) {
+    if (!(hp.pxqn_rot_sites & PXQN_SITE_BIT(site))) {
+        return x;
+    }
+    if (ranges.empty()) {
+        return build_pxqn_rht(ctx, hp, x, il, site, 0);
+    }
+    if (ranges.size() == 1) {
+        GGML_ASSERT(ranges[0].second == x->ne[0]);
+        return build_pxqn_rht(ctx, hp, x, il, site, ranges[0].first);
+    }
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    if (!ggml_is_contiguous(x)) {
+        x = ggml_cont(ctx, x);
+    }
+    const int64_t nrows = ggml_nrows(x);
+    ggml_tensor * x2 = ggml_reshape_2d(ctx, x, x->ne[0], nrows);
+    ggml_tensor * out = nullptr;
+    int64_t off = 0;
+    for (const auto & r : ranges) {
+        GGML_ASSERT(r.first % PXQN_RHT_BLOCK == 0 && r.second % PXQN_RHT_BLOCK == 0);
+        ggml_tensor * v = ggml_view_2d(ctx, x2, r.second, nrows, x2->nb[1], (size_t) off*sizeof(float));
+        ggml_tensor * y = ggml_pxqn_rht(ctx, v, hp.pxqn_rot_seed, il, site, r.first);
+        out = out ? ggml_concat(ctx, out, y, 0) : y;
+        off += r.second;
+    }
+    GGML_ASSERT(off == x->ne[0]);
+    return ggml_reshape(ctx, out, x);
+}
+
+int64_t llm_build_context::pxqn_split_k0(const ggml_split_tensor_t * st, int id) {
+    int64_t k0 = 0;
+    for (int j = 0; j < id; ++j) {
+        if (st->splits[j]) k0 += st->splits[j]->ne[0];
+    }
+    return k0;
+}
+
 ggml_tensor * llm_build_context::llm_build_ffn(
         ggml_context * ctx,
        llama_context & lctx,
@@ -863,12 +1039,15 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             if (input->op != GGML_OP_REDUCE) {
                 cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
             }
+            cur = build_pxqn_rht(ctx, lctx.model.hparams, cur, il, PXQN_SITE_FFN_IN);   // PXQN ffn_in
             cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, unary_op);
             cb(cur, "ffn_up_gate", il_cb);
             if (lctx.model.arch == LLM_ARCH_STEP35) {
                 *(float *)(cur->op_params + 1) = lctx.model.hparams.swiglu_limits[il];
             }
-            cur = llm_build_lora_mm(lctx, ctx, split_d, cur);
+            // PXQN down_in: this device's slice of ffn_down's K is [k0, k0 + ne0)
+            cur = build_pxqn_rht(ctx, lctx.model.hparams, cur, il, PXQN_SITE_DOWN_IN, pxqn_split_k0(d, id));
+            cur = pxqn_rht_keep_input(llm_build_lora_mm(lctx, ctx, split_d, cur));
             cb(cur, "ffn_down", il_cb);
             if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
                 // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
@@ -917,6 +1096,11 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     if (cur->type != GGML_TYPE_F32) {
         cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
     }
+    if (ffn_norm) {
+        cur = build_pxqn_rht(ctx, lctx.model.hparams, cur, il, PXQN_SITE_FFN_IN);   // PXQN ffn_in
+    } else if (lctx.model.hparams.pxqn_rot_sites & PXQN_SITE_BIT(PXQN_SITE_FFN_IN)) {
+        GGML_ABORT("PXQN: ffn_in rotation needs the ffn norm inside llm_build_ffn (layer %d)", il);
+    }
 
     if (lctx.cparams.fused_up_gate &&
         up && gate && !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
@@ -929,7 +1113,8 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             *(float *)(cur->op_params + 1) = lctx.model.hparams.swiglu_limits_shared[il];
         }
         if (down) {
-            cur = llm_build_lora_mm(lctx, ctx, down, cur);
+            cur = build_pxqn_rht(ctx, lctx.model.hparams, cur, il, PXQN_SITE_DOWN_IN);   // PXQN down_in
+            cur = pxqn_rht_keep_input(llm_build_lora_mm(lctx, ctx, down, cur));
             cb(cur, "ffn_down", il);
             if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
                 // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
@@ -1060,7 +1245,8 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     }
 
     if (down) {
-        cur = llm_build_lora_mm(lctx, ctx, down, cur);
+        cur = build_pxqn_rht(ctx, lctx.model.hparams, cur, il, PXQN_SITE_DOWN_IN);   // PXQN down_in
+        cur = pxqn_rht_keep_input(llm_build_lora_mm(lctx, ctx, down, cur));
         if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -1262,120 +1448,178 @@ llm_expert_gating_func_type   gating_op,
         cb(cur, "ffn_moe_weighted", il);
     }
 
-    // For now we don't modify the fused up/gate op to include biases.
-    // Hence, if we have biases, we cannot use fmoe.
-    //
-    //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
-    bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI_MOE);
+    // The routed-expert chain (up/gate -> GLU -> down) over one expert stack. PXA_XCACHE runs it
+    // twice -- once over the resident hot stack, once over the pinned cold stack, each with the ids
+    // of its own side (-1 elsewhere) -- and merges the two outputs slot by slot before the
+    // weighting below, so everything downstream of `experts` is the one-stack graph unchanged.
+    std::string xc_sfx;
+    auto xname = [&](const char * n) -> const char * {
+        static thread_local std::string tmp;
+        tmp = n; tmp += xc_sfx;
+        return tmp.c_str();
+    };
+    auto build_experts = [&](ggml_tensor * up_exps, ggml_tensor * gate_exps, ggml_tensor * down_exps,
+                             ggml_tensor * up_gate_exps, ggml_tensor * selected_experts) -> ggml_tensor * {
+        // For now we don't modify the fused up/gate op to include biases.
+        // Hence, if we have biases, we cannot use fmoe.
+        //
+        //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
+        bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI_MOE);
 
-    // PXA/DSV4: none of the fused up/gate kernels can express DS4's asymmetric
-    // clamp (up two-sided, gate one-sided), so take the explicit branch below.
-    if (dsv4_clamp) {
-        can_use_fmoe = false;
-    }
-
-    ggml_tensor * par;
-    // PXA_FMOE_CLAMP (2026-09-08). The asymmetric clamp above is the ONLY
-    // reason DeepSeek-V4 / GLM-5.3-Flash took the unfused branch, and the price of that branch
-    // is severe: three standalone MUL_MAT_ID nodes reach NONE of the fused PXQ MoE drivers, so
-    // every one of them pays the generic loop's host ids readback + cudaStreamSynchronize
-    // inside graph compute (126 of them per decode token on GLM-5.3-Flash's 42 MoE blocks) and
-    // a per-expert launch triple. ggml_moe_up_gate_clamped carries the clamp in op_params[2]
-    // and the CUDA GLU epilogue (pxq4_glu_apply arm `unary == 2`) applies it, so the fused
-    // drivers can serve these architectures without changing the function they compute.
-    // Default OFF: this changes the accumulation shape of the routed experts and so is a
-    // measured, gated change, not a silent one.
-    if (dsv4_clamp && pxa_fmoe_clamp_enabled() && !up_gate_exps && !up_gate_exps_b &&
-        up_exps && gate_exps && !up_exps_b && !gate_exps_b &&
-        lctx.cparams.fused_moe_up_gate &&
-        ggml_moe_up_gate_can_fuse(up_exps->type, gate_exps->type)) {
-        par = ggml_moe_up_gate_clamped(ctx, up_exps, gate_exps, cur, selected_experts, dsv4_limit);
-        cb(par, "ffn_moe_swiglu_limited_fused", il);
-    } else if (can_use_fmoe && up_gate_exps) {
-        if (up_gate_exps_b) {
-            par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
-        } else {
-            GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI_MOE);
-            par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur, selected_experts,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
-        }
-        if (lctx.model.arch == LLM_ARCH_STEP35) {
-            *((float *)(par->op_params + 1)) = lctx.model.hparams.swiglu_limits[il];
-        }
-    } else {
-    GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
-
-    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && ggml_moe_up_gate_can_fuse(up_exps->type, gate_exps->type)) {
-        if (up_exps_b || gate_exps_b) {
-            par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
-        } else {
-            GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI_MOE);
-            par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, selected_experts,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
-        }
-        if (lctx.model.arch == LLM_ARCH_STEP35) {
-            *(float *)(par->op_params + 1) = lctx.model.hparams.swiglu_limits[il];
-        }
-    } else {
-        ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
-
-        ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-        cb(gate, "ffn_moe_gate", il);
-
-        if (graph) {
-            // So we can potentially fuse the up and gate mul_mat_id
-            ggml_build_forward_expand(graph, up);
-            ggml_build_forward_expand(graph, gate);
-        }
-
-        if (up_exps_b) {
-            up = ggml_add_id(ctx, up, up_exps_b, selected_experts);
-            cb(up, "ffn_moe_up_biased", il);
-        }
-
-        if (gate_exps_b) {
-            gate = ggml_add_id(ctx, gate, gate_exps_b, selected_experts);
-            cb(gate, "ffn_moe_gate_biased", il);
-        }
-
+        // PXA/DSV4: none of the fused up/gate kernels can express DS4's asymmetric
+        // clamp (up two-sided, gate one-sided), so take the explicit branch below.
         if (dsv4_clamp) {
-            // DeepSeek-V4: clamp BOTH halves, then silu(gate)*up. Order matters -
-            // clamping silu(gate) instead of gate is a different (wrong) function.
-            up   = ggml_clamp(ctx, up,   -dsv4_limit, dsv4_limit);
-            cb(up, "ffn_moe_up_clamped", il);
-            gate = ggml_clamp(ctx, gate, -INFINITY,   dsv4_limit);
-            cb(gate, "ffn_moe_gate_clamped", il);
-            par  = ggml_swiglu_split(ctx, gate, up);
-            cb(par, "ffn_moe_swiglu_limited", il);
-        } else if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
-            par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+            can_use_fmoe = false;
+        }
+
+        ggml_tensor * par;
+        // PXA_FMOE_CLAMP (2026-09-08). The asymmetric clamp above is the ONLY
+        // reason DeepSeek-V4 / GLM-5.3-Flash took the unfused branch, and the price of that branch
+        // is severe: three standalone MUL_MAT_ID nodes reach NONE of the fused PXQ MoE drivers, so
+        // every one of them pays the generic loop's host ids readback + cudaStreamSynchronize
+        // inside graph compute (126 of them per decode token on GLM-5.3-Flash's 42 MoE blocks) and
+        // a per-expert launch triple. ggml_moe_up_gate_clamped carries the clamp in op_params[2]
+        // and the CUDA GLU epilogue (pxq4_glu_apply arm `unary == 2`) applies it, so the fused
+        // drivers can serve these architectures without changing the function they compute.
+        // Default OFF: this changes the accumulation shape of the routed experts and so is a
+        // measured, gated change, not a silent one.
+        if (dsv4_clamp && pxa_fmoe_clamp_enabled() && !up_gate_exps && !up_gate_exps_b &&
+            up_exps && gate_exps && !up_exps_b && !gate_exps_b &&
+            lctx.cparams.fused_moe_up_gate &&
+            ggml_moe_up_gate_can_fuse(up_exps->type, gate_exps->type)) {
+            par = ggml_moe_up_gate_clamped(ctx, up_exps, gate_exps, cur, selected_experts, dsv4_limit);
+            cb(par, xname("ffn_moe_swiglu_limited_fused"), il);
+        } else if (can_use_fmoe && up_gate_exps) {
+            if (up_gate_exps_b) {
+                par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
+                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
+            } else {
+                GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI_MOE);
+                par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur, selected_experts,
+                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+            }
             if (lctx.model.arch == LLM_ARCH_STEP35) {
                 *((float *)(par->op_params + 1)) = lctx.model.hparams.swiglu_limits[il];
             }
-        } else if (type_op == LLM_FFN_SWIGLU_OAI_MOE) {
-            constexpr float alpha = 1.702f;
-            constexpr float limit = 7.0f;
-            par = ggml_swiglu_oai(ctx, gate, up, alpha, limit);
+        } else {
+        GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
+
+        if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && ggml_moe_up_gate_can_fuse(up_exps->type, gate_exps->type)) {
+            if (up_exps_b || gate_exps_b) {
+                par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
+                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
+            } else {
+                GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI_MOE);
+                par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, selected_experts,
+                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+            }
+            if (lctx.model.arch == LLM_ARCH_STEP35) {
+                *(float *)(par->op_params + 1) = lctx.model.hparams.swiglu_limits[il];
+            }
+        } else {
+            ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cb(up, xname("ffn_moe_up"), il);
+
+            ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cb(gate, xname("ffn_moe_gate"), il);
+
+            if (graph) {
+                // So we can potentially fuse the up and gate mul_mat_id
+                ggml_build_forward_expand(graph, up);
+                ggml_build_forward_expand(graph, gate);
+            }
+
+            if (up_exps_b) {
+                up = ggml_add_id(ctx, up, up_exps_b, selected_experts);
+                cb(up, xname("ffn_moe_up_biased"), il);
+            }
+
+            if (gate_exps_b) {
+                gate = ggml_add_id(ctx, gate, gate_exps_b, selected_experts);
+                cb(gate, xname("ffn_moe_gate_biased"), il);
+            }
+
+            if (dsv4_clamp) {
+                // DeepSeek-V4: clamp BOTH halves, then silu(gate)*up. Order matters -
+                // clamping silu(gate) instead of gate is a different (wrong) function.
+                up   = ggml_clamp(ctx, up,   -dsv4_limit, dsv4_limit);
+                cb(up, xname("ffn_moe_up_clamped"), il);
+                gate = ggml_clamp(ctx, gate, -INFINITY,   dsv4_limit);
+                cb(gate, xname("ffn_moe_gate_clamped"), il);
+                par  = ggml_swiglu_split(ctx, gate, up);
+                cb(par, xname("ffn_moe_swiglu_limited"), il);
+            } else if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
+                par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+                if (lctx.model.arch == LLM_ARCH_STEP35) {
+                    *((float *)(par->op_params + 1)) = lctx.model.hparams.swiglu_limits[il];
+                }
+            } else if (type_op == LLM_FFN_SWIGLU_OAI_MOE) {
+                constexpr float alpha = 1.702f;
+                constexpr float limit = 7.0f;
+                par = ggml_swiglu_oai(ctx, gate, up, alpha, limit);
+            }
+            else {
+                GGML_ABORT("fatal error");
+            }
+
         }
-        else {
-            GGML_ABORT("fatal error");
+        }
+        cb(par, xname("ffn_moe_gate_par"), il);
+
+        // K-STRADDLE (pxa-pxq-split.h): a down shard whose K is wider than this device's slice of n_ff
+        // carries its K window; zero-pad the activation to the shard's K (exact on every path; the fused PXQN MoE
+        // kernels read the window and never compute the padding)
+        {
+            int kw_lo = 0, kw_hi = 0;
+            if (down_exps->ne[0] != par->ne[0] && pxa_kwin_get(down_exps, &kw_lo, &kw_hi)) {
+                GGML_ASSERT(kw_hi - kw_lo == par->ne[0]);
+                par = ggml_pad_ext(ctx, par, kw_lo, (int)(down_exps->ne[0] - kw_hi), 0, 0, 0, 0, 0, 0);
+                cb(par, xname("ffn_moe_par_kwin"), il);
+            }
         }
 
-    }
-    }
-    cb(par, "ffn_moe_gate_par", il);
+        ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
+        cb(experts, xname("ffn_moe_down"), il);
 
-    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
-    cb(experts, "ffn_moe_down", il);
+        if (down_exps_b) {
+            experts = ggml_add_id(ctx, experts, down_exps_b, selected_experts);
+            cb(experts, xname("ffn_moe_down_biased"), il);
+        }
 
-    if (down_exps_b) {
-        experts = ggml_add_id(ctx, experts, down_exps_b, selected_experts);
-        cb(experts, "ffn_moe_down_biased", il);
+        return experts;
+    };
+
+    // PXA_XCACHE: is this layer's expert stack split into hot + cold stacks?
+    const llama_layer * xcl = nullptr;
+    if (il >= 0 && il < (int)lctx.model.layers.size()) {
+        const llama_layer & L = lctx.model.layers[il];
+        if (L.ffn_exps_xmap && L.ffn_down_exps == down_exps && L.ffn_down_exps_xc &&
+            (up_gate_exps ? (L.ffn_up_gate_exps == up_gate_exps && L.ffn_up_gate_exps_xc)
+                          : (L.ffn_up_exps == up_exps && L.ffn_gate_exps == gate_exps && L.ffn_up_exps_xc && L.ffn_gate_exps_xc))) {
+            xcl = &L;
+        }
+    }
+    ggml_tensor * experts = nullptr;
+    if (xcl) {
+        GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b);
+        ggml_tensor * ids_hot  = ggml_moe_split_ids(ctx, selected_experts, xcl->ffn_exps_xmap, 0);
+        cb(ids_hot, "ffn_moe_ids_hot", il);
+        ggml_tensor * ids_cold = ggml_moe_split_ids(ctx, selected_experts, xcl->ffn_exps_xmap, 1);
+        cb(ids_cold, "ffn_moe_ids_cold", il);
+        ggml_tensor * exp_hot  = build_experts(up_exps, gate_exps, down_exps, up_gate_exps, ids_hot);
+        xc_sfx = "_xc";
+        ggml_tensor * exp_cold = build_experts(xcl->ffn_up_exps_xc, xcl->ffn_gate_exps_xc, xcl->ffn_down_exps_xc,
+                                               up_gate_exps ? xcl->ffn_up_gate_exps_xc : nullptr, ids_cold);
+        xc_sfx.clear();
+        experts = ggml_moe_merge(ctx, exp_hot, exp_cold, ids_hot, ids_cold);
+        cb(experts, "ffn_moe_down_merged", il);
+    } else {
+        // a hot stack must never be read as if it were the whole stack
+        GGML_ASSERT(!(down_exps && strstr(down_exps->name, "_exps.weight.xh")) &&
+                    "PXA_XCACHE: a split expert stack reached llm_build_moe_ffn without its layer (set PXA_XCACHE=0)");
+        experts = build_experts(up_exps, gate_exps, down_exps, up_gate_exps, selected_experts);
     }
 
     if (down_exps_s && !lctx.cparams.fused_mmad) {
@@ -1772,6 +2016,38 @@ static bool pxa_fa_gpu_fallback_armed() {
     return v;
 }
 
+// PXA_FA_SM61_D256_WIDE_CHAIN (2026-09-25, bug #235 follow-up, main #8658). Default ON.
+//
+// Bug #235 gave sm_61 (GTX 1080 Ti) a head-256 kernel for K/V pairs it used to decline (the new
+// q4_0 vec instance; tile-f32 for the rest). Decode gained (+22.5%), but those declined nodes had
+// been built as the unfused chain by PXA_FA_GPU_FALLBACK, and for PREFILL the chain is the faster
+// route on this card: PXA-Agent-9B PXQ4, q4_0 KV, REPS 3, pp 502.0 (chain) -> 312.3 (vec-f32 at
+// every width) = -37.8%. So a wide batch (more than 8 query columns) over head 256 keeps the
+// chain on sm_61 for exactly the K/V pairs the chain served before #235 (anything but f16/f16 and
+// q8_0/q8_0); narrow nodes take the new kernel. The CUDA support answer is unchanged, so with this
+// off (PXA_FA_SM61_D256_WIDE_CHAIN=0) every width takes the fused kernel. Applies only when every
+// visible CUDA device lacks fast fp16 (cc 610..699), i.e. a 1080 Ti-only context.
+static bool pxa_fa_sm61_d256_wide_chain(int64_t n_tokens, int64_t d_k, int64_t d_v, ggml_type tk, ggml_type tv) {
+    if (n_tokens <= 8 || d_k != 256 || d_v != 256) return false;
+    if ((tk == GGML_TYPE_F16 && tv == GGML_TYPE_F16) || (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q8_0)) return false;
+    static const bool on = [](){
+        const char * e = getenv("PXA_FA_SM61_D256_WIDE_CHAIN");
+        if (e && *e && atoi(e) == 0) return false;
+#ifdef GGML_USE_CUDA
+        const int n = ggml_backend_cuda_get_device_count();
+        if (n <= 0) return false;
+        for (int i = 0; i < n; ++i) {
+            const int cc = ggml_backend_cuda_get_device_cc(i);
+            if (cc < 610 || cc >= 700) return false;
+        }
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return on;
+}
+
 // PXA_GEMMA4_ASSISTANT, 2026-09-13. Default OFF.
 //
 // The Gemma-4 assistant drafter (arch gemma4_mtp: 4 layers, 1024 wide, no k_proj/v_proj — it reads
@@ -1851,10 +2127,19 @@ static int64_t pxa_fa_d512_fused_maxcols() {
     return v;
 }
 
-// PXA_FA_D512_FUSED_MINKV (2026-09-20) -- the fused 512/512 kernels are exact-grade on a long
-// context and WRONG on a very short one, and until that is understood the short case keeps the
-// chain. Measured on Gemma 4 26B-A4B, one fused one-column decode step against the chain on the
-// same context (the token before it comes from a chain prefill in both arms and is bit-equal
+// PXA_FA_D512_FUSED_MINKV (2026-09-20) -- a context floor for the fused 512/512 route. ROOT CAUSE
+// CORRECTED 2026-09-28 (bug gemma4-d512-fused-short-prefill): the table below compares the fused
+// step against the CHAIN, and it is the chain that was wrong, not the fused kernels. Against a
+// double-precision reference (tests/test-fa-d512-short-kv.cpp, V100, 1..1500 live keys), both fused
+// kernels are within NMSE 1e-6 at every KV length; the chain, whose two batched cuBLAS products ran
+// with fp16 accumulation and fp16 scores (GGML_PREC_DEFAULT), was at NMSE 7e-5 with 6 live keys
+// falling to 5e-6 at 1,024 (logit spread 1) and 1e-3..2e-2 at wide logits -- largest at a short
+// context, where a few keys carry the whole output and their score errors do not average out.
+// That is the "fixed number of wrongly weighted keys diluted by the real ones" read below, on the
+// other arm. The chain now accumulates in fp32 (PXA_FA_D512_CHAIN_F32 below). The floor stays: it
+// costs nothing (the fused step is no faster than the chain at a short context) and it is not a
+// correctness fence any more. The original record, measured on Gemma 4 26B-A4B, one fused
+// one-column decode step against the chain on the same context (the token before it comes from a chain prefill in both arms and is bit-equal
 // 40/40, so everything that moves is this one step), 40 contexts:
 //
 //   context tokens   top-1 agrees   max |dp| of the top-1   max KLD over the top 10
@@ -1889,6 +2174,23 @@ static int64_t pxa_fa_d512_fused_minkv() {
     return v;
 }
 
+// PXA_FA_D512_CHAIN_F32 (2026-09-28, default on) -- the unfused chain of a 512/512 head (every
+// 512-wide layer on a card without the fused kernel, and the short-context / wide-batch cells the
+// fused route leaves to the chain on sm_70) requests GGML_PREC_F32 on both of its products. With
+// the default precision the CUDA backend runs K*Q and V*softmax as batched cuBLAS GEMMs with fp16
+// compute and fp16 output: a 512-term dot product accumulated in half and a score rounded to half
+// before the softmax. Measured against a double-precision reference on one V100 (one decode column,
+// 16/2 heads, test-fa-d512-short-kv): chain NMSE 7.1e-5 -> 1.3e-8 with 6 live keys and 2.0e-2 ->
+// 1.8e-8 at 1,024 keys with a logit spread of 24 (the scores alone, 1.1e-7). 0 restores the fp16
+// chain byte for byte.
+bool pxa_fa_d512_chain_f32() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_FA_D512_CHAIN_F32");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return v;
+}
+
 static bool pxa_fa_d512_lever_set_by_hand() {
     static const bool v = [] {
         const char * e = getenv("PXA_FA_D512_VOLTA");
@@ -1916,7 +2218,14 @@ static bool pxa_fa_node_runs_on_gpu(
         ^ ((uint64_t) (has_sinks    ? 1 : 0) << 50)
         ^ ((uint64_t) (f32_precision? 1 : 0) << 51)
         ^ ((uint64_t) (softcap != 0.0f ? 1 : 0) << 52)
-        ^ ((uint64_t) (require_all  ? 1 : 0) << 53);
+        ^ ((uint64_t) (require_all  ? 1 : 0) << 53)
+        // PXA_FA_PROBE_WIDTH (2026-09-25): the CUDA planner's answer depends on the
+        // query width (pre-Volta: <= 8 columns -> vec kernels with a short type list, wider -> tile
+        // kernels that take any type). Without the width class in the key, a context whose FIRST
+        // probe was narrow (the MTP draft context) cached "no" for every width and built the
+        // unfused chain for its prompt catch-up too; a context whose first probe was wide cached
+        // "yes" and let a decode node the backend refuses land on the CPU backend.
+        ^ ((uint64_t) (n_tokens <= 8 ? 1 : 0) << 54);
 
     static std::unordered_map<uint64_t, bool> cache;
     auto it = cache.find(key);
@@ -2083,7 +2392,24 @@ static ggml_tensor * llm_build_kqv(
                 pxa_d512_mark   = true;
             }
         }
-        if (pxa_fa_to_cpu && pxa_wide_d512) {
+        // Bug #235 follow-up: a wide head-256 batch on sm_61 keeps the chain (measured faster there).
+        bool pxa_sm61_chain = false;
+        if (!pxa_fa_to_cpu && pxa_fa_sm61_d256_wide_chain(n_tokens, n_embd_head_k, n_embd_head_v,
+                                                         k_cache->type, v_cache->type)) {
+            pxa_fa_to_cpu  = true;
+            pxa_sm61_chain = true;
+            static bool pxa_told_sm61 = false;
+            if (!pxa_told_sm61) {
+                pxa_told_sm61 = true;
+                LLAMA_LOG_INFO("PXA_FA_SM61_D256_WIDE_CHAIN: layer %d (head 256, K %s / V %s) builds the unfused "
+                               "attention chain for query batches wider than 8 on sm_61; narrow batches take the "
+                               "fused kernel (PXA_FA_SM61_D256_WIDE_CHAIN=0 reverts)\n",
+                               il, ggml_type_name(k_cache->type), ggml_type_name(v_cache->type));
+            }
+        }
+        if (pxa_sm61_chain) {
+            // told above
+        } else if (pxa_fa_to_cpu && pxa_wide_d512) {
             static bool pxa_told_wide = false;
             if (!pxa_told_wide) {
                 pxa_told_wide = true;
@@ -2165,6 +2491,12 @@ static ggml_tensor * llm_build_kqv(
                         ggml_row_size(v_cache->type, n_embd_v_gqa),
                         ggml_row_size(v_cache->type, n_embd_head_v),
                         0);
+                // PXA_FA_CHAIN_QV (2026-09-25): a quantized FA-layout V cache cannot be transposed
+                // in place (ggml_cuda_cpy has no q->q strided copy: it aborted the first MTP draft
+                // with -ctv q4_0). Dequantize to f16 first; the chain then runs as with an f16 cache.
+                if (ggml_is_quantized(v->type)) {
+                    v = ggml_cast(ctx, v, GGML_TYPE_F16);
+                }
                 v = ggml_cont(ctx, ggml_transpose(ctx, v));
             }
             if (v_cache_view) {
@@ -2180,7 +2512,10 @@ static ggml_tensor * llm_build_kqv(
 
             //ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
-            if (should_use_f32_precision) {
+            // PXA_FA_D512_CHAIN_F32: a 512-wide head accumulates in fp32 (see the definition).
+            const bool pxa_d512_chain_f32 = n_embd_head_k == 512 && n_embd_head_v == 512 && pxa_fa_d512_chain_f32();
+
+            if (should_use_f32_precision || pxa_d512_chain_f32) {
                 // for this arch, we need to perform the KQ multiplication with F32 precision, otherwise we get NaNs
                 // ref: https://github.com/ggerganov/llama.cpp/pull/4490#issuecomment-1859055847
                 ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
@@ -2215,6 +2550,9 @@ static ggml_tensor * llm_build_kqv(
             GGML_ASSERT(kv.size == n_ctx);
 
             struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+            if (pxa_d512_chain_f32) {
+                ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
+            }
             cb(kqv, "kqv", il);
 
             struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
@@ -2590,6 +2928,85 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
     return cur;
 }
 
+// PXA_TSPLIT_LMHEAD_DIRECT applies to the main logits of a plain (non-MTP, non-embeddings) qwen35 context:
+// only its builder expands pxa_head_extra, and only its read-back path in llama_decode is taught the slices.
+// PXA_TSPLIT_LMHEAD_DIRECT_MTP (default 1, 2026-09-28; =0 restores the concat under MTP):
+// the TARGET decode of an MTP context (mtp_op_type NONE: the verify) takes the same no-gather head.
+// Its read-back is the generic one above (every output row, every slice into its column range); the
+// MTP feature row is a separate graph output ("result_mtp_embd") and is not touched. The draft head's
+// graphs (mtp_op_type != NONE) keep the concat. On the P100 pair the verify's concat was a 2 x 124160
+// float peer copy plus a concat kernel per round (~0.4 ms of device time).
+static bool pxa_head_direct_mtp_on() {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_LMHEAD_DIRECT_MTP"); return !(e && *e && atoi(e) == 0); }();
+    return v;
+}
+
+// PXA_VERIFY_ARGMAX (2026-09-28; ENHANCE default on, =0 off). Every target graph of
+// a qwen35 / qwen35moe context also computes, per vocab slice of the head, ggml_argmax_val -> (index,
+// max, sumexp) per row. Built unconditionally while the lever is on so the graph shape (and the reserved
+// plan) never depends on the request; a decode asked for argmax-only (llama_set_argmax_only, set by the
+// server for a pure-greedy speculative verify) then copies these [3, rows] tensors back instead of
+// w x n_vocab floats of logits, and the host combines the slices (lowest id on exact ties).
+bool pxa_verify_argmax_on() {
+    // ENHANCE default ON (mtp-round window 2026-09-28: P100 pair round 49.1 -> 48.9 ms accept side 6.1 -> 3.4,
+    // greedy text identical; with the confidence gate the winning arm on both card types); =0 off.
+    static const bool v = [] { const char * e = getenv("PXA_VERIFY_ARGMAX"); return e && *e ? atoi(e) != 0 : ggml_pxa_config_level() >= 2; }();
+    return v;
+}
+// PXA_ARGMAX_VAL: GGML_OP_ARGMAX with op_params[0] = 1 -> F32 [3, rows] = (index as an exact float, max,
+// sum(exp(x - max))), lowest index on exact ties (ggml-cuda/argmax.cu, ggml.c). Built here rather than
+// declared in ggml.h so the public header -- and with it every backend object -- is unchanged.
+// PXA_ARGMAX_COMBINE: GGML_OP_ARGMAX with op_params[0] = 2 -> I32 [rows], the global argmax over the
+// per-slice pxa_ggml_argmax_val rows (src[k], first column op_params[1 + k], op_params[5] slices).
+ggml_tensor * pxa_ggml_argmax_combine(ggml_context * ctx, const std::vector<ggml_tensor *> & parts) {
+    GGML_ASSERT(!parts.empty() && parts.size() <= 4);
+    ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, parts[0]->ne[1]);
+    r->op = GGML_OP_ARGMAX;
+    r->op_params[0] = 2;
+    r->op_params[5] = (int32_t) parts.size();
+    for (size_t k = 0; k < parts.size(); ++k) {
+        GGML_ASSERT(parts[k]->ne[0] == 3 && parts[k]->ne[1] == parts[0]->ne[1]);
+        r->src[k] = parts[k];
+        r->op_params[1 + k] = parts[k]->op_params[1];
+    }
+    return r;
+}
+ggml_tensor * pxa_ggml_argmax_val(ggml_context * ctx, ggml_tensor * a) {
+    GGML_ASSERT(ggml_is_matrix(a) && a->type == GGML_TYPE_F32);
+    ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, a->ne[1]);
+    r->op        = GGML_OP_ARGMAX;
+    r->src[0]    = a;
+    r->op_params[0] = 1;
+    return r;
+}
+static void pxa_amax_attach(llama_context & lctx, ggml_context * ctx, const std::vector<ggml_tensor *> & parts) {
+    if (!pxa_verify_argmax_on() || lctx.cparams.mtp_op_type != MTP_OP_NONE || lctx.cparams.embeddings) return;
+    if (!(lctx.model.arch == LLM_ARCH_QWEN35 || lctx.model.arch == LLM_ARCH_QWEN35MOE)) return;
+    int64_t off = 0;
+    for (auto * t : parts) {
+        if (t == nullptr || t->type != GGML_TYPE_F32 || t->ne[2] != 1 || t->ne[3] != 1 ||
+            t->nb[0] != sizeof(float)) {
+            return;   // an unexpected head shape: stay off for this graph (the logits path is untouched)
+        }
+    }
+    for (auto * t : parts) {
+        ggml_tensor * a = pxa_ggml_argmax_val(ctx, t);
+        ggml_set_name(a, "pxa_amax");
+        a->op_params[1] = (int32_t) off;   // first vocab column of this slice (read by the decode)
+        ggml_set_output(a);
+        lctx.pxa_head_extra.push_back(a);
+        lctx.pxa_amax_parts.push_back(a);
+        off += t->ne[0];
+    }
+    lctx.pxa_amax_built = true;
+}
+
+static bool pxa_head_direct_ok(const llama_context & lctx) {
+    const bool mtp_ok = !lctx.cparams.mtp || (pxa_head_direct_mtp_on() && lctx.cparams.mtp_op_type == MTP_OP_NONE);
+    return pxa_tsplit_lmhead_direct() && lctx.model.arch == LLM_ARCH_QWEN35 && mtp_ok &&
+           !lctx.cparams.embeddings;
+}
+
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
         ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name) {
     // lm_head
@@ -2614,17 +3031,38 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             cb(o.back(), "output", id);
             if (add_normed_name && last_norm) {
                 cb(last_norm, "result_norm", -1);
+                // PXA_VERIFY_ARGMAX: argmax nodes now follow the head, and this row is what an MTP
+                // target's read-back finds by name -- unprotected, ggml-alloc handed its bytes to the
+                // argmax nodes (measured: draft acceptance 60% -> 3%)
+                if (pxa_verify_argmax_on()) ggml_set_output(last_norm);
+                lctx.pxa_result_norm_t = last_norm;   // PXA_MTP_FOLD: the row the MTP commit is fed
             }
         }
         GGML_ASSERT(!o.empty());
         if (o.size() == 1) {
             cur = o.front();
+            if (output == lctx.model.output) pxa_amax_attach(lctx, ctx, { cur });   // PXA_VERIFY_ARGMAX
+        }
+        else if (pxa_head_direct_ok(lctx)) {
+            // PXA_TSPLIT_LMHEAD_DIRECT: no gather. The leading slices go to the builder (expanded into
+            // the graph ahead of the last one) under the name the read-back looks for; the last slice
+            // is returned and becomes "result_output". llama_decode reassembles the row on the host.
+            lctx.pxa_head_extra.clear();
+            for (size_t k = 0; k + 1 < o.size(); ++k) {
+                ggml_set_name(o[k], PXA_HEAD_PART_NAME);
+                ggml_set_output(o[k]);
+                lctx.pxa_head_extra.push_back(o[k]);
+            }
+            cur = o.back();
+            ggml_set_output(cur);
+            if (output == lctx.model.output) pxa_amax_attach(lctx, ctx, o);   // PXA_VERIFY_ARGMAX: one argmax per slice, in column order
         }
         else {
             cur = ggml_concat(ctx, o[0], o[1], 0);
             for (int id = 2; id < int(o.size()); ++id) {
                 cur = ggml_concat(ctx, cur, o[id], 0);
             }
+            if (output == lctx.model.output) pxa_amax_attach(lctx, ctx, { cur });   // PXA_VERIFY_ARGMAX
         }
     } else {
         int idx = lctx.model.default_layer_device[lctx.model.hparams.n_layer];
@@ -2640,11 +3078,74 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             cur = llm_build_context::llm_build_norm(ctx, cur, lctx.model.hparams, output_norm, NULL, LLM_NORM_RMS, cb, -1);
             if (add_normed_name) {
                 cb(cur, "result_norm", -1);
+                if (pxa_verify_argmax_on()) ggml_set_output(cur);   // PXA_VERIFY_ARGMAX: see the split branch
+                lctx.pxa_result_norm_t = cur;
             }
         }
-        cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
+        cur = build_output_head_mm(lctx, ctx, output, cur);
+        if (output == lctx.model.output) {
+            pxa_amax_attach(lctx, ctx, { cur });   // PXA_VERIFY_ARGMAX (single-device head)
+        }
     }
     return cur;
+}
+
+// Bug #204 (pxq-head-mtp-full-dequant-oom): a multi-row matmul on a PXQ-panel head (MTP draft
+// batches, logits for every token) takes the dequant->GEMM path, which materialises the WHOLE
+// 248320 x 5120 head as f16 in the pool (~2.4 GB) and OOMs a 16 GB card next to a 131k cache.
+// Cut the head into row chunks (multiples of the 64-row panel, so every chunk is a whole-panel
+// byte range of the tensor) and concat the logits: the pool then never holds more than one chunk.
+// Single-row matmuls (plain decode) take the MMVQ path and are left alone.
+// PXA_PXQ_HEAD_CHUNK = rows per chunk (default 32768; 0 = off).
+static bool pxa_type_is_pxq_panel_head(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_PXQ1: case GGML_TYPE_PXQ2: case GGML_TYPE_PXQ3: case GGML_TYPE_PXQ4:
+        case GGML_TYPE_PXQ4HQ: case GGML_TYPE_PXQ6:
+        case GGML_TYPE_PXQN3: case GGML_TYPE_PXQN3S8: case GGML_TYPE_PXQN4:
+        case GGML_TYPE_PXQN2: case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5:
+            return true;
+        default:
+            return false;
+    }
+}
+
+ggml_tensor * llm_build_context::build_output_head_mm(llama_context & lctx, ggml_context * ctx, ggml_tensor * output, ggml_tensor * cur) {
+    static const int64_t chunk = [] {
+        const char * e = getenv("PXA_PXQ_HEAD_CHUNK");
+        const int64_t v = e ? atoll(e) : 32768;
+        return v > 0 ? (v + 63)/64*64 : 0;
+    }();
+    // PXA_PXQN_HEAD_CHUNK (default 0 = off): a PXQN head is NOT cut by default. The
+    // backend never materialises it whole: sm_60 runs the fused half2 PXQN GEMM (no f16 image) and the
+    // dequant->cuBLAS route slices src0 by PXA_CUBLAS_SRC0_SLICE_MIB. The chunk chain's concats hold ~2.5x
+    // the logits at the reserve's widest ubatch: measured on a P100, a PXQN5 head at -ub 512 took the
+    // compute buffer from 505 to 1236 MiB (+731) and the MTP context no longer fit next to 131k KV.
+    // N > 0 restores the cut for PXQN heads at N rows per chunk (PXQ heads keep PXA_PXQ_HEAD_CHUNK).
+    static const int64_t chunk_pxqn = [] {
+        const char * e = getenv("PXA_PXQN_HEAD_CHUNK");
+        const int64_t v = e ? atoll(e) : 0;
+        return v > 0 ? (v + 63)/64*64 : 0;
+    }();
+    const bool is_pxqn_head = output->type == GGML_TYPE_PXQN3 || output->type == GGML_TYPE_PXQN3S8 ||
+        output->type == GGML_TYPE_PXQN4 || output->type == GGML_TYPE_PXQN2 || output->type == GGML_TYPE_PXQN1 ||
+        output->type == GGML_TYPE_PXQN4S8 || output->type == GGML_TYPE_PXQN5;
+    const int64_t n_rows = output->ne[1];
+    if (is_pxqn_head && chunk_pxqn == 0) {
+        return llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
+    }
+    const int64_t chunk_eff = is_pxqn_head ? chunk_pxqn : chunk;
+    if (chunk_eff == 0 || !pxa_type_is_pxq_panel_head(output->type) || cur->ne[1] <= 1 || n_rows <= chunk_eff ||
+        output->ne[2] != 1 || n_rows % 64 != 0 || !lctx.lora_adapters.empty()) {
+        return llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
+    }
+    ggml_tensor * res = nullptr;
+    for (int64_t r0 = 0; r0 < n_rows; r0 += chunk_eff) {
+        const int64_t nr = std::min(chunk_eff, n_rows - r0);
+        ggml_tensor * w = ggml_view_2d(ctx, output, output->ne[0], nr, output->nb[1], (size_t) r0*output->nb[1]);
+        ggml_tensor * y = ggml_mul_mat(ctx, w, cur);
+        res = res ? ggml_concat(ctx, res, y, 0) : y;
+    }
+    return res;
 }
 
 ggml_cgraph * llm_build_context::llama_build_graph_defrag(llama_context & lctx, const std::vector<uint32_t> & ids) {
@@ -2698,12 +3199,91 @@ struct ggml_cgraph * llm_build_context::llama_build_graph_s_copy(llama_context &
     return result;
 }
 
+// PXA_STREAM_WEIGHTS narrow/wide (stream-next 2026-09-25): see llama_model::pxa_stream_alias.
+// Runs on the finished graph, before the scheduler assigns backends: every node (and view) that
+// reads a streamed weight is pointed at the weight's CPU alias when the graph is narrower than
+// the threshold for that kind of weight. The scheduler then places the op on the CPU backend
+// (weights decide placement) and the CUDA backend's offload_op agrees for the same widths, so a
+// narrow graph takes exactly the '-ot =CPU' path, never the ring, and CUDA graphs stay on for its
+// GPU splits (pxa_stream_graph_uses no longer sees a streamed weight).
+// Narrow graphs must be BUILT against the CPU aliases, not just re-pointed afterwards: the op
+// builders decide fusion from the weight's buffer (ggml_fused_up_gate_placement_ok -- a fused
+// MOE_FUSED_UP_GATE / FUSED_UP_GATE node has no CPU implementation). So for the duration of one
+// graph build the layer's streamed FFN / expert pointers are swapped to their aliases, exactly
+// what the builder sees for '-ot ...=CPU', and restored afterwards.
+struct pxa_stream_build_swap {
+    std::vector<std::pair<ggml_tensor **, ggml_tensor *>> saved;
+    pxa_stream_build_swap(const llama_model & model, int n_tokens) {
+        if (model.pxa_stream_alias.empty()) return;
+        const bool dense_narrow = n_tokens < model.pxa_stream_narrow_dense;
+        const bool moe_narrow   = n_tokens < model.pxa_stream_narrow_moe && n_tokens > model.pxa_stream_zc_moe;
+        if (!dense_narrow && !moe_narrow) return;
+        static ggml_tensor * llama_layer::* const dense_f[] = {
+            &llama_layer::ffn_gate, &llama_layer::ffn_down, &llama_layer::ffn_up,
+        };
+        static ggml_tensor * llama_layer::* const moe_f[] = {
+            &llama_layer::ffn_gate_exps, &llama_layer::ffn_down_exps, &llama_layer::ffn_up_exps, &llama_layer::ffn_up_gate_exps,
+            &llama_layer::ffn_gate_exps_b, &llama_layer::ffn_down_exps_b, &llama_layer::ffn_up_exps_b, &llama_layer::ffn_up_gate_exps_b,
+            &llama_layer::ffn_down_exps_s,
+            // PXA_XCACHE cold stacks (the hot stacks are resident and have no alias)
+            &llama_layer::ffn_gate_exps_xc, &llama_layer::ffn_down_exps_xc, &llama_layer::ffn_up_exps_xc, &llama_layer::ffn_up_gate_exps_xc,
+        };
+        auto & layers = const_cast<llama_model &>(model).layers;
+        for (auto & L : layers) {
+            auto swap = [&](ggml_tensor * llama_layer::* f) {
+                ggml_tensor *& p = L.*f;
+                if (!p) return;
+                auto it = model.pxa_stream_alias.find(p);
+                if (it == model.pxa_stream_alias.end()) return;
+                saved.push_back({&p, p});
+                p = it->second;
+            };
+            if (dense_narrow) for (auto f : dense_f) swap(f);
+            if (moe_narrow)   for (auto f : moe_f)   swap(f);
+        }
+    }
+    ~pxa_stream_build_swap() { for (auto it = saved.rbegin(); it != saved.rend(); ++it) *it->first = it->second; }
+};
+
+static void pxa_stream_narrow_substitute(const llama_model & model, ggml_cgraph * gf, int n_tokens) {
+    if (model.pxa_stream_alias.empty() || !gf) return;
+    const bool dense_narrow = n_tokens < model.pxa_stream_narrow_dense;
+    const bool moe_narrow   = n_tokens < model.pxa_stream_narrow_moe && n_tokens > model.pxa_stream_zc_moe;
+    if (!dense_narrow && !moe_narrow) return;
+    auto alias_of = [&](const ggml_tensor * t) -> ggml_tensor * {
+        if (!t) return nullptr;
+        auto it = model.pxa_stream_alias.find(t);
+        if (it == model.pxa_stream_alias.end()) return nullptr;
+        // by name, not by ne[2]: a PXA_XCACHE cold stack may hold a single expert
+        const bool expert = strstr(t->name, "_exps") != nullptr;
+        return (expert ? moe_narrow : dense_narrow) ? it->second : nullptr;
+    };
+    auto fix = [&](ggml_tensor * n) {
+        if (n->view_src) {
+            if (ggml_tensor * a = alias_of(n->view_src)) {
+                if (n->buffer == n->view_src->buffer) n->buffer = a->buffer;
+                n->view_src = a;
+            }
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (ggml_tensor * a = alias_of(n->src[j])) n->src[j] = a;
+        }
+    };
+    for (int i = 0; i < gf->n_nodes; ++i) fix(gf->nodes[i]);
+    for (int i = 0; i < gf->n_leafs; ++i) {
+        if (ggml_tensor * a = alias_of(gf->leafs[i])) gf->leafs[i] = a;
+        else fix(gf->leafs[i]);
+    }
+}
+
 ggml_cgraph * llm_build_context::llama_build_graph(
          llama_context & lctx,
      const llama_batch & batch,
                   bool   worst_case,
                   int    n_outputs) {
     const auto & model = lctx.model;
+    // PXA_STREAM_WEIGHTS narrow graph: build against the CPU aliases (restored on return)
+    pxa_stream_build_swap pxa_swap(model, batch.n_tokens);
 
 #if IK_PRINT_TIMING
     auto tim1 = ggml_time_us();
@@ -2764,6 +3344,16 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     struct llm_build_context llm(lctx, batch, cb, worst_case, is_warming_up, n_outputs);
 
     llm.init();
+    lctx.pxa_amax_built = false;   // PXA_VERIFY_ARGMAX: build_output sets it for this graph
+    lctx.pxa_res_t = nullptr;
+    lctx.pxa_result_norm_t = nullptr;
+    lctx.pxa_amax_parts.clear();
+    // PXA_MTP_FOLD: graph-bound records of the fold (pxa_build_mtp_fold sets them)
+    lctx.pxa_fold_hid_t = lctx.pxa_fold_amax_t = lctx.pxa_fold_ids_t = nullptr;
+    lctx.pxa_fold_inp_pos = lctx.pxa_fold_inp_mask = nullptr;
+    lctx.pxa_fold_nkv = -1;
+    lctx.pxa_fold_built = false;
+    lctx.pxa_fold_cc.clear();
 
     {
         // PXA_BUILDGRAPH_DBG: first-N graph builds print the workspace identity — used to hunt
@@ -3144,6 +3734,9 @@ ggml_cgraph * llm_build_context::llama_build_graph(
 
     result->n_batch = llm.n_tokens;
 
+    // PXA_STREAM_WEIGHTS narrow/wide: a narrow graph reads the CPU aliases of streamed weights
+    pxa_stream_narrow_substitute(lctx.model, result, llm.n_tokens);
+
     // add on pooling layer
     if (lctx.cparams.mtp_op_type == MTP_OP_NONE && (lctx.cparams.embeddings ||
         (lctx.model.hparams.nextn_predict_layers > 0 || lctx.model.mtp))) {
@@ -3274,6 +3867,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 if (input->op != GGML_OP_REDUCE) {
                     cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
                 }
+                cur = build_pxqn_rht(ctx0, hparams, cur, il, PXQN_SITE_ATTN_IN);   // PXQN attn_in (whole K per device)
                 auto input_normed = cur;
                 auto the_q_norm = model.layers[il].attn_q_norm ? model.layers[il].attn_q_norm->extra ?
                     ((ggml_split_tensor_t *)model.layers[il].attn_q_norm->extra)->splits[id] : model.layers[il].attn_q_norm : nullptr;
@@ -3474,7 +4068,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     cb(cur, "fa_get_rows", il_cb);
                 }
 
-                cur = llm_build_lora_mm(lctx, ctx0, split_wo, cur);
+                // PXQN out_in: this device's heads are the contiguous K slice [k0, k0 + ne0) of wo
+                cur = build_pxqn_rht(ctx0, hparams, cur, il, PXQN_SITE_OUT_IN, pxqn_split_k0(wo, id));
+                cur = pxqn_rht_keep_input(llm_build_lora_mm(lctx, ctx0, split_wo, cur));
                 if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
                     // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
                     ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -3546,6 +4142,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     if (the_attn_norm) {
         cur = llm_build_norm(ctx0, cur, hparams, the_attn_norm, NULL, is_norm ? LLM_NORM : LLM_NORM_RMS, cb, il);
         cb(cur, "attn_norm", il);
+        cur = build_pxqn_rht(ctx0, hparams, cur, il, PXQN_SITE_ATTN_IN);   // PXQN attn_in
     }
     auto input_normed = cur;
 
@@ -3631,7 +4228,8 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         cb(cur, "attn_gated_3d", il);
         cur = ggml_reshape_2d(ctx0, cur, n_embd_head_v * n_head_l, n_tokens);
         cb(cur, "attn_gated", il);
-        cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
+        cur = build_pxqn_rht(ctx0, hparams, cur, il, PXQN_SITE_OUT_IN);   // PXQN out_in
+        cur = pxqn_rht_keep_input(llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur));
         if (model.layers[il].bo) {
             cur = ggml_add(ctx0, cur, model.layers[il].bo);
         }
@@ -3648,12 +4246,17 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 cur = ggml_mul(ctx0, cur, gate);
             }
             cb(cur, "qkv_gated", il);
-            cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
+            cur = build_pxqn_rht(ctx0, hparams, cur, il, PXQN_SITE_OUT_IN);   // PXQN out_in
+            cur = pxqn_rht_keep_input(llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur));
             if (model.layers[il].bo) {
                 cur = ggml_add(ctx0, cur, model.layers[il].bo);
             }
             cb(cur, "attn_out", il);
         } else {
+            if (hparams.pxqn_rot_sites & PXQN_SITE_BIT(PXQN_SITE_OUT_IN)) {
+                // llm_build_kv applies wo inside; the rotation of its input is not wired there
+                GGML_ABORT("PXQN: out_in rotation is not supported on this attention path (arch %s)", llama_model_arch_name(model.arch));
+            }
             cur = llm_build_kv(ctx0, lctx, kv_l, gf,
                     model.layers[il].wo, model.layers[il].bo,
                     Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head_l, n_kv_l, KQ_scale, cb, il, sinks, n_swa);

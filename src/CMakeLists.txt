@@ -48,6 +48,7 @@ add_library(llama
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-load-tensors.cpp
+            llama-pxa-place.cpp
             llama-build-context.h
             llama-build-context.cpp
             llama-model.h
@@ -57,6 +58,8 @@ add_library(llama
             llama-arch.cpp
             llama-hparams.h
             llama-hparams.cpp
+            llama-pxqn.h
+            llama-pxqn.cpp
             llama-kv-cache-dsv4.h
             llama-kv-cache-dsv4.cpp
             llama-kv-cache-kpool.h
@@ -143,6 +146,16 @@ add_library(llama
 if (PXA_PXQ_ENCODER)
     target_compile_definitions(llama PRIVATE PXA_PXQ_ENCODER)
 endif()
+if (PXA_PXQN_ENCODER)
+    target_compile_definitions(llama PRIVATE PXA_PXQN_ENCODER)
+    if (PXA_QUANTIZER_EDITION STREQUAL "pro")
+        # the Pro build: license-gated PXQN, and no LDLQ code in the binary (PXQN_NO_LDLQ).
+        # The key list goes in comma-separated (a ; would split the definition into several).
+        string(REPLACE ";" "," _pxa_pubkeys_def "${PXA_LICENSE_PUBKEYS}")
+        target_compile_definitions(llama PRIVATE PXA_PRO_LICENSE PXQN_NO_LDLQ
+                                   PXA_LICENSE_PUBKEYS="${_pxa_pubkeys_def}")
+    endif()
+endif()
 target_compile_definitions(llama PRIVATE PXA_PXQ_QUANTIZER_URL="${PXA_PXQ_QUANTIZER_URL}")
 
 target_include_directories(llama PUBLIC . ../include)
@@ -150,6 +163,9 @@ target_include_directories(llama PRIVATE ../ggml/src)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)
+if (TARGET ggml-pxqn)
+    add_dependencies(llama ggml-pxqn)   # the closed PXQN library is built with every llama tool
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

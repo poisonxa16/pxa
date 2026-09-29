@@ -12,6 +12,23 @@
 
 using json = nlohmann::ordered_json;
 
+std::string pxa_qwen_tools_variant(const std::string & marker) {
+    const std::string core = trim_whitespace(marker);
+    std::string       from, to;
+    if (core == "<tool_call>") {
+        from = "<tool_call>";
+        to   = "<tools>";
+    } else if (core == "</tool_call>") {
+        from = "</tool_call>";
+        to   = "</tools>";
+    } else {
+        return "";
+    }
+    std::string out = marker;
+    out.replace(out.find(from), from.size(), to);
+    return out;
+}
+
 std::string trim_whitespace(const std::string & str) {
     size_t start = 0;
     while (start < str.length() && std::isspace(static_cast<unsigned char>(str[start]))) {

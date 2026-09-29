@@ -97,9 +97,15 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     //we do the argmax reduce over n_expert_used, each time marking
     //the expert weight as -inf to exclude from the next iteration
 
+    // Bug #224: every lane must agree on the winner, or on an exact tie two lanes each keep their
+    // own expert, both mark it -INF and both store into slot k -- one tied expert is silently
+    // dropped and a lower-weight one takes its place. Ties therefore go to the LOWER expert index
+    // (the within-thread scan below already visits a lane's experts in ascending order), and a
+    // padding lane (threadIdx.x >= n_experts, only when n_experts < WARP_SIZE) starts at -INF so it
+    // can never beat an underflowed real expert whose weight is exactly 0 and emit an id >= n_experts.
     [[maybe_unused]] float sum_selected = 0;
     for (int k = 0; k < n_expert_used; k++) {
-        float max_val    = wt[0];
+        float max_val    = (int) threadIdx.x < (int) n_experts ? wt[0] : -INFINITY;
         int   max_expert = threadIdx.x;
 
 #pragma unroll
@@ -115,7 +121,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
         for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
             const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
             const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
-            if (val > max_val) {
+            if (val > max_val || (val == max_val && expert < max_expert)) {
                 max_val    = val;
                 max_expert = expert;
             }

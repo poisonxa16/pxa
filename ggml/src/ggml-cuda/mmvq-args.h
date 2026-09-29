@@ -25,3 +25,16 @@ struct mmvq_args {
     float          limit;
 };
 
+
+// PXA_MMVQ_GROUP: several ny = 1 GEMVs of one type on the same q8_1 activation in one launch (mmvq-templates.cuh)
+#define MMVQ_GROUP_MAX 4
+struct mmvq_group_args {
+    const void * vx[MMVQ_GROUP_MAX];
+    float      * dst[MMVQ_GROUP_MAX];
+    int          nrows[MMVQ_GROUP_MAX];
+    int          blk_end[MMVQ_GROUP_MAX];   // cumulative row-block counts, filled by the launcher
+    int          n;
+    const void * vy;
+    int          ncols_x;
+    int          nrows_y;                   // padded activation row length
+};

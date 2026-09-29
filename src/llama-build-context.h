@@ -241,14 +241,21 @@ struct llm_build_context {
     // Low-rank hyper-connection mixer: collapses the hc wide-residual streams into one
     // [n_embd, n_tokens] block input and, when `inject` is non-null, produces the per-stream
     // scatter weights that build_qwen4exp_hc_combine puts the block output back with.
+    // xn_pre (PXA_QWEN4EXP_HC_FUSED): the already-normed wide input, produced by the previous
+    // combine; the mixer then skips its own rms_norm * gamma.
     ggml_tensor * build_qwen4exp_hc_mix(ggml_tensor * x, ggml_tensor * w_norm, ggml_tensor * w_down,
-            ggml_tensor * w_up, ggml_tensor * w_inject, ggml_tensor ** inject, int il);
+            ggml_tensor * w_up, ggml_tensor * w_inject, ggml_tensor ** inject, int il,
+            ggml_tensor * xn_pre = nullptr);
 
+    // gamma_next / xn_next (PXA_QWEN4EXP_HC_FUSED): also emit the NEXT mixer's normed input.
     ggml_tensor * build_qwen4exp_hc_combine(ggml_tensor * residual, ggml_tensor * block_out,
-            ggml_tensor * inject, int il);
+            ggml_tensor * inject, int il, ggml_tensor * gamma_next = nullptr, ggml_tensor ** xn_next = nullptr);
+
+    // true when the fused hc glue is armed for a graph of n_tokens rows
+    static bool qwen4exp_hc_fused(int64_t n_tokens);
 
     // PLE n-gram side path; runs only on the layers named by <arch>.ple.layers
-    ggml_tensor * build_qwen4exp_ple(ggml_cgraph * gf, ggml_tensor * hidden, int il);
+    ggml_tensor * build_qwen4exp_ple(ggml_cgraph * gf, ggml_tensor * hidden, int il, int dev = -1);
 
     // PXA_QSA. The trunk's k-pool inputs plus qwen4exp's own per-block rope positions; called
     // once per graph, before any layer, and only when llama_qsa_enabled().
@@ -457,6 +464,21 @@ struct llm_build_context {
          struct ggml_tensor * tok_embd,
          const llm_build_cb & cb);
 
+    // PXQN (ggml-pxqn.h): the RHT128 of activation site `site` of layer `il` when the model stores that
+    // site's consumers rotated (hparams.pxqn_rot_sites); the identity otherwise. k0 = the GLOBAL K
+    // index of x's first column (non-zero only for a device's dim-0 slice under -sm tensor/graph).
+    static ggml_tensor * build_pxqn_rht(ggml_context * ctx, const llama_hparams & hparams, ggml_tensor * x,
+         int il, int site, int64_t k0 = 0);
+    // the same for a device-local activation made of several global K ranges {first, len}, in order
+    // (the DeltaNet ssm_out head split with repeat_type 1)
+    static ggml_tensor * pxqn_rht_keep_input(ggml_tensor * mm);
+    static ggml_tensor * build_pxqn_rht_ranges(ggml_context * ctx, const llama_hparams & hparams, ggml_tensor * x,
+         int il, int site, const std::vector<std::pair<int,int>> & ranges);
+    // global K offset of device `id`'s slice of a dim-0 split tensor (splits are laid out in device order)
+    static int64_t pxqn_split_k0(const ggml_split_tensor_t * st, int id);
+    // the lm-head matmul, cut into panel-aligned row chunks for a multi-row PXQ head (bug #204)
+    static ggml_tensor * build_output_head_mm(llama_context & lctx, ggml_context * ctx, ggml_tensor * output, ggml_tensor * cur);
+
     static ggml_tensor * llm_build_norm(ggml_context * ctx, ggml_tensor * cur,
          const llama_hparams & hparams,
          ggml_tensor * mw,
@@ -640,8 +662,15 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * prev_embeddings,
         int64_t n_embd_head,
         struct ggml_cgraph * gf,
-        struct ggml_tensor * inp_pos
+        struct ggml_tensor * inp_pos,
+        // PXA_MTP_FOLD: the token embeddings come from the graph (not an input), every row is kept
+        // (no out_ids), and the head's conditioning hidden is handed back through hid_out
+        struct ggml_tensor * tok_emb_in = nullptr,
+        struct ggml_tensor ** hid_out   = nullptr
     );
+
+    // PXA_MTP_FOLD: the MTP head's update pass run inside the target's verify graph
+    struct ggml_tensor * pxa_build_mtp_fold(struct ggml_tensor * trunk_hidden, struct ggml_cgraph * gf);
 
     struct ggml_tensor * build_qwen35moe_mtp(
         const struct llama_layer & mtp_layer,
@@ -683,3 +712,7 @@ llm_expert_gating_func_type   gating_op,
 
     ggml_cgraph * new_graph_custom();
 };
+
+// PXA_FA_D512_CHAIN_F32 (default on): the unfused attention chain of a 512/512 head asks for fp32
+// accumulation and fp32 scores. See the comment at its definition in llama-build-context.cpp.
+bool pxa_fa_d512_chain_f32();

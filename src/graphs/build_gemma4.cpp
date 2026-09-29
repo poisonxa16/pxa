@@ -400,6 +400,9 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
                 auto vt = ggml_cont(ctx0, ggml_transpose(ctx0, v));
                 cb(vt, "v_t", il_cb);
                 auto kq = ggml_mul_mat(ctx0, k, q);
+                if (pxa_fa_d512_chain_f32()) {
+                    ggml_mul_mat_set_prec(kq, GGML_PREC_F32); // PXA_FA_D512_CHAIN_F32, as in llm_build_kqv
+                }
                 cb(kq, "kq", il_cb);
                 if (hparams.attn_soft_cap) {
                     kq = ggml_softcap_max(ctx0, kq, KQ_mask_l, hparams.f_attention_scale,
@@ -411,6 +414,9 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
                 }
                 cb(kq, "kq_soft_max_ext", il_cb);
                 auto kqv = ggml_mul_mat(ctx0, vt, kq);
+                if (pxa_fa_d512_chain_f32()) {
+                    ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
+                }
                 cb(kqv, "kqv", il_cb);
                 auto kqv_merged = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
                 cb(kqv_merged, "kqv_merged", il_cb);

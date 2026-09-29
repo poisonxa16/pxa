@@ -112,6 +112,12 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
         case GGML_TYPE_PXQ4HQ:
             mul_mat_vec_pxq4hq_q8_1_cuda(args, stream);
             break;
+        case GGML_TYPE_PXQN4:      // : PXQ4's slab bytes, the same s8 book and SUB16 (sm_70 decode)
+            mul_mat_vec_pxqn4_q8_1_cuda(args, stream);
+            break;
+        case GGML_TYPE_PXQN4S8:    // PXQ4-HQ's slab bytes with the SUB16 table per 8-group
+            mul_mat_vec_pxqn4s8_q8_1_cuda(args, stream);
+            break;
         case GGML_TYPE_PXQ2:
             mul_mat_vec_pxq2_q8_1_cuda(args, stream);
             break;
@@ -286,6 +292,16 @@ void ggml_cuda_op_fused_mul_mat_vec_q_id(ggml_backend_cuda_context & ctx,
 }
 
 
+bool ggml_cuda_mmvq_group(ggml_type type, mmvq_group_args & g, cudaStream_t stream) {
+    switch (type) {
+        case GGML_TYPE_Q6_K:    return mul_mat_vec_q6_K_q8_1_group_cuda(g, stream);
+        case GGML_TYPE_Q8_0:    return mul_mat_vec_q8_0_q8_1_group_cuda(g, stream);
+        case GGML_TYPE_PXQN4:   return mul_mat_vec_pxqn4_q8_1_group_cuda(g, stream);
+        case GGML_TYPE_PXQN4S8: return mul_mat_vec_pxqn4s8_q8_1_group_cuda(g, stream);
+        default:                return false;
+    }
+}
+
 bool ggml_cuda_mmvq_type_supported(ggml_type src0_type) {
     switch (src0_type) {
         case GGML_TYPE_Q4_0:
@@ -318,6 +334,11 @@ bool ggml_cuda_mmvq_type_supported(ggml_type src0_type) {
         case GGML_TYPE_PXQ2:
         case GGML_TYPE_PXQ3:
             return pxa_pxq_mmvq_type(src0_type) && pxa_pxq_mmvq_mode() != 0;
+        // : PXQN4 / PXQN4S8 at decode width on sm_70 (the arch gate is in ggml_cuda_mul_mat and in
+        // pxqn.cu's decline); PXA_PXQN_MMVQ=0 keeps them on the PXQN GEMV
+        case GGML_TYPE_PXQN4:
+        case GGML_TYPE_PXQN4S8:
+            return pxqn_mmvq_route_on();
         default:
             return false;
     }

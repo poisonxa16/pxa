@@ -8,6 +8,7 @@
 
 #include "pxq-quants.h"
 #include "pxq-cpu.h"
+#include "ggml-pxqn.h"
 #include "pxa-pxq-policy.h"
 #include "pxa-glm5next-quant.h"
 
@@ -1017,6 +1018,13 @@ static size_t pxa_pxq_slab_size(ggml_type t, int64_t K, int64_t R, int64_t E) {
         case GGML_TYPE_PXQ6:   return (size_t) E*(R/64)*(PXQ6R_HDR_BYTES + (K/32)*(int64_t)PXQ6R_SLAB_BYTES);
         case GGML_TYPE_PXQ4:   return (size_t) E*(R/64)*(PXQ6_HDR_BYTES  + (K/32)*(int64_t)PXQ6_SLAB_BYTES);
         case GGML_TYPE_PXQ4HQ: return (size_t) E*(R/64)*(PXQ6_HDR_BYTES  + (K/32)*(int64_t)PXQ6HQ_SLAB_BYTES);
+        case GGML_TYPE_PXQN3:   return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/128)*(int64_t)PXQN3_SLAB_BYTES);
+        case GGML_TYPE_PXQN3S8: return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/128)*(int64_t)PXQN3S8_SLAB_BYTES);
+        case GGML_TYPE_PXQN4:   return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/32)*(int64_t)PXQN4_SLAB_BYTES);
+        case GGML_TYPE_PXQN2:   return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/128)*(int64_t)PXQN2_SLAB_BYTES);
+        case GGML_TYPE_PXQN1:   return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/128)*(int64_t)PXQN1_SLAB_BYTES);
+        case GGML_TYPE_PXQN4S8: return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/32)*(int64_t)PXQN4S8_SLAB_BYTES);
+        case GGML_TYPE_PXQN5:   return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/128)*(int64_t)PXQN5_SLAB_BYTES);
         default:               return 0;
     }
 }
@@ -1243,9 +1251,42 @@ static void pxa_errbudget_report(const std::map<std::string, pxa_err_acc> & acc,
     LLAMA_LOG_INFO("=============================================================================\n");
 }
 
+// PXQ-Next revision 1 (PXQN): its own driver around the closed codec (src/pxq-encoder/pxqn-*).
+// Only our own quantizer build compiles it (PXA_PXQN_ENCODER). The public pxq-quantize is built
+// from a tree without those files and writes the classic PXQ tiers only.
+#if defined(PXA_PXQ_ENCODER) && defined(PXA_PXQN_ENCODER)
+#include "pxq-encoder/pxqn-quantize.inc.cpp"
+#endif
+
+// What a build that cannot write a PXQN target says. The public quantizer's wording names only
+// what it DOES write, so that build carries no text about the private tiers at all.
+#if defined(PXA_PXQ_ENCODER) && !defined(PXA_PXQN_ENCODER)
+#define PXA_PXQN_REFUSAL "this quantizer writes the classic PXQ tiers (PXQ1, PXQ2, PXQ3, PXQ4, PXQ4-HQ, " \
+                         "PXQ6, PXQ_UNIVERSAL) and the stock ggml types; the requested type is not one of them"
+#elif !defined(PXA_PXQ_ENCODER)
+#define PXA_PXQN_REFUSAL "PXQN (PXQ-Next) files are written by PXA's own quantizer only; the public pxq-quantize " \
+                         "writes the classic PXQ tiers"
+#endif
+
+static bool llama_ftype_is_pxqn(llama_ftype f) {
+    return f == LLAMA_FTYPE_MOSTLY_PXQN3 || f == LLAMA_FTYPE_MOSTLY_PXQN3S8 || f == LLAMA_FTYPE_MOSTLY_PXQN4 ||
+           f == LLAMA_FTYPE_MOSTLY_PXQN2 || f == LLAMA_FTYPE_MOSTLY_PXQN1 || f == LLAMA_FTYPE_MOSTLY_PXQN4S8 ||
+           f == LLAMA_FTYPE_MOSTLY_PXQN5 ||
+           f == LLAMA_FTYPE_MOSTLY_PXQN;
+}
+
 static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     ggml_type default_type;
     llama_ftype ftype = params->ftype;
+
+    if (llama_ftype_is_pxqn(ftype)) {
+#if defined(PXA_PXQ_ENCODER) && defined(PXA_PXQN_ENCODER)
+        pxqn_model_quantize(fname_inp, fname_out, params);
+        return;
+#else
+        throw std::runtime_error(PXA_PXQN_REFUSAL);
+#endif
+    }
 
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: default_type = GGML_TYPE_Q4_0; break;
@@ -2438,7 +2479,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 // to q8_0, and the job died there after 4 minutes and 19.5 GB.) Project the
                 // refusal too, and say so again at the end of the run.
                 if (!params->allow_double_lossy &&
-                    (pxa_is_pxq_slab_type(tensor->type) || tensor->type == GGML_TYPE_Q8_0)) {
+                    (pxa_is_pxq_slab_type(tensor->type) || pxa_pxq_is_cpu_supported(tensor->type) ||
+                     tensor->type == GGML_TYPE_Q8_0)) {
                     LLAMA_LOG_WARN("\n[dry-run: WOULD REFUSE] %s is %s in the source and this "
                                    "plan requantizes it -- the real run needs "
                                    "--i-know-this-is-double-lossy, or pin it to its source type "
@@ -2463,7 +2505,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             } else {
                 float * f32_data;
 
-                const bool src_is_pxq = pxa_is_pxq_slab_type(tensor->type);
+                // PXQN panels (ids 257-263) are the same 64-row panel shape as the classic PXQ
+                // tiers and pxa_pxq_dequant_2d() decodes them too, so they take the same branch.
+                const bool src_is_pxq = pxa_is_pxq_slab_type(tensor->type) ||
+                                        pxa_pxq_is_cpu_supported(tensor->type);
 
                 // Requantizing from an already-lossy source compounds two independent
                 // quantization errors and hands the second codec a distribution that is no
@@ -2576,7 +2621,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     // allows it, in every backbone mode.
                     const bool bb_legacy = pxa_pxq_backbone_cfg().mode == PXA_BB_LEGACY;
                     const ggml_type demoted = bb_legacy ? GGML_TYPE_MXFP4 : GGML_TYPE_Q8_0;
-                    // LOUD-DEMOTE (2026-07-28): a silently demoted EXPLICIT
+                    // LOUD-DEMOTE (2026-07-28, owner-requested): a silently demoted EXPLICIT
                     // --custom-q target is how an A/B arm ends up byte-identical to its control
                     // and "measures" nothing. Scream, count, and summarize at the end.
                     if (pxa_custom_rule_matches(params, name)) {
@@ -2911,10 +2956,48 @@ static bool pxa_request_targets_pxq(const llama_model_quantize_params * params) 
 }
 #endif
 
+#if !defined(PXA_PXQN_ENCODER)
+// Does this request name a PXQN ggml type anywhere a per-tensor type can arrive (the level, a
+// --custom-q rule or PXQU map entry, the output / token-embedding type)? Without the PXQN driver
+// such a tensor would reach the classic loop, which has no codec for it; refuse before any file
+// is opened instead.
+static bool pxa_request_targets_pxqn(const llama_model_quantize_params * params) {
+    auto is_pxqn = [](ggml_type t) {
+        return t == GGML_TYPE_PXQN3 || t == GGML_TYPE_PXQN3S8 || t == GGML_TYPE_PXQN4 ||
+               t == GGML_TYPE_PXQN2 || t == GGML_TYPE_PXQN1   || t == GGML_TYPE_PXQN4S8 ||
+               t == GGML_TYPE_PXQN5;
+    };
+    if (!params) {
+        return false;
+    }
+    if (llama_ftype_is_pxqn(params->ftype)) {
+        return true;
+    }
+    if (is_pxqn(params->output_tensor_type) || is_pxqn(params->token_embedding_type)) {
+        return true;
+    }
+    if (params->custom_quants) {
+        using CustomQ = std::pair<std::string, ggml_type>;
+        for (const auto & rule : *static_cast<const std::vector<CustomQ>*>(params->custom_quants)) {
+            if (is_pxqn(rule.second)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
 uint32_t llama_model_quantize(
         const char * fname_inp,
         const char * fname_out,
         const llama_model_quantize_params * params) {
+#if !defined(PXA_PXQN_ENCODER)
+    if (pxa_request_targets_pxqn(params)) {
+        LLAMA_LOG_ERROR("%s\n", PXA_PXQN_REFUSAL);
+        return 1;
+    }
+#endif
 #if !defined(PXA_PXQ_ENCODER)
     if (pxa_request_targets_pxq(params)) {
         LLAMA_LOG_ERROR("PXQ files are made with the separate `pxq-quantize` tool, available at %s\n",

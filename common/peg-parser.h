@@ -214,6 +214,10 @@ struct common_peg_and_parser {
 
 struct common_peg_not_parser {
     common_peg_parser_id child;
+    // false: plain !A (a child that needs more input propagates NEED_MORE_INPUT).
+    // true:  settled !A (bug #222): succeeds only when the child definitively FAILS; a child that
+    //        needs more input may still match, so the lookahead fails instead of propagating.
+    bool settled = false;
 };
 
 struct common_peg_any_parser {};
@@ -401,6 +405,13 @@ class common_peg_parser_builder {
     // Negative lookahead: succeeds if child parser fails, consumes no input.
     //   S -> !A
     common_peg_parser negate(const common_peg_parser & p) { return add(common_peg_not_parser{p}); }
+
+    // Settled negative lookahead: succeeds only if the child parser definitively fails. Where the
+    // child runs out of input (lenient/streaming parse) it may still match, so this FAILS rather
+    // than propagating need-more-input. Use it to guard an optional continuation that must stop
+    // wherever the child could match, e.g. "content continues past <tools> unless a call follows".
+    //   S -> !A  (with incomplete A treated as a match)
+    common_peg_parser negate_settled(const common_peg_parser & p) { return add(common_peg_not_parser{p, true}); }
 
     // Matches any single character.
     //   S -> .

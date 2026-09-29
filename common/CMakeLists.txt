@@ -81,6 +81,8 @@ add_library(${TARGET} STATIC
     peg-parser.cpp
     peg-parser.h
     speculative.cpp
+    pxa-registry.cpp
+    pxa-registry.h
     spec-tuner.cpp
     spec-tuner.h
     unicode.cpp

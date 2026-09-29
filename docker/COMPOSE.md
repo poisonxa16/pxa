@@ -121,7 +121,7 @@ two engines and why.
 
 ## Running the vLLM sidecar
 
-Only worth it if several people or tools will hit the endpoint at once. It needs a
+Only worth it if several people or agents will hit the endpoint at once. It needs a
 **converted checkpoint directory**, not a `.gguf`; `docs/VLLM.md` covers making one.
 
 Set `VLLM_ARCH` (`sm70` for V100, `sm60` for P100), `VLLM_MODEL_DIR`, and `VLLM_GPUS`
@@ -166,7 +166,7 @@ own card, with the same driver and the same weight file, changing exactly one th
 docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0 -p 8080:8080 \
   -v /your/models:/models:ro \
   --entrypoint /opt/pxa/bin/upstream-ik-server \
-  ghcr.io/poisonxa16/pxa:v2026.09.20 \
+  ghcr.io/poisonxa16/pxa:v2026.09.20-rc4 \
   -m /models/your-model.gguf -ngl 99 -c 8192 --host 0.0.0.0 --port 8080
 ```
 
@@ -183,6 +183,6 @@ published gate results apply to the image without a separate claim. `docker imag
 inspect` will tell you which release and which commit:
 
 ```bash
-docker image inspect ghcr.io/poisonxa16/pxa:v2026.09.20 \
+docker image inspect ghcr.io/poisonxa16/pxa:v2026.09.20-rc4 \
   --format '{{json .Config.Labels}}' | python3 -m json.tool
 ```

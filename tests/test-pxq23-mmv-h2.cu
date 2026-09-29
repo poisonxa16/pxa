@@ -1,6 +1,9 @@
 // pxa / PXA kernel suite -- authored by PXA Network (https://pxanetwork.com).
 // test-pxq23-mmv-h2.cu -- differential harness for PXA_PXQ_MMV_H2, the half2 inner loop for the
-// PXQ2/PXQ3 dense decode mmv on GP100.
+// PXQ2/PXQ3/PXQ4 dense decode mmv on GP100. (The 4-bit tier joined the lever on 2026-09-13 as
+// mask bit 2; every phase below runs on all three policies. The one place the tiers genuinely
+// differ is the KEY: PXQ2 and PXQ3 key on a nibble of the 2-bit planes, PXQ4 on a whole byte of
+// the nibble plane, which is why phase 1's key-injection has a branch on the LUT size.)
 //
 // WHAT IS UNDER TEST. The shipped decode dot32 spends 2 shared-memory book gathers and
 // FMUL + FFMA + FADD per element pair -- the same 16 pair decodes per 32 weights whatever the code
@@ -111,11 +114,22 @@ static __global__ void k_lut_check(uint16_t * out_lut, uint16_t * out_ref, int *
                 uint32_t q[POL::CODE_WORDS];
                 #pragma unroll
                 for (int w = 0; w < POL::CODE_WORDS; ++w) q[w] = 0xdeadbeefu ^ (0x9e3779b9u*w);
-                const int      h  = b >> 3;
-                const int      sh = 2*((2*b) & 15);
-                q[h] = (q[h] & ~(0xfu << sh)) | ((uint32_t)(k & 0xf) << sh);       // low planes
-                if constexpr (POL::CODE_WORDS == 3) {                              // P3 high plane
-                    q[2] = (q[2] & ~(0x3u << (2*b))) | ((uint32_t)((k >> 4) & 3) << (2*b));
+                if constexpr (POL::H2LUT == 256) {
+                    // 4-BIT TIER (p6): the key is a whole BYTE of the 16-byte code row -- two
+                    // 4-bit codes -- not a nibble of a 2-bit plane, so it is injected at a
+                    // different width and a different stride from the sub-nibble tiers. Writing
+                    // this branch is the point of the phase on this tier: the key derivation
+                    // differs from the low tiers even though the LUT lookup is identical.
+                    const int h  = b >> 2;
+                    const int sh = 8*(b & 3);
+                    q[h] = (q[h] & ~(0xffu << sh)) | ((uint32_t)(k & 0xff) << sh);
+                } else {
+                    const int      h  = b >> 3;
+                    const int      sh = 2*((2*b) & 15);
+                    q[h] = (q[h] & ~(0xfu << sh)) | ((uint32_t)(k & 0xf) << sh);   // low planes
+                    if constexpr (POL::CODE_WORDS == 3) {                          // P3 high plane
+                        q[2] = (q[2] & ~(0x3u << (2*b))) | ((uint32_t)((k >> 4) & 3) << (2*b));
+                    }
                 }
                 if (POL::h2key(q, b) != k) ok = 0;
             }
@@ -399,6 +413,7 @@ int main(int argc, char ** argv) {
     printf("\nPHASE 1  half2 pair LUT, exhaustive, zero tolerance\n");
     phase1_tier<pxq6_pol_p2>("PXQ2");
     phase1_tier<pxq6_pol_p3>("PXQ3");
+    phase1_tier<pxq6_pol_p6>("PXQ4");
 
     printf("\nPHASE 2  per-(row, slab) differential vs the exact fp32 dot32\n");
     struct { int kind; const char * name; bool zero; } regimes[] = {
@@ -411,21 +426,27 @@ int main(int argc, char ** argv) {
     for (auto & rg : regimes) {
         phase2_tier<pxq6_pol_p2>("PXQ2", 4, 16, rg.kind, rg.name, seed, rg.zero);
         phase2_tier<pxq6_pol_p3>("PXQ3", 4, 16, rg.kind, rg.name, seed, rg.zero);
+        phase2_tier<pxq6_pol_p6>("PXQ4", 4, 16, rg.kind, rg.name, seed, rg.zero);
     }
 
     printf("\nPHASE 3  the guard: fp16-overflowing outliers, all-zero x, non-finite x\n");
     phase2_tier<pxq6_pol_p2>("PXQ2", 4, 16, 4, "overflow outliers",  seed, false);
     phase2_tier<pxq6_pol_p3>("PXQ3", 4, 16, 4, "overflow outliers",  seed, false);
+    phase2_tier<pxq6_pol_p6>("PXQ4", 4, 16, 4, "overflow outliers",  seed, false);
     phase2_tier<pxq6_pol_p2>("PXQ2", 2,  8, 6, "all-zero x",         seed, true);
     phase2_tier<pxq6_pol_p3>("PXQ3", 2,  8, 6, "all-zero x",         seed, true);
+    phase2_tier<pxq6_pol_p6>("PXQ4", 2,  8, 6, "all-zero x",         seed, true);
     phase3_nonfinite<pxq6_pol_p2>("PXQ2", seed);
     phase3_nonfinite<pxq6_pol_p3>("PXQ3", seed);
+    phase3_nonfinite<pxq6_pol_p6>("PXQ4", seed);
 
     printf("\nPHASE 4  split == unsplit inside the mode, bitwise\n");
     phase4_split<pxq6_pol_p2>("PXQ2",  512, 2048, seed);
     phase4_split<pxq6_pol_p3>("PXQ3",  512, 2048, seed);
+    phase4_split<pxq6_pol_p6>("PXQ4",  512, 2048, seed);
     phase4_split<pxq6_pol_p2>("PXQ2",  256, 5120, seed);
     phase4_split<pxq6_pol_p3>("PXQ3",  256, 5120, seed);
+    phase4_split<pxq6_pol_p6>("PXQ4",  256, 5120, seed);
 
     printf("\n%s  %d cases, %d failures\n", g_fail ? "FAILED" : "PASSED", g_cases, g_fail);
     return g_fail ? 1 : 0;

@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-pxqn.h"
 #include "ggml.h"
 //#include "ggml-backend.h"
 
@@ -341,6 +342,13 @@ static bool llama_pxa_type_is_pxq(enum ggml_type t) {
         case GGML_TYPE_PXQ4:
         case GGML_TYPE_PXQ4HQ:
         case GGML_TYPE_PXQ6:
+        case GGML_TYPE_PXQN3:
+        case GGML_TYPE_PXQN3S8:
+        case GGML_TYPE_PXQN4:
+        case GGML_TYPE_PXQN2:
+        case GGML_TYPE_PXQN1:
+        case GGML_TYPE_PXQN4S8:
+        case GGML_TYPE_PXQN5:
             return true;
         default:
             return false;
@@ -395,6 +403,38 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
 
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+    // PXQN revision gate (ggml-pxqn.h, src/llama-pxqn.h): a revision newer than this build reads
+    // is refused HERE, before any tensor is created, with a message that says what to do. No
+    // pxa.pxqn.rev = an old PXQ file, which loads exactly as before.
+    {
+        uint32_t pxqn_rev = 0; uint64_t pxqn_seed = 0; uint32_t pxqn_sites = 0;
+        llama_pxqn_read_keys(meta, pxqn_rev, pxqn_seed, pxqn_sites);   // throws on rev > 1 / malformed
+        bool has_pxqn = false;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            if (cur->type == GGML_TYPE_PXQN3 || cur->type == GGML_TYPE_PXQN3S8 || cur->type == GGML_TYPE_PXQN4 ||
+                cur->type == GGML_TYPE_PXQN2 || cur->type == GGML_TYPE_PXQN1 || cur->type == GGML_TYPE_PXQN4S8 ||
+                cur->type == GGML_TYPE_PXQN5) {
+                has_pxqn = true;
+                break;
+            }
+        }
+        // PXQN decode is the closed libggml-pxqn (PXA release builds): refuse here, once, before any tensor is
+        // created, instead of failing deep in a backend. A rotated file of classic types needs it too (the RHT op).
+        if ((has_pxqn || pxqn_sites != 0) && !ggml_pxqn_available()) {
+            throw std::runtime_error("PXQN models need the PXA release build (libggml-pxqn); "
+                                     "classic PXQ/k-quants work in this build");
+        }
+        if (pxqn_rev > 0) {
+            LLAMA_LOG_INFO("%s: PXQN revision %u, rotated sites: %s%s\n", __func__, pxqn_rev,
+                           pxqn_sites ? llama_pxqn_sites_str(pxqn_sites).c_str() : "none",
+                           has_pxqn ? "" : " (no PXQN-typed tensors: a rotated file of other types)");
+        } else if (has_pxqn) {
+            LLAMA_LOG_WARN("%s: this file has PXQN tensors but no %s key: read as revision 1 with no "
+                           "rotated sites. If it was written rotated it WILL DECODE WRONG -- re-quantize "
+                           "with a build that stamps the pxa.pxqn.* keys.\n", __func__, LLAMA_PXQN_KEY_REV);
+        }
+    }
 
     // PXQ table provenance guard (PXA_PXQ_CEIL_V2 2026-08-09; PXA_PXQ2_V3 2026-08-10): a file
     // quantized with non-v1 PXQ2/PXQ3 books decodes WRONG on a runtime holding different
@@ -619,6 +659,13 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             case GGML_TYPE_Q4_0_4_4: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_4_4; break;
             case GGML_TYPE_Q4_0_4_8: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_4_8; break;
             case GGML_TYPE_Q4_0_8_8: ftype = LLAMA_FTYPE_MOSTLY_Q4_0_8_8; break;
+            case GGML_TYPE_PXQN3:   ftype = LLAMA_FTYPE_MOSTLY_PXQN3;   break;
+            case GGML_TYPE_PXQN3S8: ftype = LLAMA_FTYPE_MOSTLY_PXQN3S8; break;
+            case GGML_TYPE_PXQN4:   ftype = LLAMA_FTYPE_MOSTLY_PXQN4;   break;
+            case GGML_TYPE_PXQN2:   ftype = LLAMA_FTYPE_MOSTLY_PXQN2;   break;
+            case GGML_TYPE_PXQN1:   ftype = LLAMA_FTYPE_MOSTLY_PXQN1;   break;
+            case GGML_TYPE_PXQN4S8: ftype = LLAMA_FTYPE_MOSTLY_PXQN4S8; break;
+            case GGML_TYPE_PXQN5:   ftype = LLAMA_FTYPE_MOSTLY_PXQN5;   break;
             default:
                 {
                      LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -1233,6 +1280,9 @@ bool llama_model_loader::load_all_data(
             // this can happen with split experts models
             continue;
         }
+        if (pxa_premapped.count(cur)) {
+            continue;   // PXA_PLE_MMAP: already the file's own bytes (counted when mapped)
+        }
 
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
@@ -1546,7 +1596,8 @@ bool llama_model_loader::load_all_data_parallel(
                 continue;
             }
             // with split-experts models get_weight can return nullptr - skip, same as the serial path
-            if (get_weight(ggml_get_name(cur))) {
+            // PXA_PLE_MMAP: a premapped tensor is already the file's own bytes - skip it too
+            if (get_weight(ggml_get_name(cur)) && !pxa_premapped.count(cur)) {
                 return cur;
             }
         }

@@ -2839,34 +2839,12 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         ? input
         : params.generation_prompt + input;
 
-    // PXA tool-tag normalizer (2026-06-30): Qwen3-Next/Qwen3.5 intermittently emit the
-    // tool-DEFINITIONS tag <tools>...</tools> in their OUTPUT when they mean the tool-CALL tag
-    // <tool_call>...</tool_call> (the two are adjacent in the chat template). The PEG tool parser
-    // keys on <tool_call>, so a <tools>-wrapped call leaks as plain text. A model never legitimately
-    // emits <tools> in generated text, so rewrite a <tools>{..."name"..."arguments"...}</tools> block
-    // to <tool_call>...</tool_call> for the existing parser. Surgical: only a body with BOTH "name"
-    // and "arguments" is rewritten (an actual call), never a stray tag; model/format-agnostic + safe.
-    std::string pxa_normalized_input;
-    {
-        const std::string & in_ = effective_input;
-        const std::string OPEN = "<tools>", CLOSE = "</tools>";
-        size_t pos = 0;
-        while (true) {
-            size_t o = in_.find(OPEN, pos);
-            if (o == std::string::npos) { pxa_normalized_input.append(in_, pos, std::string::npos); break; }
-            size_t bodystart = o + OPEN.size();
-            size_t c = in_.find(CLOSE, bodystart);
-            if (c == std::string::npos) { pxa_normalized_input.append(in_, pos, std::string::npos); break; }
-            std::string body = in_.substr(bodystart, c - bodystart);
-            bool call = body.find("\"name\"") != std::string::npos &&
-                        body.find("\"arguments\"") != std::string::npos;
-            pxa_normalized_input.append(in_, pos, o - pos);
-            if (call) { pxa_normalized_input += "<tool_call>"; pxa_normalized_input += body; pxa_normalized_input += "</tool_call>"; }
-            else      { pxa_normalized_input.append(in_, o, (c + CLOSE.size()) - o); }
-            pos = c + CLOSE.size();
-        }
-    }
-    const std::string & effective_input2 = pxa_normalized_input;
+    // bug #222: the former PXA <tools> -> <tool_call> string rewrite lived here. It covered JSON
+    // bodies only (never the Qwen3.5/3.8 XML calls), and it paired the FIRST "<tools>" in the reply
+    // with the next "</tools>", so a reply that mentioned "<tools>" before a wrapped call failed to
+    // parse. The PEG tool parsers now accept <tools> for Qwen markers themselves
+    // (pxa_qwen_tools_variant), and end content there only when a complete call follows.
+    const std::string & effective_input2 = effective_input;
 
     LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input2.c_str());
 

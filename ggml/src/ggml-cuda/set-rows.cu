@@ -1,6 +1,9 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "convert.cuh"
+#include <type_traits>
+#include <algorithm>
+#include <cstdlib>
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -156,6 +159,32 @@ static void set_rows_cuda(
     }
 }
 
+// PXA_SET_ROWS_FAST (default 1; =0 the generic kernel): f32 -> f32 rows in a 2-D source (ne02 == ne03 == 1) with
+// contiguous elements are a plain row copy. The generic kernel above spends four 64-bit divisions per ELEMENT to
+// recover its indices; the DeltaNet state write-back of every speculative verify step scatters one ~1.6 MB row per
+// layer through it (sm_60: 44 us per launch, 48 launches per verify). Here blockIdx.y is the row and the columns
+// go 4 at a time when both rows are 16-byte aligned. A copy, so bit-identical to the generic kernel.
+template<typename idx_t>
+static __global__ void k_set_rows_f32_rows(const float * __restrict__ src0, const idx_t * __restrict__ src1,
+        float * __restrict__ dst, const int64_t ne00, const int64_t s01, const int64_t s10, const int64_t s1, const int vec) {
+    const int64_t i01 = blockIdx.y;
+    const int64_t dst_row = src1[i01*s10];
+    const float * sr = src0 + i01*s01;
+    float * dr = dst + dst_row*s1;
+    const int64_t t0 = int64_t(blockIdx.x)*blockDim.x + threadIdx.x, nt = int64_t(gridDim.x)*blockDim.x;
+    if (vec) {
+        const int64_t n4 = ne00/4;
+        for (int64_t i = t0; i < n4; i += nt) ((float4 *)dr)[i] = ((const float4 *)sr)[i];
+        for (int64_t i = 4*n4 + t0; i < ne00; i += nt) dr[i] = sr[i];
+    } else {
+        for (int64_t i = t0; i < ne00; i += nt) dr[i] = sr[i];
+    }
+}
+static bool pxa_set_rows_fast() {
+    static const bool on = [] { const char * e = getenv("PXA_SET_ROWS_FAST"); return !(e && *e && atoi(e) == 0); }();
+    return on;
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -165,6 +194,19 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     cudaStream_t stream = ctx.stream();
 
+    if constexpr (std::is_same<src_t, float>::value) {
+        if (dst->type == GGML_TYPE_F32 && pxa_set_rows_fast() && ne02 == 1 && ne03 == 1 && ne01 > 0 && ne01 <= 65535 &&
+                nb00 == sizeof(float) && nb0 == sizeof(float) && nb01 % sizeof(float) == 0 && nb1 % sizeof(float) == 0 &&
+                nb10 % sizeof(idx_t) == 0 && ne00 > 0) {
+            const int64_t s01 = nb01/sizeof(float), s1 = nb1/sizeof(float), s10 = nb10/sizeof(idx_t);
+            const int vec = ((uintptr_t)src0_d % 16 == 0) && ((uintptr_t)dst->data % 16 == 0) && s01 % 4 == 0 && s1 % 4 == 0;
+            const int64_t work = vec ? ne00/4 : ne00;
+            const int bx = (int)std::min<int64_t>((work + 255)/256, 256);
+            k_set_rows_f32_rows<idx_t><<<dim3(bx > 0 ? bx : 1, (unsigned)ne01), 256, 0, stream>>>(
+                (const float *)src0_d, src1_d, (float *)dst->data, ne00, s01, s10, s1, vec);
+            return;
+        }
+    }
 
     if (dst->type == GGML_TYPE_F32) {
         set_rows_cuda(

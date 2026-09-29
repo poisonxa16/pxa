@@ -47,6 +47,19 @@ static const std::vector<struct quant_option> QUANT_OPTIONS = {
     { "PXQ3",     LLAMA_FTYPE_MOSTLY_PXQ3,     " 3.27 bpw, LM8 bit-plane x E16-row scales (experts; wrel 2.1x PXQ4)",},
     { "PXQ_UNIVERSAL", LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL, " mixed PXQ1/PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)",},
     { "PXQ1",     LLAMA_FTYPE_MOSTLY_PXQ1,     " 1.26 bpw, 1-bit sign x E16-row scales (experts; the sub-2-bit stretch tier)",},
+    // PXQ-Next revision 1 (PXQN). Written only by PXA's own quantizer build (PXA_PXQN_ENCODER). The
+    // public pxq-quantize does not list them; a runtime build lists them so it can say where they
+    // come from.
+#if !defined(PXA_PXQ_ENCODER) || defined(PXA_PXQN_ENCODER)
+    { "PXQN3",    LLAMA_FTYPE_MOSTLY_PXQN3,    " 3.25 bpw + 16/K, N3 int book x E16-row scales, 128-K slabs (PXQ-Next r1)",},
+    { "PXQN3S8",  LLAMA_FTYPE_MOSTLY_PXQN3S8,  " 3.50 bpw + 16/K, N3 int book x E8-row scales, 128-K slabs (PXQ-Next r1)",},
+    { "PXQN4",    LLAMA_FTYPE_MOSTLY_PXQN4,    " 4.25 bpw + 16/K, N4 int book x E16-row scales (PXQ-Next r1)",},
+    { "PXQN2",    LLAMA_FTYPE_MOSTLY_PXQN2,    " 2.25 bpw + 16/K, N2 int book x E16-row scales, 128-K slabs (PXQN ladder, vs PXQ2)",},
+    { "PXQN1",    LLAMA_FTYPE_MOSTLY_PXQN1,    " 1.25 bpw + 16/K, sign book x E16-row scales, 128-K slabs (PXQN ladder, vs PXQ1)",},
+    { "PXQN4S8",  LLAMA_FTYPE_MOSTLY_PXQN4S8,  " 4.50 bpw + 16/K, N4 int book x E8-row scales (PXQN ladder, vs PXQ4-HQ)",},
+    { "PXQN5",    LLAMA_FTYPE_MOSTLY_PXQN5,    " 5.25 bpw + 16/K, 5-bit uniform int book x E16-row scales (PXQN ladder, vs PXQ6)",},
+    { "PXQN",     LLAMA_FTYPE_MOSTLY_PXQN,     " PXQ-Next r1 allocator mix over N3/N3S8/N4/q8_0 (needs PXQN_TIERS)",},
+#endif
     { "PXQ6HQ",   LLAMA_FTYPE_MOSTLY_PXQ4HQ,   " deprecated alias for PXQ4-HQ (pre-re-ladder name)",},
     { "PXQ4HQ",   LLAMA_FTYPE_MOSTLY_PXQ4HQ,   " alias for PXQ4-HQ",},
     { "IQ2_XXS",  LLAMA_FTYPE_MOSTLY_IQ2_XXS,  " 2.06 bpw quantization",            },
@@ -126,6 +139,11 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 [[noreturn]]
 static void usage(const char * executable) {
 #if defined(PXQ_QUANTIZE_TOOL)
+#if defined(PXA_PXQN_ENCODER)
+    printf("pxq-quantize %s (private build)\n", PXA_QUANTIZER_VERSION);
+#else
+    printf("pxq-quantize %s (public edition)\n", PXA_QUANTIZER_VERSION);
+#endif
     printf("pxq-quantize — the PXA quantizer that writes PXQ files. Same command line as\n"
            "llama-quantize; it is the PXQ encoder, shipped separately from the runtime.\n"
            "Tiers it writes: PXQ1 (~1.26 bpw), PXQ2 (2-bit LM4), PXQ3 (3-bit LM8), PXQ4 and\n"
@@ -313,6 +331,16 @@ static bool pxa_type_name_eq(const char * a, const char * b) {
     return *a == *b; // both at NUL
 }
 
+#if defined(PXA_PXQ_ENCODER) && !defined(PXA_PXQN_ENCODER)
+// The public quantizer: the ggml type table it links (the runtime's) knows every type the engine
+// can LOAD, including ones this build cannot WRITE. Refuse those by number, before any work.
+static bool pxa_type_not_written_here(ggml_type t) {
+    return t == GGML_TYPE_PXQN3 || t == GGML_TYPE_PXQN3S8 || t == GGML_TYPE_PXQN4 ||
+           t == GGML_TYPE_PXQN2 || t == GGML_TYPE_PXQN1   || t == GGML_TYPE_PXQN4S8 ||
+           t == GGML_TYPE_PXQN5;
+}
+#endif
+
 static ggml_type parse_ggml_type(const char * arg) {
     ggml_type result = GGML_TYPE_COUNT;
     for (int j = 0; j < GGML_TYPE_COUNT; ++j) {
@@ -322,6 +350,14 @@ static ggml_type parse_ggml_type(const char * arg) {
             result = type; break;
         }
     }
+#if defined(PXA_PXQ_ENCODER) && !defined(PXA_PXQN_ENCODER)
+    if (result != GGML_TYPE_COUNT && pxa_type_not_written_here(result)) {
+        fprintf(stderr,
+            "\nERROR: '%s' is not a type this quantizer writes. It writes the classic PXQ tiers\n"
+            "(pxq1, pxq2, pxq3, pxq4, pxq4hq, pxq6) and the stock ggml types. Nothing has been written.\n\n", arg);
+        exit(1);
+    }
+#endif
     if (result == GGML_TYPE_COUNT) {
         // PXQ re-ladder aliases for tier maps / --custom-q / --*-type args. NOTE (2026-07-21):
         // lowercase "pxq6" now resolves via ggml_type_name to the REAL 5-bit tier (id 256) —
@@ -690,6 +726,10 @@ int main(int argc, char ** argv) {
         }
         if (!try_parse_ftype(argv[arg_idx], params.ftype, ftype_str)) {
             fprintf(stderr, "%s: invalid ftype '%s'\n", __func__, argv[arg_idx]);
+#if defined(PXA_PXQ_ENCODER) && !defined(PXA_PXQN_ENCODER)
+            fprintf(stderr, "%s: this quantizer writes PXQ1, PXQ2, PXQ3, PXQ4, PXQ4-HQ, PXQ6, PXQ_UNIVERSAL and the stock\n"
+                            "%s: types; --help lists every name. Nothing has been written.\n", __func__, __func__);
+#endif
             return 1;
         }
         if (ftype_str == "COPY") {
@@ -737,7 +777,13 @@ int main(int argc, char ** argv) {
             params.ftype == (llama_ftype) 248 || params.ftype == (llama_ftype) 252 ||
             params.ftype == (llama_ftype) 253 || params.ftype == (llama_ftype) 254 ||
             params.ftype == (llama_ftype) 255 || params.ftype == (llama_ftype) 256 ||
-            params.ftype == (llama_ftype) 257;
+            params.ftype == (llama_ftype) 257 ||
+            // PXQ-Next revision 1 (PXQN3 / PXQN3S8 / PXQN4 / PXQN mix)
+            params.ftype == (llama_ftype) 258 || params.ftype == (llama_ftype) 259 ||
+            params.ftype == (llama_ftype) 260 || params.ftype == (llama_ftype) 261 ||
+            // PXQN ladder (PXQN2 / PXQN1 / PXQN4S8 / PXQN5)
+            params.ftype == (llama_ftype) 262 || params.ftype == (llama_ftype) 263 ||
+            params.ftype == (llama_ftype) 264 || params.ftype == (llama_ftype) 265;
 
         std::string base = fname_out;
         const size_t slash = base.find_last_of("/\\");
@@ -877,6 +923,52 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // pxa.* PROVENANCE (2026-09-25, PXA core identity): every file this tool writes says which tool,
+    // which build and which recipe made it, in the pxa.* namespace (general.* is still written and
+    // read exactly as before). A requantize would otherwise INHERIT the source file's pxa.quantizer.*
+    // keys and claim a build that never touched it, so these are overrides, not additions.
+    // PXA_RECIPE_ID names the recipe; the target type name is the default.
+    {
+        const bool pxq_target =
+            params.ftype == (llama_ftype) 248 || params.ftype == (llama_ftype) 252 ||
+            params.ftype == (llama_ftype) 253 || params.ftype == (llama_ftype) 254 ||
+            params.ftype == (llama_ftype) 255 || params.ftype == (llama_ftype) 256 ||
+            params.ftype == (llama_ftype) 257;
+        if (!kv_overrides.empty() && kv_overrides.back().key[0] == 0) {
+            kv_overrides.pop_back();
+        }
+        auto push_str = [&](const char * k, const std::string & v) {
+            llama_model_kv_override o;
+            std::memset(&o, 0, sizeof(o));
+            strncpy(o.key, k, sizeof(o.key) - 1);
+            o.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+            strncpy(o.val_str, v.c_str(), sizeof(o.val_str) - 1);
+            kv_overrides.emplace_back(std::move(o));
+        };
+        const char * recipe = getenv("PXA_RECIPE_ID");
+        push_str("pxa.quantizer.name",  "pxa-quantize");
+        push_str("pxa.quantizer.build", "b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + std::string(LLAMA_COMMIT));
+        push_str("pxa.quantizer.ftype", ftype_str);
+        push_str("pxa.recipe.id",       recipe && recipe[0] ? std::string(recipe) : ftype_str);
+#if defined(PXA_PXQ_ENCODER)
+        // which quantizer build wrote the file: "free" = the public pxq-quantize (classic tiers only),
+        // "pro" = PXA's own build (docs/QUANTIZER-TIERS-AND-SERVICE-2026-09-26.md)
+#if defined(PXA_PXQN_ENCODER)
+        push_str("pxa.quantizer.edition", "pro");
+#else
+        push_str("pxa.quantizer.edition", "free");
+#endif
+        push_str("pxa.quantizer.version", PXA_QUANTIZER_VERSION);
+#endif
+        if (pxq_target) {
+            push_str("pxa.codec.name",    "PXQ");
+            push_str("pxa.codec.version", "1");
+        }
+        kv_overrides.emplace_back();
+        kv_overrides.back().key[0] = 0;
+        params.kv_overrides = &kv_overrides;
+    }
+
 #if !defined(PXA_PXQ_ENCODER)
         // This build reads and runs PXQ files but does not write them. Say so once, before the
         // library says it again through the generic failure path, and touch nothing else: every
@@ -890,10 +982,27 @@ int main(int argc, char ** argv) {
                 params.ftype == (llama_ftype) 248 || params.ftype == (llama_ftype) 252 ||
                 params.ftype == (llama_ftype) 253 || params.ftype == (llama_ftype) 254 ||
                 params.ftype == (llama_ftype) 255 || params.ftype == (llama_ftype) 256 ||
-                params.ftype == (llama_ftype) 257 ||
+                params.ftype == (llama_ftype) 257 || params.ftype == (llama_ftype) 258 ||
+                params.ftype == (llama_ftype) 259 || params.ftype == (llama_ftype) 260 ||
+                params.ftype == (llama_ftype) 261 || params.ftype == (llama_ftype) 262 ||
+                params.ftype == (llama_ftype) 263 || params.ftype == (llama_ftype) 264 ||
+                params.ftype == (llama_ftype) 265 ||
                 is_pxq_type(params.output_tensor_type) || is_pxq_type(params.token_embedding_type);
+            auto is_pxqn_type = [](ggml_type t) {
+                return t == GGML_TYPE_PXQN3 || t == GGML_TYPE_PXQN3S8 || t == GGML_TYPE_PXQN4 ||
+                       t == GGML_TYPE_PXQN2 || t == GGML_TYPE_PXQN1   || t == GGML_TYPE_PXQN4S8 ||
+                       t == GGML_TYPE_PXQN5;
+            };
+            bool want_pxqn = (int) params.ftype >= 258 && (int) params.ftype <= 265;
+            want_pxqn = want_pxqn || is_pxqn_type(params.output_tensor_type) || is_pxqn_type(params.token_embedding_type);
             for (const auto & rule : custom_quants) {
-                want_pxq = want_pxq || is_pxq_type(rule.second);
+                want_pxq  = want_pxq  || is_pxq_type(rule.second);
+                want_pxqn = want_pxqn || is_pxqn_type(rule.second);
+            }
+            if (want_pxqn) {
+                fprintf(stderr, "PXQN (PXQ-Next) files are written by PXA's own quantizer only; the public pxq-quantize\n"
+                                "(%s) writes the classic PXQ tiers.\n", PXA_PXQ_QUANTIZER_URL);
+                return 1;
             }
             if (want_pxq) {
                 fprintf(stderr, "PXQ files are made with the separate `pxq-quantize` tool, available at %s\n",

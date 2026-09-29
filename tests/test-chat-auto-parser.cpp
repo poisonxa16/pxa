@@ -94,6 +94,9 @@ static void test_hunyuan_v3_tagged_args(testing & t);
 // derivation is otherwise unaffected, so this isolates the scanner from the Hunyuan
 // separator-derivation defect.
 static void test_tagged_value_scanner_stops_at_close_marker(testing & t);
+static void test_qwen_tools_tag_is_a_tool_call(testing & t);
+static void test_qwen_tools_text_stays_content(testing & t);
+static void test_qwen_tool_calls_parallel(testing & t);
 
 int main(int argc, char * argv[]) {
     testing t(std::cout);
@@ -120,6 +123,9 @@ int main(int argc, char * argv[]) {
     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
     t.test("hunyuan_v3_tagged_args", test_hunyuan_v3_tagged_args);
     t.test("tagged_value_scanner", test_tagged_value_scanner_stops_at_close_marker);
+    t.test("qwen_tools_tag", test_qwen_tools_tag_is_a_tool_call);
+    t.test("qwen_tools_text", test_qwen_tools_text_stays_content);
+    t.test("qwen_tool_calls_parallel", test_qwen_tool_calls_parallel);
 
     return t.summary();
 }
@@ -2354,4 +2360,403 @@ static void test_tagged_value_scanner_stops_at_close_marker(testing & t) {
               "<parameter=unit>\nfahrenheit\n</parameter>\n"
               "</function>\n</tool_call>");
     });
+}
+
+
+// ---------------------------------------------------------------------------
+// bug #222: Qwen models sometimes wrap a tool call in the tool-DEFINITIONS tag
+// <tools>...</tools> instead of <tool_call>...</tool_call>. The PXA tool-tag fix accepts
+// <tools> as an alternate delimiter, but compared the template's call marker exactly
+// against "<tool_call>" while Qwen templates derive "<tool_call>\n", so it never engaged:
+// the call came back as plain content. The string normaliser in common_chat_peg_parse
+// covered JSON bodies only for a CLOSED block, so while streaming the call leaked into
+// content and the final rewrite broke the content diff. Check the final parse and that
+// every streamed prefix diffs cleanly into the next one.
+// ---------------------------------------------------------------------------
+static void test_qwen_tools_tag_is_a_tool_call(testing & t) {
+    auto run = [](testing & t, const std::string & template_path, const std::string & emission) {
+        std::ifstream fin(template_path, std::ios::binary);
+        std::ostringstream buf; buf << fin.rdbuf();
+        std::string src = buf.str();
+        if (!t.assert_true(template_path + " loaded", !src.empty())) {
+            return;
+        }
+
+        common_chat_templates_ptr tmpls(common_chat_templates_init(/* model = */ nullptr, src));
+
+        common_chat_tool weather{
+            /* .name        = */ "get_weather",
+            /* .description = */ "Get current weather",
+            /* .parameters  = */ R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})",
+        };
+
+        common_chat_msg user;
+        user.role    = "user";
+        user.content = "Weather?";
+
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { user };
+        inputs.tools                 = { weather };
+        inputs.enable_thinking       = false;
+        inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+
+        auto params = common_chat_templates_apply(tmpls.get(), inputs);
+
+        common_peg_arena arena;
+        arena.load(params.parser);
+        common_chat_parser_params pp(params);
+
+        // streamed: every prefix parses (partial) and diffs cleanly against the previous one
+        common_chat_msg prev;
+        prev.role = "assistant";
+        for (size_t i = 1; i <= emission.size(); ++i) {
+            const bool partial = i < emission.size();
+            common_chat_msg cur;
+            try {
+                cur = common_chat_peg_parse(arena, emission.substr(0, i), partial, pp);
+                common_chat_msg_diff::compute_diffs(prev, cur);
+            } catch (const std::exception & e) {
+                t.assert_true("prefix " + std::to_string(i) + " parses and diffs: " + e.what(), false);
+                return;
+            }
+            prev = cur;
+        }
+
+        if (!t.assert_equal("one tool call", (size_t) 1, prev.tool_calls.size())) {
+            return;
+        }
+        t.assert_equal("name", std::string("get_weather"), prev.tool_calls[0].name);
+        t.assert_equal("arguments", nlohmann::ordered_json::parse(R"({"city":"Atlanta"})").dump(),
+                       nlohmann::ordered_json::parse(prev.tool_calls[0].arguments).dump());
+        t.assert_equal("no leaked content", std::string(""), trim_whitespace(prev.content));
+    };
+
+    t.test("Qwen3.5 XML call wrapped in <tools>", [&](testing & t) {
+        run(t, "models/templates/Qwen3.5-4B.jinja",
+            "<tools>\n<function=get_weather>\n<parameter=city>\nAtlanta\n</parameter>\n</function>\n</tools>");
+    });
+
+    t.test("Qwen3.5 XML call in <tool_call> still parses", [&](testing & t) {
+        run(t, "models/templates/Qwen3.5-4B.jinja",
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nAtlanta\n</parameter>\n</function>\n</tool_call>");
+    });
+
+    t.test("Qwen2.5 JSON call wrapped in <tools>", [&](testing & t) {
+        run(t, "models/templates/Qwen-Qwen2.5-7B-Instruct.jinja",
+            "<tools>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Atlanta\"}}\n</tools>");
+    });
+
+    t.test("Qwen2.5 JSON call in <tool_call> still parses", [&](testing & t) {
+        run(t, "models/templates/Qwen-Qwen2.5-7B-Instruct.jinja",
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Atlanta\"}}\n</tool_call>");
+    });
+
+    t.test("Qwen3 JSON call wrapped in <tools>", [&](testing & t) {
+        run(t, "models/templates/Qwen-Qwen3-0.6B.jinja",
+            "<tools>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Atlanta\"}}\n</tools>");
+    });
+
+    t.test("Qwen3 JSON call in <tool_call> still parses", [&](testing & t) {
+        run(t, "models/templates/Qwen-Qwen3-0.6B.jinja",
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Atlanta\"}}\n</tool_call>");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// bug #222 control: accepting <tools> as a call wrapper must not break plain text that merely
+// MENTIONS "<tools>" (e.g. explaining the Qwen prompt format). The first cut stopped content at
+// "<tools>\n" unconditionally, so the final parse threw "Failed to parse input" and every
+// streamed prefix withheld all content from the tag on. "<tools>" ends content only when a
+// complete tool call follows it; otherwise it stays content. Checked final and streamed, for the
+// tagged-XML builder (Qwen3.5) and the JSON builders (Qwen3, Qwen2.5).
+// ---------------------------------------------------------------------------
+static void test_qwen_tools_text_stays_content(testing & t) {
+    struct parsed {
+        bool                         ok = false;
+        common_chat_msg              final_msg;
+        std::vector<common_chat_msg> prefixes; // one partial parse per streamed prefix
+    };
+    auto parse_stream = [](testing & t, const std::string & template_path, const std::string & emission,
+                           bool parallel_tool_calls = false) {
+        parsed out;
+        std::ifstream fin(template_path, std::ios::binary);
+        std::ostringstream buf; buf << fin.rdbuf();
+        const std::string src = buf.str();
+        if (!t.assert_true(template_path + " loaded", !src.empty())) {
+            return out;
+        }
+        common_chat_templates_ptr tmpls(common_chat_templates_init(/* model = */ nullptr, src));
+        common_chat_tool weather{
+            /* .name        = */ "get_weather",
+            /* .description = */ "Get current weather",
+            /* .parameters  = */ R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})",
+        };
+        common_chat_msg user;
+        user.role    = "user";
+        user.content = "Weather?";
+        common_chat_templates_inputs inputs;
+        inputs.messages         = { user };
+        inputs.tools            = { weather };
+        inputs.enable_thinking  = false;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        inputs.parallel_tool_calls = parallel_tool_calls;
+        auto params = common_chat_templates_apply(tmpls.get(), inputs);
+        common_peg_arena arena;
+        arena.load(params.parser);
+        common_chat_parser_params pp(params);
+
+        common_chat_msg prev;
+        prev.role = "assistant";
+        for (size_t i = 1; i <= emission.size(); ++i) {
+            const bool partial = i < emission.size();
+            common_chat_msg cur;
+            try {
+                cur = common_chat_peg_parse(arena, emission.substr(0, i), partial, pp);
+                common_chat_msg_diff::compute_diffs(prev, cur);
+            } catch (const std::exception & e) {
+                t.assert_true(std::string(partial ? "prefix " : "final ") + std::to_string(i) + " parses and diffs: " + e.what(), false);
+                return out;
+            }
+            if (partial) {
+                out.prefixes.push_back(cur);
+            }
+            prev = cur;
+        }
+        out.ok        = true;
+        out.final_msg = prev;
+        return out;
+    };
+
+    const std::vector<std::string> templates = {
+        "models/templates/Qwen3.5-4B.jinja",
+        "models/templates/Qwen-Qwen3-0.6B.jinja",
+        "models/templates/Qwen-Qwen2.5-7B-Instruct.jinja",
+    };
+    const std::string mention = "Put the schema in a <tools>\nblock like the docs say.";
+
+    for (const auto & tmpl : templates) {
+        const bool xml = tmpl.find("Qwen3.5") != std::string::npos;
+        const std::string call_body = xml ?
+            "<function=get_weather>\n<parameter=city>\nAtlanta\n</parameter>\n</function>" :
+            "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Atlanta\"}}";
+
+        t.test(tmpl + ": text mentioning <tools> is content", [&](testing & t) {
+            auto r = parse_stream(t, tmpl, mention);
+            if (!r.ok) {
+                return;
+            }
+            t.assert_equal("no tool calls", (size_t) 0, r.final_msg.tool_calls.size());
+            t.assert_equal("final content", mention, r.final_msg.content);
+            // streamed: once the text after the tag rules out a call, the tag is released
+            const std::string released = "Put the schema in a <tools>\nblock like";
+            t.assert_equal("streamed content not withheld", released,
+                           r.prefixes[released.size() - 1].content);
+        });
+
+        t.test(tmpl + ": mention, then a real <tool_call>", [&](testing & t) {
+            auto r = parse_stream(t, tmpl, "Use a <tools>\nblock.\n<tool_call>\n" + call_body + "\n</tool_call>");
+            if (!r.ok || !t.assert_equal("one tool call", (size_t) 1, r.final_msg.tool_calls.size())) {
+                return;
+            }
+            t.assert_equal("name", std::string("get_weather"), r.final_msg.tool_calls[0].name);
+            t.assert_equal("content keeps the mention", std::string("Use a <tools>\nblock."),
+                           trim_whitespace(r.final_msg.content));
+        });
+
+        t.test(tmpl + ": mention, then a <tools>-wrapped call", [&](testing & t) {
+            auto r = parse_stream(t, tmpl, "Use a <tools>\nblock.\n<tools>\n" + call_body + "\n</tools>");
+            if (!r.ok || !t.assert_equal("one tool call", (size_t) 1, r.final_msg.tool_calls.size())) {
+                return;
+            }
+            t.assert_equal("name", std::string("get_weather"), r.final_msg.tool_calls[0].name);
+            t.assert_equal("content keeps the mention", std::string("Use a <tools>\nblock."),
+                           trim_whitespace(r.final_msg.content));
+        });
+
+        // Bug #222 follow-up regressions (review of d6130ccc00). With parallel_tool_calls the tail
+        // after the last call needs more input at trailing whitespace; the <tools> lookahead must not
+        // turn that into a dropped parse, and it must not run at the template's own <tool_call>.
+        t.test(tmpl + ": parallel, <tool_call> with trailing whitespace", [&](testing & t) {
+            auto r = parse_stream(t, tmpl, "<tool_call>\n" + call_body + "\n</tool_call>\n", true);
+            if (!r.ok || !t.assert_equal("one tool call", (size_t) 1, r.final_msg.tool_calls.size())) {
+                return;
+            }
+            t.assert_equal("name", std::string("get_weather"), r.final_msg.tool_calls[0].name);
+        });
+
+        t.test(tmpl + ": parallel, text then <tools>-wrapped call with trailing whitespace", [&](testing & t) {
+            auto r = parse_stream(t, tmpl, "Let me check.\n<tools>\n" + call_body + "\n</tools>\n", true);
+            if (!r.ok || !t.assert_equal("one tool call", (size_t) 1, r.final_msg.tool_calls.size())) {
+                return;
+            }
+            t.assert_equal("content", std::string("Let me check."), trim_whitespace(r.final_msg.content));
+        });
+
+        t.test(tmpl + ": parallel, two calls", [&](testing & t) {
+            auto r = parse_stream(t, tmpl, "Let me check.\n<tool_call>\n" + call_body + "\n</tool_call>\n<tool_call>\n" +
+                                  call_body + "\n</tool_call>\n", true);
+            if (!r.ok) {
+                return;
+            }
+            t.assert_equal("two tool calls", (size_t) 2, r.final_msg.tool_calls.size());
+        });
+
+        t.test(tmpl + ": parallel, text mentioning <tools> is content", [&](testing & t) {
+            auto r = parse_stream(t, tmpl, mention, true);
+            if (!r.ok) {
+                return;
+            }
+            t.assert_equal("no tool calls", (size_t) 0, r.final_msg.tool_calls.size());
+            t.assert_equal("final content", mention, r.final_msg.content);
+        });
+
+        if (xml) {
+            // Streaming: the tool-call node appears while the call is still arriving, not only at the
+            // final byte (d6130ccc00 held every prefix back to the final parse).
+            for (bool par : { false, true }) {
+                t.test(tmpl + (par ? ": parallel" : ": serial") + ", tool call streams before the last byte", [&](testing & t) {
+                    const std::string em = "Let me check.\n<tool_call>\n" + call_body + "\n</tool_call>";
+                    auto r = parse_stream(t, tmpl, em, par);
+                    if (!r.ok) {
+                        return;
+                    }
+                    size_t first = 0;
+                    for (size_t i = 0; i < r.prefixes.size(); ++i) {
+                        if (!r.prefixes[i].tool_calls.empty()) {
+                            first = i + 1;
+                            break;
+                        }
+                    }
+                    t.assert_true("tool call visible before the closing tag (first at " + std::to_string(first) + " of " +
+                                  std::to_string(em.size()) + ")",
+                                  first > 0 && first + std::string("\n</tool_call>").size() < em.size());
+                });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bug #222 review: with parallel_tool_calls=true the tool-call tail can always take one more call,
+// so after "</tool_call>\n" it needs more input even in the final parse (the chat parse is always
+// lenient). The <tools> lookahead used a plain negate(), which propagated that need-more-input
+// through the content parser and dropped every parsed call: a single call plus a trailing newline
+// came back as 0 calls, and streaming two calls threw "now finding less tool calls". Normal
+// <tool_call> output must stream and parse exactly as without the <tools> fix, for the tagged-XML
+// (Qwen3.5, Qwen3-Coder) and JSON (Qwen3) builders, with and without thinking; <tools>-wrapped
+// calls must work in the same positions.
+// ---------------------------------------------------------------------------
+static void test_qwen_tool_calls_parallel(testing & t) {
+    auto run = [](testing & t, const std::string & template_path, const std::string & emission, bool think,
+                  size_t want_calls, const std::string & want_reasoning) {
+        std::ifstream fin(template_path, std::ios::binary);
+        std::ostringstream buf; buf << fin.rdbuf();
+        const std::string src = buf.str();
+        if (!t.assert_true(template_path + " loaded", !src.empty())) {
+            return;
+        }
+        common_chat_templates_ptr tmpls(common_chat_templates_init(/* model = */ nullptr, src));
+        common_chat_tool weather{
+            /* .name        = */ "get_weather",
+            /* .description = */ "Get current weather",
+            /* .parameters  = */ R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})",
+        };
+        common_chat_msg user;
+        user.role    = "user";
+        user.content = "Weather?";
+        common_chat_templates_inputs inputs;
+        inputs.messages            = { user };
+        inputs.tools               = { weather };
+        inputs.parallel_tool_calls = true;
+        inputs.enable_thinking     = think;
+        inputs.reasoning_format    = think ? COMMON_REASONING_FORMAT_DEEPSEEK : COMMON_REASONING_FORMAT_AUTO;
+        auto params = common_chat_templates_apply(tmpls.get(), inputs);
+        common_peg_arena arena;
+        arena.load(params.parser);
+        common_chat_parser_params pp(params);
+        pp.reasoning_format = inputs.reasoning_format;
+
+        // final parse on its own (a non-streaming request)
+        common_chat_msg final_only;
+        try {
+            final_only = common_chat_peg_parse(arena, emission, /* is_partial = */ false, pp);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("final parse did not throw: ") + e.what(), false);
+            return;
+        }
+        t.assert_equal("final parse: tool calls", want_calls, final_only.tool_calls.size());
+        t.assert_equal("final parse: no content", std::string(""), trim_whitespace(final_only.content));
+
+        // streamed: every prefix parses and diffs cleanly into the next
+        common_chat_msg prev;
+        prev.role = "assistant";
+        for (size_t i = 1; i <= emission.size(); ++i) {
+            const bool partial = i < emission.size();
+            common_chat_msg cur;
+            try {
+                cur = common_chat_peg_parse(arena, emission.substr(0, i), partial, pp);
+                common_chat_msg_diff::compute_diffs(prev, cur);
+            } catch (const std::exception & e) {
+                t.assert_true(std::string(partial ? "prefix " : "final ") + std::to_string(i) + " parses and diffs: " + e.what(), false);
+                return;
+            }
+            prev = cur;
+        }
+        if (!t.assert_equal("streamed: tool calls", want_calls, prev.tool_calls.size())) {
+            return;
+        }
+        for (const auto & tc : prev.tool_calls) {
+            t.assert_equal("name", std::string("get_weather"), tc.name);
+            t.assert_equal("arguments", nlohmann::ordered_json::parse(R"({"city":"Atlanta"})").dump(),
+                           nlohmann::ordered_json::parse(tc.arguments).dump());
+        }
+        t.assert_equal("streamed: no content", std::string(""), trim_whitespace(prev.content));
+        t.assert_equal("streamed: reasoning", want_reasoning, trim_whitespace(prev.reasoning_content));
+    };
+
+    const std::string xml = "<function=get_weather>\n<parameter=city>\nAtlanta\n</parameter>\n</function>";
+    const std::string js  = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Atlanta\"}}";
+    struct tmpl_case { std::string path; std::string body; bool thinking; };
+    const std::vector<tmpl_case> tmpls = {
+        { "models/templates/Qwen3.5-4B.jinja",       xml, true  },
+        { "models/templates/Qwen3-Coder.jinja",      xml, false },
+        { "models/templates/Qwen-Qwen3-0.6B.jinja",  js,  true  },
+    };
+    auto wrap = [](const std::string & open, const std::string & close, const std::string & body) {
+        return open + "\n" + body + "\n" + close;
+    };
+
+    for (const auto & tc : tmpls) {
+        const std::string call  = wrap("<tool_call>", "</tool_call>", tc.body);
+        const std::string tools = wrap("<tools>", "</tools>", tc.body);
+
+        t.test(tc.path + ": single <tool_call> + newline", [&](testing & t) {
+            run(t, tc.path, call + "\n", false, 1, "");
+        });
+        t.test(tc.path + ": single <tool_call>", [&](testing & t) {
+            run(t, tc.path, call, false, 1, "");
+        });
+        t.test(tc.path + ": two <tool_call>", [&](testing & t) {
+            run(t, tc.path, call + "\n" + call, false, 2, "");
+        });
+        t.test(tc.path + ": two <tool_call> + newline", [&](testing & t) {
+            run(t, tc.path, call + "\n" + call + "\n", false, 2, "");
+        });
+        t.test(tc.path + ": single <tools> + newline", [&](testing & t) {
+            run(t, tc.path, tools + "\n", false, 1, "");
+        });
+        t.test(tc.path + ": two <tools>", [&](testing & t) {
+            run(t, tc.path, tools + "\n" + tools, false, 2, "");
+        });
+        t.test(tc.path + ": <tool_call> then <tools>", [&](testing & t) {
+            run(t, tc.path, call + "\n" + tools, false, 2, "");
+        });
+        if (tc.thinking) {
+            // Qwen3.5's generation prompt opens <think>; Qwen3's does not, so its reply carries the tag
+            const std::string open = tc.path.find("Qwen3.5") != std::string::npos ? "" : "<think>\n";
+            t.test(tc.path + ": thinking, two <tool_call>", [&](testing & t) {
+                run(t, tc.path, open + "hm\n</think>\n\n" + call + "\n" + call, true, 2, "hm");
+            });
+        }
+    }
 }

@@ -14,6 +14,8 @@
 #include "pxa/fattn-volta-tile.cuh"
 #include "pxa/fattn-tile-v2.cuh"
 #include "pxa/fattn-tile-big.cuh"
+#include "pxa/fattn-qkv-direct.cuh"
+#include "pxa/fattn-qkv-tile.cuh"
 #include "pxa/core/fa-route.cuh"
 #include "fattn-mma-f16-interface.cuh"
 #include "fattn-new-mma.cuh"
@@ -58,6 +60,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case PXA_FA_ROUTE_WMMA_F16:  ggml_cuda_flash_attn_ext_wmma_f16(ctx, node);        return;
         case PXA_FA_ROUTE_MMA_F16:   ggml_cuda_flash_attn_ext_mma_f16(ctx, node);         return;
         case PXA_FA_ROUTE_MMA_NEW:   ggml_cuda_flash_attn_ext_mma_new(ctx, node);         return;
+        case PXA_FA_ROUTE_QKV_DIRECT: ggml_cuda_flash_attn_ext_qkv_direct(ctx, node);     return;
+        case PXA_FA_ROUTE_QKV_TILE:   ggml_cuda_flash_attn_ext_qkv_tile(ctx, node);       return;
 
         case PXA_FA_ROUTE_DSA_UNSERVED:
             // The node asked for sparse attention and the sparse kernel declined it. Falling

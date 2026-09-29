@@ -1,7 +1,7 @@
 """gpu_split_gate.py -- the device gate for the PXQ2/PXQ3 K-chunk-split decode family.
 
 The claim this file has to prove is BIT-EXACTNESS, not closeness. The split kernels preserve
-the monolithic kernel's fold exactly -- per-lane left-associated chunk chain, then ascending
+the monolithic kernel's fold exactly -- per-chunk chain, then ascending
 k-segment, one final ``__float2half_rn`` -- and their atomic is an arrival counter rather than
 an accumulator, so every output must equal ``k_pxq23_mmv``'s to the bit. A tolerance here would
 hide the only defects this family can have.

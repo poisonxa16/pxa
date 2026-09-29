@@ -23,6 +23,11 @@ void ggml_cuda_op_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
 
 bool ggml_cuda_mmvq_type_supported(ggml_type src0_type);
 
+// PXA_MMVQ_GROUP: ny = 1 GEMVs of one type reading the same q8_1 activation, one launch (mmvq-templates.cuh).
+// True when the type has a grouped launcher and it ran; false = launch the matrices one by one.
+struct mmvq_group_args;
+bool ggml_cuda_mmvq_group(ggml_type type, mmvq_group_args & g, cudaStream_t stream);
+
 void ggml_cuda_op_mul_mat_vec_q_3D(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,

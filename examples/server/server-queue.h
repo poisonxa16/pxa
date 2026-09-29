@@ -1,7 +1,9 @@
 #pragma once
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <deque>
 #include <mutex>
 #include <unordered_set>
@@ -17,6 +19,15 @@ struct server_task_multi {
 struct server_queue {
     int id = 0;
     bool running;
+
+    // PXA hot swap (examples/server/pxa-hotswap.h): control functions run on the loop thread ahead
+    // of every task -- that is where a model is parked and unparked. While `paused` (the model is
+    // parked: nothing may touch its contexts) the loop runs control functions only; tasks that
+    // arrive meanwhile wait in the queue. With hot swap off neither is ever used.
+    std::deque<std::function<void()>> queue_control;
+    std::atomic<bool> paused{false};
+    void post_control(std::function<void()> fn);
+    bool run_control();   // runs what is queued; true if anything ran
 
     // queues
     std::deque<server_task> queue_tasks;
@@ -79,8 +90,10 @@ struct server_queue {
     void terminate() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         running = false;
+        ended   = true;
         condition_tasks.notify_all();
     }
+    bool ended = false;   // PXA hot swap: set by terminate(); a control function posted after it is dropped
 
     /**
      * Main loop consists of these steps:

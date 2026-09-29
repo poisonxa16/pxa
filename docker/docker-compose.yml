@@ -33,7 +33,7 @@ services:
   # otherwise.
   # ---------------------------------------------------------------------------
   pxa:
-    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v2026.09.20}
+    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v2026.10}
     container_name: pxa
     restart: unless-stopped
     ports:
@@ -99,7 +99,7 @@ services:
   # ---------------------------------------------------------------------------
   pxa-vllm:
     profiles: ["vllm"]
-    image: ghcr.io/poisonxa16/pxa-vllm:${VLLM_ARCH:-sm70}-${PXA_VERSION:-v2026.09.20}
+    image: ghcr.io/poisonxa16/pxa-vllm:${VLLM_ARCH:-sm70}-${PXA_VERSION:-v2026.10}
     container_name: pxa-vllm
     restart: unless-stopped
     ports:
@@ -154,7 +154,7 @@ services:
   # ---------------------------------------------------------------------------
   launcher:
     profiles: ["tools"]
-    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v2026.09.20}
+    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v2026.10}
     entrypoint: ["/opt/pxa/dist/pxa-launch"]
     volumes:
       - ${MODELS_DIR:?set MODELS_DIR in .env}:/models:ro

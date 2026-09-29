@@ -54,7 +54,7 @@ that model:
 ```yaml
 models:
   "qwen38-27b":
-    cmd: PXA_TSPLIT_REDUCE=fused PXA_TSPLIT_REDUCE_PREFILL=1 PXA_TSPLIT_FALLBACK=1 /path/to/run-server.sh -m /models/qwen38-27b-pxq4.gguf -ngl 99 -sm tensor -ts 1,1 -c 32768 -fa on --host 127.0.0.1 --port 8081
+    cmd: PXA_TSPLIT_REDUCE=fused PXA_TSPLIT_FALLBACK=1 /path/to/run-server.sh -m /models/qwen38-27b-pxq4.gguf -ngl 99 -sm tensor -ts 1,1 -c 32768 -fa on --host 127.0.0.1 --port 8081
     proxy: http://127.0.0.1:8081
 
   "gemma4-26b-a4b":

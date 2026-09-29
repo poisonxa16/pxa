@@ -510,6 +510,18 @@ extern "C" {
         // llama.h) is a DIFFERENT namespace — no conflict with this ggml type id.
         GGML_TYPE_PXQ6     = 256,
 
+        // PXQN (PXQ-Next revision 1): PXA's rotated low-bit tiers. Decoded by the closed libggml-pxqn (PXA release
+        // builds); an open build recognises the ids and refuses the files at load. bpw (+16/K for the row anchor):
+        // PXQN3 3.25, PXQN3S8 3.50, PXQN4 4.25.
+        GGML_TYPE_PXQN3    = 257,
+        GGML_TYPE_PXQN3S8  = 258,
+        GGML_TYPE_PXQN4    = 259,
+        // PXQN2 2.25, PXQN1 1.25, PXQN4S8 4.50, PXQN5 5.25.
+        GGML_TYPE_PXQN2    = 260,
+        GGML_TYPE_PXQN1    = 261,
+        GGML_TYPE_PXQN4S8  = 262,
+        GGML_TYPE_PXQN5    = 263,
+
 
         // PINNED, deliberately, to 400 -- do NOT let this go back to taking
         // last-declared+1. GGML_TYPE_COUNT is the only implicitly-valued enumerator in this
@@ -695,6 +707,10 @@ extern "C" {
         GGML_OP_DSV4_HC_WEIGHTED_SUM,
         GGML_OP_DSV4_HC_EXPAND,
 
+        // PXA_QWEN4EXP_HC_FUSED (qwen4exp hyper-connection glue, 2026-09-25)
+        GGML_OP_HC_COMBINE_NORM,
+        GGML_OP_HC_GATE_MIX,
+
         GGML_OP_MASK_TO_IDX,
 
         // PXA_GLM5NEXT: the k-pool indexer score reduction, fused
@@ -702,6 +718,13 @@ extern "C" {
 
         // PXA_QSA: the block top-k as a SELECTION rather than a sort
         GGML_OP_QSA_TOPK,
+
+        // PXQN: the rotation of an activation site (closed library)
+        GGML_OP_PXQN_RHT,
+        // PXA expert cache (PXA_XCACHE): route each top-k expert id to the resident (hot) or the
+        // streamed (cold) half of a split expert stack, and merge the two halves' outputs back
+        GGML_OP_MOE_SPLIT_IDS,
+        GGML_OP_MOE_MERGE,
 
         GGML_OP_COUNT,
     };
@@ -749,6 +772,9 @@ extern "C" {
         GGML_TENSOR_FLAG_OUTPUT = 2,
         GGML_TENSOR_FLAG_PARAM  = 4,
         GGML_TENSOR_FLAG_LOSS   = 8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        // PXA: a weight the scheduler must never offload to a higher-priority backend (the CPU
+        // alias of a streamed weight: PXA_STREAM_WEIGHTS already decided where it computes)
+        GGML_TENSOR_FLAG_NO_OFFLOAD = 16,
     };
 
     enum ggml_tri_type {
@@ -1125,6 +1151,22 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   n);
+
+    // PXQN rotation of an activation site, per 128-block of ne0 (implemented by the closed libggml-pxqn).
+    // a: F32, ne0 % 128 == 0, any ne1..ne3, rows may be strided; result: contiguous F32, same shape.
+    // k0 = the GLOBAL K index of element 0 of a's rows (0 unless a is a dim-0 shard of the site;
+    // multiple of 128). op_params int32: [0] seed lo, [1] seed hi, [2] layer, [3] site, [4] k0.
+    // true when the closed PXQN library (libggml-pxqn, PXA release builds) is loaded and matches this build; a
+    // file with PXQN tensors is refused at load when false. Classic PXQ and k-quants never need it.
+    GGML_API bool ggml_pxqn_available(void);
+
+    GGML_API struct ggml_tensor * ggml_pxqn_rht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            uint64_t              seed,
+            int                   layer,
+            int                   site,
+            int                   k0);
 
     // dst = a
     // view(dst, nb1, nb2, nb3, offset) += b
@@ -1672,6 +1714,28 @@ extern "C" {
             struct ggml_tensor  * gate,
             struct ggml_tensor  * b,
             enum ggml_unary_op    op);
+
+    // PXA expert cache (PXA_XCACHE). An expert stack split along the expert axis into a resident
+    // HOT stack and a streamed COLD stack is addressed through a per-layer I32 map of n_expert
+    // entries: map[e] >= 0 is expert e's slot in the hot stack, map[e] <= -2 is slot (-2 - map[e])
+    // in the cold stack. ggml_moe_split_ids turns top-k ids [n_used, n_tokens] into the ids of one
+    // side (side 0 = hot, 1 = cold), -1 where the expert lives on the other side (the SER
+    // convention every MoE kernel already skips). Result: I32 [n_used, n_tokens], contiguous.
+    GGML_API struct ggml_tensor * ggml_moe_split_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * map,
+            int                   side);
+
+    // In place over `hot` (returns a view of it): every slot whose hot id is -1 takes the cold
+    // output (or 0 when the cold id is -1 as well). Slots served by the hot stack are not touched,
+    // so the result is, slot for slot, the value the one-stack graph computes for that expert.
+    GGML_API struct ggml_tensor * ggml_moe_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * hot,
+            struct ggml_tensor  * cold,
+            struct ggml_tensor  * ids_hot,
+            struct ggml_tensor  * ids_cold);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
@@ -2389,6 +2453,21 @@ extern "C" {
             int                  p2,
             int                  p3);
 
+    // pad each dimension with zeros in front (lp*) and behind (rp*): [x, ..., x] -> [0, .., 0, x, ..., x, 0, ..., 0]
+    // (upstream's signature and op_params layout [lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3]; ggml_pad leaves every
+    // lp at 0, so its result and path are unchanged). Lane pxqn-split: the K window of a straddled tensor split.
+    GGML_API struct ggml_tensor * ggml_pad_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                  lp0,
+            int                  rp0,
+            int                  lp1,
+            int                  rp1,
+            int                  lp2,
+            int                  rp2,
+            int                  lp3,
+            int                  rp3);
+
     // Ref: https://github.com/CompVis/stable-diffusion/blob/main/ldm/modules/diffusionmodules/util.py#L151
     // timesteps: [N,]
     // return: [N, dim]
@@ -2660,6 +2739,31 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // qwen4exp hyper-connection glue, fused (PXA_QWEN4EXP_HC_FUSED; 2026-09-25).
+    // hc_combine_norm: residual [n_embd, n_hc, n_tokens] F32, block_out [n_embd, n_tokens] F32,
+    // inject [n_hc, n_tokens] F32, gamma [n_embd*n_hc] F32 or NULL. Result F32
+    // [n_embd, n_hc, n_tokens, gamma ? 2 : 1]:
+    //   [:,:,:,0] = residual + block_out * 2*sigmoid(inject/n_hc)          (the combine)
+    //   [:,:,:,1] = rms_norm(each stream of [:,:,:,0], eps) * gamma         (the next mixer's norm)
+    // Every expression and reduction order mirrors the unfused scale/sigmoid/scale/mul/add and
+    // rms_norm/mul chain, so the CUDA result is meant to be bit-identical to it.
+    GGML_API struct ggml_tensor * ggml_hc_combine_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * inject,
+            struct ggml_tensor  * gamma,
+            float                 eps);
+
+    // hc_gate_mix: xn [n_embd*n_hc, n_tokens] F32, g [n_embd*n_hc, n_tokens] F32 (pre-sigmoid).
+    // Result [n_embd, n_tokens] = (1/n_hc) * sum_c xn[c*n_embd + e] * sigmoid(g[c*n_embd + e]),
+    // summed c = 0..n_hc-1 in order (the unfused sigmoid/mul/cont/add/add/add/scale chain).
+    GGML_API struct ggml_tensor * ggml_hc_gate_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * g,
+            int                   n_hc);
 
     // Turn an additive attention mask into a per-row list of the KV rows that
     // row can actually see. Result is I32 [MIN(mask->ne[0], max_row_size), ne1, ne2, ne3];

@@ -138,6 +138,38 @@ void test_basic(testing & t) {
         });
     });
 
+    // bug #222 review: negate_settled() succeeds only when its child definitively fails. A child
+    // that runs out of input (lenient parse) may still match, so the lookahead fails instead of
+    // propagating need-more-input the way plain negate() does. Checked before and after a JSON
+    // round-trip, since chat parsers are shipped serialized.
+    t.test("negate_settled", [](testing & t) {
+        auto check = [](testing & t, const common_peg_arena & parser, const std::string & tag) {
+            // child "ab" needs more input at "a": plain !A propagates, settled !A fails
+            auto ctx = common_peg_parse_context("a", COMMON_PEG_PARSE_FLAG_LENIENT);
+            auto r   = parser.parse(ctx);
+            t.assert_equal(tag + ": incomplete child -> lookahead fails", true, r.fail());
+            // child definitively fails at "x": lookahead succeeds, "x" consumed by the rest
+            ctx = common_peg_parse_context("x", COMMON_PEG_PARSE_FLAG_LENIENT);
+            r   = parser.parse(ctx);
+            t.assert_equal(tag + ": failed child -> lookahead succeeds", true, r.success());
+            // child matches: lookahead fails
+            ctx = common_peg_parse_context("ab", COMMON_PEG_PARSE_FLAG_LENIENT);
+            r   = parser.parse(ctx);
+            t.assert_equal(tag + ": matching child -> lookahead fails", true, r.fail());
+        };
+        auto settled = build_peg_parser([](common_peg_parser_builder & p) {
+            return p.negate_settled(p.literal("ab")) + p.chars("[a-z]", 1, 1);
+        });
+        check(t, settled, "built");
+        check(t, common_peg_arena::from_json(nlohmann::json::parse(settled.to_json().dump())), "round-trip");
+
+        auto plain = build_peg_parser([](common_peg_parser_builder & p) {
+            return p.negate(p.literal("ab")) + p.chars("[a-z]", 1, 1);
+        });
+        auto ctx = common_peg_parse_context("a", COMMON_PEG_PARSE_FLAG_LENIENT);
+        t.assert_equal("plain negate still propagates need-more", true, plain.parse(ctx).need_more_input());
+    });
+
     t.test("partial parsing", [](testing & t) {
         // Literals - Basic Success
         t.test("literal_success", [&](testing & t) {

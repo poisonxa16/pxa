@@ -67,6 +67,25 @@ static __global__ void pad_f32_nc(const char * cx, float * dst, int nelem,
     }
 }
 
+// ggml_pad_ext with front padding (: the K window of a straddled split): dst contiguous, any src strides
+static __global__ void pad_f32_lp(const char * cx, float * dst, const int64_t nelem,
+        const int ne0, const int ne1, const int ne2, const int ne00, const int ne01, const int ne02, const int ne03,
+        const int lp0, const int lp1, const int lp2, const int lp3,
+        const size_t nb00, const size_t nb01, const size_t nb02, const size_t nb03) {
+    const int64_t i = (int64_t)blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nelem) {
+        return;
+    }
+    int64_t ii = i;
+    const int i3 = ii/((int64_t)ne0*ne1*ne2); ii -= (int64_t)i3*ne0*ne1*ne2;
+    const int i2 = ii/((int64_t)ne0*ne1);     ii -= (int64_t)i2*ne0*ne1;
+    const int i1 = ii/ne0;
+    const int i0 = ii - (int64_t)i1*ne0;
+    const int s0 = i0 - lp0, s1 = i1 - lp1, s2 = i2 - lp2, s3 = i3 - lp3;
+    dst[i] = s0 >= 0 && s0 < ne00 && s1 >= 0 && s1 < ne01 && s2 >= 0 && s2 < ne02 && s3 >= 0 && s3 < ne03
+        ? *(const float *)(cx + s0*nb00 + s1*nb01 + s2*nb02 + s3*nb03) : 0.0f;
+}
+
 void ggml_cuda_op_pad(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *)src0->data;
@@ -76,6 +95,18 @@ void ggml_cuda_op_pad(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(dst));
+
+    // ggml_pad_ext front padding; ggml_pad leaves every lp at 0 and takes the unchanged paths below
+    const int lp0 = dst->op_params[0], lp1 = dst->op_params[2], lp2 = dst->op_params[4], lp3 = dst->op_params[6];
+    if (lp0 | lp1 | lp2 | lp3) {
+        constexpr int kBlockSize = 256;
+        const int64_t nelem = ggml_nelements(dst);
+        const int64_t nblock = (nelem + kBlockSize - 1)/kBlockSize;
+        pad_f32_lp<<<(unsigned)nblock, kBlockSize, 0, stream>>>((const char *)src0->data, dst_d, nelem,
+                (int)dst->ne[0], (int)dst->ne[1], (int)dst->ne[2], (int)src0->ne[0], (int)src0->ne[1], (int)src0->ne[2], (int)src0->ne[3],
+                lp0, lp1, lp2, lp3, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+        return;
+    }
     if (ggml_is_contiguous(src0)) {
         GGML_ASSERT(src0->ne[3] == 1 && dst->ne[3] == 1); // just 3D tensors
 

@@ -1085,67 +1085,149 @@ size_t server_prompt_cache::n_tokens() const {
 
 }
 
+// PXA_CACHE_HYBRID_USABLE (default ON; =0 restores the similarity scan below for every model).
+//
+// On a recurrent/hybrid model a cached state can only be re-entered where its recurrent half can
+// be put back: at the end of its token list (the new prompt extends it) or at one of its context
+// checkpoints strictly below the divergence (the same rule apply_checkpoint uses: pos_max <
+// n_past - 1). Anything else is a restore that installs 60-3000 MiB and is then thrown away by
+// "forcing full prompt re-processing" - and it is the only class of RAM-cache restore that a live
+// slot never performs itself, which is why it is the class the "restoring SIMILAR prompts degrades
+// hybrids" report (#200) points at. Under this rule a hybrid restores only what it can use, ranked
+// by how many tokens it saves, so every restore it does is one the live slot would have done too
+// (restore == live is measured byte-identical: restore_exact.py, ext + rewind, layer + tensor).
+static bool pxa_cache_hybrid_usable_on() {
+    static const bool v = []() {
+        const char * e = getenv("PXA_CACHE_HYBRID_USABLE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
+// Tokens a restore of `p` would actually keep on a recurrent/hybrid model for the prompt
+// `tokens_new`, worked out the way the live slot works out its own reuse (server-context.cpp,
+// "reuse any previously computed tokens"): the new prompt first loses the span the entry's
+// context shift discarded (n_kept_prompt / n_discarded_prompt, as get_tokens_similarity does),
+// then the prefix is the string-level match with the non-exact fallback when that is more than
+// 20 tokens longer. Reasoning-token exclusion is deliberately NOT applied: the live slot does not
+// apply it to n_past either (it only steers slot choice), and the recurrent state contains the
+// reasoning tokens, so an excluded-think match is exactly the unusable restore this rule skips.
+static int32_t pxa_hybrid_usable_prefix(const llama_context * ctx, const server_prompt & p, const server_tokens & tokens_new) {
+    if (p.tokens.empty()) {
+        return 0;
+    }
+    server_tokens nt = tokens_new.clone();
+    if (p.n_discarded_prompt > 0) {
+        nt.discard_n_tokens(p.n_kept_prompt, p.n_discarded_prompt);
+    }
+    common_prefix pre = p.tokens.get_common_prefix(ctx, nt, true);
+    const common_prefix pre_ne = p.tokens.get_common_prefix(ctx, nt, false);
+    if (pre.first + 20 < pre_ne.first) {
+        pre = pre_ne;
+    }
+    const int32_t n_past = (int32_t) pre.first; // cached tokens the slot would keep
+    if (n_past <= 0) {
+        return 0;
+    }
+    if (n_past >= (int32_t) p.tokens.size()) {
+        return (int32_t) pre.second; // extension: the parked recurrent state is at the re-entry point
+    }
+    // rewind: only to a checkpoint strictly below the divergence (apply_checkpoint's rule)
+    int32_t best = 0;
+    for (const auto & c : p.checkpoints) {
+        if (c.pos_max < n_past - 1) {
+            best = std::max(best, (int32_t) c.pos_max + 1);
+        }
+    }
+    return best;
+}
+
 bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction,
                                bool* out_restored) {
     if (out_restored != nullptr) {
         *out_restored = false;
     }
-    thinking_tokens think_tokens;
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        think_tokens = it->think_tokens;
-        break;
-    }
-    server_tokens prompt_tokens;
-    server_tokens tokens_new_ex;
-    if (think_tokens.exclude) {
-        prompt_tokens = prompt.tokens.get_tokens_exclude_think(ctx, think_tokens);
-        tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, think_tokens);
-    }
-    else {
-        // The caller's own prompt is being MEASURED here too, exactly like the candidates below,
-        // and the caller reads `server_cached_prompt.tokens` back after this returns. Moving it out
-        // emptied it whenever the scan found nothing better -- the normal case, since the scan only
-        // promotes on sim_best < sim_cur and sim_best starts as this very conversation -- so the
-        // slot came back with no token bookkeeping and re-prefilled the whole history.
-        prompt_tokens = prompt.tokens.clone();
-        tokens_new_ex = tokens_new.clone();
-    }
-    const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
-    float f_keep_best = float(lcp_best.second) / prompt_tokens.size();
-    float sim_best = prompt_tokens.get_tokens_similarity(ctx, tokens_new_ex, prompt.n_kept_prompt, prompt.n_discarded_prompt);
-    LLAMA_LOG_INFO(" - looking for better prompt, base f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, prompt.n_kept_prompt, prompt.n_discarded_prompt);
-
     auto it_best = states.end();
-
-    // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        server_tokens tokens;
+    if (pxa_cache_hybrid_usable_on() && llama_model_has_recurrent(llama_get_model(ctx)) &&
+            !tokens_new.has_mtmd_data() && !prompt.tokens.has_mtmd_data()) {
+        const int32_t base = pxa_hybrid_usable_prefix(ctx, prompt, tokens_new);
+        int32_t best = base;
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->tokens.has_mtmd_data() || it->tokens.empty()) {
+                continue;
+            }
+            const int32_t use = pxa_hybrid_usable_prefix(ctx, *it, tokens_new);
+            // same cost floor as the similarity scan: a restore must keep at least
+            // min_reusable_fraction of what it installs
+            if ((float) use < min_reusable_fraction * (float) it->tokens.size()) {
+                continue;
+            }
+            if (use > best) {
+                best = use;
+                it_best = it;
+            }
+        }
+        LLAMA_LOG_INFO(" - hybrid prompt cache: slot keeps %d tokens, best parked entry keeps %d (%s)\n",
+            base, best, it_best == states.end() ? "no restore" : "restoring");
+    } else {
+        thinking_tokens think_tokens;
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            think_tokens = it->think_tokens;
+            break;
+        }
+        server_tokens prompt_tokens;
+        server_tokens tokens_new_ex;
         if (think_tokens.exclude) {
-            tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
+            prompt_tokens = prompt.tokens.get_tokens_exclude_think(ctx, think_tokens);
+            tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, think_tokens);
         }
         else {
-            // This candidate is only being MEASURED here; it stays in the cache whether or not it
-            // wins. Moving its token list out emptied every entry the scan touched, so the winner
-            // was restored with no tokens and the caller re-prefilled the whole history anyway.
-            tokens = it->tokens.clone();
+            // The caller's own prompt is being MEASURED here too, exactly like the candidates below,
+            // and the caller reads `server_cached_prompt.tokens` back after this returns. Moving it out
+            // emptied it whenever the scan found nothing better -- the normal case, since the scan only
+            // promotes on sim_best < sim_cur and sim_best starts as this very conversation -- so the
+            // slot came back with no token bookkeeping and re-prefilled the whole history.
+            prompt_tokens = prompt.tokens.clone();
+            tokens_new_ex = tokens_new.clone();
         }
-        const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
-        const float f_keep_cur = float(lcp_cur.first) / tokens.size();
-        // do not recover a cached prompt whose reusable prefix is below cache-ram-similarity:
-        // restoring a 60-130 MiB state for a tiny reusable prefix costs more than reprocessing.
-        if (f_keep_cur < min_reusable_fraction) {
-            continue;
+        const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
+        float f_keep_best = float(lcp_best.second) / prompt_tokens.size();
+        float sim_best = prompt_tokens.get_tokens_similarity(ctx, tokens_new_ex, prompt.n_kept_prompt, prompt.n_discarded_prompt);
+        LLAMA_LOG_INFO(" - looking for better prompt, base f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, prompt.n_kept_prompt, prompt.n_discarded_prompt);
+
+        // find the most similar cached prompt, that would also preserve the most context
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            server_tokens tokens;
+            if (think_tokens.exclude) {
+                tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
+            }
+            else {
+                // This candidate is only being MEASURED here; it stays in the cache whether or not it
+                // wins. Moving its token list out emptied every entry the scan touched, so the winner
+                // was restored with no tokens and the caller re-prefilled the whole history anyway.
+                tokens = it->tokens.clone();
+            }
+            const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
+            const float f_keep_cur = float(lcp_cur.first) / tokens.size();
+            // do not recover a cached prompt whose reusable prefix is below cache-ram-similarity:
+            // restoring a 60-130 MiB state for a tiny reusable prefix costs more than reprocessing.
+            if (f_keep_cur < min_reusable_fraction) {
+                continue;
+            }
+            const float sim_cur = tokens.get_tokens_similarity(ctx, tokens_new_ex, it->n_kept_prompt, it->n_discarded_prompt);
+            if (sim_best < sim_cur) {
+                f_keep_best = f_keep_cur;
+                sim_best = sim_cur;
+                it_best = it;
+            }
         }
-        const float sim_cur = tokens.get_tokens_similarity(ctx, tokens_new_ex, it->n_kept_prompt, it->n_discarded_prompt);
-        if (sim_best < sim_cur) {
-            f_keep_best = f_keep_cur;
-            sim_best = sim_cur;
-            it_best = it;
+
+        if (it_best != states.end()) {
+            LLAMA_LOG_INFO(" - found better prompt with f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, it_best->n_kept_prompt, it_best->n_discarded_prompt);
         }
     }
 
     if (it_best != states.end()) {
-        LLAMA_LOG_INFO(" - found better prompt with f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, it_best->n_kept_prompt, it_best->n_discarded_prompt);
         const size_t size = it_best->data.size();
         // PXA_CKPT_APPLY_SYNC (PXA_KERNEL_FIX_20260611): drain in-flight backend work before the
         // bulk state write (see server-context.cpp apply_checkpoint note; sticky CUDA
@@ -1154,6 +1236,18 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
         const size_t n = llama_state_seq_set_data(ctx, it_best->data.data(), size, id_slot, 0);
         if (n != size) {
             LLAMA_LOG_INFO("failed to restore state with size %zu\n", size);
+            // bug #217: a refused restore has already wiped this sequence (read_kv_cache removes it
+            // on failure) or left it half-written (PLE read failure after the KV restore). The caller
+            // copies prompt.tokens back into the slot's cache_tokens, so the prompt must not keep
+            // describing cells that no longer hold it: drop the sequence and the stale description.
+            llama_kv_cache_seq_rm(ctx, id_slot, -1, -1);
+            prompt.tokens.clear();
+            prompt.checkpoints.clear();
+            prompt.n_kept_prompt      = 0;
+            prompt.n_discarded_prompt = 0;
+            // The refused entry cannot be restored into this context; left in the cache, it would
+            // win the same scan on every later request and fail the same way (bug #217 review).
+            states.erase(it_best);
             return false;
         }
 

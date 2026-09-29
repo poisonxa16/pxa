@@ -30,14 +30,16 @@ run of this script should always set `GATE_STRICT=1`.
 | 3 | **Chat completions, the production template.** The same factual prompt through `/v1/chat/completions` — the OpenAI-compatible route every real client and every tool-calling agent actually talks to, never `/completion` — at `temperature 0`, with the model's own embedded chat template applied (`--jinja`). Must answer correctly and be `CHAT_REPS`-way byte-identical (default 4). | Checks 1, 2 and 4-5 all talk to `/completion` with a hand-built prompt string. A build can pass every one of them and still be a **failed build**: a broken or missing chat template, a stop-token mismatch, a route that errors — none of that is visible from `/completion`. Skipped, not failed, if this build serves no `/v1/chat/completions` route at all. |
 | 4 | **Needle recall.** Both campaign prompts (3,121 and 20,801 tokens) must recall *both* planted identifiers, `NEEDLE_REPS` times each (default 4), with a stable sha across runs. | Long-context attention or KV handling is wrong. A model that answers fluently but has lost the first line of a 20k prompt fails here and passes check 2. |
 | 4b | **Logit reproducibility** (the primary determinism check). `LOGIT_REPS` runs (default 6) of the 3,121-token prompt at `n_predict 1`, `n_probs 2`, run once at np=1 and once pinned to slot 1 at np=2; every returned probability must be identical to the last digit. | The forward pass itself is nondeterministic. Checks 1, 4 and 5 compare the *argmax*; this one compares the numbers the argmax was taken over. A kernel race can wobble the logits on every single run and still produce a stable sha wherever the top-2 margin is wider than the wobble — which makes it look like a rare flake on long prompts and under load instead of what it is. Skipped, not failed, on a server that does not return `completion_probabilities`. |
-| 5 | **Greedy determinism, np=2, other slot erased first.** Boots with `-np 2`, erases every slot, then runs `REPS` requests pinned to slot 1. All must be byte-identical, and (unless `NP2_CROSS_CHECK=0`) must equal the np=1 reference. | A multi-slot defect: state leaking between slots, a shared scratch buffer, a graph outliving its call. Skipped, not failed, if the server has no `-np` or no slot-erase endpoint. |
+| 5 | **Greedy determinism, np=2, other slot erased first.** Boots with `-np 2`, erases every slot, then runs `REPS` requests pinned to slot 1. All must be byte-identical, and (unless `NP2_CROSS_CHECK=0`) must equal the np=1 reference — when both boots speculate with the same draft capacity (rule 3). | A multi-slot defect: state leaking between slots, a shared scratch buffer, a graph outliving its call. Skipped, not failed, if the server has no `-np` or no slot-erase endpoint. |
 | 5b | **Token-0 logit match, np=1 vs np=2.** Compares the *actual* top-2 probabilities check 4b captured at np=1 against the ones it captured at np=2 slot 1 (same KV placement) — not just each arm's own internal reproducibility, the two arms against **each other**, to the last digit. | The strongest determinism claim the gate makes, and the one that would have caught 2026-09-03 immediately: two runs can each be internally rock-stable and still silently disagree with each other. Skipped if either 4b run above was not itself stable/available. |
+| 5c | **Cross-check at the same draft capacity** (only when needed). If the np=1 and np=2 boots report different speculation (`speculation at np=N:` in the log — the auto-armed draft length of a recurrent model is clamped per `-np` state slot), check 5's byte comparison is not like for like and is not made there. Both boots are rerun with the drafter off (`PXA_AUTO_SPEC=0`, `NP2_XCHECK_REPS` runs each, default 3) and np=2 slot 1 must equal np=1. | The same multi-slot defect check 5 exists for, with the one variable removed that legitimately changes text between the two boots (rule 3). Not run when the boots speculate alike. |
 | 6 | **Unit tests.** `test-pxq-cpu-dot`, `test-kv-seq-shadow` (both CPU), `test-narrow-kernel-parity` (GPU-only — not even a build target without CUDA). | The CPU PXQ dot product, the KV sequence shadow, or a narrow-kernel lever has diverged from its reference. The GPU-only test is skipped, not failed, on a box with no GPU present — and failed, not skipped, on a GPU box that simply never built it. |
 
-## The two rules that make the multi-slot arm meaningful
+## The rules that make the multi-slot arm meaningful
 
-These are not style preferences. Both were established by chasing what looked like real defects
-and turned out not to be, and both cost hours before they were written down.
+These are not style preferences. Each cost hours before it was written down: rules 0 and 1 by
+nearly missing real defects, rules 2 and 3 by chasing what looked like real defects and turned out
+not to be.
 
 ### 0. A stable sha is not determinism
 
@@ -96,6 +98,42 @@ So the rule is:
 * A sha difference between two *differently placed* slots is evidence of nothing. Chasing it costs
   a night.
 
+### 3. Compare at the same **draft capacity**, never across two speculation configurations
+
+A server that auto-arms speculation (the ENHANCE default wherever the VRAM gate passes) verifies
+each draft in one batch of width `1 + n_draft`, and a verify step's logits come from different
+kernels and summation orders than a width-1 decode — the server says so at boot
+(`PXA_SPEC_BATCH_FIDELITY`). On a recurrent (hybrid DeltaNet) model the draft length is also
+clamped to what the per-step checkpoint budget can carry, and that budget is read from live free
+VRAM and split across the `-np` state slots. So an np=1 boot and an np=2 boot of the *same*
+build, file and flags speculate differently, and can legitimately disagree at a near-tie.
+
+Measured 2026-09-26 (Qwen3.8-27B PXQN3, one P100, `-ctk q4_0 -ctv q4_0`, `needle3121`, build
+dcb2b9dad7): np=1 drafts up to 22 tokens, np=2 up to 10 (`effective n_max` in the boot log).
+The prompt triggers one n-gram draft, rejected in both boots, but verified at width 23 in one and
+width 11 in the other. The token-0 logits match to the last digit, both arms are 12/12, and the
+probabilities first move at generated token 60 (0-based, by ~1e-7), after which the text flips at a
+near-tie ("…GPU computing, memory…" against "…GPU computing, inference…"): np=1
+`be336759673b`, np=2 slot 1 `e91f42bd334c`. With `PXA_AUTO_SPEC=0` both boots give
+`e91f42bd334c`, and so do both boots with the same explicit cap
+(`--spec-type ngram:n_max=10,n_min=2,ngram_size_n=24`). No slot state leaked anywhere.
+
+So the rule is:
+
+* **The gate prints what each boot speculates with** (`speculation at np=1: chain=ngram_mod;n_max=22`)
+  and byte-compares np=2 against np=1 in check 5 only when the two signatures match.
+* **When they differ, check 5c makes the comparison drafter-off**: both boots again with
+  `PXA_AUTO_SPEC=0`, where every token is a width-1 decode and the slot count is the only variable
+  left. The default-configuration arms keep their own 12/12 at np=1 and at np=2.
+* The token-0 logit match (5b) needs no such care: it generates one token, so no draft is ever
+  verified.
+* An explicit chain in `SERVER_ARGS` is clamped per slot as well, and `PXA_AUTO_SPEC=0` cannot
+  turn it off; 5c then reports that it could not compare like for like (a `SKIP`, a `FAIL` under
+  `GATE_STRICT=1`). Drop the chain, or add `--spec-type none`, for the cross-check.
+* Speculative output is not byte-reproducible against a drafter-off run, and not across two draft
+  capacities. It **is** reproducible run to run at one capacity — that is what checks 1 and 5
+  still demand, 12 times each.
+
 ## Configuration
 
 Everything is an environment variable; every one has a default.
@@ -116,6 +154,7 @@ Everything is an environment variable; every one has a default.
 | `N_PREDICT` | `256` | Tokens generated per determinism/needle request — see the answer-budget note below. |
 | `GATE_NP2` | `auto` | `auto` runs the np=2 arm if the server has `-np`; `0` disables it (a `SKIP`, or a `FAIL` under `GATE_STRICT=1`); `1` forces it. |
 | `NP2_CROSS_CHECK` | `1` | Also require the np=2 slot, and its token-0 logits, to equal the np=1 reference. |
+| `NP2_XCHECK_REPS` | `3` | Runs per boot of check 5c, the drafter-off cross-check that replaces check 5's comparison when the np=1 and np=2 boots speculate differently (rule 3). |
 | `GATE_TESTS` | `1` | `0` skips the unit tests (a `SKIP`, or a `FAIL` under `GATE_STRICT=1`; e.g. on a box where they were not built). |
 | `COHERENCE_EXPECT` | `paris` | Case-insensitive substring the coherence *and* chat-completions checks must contain. Change it with `prompts/coherence.txt`. |
 | `GATE_STRICT` | `0` | `1` turns every operator-disabled arm (`LOGIT_REPS=0`, `GATE_NP2=0`, `GATE_TESTS=0`) from a `SKIP` into a `FAIL` — SKIP is then reserved strictly for genuine hardware/build absence. Always `1` in the required-check CI workflow. |

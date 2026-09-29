@@ -113,6 +113,9 @@ static bool pxa_volta_mma_q8_scratch_fits(const ggml_tensor * K, const ggml_tens
         cudaGetLastError();
         return false;
     }
+    // bug #266: the pool is pre-grown at context creation; what it holds idle is available to
+    // this staging allocation, and without counting it the pre-grow would flip this route.
+    free_bytes += g_pxa_pool_idle[dev].load(std::memory_order_relaxed);
     if (need + PXA_VOLTA_Q8_SCRATCH_MARGIN > free_bytes) {
         static std::atomic<bool> told{false};
         if (!told.exchange(true)) {
@@ -158,7 +161,20 @@ bool ggml_cuda_fattn_volta_mma_supported(const ggml_tensor * dst, int cc) {
         if (!pxa_fa_mma_volta_q8()) {
             return false; // see SCOPE above
         }
-        if (DKQ != 256 || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0) {
+        // PXA_FA_MMA_VOLTA_Q4 (2026-09-27, default ON; =0 restores the q8_0-only
+        // admission): a matched q4_0 pair is the cache that buys 131k on ONE 16 GB V100, and it fell
+        // to the legacy WMMA kernel (2.7x slower attention, see WHY above) for exactly the prompts
+        // where attention dominates. The launcher stages it through the backend's own q4_0 -> f16
+        // converter -- the same bytes WMMA feeds itself -- from the same pool, and the same fit test
+        // below declines it when the staging would not fit (then PXA_FA_DEEP_QKV_TILE's chunked
+        // route serves the deep node, as before).
+        static const bool q4_on = [](){
+            const char * e = getenv("PXA_FA_MMA_VOLTA_Q4");
+            return !(e && *e && atoi(e) == 0);
+        }();
+        const bool q8_pair = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+        const bool q4_pair = q4_on && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0;
+        if (DKQ != 256 || !(q8_pair || q4_pair)) {
             return false;
         }
         if (Q->ne[1] <= 8) {
@@ -179,9 +195,10 @@ bool ggml_cuda_fattn_volta_mma_supported(const ggml_tensor * dst, int cc) {
         }
         static std::atomic<bool> told{false};
         if (!told.exchange(true)) {
-            fprintf(stderr, "PXA_FA_MMA_VOLTA_Q8: engaged (sm_70 head-256 prefill with a q8_0 K/V cache -> vendored "
+            fprintf(stderr, "PXA_FA_MMA_VOLTA_Q8: engaged (sm_70 head-256 prefill with a %s K/V cache -> vendored "
                             "m8n8k4 MMA kernel, staged to f16 from the CUDA pool; not bit-identical to the previous "
-                            "route -- override PXA_FA_MMA_VOLTA_Q8=0)\n");
+                            "route -- override PXA_FA_MMA_VOLTA_Q8=0%s)\n", ggml_type_name(K->type),
+                    K->type == GGML_TYPE_Q4_0 ? ", or PXA_FA_MMA_VOLTA_Q4=0 for q4_0 only" : "");
         }
     }
     if (!mask) {

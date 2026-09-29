@@ -2068,6 +2068,13 @@ std::string llama_model_ftype_name_from_content(const llama_model & model) {
         { GGML_TYPE_PXQ3,  "PXQ3 - 3.27 bpw" },
         { GGML_TYPE_PXQ2,  "PXQ2 - 2.27 bpw" },
         { GGML_TYPE_PXQ1,  "PXQ1 - 1.26 bpw" },
+        { GGML_TYPE_PXQN3,   "PXQN3 - 3.25 bpw" },
+        { GGML_TYPE_PXQN3S8, "PXQN3S8 - 3.50 bpw" },
+        { GGML_TYPE_PXQN4,   "PXQN4 - 4.25 bpw" },
+        { GGML_TYPE_PXQN2,   "PXQN2 - 2.25 bpw" },
+        { GGML_TYPE_PXQN1,   "PXQN1 - 1.25 bpw" },
+        { GGML_TYPE_PXQN4S8, "PXQN4S8 - 4.50 bpw" },
+        { GGML_TYPE_PXQN5,   "PXQN5 - 5.25 bpw" },
     };
     size_t best = 0; const char * best_name = nullptr;
     size_t pxq_total = 0;
@@ -2133,6 +2140,14 @@ std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL: return "PXQ-UNIVERSAL - mixed PXQ2/PXQ3/PXQ4 per-tensor tier map";
         case LLAMA_FTYPE_MOSTLY_PXQ6:     return "PXQ6 - 5.27 bpw, LM32 x E16-row scales, slab layout";
         case LLAMA_FTYPE_MOSTLY_PXQ1:     return "PXQ1 - 1.26 bpw, 1-bit sign x E16-row scales, slab layout";
+        case LLAMA_FTYPE_MOSTLY_PXQN3:    return "PXQN3 - 3.25 bpw, N3 int book x E16-row scales, 128-K slabs";
+        case LLAMA_FTYPE_MOSTLY_PXQN3S8:  return "PXQN3S8 - 3.50 bpw, N3 int book x E8-row scales, 128-K slabs";
+        case LLAMA_FTYPE_MOSTLY_PXQN4:    return "PXQN4 - 4.25 bpw, N4 int book x E16-row scales, slab layout";
+        case LLAMA_FTYPE_MOSTLY_PXQN:     return "PXQN - allocator mix over N3/N3S8/N4/q8_0";
+        case LLAMA_FTYPE_MOSTLY_PXQN2:    return "PXQN2 - 2.25 bpw, N2 int book x E16-row scales, 128-K slabs";
+        case LLAMA_FTYPE_MOSTLY_PXQN1:    return "PXQN1 - 1.25 bpw, sign book x E16-row scales, 128-K slabs";
+        case LLAMA_FTYPE_MOSTLY_PXQN4S8:  return "PXQN4S8 - 4.50 bpw, N4 int book x E8-row scales, slab layout";
+        case LLAMA_FTYPE_MOSTLY_PXQN5:    return "PXQN5 - 5.25 bpw, 5-bit uniform int book x E16-row scales, 128-K slabs";
         case LLAMA_FTYPE_MOSTLY_Q1_0_G128:return "Q1_0_G128 - 1.125 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return "IQ4_XS - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_S:    return "IQ3_S - 3.4375 bpw";

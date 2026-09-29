@@ -267,19 +267,11 @@ Files written by this build carry a codebook for every tier they contain, and a 
 emitted one without its book removes its own output and exits non-zero rather than shipping a
 file nothing can read.
 
-**You do not need an importance matrix for a PXQ tier** — the default ignores one if you pass it,
-and a PXQ file made without one is the file this release was measured on. It is worth having as an
-*option*, though: collected on text shaped the way you will actually use the model, an importance
-matrix consumed with `PXA_PXQ_IMX=1` makes a measurably better file (numbers below). The default
-stays off because collecting the matrix costs a calibration pass of its own. An imatrix also still
-helps for the ordinary K-quants — and the release tarball carries `bin/llama-imatrix` for that.
+### The imatrix: the PXQ tiers ignore it
 
-### The imatrix: ignored by default, an option worth taking
-
-Since 2026-08-24 every PXQ tier — `PXQ1`, `PXQ2`, `PXQ3`, `PXQ4`, `PXQ4-HQ`, `PXQ6` and
-`PXQ_UNIVERSAL` — **drops an offered importance matrix instead of consuming it**, unless you
-switch consumption on with `PXA_PXQ_IMX=1`. Pass `--imatrix` without that variable and the
-quantizer prints
+Do not spend a calibration run on a PXQ quantize. Since 2026-08-24 every PXQ tier —
+`PXQ1`, `PXQ2`, `PXQ3`, `PXQ4`, `PXQ4-HQ`, `PXQ6` and `PXQ_UNIVERSAL` — **drops an offered
+importance matrix instead of consuming it.** Pass `--imatrix` anyway and the quantizer prints
 
 ```
 PXQ tiers: imatrix IGNORED (measured net-negative on the PXQ lattice; PXA_PXQ_IMX=1 to consume it)
@@ -290,40 +282,13 @@ once, and writes `quantize.imatrix.ignored_by` into the output file in place of 
 not happen. (An auditor reading `quantize.imatrix.n_entries` gets `0`, which is the honest
 answer.)
 
-**About that message.** It is the wording from the 2026-08-24 measurement that set the default,
-and this build still prints it; the reading behind it has since been corrected, and the correction
-is worth your time. That A/B was run on **raw encyclopedia text** — out of distribution for a
-model you are going to talk to — and on that text every way of consuming the matrix made a PXQ4
-file slightly worse. Re-measured on **chat-templated** text, calibration and scoring both, the
-same lever is a clear win at the tiers most people ship:
-
-| model, tier | mean KL divergence | same top token | file size |
-|---|---:|---:|---|
-| Qwen3-0.6B, PXQ4, default | 0.0818 | 86.1 % | 399,573,408 B |
-| Qwen3-0.6B, PXQ4, `PXA_PXQ_IMX=1` | **0.0609** | **87.6 %** | 399,573,472 B |
-| Gemma 4 26B-A4B, PXQ3, default | 0.383 | 80.6 % | 11,013,679,104 B |
-| Gemma 4 26B-A4B, PXQ3, `PXA_PXQ_IMX=1` | **0.320** | **81.7 %** | 11,013,679,392 B |
-
-Same tier, same composition, same bytes to within the few dozen bytes of imatrix provenance the
-header gains — the matrix does not change which tensor gets which tier, only which sub-scale and
-anchor each block picks inside the tier it was already going to get.
-
-So why is it still off by default? **Because the matrix is not free.** The quantize step itself
-costs a second or two more, but collecting the matrix is a calibration pass over a corpus on a
-GPU, and for a routed-expert (MoE) model that pass is the expensive part — about half an hour on
-a pair of P100s for the Gemma 4 26B file above, and that was a *thin* calibration: 130 context
-chunks, which left 6 of one layer's 128 experts unseen and those two tensors quantized unweighted.
-A default has to be right for someone who just wants a file; an option can ask for half an hour.
-The recipe is the optional step in
-[guide 04](tutorials/04-quantize-your-own-model.md#optional--calibrate-first-with-an-importance-matrix).
-
-Two things to know before you reach for it. **Calibrate in distribution**: the win came from
-wrapping the calibration corpus in the model's own chat template, which is the whole point — a
-matrix collected on raw text is what produced the original net-negative reading. And the evidence
-is tier-dependent: PXQ4 and PXQ3 are clean wins on every metric measured; PXQ4-HQ improved on KL
-divergence and top-token agreement but moved very slightly the wrong way on perplexity, and
-PXQ1/PXQ2/PXQ6 have not been measured with it at all. (The switch lives in `pxq-quantize`, not in
-the engine; the provenance-KV rewrite is in `examples/quantize/quantize.cpp`.)
+The reason is measured, not theoretical: on a clean paired A/B, **every** way of consuming the
+matrix made a PXQ4 file *worse* than the same file quantized with no imatrix at all, while the
+same matrix improved `Q4_K_M` from the same source. The PXQ lattice — one fp16 absmax anchor per
+row, a 16-step sub-scale — cannot express per-column importance without clamping the cold columns'
+outliers. `PXA_PXQ_IMX=1` restores the diagonal-weighted-SSE consumption path for lab work; it is
+not a quality setting to reach for. (`src/pxq6-quantize.inc.cpp`, `pxq_imx_optin_enabled` /
+`pxq_imx_gate`; the KV rewrite is in `examples/quantize/quantize.cpp`.)
 
 An imatrix remains correct and worth having for **stock** tiers — including the `Q4_K_M`-style
 requantize after `llama-pxq-export`, which is an ordinary k-quant and consumes it normally:

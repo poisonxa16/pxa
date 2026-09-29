@@ -5,7 +5,7 @@
 #   MODEL=/path/to/model.gguf ./bench/gate/run-gate.sh
 #
 # Exits 0 only if every check passes. See bench/gate/README.md for what each check proves and
-# for the two rules that make the multi-slot arm meaningful.
+# for the rules that make the multi-slot arm meaningful.
 # ---------------------------------------------------------------------------------------------
 set -u
 
@@ -35,6 +35,7 @@ REQ_TIMEOUT=${REQ_TIMEOUT:-900}
 N_PREDICT=${N_PREDICT:-256}   # thinking models spend the first ~100 tokens inside <think>; 32 truncated every needle answer on stock Qwen3.8
 GATE_NP2=${GATE_NP2:-auto}             # auto | 1 | 0
 NP2_CROSS_CHECK=${NP2_CROSS_CHECK:-1}  # compare the np=2 slot against the np=1 reference
+NP2_XCHECK_REPS=${NP2_XCHECK_REPS:-3}  # runs per boot of the drafter-off cross-check (README rule 3; only when the draft capacities differ)
 GATE_TESTS=${GATE_TESTS:-1}
 COHERENCE_EXPECT=${COHERENCE_EXPECT:-paris}
 # GATE_STRICT (fail-closed, 2026-09-08): a release gate may SKIP an arm only when the hardware/
@@ -123,6 +124,7 @@ if [ "$GATE_PLAN" = 1 ]; then
             fi ;;
     esac
     row RUN "  token-0 logit match, np=1 vs np=2" "runtime-only: needs both logit-reproducibility runs above to be stable"
+    row RUN "  5c np=2 vs np=1 cross-check, drafter-off rerun" "runtime-only: runs only if the np=1 and np=2 boots drafted at different capacities (README rule 3)"
     knob_row "6/6 unit tests" "$([ "$GATE_TESTS" = 1 ] && echo 0 || echo 1)" "GATE_TESTS=$GATE_TESTS"
     if [ "$GATE_TESTS" = 1 ]; then
         gpu_ok=0; command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q . && gpu_ok=1
@@ -406,12 +408,33 @@ erase_slots(){
     return $allok
 }
 
+# spec_sig <server log> -> the speculation configuration a boot actually runs: "off", or
+# "chain=<stage chain>;n_max=<effective n_max per slot init>". README rule 3: a server that
+# auto-arms speculation clamps the draft length of a recurrent (hybrid) model to what its per-step
+# checkpoint budget affords, and that budget is split across the -np state slots and read from
+# live free VRAM -- 2026-09-26, Qwen3.8-27B PXQN3 on one P100: n_max 22 at np=1, 10 at np=2. A
+# verify step computes its logits at batch width 1 + n_draft, so two boots that differ only in this
+# number may legitimately return different text at a near-tie; the greedy cross-check below only
+# compares boots whose signatures match.
+spec_sig(){
+    local log=$1 chain nmax
+    chain=$(grep -a -m1 -oE 'PXA_SPEC: stage chain = .*' "$log" 2>/dev/null | sed 's/^PXA_SPEC: stage chain = //')
+    nmax=$(grep -a -oE 'effective n_max = [0-9]+' "$log" 2>/dev/null | grep -oE '[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//')
+    if [ -z "$chain" ] && [ -z "$nmax" ] && ! grep -aq 'speculative decoding context initialized' "$log" 2>/dev/null; then
+        echo off
+    else
+        echo "chain=${chain:-?};n_max=${nmax:-unclamped}"
+    fi
+}
+
 # ---- ARM A: np=1 ------------------------------------------------------------------------------
 say "=== 1/6  greedy determinism, np=1, $REPS runs ==="
-REF_SHA=""; REF_LOGIT_SIG=""; REF_LOGIT_OK=0
+REF_SHA=""; REF_LOGIT_SIG=""; REF_LOGIT_OK=0; SPEC_SIG_NP1=""; SPEC_SIG_NP2=""; XCHECK_DRAFTOFF=0
 if ! server_start 1 server-np1; then
     ko "server would not boot at -np 1 (see $WORKDIR/server-np1.log); every np=1 check below is unrunnable"
 else
+    SPEC_SIG_NP1=$(spec_sig "$WORKDIR/server-np1.log")
+    say "  speculation at np=1: $SPEC_SIG_NP1"
     shas=""
     for r in $(seq 1 "$REPS"); do
         out=$(complete "$PROMPTS/needle3121.txt" "$N_PREDICT")
@@ -518,6 +541,8 @@ case "$GATE_NP2" in
 esac
 if [ "$run_np2" = 1 ]; then
     if server_start 2 server-np2; then
+        SPEC_SIG_NP2=$(spec_sig "$WORKDIR/server-np2.log")
+        say "  speculation at np=2: $SPEC_SIG_NP2"
         if erase_slots 2; then
             # Slot 1 now starts at the same KV placement slot 0 would: a byte comparison is valid.
             shas=""
@@ -535,11 +560,17 @@ if [ "$run_np2" = 1 ]; then
             fi
             # Only meaningful if BOTH arms were themselves stable: comparing one sample of an
             # unstable arm against the reference reports agreement that does not exist.
-            if [ "$NP2_CROSS_CHECK" = 1 ] && [ -n "$REF_SHA" ] && [ "$uniq_n" = 1 ]; then
+            if [ "$NP2_CROSS_CHECK" = 1 ] && [ -n "$REF_SHA" ] && [ "$uniq_n" = 1 ] && [ "$SPEC_SIG_NP1" != "$SPEC_SIG_NP2" ]; then
+                # README rule 3: the two boots draft at different capacities, so their verify
+                # batches have different widths and a byte comparison of their text is not like for
+                # like. Not a verdict either way: 5c below reboots both drafter-off and compares.
+                say "  np=2 slot 1 ($got) vs np=1 ($REF_SHA): not compared -- the boots speculate differently (np=1 $SPEC_SIG_NP1, np=2 $SPEC_SIG_NP2); README rule 3, 5c re-checks with the drafter off in both"
+                XCHECK_DRAFTOFF=1
+            elif [ "$NP2_CROSS_CHECK" = 1 ] && [ -n "$REF_SHA" ] && [ "$uniq_n" = 1 ]; then
                 if [ "$got" = "$REF_SHA" ]; then
                     ok "np=2 slot 1 matches the np=1 reference at the same KV placement ($got)"
                 else
-                    ko "np=2 slot 1 ($got) differs from the np=1 reference ($REF_SHA) at the same KV placement -- see README, this is the check that catches a real multi-slot defect"
+                    ko "np=2 slot 1 ($got) differs from the np=1 reference ($REF_SHA) at the same KV placement and the same speculation ($SPEC_SIG_NP2) -- see README, this is the check that catches a real multi-slot defect"
                 fi
             elif [ "$NP2_CROSS_CHECK" = 1 ] && [ -n "$REF_SHA" ]; then
                 sk "np=2 vs np=1 cross-check: not meaningful, the np=2 arm above was not stable"
@@ -569,6 +600,56 @@ if [ "$run_np2" = 1 ]; then
         ko "server would not boot at -np 2"
     fi
     server_stop
+fi
+
+# ---- 5c: the np=2 vs np=1 cross-check at the same draft capacity (README rule 3) ---------------
+# Runs only when the two boots above speculated differently. Both boots again, with the auto-armed
+# drafter off (PXA_AUTO_SPEC=0), so every token is a width-1 decode in both and the only variable
+# left is the slot count: the question the cross-check exists to ask (state leaking between slots,
+# a shared scratch buffer, a graph outliving its call). The default-config arms above still carry
+# the shipping configuration's own 12/12 at np=1 and np=2.
+if [ "$XCHECK_DRAFTOFF" = 1 ]; then
+    say "=== 5c  np=2 vs np=1 cross-check at the same draft capacity: both boots drafter-off (PXA_AUTO_SPEC=0), $NP2_XCHECK_REPS runs each ==="
+    xs1=""; xs2=""; xsig1=""; xsig2=""; xbad=0
+    if PXA_AUTO_SPEC=0 server_start 1 server-np1-draftoff; then
+        xsig1=$(spec_sig "$WORKDIR/server-np1-draftoff.log")
+        for r in $(seq 1 "$NP2_XCHECK_REPS"); do
+            out=$(complete "$PROMPTS/needle3121.txt" "$N_PREDICT")
+            [ -n "$out" ] || { xbad=1; break; }
+            xs1="$xs1 $(sha "$out")"
+        done
+    else
+        xbad=1
+    fi
+    server_stop
+    if [ "$xbad" = 0 ] && PXA_AUTO_SPEC=0 server_start 2 server-np2-draftoff; then
+        xsig2=$(spec_sig "$WORKDIR/server-np2-draftoff.log")
+        if erase_slots 2; then
+            for r in $(seq 1 "$NP2_XCHECK_REPS"); do
+                out=$(complete "$PROMPTS/needle3121.txt" "$N_PREDICT" 1)
+                [ -n "$out" ] || { xbad=1; break; }
+                xs2="$xs2 $(sha "$out")"
+            done
+        else
+            xbad=1
+        fi
+    else
+        xbad=1
+    fi
+    server_stop
+    xn1=$(printf '%s\n' $xs1 | sort -u | grep -c .); xn2=$(printf '%s\n' $xs2 | sort -u | grep -c .)
+    xr1=$(printf '%s\n' $xs1 | head -1); xr2=$(printf '%s\n' $xs2 | head -1)
+    if [ "$xbad" = 1 ]; then
+        ko "5c drafter-off cross-check could not run (a boot, the slot-erase route or a request failed; see $WORKDIR/server-np*-draftoff.log)"
+    elif [ "$xsig1" != "$xsig2" ]; then
+        skc "5c np=2 vs np=1 cross-check: the boots still speculate differently with PXA_AUTO_SPEC=0 (np=1 $xsig1, np=2 $xsig2) -- an explicit chain in SERVER_ARGS is clamped per slot too; drop it (or add --spec-type none) to compare like for like"
+    elif [ "$xn1" != 1 ] || [ "$xn2" != 1 ]; then
+        ko "5c drafter-off arms are not stable (np=1:$xs1 / np=2 slot 1:$xs2) -- the forward pass is nondeterministic with the drafter off"
+    elif [ "$xr1" = "$xr2" ]; then
+        ok "np=2 slot 1 matches the np=1 reference at the same KV placement and the same draft capacity (drafter off in both, $NP2_XCHECK_REPS+$NP2_XCHECK_REPS runs, sha $xr2)"
+    else
+        ko "np=2 slot 1 ($xr2) differs from the np=1 reference ($xr1) at the same KV placement with the drafter off in both -- see README, this is the check that catches a real multi-slot defect"
+    fi
 fi
 
 # ---- unit tests ---------------------------------------------------------------------------------

@@ -65,7 +65,7 @@ DEV_IMAGE=${DEV_IMAGE:-}
 CUDA_MAJOR_MINOR=${CUDA_MAJOR_MINOR:-}
 ARCH_TAG=${ARCH_TAG:-sm60_61_70}
 CUDA_ARCHS=${CUDA_ARCHS:-60;61;70}
-BUILD_TARGETS="llama-server llama-cli llama-bench llama-perplexity llama-quantize llama-imatrix llama-pxq-export llama-gguf-split test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
+BUILD_TARGETS="llama-server llama-cli llama-bench llama-perplexity llama-quantize llama-pxq-export llama-gguf-split test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
 
 # The tarball's bin/ manifest. Kept here, next to BUILD_TARGETS, so the thing that gets BUILT and
 # the thing that gets SHIPPED are read and changed together -- the v2026.09.07-rc1 tarball shipped
@@ -75,11 +75,7 @@ REQUIRED_BIN="llama-server llama-cli llama-bench llama-perplexity"
 # Required, but built on demand if an externally-supplied BUILD_DIR lacks it (a CPU-only link).
 # A package without it cannot run the documented "leave PXQ" recipe, so a still-missing binary
 # here is a hard error, not a warning.
-# llama-imatrix joined this list for v2026.09.20: the package now carries the whole stock-quant
-# path (convert_hf_to_gguf.py + gguf-py + llama-imatrix + llama-quantize + llama-perplexity), so a
-# user can take a Hugging Face model all the way to a quantised GGUF without cloning the repo, and
-# docs/tutorials/04 walks through exactly that sequence out of this package's own bin/.
-REQUIRED_ONDEMAND_BIN="llama-pxq-export llama-imatrix"
+REQUIRED_ONDEMAND_BIN="llama-pxq-export"
 TEST_BIN="test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
 OPTIONAL_BIN="llama-quantize llama-gguf-split"
 
@@ -313,6 +309,11 @@ for f in src/libllama.so ggml/src/libggml.so examples/mtmd/libmtmd.so; do
 done
 # any other libggml-*.so variants a different cmake config might produce (backend split builds)
 find "$BUILD_DIR" -maxdepth 3 -name 'libggml*.so*' -exec cp -a {} "$STAGE/lib/" \; 2>/dev/null
+# the closed PXQN library: a build configured with it MUST ship it, or PXQN files are refused
+if grep -q '^PXA_PXQN_CLOSED_SRC:BOOL=ON' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null; then
+  [ -f "$STAGE/lib/libggml-pxqn.so" ] || die "PXA_PXQN_CLOSED_SRC=ON build but no ggml/src/libggml-pxqn.so to ship (build target ggml-pxqn)"
+  info "shipping lib/libggml-pxqn.so (closed PXQN library, loaded by libggml from lib/)"
+fi
 
 LDD_SCRIPT='
 set -e
@@ -354,15 +355,9 @@ echo "$EXTRA_LIB_PATHS" | sed 's/^/  /'
 
 # For each dependency, resolve it to its FULLY-versioned real file inside the container (e.g.
 # libcudart.so.12 -> libcudart.so.12.8.90) and ship both: the fully-versioned file (the "exact
-# versioned file" this order asks for) and the soname the binaries actually DT_NEEDED-reference.
-#
-# The soname is a HARD LINK to the versioned file, not a second copy and not a symlink. A second
-# copy is what this script used to write, and for the 60;61;70 build it cost 1.25 GB of duplicated
-# CUDA libraries and pushed the finished asset past the 2 GiB upload limit: gzip cannot see that
-# two files 700 MB apart in the stream are identical, so every duplicate is paid for in full. A
-# hard link is stored once by tar and comes out of tar as two ordinary files, which is exactly the
-# property the copy was there to guarantee; a symlink would not be (it can arrive dangling if
-# someone extracts only part of the archive).
+# versioned file" this order asks for) and the soname the binaries actually DT_NEEDED-reference,
+# the latter as a copy (not a symlink — tar/untar-by-hand on an unfamiliar box is more likely to
+# preserve plain files correctly than symlinks).
 while read -r libpath; do
   [ -n "$libpath" ] || continue
   base=$(basename "$libpath")
@@ -372,8 +367,21 @@ while read -r libpath; do
     || { err "WARNING: could not copy $libpath"; continue; }
   [ -s "$STAGE/lib/$realname" ] || { err "WARNING: copy of $libpath produced an empty file"; rm -f "$STAGE/lib/$realname"; continue; }
   if [ "$base" != "$realname" ]; then
-    ln -f "$STAGE/lib/$realname" "$STAGE/lib/$base" 2>/dev/null \
-      || cp -a "$STAGE/lib/$realname" "$STAGE/lib/$base"
+    # HARD LINK, not `cp -a` (found 2026-09-27): `cp -a` on a single source file
+    # makes an independent copy on every filesystem this box has (verified directly: ls -li
+    # shows two different inodes) -- it does NOT reuse the source's data the way `--preserve=
+    # links` does for a set of already-linked files. That silently doubled every large runtime
+    # lib this loop touches inside the tarball: libcublasLt.so.12 (751 MB) shipped as two full
+    # 751 MB entries instead of one, same for libnccl.so.2 (383 MB) and libcublas.so.12 (116 MB)
+    # -- about 1.25 GB of pure duplication, most of why this release's tarball measured 2.1+ GB
+    # against v2026.09.20's 1.31 GB for a comparable payload. The shipped v2026.09.20 artifact
+    # itself (/mnt/cacheone/pxa-release-assets/pxa-v2026.09.20-...tar.gz) carries these same
+    # pairs as genuine hard links (`tar -tzv` shows the "h...  0 bytes  link to ..." form) --
+    # confirming a hard link, not a second copy, is the intended shape here. `ln -f` also means
+    # patchelf/strip touching one name transparently updates the other, as long as they edit in
+    # place rather than replace-via-rename (not exercised by this box's current DEV_IMAGE, which
+    # has neither patchelf nor anything to strip -- re-check this note if that ever changes).
+    ln -f "$STAGE/lib/$realname" "$STAGE/lib/$base"
   fi
 done <<< "$EXTRA_LIB_PATHS"
 
@@ -437,26 +445,6 @@ fi
 SIZE_AFTER_STRIP=$(du -sb "$STAGE/bin" "$STAGE/lib" 2>/dev/null | awk '{s+=$1} END{print s}')
 info "bin/+lib/ size before strip: $SIZE_BEFORE_STRIP bytes, after: $SIZE_AFTER_STRIP bytes"
 
-# Re-link the soname to its versioned file. patchelf rewrites a file by replacing it, which breaks
-# the hard link made when the libraries were staged, so the pair has to be joined again here --
-# after every tool that edits these files has run and before anything is measured or archived.
-# Identical content only: the check is cmp, not the file name.
-for so in "$STAGE"/lib/*.so.*; do
-  [ -f "$so" ] || continue
-  case "$so" in *.so.[0-9]) ;; *) continue ;; esac      # a bare soname, e.g. libcublasLt.so.12
-  real=$(ls -1 "$so".* 2>/dev/null | sort -V | tail -1)
-  [ -n "$real" ] && [ -f "$real" ] || continue
-  [ "$(stat -c%i "$so")" = "$(stat -c%i "$real")" ] && continue
-  if cmp -s "$so" "$real"; then
-    ln -f "$real" "$so" && info "lib/: $(basename "$so") stored once, as a link to $(basename "$real")"
-  else
-    err "WARNING: $(basename "$so") and $(basename "$real") differ -- both shipped in full"
-  fi
-done
-SIZE_AFTER_LINK=$(du -sb --apparent-size "$STAGE/bin" "$STAGE/lib" 2>/dev/null | awk '{s+=$1} END{print s}')
-DISK_AFTER_LINK=$(du -sb "$STAGE/bin" "$STAGE/lib" 2>/dev/null | awk '{s+=$1} END{print s}')
-info "bin/+lib/ named bytes: $SIZE_AFTER_LINK, distinct bytes to archive: $DISK_AFTER_LINK"
-
 # ---------------------------------------------------------------------------------------------
 # wrappers
 # ---------------------------------------------------------------------------------------------
@@ -497,39 +485,29 @@ chmod +x "$STAGE/run-server.sh"
 mkdir -p "$STAGE/tools"
 cp -a "$EXPORT/tools/pxa-launch.py" "$STAGE/tools/pxa-launch.py"
 chmod +x "$STAGE/tools/pxa-launch.py"
+# PXA Control (pxa-launch --gui): the web front end, its page, the bench prompts it reuses and the
+# lever catalog its Advanced panel validates against (found at tools/../common/ by pxa_control.py).
+for f in pxa_control.py pxa-bench.py pxa_explain_footer.py; do
+  if [ -f "$EXPORT/tools/$f" ]; then cp -a "$EXPORT/tools/$f" "$STAGE/tools/$f"; fi
+done
+if [ -d "$EXPORT/tools/pxa_control_ui" ]; then
+  cp -a "$EXPORT/tools/pxa_control_ui" "$STAGE/tools/pxa_control_ui"
+fi
+if [ -f "$EXPORT/common/pxa-lever-catalog.inc" ]; then
+  mkdir -p "$STAGE/common" && cp -a "$EXPORT/common/pxa-lever-catalog.inc" "$STAGE/common/"
+fi
 
-# The conversion half of the stock-quant path. bin/llama-quantize can only read a GGUF, so a
-# package without the converter leaves a user who downloaded a Hugging Face model with nothing to
-# run first, and docs/tutorials/04's first command is exactly this script. gguf-py is the library
-# it imports, so the two travel together or neither works.
-cp -a "$EXPORT/convert_hf_to_gguf.py" "$STAGE/tools/convert_hf_to_gguf.py"
-chmod +x "$STAGE/tools/convert_hf_to_gguf.py"
-[ -d "$EXPORT/gguf-py" ] || die "REF $REF is missing gguf-py (convert_hf_to_gguf.py imports it)"
-cp -a "$EXPORT/gguf-py" "$STAGE/tools/gguf-py"
-# convert_hf_to_gguf.py finds gguf-py by walking up from its own directory to the repo root; in
-# this flat package the two sit side by side in tools/, so say so once rather than leave the
-# import to luck.
-cat > "$STAGE/tools/README-convert.md" <<'CONV'
-# Converting a Hugging Face model in this package
-
-`convert_hf_to_gguf.py` turns a downloaded Hugging Face model directory into a GGUF file.
-It needs the `gguf` python package that sits next to it here:
-
-```bash
-cd tools
-PYTHONPATH=$PWD/gguf-py python3 convert_hf_to_gguf.py /path/to/hf-model-dir --outfile model-f16.gguf --outtype f16
-```
-
-Then quantise it with the engine's own tool:
-
-```bash
-../bin/llama-quantize model-f16.gguf model-Q4_K_M.gguf Q4_K_M
-```
-
-`../bin/llama-imatrix` builds an importance matrix first if you want the imatrix-guided types, and
-`../bin/llama-perplexity` measures what a quantisation cost you. The PXQ tiers are not produced by
-`llama-quantize` in this package — see the release notes for where that tool lives.
-CONV
+# pxa-entrypoint: the container ENTRYPOINT (no args -> pxa-launch; engine args -> straight through
+# to run-server.sh; `doctor` -> pxa-launch --doctor). Harmless outside a container.
+if [ -f "$EXPORT/tools/pxa-entrypoint.sh" ]; then
+  cp -a "$EXPORT/tools/pxa-entrypoint.sh" "$STAGE/pxa-entrypoint"
+  chmod +x "$STAGE/pxa-entrypoint"
+fi
+# The PXA names: pxa-server, pxa-bench, pxa-quantize, pxa-perplexity, pxa-cli are symlinks to the
+# llama-* binaries, which keep working under their old names.
+for t in server bench quantize perplexity cli; do
+  [ -x "$STAGE/bin/llama-$t" ] && ln -sf "llama-$t" "$STAGE/bin/pxa-$t"
+done
 
 # ---------------------------------------------------------------------------------------------
 # bench/fair, bench/gate, docs, license
@@ -613,10 +591,11 @@ keep_doc() { # path relative to EXPORT == path relative to STAGE
   cp -aL "$EXPORT/$1" "$STAGE/$1"
   [ -e "$STAGE/$1" ] || die "cross-referenced doc did not survive staging: $1"
 }
-# docs/LEVERS.md is a REAL FILE from v2026.09.20 on. It used to be a symlink to an engineering
-# notebook (docs/lab/LEVERS.md) that was never meant for readers; the user-facing lever reference
-# now lives at docs/LEVERS.md itself and the notebook is not part of the repository.
 keep_doc docs/LEVERS.md
+keep_doc docs/lab/LEVERS.md
+keep_doc docs/DEFAULTS.md
+# PXQN ships compiled-only: the shipped lever docs are the public page, never the lab table
+python3 "$EXPORT/scripts/pxa-thin-pxqn-docs.py" "$STAGE" --allow-missing || die "PXQN doc thinning failed (scripts/pxa-thin-pxqn-docs.py)"
 keep_doc docs/QUANTIZING.md
 keep_doc docs/PXQU-CONVERT.md
 keep_doc docs/PXA-SM70-SERVING.md
@@ -625,14 +604,12 @@ keep_doc bench/README.md
 keep_doc RELEASE-NOTES-2026-09-02.md
 keep_doc RELEASE-NOTES-2026-09-07.md
 keep_doc RELEASE-NOTES-2026-09-09.md
+# RELEASE-NOTES-2026-09-13.md used to be staged only via the $RELNOTES auto-pick (it sorted
+# last). Adding RELEASE-NOTES-2026-09-20.md below (2026-09-27) makes 09-20 sort
+# last instead, so 09-13 needs its own explicit line now, same as 09-02/09-07/09-09 above --
+# found by this script's own dead-link guard the moment 09-20 was added, exactly the "next ring"
+# pattern this file's comments already describe.
 keep_doc RELEASE-NOTES-2026-09-13.md
-
-# The compose file and its plain-language guide, added for v2026.09.20: README.md tells the reader
-# this release ships a Compose file for the engine and both sidecars, and names docker/COMPOSE.md
-# as where it is explained. A package that makes that promise and then does not carry the two files
-# sends the reader looking for something that is not there.
-keep_doc docker/COMPOSE.md
-keep_doc docker/docker-compose.yml
 
 # Added 2026-09-14, again named by the dead-link guard: the 09-13 notes and docs/COOKBOOK.md cite the
 # leaderboard for every cross-engine cell and every pending re-measure. The board has no outbound
@@ -640,19 +617,12 @@ keep_doc docker/docker-compose.yml
 # the notes stay traceable to the evidence inside the package rather than to a page on the web.
 keep_doc bench/LEADERBOARD.md
 
-# The step-by-step guides, added for v2026.09.20. They are the documentation a first-time reader is
-# pointed at, they cross-reference each other, and they are written against THIS package's layout
-# (./pxa-launch, bin/, tools/), so a package without them sends that reader to a web page for
-# instructions about the files in their own directory. Named one by one, like every other doc here.
-for t in "$EXPORT"/docs/tutorials/*.md; do
-  [ -e "$t" ] || die "REF $REF is missing docs/tutorials/ (the step-by-step guides)"
-  keep_doc "docs/tutorials/$(basename "$t")"
-done
-
 # Added 2026-09-14, named by the guard below once it learned to read <img> tags: every shipped page
 # opens with the banner as an HTML <img>, the README embeds the fair-battle chart, and the 09-07
 # notes embed their five dark chart variants. Images are copied whole, never merged.
 keep_doc docs/assets/pxa-network-banner.png
+keep_doc docs/assets/pxa-control-launch-dark.png
+keep_doc docs/assets/pxa-control-chat-phone-light.png
 keep_doc docs/assets/before-after-2026-09-07-dark.png
 keep_doc docs/assets/context-vs-1cat-2026-09-07-dark.png
 keep_doc docs/assets/home-spec-ladder-2026-09-07-dark.png
@@ -677,6 +647,37 @@ keep_doc docs/QWEN4EXP-PXQ4.md
 keep_doc tools/vllm-pxq4/README.md
 keep_doc pxa/pxq4/README.md
 
+# Added 2026-09-27 (branch spd/pkg-docs-20260927), named by the dead-link guard on
+# the v2026.10 docs pass: README.md picked up five new cross-references (MODELS.md,
+# RELEASE-NOTES-2026-09-20.md, docker/COMPOSE.md, docs/tutorials/00-start-here.md,
+# docs/tutorials/README.md) plus one older one this script never staged (NOTICE), none of which
+# were in REF before this pass. MODELS.md is new content (no historical version existed to port
+# forward). RELEASE-NOTES-2026-09-20.md, docker/COMPOSE.md (+ its docker-compose.yml/.env.example
+# companions) and the full docs/tutorials/ set (12 numbered guides + GLOSSARY.md + README.md) are
+# ported forward from release/rc4/public-staging/ (the vetted public set actually used for
+# v2026.09.20) with only the version-pinned image tag bumped (v2026.09.20-rc4 -> v2026.10) --
+# not re-verified against v2026.10 line by line, since the last release already vetted them.
+keep_doc NOTICE
+keep_doc MODELS.md
+keep_doc RELEASE-NOTES-2026-09-20.md
+keep_doc docker/COMPOSE.md
+keep_doc docker/docker-compose.yml
+keep_doc docker/.env.example
+keep_doc docs/tutorials/README.md
+keep_doc docs/tutorials/GLOSSARY.md
+keep_doc docs/tutorials/00-start-here.md
+keep_doc docs/tutorials/01-run-your-first-model.md
+keep_doc docs/tutorials/02-pick-settings-for-your-cards.md
+keep_doc docs/tutorials/03-going-faster.md
+keep_doc docs/tutorials/04-quantize-your-own-model.md
+keep_doc docs/tutorials/05-quantize-for-vllm.md
+keep_doc docs/tutorials/06-run-the-vllm-sidecar.md
+keep_doc docs/tutorials/07-docker-compose.md
+keep_doc docs/tutorials/08-long-chats.md
+keep_doc docs/tutorials/09-measure-your-card.md
+keep_doc docs/tutorials/10-when-something-goes-wrong.md
+keep_doc docs/tutorials/11-switching-models-from-your-app.md
+
 # The two files copied INTO docs/ carry links written for the repo ROOT, so every one of them breaks
 # by exactly one directory (docs/README.md alone accounted for 15 of the 25 dead links). Rewrite the
 # targets for their new depth: docs/X.md -> X.md, and anything at the root gains a "../".
@@ -688,6 +689,8 @@ for f in "$STAGE/docs/README.md" "$STAGE/docs/$(basename "$RELNOTES")"; do
     -e 's#\]\(RELEASE-NOTES-#](../RELEASE-NOTES-#g' \
     -e 's#\]\(BUILD-FROM-SOURCE\.md\)#](../BUILD-FROM-SOURCE.md)#g' \
     -e 's#\]\(docker/#](../docker/#g' \
+    -e 's#\]\(MODELS\.md\)#](../MODELS.md)#g' \
+    -e 's#\]\(NOTICE\)#](../NOTICE)#g' \
     -e 's#src="docs/#src="#g' \
     -e 's#src="bench/#src="../bench/#g' \
     -e 's#src="banner\.png"#src="../banner.png"#g' \

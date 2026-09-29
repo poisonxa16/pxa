@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <atomic>
 
 #if defined(GGML_USE_HIPBLAS)
 #define GGML_COMMON_DECL_HIP
@@ -34,6 +35,18 @@
 #else
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIPBLAS)
+
+// PXA_CUDA_DEVCACHE (default ON; PXA_CUDA_DEVCACHE=0 restores one cudaGetDevice per call).
+// ggml_cuda_set_device()/ggml_cuda_get_device() asked the runtime for the current device on every
+// call: about 4850 cudaGetDevice per decode token on a 2-card tensor split (one per node plus the
+// per-op cc lookups). Inside ggml_backend_cuda_graph_compute() they now answer from a per-thread
+// copy of the current device instead. The copy is re-read from the runtime when a graph compute
+// starts, and every cudaSetDevice() in the CUDA backend goes through the tracked wrapper below
+// (the macro), so it cannot go stale inside the scope. Outside the scope nothing changes.
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+cudaError_t pxa_cuda_set_device_tracked(int device);
+#define cudaSetDevice(device) pxa_cuda_set_device_tracked(device)
+#endif
 
 #ifdef GGML_USE_NCCL
 #include <nccl.h>
@@ -705,6 +718,11 @@ static inline bool pxa_cuda_house_lever(const char * name) {
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// Bug #266: bytes the per-device VMM pool holds but has not handed out (pool_size - pool_used).
+// The pool is pre-grown at context creation, so a cudaMemGetInfo() headroom check that ignores
+// it undercounts what a pool allocation can actually get (the Volta FA MMA q8 staging check).
+extern std::atomic<size_t> g_pxa_pool_idle[GGML_CUDA_MAX_DEVICES];
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -715,6 +733,13 @@ struct ggml_cuda_pool {
     // pool memory; a generation change forces recapture instead of replaying dangling pointers.
     // The VMM pool grows in place (bump allocator, base address never moves) so it never bumps.
     virtual uint64_t generation() const { return 0; }
+    // Bug #266: grow the pool so that `size` bytes are free WITHOUT aborting when the device is
+    // out of memory. Returns false (and leaves the pool as it was) when the memory is not there.
+    // Called once at context creation with the worst case the cuBLAS dequant path will draw from
+    // this pool, so an out-of-memory becomes a clean load-time error instead of a mid-prefill
+    // abort in cuMemCreate.
+    virtual bool reserve(size_t size) { (void)size; return true; }
+    virtual size_t reserved() const { return 0; }
 };
 
 template<typename T>

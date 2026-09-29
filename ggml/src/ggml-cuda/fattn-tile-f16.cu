@@ -442,7 +442,7 @@ static __global__ void flash_attn_tile_ext_f16(
 template <int D, int cols_per_block, int nwarps, int parallel_blocks, bool use_softcap, bool pxa_mask_skip, bool pxa_f32acc>
 static fattn_kernel_t pxa_tile_f16_chunked_kernel() {
     if constexpr (parallel_blocks == 1) {
-        if (pxa_fa_f16_kv_chunk() > 0) {
+        if (pxa_fa_f16_kv_chunk() != 0) { // armed (>0) or AUTO (-1, unset)
             return flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, true>;
         }
     }

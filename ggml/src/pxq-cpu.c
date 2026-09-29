@@ -49,6 +49,8 @@
 #include "ggml-pxq2-tables.h"
 #include "ggml-pxq3-tables.h"
 #include "ggml-pxq1-tables.h"
+#include "ggml-pxqn.h"
+#include "ggml-pxqn-api.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -151,6 +153,14 @@ bool pxa_pxq_is_cpu_supported(enum ggml_type type) {
         case GGML_TYPE_PXQ1:
         case GGML_TYPE_PXQ6:
             return true;
+        case GGML_TYPE_PXQN3:
+        case GGML_TYPE_PXQN3S8:
+        case GGML_TYPE_PXQN4:
+        case GGML_TYPE_PXQN2:
+        case GGML_TYPE_PXQN1:
+        case GGML_TYPE_PXQN4S8:
+        case GGML_TYPE_PXQN5:
+            return ggml_pxqn_available();   // the closed libggml-pxqn decodes them
         default:
             return false;
     }
@@ -285,6 +295,14 @@ static void pxa_deq_row_pxq6r(const uint8_t * base, int64_t row, int64_t k, floa
     }
 }
 
+// PXQN (types 257-263): decoded by the closed libggml-pxqn (ggml-pxqn-api.h); a build without it refuses PXQN
+// files at load, so reaching the abort below means a caller skipped pxa_pxq_is_cpu_supported().
+static void pxa_pxqn_deq_row_fwd(enum ggml_type type, const void * data, int64_t row, int64_t k, float * dst) {
+    const struct ggml_pxqn_lib_api * l = ggml_pxqn_lib();
+    if (!l) { fprintf(stderr, "%s\n", GGML_PXQN_MISSING_MSG); abort(); }
+    l->cpu->deq_row(type, data, row, k, dst);
+}
+
 void pxa_pxq_dequant_row(enum ggml_type type, const void * data, int64_t row, int64_t k, float * dst) {
     pxa_pxq_ensure_tables();
     PXA_PXQ_ASSERT(k % 32 == 0);
@@ -296,6 +314,13 @@ void pxa_pxq_dequant_row(enum ggml_type type, const void * data, int64_t row, in
         case GGML_TYPE_PXQ3:   pxa_deq_row_pxq3 (base, row, k, dst); break;
         case GGML_TYPE_PXQ1:   pxa_deq_row_pxq1 (base, row, k, dst); break;
         case GGML_TYPE_PXQ6:   pxa_deq_row_pxq6r(base, row, k, dst); break;
+        case GGML_TYPE_PXQN3:
+        case GGML_TYPE_PXQN3S8:
+        case GGML_TYPE_PXQN4:
+        case GGML_TYPE_PXQN2:
+        case GGML_TYPE_PXQN1:
+        case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXQN4S8: pxa_pxqn_deq_row_fwd(type, data, row, k, dst); break;
         default: PXA_PXQ_ASSERT(!"pxa_pxq_dequant_row: not a PXQ type");
     }
 }
@@ -861,6 +886,15 @@ void pxa_hadamard(struct ggml_tensor * dst, int ith, int nth) {
         traits.to_float(x_row + offset, y, nh);
         pxa_fast_ht_f32(nh, y);
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// pxa_pxqn_rht -- GGML_OP_PXQN_RHT on the CPU: implemented by the closed libggml-pxqn (ggml-pxqn-api.h)
+// -------------------------------------------------------------------------------------------------
+void pxa_pxqn_rht(struct ggml_tensor * dst, int ith, int nth) {
+    const struct ggml_pxqn_lib_api * l = ggml_pxqn_lib();
+    if (!l) { fprintf(stderr, "%s\n", GGML_PXQN_MISSING_MSG); abort(); }
+    l->cpu->rht(dst, ith, nth);
 }
 
 // -------------------------------------------------------------------------------------------------

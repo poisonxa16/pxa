@@ -58,6 +58,18 @@ static const pxa_lever_row g_pxa_lever_rows[PXA_LEVER_COUNT] = {
       "of top-1 tokens and is not faster on a bandwidth-bound card. Default on." },
     { "PXA_CORE_ROUTES",       "CORE_ROUTES",     0,
       "print, at exit, how many flash-attention nodes each route served on each device. Default off." },
+    { "PXA_FA_QKV_DIRECT",     "FA_QKV_DIRECT",   0,
+      "sm_60 narrow attention (width 1..8, head 256, q4_0 or q8_0 K/V) on a kernel that reads the "
+      "quantized cache in place and serves a whole GQA group per block. Default on at the ENHANCE level; "
+      "=0 restores the vec-f32 route." },
+    { "PXA_FA_QKV_TILE",       "FA_QKV_TILE",     0,
+      "sm_60 wide attention (width > 8, head 256, q4_0 or q8_0 K/V) reads the quantized cache in place "
+      "instead of converting it to f16 for the tile kernel. Default on at the ENHANCE level; "
+      "=0 keeps the tile-f16 route and its conversion." },
+    { "PXA_FA_QKV_DIRECT_VOLTA", "FA_QKV_DIRECT_VOLTA", 0,
+      "sm_70 narrow attention (width 1..8, head 256, q4_0 or q8_0 K/V) takes the FA_QKV_DIRECT kernel "
+      "instead of WMMA ncols 8, which converts the whole K/V cache to f16 every decode step. Default on "
+      "at the ENHANCE level; =0 restores the WMMA route." },
 };
 
 struct pxa_lever_state {
@@ -154,6 +166,20 @@ static const pxa_lever_state * pxa_lever_table() {
                 case PXA_LEVER_SM60_FA_VEC_F32: value = pxa_env_on_unless_zero(v) ? 1 : 0; break;
                 case PXA_LEVER_FA_SWA_SLICE:    value = pxa_env_on_if_one(v)     ? 1 : 0; break;
                 case PXA_LEVER_CORE_ROUTES:     value = pxa_env_on_if_one(v)     ? 1 : 0; break;
+                case PXA_LEVER_FA_QKV_DIRECT:
+                    // On at the ENHANCE level (the shipping default), off under REFERENCE / DEFAULT;
+                    // set, anything but 0 arms it.
+                    value = !set ? (level >= 2 ? 1 : 0) : (pxa_env_on_unless_zero(v) ? 1 : 0);
+                    break;
+                case PXA_LEVER_FA_QKV_DIRECT_VOLTA:
+                    value = !set ? (level >= 2 ? 1 : 0) : (pxa_env_on_unless_zero(v) ? 1 : 0);
+                    break;
+                case PXA_LEVER_FA_QKV_TILE:
+                    // On at the ENHANCE level like QKV_DIRECT: NMSE 2-17x below the tile-f16 route on all 12
+                    // wide cases; one case's single worst element is 7% above (1.07e-4 vs 9.99e-5). =0 restores
+                    // the tile-f16 route and its KV conversion.
+                    value = !set ? (level >= 2 ? 1 : 0) : (pxa_env_on_unless_zero(v) ? 1 : 0);
+                    break;
 
                 default:                        value = g_pxa_lever_rows[i].off; break;
             }

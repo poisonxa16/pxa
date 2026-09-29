@@ -43,6 +43,8 @@ enum pxa_fa_route {
     PXA_FA_ROUTE_WMMA_F16,
     PXA_FA_ROUTE_MMA_F16,
     PXA_FA_ROUTE_MMA_NEW,
+    PXA_FA_ROUTE_QKV_DIRECT,   // PXA_FA_QKV_DIRECT -- sm_60 narrow, quantized K/V read in place
+    PXA_FA_ROUTE_QKV_TILE,     // PXA_FA_QKV_TILE -- sm_60 wide, quantized K/V read in place (no f16 conversion)
     PXA_FA_ROUTE_COUNT
 };
 
@@ -70,6 +72,12 @@ struct pxa_fa_plan_t {
 pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_query_t & q);
 
 const char * pxa_fa_route_name(pxa_fa_route route);
+
+// PXA_FA_DEEP_QKV_TILE / PXA_FA_F16_KV_CHUNK AUTO (ws6-fix 2026-09-25): would a WHOLE-tensor f16
+// staging of `need` bytes (one layer's quantized K+V converted for the attention kernel) fit on the
+// current device with the 256 MiB margin the Volta MMA q8 admission keeps? Sizes already admitted
+// are answered from a per-device high-water mark (the pool holds them). Defined in fa-route.cu.
+bool pxa_fa_whole_staging_fits(size_t need);
 
 // PXA_FA_SWA_SLICE / PXA_FA_SWA_KEEP rewrite the node the kernel sees. Dispatch side only; the
 // scratch must outlive the kernel call. Returns dst itself when no rewrite applies.

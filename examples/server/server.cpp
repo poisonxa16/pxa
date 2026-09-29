@@ -3,6 +3,7 @@
 #include "pxa-ckpt-evict.h"
 #include "pxa-spec-load.h"
 #include "pxa-mtp-cache-only.h"
+#include "pxa-hotswap.h"
 #include "server-common.h"
 #include "server-chat.h"
 #include "server-cors-proxy.h"
@@ -38,6 +39,7 @@
 #include <set>
 #include <mutex>
 #include <thread>
+#include <future>
 #include <signal.h>
 #include <memory>
 #include <random>
@@ -46,6 +48,8 @@
 #include <src/llama-impl.h>
 #ifdef SQLITE3_MODERN_CPP_SUPPORT
 #include <sqlite_modern_cpp.h>
+
+
 
 struct DatabaseHandle {
     sqlite::database db;
@@ -312,6 +316,19 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
     });
 }
 
+// bug #220: register the waiter BEFORE the task can be answered. server_response::send() drops a
+// result nobody is waiting for, so posting first and registering second could lose a fast answer
+// (e.g. an erase) and leave the HTTP worker in recv() forever.
+static server_task_result post_task_and_wait_legacy(server_context & ctx_server, server_task && task) {
+    task.id = ctx_server.queue_tasks.get_new_id();
+    const int id_task = task.id;
+    ctx_server.queue_results.add_waiting_task_id(id_task);
+    ctx_server.queue_tasks.post(std::move(task));
+    server_task_result result = ctx_server.queue_results.recv(id_task);
+    ctx_server.queue_results.remove_waiting_task_id(id_task);
+    return result;
+}
+
 // generator-like API for server responses, support pooling connection state and aggregating results
 struct server_response_reader {
     std::unordered_set<int> id_tasks;
@@ -496,6 +513,11 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
 #include <cstring>
 #include <regex>
 #include <initializer_list>
+#include "pxa-registry.h"
+#include "pxa-explain.h"     // PXA_EXPLAIN_PAGE_v1: GET /pxa + /pxa/explain (showcase, 2026-09-25)
+#include "pxa-stats.h"       // PXA_SPEED_STATS_v1: GET /pxa/stats + /pxa/speed (speed-graph, 2026-09-27)
+#include "speed.html.hpp"    // generated from examples/server/public_pxa/speed.html (scripts/xxd.cmake)
+#include "pxa.html.hpp"      // generated from examples/server/public_pxa/pxa.html (scripts/xxd.cmake)
 
 // read general.architecture from the gguf header (metadata only, no tensor data) — the
 // posture layer runs BEFORE model load but needs the arch for MLA-class exceptions.
@@ -522,7 +544,7 @@ static std::string pxa_gguf_arch(const std::string & fname) {
 // Return: >0 the file declares experts, 0 it does not, -1 the question could not be asked. The
 // caller must pass -1 through rather than flattening it to 0: "dense" and "unknown" take
 // different branches on purpose.
-static int pxa_gguf_expert_count(const std::string & fname) {
+[[maybe_unused]] static int pxa_gguf_expert_count(const std::string & fname) {
     struct gguf_init_params ip = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
     struct gguf_context * g = gguf_init_from_file(fname.c_str(), ip);
     if (!g) return -1;
@@ -1121,12 +1143,234 @@ static int pxa_adaptive_ubatch(const gpt_params & params, std::string & why) {
 #endif
 }
 
-int main(int argc, char ** argv) {
-#if SERVER_VERBOSE != 1
-    log_disable();
-#endif
-    // own arguments required by this example
-    gpt_params params;
+// =============================================================================================
+// PXA HOT SWAP -- the server side (router: pxa-hotswap.h; engine: ggml/src/pxa-residency.h).
+// hs_front.pick() decides which registered model a request is for and, when it needs the cards,
+// holds a lease that keeps that model on them until the response -- or its stream -- ends.
+// With one model (no --hot-model) pick() returns ctx_server and takes no lock at all.
+// =============================================================================================
+enum pxa_hs_kind {
+    PXA_HS_ACTIVATE,    // needs the model on the cards: swap it in if it is not, and hold it there
+    PXA_HS_PIN_ACTIVE,  // whatever model is on the cards (monitoring): hold it while answering
+    PXA_HS_PEEK,        // host-side data only (tokenizer, template, props): no swap, no lease
+};
+
+struct pxa_hs_pick {
+    server_context *                ctx = nullptr;
+    std::shared_ptr<pxa_hs::lease>  lease;
+};
+
+struct pxa_hs_front {
+    std::vector<server_context *> ctxs;          // [0] = the -m model
+    pxa_hs::router *              router = nullptr;
+    bool                          unknown_to_active = false;   // PXA_HOT_UNKNOWN=active
+
+    std::string registered() const {
+        std::string s;
+        for (size_t i = 0; i < ctxs.size(); ++i) {
+            s += (i ? ", " : "") + router->name((int) i);
+        }
+        return s;
+    }
+
+    pxa_hs_pick pick(const httplib::Request & req, httplib::Response & res, pxa_hs_kind kind) {
+        pxa_hs_pick p;
+        if (!router) {
+            p.ctx = ctxs[0];
+            return p;
+        }
+        std::string name;
+        if (req.has_param("model")) {
+            name = req.get_param_value("model");
+        } else if (!req.body.empty()) {
+            try {
+                const json b = json::parse(req.body);
+                if (b.is_object() && b.contains("model") && b.at("model").is_string()) {
+                    name = b.at("model").get<std::string>();
+                }
+            } catch (...) {
+                // not JSON: the handler reports its own parse error
+            }
+        }
+        int idx = -1;
+        if (!name.empty()) {
+            idx = router->find(name);
+            if (idx < 0 && !unknown_to_active) {
+                res_err(res, format_error_response("model '" + name + "' is not registered on this server; registered: " +
+                                                   registered(), ERROR_TYPE_NOT_FOUND));
+                return p;
+            }
+        }
+        if (kind == PXA_HS_PEEK) {
+            const int a = router->active();
+            p.ctx = ctxs[idx >= 0 ? idx : (a >= 0 ? a : 0)];
+            return p;
+        }
+        if (kind == PXA_HS_ACTIVATE && idx < 0) {
+            // no model named: whatever is on the cards when this request's turn in the queue comes
+            std::string err;
+            const int a = router->acquire_any(err, req.is_connection_closed);
+            if (a < 0) {
+                res_err(res, format_error_response(err, ERROR_TYPE_UNAVAILABLE));
+                return p;
+            }
+            p.ctx   = ctxs[a];
+            p.lease = std::make_shared<pxa_hs::lease>(router, a);
+            return p;
+        }
+        if (kind == PXA_HS_PIN_ACTIVE) {
+            // monitoring: whatever is on the cards now (after a swap in flight), without queueing
+            const int a = router->acquire_active();
+            if (a < 0) {
+                res_err(res, format_error_response("no model is on the cards (the last swap failed); name a model to load one",
+                                                   ERROR_TYPE_UNAVAILABLE));
+                return p;
+            }
+            p.ctx   = ctxs[a];
+            p.lease = std::make_shared<pxa_hs::lease>(router, a);
+            return p;
+        }
+        std::string err;
+        if (!router->acquire(idx, err, req.is_connection_closed)) {
+            res_err(res, format_error_response(err, ERROR_TYPE_UNAVAILABLE));
+            return p;
+        }
+        p.ctx   = ctxs[idx];
+        p.lease = std::make_shared<pxa_hs::lease>(router, idx);
+        return p;
+    }
+};
+
+// /props "hot_swap": the registry, who is on the cards, and the last swap
+static json pxa_hs_props_json(pxa_hs_front & f) {
+    const auto st = f.router->status();
+    const auto ls = f.router->last_swap();
+    json models = json::array();
+    for (size_t i = 0; i < f.ctxs.size(); ++i) {
+        json m = f.ctxs[i]->pxa_hs_status();
+        m["name"]        = st[i].name;
+        m["active"]      = st[i].active;
+        m["in_flight"]   = st[i].inflight;
+        m["waiting"]     = st[i].waiting;
+        m["n_swaps_in"]  = st[i].n_swaps_in;
+        m["n_swap_fail"] = st[i].n_swap_fail;
+        models.push_back(m);
+    }
+    const int a = f.router->active();
+    json last = nullptr;
+    if (ls.to >= 0) {
+        last = {
+            {"from",      ls.from >= 0 ? st[ls.from].name : std::string()},
+            {"to",        st[ls.to].name},
+            {"ok",        ls.ok},
+            {"park_ms",   ls.ms_park},
+            {"unpark_ms", ls.ms_unpark},
+            {"total_ms",  ls.ms_total},
+            {"error",     ls.err},
+        };
+    }
+    return json {
+        {"enabled",   true},
+        {"active",    a >= 0 ? st[a].name : std::string()},
+        {"swapping",  f.router->swapping()},
+        {"n_swaps",   f.router->n_swaps()},
+        {"models",    models},
+        {"last_swap", last},
+    };
+}
+
+// park/unpark run on the model's own task loop, as control functions ahead of any task
+struct pxa_hs_swap_ops : public pxa_hs::swap_ops {
+    std::vector<server_context *> ctxs;
+
+    bool run(int idx, int next, bool park, std::string & err) {
+        auto done = std::make_shared<std::promise<std::pair<bool, std::string>>>();
+        auto fut  = done->get_future();
+        server_context * c = ctxs[idx];
+        server_context * n = next >= 0 ? ctxs[next] : nullptr;
+        c->queue_tasks.post_control([c, n, park, done]() {
+            std::string e;
+            const bool ok = park ? c->pxa_hs_park(e, n ? n->pxa_hs_res : nullptr) : c->pxa_hs_unpark(e);
+            done->set_value({ok, e});
+        });
+        try {
+            const auto r = fut.get();
+            err = r.second;
+            return r.first;
+        } catch (const std::exception &) {
+            err = "the server is shutting down";   // the model's loop ended before it ran the swap
+            return false;
+        }
+    }
+    bool park  (int idx, int next, std::string & err) override { return run(idx, next, true,  err); }
+    bool unpark(int idx, std::string & err) override           { return run(idx, -1,   false, err); }
+};
+
+// Build the command line one registered model resolves its parameters from: the shared flags with
+// everything that names a model (and whatever only makes sense for that model) taken out, then the
+// model's own path and name, then its per-model flags (last, so they win).
+static std::vector<std::string> pxa_hs_model_argv(int argc, char ** argv, const pxa_hs::model_spec & spec) {
+    static const std::set<std::string> drop1 = {
+        "-m", "--model", "-a", "--alias", "--hot-model", "-md", "--model-draft", "--mmproj", "--mmproj-url",
+        "--lora", "--control-vector", "--chat-template", "--chat-template-file", "-hf", "-hfr", "--hf-repo",
+        "-hff", "--hf-file", "-mu", "--model-url", "--spec-type",
+    };
+    static const std::set<std::string> drop2 = { "--lora-scaled", "--control-vector-scaled", "--control-vector-layer-range" };
+    std::vector<std::string> out;
+    out.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (drop1.count(a)) { i += 1; continue; }
+        if (drop2.count(a)) { i += 2; continue; }
+        out.push_back(a);
+    }
+    out.push_back("-m");
+    out.push_back(spec.path);
+    out.push_back("-a");
+    out.push_back(spec.name);
+    for (const auto & a : spec.args) out.push_back(a);
+    return out;
+}
+
+// pinned-host budget for the weight/KV mirrors: PXA_SWAP_PIN_BUDGET_MB, else MemAvailable minus 8 GiB
+static uint64_t pxa_hs_pin_budget() {
+    if (const char * e = getenv("PXA_SWAP_PIN_BUDGET_MB")) {
+        return (uint64_t) atoll(e) << 20;
+    }
+    uint64_t avail_kb = 0;
+    if (FILE * f = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long long v = 0;
+            if (sscanf(line, "MemAvailable: %llu kB", &v) == 1) {
+                avail_kb = v;
+                break;
+            }
+        }
+        fclose(f);
+    }
+    const uint64_t avail = avail_kb << 10;
+    const uint64_t keep  = (uint64_t) 8 << 30;
+    return avail > keep ? avail - keep : 0;
+}
+
+// The whole parameter pipeline of this server: the command line, the environment and every
+// automatic layer that fills what the command line left unset (registry autoconfig, posture,
+// per-card batch, auto-ts, auto-samplers, auto-spec, MTP config, truth lines). It is a function
+// so PXA hot swap can run it once per registered model, on that model's own flags and file.
+// Returns -1 to go on, or the exit code main() should return (bad flags, PXA_EXPLAIN).
+// rel-integrate3 (R23): hot swap moved flag resolution into pxa_server_resolve_params(), so the -m model's
+// topology / model probe / autoconfig are locals here; GET /pxa/explain (showcase, in main) reads the first
+// call's values -- the -m model, exactly what PXA_EXPLAIN=1 prints -- from this snapshot.
+struct pxa_resolved_primary {
+    pxa_topology   topo;
+    pxa_model_info model;
+    pxa_autoconfig ac;
+    bool           set = false;
+};
+static pxa_resolved_primary g_pxa_primary;
+
+static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params) {
 
     if (!gpt_params_parse(argc, argv, params)) {
         gpt_params_print_usage(argc, argv, params);
@@ -1140,29 +1384,88 @@ int main(int argc, char ** argv) {
     server_log_json = params.log_json;
     server_verbose = params.verbosity > 0;
 
-    // PXA_CONTAINER_AWARE_v1: detect the runtime once, loudly — the wedge monitor's restart
-    // contract depends on it (see the PXA_WEDGE_EXIT_v1 block below). Always printed, even
-    // with logging disabled, so post-mortems can tell which contract was in force.
-    std::string pxa_container_why;
-    const bool pxa_in_container = pxa_detect_container(pxa_container_why);
-    fprintf(stderr, "PXA_CONTAINER_AWARE_v1: runtime=%s (%s)\n",
-            pxa_in_container ? "container" : "bare-metal", pxa_container_why.c_str());
-    fflush(stderr);
-
-
-    // struct that contains llama context and inference
-    server_context ctx_server;
-
-    if (!params.system_prompt.empty()) {
-        ctx_server.system_prompt_set(params.system_prompt);
+    // PXA REGISTRY (PXA core step 3, 2026-09-25): the engine picks -sm / -b / -ub / -fa itself from
+    // the card set and the model file when the command line does not set them, so a bare
+    // `llama-server -m file`, the docker image and pxa-launch get the same defaults. The rules live
+    // in common/pxa-registry.cpp; explicit flags always win. PXA_EXPLAIN=1 prints what would be
+    // picked as one JSON line and exits before anything is loaded (PXA_TOPOLOGY=2x600 there
+    // describes the cards without touching them); PXA_EXPLAIN=levers dumps the lever table.
+    pxa_topology   pxa_topo;
+    pxa_model_info pxa_model;
+    pxa_autoconfig pxa_ac;
+    {
+        const char * ex      = getenv("PXA_EXPLAIN");
+        const bool   explain = ex && ex[0] && strcmp(ex, "0") != 0;
+        if (explain && strcmp(ex, "levers") == 0) {
+            pxa_lever_catalog_dump(stdout);
+            return 0;
+        }
+        pxa_user_set us;
+        us.sm = pxa_argv_has(argc, argv, {"-sm", "--split-mode"});
+        us.sm_value = us.sm ? (int) params.split_mode : -1;
+        us.b  = pxa_argv_has(argc, argv, {"-b", "--batch-size"})   || getenv("LLAMA_ARG_BATCH")  != nullptr;
+        us.ub = pxa_argv_has(argc, argv, {"-ub", "--ubatch-size"}) || getenv("LLAMA_ARG_UBATCH") != nullptr;
+        us.fa = pxa_argv_has(argc, argv, {"-fa", "--flash-attn", "-no-fa", "--no-flash-attn"})
+                || getenv("LLAMA_ARG_FLASH_ATTN") != nullptr;
+        us.ts = pxa_argv_has(argc, argv, {"-ts", "--tensor-split"});
+        us.fa_value = params.flash_attn;
+        pxa_model = pxa_model_probe(params.model);
+        us.ngl = pxa_argv_has(argc, argv, {"-ngl", "--gpu-layers", "--n-gpu-layers"})
+                 || getenv("LLAMA_ARG_N_GPU_LAYERS") != nullptr;
+        us.ctx = pxa_argv_has(argc, argv, {"-c", "--ctx-size"}) || getenv("LLAMA_ARG_CTX_SIZE") != nullptr
+                 || params.n_ctx > 0;
+        us.n_parallel = params.n_parallel;
+        us.n_ctx_value = params.n_ctx;
+        us.kv_q8 = params.cache_type_k == "q8_0" && params.cache_type_v == "q8_0";
+        us.ngl_partial = us.ngl && params.n_gpu_layers >= 0 && pxa_model.n_layer > 0
+                         && params.n_gpu_layers <= pxa_model.n_layer;
+        pxa_topo = pxa_topology_detect(params.devices, params.max_gpu, explain);
+        pxa_ac   = pxa_autoconfig_resolve(pxa_topo, pxa_model, us, ggml_pxa_config_level(),
+                                          pxa_posture_mode() == 1 ? 1 : 0);
+        if (!g_pxa_primary.set) {   // the first call is main()'s, for the -m model
+            g_pxa_primary.topo  = pxa_topo;
+            g_pxa_primary.model = pxa_model;
+            g_pxa_primary.ac    = pxa_ac;
+            g_pxa_primary.set   = true;
+        }
+        if (explain) {
+            printf("PXA_EXPLAIN_JSON %s\n", pxa_autoconfig_json(pxa_topo, pxa_model, pxa_ac, ggml_pxa_config_level()).c_str());
+            fflush(stdout);
+            return 0;
+        }
+        if (pxa_ac.split != PXA_SM_KEEP) {
+            params.split_mode = (enum llama_split_mode) pxa_ac.split;
+            if (pxa_ac.ts_even && params.devices.empty()) {
+                // an EVEN split: -sm tensor cuts every weight the same way on every card and both
+                // run each step together, so a capacity-weighted ratio only adds wait
+                for (int i = 0; i < pxa_topo.n_dev && i < (int) llama_max_devices(); ++i) {
+                    params.tensor_split[i] = 1.0f;
+                }
+            }
+        }
+        if (pxa_ac.n_gpu_layers >= 0) {
+            params.n_gpu_layers = pxa_ac.n_gpu_layers;
+        }
+        if (pxa_ac.n_ctx > 0) {
+            params.n_ctx = pxa_ac.n_ctx;
+        }
+        for (const auto & e : pxa_ac.env) {
+            setenv(e.first.c_str(), e.second.c_str(), /*overwrite =*/ 0);
+        }
+        pxa_registry_banner(stderr, pxa_topo, pxa_model, pxa_ac);
     }
 
     if (params.model_alias == "unknown") {
         params.model_alias = params.model;
     }
 
-    llama_backend_init();
-    llama_numa_init(params.numa);
+    // once per process (model 0 reaches this point first, exactly where it always did)
+    static bool pxa_backend_ready = false;
+    if (!pxa_backend_ready) {
+        pxa_backend_ready = true;
+        llama_backend_init();
+        llama_numa_init(params.numa);
+    }
 
     // PXA POSTURE (2026-07-22): PXA_MODE=balance|max fills -fa/-ub the CLI left unset;
     // explicit flags always win; PXA_REFERENCE=1 stands this down. See the block above main.
@@ -1225,8 +1528,9 @@ int main(int argc, char ** argv) {
                 const char * cell = nullptr;
                 // the 4x P100 cell answers differently for a dense file than for an expert one,
                 // so the resolver is told which this is -- read from the header, before load.
-                const int n_expert = pxa_gguf_expert_count(params.model);
-                if (ggml_backend_cuda_pxa_suggest_batch(n_expert, &sb, &sub, &cell)) {
+                // (PXA core step 3: the cell table moved to the registry, which also carries the
+                // launcher's measured rows, so both pick the same -b/-ub on the same cards and file.)
+                if (pxa_registry_batch_cell(pxa_topo, pxa_model, ggml_pxa_config_level(), &sb, &sub, &cell)) {
                     if (!b_explicit)  { params.n_batch  = sb;  card_b  = true; }
                     if (!ub_explicit) { params.n_ubatch = sub; card_ub = true; }
                     fprintf(stderr,
@@ -1235,28 +1539,49 @@ int main(int argc, char ** argv) {
                             "stock defaults)\n",
                             cell, params.n_batch, card_b ? "" : " (explicit, kept)",
                             params.n_ubatch, card_ub ? "" : " (explicit, kept)");
-                    // 1x sm_61 also gets --ctx-checkpoints 0. The checkpoint pool is per slot and
-                    // sized off n_ctx; on the 11 GB card the weights leave no room for it, and the
-                    // measured 1080 Ti protocol has always run with it off. Only fills the flag
-                    // when the user did not pass it.
-                    if (pxa_single_sm61()
-                        && !pxa_argv_has(argc, argv, {"--ctx-checkpoints"})
-                        && params.ctx_checkpoints_n != 0) {
-                        params.ctx_checkpoints_n = 0;
-                        fprintf(stderr, "PXA_AUTO: --ctx-checkpoints 0 on the 1x 1080 Ti cell "
-                                        "(11 GB card, weights leave no room for the checkpoint "
-                                        "pool; pass --ctx-checkpoints N to override)\n");
+                    // (2026-09-25, ws6-server) the 1x sm_61 cell no longer forces --ctx-checkpoints 0.
+                    // Context checkpoints live in host RAM (server_prompt_checkpoint::data), not on
+                    // the 11 GB card, and PXA_CKPT_PROMPT_POLICY keeps only the two near the end of a
+                    // prompt; with none, a hybrid (qwen35moe) chat whose next turn rewinds even one
+                    // token re-prefills its whole history. The published cold-prefill protocol
+                    // passes --ctx-checkpoints 0 explicitly and still can.
+                } else {
+                    // bug auto-batch-cell-silent-nonmatch (rel-integrate3): a card set with no measured
+                    // cell used to proceed in silence, so a boot log could not tell "ran a measured
+                    // cell" from "ran stock" (a card swap once moved -b 8192 -> 2048 unseen).
+                    std::string cards;
+                    for (size_t i = 0; i < pxa_topo.cc.size(); ++i) {
+                        cards += (i ? "," : "") + std::to_string(pxa_topo.cc[i]);
                     }
+                    fprintf(stderr,
+                            "PXA_AUTO: batch defaults: no measured cell for this card set (cc %s) -> "
+                            "-b %d%s -ub %d%s before the -ub rule/ladder below (pass -b/-ub to override)\n",
+                            cards.empty() ? "?" : cards.c_str(),
+                            params.n_batch, b_explicit ? " (explicit)" : " (stock)",
+                            params.n_ubatch, ub_explicit ? " (explicit)" : " (stock)");
                 }
             }
 #else
             (void) b_explicit;
 #endif
             std::string ub_why = card_ub ? "PXA per-card measured default" : "explicit CLI/env - ub untouched";
+            if (!ub_explicit && !card_ub && pxa_ac.ub_rule != nullptr && pxa_ac.n_ubatch > 0) {
+                // bug #207 rule (registry): replaces the VRAM ladder, which would pick the -ub 2048
+                // that starves the Volta MMA q8 attention route of its staging margin. The pick is
+                // VERIFIED at load (pxa_ub_origin RULE, common.cpp pxa_auto_ub_init): it must leave
+                // PXA_AUTO_UB_RESERVE_MB free, or it steps down to the largest -ub that does, or the
+                // boot refuses cleanly -- it can no longer turn a clean refusal into a crash.
+                params.n_ubatch = pxa_ac.n_ubatch;
+                params.pxa_ub_origin = PXA_UB_RULE;
+                card_ub = true;
+                ub_why = std::string("PXA_AUTO_UB_VOLTA_Q8: ") + pxa_ac.ub_rule;
+            }
             if (!ub_explicit && !card_ub) {
                 const int ub = pxa_adaptive_ubatch(params, ub_why);
                 if (ub > 0) {
                     params.n_ubatch = ub;
+                    // the ladder's guess: kept as before when it allocates, stepped down when it does not
+                    params.pxa_ub_origin = PXA_UB_LADDER;
                     if (params.n_batch < ub && !b_explicit) {
                         params.n_batch = ub;   // keep -b >= -ub so the ub choice is not clamped away
                     }
@@ -1634,10 +1959,37 @@ int main(int argc, char ** argv) {
                 // absent and the chain is byte for byte the shipped one.
                 const bool policy_cascade     = pxa_spec_policy_enabled() && nextn > 0 &&
                                                 !ngram_pol_off && !chain_force_ngram;
-                const bool ngram_alone_chain  = !chain_force_casc && !ngram_pol_off && !policy_cascade &&
+                // PXA_SPEC_AUTO_MTP (2026-09-28; =0 restores the n-gram-alone default below):
+                // on the multi-card tensor split an MTP file takes the MTP head ALONE. Measured first-pass
+                // (distinct prompts, fresh server per class, greedy 256, REPS 3) on Qwen3.8-27B PXQN4:
+                //   P100 pair  bare (this n-gram default) 37.90 / 37.93 / 36.43  vs  MTP auto 45.96 / 65.54 / 67.72
+                //   V100 pair  bare                       55.55 / 55.85 / 55.57  vs  MTP auto 76.42 / 107.21 / 112.09
+                // (prose / code / repetition; the table never drafts on fresh text). Ledger mtpround-auto-mtp.
+                int pxa_ndev_spec = 1;
+#if defined(GGML_USE_CUDA)
+                pxa_ndev_spec = ggml_backend_cuda_get_device_count();
+#endif
+                const bool mtp_alone_auto = nextn > 0 && !chain_force_casc && !chain_force_ngram && !policy_cascade &&
+                        !(getenv("PXA_SPEC_AUTO_MTP") && atoi(getenv("PXA_SPEC_AUTO_MTP")) == 0) &&
+                        (auto_chain == "mtp" || (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && pxa_ndev_spec >= 2));
+                const bool ngram_alone_chain  = !mtp_alone_auto && !chain_force_casc && !ngram_pol_off && !policy_cascade &&
                                                 (chain_force_ngram || pxa_all_devices_pascal_plus());
 
-                if (ngram_alone_chain) {
+                if (mtp_alone_auto) {
+                    static const char * const mtp_stage = "mtp";
+                    if (!params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
+                        params.speculative.stages.push_back(common_speculative_stage_from_arg(mtp_stage));
+                    }
+                    const auto resolved = params.speculative.get_resolved_stages();
+                    params.speculative.type = resolved.empty()
+                                            ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+                    params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+                    fprintf(stderr, "PXA_AUTO: spec arch=%s -> the MTP head alone, chain = %s (%s.nextn_predict_layers=%d, "
+                                    "multi-card tensor split; PXA_SPEC_AUTO_MTP=0 restores the n-gram default)\n",
+                            arch.empty() ? "?" : arch.c_str(),
+                            common_speculative_stage_chain_to_str(params.speculative).c_str(),
+                            arch.empty() ? "<arch>" : arch.c_str(), nextn);
+                } else if (ngram_alone_chain) {
                     // The measured spelling, key for key: the alias resolves to ngram_mod and every
                     // knob it would have filled is named here, so this stage is byte for byte the
                     // --spec-type the winning arm ran.
@@ -1897,8 +2249,80 @@ int main(int argc, char ** argv) {
                 // works under, not the values a request runs: it reserves max(exact, relaxed)
                 // depth and seeds the floor from the relaxed row, and launch_slot_with_task then
                 // writes the row the request's own acceptance rule asks for.
-                const int32_t row_n_max = policy_on ? pxa_spec_policy_n_max_ceiling() : crow->n_max;
-                const float   row_p_min = policy_on ? pxa_spec_policy_for(false).p_min : crow->p_min;
+                int32_t row_n_max = policy_on ? pxa_spec_policy_n_max_ceiling() : crow->n_max;
+                // PXA_MTP_TSPLIT_NMAX (2026-09-28): the draft depth of a dense qwen35 seat under the
+                // multi-card tensor split, per card type, when the CLI names none. Under the split the verify step
+                // pays for every extra column (V100 pair: w1 19.3 / w2 26.2 / w3 29.9 / w4 33.6 ms), so the deep
+                // chain that wins on one card loses prose there: V100 pair, Qwen3.8-27B PXQN4, first-pass greedy 256,
+                // fresh server per class (rel-final #10817) -- n_max=2 is the only depth above plain on every class
+                // (58.9 / 71.8 / 68.1 vs 53.6 / 53.9 / 53.7), n_max=3 loses control (50.3). sm_60 row: see the P100
+                // pair measurement in the lever row. PXA_MTP_TSPLIT_NMAX=N forces N, =0 keeps the arch row.
+                // P100 pair (2026-09-28, P01, first-pass greedy 256, plain 37.07 / 36.11 / 36.17 on control /
+                // code / repetition): n_max=1 37.49 / 36.91 / 41.87, n_max=2 35.20 / 35.64 / 42.75, n_max=3 38.48 / 37.33 / 47.60
+                // with prompt-dependent prose losses to 32 -> depth 1, the only depth that never lost a first-pass cell there
+                // RE-MEASURED on the integrated build (mtp-width + kq-width + mtp-fastv + p100-mtp levers, P56, same protocol): plain
+                // 38.22 / 37.51 / 36.42, n_max=1 42.22 / 41.53 / 46.35, n_max=2 43.44 / 44.91 / 53.04, n_max=3 44.46 / 44.42 / 54.98 with
+                // prose reps 37.5 / 38.0 -> depth 2: above plain on every rep of every class, best on code and repetition
+                constexpr int PXA_MTP_TSPLIT_NMAX_SM60 = 2;
+                if (!policy_on && arch == "qwen35" && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                    int tsplit_nmax = -1;
+#if defined(GGML_USE_CUDA)
+                    const int ndev = ggml_backend_cuda_get_device_count();
+                    if (ndev > 1) {
+                        int cc_min = 1 << 30;
+                        for (int d = 0; d < ndev; ++d) cc_min = std::min(cc_min, ggml_backend_cuda_get_device_cc(d));
+                        if (cc_min >= 700)      tsplit_nmax = 2;
+                        else if (cc_min >= 600) tsplit_nmax = PXA_MTP_TSPLIT_NMAX_SM60;
+                    }
+#endif
+                    if (const char * e = getenv("PXA_MTP_TSPLIT_NMAX")) tsplit_nmax = atoi(e) > 0 ? atoi(e) : -1;
+                    if (tsplit_nmax > 0) {
+                        fprintf(stderr, "PXA_AUTO: spec mtp under the multi-card tensor split -> n_max=%d for this card "
+                                        "type (PXA_MTP_TSPLIT_NMAX; the arch row says %d)\n", tsplit_nmax, row_n_max);
+                        row_n_max = tsplit_nmax;
+                    }
+                }
+                float         row_p_min = policy_on ? pxa_spec_policy_for(false).p_min : crow->p_min;
+                // PXA_MTP_CONF_GATE="N:P" (2026-09-28; default unset = off until measured):
+                // confidence-gated draft depth. Reserve depth N (verify width N+1) and let the draft chain
+                // run while the head's top-1 probability stays >= P (the MTP floor: the carried token under
+                // P collapses the chain to 1, an in-loop token under P ends it). Deep on code / repetition,
+                // one token on prose -- the verify width then varies round to round, which is what
+                // PXA_VERIFY_GRAPH_CACHE makes cheap. A CLI-named n_max / p_min still wins.
+                if (!policy_on) {
+                    // ENHANCE default on the multi-card tensor split (qwen35): 3:0.9. Measured first-pass, fresh
+                    // server per class, REPS 3, greedy 256, PXA_VERIFY_ARGMAX + PXA_VERIFY_GRAPH_CACHE on:
+                    //   P100 pair  n_max=2 floor 0: 45.99 / 58.52 / 59.96   gate 3:0.9: 45.96 / 65.54 / 67.72
+                    //   V100 pair  n_max=2 floor 0: 68.88 / 97.42 / 101.67  gate 3:0.9: 76.42 / 107.21 / 112.09
+                    //   (V100 gate 3:0.8 75.29 / 108.90 / 108.96, 4:0.9 74.20 / 88.09 / 112.92). =0 or =off keeps the row.
+                    const char * e_gate = getenv("PXA_MTP_CONF_GATE");
+                    static const char * const gate_default      = "3:0.9";   // sm_70
+                    static const char * const gate_default_sm60 = "3:0.8";
+                    if (e_gate == nullptr && arch == "qwen35" && params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+                            ggml_pxa_config_level() >= 2) {
+#if defined(GGML_USE_CUDA)
+                        if (ggml_backend_cuda_get_device_count() > 1) {
+                            int cc_min = 1 << 30;
+                            for (int d = 0; d < ggml_backend_cuda_get_device_count(); ++d) cc_min = std::min(cc_min, ggml_backend_cuda_get_device_cc(d));
+                            // P100 pair: 3:0.8 48.73 / 66.40 / 67.88 beat 3:0.9 45.96 / 65.54 / 67.72 (4:0.9 47.39 / 59.68 / 60.34)
+                            e_gate = cc_min < 700 ? gate_default_sm60 : gate_default;
+                        }
+#endif
+                    }
+                    if (e_gate && (strcmp(e_gate, "0") == 0 || strcmp(e_gate, "off") == 0)) e_gate = nullptr;
+                    if (const char * e = e_gate) {
+                        int gn = 0; float gp = -1.0f;
+                        if (sscanf(e, "%d:%f", &gn, &gp) == 2 && gn >= 1 && gn <= 8 && gp >= 0.0f && gp < 1.0f) {
+                            fprintf(stderr, "PXA_AUTO: spec mtp confidence gate (PXA_MTP_CONF_GATE=%s) -> n_max=%d, "
+                                            "p_min=%.3f (was n_max=%d, p_min=%.3f)\n", e, gn, (double) gp,
+                                    row_n_max, (double) row_p_min);
+                            row_n_max = gn;
+                            row_p_min = gp;
+                        } else {
+                            fprintf(stderr, "PXA_AUTO: PXA_MTP_CONF_GATE=%s ignored (want N:P, 1<=N<=8, 0<=P<1)\n", e);
+                        }
+                    }
+                }
                 int32_t eff_n_max = row_n_max;    // what the stage ends up running with
                 float   eff_p_min = row_p_min;
                 for (auto & stage : params.speculative.stages) {
@@ -1920,6 +2344,32 @@ int main(int argc, char ** argv) {
                 // env still wins inside this call
                 common_speculative_mtp_zero_output_commit_set_default(crow->zero_output);
                 const bool zero_on = common_speculative_mtp_zero_output_commit();
+
+                // PXA_SPEC_DEPTH_NMAX (2026-09-27): the draft depth follows the
+                // context depth on the one-card rigs it was measured on (see the helper in
+                // common/speculative.cpp). One V100: depth 1 below 8k tokens, 2 from 8k, the
+                // configured ceiling (3) from 16k (measured 2k/32k/64k; the 8k-16k step is the
+                // bracket between the measured crossover points). One P100: depth 1 at every depth.
+                // A cap only: a ceiling of 1 (the launcher's bare `mtp`) is left exactly as it was.
+                // Multi-card rigs and other archs are unmeasured and keep the flat depth.
+                {
+                    const char * dn_default = nullptr;
+#if defined(GGML_USE_CUDA)
+                    if (ggml_backend_cuda_get_device_count() == 1) {
+                        const int cc = ggml_backend_cuda_get_device_cc(0);
+                        if (cc == 700) {
+                            dn_default = "0:1,8192:2,16384:3";
+                        } else if (cc == 600) {
+                            dn_default = "0:1";
+                        }
+                    }
+#endif
+                    if (dn_default) {
+                        common_speculative_mtp_depth_nmax_set_default(dn_default);
+                    }
+                    fprintf(stderr, "PXA_AUTO: spec mtp draft depth by context depth (PXA_SPEC_DEPTH_NMAX) = %s\n",
+                            common_speculative_mtp_depth_nmax_desc().c_str());
+                }
 
                 fprintf(stderr, "PXA_AUTO: spec mtp arch=%s -> n_max=%d%s, p_min=%.3f%s, "
                                 "zero-output commit %s%s (%s; override --spec-type mtp:n_max=N,p_min=X "
@@ -1982,6 +2432,11 @@ int main(int argc, char ** argv) {
                             "would be. Overrides PXA_SPEC_RELAXED where it applies; falls back to exact matching at "
                             "temp 0, under a grammar/mirostat/adaptive-p/dynamic-temperature request, and for any "
                             "drafted token that carries no distribution\n");
+            if (common_sampler_spec_block_verify_active()) {
+                fprintf(stderr, "PXA_SPEC_BLOCK_VERIFY: ON -- a sampled draft of two or more tokens is accepted "
+                                "jointly (same emitted distribution, never fewer kept tokens); per-token under "
+                                "repetition penalties or a counting reasoning budget\n");
+            }
         }
 
         if (common_sampler_spec_relaxed_active()) {
@@ -2091,6 +2546,59 @@ int main(int argc, char ** argv) {
                             "hits are counted but not used (PXA_CKPT_EVICT=value to weight by them)\n");
         }
     }
+
+    return -1;
+}
+
+int main(int argc, char ** argv) {
+#if SERVER_VERBOSE != 1
+    log_disable();
+#endif
+    // own arguments required by this example
+    gpt_params params;
+    {
+        const int rc = pxa_server_resolve_params(argc, argv, params);
+        if (rc >= 0) {
+            return rc;
+        }
+    }
+    // GET /pxa/explain reads the -m model's resolved topology / probe / autoconfig (R23, see g_pxa_primary)
+    const pxa_topology   & pxa_topo  = g_pxa_primary.topo;
+    const pxa_model_info & pxa_model = g_pxa_primary.model;
+    const pxa_autoconfig & pxa_ac    = g_pxa_primary.ac;
+
+    // PXA_CONTAINER_AWARE_v1: detect the runtime once, loudly — the wedge monitor's restart
+    // contract depends on it (see the PXA_WEDGE_EXIT_v1 block below). Always printed, even
+    // with logging disabled, so post-mortems can tell which contract was in force.
+    std::string pxa_container_why;
+    const bool pxa_in_container = pxa_detect_container(pxa_container_why);
+    fprintf(stderr, "PXA_CONTAINER_AWARE_v1: runtime=%s (%s)\n",
+            pxa_in_container ? "container" : "bare-metal", pxa_container_why.c_str());
+    fflush(stderr);
+
+
+    // struct that contains llama context and inference
+    server_context ctx_server;
+
+    if (!params.system_prompt.empty()) {
+        ctx_server.system_prompt_set(params.system_prompt);
+    }
+
+    // PXA hot swap: off unless --hot-model registered another model (see examples/server/pxa-hotswap.h)
+    pxa_hs_front hs_front;
+    hs_front.ctxs.push_back(&ctx_server);
+    hs_front.unknown_to_active = getenv("PXA_HOT_UNKNOWN") && std::string(getenv("PXA_HOT_UNKNOWN")) == "active";
+    struct pxa_hs_model {
+        pxa_hs::model_spec              spec;
+        gpt_params                      params;
+        std::unique_ptr<server_context> ctx;
+    };
+    std::vector<pxa_hs_model>              hs_models;   // the registered models other than -m
+    std::vector<std::vector<std::string>>  hs_names;    // [model][names it answers to]
+    std::unique_ptr<pxa_hs::router>        hs_router;
+    pxa_hs_swap_ops                        hs_ops;
+    std::vector<std::thread>               hs_loops;
+
 
     LOG_INFO("build info", {
         {"build",  LLAMA_BUILD_NUMBER},
@@ -2218,6 +2726,112 @@ int main(int argc, char ** argv) {
 #else
     auto db_handle = false;
 #endif
+    // PXA hot swap: every registered model is resolved from its own flags, loaded, and parked into
+    // pinned host RAM BEFORE the -m model loads -- so the -m model is the one on the cards when the
+    // server opens, and each model saw an empty card set when its buffers were sized.
+    if (!params.hot_models.empty()) {
+        std::vector<pxa_hs::model_spec> specs;
+        for (const auto & a : params.hot_models) {
+            pxa_hs::model_spec sp;
+            std::string err;
+            if (!pxa_hs::parse_model_spec(a, sp, err)) {
+                fprintf(stderr, "hot swap: %s\n", err.c_str());
+                return 1;
+            }
+            specs.push_back(sp);
+        }
+        if (!llama_pxa_residency_supported()) {
+            fprintf(stderr, "hot swap: --hot-model needs CUDA virtual memory management (VMM) on every card; "
+                            "this build or driver has none\n");
+            return 1;
+        }
+        if (getenv("PXA_EXPERT_SHARD")) {
+            fprintf(stderr, "hot swap: PXA_EXPERT_SHARD keeps a process-wide expert table keyed by tensor name and "
+                            "cannot serve two models; unset it or register one model\n");
+            return 1;
+        }
+        const auto base_of = [](const std::string & path) {
+            const size_t p = path.find_last_of("/\\");
+            return p == std::string::npos ? path : path.substr(p + 1);
+        };
+        hs_names.push_back({params.model_alias, params.model, base_of(params.model), pxa_hs::file_stem(params.model)});
+        for (const auto & sp : specs) {
+            hs_names.push_back({sp.name, sp.path, base_of(sp.path), pxa_hs::file_stem(sp.path)});
+        }
+        for (size_t i = 0; i < hs_names.size(); ++i) {
+            for (size_t j = 0; j < i; ++j) {
+                if (hs_names[i][0] == hs_names[j][0]) {
+                    fprintf(stderr, "hot swap: two registered models are both called '%s'\n", hs_names[i][0].c_str());
+                    return 1;
+                }
+            }
+        }
+        const uint64_t budget = pxa_hs_pin_budget();
+        llama_pxa_residency_set_pin_budget(budget);
+        LOG_INFO("hot swap: registering models", {
+            {"n_models", (int) hs_names.size()},
+            {"on_the_cards_at_open", hs_names[0][0]},
+            {"pinned_host_budget_gib", budget / 1073741824.0},
+        });
+        for (const auto & sp : specs) {
+            pxa_hs_model m;
+            m.spec = sp;
+            const std::vector<std::string> av = pxa_hs_model_argv(argc, argv, sp);
+            std::vector<char *> avp;
+            for (const auto & x : av) avp.push_back(const_cast<char *>(x.c_str()));
+            avp.push_back(nullptr);
+            if (pxa_server_resolve_params((int) av.size(), avp.data(), m.params) >= 0) {
+                fprintf(stderr, "hot swap: the flags of registered model '%s' do not parse\n", sp.name.c_str());
+                return 1;
+            }
+            m.params.hot_models.clear();
+            m.params.model       = sp.path;   // LLAMA_ARG_MODEL / LLAMA_ARG_MODEL_ALIAS name the -m model only
+            m.params.model_alias = sp.name;
+            m.ctx = std::make_unique<server_context>();
+            server_context & c = *m.ctx;
+            c.pxa_hs_name          = sp.name;
+            c.pxa_hs_no_cache_disk = true;
+            if (!m.params.system_prompt.empty()) {
+                c.system_prompt_set(m.params.system_prompt);
+            }
+            c.slot_prompt_similarity = m.params.slot_prompt_similarity;
+            c.cache_ram_n_min        = m.params.cache_ram_n_min;
+            c.cache_ram_similarity   = m.params.cache_ram_similarity;
+            c.pxa_hs_res = llama_pxa_residency_new(sp.name.c_str());
+            if (!c.pxa_hs_res) {
+                fprintf(stderr, "hot swap: could not create the residency group for '%s'\n", sp.name.c_str());
+                return 1;
+            }
+            llama_pxa_residency_bind(c.pxa_hs_res);
+            const int64_t t0 = ggml_time_us();
+            LOG_INFO("hot swap: loading registered model", {{"name", sp.name}, {"path", sp.path}});
+            if (!c.load_model(m.params)) {
+                fprintf(stderr, "hot swap: registered model '%s' failed to load\n", sp.name.c_str());
+                return 1;
+            }
+            try {
+                c.init();
+            } catch (const std::exception & e) {
+                fprintf(stderr, "hot swap: registered model '%s' failed to initialise: %s\n", sp.name.c_str(), e.what());
+                return 1;
+            }
+            std::string err;
+            if (!c.pxa_hs_park(err, nullptr)) {
+                fprintf(stderr, "hot swap: registered model '%s' could not be parked: %s\n", sp.name.c_str(), err.c_str());
+                return 1;
+            }
+            LOG_INFO("hot swap: registered model parked", {{"name", sp.name}, {"load_and_park_ms", (ggml_time_us() - t0) / 1000}});
+            hs_models.push_back(std::move(m));
+        }
+        ctx_server.pxa_hs_name = hs_names[0][0];
+        ctx_server.pxa_hs_res  = llama_pxa_residency_new(hs_names[0][0].c_str());
+        if (!ctx_server.pxa_hs_res) {
+            fprintf(stderr, "hot swap: could not create the residency group for '%s'\n", hs_names[0][0].c_str());
+            return 1;
+        }
+        llama_pxa_residency_bind(ctx_server.pxa_hs_res);
+    }
+
     // load the model
     if (!ctx_server.load_model(params)) {
         state.store(SERVER_STATE_ERROR);
@@ -2234,6 +2848,39 @@ int main(int argc, char ** argv) {
     }
 
     LOG_INFO("model loaded", {});
+
+    if (!hs_models.empty()) {
+        for (auto & m : hs_models) {
+            hs_front.ctxs.push_back(m.ctx.get());
+        }
+        hs_ops.ctxs = hs_front.ctxs;
+        hs_router = std::make_unique<pxa_hs::router>(hs_names, 0, &hs_ops);
+        hs_router->set_logger([](const std::string & msg) {
+            LOG_INFO(("hot swap: " + msg).c_str(), {});
+        });
+        hs_front.router = hs_router.get();
+        {
+            // mirror the opening model's weights now, so its first swap-out costs what every later one does
+            llama_pxa_residency_stats st;
+            if (llama_pxa_residency_prime(ctx_server.pxa_hs_res, &st)) {
+                LOG_INFO("hot swap: weights of the opening model mirrored to pinned host RAM", {
+                    {"name", hs_names[0][0]}, {"gib", st.bytes_mirror_new / 1073741824.0}, {"ms", (int) st.ms_total},
+                });
+            } else {
+                LOG_WARNING("hot swap: could not mirror the opening model's weights now; the first swap-out will", {{"error", st.err}});
+            }
+        }
+        for (size_t i = 0; i < hs_front.ctxs.size(); ++i) {
+            const json st = hs_front.ctxs[i]->pxa_hs_status();
+            LOG_INFO("hot swap: model registered", {
+                {"name",          hs_names[i][0]},
+                {"state",         st.at("state")},
+                {"weights_gib",   st.at("weights_bytes").get<uint64_t>() / 1073741824.0},
+                {"pinned_gib",    st.at("pinned_bytes").get<uint64_t>() / 1073741824.0},
+                {"n_ctx",         st.at("n_ctx")},
+            });
+        }
+    }
 
     // PXA: the startup log says what the loaded FILE is (codec / bpw / pxa.pxq* provenance),
     // so a serving box can be identified from its own log instead of from the filename.
@@ -2362,6 +3009,10 @@ int main(int argc, char ** argv) {
         switch (current_state) {
             case SERVER_STATE_READY:
                 {
+                    // PXA hot swap: health is asked of the model on the cards (pinned while it answers)
+                    pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PIN_ACTIVE);
+                    if (!hs_pick_.ctx) { break; }
+                    server_context & ctx_server = *hs_pick_.ctx;
                     // PXA_HONEST_HEALTH_v1: if a llama_decode has been in-flight past the stall deadline the
                     // main loop is WEDGED — return 503 immediately, WITHOUT posting a metrics task and
                     // blocking on queue_results.recv (that block permanently parks an HTTP worker and is the
@@ -2423,7 +3074,10 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_slots = [&](const httplib::Request &, httplib::Response & res) {
+    const auto handle_slots = [&](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PIN_ACTIVE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         if (!params.endpoint_slots) {
             res_err(res, format_error_response("This server does not support slots endpoint.", ERROR_TYPE_NOT_SUPPORTED));
             return;
@@ -2447,7 +3101,10 @@ int main(int argc, char ** argv) {
         res.status = 200; // HTTP OK
     };
 
-    const auto handle_metrics = [&](const httplib::Request &, httplib::Response & res) {
+    const auto handle_metrics = [&](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PIN_ACTIVE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         if (!params.endpoint_metrics) {
             res_err(res, format_error_response("This server does not support metrics endpoint.", ERROR_TYPE_NOT_SUPPORTED));
             return;
@@ -2561,7 +3218,87 @@ int main(int argc, char ** argv) {
         res.status = 200; // HTTP OK
     };
 
-    const auto handle_slots_save = [&ctx_server, &params](const httplib::Request & req, httplib::Response & res, int id_slot) {
+    // PXA_EXPLAIN_PAGE_v1 (2026-09-25, showcase lane): GET /pxa/explain -- the same
+    // pxa-autoconfig/1 object PXA_EXPLAIN=1 prints before load (pxa_topo/pxa_model/pxa_ac were
+    // computed once, above, and are captured here unchanged) plus what only exists once the
+    // server is actually serving: live per-card VRAM (a CUDA query, no allocation -- the same call
+    // the adaptive-ub picker above already makes), the active-lever breakdown (pxa-explain.h,
+    // pure), and the server's own live decode/prefill/speculation numbers, read from the identical
+    // task-queue metrics snapshot /metrics uses (reset_bucket=false, so loading this page can
+    // never perturb a Prometheus scrape's counters). Entirely read-only; not on the decode path.
+    const auto handle_pxa_explain = [&](const httplib::Request & req, httplib::Response & res) {
+        // hot swap (rel-integrate3 merge): monitor whatever model is on the cards, like /metrics;
+        // with one model pick() returns ctx_server and takes no lock (unchanged behaviour).
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PIN_ACTIVE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
+        nlohmann::ordered_json cards = nlohmann::ordered_json::array();
+#if defined(GGML_USE_CUDA)
+        const int n_cuda_dev = ggml_backend_cuda_get_device_count();
+        for (int i = 0; i < n_cuda_dev; ++i) {
+            char desc[256] = {0};
+            ggml_backend_cuda_get_device_description(i, desc, sizeof(desc));
+            size_t free_b = 0, total_b = 0;
+            ggml_backend_cuda_get_device_memory(i, &free_b, &total_b);
+            const int cc = i < (int) pxa_topo.cc.size() ? pxa_topo.cc[i] : 0;
+            cards.push_back(pxa_explain_card_entry(i, desc, cc, free_b, total_b));
+        }
+#endif
+        nlohmann::ordered_json live;
+        if (params.endpoint_metrics) {
+            server_task task;
+            task.id = ctx_server.queue_tasks.get_new_id();
+            task.id_multi  = -1;
+            task.id_target = -1;
+            task.type = SERVER_TASK_TYPE_METRICS;
+            task.data.push_back({{"reset_bucket", false}});   // never disturb /metrics' own bucket
+
+            ctx_server.queue_results.add_waiting_task_id(task.id);
+            ctx_server.queue_tasks.post(std::move(task));
+            server_task_result result = ctx_server.queue_results.recv(task.id);
+            ctx_server.queue_results.remove_waiting_task_id(task.id);
+
+            const json & d = result.data;
+            const uint64_t n_pp = d.value("n_prompt_tokens_processed", (uint64_t) 0);
+            const uint64_t t_pp = d.value("t_prompt_processing",       (uint64_t) 0);
+            const uint64_t n_tg = d.value("n_tokens_predicted",        (uint64_t) 0);
+            const uint64_t t_tg = d.value("t_tokens_generation",       (uint64_t) 0);
+            live["prefill_tok_s"] = (n_pp && t_pp) ? 1.e3 / (double) t_pp * (double) n_pp : 0.0;
+            live["decode_tok_s"]  = (n_tg && t_tg) ? 1.e3 / (double) t_tg * (double) n_tg : 0.0;
+            live["requests_processing"] = d.value("processing", 0);
+            live["requests_deferred"]   = d.value("deferred", 0);
+
+            uint64_t draft_total = 0, draft_accepted = 0;
+            double   ema_sum = 0.0; int ema_n = 0;
+            for (const auto & s : d.value("slots", json::array())) {
+                draft_total    += s.value("n_draft_total", (uint64_t) 0);
+                draft_accepted += s.value("n_draft_accepted", (uint64_t) 0);
+                if (s.contains("spec_accept_ema")) {
+                    ema_sum += s.value("spec_accept_ema", 0.0);
+                    ema_n   += 1;
+                }
+            }
+            nlohmann::ordered_json spec;
+            spec["n_draft_total"]    = draft_total;
+            spec["n_draft_accepted"] = draft_accepted;
+            spec["accept_rate"]      = draft_total ? (double) draft_accepted / (double) draft_total : 0.0;
+            spec["accept_ema"]       = ema_n ? ema_sum / ema_n : 0.0;
+            live["speculative"] = spec;
+        } else {
+            live["note"] = "metrics endpoint disabled (--no-metrics): live t/s and speculation not shown";
+        }
+
+        const std::string body = pxa_explain_build(
+            pxa_autoconfig_json(pxa_topo, pxa_model, pxa_ac, ggml_pxa_config_level()),
+            cards, live, LLAMA_BUILD_NUMBER, LLAMA_COMMIT,
+            params.model_alias.empty() ? params.model : params.model_alias);
+        res.set_content(body, "application/json; charset=utf-8");
+    };
+
+    const auto handle_slots_save = [&hs_front, &params](const httplib::Request & req, httplib::Response & res, int id_slot) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         json request_data = json::parse(req.body);
         std::string filename = request_data.at("filename");
         if (!fs_validate_filename(filename)) {
@@ -2578,11 +3315,7 @@ int main(int argc, char ** argv) {
             { "filepath", filepath }
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        server_task_result result = post_task_and_wait_legacy(ctx_server, std::move(task));
 
         if (result.error) {
             res_err(res, result.data);
@@ -2591,7 +3324,10 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_slots_restore = [&ctx_server, &params](const httplib::Request & req, httplib::Response & res, int id_slot) {
+    const auto handle_slots_restore = [&hs_front, &params](const httplib::Request & req, httplib::Response & res, int id_slot) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         json request_data = json::parse(req.body);
         std::string filename = request_data.at("filename");
         if (!fs_validate_filename(filename)) {
@@ -2608,11 +3344,7 @@ int main(int argc, char ** argv) {
             { "filepath", filepath }
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        server_task_result result = post_task_and_wait_legacy(ctx_server, std::move(task));
 
         if (result.error) {
             res_err(res, result.data);
@@ -2621,18 +3353,17 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_slots_erase = [&ctx_server](const httplib::Request & /* req */, httplib::Response & res, int id_slot) {
+    const auto handle_slots_erase = [&hs_front](const httplib::Request & req, httplib::Response & res, int id_slot) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         server_task task;
         task.type = SERVER_TASK_TYPE_SLOT_ERASE;
         task.data = {
             { "id_slot", id_slot },
         };
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        server_task_result result = post_task_and_wait_legacy(ctx_server, std::move(task));
 
         if (result.error) {
             res_err(res, result.data);
@@ -2682,7 +3413,10 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_props = [&ctx_server](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_props = [&hs_front](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         std::string template_key = "tokenizer.chat_template", curr_tmpl;
         int32_t tlen = llama_model_meta_val_str(ctx_server.model, template_key.c_str(), nullptr, 0);
         if (tlen > 0) {
@@ -2726,10 +3460,16 @@ int main(int argc, char ** argv) {
                 data["chat_template_tool_use"] = tmpl_tools;
             }
         }
+        if (hs_front.router) {
+            data["hot_swap"] = pxa_hs_props_json(hs_front);
+        }
         res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     };
 
-    const auto handle_props_simple = [&ctx_server](const httplib::Request& req, httplib::Response& res) {
+    const auto handle_props_simple = [&hs_front](const httplib::Request& req, httplib::Response& res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         int n_past = 0;
         int slot_id = 0;
@@ -2754,7 +3494,9 @@ int main(int argc, char ** argv) {
 
     // handle completion-like requests (completion, chat, infill)
     // we can optionally provide a custom format for partial results and final results
-    const auto handle_completions_impl = [&ctx_server, &params](
+    const auto handle_completions_impl = [&params](
+        server_context & ctx_server,
+        std::shared_ptr<pxa_hs::lease> hs_hold,   // PXA hot swap: keeps the model on the cards until the response (or its stream) ends
         server_task_type type,
         json& data,
         const std::vector<raw_buffer>& files,
@@ -2860,7 +3602,7 @@ int main(int argc, char ** argv) {
                 }
                 // next responses are streamed
                 json first_result_json = first_result->to_json();
-                const auto chunked_content_provider = [first_result_json, rd, oaicompat](size_t, httplib::DataSink& sink) mutable -> bool {
+                const auto chunked_content_provider = [first_result_json, rd, oaicompat, hs_hold](size_t, httplib::DataSink& sink) mutable -> bool {
                     const auto sse = [oaicompat, &sink](const json& res) {
                         if (oaicompat == OAICOMPAT_TYPE_ANTHROPIC) {
                             return server_sent_anthropic_event(sink, res);
@@ -2879,6 +3621,18 @@ int main(int argc, char ** argv) {
                             return false; // sending failed, go to on_complete()
                         }
                         first_result_json.clear(); // mark as sent
+
+                        // bug #215: the first result may already have been the last one (empty prompt,
+                        // n_predict:1 ending in an incomplete UTF-8 byte). Never wait for a result that
+                        // will not come: finish the stream here.
+                        if (!rd->has_next()) {
+                            if (oaicompat != OAICOMPAT_TYPE_ANTHROPIC && oaicompat != OAICOMPAT_TYPE_NONE && oaicompat != OAICOMPAT_TYPE_RESP) {
+                                static const std::string ev_done = "data: [DONE]\n\n";
+                                sink.write(ev_done.data(), ev_done.size());
+                            }
+                            sink.done();
+                            return false; // no more data, go to on_complete()
+                        }
                     }
 
                     // receive subsequent results
@@ -2923,18 +3677,22 @@ int main(int argc, char ** argv) {
                     return true;
                 };
 
-                auto on_complete = [rd](bool) {
+                auto on_complete = [rd, hs_hold](bool) {
                     rd->stop();
                 };
                 res.set_chunked_content_provider("text/event-stream", chunked_content_provider, on_complete);
             }
     };
 
-    const auto handle_completions = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_completions = [&hs_front, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto data = json::parse(req.body);
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
+            ctx_server, hs_pick_.lease,
             SERVER_TASK_TYPE_COMPLETION,
             data,
             files,
@@ -2943,12 +3701,16 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_NONE);
     };
 
-    const auto handle_completions_oai = [&ctx_server, &handle_completions_impl](const httplib::Request& req, httplib::Response& res) {
+    const auto handle_completions_oai = [&hs_front, &handle_completions_impl](const httplib::Request& req, httplib::Response& res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(body);
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
+            ctx_server, hs_pick_.lease,
             SERVER_TASK_TYPE_COMPLETION,
             data,
             files,
@@ -2957,7 +3719,34 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_COMPLETION);
     };
 
-    const auto handle_models = [&params, &model_meta](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_models = [&params, &model_meta, &hs_front](const httplib::Request & req, httplib::Response & res) {
+        if (hs_front.router) {
+            // PXA hot swap: every registered model, which one is on the cards, and what each holds
+            const auto st = hs_front.router->status();
+            json data = json::array();
+            for (size_t i = 0; i < hs_front.ctxs.size(); ++i) {
+                server_context & c = *hs_front.ctxs[i];
+                json hs = c.pxa_hs_status();
+                hs["active"]      = st[i].active;
+                hs["in_flight"]   = st[i].inflight;
+                hs["waiting"]     = st[i].waiting;
+                hs["n_requests"]  = st[i].n_requests;
+                hs["n_swaps_in"]  = st[i].n_swaps_in;
+                hs["n_swap_fail"] = st[i].n_swap_fail;
+                data.push_back({
+                    {"id",            st[i].name},
+                    {"object",        "model"},
+                    {"created",       std::time(0)},
+                    {"owned_by",      "llamacpp"},
+                    {"meta",          c.model_meta()},
+                    {"max_model_len", c.n_ctx},
+                    {"path",          c.params_base.model},
+                    {"pxa_hot_swap",  hs},
+                });
+            }
+            res.set_content(safe_json_to_str(json{{"object", "list"}, {"data", data}}), "application/json; charset=utf-8");
+            return;
+        }
         json models = {
             {"object", "list"},
             {"data", {
@@ -2977,12 +3766,16 @@ int main(int argc, char ** argv) {
 
 
 
-    const auto handle_chat_completions = [&ctx_server, &params, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_chat_completions = [&hs_front, &params, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
         handle_completions_impl(
+            ctx_server, hs_pick_.lease,
             SERVER_TASK_TYPE_COMPLETION,
             data,
             files,
@@ -2991,13 +3784,17 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_CHAT);
     };
 
-    const auto handle_responses = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_responses = [&hs_front, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files;
         json body_parsed = server_chat_convert_responses_to_chatcmpl(body);
         json data = oaicompat_chat_params_parse(body_parsed, ctx_server.chat_params, files);
         handle_completions_impl(
+            ctx_server, hs_pick_.lease,
             SERVER_TASK_TYPE_COMPLETION,
             data,
             files,
@@ -3006,7 +3803,10 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_RESP);
     };
 
-    const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_anthropic_messages = [&hs_front, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         std::vector<raw_buffer> files;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
@@ -3017,6 +3817,7 @@ int main(int argc, char ** argv) {
             ctx_server.chat_params,
             files);
         return handle_completions_impl(
+            ctx_server, hs_pick_.lease,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
@@ -3025,7 +3826,10 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_ANTHROPIC);
     };
 
-    const auto handle_anthropic_count_tokens = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_anthropic_count_tokens = [&hs_front](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         std::vector<raw_buffer> files;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
@@ -3038,11 +3842,13 @@ int main(int argc, char ** argv) {
         json prompt = body_parsed.at("prompt");
         llama_tokens tokens = tokenize_mixed(llama_get_vocab(ctx_server.ctx), prompt, true, true);
         res_ok(res, { {"input_tokens", static_cast<int>(tokens.size())} });
-        return res;
     };
 
     // same with handle_chat_completions, but without inference part
-    const auto handle_apply_template = [&ctx_server, &params](const httplib::Request& req, httplib::Response& res) {
+    const auto handle_apply_template = [&hs_front, &params](const httplib::Request& req, httplib::Response& res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         auto body = json::parse(req.body);
         std::vector<raw_buffer> files; // dummy, unused
@@ -3050,7 +3856,10 @@ int main(int argc, char ** argv) {
         res_ok(res, { { "prompt", std::move(data.at("prompt")) } });
     };
 
-    const auto handle_infill = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_infill = [&hs_front, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         json data = json::parse(req.body);
         //avoid double submits: handle_completions_impl below already queues the infill task
@@ -3060,6 +3869,7 @@ int main(int argc, char ** argv) {
         //ctx_server.request_completion(id_task, -1, data, true, false, token);
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
+            ctx_server, hs_pick_.lease,
             SERVER_TASK_TYPE_INFILL,
             data,
             files,
@@ -3068,7 +3878,10 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_NONE); // infill is not OAI compatible
     };
 
-    const auto handle_tokenize = [&ctx_server](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_tokenize = [&hs_front](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         const json body = json::parse(req.body);
 
         std::vector<llama_token> tokens;
@@ -3080,7 +3893,10 @@ int main(int argc, char ** argv) {
         return res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     };
 
-    const auto handle_detokenize = [&ctx_server](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_detokenize = [&hs_front](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         const json body = json::parse(req.body);
 
         std::string content;
@@ -3093,7 +3909,7 @@ int main(int argc, char ** argv) {
         return res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     };
 
-    const auto handle_embeddings_impl = [&ctx_server](const httplib::Request& req, httplib::Response& res, oaicompat_type oaicompat) {
+    const auto handle_embeddings_impl = [](server_context & ctx_server, const httplib::Request& req, httplib::Response& res, oaicompat_type oaicompat) {
         if (!ctx_server.params_base.embedding) {
             res_err(res, format_error_response("This server does not support embeddings. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
             return;
@@ -3197,18 +4013,27 @@ int main(int argc, char ** argv) {
 
     };
 
-    const auto handle_embeddings = [&ctx_server, &handle_embeddings_impl](const httplib::Request& req, httplib::Response& res) {
+    const auto handle_embeddings = [&hs_front, &handle_embeddings_impl](const httplib::Request& req, httplib::Response& res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
-        handle_embeddings_impl(req, res, OAICOMPAT_TYPE_NONE);
+        handle_embeddings_impl(ctx_server, req, res, OAICOMPAT_TYPE_NONE);
     };
 
-    const auto handle_embeddings_oai = [&ctx_server, &handle_embeddings_impl](const httplib::Request& req, httplib::Response& res) {
+    const auto handle_embeddings_oai = [&hs_front, &handle_embeddings_impl](const httplib::Request& req, httplib::Response& res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
-        handle_embeddings_impl(req, res, OAICOMPAT_TYPE_EMBEDDING);
+        handle_embeddings_impl(ctx_server, req, res, OAICOMPAT_TYPE_EMBEDDING);
     };
 
 
     const auto handle_lora_adapters_list = [&](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         json result = json::array();
         for (size_t i = 0; i < ctx_server.lora_adapters.size(); ++i) {
             auto & la = ctx_server.lora_adapters[i];
@@ -3224,6 +4049,9 @@ int main(int argc, char ** argv) {
 
 
     const auto handle_lora_adapters_apply = [&](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         log_prompt(ctx_server.params_base, json::parse(req.body));
         const std::vector<json> body = json::parse(req.body);
         int max_idx = ctx_server.lora_adapters.size();
@@ -3246,11 +4074,7 @@ int main(int argc, char ** argv) {
 
         server_task task;
         task.type = SERVER_TASK_TYPE_SET_LORA;
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        server_task_result result = post_task_and_wait_legacy(ctx_server, std::move(task));
 
         res.set_content(safe_json_to_str(result.data), "application/json");
         res.status = 200; // HTTP OK
@@ -3258,6 +4082,9 @@ int main(int argc, char ** argv) {
 
     // Control vector handlers
     const auto handle_control_vectors_list = [&](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         json result = json::array();
         for (size_t i = 0; i < ctx_server.control_vectors.size(); ++i) {
             auto & cv = ctx_server.control_vectors[i];
@@ -3275,40 +4102,41 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_control_vectors_load = [&](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         const json body = json::parse(req.body);
 
         server_task task;
         task.type = SERVER_TASK_TYPE_LOAD_CONTROL_VECTOR;
         task.data = body;
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        server_task_result result = post_task_and_wait_legacy(ctx_server, std::move(task));
 
         res.set_content(safe_json_to_str(result.data), "application/json");
         res.status = result.error ? 400 : 200;
     };
 
     const auto handle_control_vectors_unload = [&](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         const json body = json::parse(req.body);
 
         server_task task;
         task.type = SERVER_TASK_TYPE_UNLOAD_CONTROL_VECTOR;
         task.data = body;
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        server_task_result result = post_task_and_wait_legacy(ctx_server, std::move(task));
 
         res.set_content(safe_json_to_str(result.data), "application/json");
         res.status = result.error ? 400 : 200;
     };
 
     const auto handle_control_vectors_apply = [&](const httplib::Request & req, httplib::Response & res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_ACTIVATE);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         const std::vector<json> body = json::parse(req.body);
         int max_idx = ctx_server.control_vectors.size();
 
@@ -3341,17 +4169,16 @@ int main(int argc, char ** argv) {
         server_task task;
         task.type = SERVER_TASK_TYPE_SET_CONTROL_VECTOR;
 
-        const int id_task = ctx_server.queue_tasks.post(std::move(task));
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-
-        server_task_result result = ctx_server.queue_results.recv(id_task);
-        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        server_task_result result = post_task_and_wait_legacy(ctx_server, std::move(task));
 
         res.set_content(safe_json_to_str(result.data), "application/json");
         res.status = result.error ? 400 : 200;
     };
 
-    const auto list_saved_prompts = [&ctx_server, &params](const httplib::Request& req, httplib::Response& res) {
+    const auto list_saved_prompts = [&hs_front, &params](const httplib::Request& req, httplib::Response& res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         json response = json::array();
 
         try {
@@ -3410,7 +4237,10 @@ int main(int argc, char ** argv) {
         res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
     };
 
-    const auto list_slot_prompts = [&ctx_server, &params](const httplib::Request& req, httplib::Response& res) {
+    const auto list_slot_prompts = [&hs_front, &params](const httplib::Request& req, httplib::Response& res) {
+        pxa_hs_pick hs_pick_ = hs_front.pick(req, res, PXA_HS_PEEK);
+        if (!hs_pick_.ctx) { return; }
+        server_context & ctx_server = *hs_pick_.ctx;
         json response = json::array();
         for (server_slot & slot : ctx_server.slots) {
             response.push_back({
@@ -3423,7 +4253,7 @@ int main(int argc, char ** argv) {
     };
 
 
-    const auto delete_saved_prompt = [&ctx_server, &params](const httplib::Request& req, httplib::Response& res)-> void {
+    const auto delete_saved_prompt = [&params](const httplib::Request& req, httplib::Response& res)-> void {
         json response;
         namespace fs = std::filesystem;
 
@@ -3470,7 +4300,7 @@ int main(int argc, char ** argv) {
         res.set_content(safe_json_to_str(response), "application/json; charset=utf-8");
     };
 
-    const auto rename_saved_prompt = [&ctx_server, &params](const httplib::Request& req, httplib::Response& res)-> void {
+    const auto rename_saved_prompt = [&params](const httplib::Request& req, httplib::Response& res)-> void {
         json response;
         namespace fs = std::filesystem;
 
@@ -3747,9 +4577,66 @@ int main(int argc, char ** argv) {
     // register API routes
     svr->Get ("/health",              handle_health);
     svr->Get ("/metrics",             handle_metrics);
+    // PXA_EXPLAIN_PAGE_v1 (2026-09-25): the engine explains its own settings, live. /pxa is the
+    // page (plain HTML+JS, embedded the same way loading.html/index.html are -- see
+    // examples/server/public_pxa/pxa.html and the PXA_ASSETS block in CMakeLists.txt); /pxa/explain
+    // is the JSON it fetches, also servable standalone (`curl .../pxa/explain | jq`).
+    svr->Get ("/pxa",                 handle_static_file(pxa_html, pxa_html_len, "text/html; charset=utf-8"));
+    svr->Get ("/pxa/explain",         handle_pxa_explain);
+    // PXA_SPEED_STATS_v1: speed history (examples/server/pxa-stats.h). PXA_STATS=0 -> not registered.
+    if (pxa_stats::get().enabled()) {
+        int n_gpu = 0;
+        if (params.n_gpu_layers != 0) {
+            if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
+                n_gpu = 1;
+            } else {
+                for (int i = 0; i < 128; ++i) { if (params.tensor_split[i] > 0.0f) n_gpu++; }
+#if defined(GGML_USE_CUDA)
+                if (n_gpu == 0) n_gpu = ggml_backend_cuda_get_device_count();
+#endif
+            }
+        }
+        pxa_stats::get().set_load_info(pxa_stats_split_name((int) params.split_mode), n_gpu);
+        LOG_INFO("pxa speed stats on", {
+            {"capacity", pxa_stats::get().capacity()},
+            {"loaded",   pxa_stats::get().size()},
+            {"file",     pxa_stats::get().file().empty() ? std::string("(memory only)") : pxa_stats::get().file()},
+        });
+        svr->Get ("/pxa/speed",       handle_static_file(speed_html, speed_html_len, "text/html; charset=utf-8"));
+        svr->Get ("/pxa/stats",       [](const httplib::Request & req, httplib::Response & res) {
+            double since = 0.0;
+            size_t limit = 0;
+            std::string model;
+            try {
+                if (req.has_param("since")) since = std::stod(req.get_param_value("since"));
+                if (req.has_param("limit")) limit = (size_t) std::stoul(req.get_param_value("limit"));
+            } catch (...) {
+                res_err(res, format_error_response("since / limit must be numbers", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            if (req.has_param("model")) model = req.get_param_value("model");
+            const auto recs = pxa_stats::get().query(since, model, limit);
+            nlohmann::ordered_json out;
+            out["now"]      = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+            out["capacity"] = pxa_stats::get().capacity();
+            out["stored"]   = pxa_stats::get().size();
+            out["persist"]  = !pxa_stats::get().file().empty();
+            out["count"]    = recs.size();
+            out["summary"]  = pxa_stats::summarize(recs);
+            nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+            for (const auto & r : recs) arr.push_back(r.to_json());
+            out["records"]  = std::move(arr);
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json; charset=utf-8");
+        });
+    }
     svr->Get ("/props",               handle_props);
     svr->Get("/v1/props",             handle_props_simple);
     svr->Get ("/v1/models",           handle_models);
+    // mainline's aliases: clients that take the server root as their base URL (Pi's llama.cpp provider,
+    // Ollama-style tools) ask for /models or /api/tags; both were already public and loading-allowed above
+    // but never routed, so they 404'd (Discord report 2026-09-27).
+    svr->Get ("/models",              handle_models);
+    svr->Get ("/api/tags",            handle_models);
     svr->Post("/completion",          handle_completions); // legacy
     svr->Post("/completions", handle_completions); // legacy
     svr->Post("/v1/completions",     handle_completions_oai);
@@ -3840,50 +4727,60 @@ int main(int argc, char ** argv) {
         return 0;
     });
 
-    ctx_server.queue_tasks.on_new_task([&ctx_server](server_task && task) {
-        ctx_server.process_single_task(std::move(task));
-        });
-    ctx_server.queue_tasks.on_finish_multitask(std::bind(
-        &server_context::on_finish_multitask, &ctx_server, std::placeholders::_1));
-    ctx_server.queue_tasks.on_update_slots(std::bind(
-        &server_context::update_slots, &ctx_server));
-    // PXA_DEFER_PUMP_v1: lets the queue loop revive parked tasks the moment a slot frees
-    ctx_server.queue_tasks.on_slot_available([&ctx_server]() {
-        bool any_available = false;
-        for (const auto & slot : ctx_server.slots) {
-            if (slot.available()) {
-                any_available = true;
-                break;
+    // every registered model's task loop gets the same callbacks (PXA hot swap: one per model)
+    const auto pxa_wire_queue = [](server_context & ctx_server) {
+        ctx_server.queue_tasks.on_new_task([&ctx_server](server_task && task) {
+            ctx_server.process_single_task(std::move(task));
+            });
+        ctx_server.queue_tasks.on_finish_multitask(std::bind(
+            &server_context::on_finish_multitask, &ctx_server, std::placeholders::_1));
+        ctx_server.queue_tasks.on_update_slots(std::bind(
+            &server_context::update_slots, &ctx_server));
+        // PXA_DEFER_PUMP_v1: lets the queue loop revive parked tasks the moment a slot frees
+        ctx_server.queue_tasks.on_slot_available([&ctx_server]() {
+            bool any_available = false;
+            for (const auto & slot : ctx_server.slots) {
+                if (slot.available()) {
+                    any_available = true;
+                    break;
+                }
             }
-        }
-        if (!any_available) {
-            return false;
-        }
-        // PXA_KV_UNIFIED_v1: under the shared ring a free slot is no longer sufficient -- tasks are
-        // also parked for lack of KV cells. Re-dispatching into a ring that is still full only makes
-        // them bounce straight back to the deferred queue, so require some headroom as well. (The
-        // pump already waits up to 500 ms per cycle, so a bounce is a poll and not a spin; this check
-        // keeps the churn and the log noise down.) Attention KV cells only -- the per-sequence
-        // recurrent GDN state is not in this ring and is not part of this decision.
-        if (ctx_server.params_base.kv_unified) {
-            const int32_t used    = llama_get_kv_cache_used_cells(ctx_server.ctx);
-            const int32_t pending = ctx_server.kv_unified_cells_busy(nullptr);
-            if (ctx_server.n_ctx - used - pending <= ctx_server.kv_unified_reserve) {
+            if (!any_available) {
                 return false;
             }
-        }
-        return true;
-        });
-    ctx_server.queue_results.on_multitask_update(std::bind(
-        &server_queue::update_multitask,
-        &ctx_server.queue_tasks,
-        std::placeholders::_1,
-        std::placeholders::_2,
-        std::placeholders::_3
-    ));
+            // PXA_KV_UNIFIED_v1: under the shared ring a free slot is no longer sufficient -- tasks are
+            // also parked for lack of KV cells. Re-dispatching into a ring that is still full only makes
+            // them bounce straight back to the deferred queue, so require some headroom as well. (The
+            // pump already waits up to 500 ms per cycle, so a bounce is a poll and not a spin; this check
+            // keeps the churn and the log noise down.) Attention KV cells only -- the per-sequence
+            // recurrent GDN state is not in this ring and is not part of this decision.
+            if (ctx_server.params_base.kv_unified) {
+                const int32_t used    = llama_get_kv_cache_used_cells(ctx_server.ctx);
+                const int32_t pending = ctx_server.kv_unified_cells_busy(nullptr);
+                if (ctx_server.n_ctx - used - pending <= ctx_server.kv_unified_reserve) {
+                    return false;
+                }
+            }
+            return true;
+            });
+        ctx_server.queue_results.on_multitask_update(std::bind(
+            &server_queue::update_multitask,
+            &ctx_server.queue_tasks,
+            std::placeholders::_1,
+            std::placeholders::_2,
+            std::placeholders::_3
+        ));
+    };
+    pxa_wire_queue(ctx_server);
+    for (auto & m : hs_models) {
+        pxa_wire_queue(*m.ctx);
+    }
 
     shutdown_handler = [&](int) {
         ctx_server.queue_tasks.terminate();
+        for (auto & m : hs_models) {
+            m.ctx->queue_tasks.terminate();
+        }
     };
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -3922,13 +4819,17 @@ int main(int argc, char ** argv) {
         const char * pxa_we_env = getenv("PXA_WEDGE_EXIT_MS");
         const int64_t pxa_wedge_exit_ms = pxa_we_env ? atoll(pxa_we_env) : 180000LL;
         if (pxa_wedge_exit_ms > 0) {
-            std::thread([&ctx_server, pxa_wedge_exit_ms, pxa_in_container]() {
+            std::thread([pxa_hs_all = hs_front.ctxs, pxa_wedge_exit_ms, pxa_in_container]() {
                 const int strikes_max = pxa_in_container ? 3 : 6;
                 int  strikes = 0;
                 bool recovery_tried = false;
                 for (;;) {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
-                    if (ctx_server.pxa_decode_wedged(pxa_wedge_exit_ms)) {
+                    bool pxa_any_wedged = false;
+                    for (server_context * c : pxa_hs_all) {
+                        pxa_any_wedged = pxa_any_wedged || c->pxa_decode_wedged(pxa_wedge_exit_ms);
+                    }
+                    if (pxa_any_wedged) {
                         ++strikes;
                         fprintf(stderr, "PXA_WEDGE_EXIT_v1: llama_decode in flight > %lld ms (strike %d/%d)\n",
                                 (long long) pxa_wedge_exit_ms, strikes, strikes_max);
@@ -3969,7 +4870,22 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // PXA hot swap: every registered model runs its own task loop; parked ones wait in it
+    for (auto & m : hs_models) {
+        server_context * c = m.ctx.get();
+        hs_loops.emplace_back([c]() {
+            c->queue_tasks.start_loop();
+        });
+    }
+
     ctx_server.queue_tasks.start_loop();
+
+    for (auto & m : hs_models) {
+        m.ctx->queue_tasks.terminate();
+    }
+    for (auto & t : hs_loops) {
+        t.join();
+    }
 
     // PXA_CACHE_DISK_v1: the task loop has ended, so no slot is running and every sequence state is
     // quiescent - the one point where the whole prompt cache can be written out consistently.

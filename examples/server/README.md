@@ -12,7 +12,7 @@ Set of LLM REST APIs and a simple web front end to interact with llama.cpp.
  * Multimodal (wip)
  * Monitoring endpoints
  * Schema-constrained JSON response format
- * Prefilling of assistant messages similar to the Claude API
+ * Prefilling of assistant messages similar to other hosted chat APIs
  * [Function calling](../../docs/function-calling.md) / tool use for ~any model
  * Speculative decoding
  * Easy-to-use web UI

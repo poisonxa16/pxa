@@ -12,8 +12,8 @@
 # EXPERTS 68.242 GiB, avg 4.8528 bpw, floor pxq4, hist {'pxq4': 59, 'pxq6': 85}.
 #
 # BUILT   2026-09-16, rc=0, 1224/1224 tensors, 5,059,459 ms (84.3 min) at 16 threads.
-#   source $PXA_MODELS_DIR/Qwen3.8-Flash-Next-Uncensored-BF16-pleq8.gguf
-#   out    $PXA_MODELS_DIR/Qwen3.8-Flash-Next-Uncensored-PXQU96-6card-262k.gguf
+#   source /mnt/user/qwen4exp-unc/Qwen3.8-Flash-Next-Uncensored-BF16-pleq8.gguf
+#   out    /mnt/disk21/qwen4exp-unc/Qwen3.8-Flash-Next-Uncensored-PXQU96-6card-262k.gguf
 #   size   131304128928 B (122.28 GiB)
 #   sha256 075c431c6270888d2bf45305a0d7c8aa3efae41e15a3d555c1a277322f5a5289
 #   COMPOSITION MEASURED q8_0 42.0% + pxq6 35.7% + pxq4 21.2% + q6_K 0.8% + f32 0.2%

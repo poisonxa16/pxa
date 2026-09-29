@@ -110,7 +110,8 @@ static inline bool pxa_pxq6_enabled() {
                 fprintf(stderr, "PXA_PXQ6: table self-check FAILED — fused kernels DISABLED (fallback in use)\n");
                 v = false;
             } else {
-                fprintf(stderr, "PXA_PXQ6 fused kernels: ON (table self-check PASS; PXA_PXQ6=0 disables)\n");
+                fprintf(stderr, "PXA_PXQ6 fused kernels: ON (table self-check PASS; PXA_PXQ6=0 disables)%s\n",
+                        pxa_config_level() == 0 ? " [codec kernels, not a lever: on at REFERENCE too]" : "");
             }
         } else {
             fprintf(stderr, "PXA_PXQ6 fused kernels: OFF (dequant->cublas fallback)\n");
@@ -363,6 +364,37 @@ struct pxq6_pol_p6 {
     }
     __device__ static float2 pairl(const uint32_t * q, int b, const float2 * plut) {
         return plut[(q[b >> 2] >> (8*(b & 3))) & 0xff];
+    }
+    // H2 (PXA_PXQ_MMV_H2, MODE 7 — sm_60 only), 4-bit tier (2026-09-13). The key is the SAME
+    // byte pair() already extracts: two 4-bit codes, so the pair-LUT is PAIRLUT's 256 entries
+    // with a __half2 payload instead of a float2 — one LDS.32 and one HFMA2 where the fp32 loop
+    // pays two book gathers and FMUL+FFMA+FADD. Staged from bookv(), the same per-TU global
+    // table stage_tabs() fills tab[] from.
+    //
+    // WHY THIS TIER NEEDS ITS OWN BOOK GATE: the PX16 book is fp16-exact (all 16 entries verified
+    // ascending, sign-straddling and fp16-snap idempotent), so the LUT carries ZERO book error
+    // exactly as it does on the low tiers — but its absmax is EXACTLY 1.0, and the low-tier
+    // self-check pxa_pxq23_book_ok() requires |v| < 1 (right for the Lloyd-fit LM4/LM8 books,
+    // wrong here). Reusing it would fail the check and silently disable the kernel, which is the
+    // same trap pxa_pxq1_book_ok() exists to avoid; pxa_pxq6_h2_book_ok() below is the |v| <= 1
+    // form. The fp16 accumulation headroom still holds at absmax 1.0: a 16-element group is 8
+    // hfma2 steps and x is scaled into [512,1024), so |acc| <= 8*1024*1.0 = 8192 against fp16's
+    // 65504 — the same 8x margin the low tiers get.
+    //
+    // COST THIS TIER PAYS THAT THE LOW TIERS DO NOT: 256 __half2 = 1024 B of static shared memory
+    // per block, against 64 B (PXQ2) and 256 B (PXQ3). That is an occupancy question on GP100's
+    // 64 KB/SM, not a correctness one, and it is why this tier is a separate mask bit rather than
+    // riding the low tiers' default.
+    static constexpr int H2LUT = 256;
+    __device__ static int h2key(const uint32_t * q, int b) {
+        return (int)((q[b >> 2] >> (8*(b & 3))) & 0xffu);
+    }
+    __device__ static void h2codes(int key, int & c0, int & c1) {
+        c0 = key & 0xf;
+        c1 = (key >> 4) & 0xf;
+    }
+    __device__ static __half2 pairh2(const uint32_t * q, int b, const __half2 * hlut) {
+        return hlut[h2key(q, b)];
     }
 };
 
@@ -3179,6 +3211,11 @@ static inline int * pxq6_ksplit_counters(int device, cudaStream_t stream) {
 // persistent KSPLIT workspace (per device; grown OUTSIDE graph capture only — if capture is
 // active and the buffer is too small, the driver falls back to the non-split kernel, which is
 // bit-identical anyway, so replayed graphs stay correct whatever the capture saw).
+// Bug #230: an exec captured earlier still holds the OLD pointer as a kernel argument, and the
+// per-node property compare cannot see it. So every growth bumps the allocator generation
+// (ggml-cuda.cu), which forces every cached CUDA graph to re-capture instead of replaying into
+// freed memory.
+extern "C" void ggml_cuda_alloc_generation_bump(void);
 struct pxq6_ksplit_ws_t { float * ptr = nullptr; size_t sz = 0; };
 static inline float * pxq6_ksplit_workspace(int device, cudaStream_t stream, size_t need_floats) {
     static pxq6_ksplit_ws_t ws[64];
@@ -3189,7 +3226,10 @@ static inline float * pxq6_ksplit_workspace(int device, cudaStream_t stream, siz
     cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
     cudaStreamIsCapturing(stream, &st);
     if (st != cudaStreamCaptureStatusNone) return nullptr;   // can't grow mid-capture -> decline
-    if (w.ptr) cudaFree(w.ptr);
+    if (w.ptr) {
+        ggml_cuda_alloc_generation_bump();   // bug #230: invalidate every exec that baked w.ptr
+        cudaFree(w.ptr);
+    }
     w.ptr = nullptr; w.sz = 0;
     if (cudaMalloc(&w.ptr, need) != cudaSuccess) { w.ptr = nullptr; cudaGetLastError(); return nullptr; }
     w.sz = need;
@@ -4083,14 +4123,19 @@ typedef void (*pxq6_scat_fn)(const uint8_t *, const half *, char *, size_t, size
 #define PXQ6_PICK2(K, POL, b1, b2) \
     ((b1) ? ((b2) ? (K<POL, true, true>) : (K<POL, true, false>)) \
           : ((b2) ? (K<POL, false, true>) : (K<POL, false, false>)))
+// b1 = RAG (K4 ragged-tile FMA skip). It only gates the shared-memory FMA loop of rows whose
+// stores are masked anyway, so it is policy-independent and valid for every tier (bug #227: the
+// sub-nibble / P6R / P1 cases used to hard-wire `false`, a leftover from when this slot was the
+// 4-bit-only PAIRLUT bit, so the default-on skip never ran on those tiers). The GUFUSE pickers
+// below already pass it through for every tier.
 #define PXQ6_PICK_FMT(RET, NAME, K) \
     static inline RET NAME(int fmt, bool b1, bool b2) { \
         switch (fmt) { \
             case PXA_PXQ_FMT_P6: return PXQ6_PICK2(K, pxq6_pol_p6,   b1, b2); \
-            case PXA_PXQ_FMT_P2: return PXQ6_PICK2(K, pxq6_pol_p2, false, b2); \
-            case PXA_PXQ_FMT_P3: return PXQ6_PICK2(K, pxq6_pol_p3, false, b2); \
-            case PXA_PXQ_FMT_P6R: return PXQ6_PICK2(K, pxq6_pol_p6r, false, b2); \
-            case PXA_PXQ_FMT_P1: return PXQ6_PICK2(K, pxq6_pol_p1, false, b2); \
+            case PXA_PXQ_FMT_P2: return PXQ6_PICK2(K, pxq6_pol_p2,   b1, b2); \
+            case PXA_PXQ_FMT_P3: return PXQ6_PICK2(K, pxq6_pol_p3,   b1, b2); \
+            case PXA_PXQ_FMT_P6R: return PXQ6_PICK2(K, pxq6_pol_p6r, b1, b2); \
+            case PXA_PXQ_FMT_P1: return PXQ6_PICK2(K, pxq6_pol_p1,   b1, b2); \
             default:             return PXQ6_PICK2(K, pxq6_pol_p6hq, b1, b2); \
         } \
     }
@@ -4206,8 +4251,16 @@ PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen_qp, k_pxq6_gat
 // same exclusion the MMVQ path uses). A separate picker also means the mode cannot reach a tier,
 // an arch or a driver it was not measured on by way of a demotion arm.
 //
-// Returns nullptr for everything except PXQ2/PXQ3 on cc == 600 with the lever bit set, and the
-// 2D driver treats nullptr as "keep the incumbent kernel".
+// Returns nullptr for everything except PXQ2/PXQ3/PXQ4 on cc == 600 with that tier's lever bit
+// set, and the 2D driver treats nullptr as "keep the incumbent kernel".
+//
+// PXQ4 (2026-09-13) rides bit 2 and is NOT in the default mask. Two things about it that the low
+// tiers did not have to say: (1) its book self-check is the |v| <= 1 form, because the PX16
+// book's absmax is exactly 1.0 -- see pxa_pxq6_h2_book_ok; (2) an armed PXQ4 bit DISPLACES the
+// TOK twin at ny >= 2 (the driver's `!h2` condition), because there is no h2 form of the
+// token-batched kernel. That is deliberate -- an armed lever must not be silently displaced by a
+// default-off one -- but it means PXA_PXQ_MMV_H2 bit 2 and PXA_PXQ_MMV_TOK are alternatives at
+// verify widths, not additive, and an A/B that arms both measures the h2 arm alone.
 // ---------------------------------------------------------------------------------------------
 
 // arch + tier + book gate. cc == 600 EXACTLY: sm_61 runs fp16 at 1/64 rate, so a >= gate would
@@ -4221,10 +4274,39 @@ PXQ6_PICKM_FMT_GU(pxq6_gateup_ksg_fn, pxq6_pick_gateup_ksplit_gen_qp, k_pxq6_gat
 // of this control flow is exactly how a lever comes to be reported as armed while behaving as off.
 // `cc` is reported alongside the reason because three of the four gates are arch- or tier-specific
 // and the line is otherwise unreadable on a mixed fleet.
+// PX16 book self-check for the 4-bit tier's h2 LUT (2026-09-13). Same shape as
+// pxa_pxq23_book_ok() -- fp16-snap idempotence, strictly ascending, sign-straddling -- with
+// |v| <= 1 instead of |v| < 1, because the PX16 book's absmax is EXACTLY 1.0 by construction
+// (it is the frozen sorted book with book[7] == 0 and absmax == 1). Using the strict form here
+// would fail on a correct book and silently disable the kernel; that failure mode is the reason
+// pxa_pxq1_book_ok() exists for the sign book, and this is the same fix for the other end of
+// the range. The fp16-exactness is what the zero-book-error claim rests on, so it is CHECKED
+// here once rather than trusted -- a book override or a re-fit that broke it would otherwise
+// turn a documented property into a silent one.
+static inline bool pxa_pxq6_h2_book_ok(const float * b, int n) {
+    bool ok = b[0] < 0.0f && b[n-1] > 0.0f;
+    for (int i = 0; i < n - 1 && ok; ++i) ok = b[i] < b[i+1];
+    for (int i = 0; i < n && ok; ++i) {
+        ok = fabsf(b[i]) <= 1.0f && __half2float(__float2half_rn(b[i])) == b[i];
+    }
+    return ok;
+}
+
 static inline const char * pxa_pxq_mmv_h2_why(int cc, int fmt) {
     const int m = pxa_pxq_mmv_h2_mask();
     if (!m) return "lever-not-armed";
     if (cc != 600) return "cc-not-600";
+    if (fmt == PXA_PXQ_FMT_P6) {
+        if (!(m & 4)) return "tier-bit-not-set-for-pxq4";
+        static const bool ok = [](){
+            static const float b[16] = PXQ6_BOOK_INIT;
+            const bool v = pxa_pxq6_h2_book_ok(b, 16);
+            if (!v) fprintf(stderr, "PXA_PXQ_MMV_H2: PXQ4 DISABLED — the PX16 book is not fp16-exact, "
+                                    "so the half2 pair LUT would carry book error it must not carry\n");
+            return v;
+        }();
+        return ok ? nullptr : "pxq4-book-not-fp16-exact";
+    }
     if (fmt == PXA_PXQ_FMT_P2) {
         if (!(m & 1)) return "tier-bit-not-set-for-pxq2";
         static const bool ok = [](){
@@ -4262,6 +4344,7 @@ static inline bool pxa_pxq_mmv_h2_on(int cc, int fmt) {
         switch (fmt) { \
             case PXA_PXQ_FMT_P2: return K<pxq6_pol_p2>; \
             case PXA_PXQ_FMT_P3: return K<pxq6_pol_p3>; \
+            case PXA_PXQ_FMT_P6: return K<pxq6_pol_p6>; \
             default:             return nullptr; \
         } \
     }
@@ -4285,7 +4368,7 @@ static inline void pxa_pxq_mmv_h2_log(int device, int cc, int arm, bool fired, c
     if (seen.fetch_or(bit) & bit) return;
     static const char * arm_name[2] = { "plain/ksplit", "ksplit_gen" };
     if (fired) {
-        fprintf(stderr, "PXA_PXQ_MMV_H2 dev%d: ENGAGED %s cc=%d fmt=%d (5=PXQ2 6=PXQ3) R=%d K=%d S=%d "
+        fprintf(stderr, "PXA_PXQ_MMV_H2 dev%d: ENGAGED %s cc=%d fmt=%d (3=PXQ4 5=PXQ2 6=PXQ3) R=%d K=%d S=%d "
                         "mode=%d — half2 pair-LUT decode, sm_60\n",
                 device, arm_name[arm & 1], cc, fmt, R, K, S, PXQ6_MODE_H2);
     } else {
@@ -4371,7 +4454,11 @@ static inline pxq6_mmv_ksg_tok_fn pxq6_pick_mmv_ksplit_gen_tok(int fmt, int m, b
 static inline int pxa_pxq_mmv_tok() {
     static const int v = [](){
         const char * e = getenv("PXA_PXQ_MMV_TOK");
-        int t = e ? atoi(e) : 0;
+        // mtp-round 2026-09-28 (main's order): unset = -1 -> the caller applies the per-card default
+        // (TOK=3 on sm_60 verify batches, measured by : PXQ4 MTP n2 23.7 -> 25.0 t/s on
+        // the P100 pair; bit-exact). An explicit 0 still turns it off everywhere.
+        if (!e) return -1;
+        int t = atoi(e);
         if (t != 0 && (t < 2 || t > 4)) {
             fprintf(stderr, "PXA_PXQ_MMV_TOK=%d invalid (want 0/2/3/4) -- OFF\n", t);
             t = 0;

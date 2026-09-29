@@ -62,7 +62,7 @@ adaptive-VRAM ladder.
 > (KSPLIT/VECX/GUFUSE/SCATFUSE), `PXA_FUSE_DELTANET=3`, `PXA_G2_ADDFUSE=1` (2026-07-19, +1.9% V100
 > / +1.2% P100 decode, bit-exact), and the sm_61 `PXA_PXQ_INT8_PREFILL` carrier used in the 1080 Ti
 > recipe below — is a hand-settable lab knob in its own right, each with its own measurement and
-> gate class, in [`docs/LEVERS.md`](LEVERS.md). Setting any of them by hand
+> gate class, in [`docs/lab/LEVERS.md`](lab/LEVERS.md). Setting any of them by hand
 > bypasses the per-arch gate the ENHANCE level applies and is usually **slower**, not faster.
 
 ## Two FA regimes — pick by workload (read this before quoting a prefill number)
@@ -185,7 +185,11 @@ If you want the drafter anyway, `--spec-type ngram-mod:n_max=4,n_min=2` or `PXA_
 forces it — on a card with the headroom, it is a real win.
 
 Measured on the published PXQ2 tier, n=3, with nothing passed: cold prefill **1,363 t/s** at
-`-fa off` and **747 t/s** chat prefill at `-fa on`, decode **65.3 t/s** chat and 36.7 cold. (The
+`-fa off` and **747 t/s** chat prefill at `-fa on`, decode **65.3 t/s** chat and 36.7 cold. Those
+runs had no context checkpoints (the engine forced `--ctx-checkpoints 0` on this card until
+2026-09-25); it now keeps them, so a hybrid chat turn that rewinds no longer re-prefills its whole
+history, and these numbers are unmeasured with checkpoints on. `--ctx-checkpoints 0` reproduces
+the measured configuration. (The
 older row for this card, 1,306 / 729 / 59.2 / 32.1, is the same engine launched with the levers
 and the flags spelled out by hand.) Against
 a fresh upstream ik_llama.cpp IQ2_KS build on the same card that is **+15.4%** cold prefill and
@@ -202,7 +206,7 @@ PXA_PXQ_I8_BLUT: ON (N14 byte-keyed 2-bit W-decode, bit-identical)
 ```
 
 `PXA_PXQ_INT8_PREFILL=1` sets the first explicitly if you have rolled the level back with
-`PXA_ENHANCE=0`; it is a G3-class lever, see [`docs/LEVERS.md`](LEVERS.md) §4.
+`PXA_ENHANCE=0`; it is a G3-class lever, see [`docs/lab/LEVERS.md`](lab/LEVERS.md) §4.
 `PXA_PXQ_I8_BLUT` is already on by default and bit-identical — you do not need to set it. Use
 `-ub 768`: a ub2048 compute buffer (~1.9 GiB) cannot allocate next to the resident model on 11 GB.
 ⚠ PXQU-12 (11.6 GB) does NOT fit an 11 GB card — it's a 12 GB tier; PXQ2 is the 1080 Ti tier.
@@ -294,7 +298,7 @@ Full raw reps, the arm-by-arm ladder, and what each lever's number depends on:
 
 > **Lab footnote:** this is the campaign's shipped set, not the whole lab. `PXA_FA_KEYS_PER_SPLIT`
 > and `PXA_GEMV_RPB` were measured in the same run and are **negative** at this fill depth —
-> left off deliberately, not omitted by oversight. See `docs/LEVERS.md` and
+> left off deliberately, not omitted by oversight. See `docs/lab/LEVERS.md` and
 > `RELEASE-NOTES-2026-09-02.md`'s rejected-levers list before re-trying either.
 
 ## 2xv100-27b-vllm — 2× Tesla V100, 27B dense, vLLM sm_70 serving line

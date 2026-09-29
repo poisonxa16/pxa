@@ -2,6 +2,7 @@
 #include "llama-hparams.h"
 #include "llama-model-loader.h"
 #include "llama-model.h"
+#include "llama-pxqn.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -243,6 +244,22 @@ void llm_load_hparams(
     }
 
     ml.get_key(LLM_KV_BLOCK_COUNT,       hparams.n_layer);
+
+    // PXQN (ggml-pxqn.h): the revision was already vetted by the loader (rev > 1 refused there);
+    // take the rotation contract the graph needs.
+    llama_pxqn_read_keys(ctx, hparams.pxqn_rev, hparams.pxqn_rot_seed, hparams.pxqn_rot_sites);
+    if (hparams.pxqn_rot_sites) {
+        // The activation rotation is wired into the graph builders the Qwen3.5/3.8 family uses
+        // (build_std_attention, the DeltaNet layer, llm_build_ffn) -- single device and the
+        // -sm graph/tensor split paths. Anything else would run UNROTATED activations against
+        // rotated weights: refuse instead of decoding garbage.
+        const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE;
+        const uint32_t ffn_sites = PXQN_SITE_BIT(PXQN_SITE_FFN_IN) | PXQN_SITE_BIT(PXQN_SITE_DOWN_IN);
+        if (!arch_ok || (model.arch == LLM_ARCH_QWEN35MOE && (hparams.pxqn_rot_sites & ffn_sites))) {
+            throw std::runtime_error(format("PXQN: rotated sites '%s' are not supported for arch %s by this build",
+                    llama_pxqn_sites_str(hparams.pxqn_rot_sites).c_str(), llama_model_arch_name(model.arch)));
+        }
+    }
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, model.name, false);

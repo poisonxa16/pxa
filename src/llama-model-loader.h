@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <map>
 
@@ -180,6 +181,11 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+
+    // PXA_PLE_MMAP (2026-09-25): tensors llm_load_tensors already served straight
+    // from a private read-only file mapping (their bytes ARE the file). Both load paths skip
+    // them; their size is counted into size_done when they are mapped.
+    std::unordered_set<const struct ggml_tensor *> pxa_premapped;
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(

@@ -1023,6 +1023,12 @@ struct cmd_params_instance {
         mparams.fit_margin = fit_margin;
         mparams.type_k = type_k;
         mparams.type_v = type_v;
+        // the load-time fit / PXA_STREAM_WEIGHTS=auto planner sizes KV and the compute buffer from
+        // these (the model is reused across instances with equal mparams: the first one plans)
+        if (const char * e = getenv("PXA_BENCH_WGT")) mparams.worst_graph_tokens = atoi(e);   // = -wgt
+        mparams.max_ctx_size = n_prompt + n_gen;
+        mparams.n_ubatch = n_ubatch;
+        mparams.flash_attn = flash_attn;
 
         return mparams;
     }
@@ -1050,6 +1056,7 @@ struct cmd_params_instance {
         llama_context_params cparams = llama_context_default_params();
 
         cparams.n_ctx = n_prompt + n_gen;
+        if (const char * e = getenv("PXA_BENCH_WGT")) cparams.worst_case_tokens = atoi(e);    // = -wgt
         cparams.n_batch = n_batch;
         cparams.n_ubatch = n_ubatch;
         cparams.type_k = type_k;

@@ -11,6 +11,13 @@ std::string trim_leading_whitespace(const std::string & str);
 std::string trim_trailing_whitespace(const std::string & str);
 std::string trim_trailing_newlines(const std::string & str);
 
+// PXA tool-tag fix (bug #222): Qwen models sometimes wrap a tool call in the tool-DEFINITIONS tag
+// <tools>...</tools> instead of <tool_call>...</tool_call>. Given a call/section marker as the
+// template analysis derived it (e.g. "<tool_call>\n"), return the same marker with <tools> /
+// </tools> in place of <tool_call> / </tool_call>, keeping its surrounding whitespace; return ""
+// for any other marker, so other model families are untouched.
+std::string pxa_qwen_tools_variant(const std::string & marker);
+
 // calculate a diff split (longest common prefix, longest common suffix excluding prefix,
 // mismatched part on the left, mismatched part on the right) between two strings
 // account for markers - align prefix and suffix endings so that they end on markers

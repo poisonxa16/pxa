@@ -294,6 +294,17 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps  = nullptr;
     struct ggml_tensor * ffn_up_gate_exps  = nullptr;
 
+    // PXA_XCACHE (expert-granular hot cache): when the planner splits this layer's expert stack,
+    // the four pointers above hold the resident HOT stack (the experts routed to most) and these
+    // hold the COLD stack (pinned host RAM, CUDA<d>_Stream buffer: ring for wide graphs, CPU alias
+    // or zero-copy for narrow ones). ffn_exps_xmap is the I32 [n_expert] routing map (map[e] >= 0:
+    // hot slot, <= -2: cold slot -2 - map[e]) that GGML_OP_MOE_SPLIT_IDS reads.
+    struct ggml_tensor * ffn_gate_exps_xc    = nullptr;
+    struct ggml_tensor * ffn_down_exps_xc    = nullptr;
+    struct ggml_tensor * ffn_up_exps_xc      = nullptr;
+    struct ggml_tensor * ffn_up_gate_exps_xc = nullptr;
+    struct ggml_tensor * ffn_exps_xmap       = nullptr;
+
     llama_split_tensor split_ffn_gate_inp;
     llama_split_tensor split_ffn_up_exps;
     llama_split_tensor split_ffn_gate_exps;
@@ -569,6 +580,11 @@ struct llama_model {
     struct ggml_tensor * output_mtp_shortlist = nullptr;
     std::unique_ptr<ggml_tensor> output_mtp_shortlist_ptr;
     std::vector<int32_t> mtp_shortlist_rows;
+    // PXA_MTP_SHORTLIST_DUAL: the prefix head cut over both cards of a 2-card tensor split
+    // (rows [0,h) a window onto device 0's slice, rows [h,N) a copy on device 1)
+    std::unique_ptr<ggml_tensor> mtp_shortlist_lo_ptr;
+    ggml_split_tensor_t          mtp_shortlist_split = {};
+    ggml_tensor *                mtp_shortlist_splits[2] = { nullptr, nullptr };
 
     // DSpark drafter -> its target. Non-owning; set by llama_dspark_bind_target().
     const llama_model * dspark_target = nullptr;
@@ -650,6 +666,41 @@ struct llama_model {
 
     // Set by llm_apply_khad_pretransform once H is folded into wv_b/wk_b_pp.
     bool khad_pretransformed = false;
+
+    // PXA_STREAM_WEIGHTS narrow/wide (stream-next, 2026-09-25). Every weight in a CUDA<d>_Stream
+    // buffer (pinned host RAM presented as a CUDA buffer, streamed through a VRAM ring in wide
+    // graphs) also gets a CPU ALIAS: a second tensor over the SAME pinned bytes in a CPU buffer.
+    // A narrow graph (decode, spec verify, a ragged tail) reads the alias, so the scheduler runs
+    // that op on the CPU exactly as '-ot ...=CPU' does, instead of copying the whole weight over
+    // PCIe for a handful of tokens. The stream buffer keeps its CUDA identity for wide graphs
+    // (36 is_cuda checks gate the PXQ fast paths).
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> pxa_stream_alias;
+    struct ggml_context * pxa_alias_ctx = nullptr;
+    std::vector<ggml_backend_buffer_t> pxa_alias_bufs;
+    int pxa_stream_narrow_dense = 0;    // graphs narrower than this read dense aliases (0 = ring always)
+    int pxa_stream_narrow_moe   = 32;   // ... and expert aliases (tokens; offload_op formula)
+    int pxa_stream_zc_moe       = 0;    // expert graphs no wider than this skip the alias and read the
+                                        // pinned experts in place on the GPU (zero-copy, CUDA graphs on)
+    bool pxa_stream_cold_zc     = false; // planner: streamed experts take the zero-copy cold path (no CPU alias)
+    size_t pxa_stream_bytes = 0;        // total pinned stream bytes (placement report)
+    // PXA_STREAM_WEIGHTS=auto planner decision (src/llama-pxa-place.h): tensors that leave VRAM
+    std::set<std::string> pxa_place_names;
+    bool        pxa_place_cpu_instead = false;   // R5: to mmap'd host RAM instead of the stream buffer
+    int         pxa_place_mode = 0;              // 0 resident, 2 experts, 3 spill
+    std::string pxa_place_json;                  // PXA_EXPLAIN placement object
+    int         pxa_auto_wgt = 0;                // >0: streaming placement planned with the logits reservation capped here
+
+    // PXA_XCACHE: the planner's expert-granular split (src/llama-pxa-place.h). Per layer, the
+    // expert ids kept resident (hot) and streamed (cold), each ascending = slot order in its stack;
+    // both empty = the layer is not split. The loader fills the stacks from the file (the file's
+    // own expert tensors are never allocated) before the ordinary weight load.
+    struct pxa_xc_layer { std::vector<int32_t> hot, cold; };
+    std::vector<pxa_xc_layer> pxa_xc;
+    struct pxa_xc_fill { ggml_tensor * hot; ggml_tensor * cold; std::string src; int il; };
+    std::vector<pxa_xc_fill> pxa_xc_fills;       // one per split expert tensor
+    std::vector<std::pair<ggml_tensor *, int>> pxa_xc_maps;   // (map tensor, layer)
+    size_t      pxa_xc_ring = 0;                  // ring bytes the split needs (per device of the layer)
+    std::string pxa_model_path;                   // the GGUF path (sidecar lookup: <path>.expert-counts.csv)
 
     ~llama_model();
 

@@ -7,7 +7,7 @@ this note covers everything since that tag: it carries forward what the unpublis
 and `v2026.09.11-rc3` candidates described — both were cut and gated but never published — and adds
 this cut's work on top. The full
 reference for every lever, its default, the configuration its number came from and its verification
-class is [`docs/LEVERS.md`](docs/LEVERS.md); where a change has no number here, the number
+class is [`docs/lab/LEVERS.md`](docs/lab/LEVERS.md); where a change has no number here, the number
 lives in the row, and the row is the citation.
 
 ---
@@ -743,7 +743,7 @@ measurements, so it stays a lever — set it to 2 on a two-card Pascal box), `PX
 `PXA_ATTN_SPLIT_QWEN38` (the attention-split admission), `PXA_RESERVE_DEBUG` and `PXA_REDUCE_TIME`
 (diagnostics).
 
-Every one of those has a row in [`docs/LEVERS.md`](docs/LEVERS.md) carrying its default, the
+Every one of those has a row in [`docs/lab/LEVERS.md`](docs/lab/LEVERS.md) carrying its default, the
 `getenv` site the default is decided at, the window each number came from, and its gate class.
 
 ---

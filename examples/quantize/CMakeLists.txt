@@ -20,4 +20,12 @@ if (PXA_PXQ_ENCODER)
     target_compile_features(${PXQ_TARGET} PRIVATE cxx_std_11)
     target_compile_definitions(${PXQ_TARGET} PRIVATE PXA_PXQ_ENCODER PXQ_QUANTIZE_TOOL
                                PXA_PXQ_QUANTIZER_URL="${PXA_PXQ_QUANTIZER_URL}")
+    target_compile_definitions(${PXQ_TARGET} PRIVATE PXA_QUANTIZER_VERSION="${PXA_QUANTIZER_VERSION}")
+    target_compile_definitions(${TARGET}     PRIVATE PXA_QUANTIZER_VERSION="${PXA_QUANTIZER_VERSION}")
+    if (PXA_PXQN_ENCODER)
+        target_compile_definitions(${TARGET}     PRIVATE PXA_PXQN_ENCODER)
+        target_compile_definitions(${PXQ_TARGET} PRIVATE PXA_PXQN_ENCODER)
+    endif()
 endif()
+
+pxa_add_alias(${TARGET} pxa-quantize)

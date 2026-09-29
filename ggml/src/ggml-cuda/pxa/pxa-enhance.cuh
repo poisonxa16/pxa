@@ -317,18 +317,25 @@ static inline int pxa_pxq23_mmvq_mask() {
 // The arch gate is cc == 600 EXACTLY, not >=: sm_61 runs fp16 at 1/64 rate, so shipping a >= gate
 // would hand consumer Pascal a kernel 64x slower than the one it has. It lives in pxq6.cuh next
 // to the format ids (pxa_pxq_mmv_h2_on); this function is the mask alone.
+// bit2 = PXQ4 (2026-09-13). The 4-bit tier's PX16 book is fp16-exact too, so the same loop
+// reaches it with no book error; it is a SEPARATE bit and NOT in the default because it pays
+// 1024 B of static shared memory for its 256-entry pair LUT (against 64 B / 256 B on the low
+// tiers), which is an occupancy question this tier has to answer on its own numbers. Default
+// stays 3 until the ship rule is satisfied for PXQ4; PXA_PXQ_MMV_H2=7 arms all three.
 static inline int pxa_pxq_mmv_h2_mask() {
     static const int mask = [](){
         if (pxa_config_level() == 0) return 0;                    // REFERENCE opts out of everything
         const char * e = getenv("PXA_PXQ_MMV_H2");
         int m = e ? atoi(e) : 3;                                  // DEFAULT ON, cc == 600 only: both
                                                                   // low tiers, per the ship rule
-        if (m < 0 || m > 3) m = 0;
+        if (m < 0 || m > 7) m = 0;
         if (m) {
-            fprintf(stderr, "PXA_PXQ_MMV_H2: mode %d (%s%s%s dense decode via the half2 pair-LUT loop, "
-                            "sm_60 only — NOT bit-exact vs the fp32 mmv, fidelity-gated; the fp16-exact "
-                            "book self-check runs at first dispatch)\n",
-                    m, (m & 1) ? "PXQ2" : "", (m == 3) ? "/" : "", (m & 2) ? "PXQ3" : "");
+            fprintf(stderr, "PXA_PXQ_MMV_H2: mode %d (%s%s%s%s%s dense decode via the half2 pair-LUT "
+                            "loop, sm_60 only — NOT bit-exact vs the fp32 mmv, fidelity-gated; the "
+                            "fp16-exact book self-check runs at first dispatch)\n",
+                    m, (m & 1) ? "PXQ2" : "", ((m & 1) && (m & 6)) ? "/" : "",
+                       (m & 2) ? "PXQ3" : "", ((m & 3) && (m & 4)) ? "/" : "",
+                       (m & 4) ? "PXQ4" : "");
         }
         return m;
     }();
@@ -418,8 +425,13 @@ static inline bool pxa_gate_default(bool shipped_dflt) {
 // pxa_try_deltanet_outgate() now carries the shifted-overlap guard (the same predicate
 // pxa_g2_addfuse_no_shifted_overlap() applies to ADD+FUSED_RMS_NORM), so PXA_FUSE_DELTANET=55
 // is safe to re-arm for a measurement -- it just has no win to collect.
+// Bit 1 is back IN the default (53 -> 55, 2026-09-27): pxa_dn_rms_silu_gate_f32 now repeats the
+// eager kernels' arithmetic in their order (fused_rms_norm_f32's block size and reduction tree,
+// the stored scale*w*x, then fused_mul_silu_f32's z*v/(1+expf(-z))), the q8_1 sidecar quantizes
+// the stored value, and the shifted-overlap guard above still declines the racing placements.
+// PXA_FUSE_DELTANET=53 restores the previous default.
 static inline int pxa_fuse_deltanet_default() {
-    return pxa_config_level() == 0 ? 0 : 53;
+    return pxa_config_level() == 0 ? 0 : 55;
 }
 
 // PXA_VOLTA_CUBLAS_NE11 canonical resolver (mmq.cu + the startup report). sm_70 routes dense
@@ -529,6 +541,10 @@ static inline bool pxa_router_fuse_on(int cc) {
 static inline bool pxa_spec_relaxed_resolve() {
     const char * e = getenv("PXA_SPEC_RELAXED");
     if (e) return atoi(e) != 0;
+    // v2026.10: the lossless PXA_SPEC_SAMPLED rule is the default, so relaxed is the level default
+    // only where that rule is explicitly off (mirrors common/sampling.cpp)
+    const char * s = getenv("PXA_SPEC_SAMPLED");
+    if (!(s && atoi(s) == 0)) return false;
     return pxa_config_level() == 2;
 }
 
@@ -577,7 +593,7 @@ static inline bool pxa_p100_fp16_gemm() {
 // REFERENCE reports itself, because at level 0 every lever above is forced off.
 static inline const char * pxa_enhance_path_name(int cc) {
     if (pxa_config_level() == 0) {
-        return "reference (all levers off)";
+        return "reference (levers off; PXQ codec kernels on)";
     }
     if (cc == 600) {
         return pxa_p100_fp16_gemm() ? "sm_60 fp16-hfma2" : "sm_60 fp32-sgemm";
@@ -915,7 +931,14 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
             // printing this line (bug 67). If a future gate must be level-independent it may
             // not be silent here: either the gate honours level 0, or this sentence gains a
             // qualifier naming exactly what it does not cover.
-            fprintf(stderr, " reference [all PXA levers OFF]");
+            // Bug #281 (2026-09-27): PXQ4_2D_SPLIT, PXQ_DENSE_GATEUP, FA_VEC_ILP, F16_GEMV(_WIDE)
+            // and PXQ_MOE_MMV_ID now honour level 0. What does NOT turn off is the codec itself:
+            // the PXQ kernel families (PXA_PXQ6/PXQ6R, PXA_PXQ1-3, PXA_PXQ4_2D, PXA_PXQN_*) are
+            // how a PXQ tensor is read at all (off = dequant->cuBLAS expansion, a different
+            // engine, not a reference), plus PXA_VOLTA_F16_GEMM (fixes an ldc overrun on sm_70)
+            // and PXA_MXFP4_DEQ_V2. The banner names them instead of claiming them off.
+            fprintf(stderr, " reference [PXA levers OFF; stay on: PXQ codec kernels "
+                            "(PXQ6/PXQ1-3/PXQ4_2D/PXQN), VOLTA_F16_GEMM, MXFP4_DEQ_V2]");
         } else if (cc >= 700 && cc < 750) {
             if (pxa_volta_cublas_ne11() > 0) {
                 fprintf(stderr, " CUBLAS%d ON [+9.4%% pf]", pxa_volta_cublas_ne11());
@@ -1042,14 +1065,26 @@ static inline void pxa_enhance_log_model_decisions() {
                     ? "OFF: the low tiers keep their bespoke fused decode kernels"
                     : "INERT: this model carries no PXQ2/PXQ3 tensor");
         const int maskh2 = pxa_pxq_mmv_h2_mask();
-        const int n_low  = m.n_pxq2_tensors + m.n_pxq3_tensors;
+        // The INERT test counts the tiers the ARMED bits can actually reach, so arming PXQ4
+        // alone on a file with no PXQ2/PXQ3 tensor does not read as inert, and arming the low
+        // tiers alone on a PXQ4-only file still does. NOTE the PXQ4 term is the PXQ4/PXQ4HQ
+        // count and the h2 loop reaches PXQ4 only, so on a file carrying PXQ4HQ tensors and no
+        // PXQ4 ones this line can say "armed" where the picker will decline per node; the
+        // per-device ENGAGED/DECLINED lines from pxa_pxq_mmv_h2_log are what settle that, and
+        // they name the fmt. A finer counter is not worth a new field in the model profile.
+        const int n_low  = ((maskh2 & 1) ? m.n_pxq2_tensors : 0)
+                         + ((maskh2 & 2) ? m.n_pxq3_tensors : 0)
+                         + ((maskh2 & 4) ? m.n_pxq_mmvq_tensors : 0);
         fprintf(stderr, "PXA_AUTO: PXQ_MMV_H2=%d (%s; override PXA_PXQ_MMV_H2)\n", maskh2,
                 !t.has_sm60         ? "INERT: no sm_60 device — the half2 decode loop is gated cc==600 exactly (sm_61 runs fp16 at 1/64 rate)" :
-                n_low <= 0          ? "INERT: this model carries no PXQ2/PXQ3 tensor" :
+                maskh2 == 0         ? "OFF: every tier keeps the exact fp32 decode loop" :
+                n_low <= 0          ? "INERT: this model carries no tensor in any tier this mask arms" :
                 maskh2 == 3         ? "PXQ2 and PXQ3 dense decode on the half2 pair-LUT loop (sm_60 devices only)" :
+                maskh2 == 7         ? "PXQ2, PXQ3 and PXQ4 dense decode on the half2 pair-LUT loop (sm_60 devices only)" :
                 maskh2 == 1         ? "PXQ2 only (sm_60 devices only)" :
                 maskh2 == 2         ? "PXQ3 only (sm_60 devices only)" :
-                                      "OFF: the low tiers keep the exact fp32 decode loop");
+                maskh2 == 4         ? "PXQ4 only (sm_60 devices only)" :
+                                      "a partial tier mask (sm_60 devices only)");
     }
     // The device-only levers, restated with model context so ONE ledger holds every decision.
     fprintf(stderr, "PXA_AUTO: VOLTA_CUBLAS_NE11=%d (%s; override PXA_VOLTA_CUBLAS_NE11)\n",

@@ -17,6 +17,7 @@ using json = nlohmann::ordered_json;
 
 struct llama_sampler_adaptive_p * llama_clone_adaptive_p(const struct llama_sampler_adaptive_p * adapt_p_ctx);
 void llama_free_adaptive_p(struct llama_sampler_adaptive_p * adapt_p_ctx);
+void llama_adaptive_p_copy_rng(struct llama_sampler_adaptive_p * dst, const struct llama_sampler_adaptive_p * src);
 
 // PXQ repetition guard (2026-07-23; widened to all PXQ tiers 2026-07-24): low-bit tiers
 // measurably loop on open-ended prompts (coding answers stay clean — measured on a 122B
@@ -342,6 +343,20 @@ void common_sampler_clone(common_sampler * src, common_sampler * dst) {
     }
     if (src->rbudget) {
         dst->rbudget = common_reasoning_budget_clone(src->rbudget);
+    }
+}
+
+void common_sampler_rewind_keep_rng(common_sampler * ckpt, common_sampler * dst) {
+    const std::mt19937 rng_live = dst->rng;
+    // the adaptive-p sampler draws from its OWN generator (llama_sample_token_adaptive_p), so it is
+    // taken out of dst before the clone frees it and only its RNG is carried over to the clone
+    llama_sampler_adaptive_p * adapt_p_live = dst->adapt_p_ctx;
+    dst->adapt_p_ctx = nullptr;
+    common_sampler_clone(ckpt, dst);
+    dst->rng = rng_live;
+    if (adapt_p_live != nullptr) {
+        llama_adaptive_p_copy_rng(dst->adapt_p_ctx, adapt_p_live);
+        llama_free_adaptive_p(adapt_p_live);
     }
 }
 
@@ -1227,7 +1242,11 @@ static bool pxa_spec_relaxed_enabled() {
         // Level default — ggml_pxa_config_level() is the ONE definition (ggml/src/ggml.c), the
         // same one pxa_spec_relaxed_resolve() in ggml/src/ggml-cuda/pxa/pxa-enhance.cuh reads.
         // ENHANCE (the default level) -> on (G3, spec lanes only); DEFAULT/REFERENCE -> off.
-        return ggml_pxa_config_level() >= 2;
+        // v2026.10: the lossless sampled rule (PXA_SPEC_SAMPLED, below) is the default now, so the
+        // lossy relaxed rule is only the level default where that rule has been turned off.
+        const char * s = std::getenv("PXA_SPEC_SAMPLED");
+        const bool sampled_off = s != nullptr && atoi(s) == 0;
+        return sampled_off && ggml_pxa_config_level() >= 2;
     }();
     return en;
 }
@@ -1254,14 +1273,49 @@ float common_sampler_spec_relaxed_pmin()   { return pxa_spec_relaxed_pmin(); }
 // on rejection emits a draw from the residual normalise(max(p - q, 0)). See common/pxa-spec-sampled.h
 // for the identity that makes that exact, and tests/test-spec-sampled.cpp for its CPU proof.
 //
-// Default OFF: it changes which tokens a request emits (a different draw from the same
-// distribution), so it is a lever until main decides the default.
+// Default ON since v2026.10 (it was a lever until the end-to-end distribution check landed: a
+// CPU proof in tests/test-spec-sampled.cpp and tests/test-spec-block-verify.cpp, and a served
+// with/without-speculation comparison of emitted-token frequencies on the one-card 27B). It
+// replaces the lossy relaxed rule as the temp>0 default. PXA_SPEC_SAMPLED=0 restores the old
+// behaviour (and with it the relaxed level default).
 static bool pxa_spec_sampled_enabled() {
     static const bool en = [] {
         const char * e = std::getenv("PXA_SPEC_SAMPLED");
+        return e ? atoi(e) != 0 : true;
+    }();
+    return en;
+}
+
+// PXA_SPEC_BLOCK_VERIFY (default OFF, =1 arms it; only reachable under PXA_SPEC_SAMPLED): decide a sampled
+// draft block of two or more tokens jointly instead of token by token (the rule and its proof are in
+// common/pxa-spec-sampled.h). Same emitted distribution, never fewer kept tokens per step. Runs
+// only where every verify position's target distribution is independent of the drafted tokens the
+// sampler has not accepted yet (no repetition penalties, no reasoning budget still counting);
+// elsewhere the per-token rule runs. Left OFF by measurement: on the one-card 27B the default draft
+// depth is clamped to 1 at 131k context (where the two rules are the same rule), and at depth 3
+// (-c 16384, 1x V100, temp 0.7, REPS 3) it did not beat the per-token rule (45.0 vs 47.8/48.2 t/s,
+// per-draft acceptance unchanged within the noise); the served distribution check passed (p 0.50).
+static bool pxa_spec_block_verify_enabled() {
+    static const bool en = [] {
+        const char * e = std::getenv("PXA_SPEC_BLOCK_VERIFY");
         return e ? atoi(e) != 0 : false;
     }();
     return en;
+}
+
+bool common_sampler_spec_block_verify_active() { return pxa_spec_sampled_enabled() && pxa_spec_block_verify_enabled(); }
+
+// true when the target distribution at every verify position of one step can be computed before
+// any of the step's drafted tokens is accepted into the sampler: nothing in the chain reads the
+// accepted-token history
+static bool pxa_spec_block_stateless(const struct common_sampler * gsmpl) {
+    const auto & p = gsmpl->params;
+    if (!(p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f)) return false;
+    if (p.dry_multiplier != 0.0f)            return false;
+    if (!p.elb_params.empty())               return false;
+    if (gsmpl->grammar != nullptr)           return false;
+    if (gsmpl->rbudget != nullptr && common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_DONE) return false;
+    return true;
 }
 
 bool common_sampler_spec_sampled_active() { return pxa_spec_sampled_enabled(); }
@@ -1494,9 +1548,63 @@ bool common_sampler_acceptance_is_exact(const struct common_params_sampling & pa
     return exact;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const std::vector<llama_token> & draft, bool grammar_first,
-        const std::vector<std::vector<pxa_spec_cand>> * draft_q) {
+bool common_sampler_pure_greedy(const struct common_sampler * cs) {
+    if (cs == nullptr) return false;
+    const auto & p = cs->params;
+    if (!(p.temp == 0.0f)) return false;                  // temp < 0 computes probs, temp > 0 samples
+    if (p.n_probs > 0) return false;
+    if (cs->grammar != nullptr) return false;
+    if (p.mirostat != 0) return false;
+    if (!p.logit_bias.empty()) return false;
+    if (cs->elb_states.size() > cs->elb_idx) return false;
+    if (cs->server_biases != nullptr) return false;
+    if (cs->rbudget != nullptr && common_reasoning_budget_get_state(cs->rbudget) != REASONING_BUDGET_DONE) return false;
+    if (pxa_topk_raw_penalties_active(cs)) return false;
+    return true;
+}
+
+std::vector<llama_token> common_sampler_accept_n_argmax(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const std::vector<llama_token> & draft) {
+    std::vector<llama_token> result;
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    // read every row first: a missing row must fail before any accept() has changed the sampler
+    std::vector<llama_token> tops(idxs.size());
+    for (size_t k = 0; k < idxs.size(); ++k) {
+        tops[k] = llama_get_argmax_ith(ctx, idxs[k], nullptr);
+        if (tops[k] < 0) return {};
+    }
+    result.reserve(idxs.size());
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const llama_token id = tops[i];
+        gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
+        common_sampler_accept(gsmpl, ctx, id, true);
+        result.push_back(id);
+        if (draft[i] != id) {
+            return result;
+        }
+    }
+    const llama_token id = tops[i];
+    gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
+    common_sampler_accept(gsmpl, ctx, id, true);
+    result.push_back(id);
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const std::vector<llama_token> & draft, bool grammar_first,
+        const std::vector<std::vector<pxa_spec_cand>> * draft_q,
+        std::vector<std::vector<llama_token_data>> * cur_p_out) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    // bug #212: the post-chain window of each position, captured right after that position's draw
+    const auto snap_cur_p = [&]() {
+        if (cur_p_out != nullptr) {
+            cur_p_out->emplace_back(gsmpl->cur_p.data, gsmpl->cur_p.data + gsmpl->cur_p.size);
+        }
+    };
+    if (cur_p_out != nullptr) {
+        cur_p_out->clear();
+    }
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -1528,9 +1636,60 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     const bool suppress_relaxed = common_sampler_spec_sampled_active();
     std::vector<pxa_spec_cand> p_cand;
 
+    // PXA_SPEC_BLOCK_VERIFY: a sampled block of two or more tokens, every one carrying its q, on a
+    // chain whose per-position target distribution does not depend on the not-yet-accepted drafts.
+    bool block_rule = sampled_rule && draft.size() >= 2 && pxa_spec_block_verify_enabled() &&
+                      pxa_spec_block_stateless(gsmpl);
+    if (block_rule) {
+        for (const auto & q : *draft_q) {
+            if (q.empty()) { block_rule = false; break; }
+        }
+    }
+    if (block_rule) {
+        const size_t n = draft.size();
+        std::vector<std::vector<pxa_spec_cand>> ps(n + 1);
+        for (size_t k = 0; k <= n; ++k) {
+            // the draw itself is discarded: only the post-chain window it leaves in cur_p is used
+            common_sampler_sample(gsmpl, ctx, idxs[k], grammar_first);
+            snap_cur_p();
+            const llama_token_data_array & cur_p = gsmpl->cur_p;
+            auto & pk = ps[k];
+            pk.reserve(cur_p.size);
+            for (size_t j = 0; j < cur_p.size; ++j) {
+                pk.push_back({ cur_p.data[j].id, cur_p.data[j].logit, 0.0f });
+            }
+            pxa_spec_sort(pk);
+            pxa_spec_softmax(pk);
+        }
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        std::vector<float> eta(n);
+        for (auto & e : eta) e = u01(gsmpl->rng);
+        const float u_res = u01(gsmpl->rng);
+        std::vector<int32_t> xs(draft.begin(), draft.end());
+        int32_t extra = -1;
+        const size_t t = pxa_spec_block_verify(ps, *draft_q, xs, eta, u_res, extra);
+        if (extra >= 0) {
+            if (cur_p_out != nullptr && cur_p_out->size() > t + 1) {
+                cur_p_out->resize(t + 1);
+            }
+            for (size_t k = 0; k <= t; ++k) {
+                const llama_token id = k < t ? draft[k] : extra;
+                gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
+                common_sampler_accept(gsmpl, ctx, id, true);
+                result.push_back(id);
+            }
+            return result;
+        }
+        // an empty target window cannot happen after a draw; if it does, run the per-token rule
+        if (cur_p_out != nullptr) {
+            cur_p_out->clear();
+        }
+    }
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        snap_cur_p();
 
         bool accept = (draft[i] == id);
 
@@ -1580,11 +1739,15 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
             // -- it is reached only when accept is already false, i.e. never matches. Keeping the
             // term makes the truncation claim true by construction rather than by inspection of
             // whichever sampler chain ran.
+            //
+            // Bug #213: the floor is a post-chain softmax MASS, so it is compared against the
+            // normalised probability the draw used. cur_p.p is exp(l - max) here (unnormalised: a
+            // 0.02 token under a 0.30 argmax read as 0.067 and passed a 0.05 floor).
             const llama_token_data_array & cur_p = gsmpl->cur_p;
             const float pmin = pxa_spec_relaxed_pmin();
             for (size_t j = 0; j < cur_p.size; ++j) {
                 if (cur_p.data[j].id == draft[i]) {
-                    if (cur_p.data[j].p >= pmin) {
+                    if (pxa_spec_cand_mass(cur_p.data, cur_p.size, j) >= (double) pmin) {
                         id = draft[i];   // keep the draft token — later positions condition on it
                         accept = true;
                     }
@@ -1606,6 +1769,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        snap_cur_p();
 
         gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
 
@@ -1650,6 +1814,10 @@ void common_expiring_logit_bias_apply(struct common_sampler* ctx_sampling, float
         );
     };
 
+    if (ctx_sampling->elb_idx >= ctx_sampling->elb_states.size() ||
+        ctx_sampling->elb_idx >= ctx_sampling->params.elb_params.size()) {
+        return; // bug server-elb-completion-segfault: never index past either table
+    }
     const auto& elb = ctx_sampling->elb_states[ctx_sampling->elb_idx];
 
     std::string combined_text;
@@ -1751,6 +1919,10 @@ void common_expiring_logit_bias_accept(struct common_sampler* ctx_sampling, stru
     }
 
     auto idx = ctx_sampling->elb_idx;
+    if (idx >= ctx_sampling->elb_states.size() || idx >= ctx_sampling->params.elb_params.size() ||
+        ctx_sampling->prev.empty()) {
+        return; // bug server-elb-completion-segfault: never index past either table
+    }
     auto& elb = ctx_sampling->elb_states[idx];
     if ((elb.delay > ++elb.countup) || (elb.search_word_len == 0)) {
         return;
@@ -1793,7 +1965,10 @@ void common_expiring_logit_bias_accept(struct common_sampler* ctx_sampling, stru
         }
     }
 
-    // prepare next sampler bias
+    // prepare next sampler bias (the last exit word moves elb_idx past the end: nothing left to arm)
+    if (ctx_sampling->elb_idx >= ctx_sampling->params.elb_params.size()) {
+        return;
+    }
     for (auto& entry: ctx_sampling->params.elb_params[ctx_sampling->elb_idx].entries) {
         // no clearance for sampler bias
         std::fill(entry.posi.begin(), entry.posi.end(), pos);

@@ -77,10 +77,9 @@ at `q8_0` rather than 4-bit.
 
 ## Status
 
-Validated on real hardware. All five gates below pass on both architectures — see
-`docs/VLLM.md` section 10 for the runs, and `docs/PXA-SM60-SERVING.md` and
-`docs/PXA-SM70-SERVING.md` for the measured sweeps behind the numbers. The gates, which is what
-each one proves:
+Pre-release. The implementation is complete and reviewed; it has **not** been executed
+against real weights on a GPU. Nothing here is validated hardware-in-the-loop yet.
+Ship gates before anyone should trust it:
 
 1. bit-exact dequant parity against a CPU reference
 2. single-linear-layer GEMM parity

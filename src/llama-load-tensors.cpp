@@ -4,7 +4,11 @@
 #include "llama-model.h"
 #include "pxa-pxq-split.h"
 #include "pxa-tsplit.h"
+#include "ggml-pxqn.h"
 #include "ggml.h"
+#ifdef GGML_USE_CUDA
+#  include "ggml-cuda.h"
+#endif
 
 
 #include <set>
@@ -241,8 +245,11 @@ struct create_tensors_helper : public create_tensors_helper_interface {
         if (model.splits.size() < 2 || ggml_backend_buft_is_host(model.buft_output.buft_matrix)) {
             return plain;
         }
+        // default-on since : the declines below are only warnings when the lever was asked for by
+        // name (an arch that never could take it is not news on every '-sm tensor' boot)
+        const bool asked = getenv("PXA_TSPLIT_LMHEAD") != nullptr;
         if (!pxa_tsplit_lmhead_arch_ok(model.arch)) {
-            LLAMA_LOG_WARN("%s: PXA_TSPLIT_LMHEAD is set but arch '%s' is not on the vocab-parallel "
+            if (asked) LLAMA_LOG_WARN("%s: PXA_TSPLIT_LMHEAD is set but arch '%s' is not on the vocab-parallel "
                     "head list: its graph builder does not resolve the head's per-device slices, so "
                     "the head stays single-device\n", __func__, llama_model_arch_name(model.arch));
             return plain;
@@ -258,12 +265,30 @@ struct create_tensors_helper : public create_tensors_helper_interface {
         if (model.mtp) {
             // With MTP, output_mtp falls back to model.output when the file carries no
             // output_extra.weight, and the MTP head's norm (shared_head_norm) is deliberately NOT
-            // replicated -- it must stay single-device to match a non-split lm_head. Splitting the
-            // head would make every device read that norm across the bus. The speculative head
-            // needs its own replication decision before this lever can cover it.
-            LLAMA_LOG_WARN("%s: PXA_TSPLIT_LMHEAD is set but this is an MTP model: the LM head stays "
-                    "single-device (the speculative head's norm is not replicated)\n", __func__);
-            return plain;
+            // replicated (see the note at the nextn mirroring below: replicating it would hand the
+            // non-split build_output a dummy base pointer). A SPLIT head does not need it replicated:
+            // build_output's split branch takes the single-device norm whenever the norm has no
+            // ->extra (the_norm = output_norm), so each device normalises its own copy of the hidden
+            // row against that one weight -- a 20 KB input copy per draft step, not a cross-device
+            // read of the head. Every logit row is still computed by the same kernel on the same
+            // row, so the split head is bit-identical to the single-device one, under MTP as well.
+            // PXA_TSPLIT_LMHEAD_MTP (default 1): let an MTP load split the head. =0 restores the
+            // single-device head under MTP exactly. A PXQ-panel head stays single-device under MTP:
+            // the multi-row draft batches need build_output's chunked head path (bug #204), which
+            // only the non-split branch has.
+            static const bool mtp_ok = [] {
+                const char * e = getenv("PXA_TSPLIT_LMHEAD_MTP");
+                return !(e && *e && atoi(e) == 0);
+            }();
+            const ggml_tensor * hm = ml.get_tensor_meta(head_name.c_str());
+            const bool pxq_head = hm && pxa_type_is_pxq_panel(hm->type);
+            if (!mtp_ok || pxq_head) {
+                if (asked) LLAMA_LOG_WARN("%s: PXA_TSPLIT_LMHEAD is set but this is an MTP model with %s: the LM head stays "
+                        "single-device\n", __func__, pxq_head ? "a PXQ-panel head" : "PXA_TSPLIT_LMHEAD_MTP=0");
+                return plain;
+            }
+            LLAMA_LOG_INFO("%s: PXA_TSPLIT_LMHEAD_MTP: vocab-parallel LM head under MTP (the draft head's norm stays "
+                    "single-device and is read as an input; =0 restores the single-device head)\n", __func__);
         }
         // The shape, answered from the FILE before anything is created. A head whose row count is
         // not a multiple of the granularity the splitter will use cannot be cut; that must be a
@@ -318,6 +343,23 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     std::vector<std::pair<std::regex, ggml_backend_buffer_type_t>> overrides;
 
+    // PXA_STREAM_WEIGHTS=layers|experts: selected layer weights live in pinned host RAM and are
+    // streamed to their device once per graph (ggml/src/ggml-cuda/pxa/pxa-stream.cuh).
+    int  stream_mode = 0;                     // 0 off, 1 layers, 2 experts
+    std::vector<char> stream_layer;           // per layer: stream its weights
+    size_t stream_min_bytes = 1u << 20;
+    bool stream_by_name = false;              // PXA_STREAM_WEIGHTS=auto|spill planner: model.pxa_place_names
+    std::map<std::pair<int,int>, size_t> stream_layer_bytes;   // (cuda device, layer) -> bytes
+    std::map<int, size_t> stream_max_tensor;                   // cuda device -> largest tensor
+    std::map<int, size_t> stream_dev_bytes;                    // cuda device -> total
+    ggml_backend_buffer_type_t stream_buft_for(const std::string & name, ggml_context * ctx);
+
+    // PXA_XCACHE: a planned layer's routed-expert tensor is created as a hot stack (this layer's
+    // context) + a cold stack (the device's CUDA<d>_Stream context); nullptr = not a split tensor
+    std::map<int, ggml_tensor *> xc_map_of_layer;
+    ggml_tensor * pxa_xc_create(ggml_context * ctx, const std::string & name, const std::vector<int64_t> & ne, int flags);
+    void pxa_xc_attach();
+
     inline ggml_context * ctx_for_buft(ggml_backend_buffer_type_t buft) {
         if (auto it = ctx_map.find(buft); it != ctx_map.end()) return it->second;
 
@@ -371,6 +413,73 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
             if (ggml_backend_buft_is_host(buft)) buft = default_cpu_buft;
             overrides.emplace_back(std::make_pair(std::regex(o->pattern), buft));
         }
+    }
+
+    if (const char * e = getenv("PXA_STREAM_WEIGHTS")) {
+        const std::string m = e;
+        stream_mode = m == "layers" ? 1 : m == "experts" ? 2 : 0;
+        // experts without PXA_STREAM_LAYERS is sized by the planner (below), like auto / spill
+        if (stream_mode == 2 && !getenv("PXA_STREAM_LAYERS")) stream_mode = 0;
+        if (stream_mode == 0 && m != "off" && m != "0" && !m.empty() && m != "auto" && m != "spill" && m != "experts") {
+            LLAMA_LOG_WARN("PXA_STREAM_WEIGHTS=%s not understood (auto|off|layers|experts|spill); streaming stays off\n", e);
+        }
+#ifndef GGML_USE_CUDA
+        if (stream_mode) { LLAMA_LOG_WARN("PXA_STREAM_WEIGHTS needs the CUDA backend; off\n"); stream_mode = 0; }
+#endif
+        if (stream_mode && model.split_mode != LLAMA_SPLIT_MODE_LAYER && model.split_mode != LLAMA_SPLIT_MODE_NONE) {
+            LLAMA_LOG_WARN("PXA_STREAM_WEIGHTS: only -sm layer / -sm none are supported (tensor/graph split keeps weights resident); off\n");
+            stream_mode = 0;
+        }
+    }
+    if (!stream_mode && !model.pxa_place_names.empty()) {
+        // the placement planner (src/llama-pxa-place.h) chose the tensors
+        stream_mode = model.pxa_place_mode == 2 ? 2 : 1;
+        stream_by_name = true;
+        stream_layer.assign(n_layer, 1);
+        stream_min_bytes = 0;
+    }
+    if (stream_mode && !stream_by_name) {
+        const int n_main = n_layer - (int)model.hparams.nextn_predict_layers;   // MTP/NextN layers stay resident
+        stream_layer.assign(n_layer, 0);
+        int lo = 0, hi = n_main - 1, stream_spread = -1;
+        if (const char * e = getenv("PXA_STREAM_LAYERS")) {
+            const std::string v = e;
+            const auto dash = v.find('-');
+            if (v == "all" || v.empty()) {
+            } else if (dash != std::string::npos) {
+                lo = std::max(0, atoi(v.substr(0, dash).c_str()));
+                hi = std::min(n_main - 1, atoi(v.substr(dash + 1).c_str()));
+            } else {
+                // N layers spread EVENLY over the stack: each streamed layer's copy then overlaps the
+                // compute of the resident layers around it. Streaming the last N instead makes the
+                // tail of the pass copy-bound, because the ring (about two layers) cannot prefetch
+                // the whole streamed block while the resident head computes: measured 810 vs 1022
+                // t/s at N=32/64, ub 2048 on a V100 (x4), where the copy alone would hide.
+                const int n = std::max(0, std::min(n_main, atoi(v.c_str())));
+                lo = 0; hi = n_main - 1;
+                stream_spread = n;
+            }
+        }
+        if (stream_spread >= 0) {
+            for (int i = 0; i < n_main; ++i) {
+                // layer i streams when the running quota n*(i+1)/n_main steps past n*i/n_main
+                if ((int64_t)stream_spread*(i + 1)/n_main > (int64_t)stream_spread*i/n_main) stream_layer[i] = 1;
+            }
+        } else {
+            for (int i = lo; i <= hi; ++i) stream_layer[i] = 1;
+        }
+        {
+            std::string list; int cnt = 0;
+            for (int i = 0; i < n_main; ++i) if (stream_layer[i]) { ++cnt; if (list.size() < 400) list += std::to_string(i) + " "; }
+            LLAMA_LOG_INFO("PXA_STREAM_WEIGHTS: %d streamed layers: %s\n", cnt, list.c_str());
+        }
+        if (const char * e = getenv("PXA_STREAM_MIN_MB")) stream_min_bytes = (size_t)(atof(e) * 1048576.0);
+        // experts mode: a decode-width batch reads only its routed experts, so reading them in place
+        // over PCIe moves a fraction of what copying every expert would. Dense layers are read in
+        // full either way, so layers mode keeps copying unless the env says otherwise.
+        if (stream_mode == 2 && !getenv("PXA_STREAM_ZC_NY")) setenv("PXA_STREAM_ZC_NY", "32", 0);
+        LLAMA_LOG_INFO("PXA_STREAM_WEIGHTS=%s: streaming layers %d..%d (of %d main layers), tensors >= %.2f MiB\n",
+                stream_mode == 1 ? "layers" : "experts", lo, hi, n_main, stream_min_bytes/1048576.0);
     }
 
     if (ml.ncmoe > 0) {
@@ -568,6 +677,13 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
             break;
         }
     }
+    if (stream_mode) {
+        bool overridden = false;
+        for (auto & o : overrides) if (std::regex_search(name, o.first)) { overridden = true; break; }
+        if (!overridden) {
+            if (auto buft = stream_buft_for(name, ctx)) ctx = ctx_for_buft(buft);
+        }
+    }
     //if (ml.tensor_buft_overrides) {
     //    for (const auto * overrides = ml.tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
     //        std::regex pattern(overrides->pattern);
@@ -583,8 +699,134 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
     return ctx;
 }
 
+ggml_backend_buffer_type_t create_tensors_helper::stream_buft_for(const std::string & name, ggml_context * ctx) {
+#ifdef GGML_USE_CUDA
+    if (name.compare(0, 4, "blk.") != 0) return nullptr;
+    const int il = atoi(name.c_str() + 4);
+    if (il < 0 || il >= (int)stream_layer.size() || !stream_layer[il]) return nullptr;
+    if (stream_by_name) {
+        if (!model.pxa_place_names.count(name)) return nullptr;
+    } else if (stream_mode == 2 && name.find("_exps") == std::string::npos) return nullptr;
+    const struct ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
+    if (!meta || ggml_n_dims(meta) < 2 || ggml_nbytes(meta) < stream_min_bytes) return nullptr;
+    // only weights that would otherwise sit on a CUDA device (the layer's matrix buffer)
+    ggml_backend_buffer_type_t lb = nullptr;
+    for (auto cand : { model.buft_layer[il].buft_matrix, model.buft_layer[il].buft }) {
+        auto it = ctx_map.find(cand);
+        if (it != ctx_map.end() && it->second == ctx) { lb = cand; break; }
+    }
+    if (!lb) return nullptr;
+    int dev = -1;
+    for (int d = 0; d < ggml_backend_cuda_get_device_count(); ++d) {
+        if (ggml_backend_cuda_buffer_type(d) == lb) { dev = d; break; }
+    }
+    if (dev < 0) return nullptr;
+    // R5: the pin budget is exceeded -- the chosen tensors go to (mmap'd) host RAM, today's -ot path
+    if (stream_by_name && model.pxa_place_cpu_instead) return default_cpu_buft;
+    auto buft = ggml_backend_cuda_stream_buffer_type(dev);
+    if (!buft) return nullptr;
+    const size_t nb = ggml_backend_buft_get_alloc_size(buft, meta);
+    size_t & lb_bytes = stream_layer_bytes[{dev, il}];
+    lb_bytes += nb;
+    size_t & mt = stream_max_tensor[dev];
+    mt = std::max(mt, nb);
+    stream_dev_bytes[dev] += nb;
+    size_t max_layer = 0;
+    for (auto & kv : stream_layer_bytes) if (kv.first.first == dev) max_layer = std::max(max_layer, kv.second);
+    // double buffering at layer granularity plus room for the largest tensor to wrap
+    ggml_backend_cuda_stream_set_ring(dev, 2*max_layer + mt + (size_t(32) << 20));
+    return buft;
+#else
+    GGML_UNUSED(name); GGML_UNUSED(ctx);
+    return nullptr;
+#endif
+}
+
+ggml_tensor * create_tensors_helper::pxa_xc_create(ggml_context * ctx, const std::string & name,
+        const std::vector<int64_t> & ne, int flags) {
+#ifdef GGML_USE_CUDA
+    if (model.pxa_xc.empty() || (flags & (llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_DUPLICATED))) return nullptr;
+    if (name.compare(0, 4, "blk.") != 0) return nullptr;
+    const int il = atoi(name.c_str() + 4);
+    if (il < 0 || il >= (int)model.pxa_xc.size() || model.pxa_xc[il].cold.empty()) return nullptr;
+    const char * kinds[] = { ".ffn_up_exps.weight", ".ffn_gate_exps.weight", ".ffn_down_exps.weight", ".ffn_gate_up_exps.weight" };
+    bool is_exp = false;
+    for (const char * k : kinds) {
+        const size_t kl = strlen(k);
+        if (name.size() > kl && name.compare(name.size() - kl, kl, k) == 0) is_exp = true;
+    }
+    if (!is_exp) return nullptr;
+    const ggml_tensor * meta = ml.check_tensor_dims(name, ne, !(flags & llama_model_loader::TENSOR_NOT_REQUIRED));
+    if (!meta) return nullptr;
+    const auto & xl = model.pxa_xc[il];
+    GGML_ASSERT(meta->ne[2] == (int64_t)(xl.hot.size() + xl.cold.size()) && meta->ne[3] == 1);
+    // the layer's CUDA device, from the buffer type behind ctx
+    int dev = -1;
+    for (auto & kv : ctx_map) {
+        if (kv.second != ctx) continue;
+        for (int d = 0; d < ggml_backend_cuda_get_device_count(); ++d) {
+            if (ggml_backend_cuda_buffer_type(d) == kv.first) { dev = d; break; }
+        }
+    }
+    if (dev < 0) {
+        throw std::runtime_error(format("PXA_XCACHE: '%s' is not on a CUDA device; set PXA_XCACHE=0", name.c_str()));
+    }
+    ggml_context * cold_ctx = ctx_for_buft(ggml_backend_cuda_stream_buffer_type(dev));
+    ggml_tensor * hot  = ggml_new_tensor_3d(ctx,      meta->type, meta->ne[0], meta->ne[1], (int64_t)xl.hot.size());
+    ggml_tensor * cold = ggml_new_tensor_3d(cold_ctx, meta->type, meta->ne[0], meta->ne[1], (int64_t)xl.cold.size());
+    ggml_format_name(hot,  "%s.xh", name.c_str());
+    ggml_format_name(cold, "%s.xc", name.c_str());
+    // the file's own tensor is consumed here and never allocated: pxa_xc_fill copies its slices
+    ml.n_created++;
+    ml.size_data -= ggml_nbytes(meta);
+    model.pxa_xc_fills.push_back({hot, cold, name, il});
+    if (!xc_map_of_layer.count(il)) {
+        ggml_tensor * m = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, meta->ne[2]);
+        ggml_format_name(m, "blk.%d.ffn_exps_xmap", il);
+        xc_map_of_layer[il] = m;
+        model.pxa_xc_maps.push_back({m, il});
+    }
+    return hot;
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(name); GGML_UNUSED(ne); GGML_UNUSED(flags);
+    return nullptr;
+#endif
+}
+
+// after the architecture created its tensors: hang each cold stack and the map on its layer
+void create_tensors_helper::pxa_xc_attach() {
+    if (model.pxa_xc.empty()) return;
+    for (const auto & f : model.pxa_xc_fills) {
+        auto & L = model.layers.at(f.il);
+        if      (L.ffn_up_exps      == f.hot) L.ffn_up_exps_xc      = f.cold;
+        else if (L.ffn_gate_exps    == f.hot) L.ffn_gate_exps_xc    = f.cold;
+        else if (L.ffn_down_exps    == f.hot) L.ffn_down_exps_xc    = f.cold;
+        else if (L.ffn_up_gate_exps == f.hot) L.ffn_up_gate_exps_xc = f.cold;
+        else throw std::runtime_error(format("PXA_XCACHE: '%s' was not stored as a routed-expert tensor of layer %d; set PXA_XCACHE=0",
+                f.src.c_str(), f.il));
+    }
+    for (int il = 0; il < (int)model.pxa_xc.size(); ++il) {
+        if (model.pxa_xc[il].cold.empty()) continue;
+        auto & L = model.layers.at(il);
+        auto it = xc_map_of_layer.find(il);
+        const bool updown = (L.ffn_up_exps_xc && L.ffn_gate_exps_xc) || L.ffn_up_gate_exps_xc;
+        if (it == xc_map_of_layer.end() || !updown || !L.ffn_down_exps_xc) {
+            // the plan counted this layer's experts out of VRAM: a layer left whole would not fit
+            throw std::runtime_error(format("PXA_XCACHE: layer %d's routed experts were not created through the split loader; "
+                    "set PXA_XCACHE=0", il));
+        }
+        L.ffn_exps_xmap = it->second;
+    }
+    LLAMA_LOG_INFO("PXA_XCACHE: %zu expert tensors split into hot + cold stacks over %zu layers\n",
+            model.pxa_xc_fills.size(), xc_map_of_layer.size());
+}
+
 ggml_tensor * create_tensors_helper::create_tensor(ggml_context * ctx, const std::string & name, const std::vector<int64_t> & ne,
         int flags, ggml_context ** actual_context) {
+    if (ggml_tensor * t = pxa_xc_create(ctx, name, ne, flags)) {
+        if (actual_context) *actual_context = ctx;
+        return t;
+    }
     ctx = get_context_for_tensor(ctx, name);
     if (actual_context) *actual_context = ctx;
     auto tensor = ml.create_tensor(ctx, name, ne, flags);
@@ -4843,6 +5085,17 @@ static void prepare_split_tensors(int split_dim, ggml_context * ctx, ggml_tensor
                 "'-sm layer'.",
                 tensor->name, ggml_type_name(tensor->type)));
         }
+        if (split_dim == 0) {
+            for (size_t i = 0; i < splits.size(); ++i) {
+                if (splits[i] > 0 && splits[i] < PXA_PXQ_MIN_SHARD_K_LLAMA) {
+                    throw std::runtime_error(format(
+                        "a tensor split would give device %zu a K shard of %d of the PXQ tensor '%s' (type %s), "
+                        "below the %d-element minimum the panel mat-vec kernels read unconditionally. Use "
+                        "fewer devices or a more even -ts for this file, or run '-sm layer'.",
+                        i, splits[i], tensor->name, ggml_type_name(tensor->type), PXA_PXQ_MIN_SHARD_K_LLAMA));
+                }
+            }
+        }
         if (split_dim == 1) {
             for (size_t i = 0; i < splits.size(); ++i) {
                 if (splits[i] > 0 && (splits[i] % PXA_PXQ_PANEL_ROWS) != 0) {
@@ -5026,6 +5279,29 @@ static void check_delta_split(ggml_tensor * t, llama_split_tensor & l_split) {
         GGML_ASSERT(ntot == extra->splits[is]->ne[extra->split_dim]);
         //auto data = &l_split.ranges[is];
         //std::memcpy(extra->splits[is]->op_params, &data, sizeof(data));
+    }
+    // The ranges of all devices together must tile [0, ne[split_dim]) exactly once: no element on two
+    // devices, none on none. check above only proves each device's count; a wrong 'first' would pass
+    // it and produce a split that is wrong without being detectably wrong.
+    {
+        const int64_t n = t->ne[extra->split_dim];
+        std::vector<uint8_t> seen((size_t) n, 0);
+        for (int is = 0; is < extra->n_device; ++is) {
+            for (auto & p : l_split.ranges[is]) {
+                GGML_ASSERT(p.first >= 0 && p.second >= 0 && (int64_t) p.first + p.second <= n);
+                for (int64_t j = p.first; j < (int64_t) p.first + p.second; ++j) {
+                    if (seen[j]) {
+                        GGML_ABORT("%s: split ranges overlap at element %lld on dim %d", t->name, (long long) j, extra->split_dim);
+                    }
+                    seen[j] = 1;
+                }
+            }
+        }
+        for (int64_t j = 0; j < n; ++j) {
+            if (!seen[j]) {
+                GGML_ABORT("%s: split ranges leave element %lld of dim %d on no device", t->name, (long long) j, extra->split_dim);
+            }
+        }
     }
     auto data = &l_split.ranges;
     std::memcpy(t->op_params, &data, sizeof(data));
@@ -5273,7 +5549,22 @@ static void split_recurrent_tensors(const llama_hparams & hparams, llama_layer &
         GGML_ASSERT(eff_head_v_dim % tt.blck_size == 0);
     }
     if (tt.row_meta_size > 0) {
-        GGML_ABORT("Quantization types with per row meta data are not supported for the ssm_out tensor when using split mode graph");
+        // A PXQ panel tier carries its per-row metadata as a 128-byte anchor header per 64-row
+        // panel that spans all of K, and the split uploader's explicit-ranges arm slices it
+        // panel-aware (pxa_pxq_k_slice_ranges_2d: header verbatim, then each range's slabs), so a
+        // K-splittable panel type is admitted here. Every other per-row-metadata type still has no
+        // ranges slicer, and prepare_split_tensors() keeps the ladder lever's refusal. Block alignment of
+        // every range is enforced by the slicer itself (it aborts naming the tensor).
+        if (!pxa_type_is_pxq_panel(layer.ssm_out->type)) {
+            GGML_ABORT("Quantization types with per row meta data are not supported for the ssm_out tensor when using split mode graph");
+        }
+        if (!pxa_pxq_k_split_ranges_ok(layer.ssm_out->type)) {
+            throw std::runtime_error(format(
+                "a tensor split cannot cut '%s' (type %s): a PXQ ssm_out is cut on dim 0 through explicit "
+                "ranges and that is turned off (PXA_TSPLIT_SSM_OUT_PANEL=0, or PXA_TSPLIT_KSPLIT_LADDER=0 "
+                "for a tier other than PXQ4). Unset the lever, or run '-sm layer'.",
+                layer.ssm_out->name, ggml_type_name(layer.ssm_out->type)));
+        }
     }
 
     auto split = create_split(num_k_heads, k_head_granularity, cur_splits, mem_used);
@@ -5588,6 +5879,8 @@ bool create_tensors_helper::create_tensors() {
             throw std::runtime_error("unknown architecture");
     }
 
+    pxa_xc_attach();
+
     if (getenv("GGML_CUDA_NO_PINNED") == nullptr) {
         use_mmap_buffer &= !has_buft_overrides;
     }
@@ -5893,10 +6186,67 @@ bool create_tensors_helper::create_tensors() {
                         // still a whole panel -- but the base vector must still be panel-aligned.
                         ffn_granularity = std::max(ffn_granularity, pxa_split_granularity(layer.ffn_up_gate_exps->type, 16));
                     }
+                    // K-STRADDLE (pxa-pxq-split.h): a PXQN down with K blocks wider than a panel
+                    // (128-K slabs) would force the n_ff cut onto 128 (640 -> 384/256, every layer waiting on the
+                    // 384 device). Cut at panel granularity instead; when a cut then falls INSIDE a down K block,
+                    // that block goes to both devices (explicit K ranges) and each shard carries its K window.
+                    // Every other tensor, and every cut that lands on a block boundary, keeps the slicing below.
+                    std::vector<int> down_split;
+                    if (pxa_kstraddle_enabled() && layer.ffn_up_exps && layer.ffn_gate_exps && !layer.ffn_up_gate_exps &&
+                        !layer.ffn_up_exps_b && !layer.ffn_gate_exps_b && !layer.ffn_down_exps_b && !layer.ffn_up_gate_exps_b &&
+                        pxa_type_is_pxqn(layer.ffn_down_exps->type) &&
+                        pxa_pxq_type_is_panel(layer.ffn_up_exps->type) && pxa_pxq_type_is_panel(layer.ffn_gate_exps->type) &&
+                        !(model.hparams.pxqn_rot_sites & PXQN_SITE_BIT(PXQN_SITE_DOWN_IN)) &&
+                        layer.ffn_down_exps->ne[3] == 1 && layer.ffn_down_exps->ne[1] % PXA_PXQ_PANEL_ROWS == 0) {
+                        const int kb   = (int) ggml_blck_size(layer.ffn_down_exps->type);
+                        const int rg   = PXA_PXQ_PANEL_ROWS;
+                        const int n_ff = (int) layer.ffn_down_exps->ne[0];
+                        if (kb > rg && kb % rg == 0 && n_ff % kb == 0 && ffn_granularity == kb) {
+                            auto fs = create_split(n_ff, rg, cur_splits, mem_used);
+                            bool inside = false;
+                            for (int i = 0, a = 0; i < (int) fs.size(); ++i) {
+                                if (fs[i] > 0 && ((a % kb) != 0 || ((a + fs[i]) % kb) != 0)) inside = true;
+                                a += fs[i];
+                            }
+                            if (inside) {
+                                auto & ranges = layer.split_ffn_down_exps.ranges;
+                                ranges.assign(fs.size(), {});
+                                down_split.assign(fs.size(), 0);
+                                std::vector<int> lo(fs.size(), 0), hi(fs.size(), 0);
+                                for (int i = 0, a = 0; i < (int) fs.size(); ++i) {
+                                    if (fs[i] == 0) continue;
+                                    const int b = a + fs[i];
+                                    const int s0 = a/kb*kb, s1 = (b + kb - 1)/kb*kb;
+                                    down_split[i] = s1 - s0;
+                                    ranges[i].push_back({ s0, s1 - s0 });
+                                    lo[i] = a - s0; hi[i] = b - s0;
+                                    a = b;
+                                }
+                                ffn_split = fs;
+                                prepare_split_tensors(0, ctx_split, layer.ffn_down_exps, layer.split_ffn_down_exps, down_split, mem_used);
+                                // the uploader's explicit-ranges arm reads this pointer (same contract as check_delta_split)
+                                auto data = &layer.split_ffn_down_exps.ranges;
+                                std::memcpy(layer.ffn_down_exps->op_params, &data, sizeof(data));
+                                for (int i = 0; i < (int) fs.size(); ++i) {
+                                    if (layer.split_ffn_down_exps.tensor_splits[i]) {
+                                        pxa_kwin_set(layer.split_ffn_down_exps.tensor_splits[i], lo[i], hi[i]);
+                                    }
+                                }
+                                std::string m;
+                                for (int i = 0; i < (int) fs.size(); ++i) {
+                                    if (fs[i] > 0) m += format(" dev%d n_ff %d, down K [%d,%d) window [%d,%d);", i, fs[i],
+                                                               ranges[i][0].first, ranges[i][0].first + ranges[i][0].second, lo[i], hi[i]);
+                                }
+                                LLAMA_LOG_INFO("PXA_TSPLIT: K-straddle %s (%d-K blocks):%s\n", layer.ffn_down_exps->name, kb, m.c_str());
+                            }
+                        }
+                    }
+                    if (down_split.empty()) {
                     ffn_split = create_split(layer.ffn_down_exps->ne[0], ffn_granularity, cur_splits, mem_used);
                     LLAMA_LOG_DEBUG("  split_ffn_exps:"); for ([[maybe_unused]] auto s : ffn_split) LLAMA_LOG_DEBUG(" %d", s);
                     LLAMA_LOG_DEBUG("\n");
                     prepare_split_tensors(0, ctx_split, layer.ffn_down_exps, layer.split_ffn_down_exps, ffn_split, mem_used);
+                    }
                     if (layer.ffn_up_gate_exps) {
                         auto up_gate_split = ffn_split;
                         for (auto & v : up_gate_split) v *= 2;
