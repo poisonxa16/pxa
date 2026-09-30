@@ -326,5 +326,5 @@ python3 tools/pxa-launch.py --model your-model.gguf --cards 0,1 --explain
 
 Prebuilt Linux x86-64 CUDA 12 binaries are attached to each
 [release](https://github.com/poisonxa16/pxa/releases), and container images are
-described in [`docker.md`](docker.md). `./install.sh` reads your card with `nvidia-smi` and
-names the supported path rather than guessing.
+described in [`docker.md`](docker.md). `./install.sh` checks your card with `nvidia-smi` and
+installs the matching release tarball (or pulls the container image with `--docker`).
