@@ -12350,6 +12350,27 @@ struct llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // PXA_DN_CONVFUSE is a tensor-split lever: the fused delta-net conv cluster measured -31% (1x V100)
+    // and -21% (1x P100) decode on a single device, +4-5% on a tensor-split pair (27B, 2026-09-29).
+    // Every tool (server, cli, bench) reaches here before the first graph runs, so the default is
+    // decided once, per process, from the model's split mode. An explicit PXA_DN_CONVFUSE always wins.
+    if (!getenv("PXA_DN_CONVFUSE") && !model->pxa_tsplit) {  // -sm tensor resolves to ATTN + pxa_tsplit (see the loader)
+        setenv("PXA_DN_CONVFUSE", "0", 0);
+        LLAMA_LOG_INFO("%s: PXA_DN_CONVFUSE=0 (no tensor split: the fused delta-net conv is slower on a single device)\n", __func__);
+    }
+
+    // PXA_PXQN_RHT_FUSE (RHT->GEMV fusion) off on one V100: measured -5..8% decode on the one-card 27B and
+    // PXQN4 (32.3-33.4 vs 34.8-35.0 t/s), greedy sha identical. The server's registry already picked this,
+    // but llama-bench and llama-cli never run the registry, so the default lives here with the one above.
+    // Pairs and P100 are unmeasured and keep the fusion. An explicit PXA_PXQN_RHT_FUSE always wins.
+#if defined(GGML_USE_CUDA)
+    if (!getenv("PXA_PXQN_RHT_FUSE") && ggml_pxa_config_level() >= 2 && model->devices.size() == 1 &&
+        ggml_backend_cuda_get_device_cc(model->devices[0]) == 700) {
+        setenv("PXA_PXQN_RHT_FUSE", "0", 0);
+        LLAMA_LOG_INFO("%s: PXA_PXQN_RHT_FUSE=0 (one V100: the RHT->GEMV fusion is slower on a single sm_70)\n", __func__);
+    }
+#endif
+
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;

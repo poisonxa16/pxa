@@ -316,6 +316,8 @@ llama_build(test-pxq-ksplit.cpp)
 target_include_directories(test-pxq-ksplit PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 target_link_libraries(test-pxq-ksplit PRIVATE ggml)
 llama_test(test-pxq-ksplit)
+llama_build(test-pxa-tsplit-bounds.cpp)
+llama_test(test-pxa-tsplit-bounds)
 
 # PXA core step 3 (2026-09-25): the engine's own serve-flag defaults over a case table (pure, no GPU),
 # and the lever catalog covering every PXA_*/PXQ_* lever in the tree.

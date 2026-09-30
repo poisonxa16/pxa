@@ -508,9 +508,8 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
                         ((const ggml_split_tensor_t *)model.layers[il].ffn_gate_inp_s->extra)->splits[id], hparams.f_norm_rms_eps);
                 cb(tmp, "tmp", il_cb);
                 auto logits = llm.llm_build_lora_mm(lctx, ctx0, ((const ggml_split_tensor_t *)model.layers[il].ffn_gate_inp->extra)->splits[id], tmp);
-                // see the twin comment on the single-device path below: the router input is
-                // L2-normalised, so the logits carry a 1/sqrt(n_embd) factor.
-                logits = ggml_scale(ctx0, logits, 1.0f/sqrtf((float) hparams.n_embd));
+                // no extra 1/sqrt(n_embd) here: llm_scale_gate_inp_s() (llama.cpp) already folds it into
+                // ffn_gate_inp.scale at load, which makes the router input L2-normalised. See the twin note below.
                 cb(logits, "logits", il_cb);
                 ggml_build_forward_expand(gf, logits);
 
@@ -987,13 +986,11 @@ ggml_cgraph * llm_build_context::build_gemma4() {
             auto tmp = ggml_fused_rms_norm(ctx0, attn_out, model.layers[il].ffn_gate_inp_s, hparams.f_norm_rms_eps);
             cb(tmp, "tmp", il);
             auto logits = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
-            // The router input is L2-normalised, not RMS-normalised: the reference divides the
-            // RMS-normalised hidden state by sqrt(n_embd), which turns x/rms(x) into x/||x||.
-            // Without it every routed logit is sqrt(n_embd) (=53 at n_embd 2816) too large and the
-            // softmax that produces the expert weights is that much too sharp. Applied to the
-            // logits rather than to the 2816-wide input because the projection is linear and the
-            // logit vector is n_expert (128) wide.
-            logits = ggml_scale(ctx0, logits, 1.0f/sqrtf((float) hparams.n_embd));
+            // The router input must be L2-normalised (x/||x|| * scale), i.e. the RMS norm carries an extra
+            // 1/sqrt(n_embd). That factor is folded into blk.N.ffn_gate_inp.scale at load by
+            // llm_scale_gate_inp_s() (llama.cpp), so it is NOT applied again to the logits. Applying it twice
+            // (2026-09-20 .. this fix) made every routed softmax ~uniform (1/128 per expert):
+            // English chat survived, non-English text (Finnish) came out with malformed words.
             cb(logits, "ffn_moe_logits", il);
 
             cur_moe = llm_build_moe_ffn(ctx0, lctx, cur_moe,

@@ -5,15 +5,15 @@ variable "CUDA_VERSION" { default = "12.6.2" }
 
 target "server" {
   inherits = ["settings"]
-  dockerfile = "${VARIANT == "cpu" ? "./docker/ik_llama-cpu.Containerfile" : "./docker/ik_llama-cuda.Containerfile"}"
+  dockerfile = "${VARIANT == "cpu" ? "./docker/pxa-cpu.Containerfile" : "./docker/pxa-cuda.Containerfile"}"
 }
 
 target "swap" {
   inherits = ["settings"]
-  dockerfile = "${VARIANT == "cpu" ? "./docker/ik_llama-cpu.Containerfile" : "./docker/ik_llama-cuda.Containerfile"}"
+  dockerfile = "${VARIANT == "cpu" ? "./docker/pxa-cpu.Containerfile" : "./docker/pxa-cuda.Containerfile"}"
 }
 
 target "full" {
   inherits = ["settings"]
-  dockerfile = "${VARIANT == "cpu" ? "./docker/ik_llama-cpu.Containerfile" : "./docker/ik_llama-cuda.Containerfile"}"
+  dockerfile = "${VARIANT == "cpu" ? "./docker/pxa-cpu.Containerfile" : "./docker/pxa-cuda.Containerfile"}"
 }

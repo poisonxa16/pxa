@@ -224,6 +224,13 @@ canvas.chart{width:100%;height:260px;display:block}
   .dirpill{max-width:100%}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.rpd{width:min(860px,94vw);max-height:92vh;border:1px solid var(--line-2);border-radius:14px;background:var(--surface);color:var(--text);padding:var(--s5);box-shadow:var(--shadow)}
+.rpd::backdrop{background:rgba(0,0,0,.55)}
+.rpd h2{margin:0 0 6px}.rpd p{margin:0 0 var(--s3);color:var(--dim);font-size:var(--fs-1)}
+.rpd textarea{width:100%;min-height:300px;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:10px;resize:vertical;box-sizing:border-box;white-space:pre}
+.rpd input{width:100%;box-sizing:border-box;height:36px;background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:0 10px;margin:4px 0 var(--s3)}
+.rpd .row{display:flex;gap:var(--s2);justify-content:flex-end;flex-wrap:wrap;margin-top:var(--s3)}
+.rpd .msg{margin-top:var(--s3);font-weight:600}.rpd .msg.ok{color:var(--ok,#3fb950)}.rpd .msg.bad{color:var(--bad)}
 </style>
 </head>
 <body>
@@ -238,6 +245,9 @@ canvas.chart{width:100%;height:260px;display:block}
   </nav>
   <span class="sp"></span>
   <span class="pill" id="health" title="server health" role="status" aria-live="polite"><span class="dot" id="hdot"></span><span id="htext">no server</span></span>
+  <a class="b" href="https://discord.gg/EqazvV9tf" target="_blank" rel="noopener" title="PXA Network Discord: help, news, benchmarks" style="text-decoration:none">Discord</a>
+  <a class="b" href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener" title="support PXA development on Ko-fi" style="text-decoration:none">&#9829; Support PXA</a>
+  <button class="b" id="rp-open" title="send a bug report to the PXA team (you review it first)">Report a problem</button>
   <button class="icon" id="theme" title="switch light / dark" aria-label="switch light or dark theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>
 </header>
 <main>
@@ -379,6 +389,15 @@ canvas.chart{width:100%;height:260px;display:block}
       <a id="sp-link" href="/api/engine/pxa/speed" target="_blank" rel="noopener" style="margin-left:auto;font-size:var(--fs-1)">server's own /pxa/speed page &#8599;</a>
     </div>
     <pre class="out" id="bn-lines" style="margin-top:10px;max-height:160px" hidden></pre>
+    <button class="b" id="hs-check" hidden title="asks the PXA community board for the record on your setup (card type, count, model, mode); nothing is sent until you press this">Check the community high-score board</button>
+    <div id="hs" hidden style="margin-top:10px;padding:12px;border:1px solid var(--line-2);border-radius:10px">
+      <strong id="hs-title">New high score!</strong>
+      <p class="tiny" id="hs-sub" style="margin:4px 0 8px"></p>
+      <label class="f" style="max-width:340px">Name for the board (optional, max 32 characters; no links)<input id="hs-name" maxlength="32" autocomplete="off" placeholder="anonymous"></label>
+      <p class="tiny" style="margin:8px 0 4px">This is exactly what will be sent (self-reported and redacted; the name above is the only personal part):</p>
+      <textarea id="hs-body" readonly spellcheck="false" rows="9" style="width:100%;box-sizing:border-box;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:8px"></textarea>
+      <div class="row" style="margin-top:8px"><button class="b pri" id="hs-send">Submit to the board</button><button class="b" id="hs-skip">Not now</button><span id="hs-msg" class="tiny" role="status" aria-live="polite"></span></div>
+    </div>
     <div class="tw" style="margin-top:10px"><table><thead><tr><th>When</th><th>Model</th><th>Cards</th><th>prose dec t/s</th><th>edit dec t/s</th><th>long dec t/s</th><th>long prefill t/s</th><th>greedy512</th></tr></thead><tbody id="bn-hist"></tbody></table></div>
   </div>
 </section>
@@ -409,6 +428,16 @@ canvas.chart{width:100%;height:260px;display:block}
   </div>
 </section>
 </main>
+<dialog class="rpd" id="rp" aria-labelledby="rp-h">
+  <h2 id="rp-h">Report a problem</h2>
+  <p>This is exactly what will be sent to the PXA team, and nothing else. Home paths, host names, IPs, user names and anything that looks like a key were already removed. You can edit it. Nothing is sent until you press Send.</p>
+  <label class="tiny" for="rp-contact">Contact, optional (your Discord name, so we can ask you a question)</label>
+  <input id="rp-contact" maxlength="100" autocomplete="off" placeholder="e.g. name#1234 or @name">
+  <label class="tiny" for="rp-body">Report (JSON, editable)</label>
+  <textarea id="rp-body" spellcheck="false" aria-label="the exact report"></textarea>
+  <div class="msg" id="rp-msg" role="status" aria-live="polite"></div>
+  <div class="row"><button class="b" id="rp-copy">Copy report</button><button class="b" id="rp-cancel">Close</button><button class="b pri" id="rp-send">Send</button></div>
+</dialog>
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
 <script>
@@ -453,6 +482,45 @@ function segInit(seg, onchange) {
   $$("button", seg).forEach(b => b.addEventListener("click", () => { set(b.dataset.v); onchange && onchange(b.dataset.v); }));
   set(seg.dataset.v); seg.setv = set;
 }
+
+// ---------------- report a problem ----------------
+(function () {
+  const dlg = $("#rp"), body = $("#rp-body"), msg = $("#rp-msg"), contact = $("#rp-contact"), send = $("#rp-send");
+  const say = (t, cls) => { msg.textContent = t; msg.className = "msg" + (cls ? " " + cls : ""); };
+  function currentPayload() {                 // the box text is the source of truth; the contact box only fills its field
+    const o = JSON.parse(body.value);
+    if (o && typeof o === "object") o.contact = contact.value.trim();
+    return o;
+  }
+  function refreshBody() {                    // keep the preview exact when the contact field changes
+    try { const o = JSON.parse(body.value); o.contact = contact.value.trim(); body.value = JSON.stringify(o, null, 2); } catch (e) { /* user is mid-edit */ }
+  }
+  contact.addEventListener("change", refreshBody);
+  $("#rp-open").addEventListener("click", async () => {
+    say("Building the report...", ""); body.value = ""; send.disabled = true; send.textContent = "Send";
+    dlg.showModal();
+    try {
+      const b = await api("/api/report/bundle");
+      body.value = JSON.stringify(b, null, 2); say("Review it, then press Send.", ""); send.disabled = false;
+    } catch (e) { say("Could not build the report: " + e.message, "bad"); }
+  });
+  $("#rp-cancel").addEventListener("click", () => dlg.close());
+  $("#rp-copy").addEventListener("click", async () => {
+    try { refreshBody(); await navigator.clipboard.writeText(body.value); say("Copied. Paste it into #support on the PXA Network Discord.", "ok"); }
+    catch (e) { body.select(); say("Select all and copy by hand (Ctrl+C).", "bad"); }
+  });
+  send.addEventListener("click", async () => {
+    let payload;
+    try { payload = currentPayload(); } catch (e) { say("The report is not valid JSON: " + e.message, "bad"); return; }
+    send.disabled = true; say("Sending...", "");
+    try {
+      const r = await api("/api/report/send", {body: {payload}});
+      if (r.ok) { say("Sent. Report id: " + r.id + " (quote it if you talk to us).", "ok"); send.textContent = "Sent"; return; }
+      say("Could not send: " + (r.error || "unknown error") + ". Use Copy report and post it in #support instead.", "bad");
+    } catch (e) { say("Could not send: " + e.message + ". Use Copy report and post it in #support instead.", "bad"); }
+    send.disabled = false;
+  });
+})();
 
 // ---------------- theme ----------------
 function applyTheme(t, keep) { document.documentElement.dataset.theme = t; if (keep) store.set("theme", t); if (S.speedData) drawSpeed(); }
@@ -871,6 +939,33 @@ function renderSpeedTables() {
     return el("tr", {}, el("td", {text: m}), el("td", {text: b}), el("td", {text: g.length}), el("td", {text: fmtNum(median(g.map(r => r.decode)))}), el("td", {text: fmtNum(median(g.map(r => r.prefill)))})); })
     : [el("tr", {}, el("td", {colspan: 5, class: "empty", text: "nothing measured in this range yet"}))]));
 }
+// community high-score board: never automatic; the record check runs only on a click, and a submit needs a second click
+const HS = {payload: null, shownFor: null};
+async function checkHighScore(ts) {
+  if (HS.shownFor === ts) return;
+  HS.shownFor = ts;
+  try {
+    const c = await api("/api/score/check");
+    if (!c.available || c.error || !c.beats) return;
+    HS.payload = c.payload;
+    $("#hs-sub").textContent = (c.record ? "Beats the record of " + c.record.decode.toFixed(1) + " t/s by " + c.record.name : "First entry for this setup") +
+      " (" + c.payload.metrics.decode_tps + " t/s decode).";
+    $("#hs-msg").textContent = ""; $("#hs-send").disabled = false; $("#hs").hidden = false; renderHs();
+  } catch (e) { /* the board is optional */ }
+}
+function renderHs() { const p = Object.assign({}, HS.payload); p.name = $("#hs-name").value.trim(); $("#hs-body").value = JSON.stringify(p, null, 2); }
+$("#hs-name").addEventListener("input", renderHs);
+$("#hs-skip").addEventListener("click", () => { $("#hs").hidden = true; });
+$("#hs-send").addEventListener("click", async () => {
+  const p = Object.assign({}, HS.payload); p.name = $("#hs-name").value.trim();
+  $("#hs-send").disabled = true; $("#hs-msg").textContent = "Sending...";
+  try {
+    const r = await api("/api/score/send", {body: {payload: p}});
+    if (r.ok) { $("#hs-msg").textContent = r.status === "flagged" ? "Received. It is held for a quick review before it shows on the board." : "On the board" + (r.rank ? " at rank " + r.rank : "") + "."; return; }
+    $("#hs-msg").textContent = "Could not submit: " + (r.error || "unknown error");
+  } catch (e) { $("#hs-msg").textContent = "Could not submit: " + e.message; }
+  $("#hs-send").disabled = false;
+});
 async function loadBench() {
   try {
     const d = await api("/api/bench"), j = d.job;
@@ -882,6 +977,7 @@ async function loadBench() {
         el("td", {text: fmtNum(c("long").prefill_tps)}), el("td", {class: "mono", text: r.greedy512_sha ? r.greedy512_sha.slice(0, 12) : "-"})); })
       : [el("tr", {}, el("td", {colspan: 8, class: "empty", text: "no benchmark yet"}))]));
     if (j.running) setTimeout(loadBench, 1500); else if (j.error) toast("benchmark: " + j.error, true);
+    else if (j.result && Date.now() / 1000 - j.result.ts < 600 && HS.shownFor !== j.result.ts) { const hb = $("#hs-check"); hb.hidden = false; hb.onclick = () => { hb.hidden = true; checkHighScore(j.result.ts); }; }
   } catch (e) { /* optional */ }
 }
 $("#bn-run").addEventListener("click", async () => {

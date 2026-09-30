@@ -430,6 +430,111 @@ class SeatProcess(unittest.TestCase):
         self.assertFalse(s.stop())
 
 
+class Redaction(unittest.TestCase):
+    """the bug-report bundle leaves the machine only after redact_obj()."""
+    H, U = {"rigbox"}, {"alice"}
+
+    def r(self, s):
+        return C.redact_text(s, self.H, self.U)
+
+    def test_home_paths(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(self.r(home + "/models/x.gguf"), "~/models/x.gguf")
+        self.assertEqual(self.r("/home/bob/pxa/x"), "~/pxa/x")
+        self.assertEqual(self.r("/Users/carol/Library/x"), "~/Library/x")
+        self.assertEqual(self.r("C:\\Users\\dave\\m.gguf"), "~\\m.gguf")
+        self.assertEqual(self.r("/" + "root/m.gguf"), "~/m.gguf")
+
+    def test_ips_hosts_users_mail(self):
+        out = self.r("server 192.168.1.50:8080 from 10.0.0.7 and 127.0.0.1, host rigbox user alice mail a.b@example.com")
+        for bad in ("192.168.1.50", "10.0.0.7", "rigbox", "alice", "example.com"):
+            self.assertNotIn(bad, out)
+        self.assertIn("127.0.0.1", out)
+        self.assertIn("<ip>:8080", out)
+        self.assertNotIn("fe80", self.r("addr fe80::1c2b:3aff:fe4d:5e6f end"))
+        self.assertNotIn("aa:bb:cc:dd:ee:ff", self.r("mac aa:bb:cc:dd:ee:ff"))
+
+    def test_secrets(self):
+        cases = ["--api-key sk-abcdefghijklmnop1234", "--api-key=hunter2hunter2", "Authorization: Bearer abcdef0123456789xyz",
+                 "HF_TOKEN=hf_" + "a" * 30, "token: abcdEFGH12345678", "password = 'p4ssw0rd!'",
+                 "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abc123def456",
+                 "ghp_" + "Z" * 36, "MTIzNDU2Nzg5MDEyMzQ1Njc4" + "." + "GabcdE" + "." + "abcdefghijklmnopqrstuvwxyz0123",
+                 "key AbCdEf0123456789AbCdEf0123456789xyz"]
+        for c in cases:
+            out = self.r(c)
+            self.assertIn("<redacted", out, c)
+            for frag in ("hunter2", "sk-abc", "abcdef0123456789xyz", "hf_aaaa", "abcdEFGH", "p4ssw0rd", "eyJhbGci", "ghp_ZZ",
+                         "GabcdE", "AbCdEf0123456789AbCdEf"):
+                self.assertNotIn(frag, out, c)
+
+    def test_keeps_useful_diagnostics(self):
+        for keep in ("PXA_TSPLIT: mode=tensor devs=2", "prompt eval time = 812.4 ms / 2048 tokens", "n_tokens = 512",
+                     "llama_model_loader: loaded meta data with 41 key-value pairs", "CUDA error: out of memory",
+                     "greedy512 sha 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "Tesla V100-SXM2-16GB cc 70",
+                     "driver 535.104.05 CUDA 12.2"):
+            self.assertEqual(self.r(keep), keep)
+
+    def test_idempotent_and_recursive(self):
+        o = {"a": ["/home/bob/x", {"k": "10.1.2.3"}], "n": 5, "log": ["--api-key abcdefgh12345"]}
+        once = C.redact_obj(o, self.H, self.U)
+        self.assertEqual(once, C.redact_obj(once, self.H, self.U))
+        self.assertNotIn("bob", json.dumps(once))
+        self.assertNotIn("10.1.2.3", json.dumps(once))
+        self.assertEqual(once["n"], 5)
+
+
+class ReportBundle(unittest.TestCase):
+    def setUp(self):
+        self.app = C.App(L, port=0, models_dirs=[MODELS])
+
+    def test_bundle_shape_and_send_failure_is_reported(self):
+        self.app.seat._append("PXA_REGISTRY: card 0 sm 60 class=p100")
+        self.app.seat._append("build: 4711 (abc1234)")
+        self.app.seat._append("using key sk-abcdefghijklmnop1234 at /home/bob/x")
+        b = self.app.report_bundle()
+        self.assertEqual((b["app"], b["version"]), ("pxa-control", C.CONTROL_VERSION))
+        bu = b["bundle"]
+        self.assertTrue(any("PXA_REGISTRY" in x for x in bu["banner"]))
+        self.assertEqual(bu["engine"]["version"], "4711 (abc1234)")
+        self.assertEqual(len(bu["gpus"]), 2)
+        self.assertNotIn("sk-abc", json.dumps(b))
+        self.assertNotIn("/home/bob", json.dumps(b))
+        old = os.environ.get("PXA_BUG_URL")
+        os.environ["PXA_BUG_URL"] = "http://127.0.0.1:1/v1/report"     # nothing listens
+        try:
+            r = self.app.report_send({"payload": b})
+        finally:
+            os.environ.pop("PXA_BUG_URL") if old is None else os.environ.__setitem__("PXA_BUG_URL", old)
+        self.assertFalse(r["ok"])
+        self.assertIn("could not reach", r["error"])
+        with self.assertRaises(C.Invalid):
+            self.app.report_send({"payload": "{not json"})
+        with self.assertRaises(C.Invalid):
+            self.app.report_send({"payload": {"x": "y" * (C.REPORT_MAX + 10)}})
+
+
+class ScoreBoardClient(unittest.TestCase):
+    def test_name_filter_matches_board(self):
+        for bad in ("http://x.example", "see example.com", "@everyone", "f u c k", "sh1t", "<b>", ""):
+            self.assertEqual(C.clean_board_name(bad), "", bad)
+        self.assertEqual(C.clean_board_name("  Pat O'Neil "), "Pat O'Neil")
+        self.assertEqual(len(C.clean_board_name("y" * 90)), 32)
+
+    def test_payload_shape_and_redaction(self):
+        app = C.App(L, port=0, models_dirs=[MODELS])
+        app.seat.cmd = ["llama-server", "-m", FAKE_MODEL, "-sm", "tensor", "--api-key", "sk-abcdefghijklmnop1234"]
+        app.seat.req = {"model": FAKE_MODEL, "gpus": [0, 1], "port": 8999}
+        res = {"ts": 1.0, "model": FAKE_MODEL, "cards": [0, 1], "reps": 3, "greedy512_sha": "ab" * 32,
+               "classes": [{"class": "prose", "decode_tps": 41.5, "prefill_tps": 0, "n_prompt": 20, "decode_all": [41, 42], "prefill_all": []},
+                           {"class": "long", "decode_tps": 30.0, "prefill_tps": 900.0, "n_prompt": 8000, "decode_all": [], "prefill_all": [900]}]}
+        p = app.score_payload(res, "Zed")
+        self.assertEqual((p["bracket"]["mode"], p["bracket"]["gpu_count"], p["name"]), ("tensor", 2, "Zed"))
+        self.assertEqual((p["metrics"]["decode_tps"], p["metrics"]["prefill_tps"]), (41.5, 900.0))
+        self.assertNotIn("sk-abc", json.dumps(p))
+        self.assertRegex(p["bracket"]["model_sha8"], r"^[0-9a-f]{8}$")
+        self.assertEqual(app.score_check()["available"], False)          # no benchmark run on this App yet
+
+
 if __name__ == "__main__":
     try:
         unittest.main(verbosity=2)

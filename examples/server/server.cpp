@@ -1993,7 +1993,19 @@ static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params
                     // The measured spelling, key for key: the alias resolves to ngram_mod and every
                     // knob it would have filled is named here, so this stage is byte for byte the
                     // --spec-type the winning arm ran.
-                    static const char * const ngram_alone_stage = "ngram:n_max=64,n_min=2,ngram_size_n=24";
+                    // n_max 64 -> 8 (2026-09-29, v2026.10.1). The 64-token drafts were measured on
+                    // re-generated text in one boot; on sampled first-pass traffic they collapse
+                    // (a user's 9B at temp 0.7: 80 -> 19 t/s, 33% acceptance), and the gate's
+                    // 10-request sampled sequence on 2x P100 9B tensor split read prose 65-75 t/s
+                    // armed at 64 against 77.7 with no speculation. The same sequence at n_max=8
+                    // read prose 78.0-78.3 (no loss) and edits 74-85 (vs 77.9): the draft a miss
+                    // can waste is bounded. PXA_SPEC_NGRAM_NMAX restores any other depth.
+                    static std::string ngram_alone_stage_s = [] {
+                        const char * e = getenv("PXA_SPEC_NGRAM_NMAX");
+                        const int n = e && atoi(e) > 0 ? atoi(e) : 8;
+                        return "ngram:n_max=" + std::to_string(n) + ",n_min=2,ngram_size_n=24";
+                    }();
+                    const char * const ngram_alone_stage = ngram_alone_stage_s.c_str();
                     // The fourth constant has no stage knob. The streak-3 full-map wipe lives in
                     // common/speculative.cpp and reads PXA_NGRAM_RESET_STREAK once, from the
                     // environment; every arm in the table above ran with it at 0, and turning it off

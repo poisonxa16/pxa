@@ -3,7 +3,7 @@
 ## The one engine
 
 **`poisonxa16/pxa`** (public, standalone) — THE engine and THE product. One codebase,
-one name, in the `llama.cpp` -> `ik_llama.cpp` -> `pxa` lineage. Contains everything:
+one name, built on the ggml/llama.cpp code base (full lineage and credits in [`NOTICE`](NOTICE)). Contains everything:
 
 - Engine + all architectures (Laguna, Cohere2-MoE/North, Gemma-4, GLM, qwen35moe, deepseek, ...)
 - PXQ codecs (PXQ1/2/4/6) + PXQU universal mixed-tier maps
@@ -23,22 +23,6 @@ published (`pxqu_wrel.py`, `pxqu_golden.py`, the bulk generated artifacts). The 
 reference budgets under `pxa-bench/pxq-universal/` — the `.tiers` files, `tier-maps.json` and
 the determinism-gate scripts — DO ship here; see `.gitignore` for exactly what stays out.
 One tree -> two remotes: `origin` = public clean, the other = dirty backup.
-
-## Upstream
-
-**`ikawrakow/ik_llama.cpp`** (external) — the upstream we pull improvements from. Add as a remote to
-`pxa` when cherry-picking upstream PRs; fold them straight into `main`. No staging fork.
-
-## Retired / legacy
-
-- **`poisonxa16/ik_llama.cpp` (the old fork) — DELETED 2026-07-24.** Content fully folded into
-  `pxa`. Its campaign branches are bundled at
-  `ik_llama-campaign-branches.bundle` in the offline archive.
-- **A local legacy ik_llama tree** — kept ONLY because one resident service still
-  runs its `build-mmfast`. It retires the day that service moves onto the `pxa` unified build
-  (a validated engine swap, done deliberately). After that, one engine, period.
-- **Historical builds** live on the array: `<archive>/`
-  (old worktrees, experiment binaries, the campaign bundle, MANIFEST.md). Never on the cards' cache.
 
 ## The law
 

@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "pxa-pxq-split.h"
 #include "pxa-tsplit.h"
+#include "pxa-tsplit-bounds.h"
 #include "ggml-pxqn.h"
 #include "ggml.h"
 #ifdef GGML_USE_CUDA
@@ -602,67 +603,7 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
 
 static std::vector<int> create_split(int nr, int granularity, const std::vector<float> & splits, const std::vector<size_t> & mem_used,
         bool verbose = false) {
-    GGML_ASSERT(nr % granularity == 0);
-    GGML_ASSERT(!splits.empty());
-    if (granularity < 0) return std::vector<int>(splits.size(), nr);
-    GGML_ASSERT(mem_used.size() == splits.size());
-    size_t tot_memory_used = 1;
-    for (auto & mem : mem_used) tot_memory_used += mem;
-    int nchunk = nr / granularity;
-    std::vector<int> result(splits.size());
-    float last_split = 0;
-    int sum = 0;
-    if (verbose) LLAMA_LOG_INFO("--- %s: %d chunks\n", __func__, nchunk);
-    for (int i = 0; i < (int)splits.size(); ++i) {
-        float p = splits[i] - last_split;
-        float p0 = p;
-        p += (p - 1.f*mem_used[i]/tot_memory_used);
-        result[i] = roundf(p*nchunk);
-        if (result[i] < 0) result[i] = 0;
-        if (verbose) LLAMA_LOG_INFO("i = %d, p0 = %g, p = %g, result = %d\n", i, p0, p, result[i]);
-        sum += result[i];
-        last_split = splits[i];
-    }
-    while (sum > nchunk) {
-        last_split = 0;
-        float best_err = -INFINITY;
-        int ibest = -1;
-        for (int i = 0; i < (int)splits.size(); ++i) {
-            if (result[i] > 0) {
-                float p = splits[i] - last_split;
-                p += (p - 1.f*mem_used[i]/tot_memory_used);
-                float n_want = p*nchunk;
-                float err = result[i] - n_want;
-                if (err > best_err) {
-                    best_err = err; ibest = i;
-                }
-            }
-            last_split = splits[i];
-        }
-        GGML_ASSERT(ibest >= 0 && result[ibest] > 0);
-        --result[ibest];
-        --sum;
-    }
-    while (sum < nchunk) {
-        last_split = 0;
-        float best_err = -INFINITY;
-        int ibest = -1;
-        for (int i = 0; i < (int)splits.size(); ++i) {
-            float p = splits[i] - last_split;
-            p += (p - 1.f*mem_used[i]/tot_memory_used);
-            float n_want = p*nchunk;
-            float err = n_want - result[i];
-            if (err > best_err) {
-                best_err = err; ibest = i;
-            }
-            last_split = splits[i];
-        }
-        GGML_ASSERT(ibest >= 0);
-        ++result[ibest];
-        ++sum;
-    }
-    for (auto & r : result) r *= granularity;
-    return result;
+    return pxa_tsplit_create_split(nr, granularity, splits, mem_used, verbose);
 }
 
 ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx, const std::string & name) {
@@ -5069,6 +5010,21 @@ static int pxa_split_granularity(enum ggml_type type, int floor_gran) {
     return g;
 }
 
+// PXQN RHT: see pxa_tsplit_rht_granularity(). One log line per model when the 128 cut cannot be honoured.
+static int pxa_ffn_rht_gran(const llama_model & model, int gran, int nr) {
+    const bool rotated = (model.hparams.pxqn_rot_sites & (PXQN_SITE_BIT(PXQN_SITE_FFN_IN) | PXQN_SITE_BIT(PXQN_SITE_DOWN_IN))) != 0;
+    bool fell_back = false;
+    const int g = pxa_tsplit_rht_granularity(gran, nr, rotated, &fell_back);
+    if (fell_back) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            LLAMA_LOG_WARN("PXA_TSPLIT: FFN width %d is not a multiple of the PXQN RHT block 128; cutting at granularity %d\n", nr, gran);
+        }
+    }
+    return g;
+}
+
 static void prepare_split_tensors(int split_dim, ggml_context * ctx, ggml_tensor * tensor, llama_split_tensor & split_tensor,
         const std::vector<int> & splits, std::vector<size_t> & mem_used) {
     GGML_ASSERT(split_dim <= 2);
@@ -6159,6 +6115,7 @@ bool create_tensors_helper::create_tensors() {
                     int ffn_granularity = std::max({ pxa_split_granularity(layer.ffn_down->type, 16),
                                                      pxa_split_granularity(layer.ffn_up->type,   16),
                                                      pxa_split_granularity(layer.ffn_gate->type, 16) });
+                    ffn_granularity = pxa_ffn_rht_gran(model, ffn_granularity, layer.ffn_down->ne[0]);
                     auto split = create_split(layer.ffn_down->ne[0], ffn_granularity, cur_splits, mem_used);
                     LLAMA_LOG_DEBUG("  split_ffn:"); for ([[maybe_unused]] auto s : split) LLAMA_LOG_DEBUG(" %d", s); LLAMA_LOG_DEBUG("\n");
                     prepare_split_tensors(0, ctx_split, layer.ffn_down, layer.split_ffn_down, split, mem_used);
@@ -6282,6 +6239,7 @@ bool create_tensors_helper::create_tensors() {
                     int ffn_granularity = std::max({ pxa_split_granularity(layer.ffn_down_shexp->type, 16),
                                                      pxa_split_granularity(layer.ffn_up_shexp->type,   16),
                                                      pxa_split_granularity(layer.ffn_gate_shexp->type, 16) });
+                    ffn_granularity = pxa_ffn_rht_gran(model, ffn_granularity, layer.ffn_down_shexp->ne[0]);
                     auto split = create_split(layer.ffn_down_shexp->ne[0], ffn_granularity, cur_splits, mem_used);
                     bool ok = true;
                     if (!ffn_split.empty()) {

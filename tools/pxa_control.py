@@ -351,6 +351,134 @@ def cli_line(req):
 # ---------------------------------------------------------------------------------------------
 # the one seat this GUI runs
 # ---------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
+# "Report a problem": a redacted bundle, shown to the user in full, sent only on a Send click
+# ---------------------------------------------------------------------------------------------
+CONTROL_VERSION = "2026.10.1"
+BUG_URL_DEFAULT = "https://bugs.pxanetwork.com/v1/report"
+REPORT_MAX = 256 * 1024                      # the intake refuses more than this
+BANNER_RE = re.compile(r"PXA_(REGISTRY|TSPLIT|AUTO)")
+BUILD_RE = re.compile(r"^(build|version|system_info|PXA[ _-]?(build|version))\b", re.I)
+
+
+def bug_url():
+    return os.environ.get("PXA_BUG_URL") or BUG_URL_DEFAULT
+
+
+_SECRET_PATTERNS = [
+    (re.compile(r"(--api-key)(?:=|\s+)\S+", re.I), r"\1 <redacted>"),
+    (re.compile(r"(?i)\b(authorization|proxy-authorization)\s*[:=]\s*(?:bearer|basic|bot)?\s*\S+"), r"\1: <redacted>"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{8,}"), "Bearer <redacted>"),
+    (re.compile(r"(?i)\b([A-Za-z0-9_\-]*(?:api[_-]?key|token(?!s)|secret|passw(?:or)?d|credential)[A-Za-z0-9_\-]*)"
+                r"(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|\S{6,})"), r"\1\2<redacted>"),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]*"), "<redacted-jwt>"),
+    (re.compile(r"\b(?:hf|ghp|gho|ghs|ghu|github_pat|glpat|xox[abprs]|sk|pk|rk|AKIA|AIza)[_\-]?[A-Za-z0-9_\-]{16,}"), "<redacted-key>"),
+    (re.compile(r"\b[A-Za-z0-9_\-]{23,28}\.[A-Za-z0-9_\-]{6,7}\.[A-Za-z0-9_\-]{27,}\b"), "<redacted-token>"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S), "<redacted-private-key>"),
+]
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+_IPV4_RE = re.compile(r"(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])")
+_IPV6_RE = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
+_MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b")
+_HOME_RES = [re.compile(r"/home/[^/\s\"']+"), re.compile(r"/Users/[^/\s\"']+"), re.compile(r"(?i)[A-Z]:\\Users\\[^\\\s\"']+"),
+             re.compile(r"/root(?=/|\b)")]
+_KEEP_IPS = {"127.0.0.1", "0.0.0.0", "255.255.255.255"}
+_HIGH_ENTROPY_RE = re.compile(r"\b(?=[A-Za-z0-9+/_\-]*[A-Z])(?=[A-Za-z0-9+/_\-]*[a-z])(?=[A-Za-z0-9+/_\-]*\d)[A-Za-z0-9+/_\-]{32,}={0,2}")
+
+
+def _identity_words():
+    """hostnames and user names that must not leave the machine."""
+    hosts, users = set(), set()
+    for h in (getattr(os, "uname", lambda: None)() and os.uname().nodename, socket.gethostname(),
+              os.environ.get("HOSTNAME"), os.environ.get("COMPUTERNAME")):
+        if h and len(h) >= 2:
+            hosts.add(h)
+            hosts.add(h.split(".")[0])
+    for u in (os.environ.get("USER"), os.environ.get("LOGNAME"), os.environ.get("USERNAME")):
+        if u and len(u) >= 3 and u.lower() not in ("root", "user", "admin", "pxa"):
+            users.add(u)
+    try:
+        import getpass
+        u = getpass.getuser()
+        if u and len(u) >= 3 and u.lower() not in ("root", "user", "admin", "pxa"):
+            users.add(u)
+    except Exception:
+        pass
+    return {h for h in hosts if len(h) >= 2}, users
+
+
+def _ip6_or_keep(t):
+    import ipaddress
+    try:
+        ipaddress.IPv6Address(t)
+    except ValueError:
+        return t                     # a clock time, a "a:b:c" label, ...
+    return t if t in ("::1", "::") else "<ip6>"
+
+
+def redact_text(s, hosts=None, users=None):
+    """One string in, the same string with home paths, hostnames, IPs, user names, e-mail, MACs and anything
+    that looks like a token or key replaced by a placeholder. Idempotent."""
+    if not isinstance(s, str) or not s:
+        return s
+    if hosts is None or users is None:
+        h, u = _identity_words()
+        hosts = h if hosts is None else hosts
+        users = u if users is None else users
+    for rx, rep in _SECRET_PATTERNS:
+        s = rx.sub(rep, s)
+    home = os.path.expanduser("~")
+    if home and home not in ("/", "~") and len(home) > 1:
+        s = s.replace(home, "~")
+    for rx in _HOME_RES:
+        s = rx.sub("~", s)
+    s = _EMAIL_RE.sub("<email>", s)
+    s = _MAC_RE.sub("<mac>", s)
+    s = _IPV4_RE.sub(lambda m: m.group(0) if m.group(0) in _KEEP_IPS else "<ip>", s)
+    s = _IPV6_RE.sub(lambda m: _ip6_or_keep(m.group(0)), s)
+    for w in sorted(hosts, key=len, reverse=True):
+        s = re.sub(r"(?<![A-Za-z0-9])" + re.escape(w) + r"(?![A-Za-z0-9])", "<host>", s, flags=re.I)
+    for w in sorted(users, key=len, reverse=True):
+        s = re.sub(r"(?<![A-Za-z0-9])" + re.escape(w) + r"(?![A-Za-z0-9])", "<user>", s)
+    s = _HIGH_ENTROPY_RE.sub("<redacted-key>", s)
+    return s
+
+
+def redact_obj(o, hosts=None, users=None, depth=0):
+    if hosts is None or users is None:
+        h, u = _identity_words()
+        hosts = h if hosts is None else hosts
+        users = u if users is None else users
+    if depth > 8:
+        return None
+    if isinstance(o, str):
+        return redact_text(o, hosts, users)
+    if isinstance(o, (list, tuple)):
+        return [redact_obj(x, hosts, users, depth + 1) for x in o]
+    if isinstance(o, dict):
+        return {redact_text(str(k), hosts, users): redact_obj(v, hosts, users, depth + 1) for k, v in o.items()}
+    return o
+
+
+SCORE_NAME_BAD = ("fuck", "shit", "cunt", "bitch", "nigg", "fagg", "whore", "slut", "rape", "nazi", "hitler", "dick", "cock", "pussy", "asshole", "retard", "porn")
+SCORE_URL_RE = re.compile(r"(https?:|www\.|discord\.gg|discord\.com|://|\.(com|net|org|io|gg|xyz|ru|cn|tk|ly|me)\b)", re.I)
+QUANT_RE = re.compile(r"(PXQN\d+\w*|PXQ\d+\w*|PXQU\w*|IQ\d_\w+|Q\d_K(?:_[SML])?|Q\d_\d|MXFP4|F16|BF16)", re.I)
+
+
+def clean_board_name(name):
+    """the same rules the board applies: max 32 chars, no links/mentions/profanity; '' = anonymous."""
+    n = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()
+    flat = re.sub(r"[^a-z]", "", n.lower().translate(str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "!": "i"})))
+    if not n or SCORE_URL_RE.search(n) or re.search(r"[@<`*]", n) or any(b in flat for b in SCORE_NAME_BAD):
+        return ""
+    return re.sub(r"[^\w .'\-]", "", n)[:32].strip()
+
+
+def score_base_url():
+    u = urllib.parse.urlparse(bug_url())
+    return f"{u.scheme}://{u.netloc}"
+
+
 class Seat(object):
     def __init__(self, L):
         self.L = L
@@ -790,6 +918,177 @@ class App(object):
             except Exception:
                 d["health"] = "down"
         return d
+
+    # ---- report a problem -----------------------------------------------------------------
+    def report_bundle(self):
+        """The whole report, already redacted, exactly as the page will show it (and send it)."""
+        seat = self.seat
+        with seat.cond:
+            log = [x[1] for x in seat.log]
+        banner = [ln for ln in log if BANNER_RE.search(ln)][:40]
+        build = [ln for ln in log if BUILD_RE.match(ln.strip())][:6]
+        version = "unknown"
+        for ln in build:
+            m = re.search(r"(?:build|version)\s*[:=]\s*(\S.*)", ln, re.I)
+            if m:
+                version = m.group(1).strip()[:80]
+                break
+        if version == "unknown":
+            try:
+                port = self.engine_port()
+                if port:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/props", timeout=2) as r:
+                        bi = (json.loads(r.read().decode("utf-8", "replace")) or {}).get("build_info")
+                        if bi:
+                            version = str(bi)[:80]
+            except Exception:
+                pass
+        rows, _err = self.gpus()
+        st = self.rig_static()
+        gpus = [{"index": g[0], "name": g[1].replace("NVIDIA ", ""), "cc": g[2], "vram_gb": round(g[3] / 1024.0, 1),
+                 "driver": st.get("driver")} for g in rows]
+        req = seat.req or {}
+        mpath = req.get("model") if isinstance(req.get("model"), str) else None
+        msize = None
+        try:
+            msize = os.path.getsize(mpath) if mpath else None
+        except OSError:
+            pass
+        bench = read_jsonl("bench.jsonl", limit=3)[-3:]
+        bundle = {
+            "engine": {"version": version, "build_lines": build, "cuda": st.get("cuda"), "container": st.get("container")},
+            "banner": banner or ["(no PXA_REGISTRY / PXA_TSPLIT / PXA_AUTO lines in this seat's log yet; start a server first)"],
+            "flags": " ".join(self.L.redact_cmd(seat.cmd)) if seat.cmd else "",
+            "request": {k: v for k, v in req.items() if k != "model"},
+            "gpus": gpus,
+            "model": {"filename": os.path.basename(mpath) if mpath else None, "size_bytes": msize},
+            "phase": seat.phase,
+            "exit_code": seat.proc.returncode if (seat.proc and not seat.running()) else None,
+            "log_tail": log[-300:],
+            "benchmarks": bench,
+        }
+        return {"version": CONTROL_VERSION, "app": "pxa-control", "bundle": redact_obj(bundle), "contact": ""}
+
+    def report_send(self, body):
+        """POST the payload the user saw (and maybe edited) to the intake. Only ever called from a Send click."""
+        payload = (body or {}).get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                raise Invalid("the report is not valid JSON; fix it in the box or use Copy report")
+        if not isinstance(payload, dict):
+            raise Invalid("no report to send")
+        raw = json.dumps(payload).encode("utf-8")
+        if len(raw) > REPORT_MAX:
+            raise Invalid(f"the report is {len(raw) // 1024} KB; the limit is {REPORT_MAX // 1024} KB (trim the log tail)")
+        url = bug_url()
+        if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+            return {"ok": False, "error": "PXA_BUG_URL must be an http(s) URL", "url": url}
+        req = urllib.request.Request(url, data=raw, method="POST",
+                                     headers={"Content-Type": "application/json", "User-Agent": "pxa-control/" + CONTROL_VERSION})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                j = json.loads(r.read().decode("utf-8", "replace") or "{}")
+            return {"ok": bool(j.get("ok")), "id": j.get("id"), "url": url}
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.loads(e.read().decode("utf-8", "replace")).get("error")
+            except Exception:
+                msg = None
+            return {"ok": False, "error": f"the report server said {e.code}: {msg or e.reason}", "url": url}
+        except Exception as e:
+            return {"ok": False, "error": f"could not reach the report server ({e.__class__.__name__}: {e})", "url": url}
+
+    # ---- community high-score board ---------------------------------------------------------
+    def score_payload(self, res, name=""):
+        """bench result -> the exact /v1/score payload (redacted; nothing identifying beyond the chosen name)."""
+        req = self.seat.req or {}
+        model = res.get("model") or req.get("model") or ""
+        base = os.path.basename(str(model))
+        sha8 = "*"
+        try:
+            import hashlib
+            with open(model, "rb") as f:
+                sha8 = hashlib.sha256(f.read(16 << 20)).hexdigest()[:8]     # first 16 MiB: the header and the first tensors
+        except (OSError, TypeError):
+            pass
+        rows, _e = self.gpus()
+        cards = [c for c in (res.get("cards") or req.get("gpus") or [])]
+        sel = [g for g in rows if g[0] in cards] or rows
+        gname = (sel[0][1].replace("NVIDIA ", "") if sel else "unknown")
+        cmd = " ".join(self.L.redact_cmd(self.seat.cmd)) if self.seat.cmd else ""
+        low = cmd.lower()
+        n = max(1, len(cards) or len(sel))
+        split = "tensor" if re.search(r"(-sm|--split-mode)[ =]tensor", low) else ("layer" if n > 1 else "plain")
+        mode = split + ("+mtp" if ("mtp" in low and split != "plain") else "")
+        if split == "plain" and "mtp" in low:
+            mode = "mtp"
+        by = {c["class"]: c for c in res.get("classes", [])}
+        prose, long_ = by.get("prose", {}), by.get("long", {})
+        qm = QUANT_RE.search(base)
+        payload = {
+            "app": "pxa-control", "version": CONTROL_VERSION, "name": clean_board_name(name),
+            "engine_version": self.report_bundle()["bundle"]["engine"]["version"],
+            "bracket": {"model_file": base, "model_sha8": sha8, "quant": qm.group(1).lower() if qm else "unknown",
+                        "gpu": gname, "gpu_count": n, "mode": mode},
+            "metrics": {"decode_tps": round(prose.get("decode_tps") or 0, 2), "prefill_tps": round(long_.get("prefill_tps") or 0, 1) or None},
+            "cmd": cmd,
+            "raw": {"reps": res.get("reps"), "greedy512_sha": res.get("greedy512_sha"),
+                    "classes": [{k: c.get(k) for k in ("class", "decode_tps", "prefill_tps", "n_prompt", "decode_all", "prefill_all")}
+                                for c in res.get("classes", [])]},
+        }
+        return redact_obj(payload)
+
+    def score_check(self):
+        """after a benchmark: the payload we would send, the current record for its bracket and whether this run beats it."""
+        res = self.bench.get("result")
+        if not res or self.bench.get("running"):
+            return {"available": False, "reason": "run a benchmark first"}
+        p = self.score_payload(res)
+        if not p["metrics"]["decode_tps"]:
+            return {"available": False, "reason": "the benchmark has no decode number"}
+        b = p["bracket"]
+        key = "|".join([re.sub(r"[^a-z0-9.]+", "-", re.sub(r"(?i)\.gguf$", "", b["model_file"]).lower()).strip("-")[:64], b["model_sha8"],
+                        re.sub(r"[^a-z0-9_.]+", "-", b["quant"].lower()).strip("-")[:24],
+                        re.sub(r"[^a-z0-9]+", "-", re.sub(r"(?i)nvidia|geforce|tesla|-pcie|-sxm2|-\d+gb|\d+gb", " ", b["gpu"]).lower()).strip("-")[:32],
+                        str(b["gpu_count"]), b["mode"]])
+        rec, err = None, None
+        try:
+            with urllib.request.urlopen(score_base_url() + "/v1/scores?bracket=" + urllib.parse.quote(key, safe=""), timeout=8) as r:
+                rec = (json.loads(r.read().decode("utf-8", "replace")) or {}).get("record")
+        except Exception as e:
+            err = f"could not reach the board ({e.__class__.__name__})"
+        beats = err is None and (rec is None or p["metrics"]["decode_tps"] > rec["decode"])
+        return {"available": True, "payload": p, "record": rec, "beats": beats, "error": err, "board": score_base_url()}
+
+    def score_send(self, body):
+        payload = (body or {}).get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                raise Invalid("the submission is not valid JSON")
+        if not isinstance(payload, dict):
+            raise Invalid("nothing to send")
+        payload["name"] = clean_board_name(payload.get("name"))
+        raw = json.dumps(payload).encode("utf-8")
+        if len(raw) > 32 * 1024:
+            raise Invalid("the submission is over 32 KB")
+        req = urllib.request.Request(score_base_url() + "/v1/score", data=raw, method="POST",
+                                     headers={"Content-Type": "application/json", "User-Agent": "pxa-control/" + CONTROL_VERSION})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                j = json.loads(r.read().decode("utf-8", "replace") or "{}")
+            return {"ok": bool(j.get("ok")), "id": j.get("id"), "record": j.get("record"), "rank": j.get("rank"), "status": j.get("status"), "note": j.get("note")}
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.loads(e.read().decode("utf-8", "replace")).get("error")
+            except Exception:
+                msg = None
+            return {"ok": False, "error": f"the board said {e.code}: {msg or e.reason}"}
+        except Exception as e:
+            return {"ok": False, "error": f"could not reach the board ({e.__class__.__name__}: {e})"}
 
     # ---- presets --------------------------------------------------------------------------
     def presets(self):
@@ -1297,6 +1596,22 @@ def r_history(app, body, query):
     return {"records": read_jsonl("history.jsonl", since=since)}
 
 
+def r_report_bundle(app, body, query):
+    return app.report_bundle()
+
+
+def r_score_check(app, body, query):
+    return app.score_check()
+
+
+def r_score_send(app, body, query):
+    return app.score_send(body)
+
+
+def r_report_send(app, body, query):
+    return app.report_send(body)
+
+
 ROUTES = {
     ("GET", "/api/info"): r_info,
     ("GET", "/api/rig"): r_rig,
@@ -1319,6 +1634,10 @@ ROUTES = {
     ("POST", "/api/bench"): r_bench_start,
     ("GET", "/api/bench"): r_bench,
     ("GET", "/api/history"): r_history,
+    ("GET", "/api/report/bundle"): r_report_bundle,
+    ("POST", "/api/report/send"): r_report_send,
+    ("GET", "/api/score/check"): r_score_check,
+    ("POST", "/api/score/send"): r_score_send,
 }
 
 

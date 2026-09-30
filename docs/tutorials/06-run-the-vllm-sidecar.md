@@ -41,7 +41,7 @@ docker run -d --name pxa-vllm --runtime=nvidia \
   -p 127.0.0.1:8000:8000 --ipc=host --shm-size=16g \
   -e NVIDIA_VISIBLE_DEVICES=0,1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -v ~/models:/models \
-  ghcr.io/poisonxa16/pxa-vllm:sm70-v2026.09.20 \
+  ghcr.io/poisonxa16/pxa-vllm:sm70-v2026.10 \
   python -m vllm.entrypoints.openai.api_server \
     --model /models/your-model-PXQ4-vllm --quantization pxq4 \
     --attention-backend FLASH_ATTN_V100 --tensor-parallel-size 2 --dtype float16 \
@@ -60,7 +60,7 @@ docker run -d --name pxa-vllm --runtime=nvidia \
   -e NVIDIA_VISIBLE_DEVICES=0,1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e TORCHDYNAMO_DISABLE=1 \
   -v ~/models:/models \
-  ghcr.io/poisonxa16/pxa-vllm:sm60-v2026.09.20 \
+  ghcr.io/poisonxa16/pxa-vllm:sm60-v2026.10 \
   python -m vllm.entrypoints.openai.api_server \
     --model /models/your-model-PXQ4-vllm --quantization pxq4 \
     --attention-backend PASCAL_SDPA --tensor-parallel-size 2 --dtype float16 \

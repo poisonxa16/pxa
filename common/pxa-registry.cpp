@@ -709,6 +709,45 @@ static pxa_autoconfig pxa_autoconfig_resolve_picks(const pxa_topology & topo, co
         ac.picks.push_back(p);
     }
 
+    // ---- PXA_DN_CONVFUSE (delta-net conv cluster) is a tensor-split lever ----------------------------
+    // measured 2026-09-29 on v2026.10, 27B one-card file, llama-bench tg128 ABAB, -fa 1 q4_0 KV:
+    //   1x V100  fused 23.3/22.4 vs unfused 32.3/33.6 t/s (-31%);  1x P100  19.4/19.3 vs 24.6/24.2 (-21%);
+    //   2x P100 -sm tensor fused 37.9/37.9 vs 36.3/36.3 (+4.4%);   2x V100 -sm tensor 56.3/56.1 vs 53.4/53.4 (+5.3%).
+    // So the fused conv kernel is a default only where the split is tensor; anywhere else (one card,
+    // -sm layer) the separate kernels are the default. PXA_DN_CONVFUSE=1/0 in the environment always wins.
+    if (level >= 2 && topo.n_dev >= 1) {
+        const bool tensor_eff = user.sm ? user.sm_value == PXA_SM_TENSOR : ac.split == PXA_SM_TENSOR;
+        pxa_pick p;
+        p.flag = "PXA_DN_CONVFUSE";
+        p.evidence = "convfuse-single-device-2026-09-29";
+        if (tensor_eff) {
+            p.value = "on"; p.status = "MEASURED"; p.applied = false;
+            p.why = "tensor split: the fused delta-net conv cluster measured +4.4% (2x P100) / +5.3% (2x V100) decode";
+        } else {
+            ac.env.emplace_back("PXA_DN_CONVFUSE", "0");
+            p.value = "off"; p.status = "MEASURED"; p.applied = true;
+            p.why = "no tensor split: the fused delta-net conv cluster measured -31% (1x V100) / -21% (1x P100) decode; "
+                    "PXA_DN_CONVFUSE=1 puts it back";
+        }
+        ac.picks.push_back(p);
+    }
+
+    // ---- PXA_PXQN_RHT_FUSE (RHT->GEMV fusion) is off on one V100 ---------------------------------
+    // measured 2026-09-29, 1x V100 (GPU 2), llama-bench tg128 -fa 1 q4_0 KV, REPS 3, 3 rounds interleaved:
+    //   one-card 27B file  fused 32.3-33.4 vs unfused 34.8-35.0 t/s (+5..8%); PXQN4 ladder 31.0/32.6 vs 34.8/33.8;
+    //   greedy512 sha identical (435d10f612f952d1). The fusion first fired in v2026.10.
+    // Pairs and P100 are unmeasured, so only the single-V100 case flips. PXA_PXQN_RHT_FUSE=1/0 in the environment wins.
+    if (level >= 2 && topo.n_dev == 1 && !topo.cc.empty() && topo.cc[0] == 700) {
+        pxa_pick p;
+        p.flag = "PXA_PXQN_RHT_FUSE";
+        p.evidence = "rhtfuse-single-v100-2026-09-29";
+        ac.env.emplace_back("PXA_PXQN_RHT_FUSE", "0");
+        p.value = "off"; p.status = "MEASURED"; p.applied = true;
+        p.why = "1x V100: the RHT->GEMV fusion measured -5..8% decode (32.3-33.4 vs 34.8-35.0 t/s), sha identical; "
+                "PXA_PXQN_RHT_FUSE=1 puts it back";
+        ac.picks.push_back(p);
+    }
+
     // ---- -ngl ---------------------------------------------------------------------------------
     // The engine's own default offloads NOTHING on CUDA (llama_model_default_params: 0 layers), so a
     // bare `llama-server -m file` used to run on the CPU while pxa-launch passes -ngl 999. With a
@@ -1000,7 +1039,7 @@ std::string pxa_autoconfig_json(const pxa_topology & topo, const pxa_model_info 
         q["applied"] = p.applied;
         q["evidence"] = p.evidence;
         q["why"] = p.why;
-        picks[p.flag.substr(1)] = q;
+        picks[p.flag[0] == '-' ? p.flag.substr(1) : p.flag] = q;
     }
     j["picks"] = picks;
     json env = json::object();

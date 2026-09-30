@@ -51,7 +51,7 @@ The build number and commit will be this release's, not the ones above.
 
 ```bash
 mkdir -p ~/models
-docker pull ghcr.io/poisonxa16/pxa:v2026.09.20
+docker pull ghcr.io/poisonxa16/pxa:v2026.10.1
 ```
 
 Nothing to unpack. Models live in `~/models` on your machine and the container sees them at
@@ -137,7 +137,7 @@ docker run -d --name pxa \
     --gpus '"device=0"' \
     -p 8080:8080 \
     -v ~/models:/models:ro \
-    ghcr.io/poisonxa16/pxa:v2026.09.20 \
+    ghcr.io/poisonxa16/pxa:v2026.10.1 \
     -m /models/fusion2-35b-U16-q8head.gguf \
     -ngl 99 -c 8192 -fa on
 ```
