@@ -19,6 +19,14 @@ tar xzf pxa-v2026.10.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v2026.1
 
 No Docker, no build toolchain, nothing phones home. Prefer a container? See [Get PXA](#get-pxa).
 
+<table align="center"><tr>
+<td align="center"><b>107.6 t/s</b><br><sub>27B code, 2x V100, MTP</sub></td>
+<td align="center"><b>77.1 t/s</b><br><sub>27B prose, 2x V100, MTP</sub></td>
+<td align="center"><b>35.1 t/s</b><br><sub>27B on one V100</sub></td>
+<td align="center"><b>29%</b><br><sub>of the original size, PXQN4</sub></td>
+<td align="center"><b>131k</b><br><sub>context on one 16 GB card</sub></td>
+</tr></table>
+
 **On this page:** [PXQN](#pxqn-closer-to-the-original-at-a-fraction-of-the-size) · [Speeds](#speeds) · [PXA Control](#pxa-control) · [Features](#features) · [Models](#models) · [Get PXA](#get-pxa) · [Community and support](#community-and-support)
 
 ---
@@ -63,36 +71,34 @@ Every number below is a first-pass measurement on PXA v2026.10 or later: fresh s
 
 ### Qwen3.8-27B
 
-Decode is `tg128` tokens per second (context at 512 tokens, q4_0 KV cache, flash attention on), prefill is `pp512`. Two or more cards run the tensor split.
+Prefill, plain decode and MTP decode side by side, in tokens per second. Two or more cards run the tensor split.
 
-| File | 1x P100 | 2x P100 | 4x P100 | 1x V100 | 2x V100 |
-|---|---:|---:|---:|---:|---:|
-| **PXQN3** (12.6 GB) | 24.5 / 249 | | | 32.9 / 1029 &sup1; | |
-| **PXQN3bal** (13.5 GB) | 24.4 / 251 | | | 32.4 / 1028 &sup1; | |
-| **One-card 27B** (13.6 GB) | 24.2 / 252 | | | **35.1 / 1000** | |
-| **PXQN4** (15.7 GB) | 24.0 / 254 | **37.8 / 345** | 30.7 / 440 | **34.0 / 1000** | **56.4 / 924** |
-| **PXQN5** (18.8 GB) | | 29.6 / 334 | 29.8 / 434 | | 49.0 / 921 |
-| PXQ4 classic (16.5 GB) | | 33.0 / 334 | | | 54.1 / 942 |
+| Cards | File | Prefill | Plain decode | MTP decode, prose | MTP decode, code |
+|---|---|---:|---:|---:|---:|
+| **2x V100** | **PXQN4** (15.7 GB) | 924 | 56.4 | **77.1** | **107.6** |
+| 2x V100 | PXQN5 (18.8 GB) | 921 | 49.0 | | |
+| 2x V100 | PXQ4 classic (16.5 GB) | 942 | 54.1 | | |
+| **1x V100** | **One-card 27B** (13.6 GB) | 1000 | **35.1** | | |
+| 1x V100 | PXQN4 (15.7 GB) | 1000 | 34.0 | | |
+| 1x V100 | PXQN3 (12.6 GB) | 1029 | 32.9 &sup1; | | |
+| 1x V100 | PXQN3bal (13.5 GB) | 1028 | 32.4 &sup1; | | |
+| **2x P100** | **PXQN4** (15.7 GB) | 345 | 37.8 | **47.1** | **66.2** |
+| 2x P100 | PXQN5 (18.8 GB) | 334 | 29.6 | | |
+| 2x P100 | PXQ4 classic (16.5 GB) | 334 | 33.0 | | |
+| **4x P100** | PXQN4 (15.7 GB) | 440 | 30.7 | | |
+| 4x P100 | PXQN5 (18.8 GB) | 434 | 29.8 | | |
+| **1x P100** | **One-card 27B** (13.6 GB) | 252 | 24.2 | **32.3** | **36.2** |
+| 1x P100 | PXQN4 (15.7 GB) | 254 | 24.0 | | |
+| 1x P100 | PXQN3 (12.6 GB) | 249 | 24.5 | | |
+| 1x P100 | PXQN3bal (13.5 GB) | 251 | 24.4 | | |
+
+**How these were measured.** Prefill is `pp512` and plain decode is `tg128` from `llama-bench` (q4_0 KV cache, flash attention on). MTP decode is the server's first answer to a fresh prompt: a story-style essay for prose, a small refactor for code, greedy output. MTP uses the model's own MTP head, with no second model. It switches on by itself on a multi-card tensor split; on one card, add `--spec-type mtp:n_max=1`. A blank MTP cell was not measured.
 
 &sup1; Measured before the single-V100 decode fix in v2026.10.1, so it is likely an underestimate.
 
-*Each cell: decode t/s / prefill t/s. Blank = the file does not fit or was not measured. PXQN5 (18.8 GB) needs two cards. Our 4x P100 test rig runs every card on a x4 PCIe link, so four cards trade decode for prefill and room for bigger models; on a 27B, two cards decode fastest there.*
-
-At 16k context the P100 pair keeps 36.7 t/s and the V100 pair 54.2 t/s on PXQN4.
-
-### MTP speculative decoding
-
-Files that carry the model's own MTP head decode faster with no second model. Server default, first request of each class, greedy output (prose is a story-style essay, code is a small refactor).
+*PXQN5 (18.8 GB) needs two cards. Our 4x P100 test rig runs every card on a x4 PCIe link, so four cards trade decode for prefill and room for bigger models; on a 27B, two cards decode fastest there. At 16k context the P100 pair keeps 36.7 t/s and the V100 pair 54.2 t/s on PXQN4.*
 
 <p align="center"><img src="assets/chart-mtp-speedup.png" alt="MTP speed-up: plain against MTP decode on 2x V100 and 2x P100, prose and code" width="800"></p>
-
-| Qwen3.8-27B PXQN4, tokens/s | Plain, prose / code | MTP, prose / code | Gain |
-|---|---:|---:|---:|
-| 2x V100 | 56.6 / 56.4 | **77.1 / 107.6** | +36% / +91% |
-| 2x P100 | 38.5 / 38.5 | **47.1 / 66.2** | +22% / +72% |
-| 1x P100, one-card 27B (`mtp:n_max=1`) | 24.0 | **32.3 / 36.2** | +35% / +51% |
-
-MTP switches on by itself for an MTP file on a multi-card tensor split. For one card, add `--spec-type mtp:n_max=1`. The 1x P100 plain figure is the `tg128` figure from the table above.
 
 ### Other models
 
