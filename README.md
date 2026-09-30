@@ -211,7 +211,7 @@ The showcase **one-card Qwen3.8-27B PXQN** (12.6 GiB, 131k context on one 16 GB 
 
 - **Tarball.** A prebuilt release with `START-HERE.md` and the `pxa-launch` launcher, for Ubuntu 24.04 (glibc 2.38) and Ubuntu 22.04 (glibc 2.35). Both bundle their CUDA runtime libraries and are tested in a bare container of their own OS. Download from the [release page](https://github.com/poisonxa16/pxa/releases/latest).
 - **Container images.** `ghcr.io/poisonxa16/pxa` (the engine) and `ghcr.io/poisonxa16/pxa-vllm` with `sm60` (Pascal) and `sm70` (Volta) tags for the vLLM sidecar. Multi-card containers should pass `--shm-size=1g`. See [`docker/COMPOSE.md`](docker/COMPOSE.md).
-- **From source.** [`BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md). PXQN files need the release build.
+- **From source.** [`BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md). A source build runs classic PXQ files and K-quants as is. For PXQN files, add the compiled **PXQN library**, a separate download on the [release page](https://github.com/poisonxa16/pxa/releases/latest) (`libggml-pxqn-v2026.10.1-...tar.gz`): drop `libggml-pxqn.so` next to `libggml.so` and PXQN runs at full speed. [How](BUILD-FROM-SOURCE.md#4b-pxqn-files-with-a-source-build).
 
 Cards supported: Tesla P100, Tesla V100, GTX 1080 Ti and other Pascal cards. Newer cards are not covered by the released build.
 

@@ -61,10 +61,10 @@ Then, **inside the container**:
 apt-get update && apt-get install -y --no-install-recommends cmake git
 
 cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70" \
-  -DGGML_SCHED_MAX_COPIES=2
+  -DGGML_SCHED_MAX_COPIES=2 -DPXA_PXQN_CLOSED_SRC=OFF -DPXA_PXQ_ENCODER=OFF
 
 cmake --build build \
-  --target llama-server llama-cli llama-bench llama-quantize llama-pxq-export \
+  --target llama-server llama-cli llama-bench \
   -j"$(nproc)"
 ```
 
@@ -121,12 +121,12 @@ ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcud
 
 # 2. point the link at it
 cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70" \
-  -DGGML_SCHED_MAX_COPIES=2 \
+  -DGGML_SCHED_MAX_COPIES=2 -DPXA_PXQN_CLOSED_SRC=OFF -DPXA_PXQ_ENCODER=OFF \
   -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
   -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs"
 
 cmake --build build \
-  --target llama-server llama-cli llama-bench llama-quantize llama-pxq-export \
+  --target llama-server llama-cli llama-bench \
   -j"$(nproc)"
 ```
 
@@ -275,6 +275,40 @@ weight, and the backbone revision and codec tier the quantizer recorded, with `n
 anything the file does not carry.
 
 ---
+
+## 4b. PXQN files with a source build
+
+`-DPXA_PXQN_CLOSED_SRC=OFF -DPXA_PXQ_ENCODER=OFF` are required on this public tree: the closed PXQN decoder and the quantizer's private encoder are not in it, and without the two flags the configure step stops with an error.
+
+The PXQN decoder is closed and ships compiled. A build from this repository has open stubs in its place and refuses PXQN files at load with a clear message. To run PXQN files at full speed, download the matching library from the [v2026.10.1 release page](https://github.com/poisonxa16/pxa/releases/tag/v2026.10.1):
+
+| your OS | asset |
+|---|---|
+| Ubuntu 24.04 and newer (glibc 2.38+) | `libggml-pxqn-v2026.10.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` |
+| Ubuntu 22.04 (glibc 2.35+) | `libggml-pxqn-v2026.10.1-linux-x86_64-cuda12.8-sm60_61_70-ubuntu22.04.tar.gz` |
+
+The library matches the source tag `v2026.10.1` only. Check out that tag, then build with:
+
+```bash
+git clone --branch v2026.10.1 https://github.com/poisonxa16/pxa && cd pxa
+cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70" \
+  -DGGML_SCHED_MAX_COPIES=2 -DPXA_PXQN_CLOSED_SRC=OFF -DPXA_PXQ_ENCODER=OFF
+cmake --build build --target llama-server llama-cli llama-bench -j"$(nproc)"
+```
+
+Then either copy `libggml-pxqn.so` into `build/bin/` next to `libggml.so` (the directory that holds your `libggml.so`), or point at it:
+
+```bash
+export PXA_PXQN_LIB=/path/to/libggml-pxqn.so
+```
+
+The library needs the CUDA 12 runtime, cuBLAS 12 and NCCL 2 at run time (the same libraries a CUDA 12 build already links). On start you should see one line on stderr:
+
+```
+pxqn: loaded /path/to/libggml-pxqn.so (<build id>)
+```
+
+If you see `pxqn: ... was built for a different engine build ... PXQN unavailable`, the source and the library are not the same release: use the tag above. `PXA_PXQN_VERBOSE=1` prints why a library was not found.
 
 ## 5. Traps, with the exact error
 
