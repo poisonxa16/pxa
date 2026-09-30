@@ -9,6 +9,7 @@ PXQN quants, tensor split, MTP speculation and one-click PXA Control, for the Te
 <a href="https://github.com/poisonxa16/pxa/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/poisonxa16/pxa?label=release&color=E69F00&style=for-the-badge"></a>
 <a href="https://discord.gg/EqazvV9tf"><img alt="Discord" src="https://img.shields.io/badge/Discord-PXA%20Network-5865F2?logo=discord&logoColor=white&style=for-the-badge"></a>
 <a href="https://ko-fi.com/shatteredrealms1"><img alt="Support on Ko-fi" src="https://img.shields.io/badge/Ko--fi-Support%20PXA-FF5E5B?logo=ko-fi&logoColor=white&style=for-the-badge"></a>
+<a href="https://huggingface.co/poisonxa/Qwen3.8-27B-PXQN-OneCard"><img alt="Free model: Qwen3.8-27B one-card" src="https://img.shields.io/badge/%F0%9F%A4%97%20Free%20model-Qwen3.8--27B%20One--Card-FFD21E?style=for-the-badge"></a>
 </p>
 
 ```bash
@@ -22,7 +23,7 @@ No Docker, no build toolchain, nothing phones home. Prefer a container? See [Get
 <table align="center"><tr>
 <td align="center"><b>107.6 t/s</b><br><sub>27B code, 2x V100, MTP</sub></td>
 <td align="center"><b>77.1 t/s</b><br><sub>27B prose, 2x V100, MTP</sub></td>
-<td align="center"><b>35.1 t/s</b><br><sub>27B on one V100</sub></td>
+<td align="center"><b>61.2 t/s</b><br><sub>27B code on ONE V100, MTP</sub></td>
 <td align="center"><b>29%</b><br><sub>of the original size, PXQN4</sub></td>
 <td align="center"><b>131k</b><br><sub>context on one 16 GB card</sub></td>
 </tr></table>
@@ -78,7 +79,7 @@ Prefill, plain decode and MTP decode side by side, in tokens per second. Two or 
 | **2x V100** | **PXQN4** (15.7 GB) | 924 | 56.4 | **77.1** | **107.6** |
 | 2x V100 | PXQN5 (18.8 GB) | 921 | 49.0 | | |
 | 2x V100 | PXQ4 classic (16.5 GB) | 942 | 54.1 | | |
-| **1x V100** | **One-card 27B** (13.6 GB) | 1000 | **35.1** | | |
+| **1x V100** | **One-card 27B** (13.6 GB) | 1000 | **35.1** | **55.6** | **61.2** |
 | 1x V100 | PXQN4 (15.7 GB) | 1000 | 34.0 | | |
 | 1x V100 | PXQN3 (12.6 GB) | 1029 | 32.9 &sup1; | | |
 | 1x V100 | PXQN3bal (13.5 GB) | 1028 | 32.4 &sup1; | | |
@@ -87,7 +88,7 @@ Prefill, plain decode and MTP decode side by side, in tokens per second. Two or 
 | 2x P100 | PXQ4 classic (16.5 GB) | 334 | 33.0 | | |
 | **4x P100** | PXQN4 (15.7 GB) | 440 | 30.7 | | |
 | 4x P100 | PXQN5 (18.8 GB) | 434 | 29.8 | | |
-| **1x P100** | **One-card 27B** (13.6 GB) | 252 | 24.2 | **32.3** | **36.2** |
+| **1x P100** | **One-card 27B** (13.6 GB) | 252 | 24.2 | **31.6** | **35.2** |
 | 1x P100 | PXQN4 (15.7 GB) | 254 | 24.0 | | |
 | 1x P100 | PXQN3 (12.6 GB) | 249 | 24.5 | | |
 | 1x P100 | PXQN3bal (13.5 GB) | 251 | 24.4 | | |
@@ -200,7 +201,7 @@ Models quantized to PXA formats by the team. New posts in the #models channel on
 Full list with download counts: [MODELS.md](MODELS.md)
 <!-- models:end -->
 
-The showcase **one-card Qwen3.8-27B PXQN** (12.6 GiB, 131k context on one 16 GB card) is a free public download from PXA Network. The larger PXQN sizes and the other PXQN models go to supporters first; see below.
+The showcase **one-card Qwen3.8-27B PXQN** (12.6 GiB, 131k context on one 16 GB card) is a free public download: **[poisonxa/Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Qwen3.8-27B-PXQN-OneCard)**. On one V100 it runs 34 t/s plain and **55.6 t/s prose / 61.2 t/s code with MTP**; on one P100, 23.6 plain and 31.6 / 35.2 with MTP (v2026.10.1). The larger PXQN sizes and the other PXQN models go to supporters first; see below.
 
 ---
 
