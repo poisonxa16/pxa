@@ -502,6 +502,22 @@ bool server_context::load_model(const gpt_params& params_) {
                          : params_dft.n_ctx;
         params_dft.n_parallel = 1;
         params_dft.n_batch = params_dft.n_ctx;
+        // The Gemma-4 assistant drafter reads the TARGET's K/V in place and writes none of its own:
+        // its context needs no n_ctx-sized cache (4 layers x n_ctx cells of unused K/V: 150 MiB at
+        // 2k, 2.4 GiB at 32k) and only ever decodes n_max rows, so the ubatch (which sizes the
+        // compute buffer through the 262144-wide logits) is capped to that instead of the target's.
+        if (llama_is_gemma4_mtp_file(params_dft.model.c_str())) {
+            const int32_t n_rows = std::max(params_base.speculative.get_max_stage_n_max() + 1, 4);
+            params_dft.n_ctx    = 512;
+            params_dft.n_batch  = 512;
+            params_dft.n_ubatch = n_rows;
+            // the target has already claimed its own cache and compute buffers; the default 1 GiB fit margin
+            // would leave the whole (250-800 MiB) drafter on the CPU, which is the slowest place for it
+            if (params_dft.fit_margin <= 0) params_dft.fit_margin = 128;
+            // and it runs on the card unless the user said -ngld (the engine's own default offloads nothing)
+            if (params_dft.n_gpu_layers < 0) params_dft.n_gpu_layers = 999;
+            LLAMA_LOG_INFO("Gemma-4 assistant drafter: own context capped to n_ctx=512 n_ubatch=%d (it reads the target's K/V)\n", n_rows);
+        }
 
         params_base.speculative.mparams_dft.path = params_dft.model; //
 

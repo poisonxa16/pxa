@@ -2455,7 +2455,7 @@ extern "C" {
 
     // pad each dimension with zeros in front (lp*) and behind (rp*): [x, ..., x] -> [0, .., 0, x, ..., x, 0, ..., 0]
     // (upstream's signature and op_params layout [lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3]; ggml_pad leaves every
-    // lp at 0, so its result and path are unchanged). Lane pxqn-split: the K window of a straddled tensor split.
+    // lp at 0, so its result and path are unchanged). The K window of a straddled tensor split.
     GGML_API struct ggml_tensor * ggml_pad_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

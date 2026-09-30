@@ -98,6 +98,11 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
 };
 
 llm_arch llm_arch_from_string(const std::string & name) {
+    // Upstream ggml-org Gemma-4 assistant drafters (e.g. unsloth mtp-gemma-4-*-it.gguf) write the
+    // arch "gemma4-assistant"; ours is "gemma4_mtp". Same model, different name: accept both.
+    if (name == "gemma4-assistant") {
+        return LLM_ARCH_GEMMA4_MTP;
+    }
     for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
         if (kv.second == name) {
             return kv.first;
@@ -304,6 +309,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 LLM_KV::LLM_KV(llm_arch arch, const char* suffix) : arch(arch), suffix(suffix) {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
+    // an aliased arch (llm_arch_from_string) keeps the KEY prefix the file was written with
+    if (!prefix_override.empty()) {
+        return suffix ? ::format(LLM_KV_NAMES.at(kv), prefix_override.c_str(), suffix)
+            : ::format(LLM_KV_NAMES.at(kv), prefix_override.c_str());
+    }
     return suffix ? ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch), suffix)
         : ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
 }

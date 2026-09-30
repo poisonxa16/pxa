@@ -375,7 +375,7 @@ while read -r libpath; do
     # 751 MB entries instead of one, same for libnccl.so.2 (383 MB) and libcublas.so.12 (116 MB)
     # -- about 1.25 GB of pure duplication, most of why this release's tarball measured 2.1+ GB
     # against v2026.09.20's 1.31 GB for a comparable payload. The shipped v2026.09.20 artifact
-    # itself (/mnt/cacheone/pxa-release-assets/pxa-v2026.09.20-...tar.gz) carries these same
+    # itself (<assets>/pxa-v2026.09.20-...tar.gz) carries these same
     # pairs as genuine hard links (`tar -tzv` shows the "h...  0 bytes  link to ..." form) --
     # confirming a hard link, not a second copy, is the intended shape here. `ln -f` also means
     # patchelf/strip touching one name transparently updates the other, as long as they edit in

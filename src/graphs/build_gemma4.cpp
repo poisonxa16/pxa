@@ -661,22 +661,17 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
     cb(lctx.inp_tokens, "inp_tokens", -1);
     ggml_set_input(lctx.inp_tokens);
 
-    // The frozen KV views below address the TARGET's kv_self directly, one view per target layer.
-    // If the target is running the sliding-window cache, its sliding layers have no K/V in kv_self
-    // at all (they live in kv_swa, a different index space with a different extent), so those views
-    // would be built on a null tensor. Refuse in words rather than crash in a view: the two levers
-    // are exclusive until the frozen-view builder learns to pick a cache per layer the way the
-    // dense graph now does.
-    if (lctx.mtp_target_ctx->swa_kv_active) {
-        throw std::runtime_error("the Gemma 4 assistant drafter reads the target's K/V through frozen views "
-                "into its single cache, so it cannot run against a target using the sliding-window cache "
-                "(PXA_GEMMA4_ISWA); run one or the other");
-    }
+    // The drafter reads the TARGET's K/V in place. When the target runs the sliding-window cache
+    // (PXA_GEMMA4_ISWA, the Gemma-4 default), its sliding layers keep K/V in kv_swa -- a separate
+    // cache object with its own extent -- and its full layers in kv_self; each drafter layer is
+    // pointed at the cache that owns the target layer it mirrors, with that cache's own n and mask.
+    const bool target_swa = lctx.mtp_target_ctx->swa_kv_active;
 
     const llama_model   & target_model   = lctx.mtp_target_ctx->model;
     const llama_hparams & target_hparams = target_model.hparams;
     const llama_cparams & target_cparams = lctx.mtp_target_ctx->cparams;
     const llama_kv_cache & target_kv     = lctx.mtp_target_ctx->kv_self;
+    const llama_kv_cache & target_kv_swa = target_swa ? lctx.mtp_target_ctx->kv_swa : target_kv;
 
     GGML_ASSERT(n_tokens <= target_kv.n);
 
@@ -694,6 +689,8 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
 
     const int32_t target_n_kv = target_kv.n;
     const int32_t target_kv_head = target_kv.head;
+    const int32_t target_n_kv_swa = target_swa ? (int32_t) target_kv_swa.n : target_n_kv;
+    const int32_t target_kv_head_swa = target_swa ? (int32_t) target_kv_swa.head : target_kv_head;
 
     ggml_tensor * KQ_mask = nullptr;
     ggml_tensor * KQ_mask_swa = nullptr;
@@ -709,7 +706,7 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
         KQ_mask = lctx.inp_KQ_mask;
 
         if (target_hparams.n_swa > 0) {
-            lctx.inp_KQ_mask_swa = ggml_new_tensor_2d(ctx0, flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, target_n_kv, n_mask_tokens);
+            lctx.inp_KQ_mask_swa = ggml_new_tensor_2d(ctx0, flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, target_n_kv_swa, n_mask_tokens);
             cb(lctx.inp_KQ_mask_swa, "KQ_mask_swa", -1);
             ggml_set_input(lctx.inp_KQ_mask_swa);
             KQ_mask_swa = lctx.inp_KQ_mask_swa;
@@ -743,9 +740,13 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
         const int target_il = gemma4_mtp_target_kv_layer(hparams, target_hparams, il);
         ggml_tensor *& frozen_k = is_sliding ? frozen_k_swa : frozen_k_full;
         ggml_tensor *& frozen_v = is_sliding ? frozen_v_swa : frozen_v_full;
-        gemma4_mtp_prepare_frozen_kv_views(ctx0, lctx, target_kv, il, target_il, target_n_kv, &frozen_k, &frozen_v, cb);
-        cur = llm_build_kv(ctx0, lctx, target_kv, gf, model.layers[il].wo, model.layers[il].bo,
-            nullptr, nullptr, Qcur, KQ_mask_l, n_tokens, target_kv_head, target_n_kv, hparams.f_attention_scale, cb, il, nullptr, n_swa, target_il,
+        const bool             use_swa_kv = is_sliding && target_swa;
+        const llama_kv_cache & kv_l       = use_swa_kv ? target_kv_swa : target_kv;
+        const int32_t          n_kv_l     = use_swa_kv ? target_n_kv_swa : target_n_kv;
+        const int32_t          kv_head_l  = use_swa_kv ? target_kv_head_swa : target_kv_head;
+        gemma4_mtp_prepare_frozen_kv_views(ctx0, lctx, kv_l, il, target_il, n_kv_l, &frozen_k, &frozen_v, cb);
+        cur = llm_build_kv(ctx0, lctx, kv_l, gf, model.layers[il].wo, model.layers[il].bo,
+            nullptr, nullptr, Qcur, KQ_mask_l, n_tokens, kv_head_l, n_kv_l, hparams.f_attention_scale, cb, il, nullptr, n_swa, target_il,
             &frozen_k, &frozen_v);
 
         cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, cb, il);

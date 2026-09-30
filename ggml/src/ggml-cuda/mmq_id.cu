@@ -488,7 +488,10 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         // Unset/0 = MMQ always (previous behavior). Decode (tiny ne11) stays MMQ/MMVQ.
         if (cc >= CC_VOLTA && cc < CC_TURING) {
             static const char * pxa_vci_env  = getenv("PXA_VOLTA_CUBLAS_ID_NE11");
-            static const int    pxa_vci_ne11 = pxa_vci_env ? atoi(pxa_vci_env) : 0;
+            // Default 2048 (2026-09-30, , Gemma 4 26B-A4B UD-Q4_K_XL / QAT q4_0 on V100:
+            // ub2048 pp4096 2674 -> 2780, pp512 unchanged since ne11 < 2048 keeps MMQ; ub1024 unchanged).
+            // Lower thresholds lose (64: pp512 -30%). PXA_VOLTA_CUBLAS_ID_NE11=0 restores MMQ-always.
+            static const int    pxa_vci_ne11 = pxa_vci_env ? atoi(pxa_vci_env) : 2048;
             if (pxa_vci_ne11 > 0 && ne11 >= pxa_vci_ne11) {
                 return false;
             }

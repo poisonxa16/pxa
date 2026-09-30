@@ -592,7 +592,7 @@ bool common_chat_auto_jinja(const struct llama_model * model, bool & use_jinja,
     //                         from the reply - without it a plain /v1/chat/completions request gets
     //                         the whole thought back inside `content` (checked on Qwen3.8-27B:
     //                         --jinja and nothing else moves it to `reasoning_content`).
-    const bool is_gemma4   = (strcmp(arch, "gemma4") == 0 || strcmp(arch, "gemma4_mtp") == 0);
+    const bool is_gemma4   = (strcmp(arch, "gemma4") == 0 || strcmp(arch, "gemma4_mtp") == 0 || strcmp(arch, "gemma4-assistant") == 0);
     const bool is_qwen35   = (strcmp(arch, "qwen35") == 0);
     const bool needs_jinja = is_gemma4 || is_qwen35;
     if (!needs_jinja) {
@@ -653,7 +653,7 @@ bool common_chat_auto_reasoning(const struct llama_model * model, bool use_jinja
     // with thinking on, a system turn carrying <|think|> is injected and the generation prompt
     // leaves the thought channel open; with it off, the prompt ends <|channel>thought\n<channel|>,
     // an already-closed empty thought, and the model answers directly.
-    const bool template_default_is_off = (strcmp(arch, "gemma4") == 0 || strcmp(arch, "gemma4_mtp") == 0);
+    const bool template_default_is_off = (strcmp(arch, "gemma4") == 0 || strcmp(arch, "gemma4_mtp") == 0 || strcmp(arch, "gemma4-assistant") == 0);
     if (!template_default_is_off) {
         return false;
     }

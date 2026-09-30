@@ -2971,8 +2971,14 @@ bool create_tensors_helper::create_gemma4_mtp_tensors(const LLM_TN & tn) {
     if (model.output == NULL) {
         model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
     }
-    model.mtp_pre_proj  = create_tensor(ctx_output, tn(LLM_TENSOR_MTP_PRE_PROJ,  "weight"), {2*n_backbone, n_embd}, 0);
-    model.mtp_post_proj = create_tensor(ctx_output, tn(LLM_TENSOR_MTP_POST_PROJ, "weight"), {n_embd, n_backbone}, 0);
+    // upstream ggml-org drafter files name the two projections nextn.pre/post_projection; ours say mtp_pre/post_proj
+    const bool up_names = ml.get_tensor_meta("nextn.pre_projection.weight") != nullptr;
+    model.mtp_pre_proj  = create_tensor(ctx_output, up_names ? std::string("nextn.pre_projection.weight")  : tn(LLM_TENSOR_MTP_PRE_PROJ,  "weight"), {2*n_backbone, n_embd}, 0);
+    model.mtp_post_proj = create_tensor(ctx_output, up_names ? std::string("nextn.post_projection.weight") : tn(LLM_TENSOR_MTP_POST_PROJ, "weight"), {n_embd, n_backbone}, 0);
+    // the upstream file also carries rope_freqs.weight (unused: our graph derives its own rope factors)
+    if (const ggml_tensor * rf = ml.get_tensor_meta("rope_freqs.weight")) {
+        (void) create_tensor(ctx_output, "rope_freqs.weight", {rf->ne[0]}, llama_model_loader::TENSOR_NOT_REQUIRED);
+    }
 
     model.mtp_token_ordering = create_tensor(ctx_output, tn(LLM_TENSOR_MTP_TOKEN_ORDERING, "weight"), {n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
     model.mtp_centroids      = create_tensor(ctx_output, tn(LLM_TENSOR_MTP_CENTROIDS,      "weight"), {n_embd, hparams.mtp_num_centroids}, llama_model_loader::TENSOR_NOT_REQUIRED);

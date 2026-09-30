@@ -293,6 +293,7 @@ struct LLM_KV {
 
     llm_arch arch;
     const char* suffix;
+    std::string prefix_override; // non-empty: key prefix of the file when its arch string is an alias
     std::string operator()(llm_kv kv) const;
 };
 

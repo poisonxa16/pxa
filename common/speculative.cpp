@@ -433,6 +433,15 @@ struct common_speculative_state {
     virtual void hard_reset() {}
 };
 
+static bool pxa_g4_gate_on() {
+    static const bool v = [](){ const char * e = getenv("PXA_GEMMA4_MTP_GATE"); return !(e && atoi(e) == 0); }();
+    return v;
+}
+static float pxa_g4_gate_min() {
+    static const float v = [](){ const char * e = getenv("PXA_GEMMA4_MTP_GATE_MIN"); const float x = e ? (float) atof(e) : 0.5f; return x > 0.0f && x < 1.0f ? x : 0.5f; }();
+    return v;
+}
+
 struct common_speculative_state_mtp;
 
 static common_speculative_state_mtp * common_speculative_get_mtp_state(common_speculative * spec);
@@ -784,6 +793,17 @@ struct common_speculative_state_mtp : public common_speculative_state {
     std::unordered_map<llama_seq_id, common_sampler *> pxa_req_smpl_by_seq;
     std::unordered_map<llama_seq_id, std::vector<std::vector<pxa_spec_cand>>> pxa_draft_q_by_seq;
 
+    // Gemma-4 assistant drafter acceptance gate (PXA_GEMMA4_MTP_GATE, default on). One MTP cycle costs a
+    // 2-row MoE verify plus a draft step (~14 ms against 8.4 ms for a plain token on a V100), so a draft
+    // only pays above about 0.68 acceptance at n_max=1. English prose and code sit at 0.7-0.99; Finnish
+    // sits near 0.45 on the same drafter and loses 5-12% to plain decode. When the running acceptance
+    // falls under PXA_GEMMA4_MTP_GATE_MIN (default 0.5) the stage stops drafting for a stretch of steps
+    // (plain decode, nothing else changes) and then probes again. Draft length only; acceptance of
+    // whatever is drafted is untouched.
+    float    pxa_g4_ema      = 0.85f;
+    uint32_t pxa_g4_drafted  = 0;    // tokens the last draft() emitted; consumed by accept()
+    int      pxa_g4_skip     = 0;    // steps left to sit out
+
     // PXA_MTP_ADAPTIVE_K controller state (inert unless PXA_MTP_ADAPTIVE_K=1).
     float    pxa_ak_ema     = 0.70f; // running acceptance EMA (optimistic cold-start = full-depth drafts)
     uint32_t pxa_ak_drafted = 0;     // draft tokens emitted last cycle (accept() denominator)
@@ -961,6 +981,13 @@ struct common_speculative_state_mtp : public common_speculative_state {
             return;
         }
 
+        if (constant_draft_positions && pxa_g4_gate_on() && pxa_g4_skip > 0) {
+            --pxa_g4_skip;
+            pxa_g4_drafted = 0;
+            result.clear();
+            return;
+        }
+
         // PXA_LLAMA_MTP_NP_FIX: ctx_mtp is single-seq per slot -> query local row 0.
         const llama_seq_id mtp_kv_seq = llama_n_seq_max(ctx_mtp) <= 1 ? 0 : seq_id;
         const llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_mtp, mtp_kv_seq);
@@ -1005,6 +1032,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             seq_id,
             constant_draft_positions
         );
+        pxa_g4_drafted = constant_draft_positions ? (uint32_t) result.size() : 0;
     }
 
     // PXA_SPEC_CHAIN_ACCEPT_v1 + PXA_SPEC_MTP_LAZY_v1: another stage won this step, so the run
@@ -1027,6 +1055,20 @@ struct common_speculative_state_mtp : public common_speculative_state {
     }
 
     void accept(uint16_t n_accepted) override {
+        if (constant_draft_positions && pxa_g4_gate_on() && pxa_g4_drafted > 0) {
+            float f = (float) n_accepted / (float) pxa_g4_drafted;
+            if (f > 1.0f) f = 1.0f;
+            pxa_g4_ema = 0.9f * pxa_g4_ema + 0.1f * f;
+            const uint32_t pxa_g4_drafted_dbg = pxa_g4_drafted;
+            pxa_g4_drafted = 0;
+            if (getenv("PXA_GEMMA4_MTP_GATE_DBG")) {
+                LOG_WRN("PXA_GEMMA4_MTP_GATE: accepted %d of %u -> ema %.3f\n", (int) n_accepted, pxa_g4_drafted_dbg, (double) pxa_g4_ema);
+            }
+            if (pxa_g4_ema < pxa_g4_gate_min()) {
+                pxa_g4_skip = 8;
+                pxa_g4_ema  = 0.62f;   // restart just above the floor: two more misses close it again, a run of hits reopens it
+            }
+        }
         // PXA_MTP_STATS: the target has just told us how many of the proposed tokens it kept.
         if (auto & st = pxa_mtp_stats(); st.on) {
             st.accepted     += n_accepted;

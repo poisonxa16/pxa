@@ -3254,8 +3254,14 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
 
     cmd = [f"{E}/bin/llama-server", "-m", a.model, "--host", a.host, "--port", str(a.port),
            "-ngl", str(a.ngl), "-sm", a.sm, "-c", str(ctx),
-           "-ctk", a.ctk, "-ctv", a.ctv, "-np", str(a.np),
+           "-np", str(a.np),
            "-fa", plan.fa, "--cont-batching"]
+    if a.ctk == "auto" and a.ctv == "auto":
+        print("  -ctk/-ctv: NOT PASSED (auto). The engine's registry picks the measured KV cache type for this "
+              "card and model (q4_0 for the Qwen3.8 family on Pascal/Volta, what every published number uses; f16 "
+              "elsewhere). --ctk/--ctv force one.")
+    else:
+        cmd += ["-ctk", "f16" if a.ctk == "auto" else a.ctk, "-ctv", "f16" if a.ctv == "auto" else a.ctv]
     if getattr(a, "emit_threads", True):
         cmd += ["-t", str(a.threads)]
     else:
@@ -6081,7 +6087,7 @@ def plan_and_build(a, gpus):
             plan.refuse("R-10", code=3)
         if a.sm and a.sm != "layer":
             plan.refuse("R-11", code=3, sm=a.sm)
-        if (a.ctk, a.ctv) != ("f16", "f16"):
+        if (a.ctk, a.ctv) not in (("f16", "f16"), ("auto", "auto")):
             plan.refuse("R-13V", code=3)
         m, _ = parse_spec(a.spec)
         if m == "mtp":
@@ -6101,7 +6107,7 @@ def plan_and_build(a, gpus):
                 why = f"arch '{prof['arch']}' is on the guarded list (tools/pxa-launch.py)"
             if why:
                 plan.refuse("R-12", code=3, why=why)
-        if (a.ctk, a.ctv) not in COMPILED_CTKV_PAIRS:
+        if (a.ctk, a.ctv) != ("auto", "auto") and (a.ctk, a.ctv) not in COMPILED_CTKV_PAIRS:
             plan.refuse("R-13L", code=3, k=a.ctk, v=a.ctv)
         if a.draft_model and not a.accept_unmeasured:
             plan.refuse("R-25", code=3)
@@ -6502,8 +6508,11 @@ def build_parser():
                          "--explain prints which it picked and why. The ENGINE's own default is "
                          "still layer - this is the launcher choosing, and --sm layer is the "
                          "one flag back.")
-    ap.add_argument("--ctk", default="f16")
-    ap.add_argument("--ctv", default="f16")
+    ap.add_argument("--ctk", default="auto",
+                    help="K cache type. Default auto: not passed, the engine registry picks the measured KV type "
+                         "for the card and model (q4_0 on Qwen3.8 / Pascal-Volta; f16 at 65k spills a 16 GB card's "
+                         "weights to host RAM: 1.7 vs 24 t/s decode)")
+    ap.add_argument("--ctv", default="auto", help="V cache type (default auto, see --ctk)")
     ap.add_argument("--mmproj", default="")
     ap.add_argument("--no-mmproj", action="store_true")
     ap.add_argument("--no-mmap", action="store_true")

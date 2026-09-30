@@ -120,7 +120,7 @@ class LaunchValidation(unittest.TestCase):
     def test_defaults(self):
         r = self.v()
         self.assertEqual((r["gpus"], r["kv"], r["sm"], r["fa"], r["ctx"], r["np"]),
-                         ([0], "f16", "auto", "auto", 0, 0))
+                         ([0], "auto", "auto", "auto", 0, 0))
         # port auto = the first FREE port from 8080 up (8080 itself is often taken)
         self.assertGreaterEqual(r["port"], 8080)
         self.assertFalse(C.port_in_use(r["port"]))
@@ -175,6 +175,12 @@ class LaunchValidation(unittest.TestCase):
             self.assertEqual(a[i:i + 2], want)
         self.assertIn("--accept-unmeasured", a)
         self.assertNotIn("--allow-busy", a)
+        # kv auto (the default) passes no --ctk/--ctv: the engine registry picks the KV type
+        a2 = C.launcher_argv(self.v())
+        self.assertNotIn("--ctk", a2)
+        self.assertNotIn("--ctv", a2)
+        ns2 = L.build_parser().parse_args(a2)
+        self.assertEqual((ns2.ctk, ns2.ctv), ("auto", "auto"))
         # the launcher's own parser accepts every argv the GUI builds
         ns = L.build_parser().parse_args(a)
         self.assertEqual((ns.gpus, ns.np, ns.workload, ns.spec), ("1,0", 2, "serve", "mtp"))
@@ -242,7 +248,7 @@ class Handlers(unittest.TestCase):
         self.assertEqual((code, body[:4]), (200, b"\x89PNG"))
         code, _, body = req(self.port, "/api/info")
         d = json.loads(body)
-        self.assertEqual((code, d["lan"], d["kv_types"][0]), (200, False, "f16"))
+        self.assertEqual((code, d["lan"], d["kv_types"][0]), (200, False, "auto"))
 
     def test_status_rig_presets(self):
         self.assertEqual(json.loads(req(self.port, "/api/status")[2])["running"], False)
@@ -487,6 +493,34 @@ class ReportBundle(unittest.TestCase):
     def setUp(self):
         self.app = C.App(L, port=0, models_dirs=[MODELS])
 
+    def test_gpu_telemetry_in_bundle(self):
+        line = ("0, 83, 544, 1328, 715, 715, 121.50, 250.00, 0x0000000000000068\n"
+                "1, 41, 1328, 1328, 715, 715, 30.00, 250.00, 0x1\n")
+        real = self.app.L._run
+        self.app.L._run = lambda argv, timeout=10: line if argv and argv[0] == "nvidia-smi" else real(argv, timeout=timeout)
+        fake = os.environ.pop("PXA_LAUNCH_FAKE_GPUS")
+        try:
+            t = self.app.gpu_telemetry()
+        finally:
+            os.environ["PXA_LAUNCH_FAKE_GPUS"] = fake
+            self.app.L._run = real
+        self.assertEqual([r["index"] for r in t], [0, 1])
+        self.assertEqual((t[0]["temp_c"], t[0]["sm_clock_mhz"], t[0]["power_limit_w"]), (83.0, 544.0, 250.0))
+        self.assertEqual(sorted(t[0]["throttle_reasons"]), ["hw_slowdown", "hw_thermal_slowdown", "sw_thermal_slowdown"])
+        self.assertEqual(t[1]["throttle_reasons"], [])   # idle only is not a throttle
+        # the fake rig asks no nvidia-smi
+        self.assertEqual(self.app.gpu_telemetry(), [])
+
+    def test_heat_warning(self):
+        w = C.App.heat_warning(2, 84.0, ["hw_thermal_slowdown"])
+        self.assertEqual(w, "Card 2 is running hot (84 \u00b0C, thermal throttling): expect much lower speed. "
+                            "Passive Tesla cards need forced airflow.")
+        self.assertIn("80 \u00b0C", C.App.heat_warning(0, 80.0, []))
+        self.assertIn("power throttling", C.App.heat_warning(1, None, ["sw_power_cap"]))
+        self.assertIsNone(C.App.heat_warning(0, 79.0, []))
+        self.assertIsNone(C.App.heat_warning(0, 40.0, ["gpu_idle"]))
+        self.assertIn("heat_warning", self.app.rig_live()["cards"][0])
+
     def test_bundle_shape_and_send_failure_is_reported(self):
         self.app.seat._append("PXA_REGISTRY: card 0 sm 60 class=p100")
         self.app.seat._append("build: 4711 (abc1234)")
@@ -497,6 +531,7 @@ class ReportBundle(unittest.TestCase):
         self.assertTrue(any("PXA_REGISTRY" in x for x in bu["banner"]))
         self.assertEqual(bu["engine"]["version"], "4711 (abc1234)")
         self.assertEqual(len(bu["gpus"]), 2)
+        self.assertIn("gpu_telemetry", bu)
         self.assertNotIn("sk-abc", json.dumps(b))
         self.assertNotIn("/home/bob", json.dumps(b))
         old = os.environ.get("PXA_BUG_URL")

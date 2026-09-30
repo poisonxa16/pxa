@@ -63,6 +63,9 @@ struct pxa_model_info {
     int         n_expert  = -1;   // >0 experts, 0 dense, -1 unknown
     int         n_head_kv = -1;   // smallest per-layer KV head count, -1 unknown
     int         n_layer   = -1;   // <arch>.block_count, -1 unknown
+    int         head_k    = -1;   // <arch>.attention.key_length, -1 unknown
+    int         head_v    = -1;   // <arch>.attention.value_length
+    int         full_attn_interval = -1;   // hybrid arches: every Nth layer holds KV, -1 unknown
     int         n_ctx_train = -1; // <arch>.context_length, -1 unknown
     int         n_pxq     = 0;    // tensors carrying a PXQ codec
     int         n_shards  = 1;
@@ -83,6 +86,7 @@ struct pxa_user_set {
     bool fa_value    = true;    // the -fa value in effect (explicit or posture)
     int  n_ctx_value = 0;       // the -c value when given (0 = unset / trained window)
     bool kv_q8       = false;   // -ctk q8_0 and -ctv q8_0 both in effect
+    bool kv          = false;   // -ctk or -ctv given (flag or LLAMA_ARG_CACHE_TYPE_K/V)
     int  sm_value    = -1;      // the -sm in effect when given (llama_split_mode: 1 layer, 4 tensor, ...)
 };
 
@@ -117,6 +121,7 @@ struct pxa_autoconfig {
     int  n_gpu_layers = -1;           // -1 keep; 999 = every layer on the cards (-ngl unset, CUDA present)
     int  n_ctx       = 0;             // 0 keep; else the -c the engine picked (-c unset, ENHANCE)
     bool ts_even     = false;         // tensor split picked: set -ts 1,1,...
+    const char * kv_type = nullptr;   // a KV cache type the engine picked for -ctk and -ctv (null = keep f16)
     const char * ub_rule = nullptr;   // a -ub RULE replaced the adaptive ladder (n_ubatch holds it)
     const char * batch_cell = nullptr;
     int  batch_cell_ctx = 0;          // the cell's own -c (0 = none); see pxa_registry_batch_cell

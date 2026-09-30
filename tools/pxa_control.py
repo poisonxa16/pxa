@@ -189,7 +189,7 @@ def validate_levers(levers, catalog_names):
 # ---------------------------------------------------------------------------------------------
 # launch request validation -> launcher argv
 # ---------------------------------------------------------------------------------------------
-KV_TYPES = ["f16", "q8_0", "q6_0", "q5_0", "q4_0"]
+KV_TYPES = ["auto", "q4_0", "q8_0", "q6_0", "q5_0", "f16"]   # auto = pass nothing; the engine registry picks the measured KV
 SPLIT_MODES = ["auto", "layer", "tensor"]
 FA_MODES = {"auto": None, "on": "chat", "off": "longdoc"}   # the launcher's FA regime IS the workload
 PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9 _.\-]{1,48}$")
@@ -284,7 +284,7 @@ def validate_launch(body, gpu_indexes, catalog_names, model_roots, gui_port=None
             raise Invalid(f"model file not found: {model}")
         if not path_under(model, model_roots):
             raise Invalid("the model must be inside one of your model folders (Models tab)")
-    kv = body.get("kv", "f16") or "f16"
+    kv = body.get("kv", "auto") or "auto"
     if kv not in KV_TYPES:
         raise Invalid(f"kv must be one of {', '.join(KV_TYPES)}")
     sm = body.get("sm", "auto") or "auto"
@@ -321,8 +321,10 @@ def launcher_argv(req):
     """The command line a user would have typed for this request (no shell; argv only)."""
     argv = ["--gpus", ",".join(str(x) for x in req["gpus"]), "--model", req["model"],
             "--port", str(req["port"]), "--host", "0.0.0.0" if req["expose"] else "127.0.0.1",
-            "--sm", req["sm"], "--ctk", req["kv"], "--ctv", req["kv"],
-            "--yes", "--no-interactive", "--no-tui"]
+            "--sm", req["sm"]]
+    if req["kv"] != "auto":          # auto: no -ctk/-ctv, the engine registry picks the KV type
+        argv += ["--ctk", req["kv"], "--ctv", req["kv"]]
+    argv += ["--yes", "--no-interactive", "--no-tui"]
     if req["ctx"]:
         argv += ["--ctx", str(req["ctx"])]
     if req["np"]:
@@ -626,8 +628,27 @@ class App(object):
         rows, err = self.L.gpu_table()
         return rows or [], err
 
+    HOT_C = 80.0
+    THROTTLE_WARN = ("sw_power_cap", "hw_slowdown", "sw_thermal_slowdown", "hw_thermal_slowdown", "hw_power_brake_slowdown")
+
+    @classmethod
+    def heat_warning(cls, index, temp_c, reasons):
+        """One plain sentence for a card at/above 80 C or with an active thermal/power throttle, else None."""
+        bad = [r for r in (reasons or []) if r in cls.THROTTLE_WARN]
+        hot = temp_c is not None and temp_c >= cls.HOT_C
+        if not hot and not bad:
+            return None
+        thermal = [r for r in bad if "thermal" in r or r == "hw_slowdown"]
+        if hot and temp_c is not None:
+            what = f"{temp_c:.0f} \u00b0C" + (", thermal throttling" if thermal else (", power throttling" if bad else ""))
+        else:
+            what = "thermal throttling" if thermal else "power throttling"
+        return (f"Card {index} is running hot ({what}): expect much lower speed. "
+                "Passive Tesla cards need forced airflow.")
+
     def rig_live(self):
         rows, err = self.gpus()
+        throttle = {t["index"]: t["throttle_reasons"] for t in self.gpu_telemetry()}
         tele = {}
         if not os.environ.get("PXA_LAUNCH_FAKE_GPUS"):
             out = self.L._run(["nvidia-smi", "--query-gpu=index,temperature.gpu,power.draw,power.limit,"
@@ -659,7 +680,9 @@ class App(object):
                                "mem_total_mib": g[3], "mem_used_mib": g[4], "uuid": g[5],
                                "class": self.L.CARD_CLASS.get(g[2], f"sm_{g[2]}"),
                                "procs": [{"pid": p, "name": n, "mib": m} for p, n, m in procs.get(g[0], [])],
-                               "narrow": bool(t.get("pcie_width") and t["pcie_width"] < self.L.PCIE_NARROW_BELOW)},
+                               "narrow": bool(t.get("pcie_width") and t["pcie_width"] < self.L.PCIE_NARROW_BELOW),
+                               "throttle_reasons": throttle.get(g[0], []),
+                               "heat_warning": self.heat_warning(g[0], t.get("temp_c"), throttle.get(g[0], []))},
                               **t))
         return {"cards": cards, "error": err, "ts": time.time()}
 
@@ -920,6 +943,46 @@ class App(object):
         return d
 
     # ---- report a problem -----------------------------------------------------------------
+    THROTTLE_BITS = ((0x1, "gpu_idle"), (0x2, "applications_clocks_setting"), (0x4, "sw_power_cap"),
+                     (0x8, "hw_slowdown"), (0x10, "sync_boost"), (0x20, "sw_thermal_slowdown"),
+                     (0x40, "hw_thermal_slowdown"), (0x80, "hw_power_brake_slowdown"))
+
+    def gpu_telemetry(self):
+        """Per-GPU temperature, SM/memory clocks, power draw/limit and throttle reasons, read now."""
+        if os.environ.get("PXA_LAUNCH_FAKE_GPUS"):
+            return []
+        base = "index,temperature.gpu,clocks.sm,clocks.max.sm,clocks.mem,clocks.max.mem,power.draw,power.limit,"
+        out = None
+        for fld in ("clocks_throttle_reasons.active", "clocks_event_reasons.active"):   # renamed in newer drivers
+            out = self.L._run(["nvidia-smi", "--query-gpu=" + base + fld, "--format=csv,noheader,nounits"], timeout=15)
+            if out:
+                break
+        rows = []
+
+        def num(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+        for line in (out or "").splitlines():
+            f = [x.strip() for x in line.split(",")]
+            if len(f) < 9:
+                continue
+            try:
+                idx = int(f[0])
+            except ValueError:
+                continue
+            try:
+                mask = int(f[8], 16) if f[8].lower().startswith("0x") else int(f[8])
+            except ValueError:
+                mask = None
+            reasons = None if mask is None else [n for b, n in self.THROTTLE_BITS if mask & b and n != "gpu_idle"]
+            rows.append({"index": idx, "temp_c": num(f[1]), "sm_clock_mhz": num(f[2]), "sm_clock_max_mhz": num(f[3]),
+                         "mem_clock_mhz": num(f[4]), "mem_clock_max_mhz": num(f[5]), "power_w": num(f[6]),
+                         "power_limit_w": num(f[7]), "throttle_mask": f[8],
+                         "throttle_reasons": reasons if reasons is not None else [f[8]]})
+        return rows
+
     def report_bundle(self):
         """The whole report, already redacted, exactly as the page will show it (and send it)."""
         seat = self.seat
@@ -961,6 +1024,7 @@ class App(object):
             "flags": " ".join(self.L.redact_cmd(seat.cmd)) if seat.cmd else "",
             "request": {k: v for k, v in req.items() if k != "model"},
             "gpus": gpus,
+            "gpu_telemetry": self.gpu_telemetry(),
             "model": {"filename": os.path.basename(mpath) if mpath else None, "size_bytes": msize},
             "phase": seat.phase,
             "exit_code": seat.proc.returncode if (seat.proc and not seat.running()) else None,

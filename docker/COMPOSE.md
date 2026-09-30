@@ -166,7 +166,7 @@ own card, with the same driver and the same weight file, changing exactly one th
 docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0 -p 8080:8080 \
   -v /your/models:/models:ro \
   --entrypoint /opt/pxa/bin/upstream-ik-server \
-  ghcr.io/poisonxa16/pxa:v2026.10.1 \
+  ghcr.io/poisonxa16/pxa:v2026.10.2 \
   -m /models/your-model.gguf -ngl 99 -c 8192 --host 0.0.0.0 --port 8080
 ```
 
@@ -183,6 +183,6 @@ published gate results apply to the image without a separate claim. `docker imag
 inspect` will tell you which release and which commit:
 
 ```bash
-docker image inspect ghcr.io/poisonxa16/pxa:v2026.10.1 \
+docker image inspect ghcr.io/poisonxa16/pxa:v2026.10.2 \
   --format '{{json .Config.Labels}}' | python3 -m json.tool
 ```

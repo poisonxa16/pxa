@@ -634,6 +634,17 @@ static bool is_autoy(const std::string & value) {
 static void common_speculative_finalize_stages(gpt_params & params) {
     auto & spec = params.speculative;
 
+    // -md pointing at a Gemma-4 assistant drafter (arch gemma4_mtp / gemma4-assistant) and no --spec-type:
+    // the only thing that file can be is the MTP stage, so arm it (n_max=1: measured best across prose,
+    // code and Finnish on a V100). PXA_GEMMA4_MTP_AUTO=0 restores the old refusal.
+    if (spec.stages.empty() && (spec.type == COMMON_SPECULATIVE_TYPE_NONE || spec.type == COMMON_SPECULATIVE_TYPE_DRAFT) &&
+        !spec.model.empty() && !(getenv("PXA_GEMMA4_MTP_AUTO") && atoi(getenv("PXA_GEMMA4_MTP_AUTO")) == 0) &&
+        llama_is_gemma4_mtp_file(spec.model.c_str())) {
+        spec.stages.push_back(common_speculative_stage_from_arg("mtp:n_max=1,p_min=0.0"));
+        fprintf(stderr, "PXA: -md %s is a Gemma-4 assistant drafter; arming --spec-type mtp:n_max=1,p_min=0.0 "
+                        "(PXA_GEMMA4_MTP_AUTO=0 to refuse)\n", spec.model.c_str());
+    }
+
     if (!spec.stages.empty()) {
         const auto resolved = spec.get_resolved_stages();
         if (resolved.size() != spec.stages.size()) {

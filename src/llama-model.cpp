@@ -2354,7 +2354,7 @@ bool llama_is_gemma4_mtp_file(const char * path) {
     const int key_id = gguf_find_key(ctx, "general.architecture");
     if (key_id >= 0) {
         const char * arch = gguf_get_val_str(ctx, key_id);
-        if (arch && strcmp(arch, "gemma4_mtp") == 0) {
+        if (arch && (strcmp(arch, "gemma4_mtp") == 0 || strcmp(arch, "gemma4-assistant") == 0)) {
             result = true;
         }
     }

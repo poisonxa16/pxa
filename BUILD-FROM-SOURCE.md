@@ -280,17 +280,17 @@ anything the file does not carry.
 
 `-DPXA_PXQN_CLOSED_SRC=OFF -DPXA_PXQ_ENCODER=OFF` are required on this public tree: the closed PXQN decoder and the quantizer's private encoder are not in it, and without the two flags the configure step stops with an error.
 
-The PXQN decoder is closed and ships compiled. A build from this repository has open stubs in its place and refuses PXQN files at load with a clear message. To run PXQN files at full speed, download the matching library from the [v2026.10.1 release page](https://github.com/poisonxa16/pxa/releases/tag/v2026.10.1):
+The PXQN decoder is closed and ships compiled. A build from this repository has open stubs in its place and refuses PXQN files at load with a clear message. To run PXQN files at full speed, download the matching library from the [v2026.10.2 release page](https://github.com/poisonxa16/pxa/releases/tag/v2026.10.2):
 
 | your OS | asset |
 |---|---|
-| Ubuntu 24.04 and newer (glibc 2.38+) | `libggml-pxqn-v2026.10.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` |
-| Ubuntu 22.04 (glibc 2.35+) | `libggml-pxqn-v2026.10.1-linux-x86_64-cuda12.8-sm60_61_70-ubuntu22.04.tar.gz` |
+| Ubuntu 24.04 and newer (glibc 2.38+) | `libggml-pxqn-v2026.10.2-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` |
+| Ubuntu 22.04 (glibc 2.35+) | `libggml-pxqn-v2026.10.2-linux-x86_64-cuda12.8-sm60_61_70-ubuntu22.04.tar.gz` |
 
-The library matches the source tag `v2026.10.1` only. Check out that tag, then build with:
+The library matches the source tag `v2026.10.2` only. Check out that tag, then build with:
 
 ```bash
-git clone --branch v2026.10.1 https://github.com/poisonxa16/pxa && cd pxa
+git clone --branch v2026.10.2 https://github.com/poisonxa16/pxa && cd pxa
 cmake -B build -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70" \
   -DGGML_SCHED_MAX_COPIES=2 -DPXA_PXQN_CLOSED_SRC=OFF -DPXA_PXQ_ENCODER=OFF
 cmake --build build --target llama-server llama-cli llama-bench -j"$(nproc)"

@@ -1259,7 +1259,11 @@ void llm_load_hparams(
             } break;
         case LLM_ARCH_GEMMA4_MTP:
             {
-                ml.get_key(LLM_KV_MTP_BACKBONE_EMBEDDING_LENGTH, hparams.mtp_backbone_n_embd);
+                // our converter writes <arch>.backbone_embedding_length; the upstream ggml-org
+                // drafter writes <arch>.embedding_length_out for the same number.
+                if (!ml.get_key(LLM_KV_MTP_BACKBONE_EMBEDDING_LENGTH, hparams.mtp_backbone_n_embd, false)) {
+                    ml.get_key(format("%s.embedding_length_out", ml.get_arch_name().c_str()), hparams.mtp_backbone_n_embd);
+                }
                 ml.get_key(LLM_KV_MTP_USE_ORDERED_EMBEDDINGS,    hparams.mtp_use_ordered_embeddings, false);
                 ml.get_key(LLM_KV_MTP_CENTROID_COUNT,            hparams.mtp_num_centroids, false);
                 ml.get_key(LLM_KV_MTP_CENTROID_TOP_K,            hparams.mtp_centroid_top_k, false);

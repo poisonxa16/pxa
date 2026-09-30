@@ -650,9 +650,23 @@ static bool pxa_fold_patch_cc(llama_context & tgt, llama_context & comp) {
 bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse) return false;
     //if (kv_self.save_per_step_ssm) return false;
-    if (model.arch == LLM_ARCH_GEMMA4_MTP && mtp_target_ctx != nullptr) return false;
     auto the_prev = cparams.mtp_op_type == MTP_OP_NONE ? prev.get() : prev_mtp.get();
     if (!the_prev || !the_prev->graph) return false;
+    if (model.arch == LLM_ARCH_GEMMA4_MTP && mtp_target_ctx != nullptr) {
+        // The assistant drafter owns no K/V (nothing to patch, no head), and its graph is shaped by
+        // the TARGET's extents: the frozen views and both masks are as wide as the target's n. So
+        // the graph is reusable while those extents, the row count and the sequence are unchanged;
+        // everything else (token, position, hidden row, masks) is an input rewritten each step.
+        // Recorded in Prev::n_kv / n_kv_swa by llama_decode_internal.
+        if (u_batch.embd) return false;
+        const llama_context & t = *mtp_target_ctx;
+        return u_batch.all_seq_id == the_prev->all_seq_id &&
+               (int) t.kv_self.n == the_prev->n_kv &&
+               (!t.swa_kv_active || (int) t.kv_swa.n == the_prev->n_kv_swa) &&
+               n_outputs == the_prev->n_outputs &&
+               u_batch.n_tokens == the_prev->n_tokens &&
+               cparams.mtp_op_type == the_prev->mtp_op_type;
+    }
     //if (u_batch.n_tokens > 1) return false;
     if (u_batch.embd) return false;
     if (the_prev->save_per_step_ssm != kv_self.save_per_step_ssm ||
@@ -3398,7 +3412,7 @@ pxa_mtp_shortlist_report pxa_mtp_shortlist_report_instance;
 // layout the lm-head row chunking already relies on (build_output_head_mm).
 static const int64_t pxa_mtp_prefix_default = 81920;
 
-// PXA_MTP_SHORTLIST_DUAL (default 1; =0 keeps the whole prefix on device 0). Lane p100-mtp, 2026-09-28.
+// PXA_MTP_SHORTLIST_DUAL (default 1; =0 keeps the whole prefix on device 0). (2026-09-28).
 // The split-aware prefix (PXA_MTP_SHORTLIST_SPLIT) runs the whole 81920-row draft head on device 0 while
 // device 1 idles: on the P100 pair that GEMV was 1.25 ms of the 1.9 ms MTP decode, paid once per draft
 // token. With two cards the prefix is cut in half: rows [0,h) stay a window onto device 0's slice and rows
@@ -5001,6 +5015,28 @@ static bool pxa_overrides_touch_layers(const llama_model_loader & ml) {
     return false;
 }
 
+// PXA_GEMMA4_ISWA: the number of cells a sliding-window layer's ring gets, mirroring llama_init_from_model
+// below (window + guard + ubatch + 3 ubatch of slack, per sequence). 0 = the ring will not be armed (lever
+// off, another arch, or it would not be smaller than the context) -- callers then charge the full n_ctx.
+// The placement planner needs this BEFORE the context exists: charging every sliding layer a full-context
+// cache made a 16k Gemma-4 look 2.7 GiB bigger than it is and sent a model that fits to expert streaming.
+static uint32_t pxa_gemma4_iswa_ring_cells(const llama_model & model, uint32_t kv_size, int n_ubatch, int n_seq_max) {
+    if (model.arch != LLM_ARCH_GEMMA4) return 0;
+    const char * env_g4 = getenv("PXA_GEMMA4_ISWA");
+    if (env_g4 && atoi(env_g4) == 0) return 0;
+    const auto & hp = model.hparams;
+    if (hp.n_swa == 0 || hp.n_attn_chunk != 0) return 0;
+    const uint32_t ub    = (uint32_t) std::max(1, n_ubatch);
+    const uint32_t guard = std::min<uint32_t>(std::max<uint32_t>(ub, 256u), 512u);
+    const uint32_t seqs  = (uint32_t) std::max(1, n_seq_max);
+    // llama_kv_cache_get_padding() is 256 on the CUDA flash-attention path; PAD to that
+    const uint32_t pad   = 256;
+    const uint64_t live  = (uint64_t) hp.n_swa + guard + ub;
+    const uint64_t per   = GGML_PAD(live + 3ull*ub, pad);
+    const uint64_t cells = GGML_PAD(std::min<uint64_t>(kv_size, per * seqs), pad);
+    return cells >= kv_size ? 0 : (uint32_t) cells;
+}
+
 static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_loader & ml, const llama_model & model,
         ggml_type cache_type_k, ggml_type cache_type_v, uint32_t max_ctx_size, int mla_attn, int n_seq_max, int n_ubatch,
         int amb, int worst_case_tokens, bool flash_attn,
@@ -5088,7 +5124,8 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
                 continue;
             }
         }
-        if (name == "mtp_pre_proj.weight"  || name == "mtp_post_proj.weight" ||
+        if (name == "nextn.pre_projection.weight" || name == "nextn.post_projection.weight" || name == "rope_freqs.weight" ||
+            name == "mtp_pre_proj.weight"  || name == "mtp_post_proj.weight" ||
             name == "mtp_centroids.weight" || name == "mtp_token_ordering.weight") {
             continue;
         }
@@ -5226,8 +5263,10 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
     result[n_layer] = ow_size + output_misc_size;
     LLAMA_LOG_INFO("------------------- Layer sizes:\n");
     double tot_model = 0, tot_cache = 0, max_compute = 0;
+    const uint32_t iswa_cells = pxa_gemma4_iswa_ring_cells(model, max_ctx_size, n_ubatch, n_seq_max);
     for (int il = 0; il < n_layer; ++il) {
-        auto kv_size = model.cache_size(il, cache_type_k, cache_type_v, max_ctx_size, mla_attn, n_seq_max, flash_attn);
+        const bool ring = iswa_cells > 0 && il < (int) model.hparams.swa_layers.size() && model.hparams.swa_layers[il];
+        auto kv_size = model.cache_size(il, cache_type_k, cache_type_v, ring ? iswa_cells : max_ctx_size, mla_attn, n_seq_max, flash_attn);
         LLAMA_LOG_INFO("Layer %2d: %9.2f, %9.2f, %9.2f   %9.2f  MiB\n", il, result[il]/1024./1024., kv_size/1024./1024., (result[il] + kv_size)/1024./1024., compute[il]/1024./1024.);
         max_compute = std::max(max_compute, compute[il]);
         tot_model += result[il];
@@ -5707,6 +5746,12 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
             r.mode == 0 ? "resident" : r.mode == 2 ? "stream routed experts" : "spill dense FFN",
             r.cpu_instead ? " in mmap'd host RAM (pin budget)" : "", r.names.size(), r.streamed/1073741824.0);
     LLAMA_LOG_INFO("PXA_PLACE: %s\n", r.reason.c_str());
+    if (r.mode != 0 && !r.cpu_instead && r.streamed > 0) {
+        LLAMA_LOG_WARN("PXA_PLACE: WARNING %.2f GiB of weights are re-read from host RAM over PCIe on every graph, so decode and "
+                "prefill run several times slower than a resident placement (1x P100, 27B one-card file: 24 -> 1.7 t/s). The "
+                "KV cache and compute buffers are what did not fit: lower -c, or use -ctk q4_0 -ctv q4_0 (f16 KV is 4x the "
+                "size), to keep the weights resident\n", r.streamed/1073741824.0);
+    }
     LLAMA_LOG_INFO("PXA_PLACE_JSON: %s\n", model.pxa_place_json.c_str());
 #else
     GGML_UNUSED(ml); GGML_UNUSED(model); GGML_UNUSED(split_mode); GGML_UNUSED(n_gpu_layers);
@@ -7680,7 +7725,9 @@ static void pxa_kq_mask_probe(const llama_batch & batch, const llama_kv_cache & 
 static void llama_set_inp_KQ_mask_swa(llama_context & lctx, const llama_batch & batch) {
     const auto & hparams = lctx.model.hparams;
     const auto & cparams = lctx.cparams;
-    const auto & kv      = lctx.kv_swa;
+    // the Gemma-4 assistant drafter has no cache of its own to mask: it reads the target's
+    const auto & kv      = (lctx.model.arch == LLM_ARCH_GEMMA4_MTP && lctx.mtp_target_ctx != nullptr)
+                         ? lctx.mtp_target_ctx->kv_swa : lctx.kv_swa;
 
     if (!lctx.inp_KQ_mask_swa) {
         return;
@@ -8064,7 +8111,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             }
 
             // PXA_SWA_KV: the sliding mask no longer shares this cell array or this width.
-            if (lctx.swa_kv_active) {
+            if (lctx.swa_kv_active ||
+                (lctx.model.arch == LLM_ARCH_GEMMA4_MTP && lctx.mtp_target_ctx != nullptr && lctx.mtp_target_ctx->swa_kv_active)) {
                 data_swa     = nullptr;
                 data_swa_f16 = nullptr;
                 llama_set_inp_KQ_mask_swa(lctx, batch);
@@ -10172,14 +10220,16 @@ static int llama_decode_internal(
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
 #endif
             //if (u_batch.n_tokens == 1 && u_batch.embd == nullptr && lctx.cparams.graph_reuse) {
-            if (u_batch.embd == nullptr && lctx.cparams.graph_reuse &&
-                    !(lctx.model.arch == LLM_ARCH_GEMMA4_MTP && lctx.mtp_target_ctx != nullptr)) {
+            if (u_batch.embd == nullptr && lctx.cparams.graph_reuse) {
+                // the assistant drafter's graph is shaped by the target's extents, not its own
+                const bool drafter = lctx.model.arch == LLM_ARCH_GEMMA4_MTP && lctx.mtp_target_ctx != nullptr;
                 prev = std::make_unique<llama_context::Prev>(llama_context::Prev{
-                        (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)lctx.kv_self.n,
+                        (int)u_batch.all_seq_id, (int)lctx.n_outputs,
+                        drafter ? (int)lctx.mtp_target_ctx->kv_self.n : (int)lctx.kv_self.n,
                         (int)u_batch.n_tokens,
                         lctx.kv_self.save_per_step_ssm, lctx.kv_self.ckpt.per_step_max_allocated,
                         cparams.mtp_op_type, gf, pxa_seq_sig(u_batch),
-                        (int) lctx.kv_swa.n});
+                        drafter ? (int)lctx.mtp_target_ctx->kv_swa.n : (int) lctx.kv_swa.n});
                 prev->pxa_fold     = lctx.pxa_fold_built ? 1 : 0;   // PXA_MTP_FOLD
                 prev->pxa_fold_nkv = lctx.pxa_fold_nkv;
             }
@@ -13100,7 +13150,12 @@ struct llama_context * llama_init_from_model(
             // arch can be armed (and defaulted on, later, once it is measured) without changing
             // what PXA_SWA_KV means for the arch that already ships behind it.
             const char * env_g4 = getenv("PXA_GEMMA4_ISWA");
-            const bool want_g4  = env_g4 && atoi(env_g4) != 0 && model->arch == LLM_ARCH_GEMMA4;
+            // 2026-09-30: default ON for Gemma 4 (PXA_GEMMA4_ISWA=0 turns it off). The window ring is what lets the
+            // target plus the assistant drafter fit a 16 GB card at a useful context (full-n_ctx K/V on all 30
+            // layers is 3.5 GiB at 16k against 0.6 GiB), and the drafter reads through it (build_gemma4_mtp).
+            // Measured cost, ledger gemma4moe-iswa-26b: decode -1..-4%, output not byte-identical to the
+            // full cache once the prompt exceeds the window. The ring only arms when it is smaller than -c.
+            const bool want_g4  = (env_g4 ? atoi(env_g4) != 0 : true) && model->arch == LLM_ARCH_GEMMA4;
             const bool want = (env && atoi(env) != 0) || want_g4;
 
             // Requirements. Each is a structural precondition, not a preference:

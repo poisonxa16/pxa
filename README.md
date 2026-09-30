@@ -13,7 +13,7 @@ PXQN quants, tensor split, MTP speculation and one-click PXA Control, for the Te
 </p>
 
 ```bash
-tar xzf pxa-v2026.10.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v2026.10.1   # 1. unpack the release tarball
+tar xzf pxa-v2026.10.2-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v2026.10.2   # 1. unpack the release tarball
 ./pxa-launch --gui                                                                     # 2. open PXA Control in your browser
 # 3. pick your cards, pick a model, press Start. Or skip the GUI: ./pxa-launch
 ```
@@ -110,7 +110,8 @@ Prefill, plain decode and MTP decode side by side, in tokens per second. Two or 
 | Ornith 1.5 9B | 2x P100, plain | about 78 | |
 | Flash-Next (PXQN, 98.7 GB) | 4x P100, tensor split | 36.3 (37.9 prose) | 510 (3k), 474 (16k) |
 | Flash-Next (PXQN, 98.7 GB) | 2x P100, expert cache (does not fit in VRAM) | 10.7 | 189 (3k) |
-| Gemma 4 26B-A4B | supported since v2026.09.20 | v2026.10+ speed rows to follow | |
+| Gemma 4 26B-A4B (Google QAT q4_0) | 1x V100, plain | 115 | 2044 (4k prompt) |
+| Gemma 4 26B-A4B (Google QAT q4_0) | 1x V100, MTP with the upstream drafter (`-md`) | **135 prose / 134 code** (about 150 prose at `mtp:n_max=2`) | |
 | GLM | beta | not yet published | |
 
 Ornith 35B-A3B on two P100s went from about 60 in v2026.10 to about 67 in v2026.10.1.
@@ -212,7 +213,7 @@ The showcase **one-card Qwen3.8-27B PXQN** (12.6 GiB, 131k context on one 16 GB 
 - **One command.** Checks your CPU, glibc and GPUs (compute capability 6.0, 6.1, 7.0), downloads the right tarball for your OS and verifies its checksum: `curl -fsSL https://raw.githubusercontent.com/poisonxa16/pxa/main/install.sh | bash`. Add `-s -- --docker` after `bash` to pull the container image instead.
 - **Tarball.** A prebuilt release with `START-HERE.md` and the `pxa-launch` launcher, for Ubuntu 24.04 (glibc 2.38) and Ubuntu 22.04 (glibc 2.35). Both bundle their CUDA runtime libraries and are tested in a bare container of their own OS. Download from the [release page](https://github.com/poisonxa16/pxa/releases/latest).
 - **Container images.** `ghcr.io/poisonxa16/pxa` (the engine) and `ghcr.io/poisonxa16/pxa-vllm` with `sm60` (Pascal) and `sm70` (Volta) tags for the vLLM sidecar. Multi-card containers should pass `--shm-size=1g`. See [`docker/COMPOSE.md`](docker/COMPOSE.md).
-- **From source.** [`BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md). A source build runs classic PXQ files and K-quants as is. For PXQN files, add the compiled **PXQN library**, a separate download on the [release page](https://github.com/poisonxa16/pxa/releases/latest) (`libggml-pxqn-v2026.10.1-...tar.gz`): drop `libggml-pxqn.so` next to `libggml.so` and PXQN runs at full speed. [How](BUILD-FROM-SOURCE.md#4b-pxqn-files-with-a-source-build).
+- **From source.** [`BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md). A source build runs classic PXQ files and K-quants as is. For PXQN files, add the compiled **PXQN library**, a separate download on the [release page](https://github.com/poisonxa16/pxa/releases/latest) (`libggml-pxqn-v2026.10.2-...tar.gz`): drop `libggml-pxqn.so` next to `libggml.so` and PXQN runs at full speed. [How](BUILD-FROM-SOURCE.md#4b-pxqn-files-with-a-source-build).
 
 Cards supported: Tesla P100, Tesla V100, GTX 1080 Ti and other Pascal cards. Newer cards are not covered by the released build.
 
@@ -240,7 +241,7 @@ Supporter models are available to supporters first. Bug reports are welcome on D
 
 ## More
 
-- [Release notes v2026.10.1](RELEASE-NOTES-v2026.10.1.md) · [v2026.10](RELEASE-NOTES-v2026.10.md) · [all releases](https://github.com/poisonxa16/pxa/releases)
+- [Release notes v2026.10.2](RELEASE-NOTES-v2026.10.2.md) · [v2026.10.1](RELEASE-NOTES-v2026.10.1.md) · [v2026.10](RELEASE-NOTES-v2026.10.md) · [all releases](https://github.com/poisonxa16/pxa/releases)
 - [`docs/QUICKSTART.md`](docs/QUICKSTART.md) · [`docs/COOKBOOK.md`](docs/COOKBOOK.md) · [`docs/LEVERS.md`](docs/LEVERS.md) · [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md)
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`LICENSING.md`](LICENSING.md)
 

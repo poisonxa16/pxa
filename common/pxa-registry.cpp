@@ -157,7 +157,9 @@ pxa_topology pxa_topology_detect(const std::string & devices, int max_gpu, bool 
     for (int id : ids) {
         t.cc.push_back(ggml_backend_cuda_get_device_cc(id));
         t.pcie_width.push_back(ggml_backend_cuda_get_device_pcie_width(id));
-        t.vram_mib.push_back(0);   // total VRAM is not needed by any rule; not queried (no context)
+        size_t vfree = 0, vtot = 0;   // total VRAM: the KV pick needs it (the server initialises these cards anyway)
+        ggml_backend_cuda_get_device_memory(id, &vfree, &vtot);
+        t.vram_mib.push_back(vtot / 1048576);
     }
     t.n_dev  = (int) t.cc.size();
     t.source = "cuda";
@@ -289,6 +291,12 @@ pxa_model_info pxa_model_probe(const std::string & path) {
                 m.n_layer = il < 0 ? -1 : pxa_kv_int(g, il);
                 const int ic = gguf_find_key(g, (m.arch + ".context_length").c_str());
                 m.n_ctx_train = ic < 0 ? -1 : pxa_kv_int(g, ic);
+                const int ik = gguf_find_key(g, (m.arch + ".attention.key_length").c_str());
+                const int iv = gguf_find_key(g, (m.arch + ".attention.value_length").c_str());
+                const int ii = gguf_find_key(g, (m.arch + ".full_attention_interval").c_str());
+                m.head_k = ik < 0 ? -1 : pxa_kv_int(g, ik);
+                m.head_v = iv < 0 ? m.head_k : pxa_kv_int(g, iv);
+                m.full_attn_interval = ii < 0 ? -1 : pxa_kv_int(g, ii);
             }
             const int nkv = gguf_get_n_kv(g);
             for (int k = 0; k < nkv; ++k) {
@@ -358,7 +366,7 @@ static bool pxa_tsplit_auto_tier(const std::string & t) {
     }
     return t == "PXQN4" || t == "PXQN4S8" || t == "PXQN5";
 }
-static bool pxa_is_gemma4(const std::string & a) { return a == "gemma4" || a == "gemma4_mtp"; }
+static bool pxa_is_gemma4(const std::string & a) { return a == "gemma4" || a == "gemma4_mtp" || a == "gemma4-assistant"; }
 
 static const char * pxa_card_name(int cc) {
     switch (cc) {
@@ -415,6 +423,12 @@ int pxa_registry_batch_cell(const pxa_topology & topo, const pxa_model_info & mo
             b = 8192; ub = 256; cctx = 32768;
             cell = "2x P100 (sm_60) (measured: 340 t/s @3k, 317 @20k at -ub 256 against 231 at 2048)";
         }
+    } else if (n == 1 && cc == 610 && !topo.vram_mib.empty() && topo.vram_mib[0] >= 20480) {
+        // The P40 (24 GB) shares cc 610 with the 11 GB 1080 Ti but has the memory of a big card: it
+        // takes the 16 GB-class batch (a user's P40 log, 2026-09-23, showed it on the 1080 Ti cell).
+        b = 2048; ub = 2048; cctx = 8192;
+        st = "INFERRED";
+        cell = "1x P40-class 24 GB (sm_61) (-ub 2048 as on the 16 GB cards; not measured on a P40 here)";
     } else if (n == 1 && cc == 610) {
         b = 2048; ub = 768; cctx = 8192;
         cell = "1x 1080 Ti (sm_61) (measured: 1,306 t/s cold prefill; -ub 2048 does not fit on 11 GB)";
@@ -864,6 +878,62 @@ static pxa_autoconfig pxa_autoconfig_resolve_picks(const pxa_topology & topo, co
             }
         }
         ac.picks.push_back(p);
+    }
+    // ---- -ctk / -ctv (KV cache type): the FASTEST type that keeps the weights resident ---------------
+    // f16 KV is the fastest where it fits (P100 27B one-card file, -c 8192: f16 24.9 vs q4_0 22.4 t/s), but at
+    // -c 65536 it is 4.2 GB and tips a 16 GB card from resident into "spill dense ffn_down": 1.8 GB re-read from
+    // host RAM over PCIe per graph, decode 24 -> 1.72 t/s, prefill 50 -> 14 (user report 2026-09-30, reproduced
+    // on 1x P100, v2026.10.1). So with neither flag given: f16 if weights + f16 KV + compute + margin fit each
+    // card, else q8_0 if that fits, else q4_0 (what every published number uses). Estimate, per card (MiB):
+    //   weights = file - 1024 (the CPU-side output/embedding buffer) ; KV = 2 x K/V heads x head dim x
+    //   bytes/elem x (layers / full_attention_interval) x n_ctx ; + 160 recurrent state ; + 1536 compute buffers
+    //   + 512 margin, against total VRAM - 384. Both sides are divided by the card count.
+    {
+        pxa_pick pk, pv;
+        pk.flag = "-ctk"; pv.flag = "-ctv";
+        pk.evidence = pv.evidence = "kv-f16-host-spill-2026-09-30";
+        const bool sm_cards = topo.n_dev >= 1 && !topo.cc.empty() &&
+                              (topo.cc[0] == 600 || topo.cc[0] == 610 || topo.cc[0] == 700);
+        if (user.kv) {
+            pk.status = pv.status = "USER"; pk.why = pv.why = "given on the command line";
+        } else if (level >= 2 && sm_cards && model.arch == "qwen35" && !getenv("PXA_KV_AUTO_OFF")) {
+            const int    n_ctx = user.ctx && user.n_ctx_value > 0 ? user.n_ctx_value
+                               : ac.n_ctx > 0 ? ac.n_ctx : model.n_ctx_train;
+            size_t vmin = 0;
+            for (size_t v : topo.vram_mib) { if (v > 0 && (vmin == 0 || v < vmin)) vmin = v; }
+            const int    itv   = model.full_attn_interval > 0 ? model.full_attn_interval : 4;
+            const double lay   = model.n_layer > 0 ? (double) (model.n_layer / itv) : 0.0;
+            const double kv_el = lay * (double) model.n_head_kv * ((double) model.head_k + (double) model.head_v) * (double) std::max(n_ctx, 0);
+            const double n_dev = (double) topo.n_dev;
+            const double wt    = std::max(0.0, (double) model.bytes / 1048576.0 - 1024.0) / n_dev;
+            const double budget = (double) vmin - 384.0;
+            const struct { const char * t; double b; } cand[3] = {{"f16", 2.0}, {"q8_0", 34.0 / 32.0}, {"q4_0", 18.0 / 32.0}};
+            const char * pick = "q4_0";
+            char why[600] = "";
+            if (vmin == 0 || lay <= 0.0 || model.n_head_kv <= 0 || model.head_k <= 0 || n_ctx <= 0 || model.bytes == 0) {
+                snprintf(why, sizeof(why), "no VRAM / KV geometry to estimate with: q4_0 (what every published number uses)");
+            } else {
+                for (int i = 0; i < 3; ++i) {
+                    const double kv   = kv_el * cand[i].b / 1048576.0 / n_dev;
+                    const double need = wt + kv + 160.0 + 1536.0 + 512.0;
+                    if (need <= budget || i == 2) {
+                        pick = cand[i].t;
+                        snprintf(why, sizeof(why), "-c %d: weights %.0f + %s KV %.0f + 160 state + 1536 compute + 512 margin = %.0f MiB per card vs %.0f MiB budget (%.0f total - 384)%s",
+                                 n_ctx, wt, cand[i].t, kv, need, budget, (double) vmin, need <= budget ? "" : "; nothing fits, smallest KV");
+                        break;
+                    }
+                }
+            }
+            ac.kv_type = pick;
+            pk.value = pv.value = pick; pk.status = pv.status = "MEASURED"; pk.applied = pv.applied = true;
+            pk.why = pv.why = std::string(why) + "; f16 at 64k spills a 16 GB card's weights to host RAM (1.72 vs 24.1 t/s). "
+                              "-ctk/-ctv force one; PXA_KV_AUTO_OFF=1 keeps the engine default f16";
+        } else {
+            pk.status = pv.status = "OFF"; pk.why = pv.why = "no measured KV pick for this model/card: the engine default f16 is kept";
+            pk.evidence = pv.evidence = "";
+        }
+        ac.picks.push_back(pk);
+        ac.picks.push_back(pv);
     }
     return ac;
 }

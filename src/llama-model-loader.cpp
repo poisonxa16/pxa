@@ -403,6 +403,9 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
 
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+    if (llm_kv.arch != LLM_ARCH_UNKNOWN && arch_name != llama_model_arch_name(llm_kv.arch)) {
+        llm_kv.prefix_override = arch_name;   // e.g. "gemma4-assistant" -> LLM_ARCH_GEMMA4_MTP, keys stay gemma4-assistant.*
+    }
 
     // PXQN revision gate (ggml-pxqn.h, src/llama-pxqn.h): a revision newer than this build reads
     // is refused HERE, before any tensor is created, with a message that says what to do. No

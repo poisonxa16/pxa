@@ -1047,7 +1047,23 @@ static long long pxa_min_vram_headroom(const gpt_params & params, std::string & 
 // 1080 Ti seat, where the weights already fill the card and any extra context is fatal.
 static bool pxa_single_sm61(void) {
 #if defined(GGML_USE_CUDA)
-    return ggml_backend_cuda_get_device_count() == 1 && ggml_backend_cuda_get_device_cc(0) == 610;
+    // Only the 11 GB class: a 24 GB P40 is also cc 610 but has room for a draft context.
+    size_t free = 0, total = 0;
+    if (ggml_backend_cuda_get_device_count() == 1) ggml_backend_cuda_get_device_memory(0, &free, &total);
+    return ggml_backend_cuda_get_device_count() == 1 && ggml_backend_cuda_get_device_cc(0) == 610 &&
+           total < 20ull*1024*1024*1024;
+#else
+    return false;
+#endif
+}
+
+// A 24 GB-class sm_61 card on its own (the P40): room for the MTP head, unlike the 11 GB 1080 Ti.
+static bool pxa_big_sm61_single(void) {
+#if defined(GGML_USE_CUDA)
+    size_t free = 0, total = 0;
+    if (ggml_backend_cuda_get_device_count() != 1 || ggml_backend_cuda_get_device_cc(0) != 610) return false;
+    ggml_backend_cuda_get_device_memory(0, &free, &total);
+    return total >= 20ull*1024*1024*1024;
 #else
     return false;
 #endif
@@ -1416,6 +1432,8 @@ static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params
                  || params.n_ctx > 0;
         us.n_parallel = params.n_parallel;
         us.n_ctx_value = params.n_ctx;
+        us.kv = pxa_argv_has(argc, argv, {"-ctk", "--cache-type-k", "-ctv", "--cache-type-v"})
+                || getenv("LLAMA_ARG_CACHE_TYPE_K") != nullptr || getenv("LLAMA_ARG_CACHE_TYPE_V") != nullptr;
         us.kv_q8 = params.cache_type_k == "q8_0" && params.cache_type_v == "q8_0";
         us.ngl_partial = us.ngl && params.n_gpu_layers >= 0 && pxa_model.n_layer > 0
                          && params.n_gpu_layers <= pxa_model.n_layer;
@@ -1448,6 +1466,10 @@ static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params
         }
         if (pxa_ac.n_ctx > 0) {
             params.n_ctx = pxa_ac.n_ctx;
+        }
+        if (pxa_ac.kv_type != nullptr) {
+            params.cache_type_k = pxa_ac.kv_type;
+            params.cache_type_v = pxa_ac.kv_type;
         }
         for (const auto & e : pxa_ac.env) {
             setenv(e.first.c_str(), e.second.c_str(), /*overwrite =*/ 0);
@@ -1971,12 +1993,13 @@ static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params
 #endif
                 const bool mtp_alone_auto = nextn > 0 && !chain_force_casc && !chain_force_ngram && !policy_cascade &&
                         !(getenv("PXA_SPEC_AUTO_MTP") && atoi(getenv("PXA_SPEC_AUTO_MTP")) == 0) &&
-                        (auto_chain == "mtp" || (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && pxa_ndev_spec >= 2));
+                        (auto_chain == "mtp" || (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && pxa_ndev_spec >= 2) ||
+                         pxa_big_sm61_single());
                 const bool ngram_alone_chain  = !mtp_alone_auto && !chain_force_casc && !ngram_pol_off && !policy_cascade &&
                                                 (chain_force_ngram || pxa_all_devices_pascal_plus());
 
                 if (mtp_alone_auto) {
-                    static const char * const mtp_stage = "mtp";
+                    const char * const mtp_stage = pxa_ndev_spec == 1 ? "mtp:n_max=1" : "mtp";   // one card (the P40 class): the single-card depth measured on the one-card 27B
                     if (!params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
                         params.speculative.stages.push_back(common_speculative_stage_from_arg(mtp_stage));
                     }
@@ -1985,7 +2008,7 @@ static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params
                                             ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
                     params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
                     fprintf(stderr, "PXA_AUTO: spec arch=%s -> the MTP head alone, chain = %s (%s.nextn_predict_layers=%d, "
-                                    "multi-card tensor split; PXA_SPEC_AUTO_MTP=0 restores the n-gram default)\n",
+                                    "multi-card tensor split or a 24 GB sm_61 card; PXA_SPEC_AUTO_MTP=0 restores the n-gram default)\n",
                             arch.empty() ? "?" : arch.c_str(),
                             common_speculative_stage_chain_to_str(params.speculative).c_str(),
                             arch.empty() ? "<arch>" : arch.c_str(), nextn);

@@ -2060,8 +2060,10 @@ static bool pxa_fa_sm61_d256_wide_chain(int64_t n_tokens, int64_t d_k, int64_t d
 // refusal is byte-for-byte what it was.
 static bool pxa_gemma4_assistant_armed() {
     static const bool v = [](){
+        // 2026-09-30: default ON. Loading an assistant file (-md, arch gemma4_mtp / gemma4-assistant) IS the
+        // request for it; the lever remains as the off switch (PXA_GEMMA4_ASSISTANT=0).
         const char * e = getenv("PXA_GEMMA4_ASSISTANT");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return v;
 }
