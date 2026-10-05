@@ -1,0 +1,4 @@
+# gen_fixture.py output -- never commit generated weights/GGUFs
+model.safetensors
+*.gguf
+__pycache__/

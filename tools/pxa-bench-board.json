@@ -1,0 +1,38 @@
+{
+  "schema": "pxa-bench-board/1",
+  "note": "PLACEHOLDER (showcase lane, 2026-09-25): every row below has status \"placeholder\" and a null decode/prefill -- board-window.sh's own header says today's v2026.10 board run was CPU-only / dry-run, and CLAIMS.md flags the one candidate real number (mix27 on one P100) as NOT YET TRACED TO A CAPTURE LOG, so it is not repeated here as if it were confirmed. tools/pxa-bench.py reads this file at the path next to itself (override with --board-json) and shows \"board row is a PLACEHOLDER\" for every match until this file is replaced. Schema is stable: rel-integrate/board-prep can swap in real decode_tok_s/prefill_tok_s/status/source values without pxa-bench.py changing.",
+  "generated": "2026-09-25",
+  "schema_fields": {
+    "card_class": "P100 | V100 | 1080TI | ... (tools/pxa-bench.py's card_class_from_name())",
+    "n_cards": "how many of that class, e.g. 1 or 2",
+    "model_tier": "PXQ2 | PXQ3 | PXQ4 | mix27 | ... (from GET /pxa/explain's model.tier)",
+    "class": "prose | edit | long (tools/pxa-bench.py's own three prompt classes)",
+    "decode_tok_s": "median decode t/s on the published board run, or null if not measured yet",
+    "prefill_tok_s": "median prefill t/s on the published board run, or null if not measured yet",
+    "status": "placeholder | measured",
+    "source": "ledger id / capture log path once status is measured, else \"\""
+  },
+  "rows": [
+    { "card_class": "P100",  "n_cards": 1, "model_tier": "PXQ4",  "class": "prose", "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 1, "model_tier": "PXQ4",  "class": "edit",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 1, "model_tier": "PXQ4",  "class": "long",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 2, "model_tier": "PXQ4",  "class": "prose", "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 2, "model_tier": "PXQ4",  "class": "edit",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 2, "model_tier": "PXQ4",  "class": "long",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 1, "model_tier": "mix27", "class": "prose", "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 1, "model_tier": "mix27", "class": "edit",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 1, "model_tier": "mix27", "class": "long",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 1, "model_tier": "PXQ4",  "class": "prose", "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 1, "model_tier": "PXQ4",  "class": "edit",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 1, "model_tier": "PXQ4",  "class": "long",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 2, "model_tier": "PXQ4",  "class": "prose", "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 2, "model_tier": "PXQ4",  "class": "edit",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 2, "model_tier": "PXQ4",  "class": "long",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 1, "model_tier": "mix27", "class": "prose", "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 1, "model_tier": "mix27", "class": "edit",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "V100",  "n_cards": 1, "model_tier": "mix27", "class": "long",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 4, "model_tier": "PXQ4",  "class": "prose", "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 4, "model_tier": "PXQ4",  "class": "edit",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" },
+    { "card_class": "P100",  "n_cards": 4, "model_tier": "PXQ4",  "class": "long",  "decode_tok_s": null, "prefill_tok_s": null, "status": "placeholder", "source": "" }
+  ]
+}

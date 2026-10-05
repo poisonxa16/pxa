@@ -1,0 +1,25 @@
+# ctest driver for test-rep-penalty-window (PXA_REP_PREV_v1 / PXA_REP_DRY_GREEDY_v1).
+#   cmake -DPYTHON=<python3> -DGEN=<tests/gen_tiny_qwen4exp.py> -DOUT=<dir> -DEXE=<test binary>
+#         -P run-rep-penalty-window.cmake
+# Prints "REP_PENALTY_SKIP" (the test's SKIP_REGULAR_EXPRESSION) when python3 or numpy is missing.
+if(NOT PYTHON OR NOT EXISTS "${PYTHON}")
+    message(STATUS "REP_PENALTY_SKIP: no python3 interpreter for the fixture generator")
+    return()
+endif()
+execute_process(COMMAND "${PYTHON}" -c "import numpy" RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
+if(NOT rc EQUAL 0)
+    message(STATUS "REP_PENALTY_SKIP: numpy is not importable by ${PYTHON}")
+    return()
+endif()
+file(MAKE_DIRECTORY "${OUT}")
+execute_process(COMMAND "${PYTHON}" "${GEN}" "${OUT}/tiny-qwen4exp.gguf" RESULT_VARIABLE rc)
+if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "fixture generation failed: ${GEN}")
+endif()
+foreach(topk 0 1)
+    set(ENV{PXA_TOPK_RAW} "${topk}")
+    execute_process(COMMAND "${EXE}" "${OUT}/tiny-qwen4exp.gguf" RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+        message(FATAL_ERROR "test-rep-penalty-window failed with PXA_TOPK_RAW=${topk} (${rc})")
+    endif()
+endforeach()

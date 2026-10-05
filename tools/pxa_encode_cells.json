@@ -1,0 +1,7 @@
+{
+  "note": "Measured decode speeds the Encode tab may quote next to a tier. Only rows PXA has published (README.md speed table, v2026.10); a row needs the tier, the card class and count, and a model within 15% of the size. No row means the tab says 'no measured speed for this setup yet'. Add a row only with a measurement behind it.",
+  "cells": [
+    {"tier": "pxq2", "card_class": "GTX 1080 Ti-class sm_61", "n_cards": 1, "params": 35000000000, "moe": true, "decode_tps": 59.2, "source": "README: 35B MoE on one GTX 1080 Ti"},
+    {"tier": "pxq3", "card_class": "V100-class sm_70", "n_cards": 1, "params": 26000000000, "moe": true, "decode_tps": 105.0, "source": "README: Gemma 4 26B-A4B on one V100, short fill"}
+  ]
+}

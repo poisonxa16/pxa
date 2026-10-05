@@ -1,0 +1,437 @@
+diff --git a/vllm/compilation/passes/pass_manager.py b/vllm/compilation/passes/pass_manager.py
+index fbf05f7..b686877 100644
+--- a/vllm/compilation/passes/pass_manager.py
++++ b/vllm/compilation/passes/pass_manager.py
+@@ -18,6 +18,8 @@ from .ir.clone_elimination import UnsafeCloneEliminationPass
+ from .ir.lowering_pass import VllmIRLoweringPass
+ from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+ 
++logger = init_logger(__name__)
++
+ if rocm_aiter_ops.is_enabled():
+     from .fusion.allreduce_rms_fusion import (
+         RocmAiterAllReduceFusionPass,
+@@ -29,21 +31,62 @@ if rocm_aiter_ops.is_enabled():
+         RocmAiterTritonAddRMSNormPadFusionPass,
+     )
+ 
++def _optional_pass(module: str, name: str):
++    """Import one fusion pass, tolerating a build that lacks its kernels.
++
++    The quant-fusion passes bind torch.ops._C.<kernel> at *module scope*, and
++    several of those kernels live in the _C_stable_libtorch extension.  A build
++    that cannot produce that extension -- the sm_60 Pascal build, where torch
++    2.7 has no stable-ABI headers and none of the int8/fp4/cutlass kernels
++    target Pascal anyway -- would otherwise fail the import and take the whole
++    torch.compile backend down with it, even though every one of these passes
++    is opt-in through pass_config and every one of them is off by default.
++
++    Returns a stand-in that raises only if the pass is actually requested.
++    """
++    import importlib
++
++    try:
++        return getattr(importlib.import_module(module, __package__), name)
++    except (ImportError, AttributeError) as exc:
++        reason = f"{type(exc).__name__}: {exc}"
++        logger.debug("compilation pass %s unavailable in this build (%s)", name, reason)
++
++        def _unavailable(*args, **kwargs):
++            raise RuntimeError(
++                f"compilation pass {name} is not available in this build "
++                f"({reason}); turn off the pass_config flag that requests it."
++            )
++
++        return _unavailable
++
++
+ if current_platform.is_cuda_alike():
+-    from .fusion.act_quant_fusion import ActivationQuantFusionPass
+-    from .fusion.attn_quant_fusion import AttnQuantFusionPass
+-    from .fusion.mla_attn_quant_fusion import MLAAttnQuantFusionPass
+-    from .fusion.mla_rope_kvcache_cat_fusion import MLARoPEKVCacheCatFusionPass
+-    from .fusion.qk_norm_rope_fusion import QKNormRoPEFusionPass
+-    from .fusion.rms_quant_fusion import RMSNormQuantFusionPass
+-    from .fusion.rope_kvcache_fusion import RopeKVCacheFusionPass
+-    from .fusion.sequence_parallelism import SequenceParallelismPass
+-    from .utility.scatter_split_replace import ScatterSplitReplacementPass
+-    from .utility.split_coalescing import SplitCoalescingPass
++    ActivationQuantFusionPass = _optional_pass(
++        ".fusion.act_quant_fusion", "ActivationQuantFusionPass")
++    AttnQuantFusionPass = _optional_pass(
++        ".fusion.attn_quant_fusion", "AttnQuantFusionPass")
++    MLAAttnQuantFusionPass = _optional_pass(
++        ".fusion.mla_attn_quant_fusion", "MLAAttnQuantFusionPass")
++    MLARoPEKVCacheCatFusionPass = _optional_pass(
++        ".fusion.mla_rope_kvcache_cat_fusion", "MLARoPEKVCacheCatFusionPass")
++    QKNormRoPEFusionPass = _optional_pass(
++        ".fusion.qk_norm_rope_fusion", "QKNormRoPEFusionPass")
++    RMSNormQuantFusionPass = _optional_pass(
++        ".fusion.rms_quant_fusion", "RMSNormQuantFusionPass")
++    RopeKVCacheFusionPass = _optional_pass(
++        ".fusion.rope_kvcache_fusion", "RopeKVCacheFusionPass")
++    SequenceParallelismPass = _optional_pass(
++        ".fusion.sequence_parallelism", "SequenceParallelismPass")
++    ScatterSplitReplacementPass = _optional_pass(
++        ".utility.scatter_split_replace", "ScatterSplitReplacementPass")
++    SplitCoalescingPass = _optional_pass(
++        ".utility.split_coalescing", "SplitCoalescingPass")
+ 
+ if current_platform.is_cuda():
+-    from .fusion.allreduce_rms_fusion import AllReduceFusionPass
+-    from .fusion.collective_fusion import AsyncTPPass
++    AllReduceFusionPass = _optional_pass(
++        ".fusion.allreduce_rms_fusion", "AllReduceFusionPass")
++    AsyncTPPass = _optional_pass(".fusion.collective_fusion", "AsyncTPPass")
+ 
+ from .inductor_pass import (
+     CustomGraphPass,
+@@ -53,7 +96,6 @@ from .inductor_pass import (
+ from .utility.fix_functionalization import FixFunctionalizationPass
+ from .utility.noop_elimination import NoOpEliminationPass
+ 
+-logger = init_logger(__name__)
+ 
+ P = ParamSpec("P")
+ R = TypeVar("R")
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 2a5f746..dde232a 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -32,6 +32,7 @@ from vllm.model_executor.models.interfaces import SupportsQuant
+ from vllm.tracing import instrument
+ from vllm.utils.platform_utils import is_pin_memory_available
+ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++from vllm.utils.torch_utils import is_torch_equal_or_newer
+ 
+ logger = init_logger(__name__)
+ 
+@@ -126,6 +127,44 @@ def process_weights_after_loading(
+     if model_config.quantization == "torchao":
+         set_torchao_reload_attrs(model, model_config)
+ 
++    # PASCAL PORT: torch 2.7 is the last release with sm_60 kernels, and its
++    # dynamo dispatches on the *exact* tensor type.  A torch.nn.Parameter
++    # *subclass* therefore becomes a UserDefinedObjectVariable rather than a
++    # tensor, and the first plain F.linear that receives one aborts the trace
++    # with "All __torch_function__ overrides ... returned NotImplemented" --
++    # which takes the entire torch.compile path down and forces eager mode,
++    # where ~90% of a decode step is python dispatch.
++    #
++    # vLLM's parameter subclasses carry weight-*loading* metadata only (shard
++    # layout, loader callbacks); nothing in them is read during forward.  Once
++    # loading and per-quant-method processing are both finished they can be
++    # demoted to plain Parameters over the same storage.  torch >= 2.8 traces
++    # the subclasses directly and skips this entirely.
++    if not is_torch_equal_or_newer("2.8"):
++        n = _demote_parameter_subclasses(model)
++        if n:
++            logger.debug_once(
++                "torch %s: demoted %d vLLM parameter subclasses to plain "
++                "nn.Parameter so dynamo can trace the model",
++                torch.__version__,
++                n,
++            )
++
++
++def _demote_parameter_subclasses(model: nn.Module) -> int:
++    """Replace every non-exact nn.Parameter with a plain one over the same
++    storage.  Returns how many were replaced.  See the caller for why."""
++    replaced = 0
++    for module in model.modules():
++        for name, param in list(module.named_parameters(recurse=False)):
++            if type(param) is nn.Parameter:
++                continue
++            module.__setattr__(
++                name, nn.Parameter(param.data, requires_grad=param.requires_grad)
++            )
++            replaced += 1
++    return replaced
++
+ 
+ @contextmanager
+ def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+diff --git a/vllm/model_executor/parameter.py b/vllm/model_executor/parameter.py
+index 4106672..b139048 100644
+--- a/vllm/model_executor/parameter.py
++++ b/vllm/model_executor/parameter.py
+@@ -119,11 +119,17 @@ class BasevLLMParameter(Parameter):
+         assert shard_id in qkv_idxs
+         return qkv_idxs[shard_id]
+ 
+-    @classmethod
+-    def __torch_function__(cls, func, types, args=(), kwargs=None):
+-        if kwargs is None:
+-            kwargs = {}
+-        return super().__torch_function__(func, types, args, kwargs)
++    # PASCAL PORT: a bare class attribute, not a wrapper method.  Upstream
++    # defines a classmethod that normalises kwargs and forwards to
++    # super().__torch_function__, which resolves to the built-in
++    # torch._C._disabled_torch_function_impl -- the very thing nn.Parameter
++    # itself binds.  Both torch/overrides and dynamo test for that builtin *by
++    # identity* in order to skip subclass dispatch entirely; wrapping it in a
++    # python method hides the identity, and torch 2.7's dynamo then tries to
++    # trace the wrapper and dies on the `types` argument ("Failed to convert
++    # args/kwargs to proxy").  The wrapper adds no behaviour of its own -- the
++    # builtin already accepts kwargs=None.
++    __torch_function__ = torch._C._disabled_torch_function_impl
+ 
+ 
+ class _ColumnvLLMParameter(BasevLLMParameter):
+diff --git a/vllm/v1/attention/backends/pascal_decode_attn.py b/vllm/v1/attention/backends/pascal_decode_attn.py
+new file mode 100644
+index 0000000..696d6e4
+--- /dev/null
++++ b/vllm/v1/attention/backends/pascal_decode_attn.py
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Triton paged single-token-decode attention for Pascal (sm_60/sm_61).
++
++Why this exists
++---------------
++The torch fallback in ``pascal_sdpa.py`` is correct but has two properties that
++make it the wrong thing to run in a decode loop:
++
++  * it is **shaped by host data** -- it reads ``seq_lens`` on the CPU to decide
++    how many KV blocks to gather, so the tensor shapes change from step to
++    step.  That makes it impossible to capture in a CUDA graph, which in turn
++    forces the whole engine into eager mode, where ~90% of a decode step is
++    Python dispatch rather than GPU work;
++  * it *materialises* the gathered KV in fp32 (``k.float()``, plus a
++    ``repeat_interleave`` to expand the GQA groups), so a step touches several
++    times the memory the attention math actually needs.
++
++This kernel fixes both.  The launch grid is a function of (batch, heads) only,
++the per-sequence context length is read *inside* the kernel from a device
++tensor, and the KV is streamed straight out of the paged cache in its stored
++dtype.  Shapes are therefore static for a given batch size, so the whole decode
++step becomes CUDA-graph capturable.
++
++Pascal constraint: no ``tl.dot``.  Triton cannot lower MMA for sm_60, and the
++tl.dot path miscompiles or refuses on this arch.  It is not needed here --
++single-token decode has no matmul in it.  Both contractions are
++elementwise-multiply-then-reduce:
++
++    scores[j] = sum_d q[d] * k[j, d]        -> tl.sum(q[None, :] * k, axis=1)
++    out[d]    = sum_j p[j] * v[j, d]        -> tl.sum(p[:, None] * v, axis=0)
++
++Numerics: accumulation is fp32 with the standard online-softmax rescaling, so
++the result matches the fp32 reference path to fp16 rounding.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _paged_decode_attn_kernel(
++    q_ptr,            # [S, H, D]
++    k_cache_ptr,      # [num_blocks, block_size, KVH, D]
++    v_cache_ptr,      # [num_blocks, block_size, KVH, D]
++    blk_tbl_ptr,      # [S, max_blocks] int32
++    seq_lens_ptr,     # [S] int32
++    out_ptr,          # [S, H, D]
++    scale,
++    stride_qs, stride_qh,
++    stride_kb, stride_kp, stride_kh,
++    stride_vb, stride_vp, stride_vh,
++    stride_ts,
++    stride_os, stride_oh,
++    N_REP: tl.constexpr,        # query heads per kv head
++    D: tl.constexpr,            # head dim (power of two)
++    PAGE: tl.constexpr,         # tokens per KV block
++    BLOCK_N: tl.constexpr,      # keys processed per iteration
++):
++    s = tl.program_id(0)
++    h = tl.program_id(1)
++    kvh = h // N_REP
++
++    d = tl.arange(0, D)
++    q = tl.load(q_ptr + s * stride_qs + h * stride_qh + d).to(tl.float32) * scale
++
++    n = tl.load(seq_lens_ptr + s).to(tl.int32)
++
++    m_i = float("-inf")
++    l_i = 0.0
++    acc = tl.zeros([D], dtype=tl.float32)
++
++    for start in range(0, n, BLOCK_N):
++        offs = start + tl.arange(0, BLOCK_N)
++        valid = offs < n
++        # Page lookup.  PAGE is a constexpr, so these become mul-shift, not div.
++        blk = tl.load(blk_tbl_ptr + s * stride_ts + offs // PAGE,
++                      mask=valid, other=0).to(tl.int32)
++        pos = offs % PAGE
++
++        base = blk[:, None] * stride_kb + pos[:, None] * stride_kp + kvh * stride_kh
++        k = tl.load(k_cache_ptr + base + d[None, :],
++                    mask=valid[:, None], other=0.0).to(tl.float32)
++
++        sij = tl.sum(q[None, :] * k, axis=1)
++        sij = tl.where(valid, sij, float("-inf"))
++
++        m_new = tl.maximum(m_i, tl.max(sij, axis=0))
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(sij - m_new)
++
++        vbase = blk[:, None] * stride_vb + pos[:, None] * stride_vp + kvh * stride_vh
++        v = tl.load(v_cache_ptr + vbase + d[None, :],
++                    mask=valid[:, None], other=0.0).to(tl.float32)
++
++        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
++        l_i = l_i * alpha + tl.sum(p, axis=0)
++        m_i = m_new
++
++    # n == 0 happens for the padding slots of a cudagraph-captured batch; the
++    # loop never ran, so l_i is 0 and acc/l_i would be NaN.  Those slots are
++    # discarded downstream, but NaN in a captured buffer is a debugging trap.
++    out = tl.where(l_i > 0.0, acc / tl.where(l_i > 0.0, l_i, 1.0), 0.0)
++    tl.store(out_ptr + s * stride_os + h * stride_oh + d, out.to(out_ptr.dtype.element_ty))
++
++
++def paged_decode_attention(
++    query: torch.Tensor,        # [S, H, D]
++    key_cache: torch.Tensor,    # [num_blocks, page, KVH, D]
++    value_cache: torch.Tensor,  # [num_blocks, page, KVH, D]
++    block_table: torch.Tensor,  # [S, max_blocks] int32
++    seq_lens: torch.Tensor,     # [S] int32, on device
++    output: torch.Tensor,       # [S, H, D]
++    scale: float,
++    block_n: int = 128,
++) -> torch.Tensor:
++    """One decode step of paged attention.  Shapes depend only on (S, H, D),
++    never on the contents of ``seq_lens`` -- safe to capture in a CUDA graph."""
++    S, H, D = query.shape
++    KVH = key_cache.shape[2]
++    page = key_cache.shape[1]
++    assert D & (D - 1) == 0, f"head dim {D} must be a power of two"
++    assert output.shape == query.shape
++
++    _paged_decode_attn_kernel[(S, H)](
++        query, key_cache, value_cache, block_table, seq_lens, output,
++        scale,
++        query.stride(0), query.stride(1),
++        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
++        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
++        block_table.stride(0),
++        output.stride(0), output.stride(1),
++        N_REP=H // KVH,
++        D=D,
++        PAGE=page,
++        BLOCK_N=block_n,
++        num_warps=4,
++        num_stages=2,
++    )
++    return output
+diff --git a/vllm/v1/attention/backends/pascal_sdpa.py b/vllm/v1/attention/backends/pascal_sdpa.py
+index 8981c53..eb3c877 100644
+--- a/vllm/v1/attention/backends/pascal_sdpa.py
++++ b/vllm/v1/attention/backends/pascal_sdpa.py
+@@ -23,18 +23,20 @@ syncs the GPU to read loop bounds.
+ """
+ 
+ from dataclasses import dataclass
++from typing import ClassVar
+ 
+ import torch
+ 
+ from vllm.logger import init_logger
+ from vllm.platforms.interface import DeviceCapability
+-from vllm.v1.attention.backend import AttentionType
++from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
+ from vllm.v1.attention.backends.triton_attn import (
+     TritonAttentionBackend,
+     TritonAttentionImpl,
+     TritonAttentionMetadata,
+     TritonAttentionMetadataBuilder,
+ )
++from vllm.v1.attention.backends.pascal_decode_attn import paged_decode_attention
+ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+ 
+ logger = init_logger(__name__)
+@@ -48,6 +50,15 @@ class PascalSDPAMetadata(TritonAttentionMetadata):
+ 
+ 
+ class PascalSDPAMetadataBuilder(TritonAttentionMetadataBuilder):
++    # Only the all-qlen==1 decode path is graph-safe: it runs one triton kernel
++    # whose launch shape is (batch, heads) and which reads each sequence's
++    # length from device memory.  Prefill and mixed batches still walk a
++    # host-driven python loop over requests, so they must stay eager.
++    # (TritonAttentionMetadataBuilder claims ALWAYS; that is not true here.)
++    _cudagraph_support: ClassVar[AttentionCGSupport] = (
++        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
++    )
++
+     def build(
+         self,
+         common_prefix_len: int,
+@@ -119,25 +130,27 @@ class PascalSDPAImpl(TritonAttentionImpl):
+             raise NotImplementedError(
+                 "PASCAL_SDPA: only kv_cache_dtype=auto is supported"
+             )
+-        # Pure-torch cache write: _C_cache_ops lives in _C_stable_libtorch,
+-        # which cannot be built against torch 2.7. slot_mapping encodes
+-        # block * block_size + offset; negative slots are padding.
++        # Pure-torch cache write.  reshape_and_cache_flash lives in
++        # _C_stable_libtorch, which cannot be built here (torch 2.7 ships no
++        # stable-ABI headers), so torch.ops._C_cache_ops does not exist at all
++        # in this build.
++        #
++        # slot_mapping encodes block * block_size + offset; padding rows carry
++        # -1, which the C++ kernel skips.  Here they are clamped into slot 0 --
++        # vLLM's reserved null block (BlockPool pops block 0 and marks it
++        # is_null, so no request is ever handed it) whose contents are never
++        # read back.  Clamping rather than masking is deliberate: selecting the
++        # valid rows needs `bool(mask.all())` on the host, which syncs the GPU
++        # every single step *and* makes the write shape depend on data -- either
++        # one alone makes the decode step impossible to capture in a CUDA graph.
+         key_cache, value_cache = kv_cache.unbind(1)
+         block_size = key_cache.shape[1]
+         n = slot_mapping.shape[0]
+-        slots = slot_mapping
+-        mask = slots >= 0
+-        if not bool(mask.all()):
+-            slots = slots[mask]
+-            key = key[:n][mask]
+-            value = value[:n][mask]
+-        else:
+-            key = key[:n]
+-            value = value[:n]
++        slots = slot_mapping.clamp_min(0)
+         blk = torch.div(slots, block_size, rounding_mode="floor")
+         off = slots - blk * block_size
+-        key_cache[blk, off] = key
+-        value_cache[blk, off] = value
++        key_cache[blk, off] = key[:n]
++        value_cache[blk, off] = value[:n]
+ 
+     def fused_rope_kvcache_supported(self):
+         return False
+@@ -212,6 +225,25 @@ class PascalSDPAImpl(TritonAttentionImpl):
+         n_rep = self.num_heads // self.num_kv_heads
+ 
+         num_seqs = seq_cpu.shape[0]
++
++        # ---- batched decode fast path: every sequence has qlen == 1 -------
++        # One triton kernel for the whole batch.  Its launch shape is
++        # (batch, heads) and the per-sequence context length is read from the
++        # device-side seq_lens *inside* the kernel, so nothing here depends on
++        # host data -- which is what makes the decode step capturable into a
++        # CUDA graph.  (See pascal_decode_attn.py for why sm_60 needs its own
++        # kernel rather than any of the tl.dot-based ones.)
++        if num_actual_tokens == num_seqs and int(cu_cpu[num_seqs]) == num_seqs:
++            paged_decode_attention(
++                query[:num_seqs],
++                key_cache,
++                value_cache,
++                block_table[:num_seqs],
++                attn_metadata.seq_lens[:num_seqs],
++                output[:num_seqs],
++                self.scale,
++            )
++            return output
+         for i in range(num_seqs):
+             q0 = int(cu_cpu[i])
+             q1 = int(cu_cpu[i + 1])
