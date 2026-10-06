@@ -2643,9 +2643,12 @@ class App(object):
             pid = st["pid"] if st["running"] else None
             if pid:
                 managed_pids |= descendants(pid, table)
+            # a seat Control did not start itself can still be ATTACHED to a server the launcher started (attach_port):
+            # status() and the header call that serving, so the pickers must not label it "stopped"
+            aport = None if st["running"] else self.engine_port(sid)
             insts.append({"key": "m:" + sid, "kind": "managed", "sid": sid, "name": profiles[sid].get("name", sid),
-                          "running": st["running"], "phase": st["phase"], "pid": pid,
-                          "port": st["port"] if st["running"] else (prof.get("port") or None),
+                          "running": st["running"], "phase": st["phase"], "pid": pid, "attached": bool(aport),
+                          "port": st["port"] if st["running"] else (aport or prof.get("port") or None),
                           "host": ("0.0.0.0" if (seat.req or prof).get("expose") else "127.0.0.1"),
                           "gpus": st["gpus"] if st["running"] else prof.get("gpus"),
                           "model": st["model"] if st["running"] else prof.get("model"),

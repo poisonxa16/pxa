@@ -682,9 +682,10 @@ function segInit(seg, onchange) {
     // the server the user is looking at, unless it is stopped and another one of ours is running
     const mine = (S.fleet ? S.fleet.instances : []).filter(x => x.kind === "managed");
     pick.replaceChildren(...(mine.length ? mine : [{sid: S.sid, name: currentServer().name || S.sid}]).map(x =>
-      el("option", {value: x.sid, text: `${x.name}${x.running ? " (" + (x.phase || "running") + ")" : " (stopped)"}`})));
+      el("option", {value: x.sid, text: `${x.name}${x.running ? " (" + (x.phase || "running") + ")" : x.attached ? " (attached)" : " (stopped)"}`})));
     const cur = mine.find(x => x.sid === S.sid);
-    const sid = (cur && cur.running) ? S.sid : ((mine.find(x => x.running) || cur || {sid: S.sid}).sid);
+    const live = x => x && (x.running || x.attached);
+    const sid = live(cur) ? S.sid : ((mine.find(live) || cur || {sid: S.sid}).sid);
     pick.value = sid; return sid;
   }
   pick.addEventListener("change", () => build(pick.value));
@@ -936,7 +937,7 @@ async function fillTargets() {
   if (!S.fleet) { try { S.fleet = await api("/api/fleet"); } catch (e) { /* keep */ } }
   const opts = [];
   for (const x of (S.fleet ? S.fleet.instances : [])) {
-    if (x.kind === "managed") opts.push({run: !!x.running, v: JSON.stringify({sid: x.sid, label: x.name}), t: `${x.name}${x.running ? " :" + x.port : " (stopped)"}`});
+    if (x.kind === "managed") opts.push({run: !!(x.running || x.attached), v: JSON.stringify({sid: x.sid, label: x.name}), t: `${x.name}${x.running ? " :" + x.port : x.attached ? " :" + x.port + " (attached)" : " (stopped)"}`});
     else if (x.running && x.port) opts.push({run: true, v: JSON.stringify({port: x.port, label: x.label || x.name}), t: `${x.label || x.name} :${x.port} (${x.kind})`});
   }
   const cur = JSON.stringify(S.target ? (S.target.sid ? {sid: S.target.sid, label: S.target.label} : {port: S.target.port, label: S.target.label}) : null);
