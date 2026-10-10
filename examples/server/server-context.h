@@ -219,6 +219,10 @@ struct server_slot {
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    // PXA spec metrics: the same totals split by the drafter that proposed them
+    // (common_speculative_type). Index 0 (none) stays 0; /metrics reads these.
+    int32_t n_draft_total_by_type[COMMON_SPECULATIVE_TYPE_COUNT] = {};
+    int32_t n_draft_accepted_by_type[COMMON_SPECULATIVE_TYPE_COUNT] = {};
 
     // PXA_MTP_ADAPTIVE: acceptance-EMA-gated draft-length controller (np=1 only; see add_sampled_tokens)
     float spec_accept_ema      = 0.70f; // EMA of per-step draft acceptance ratio (optimistic cold start -> full drafts)

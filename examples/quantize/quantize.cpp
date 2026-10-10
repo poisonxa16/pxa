@@ -58,6 +58,7 @@ static const std::vector<struct quant_option> QUANT_OPTIONS = {
     { "PXQN1",    LLAMA_FTYPE_MOSTLY_PXQN1,    " 1.25 bpw + 16/K, sign book x E16-row scales, 128-K slabs (PXQN ladder, vs PXQ1)",},
     { "PXQN4S8",  LLAMA_FTYPE_MOSTLY_PXQN4S8,  " 4.50 bpw + 16/K, N4 int book x E8-row scales (PXQN ladder, vs PXQ4-HQ)",},
     { "PXQN5",    LLAMA_FTYPE_MOSTLY_PXQN5,    " 5.25 bpw + 16/K, 5-bit uniform int book x E16-row scales (PXQN ladder, vs PXQ6)",},
+    { "PXA4",     LLAMA_FTYPE_MOSTLY_PXA4,     " 5.06 bpw, PXA subscriber flagship tier (needs the PXA4 entitlement)",},
     { "PXQN",     LLAMA_FTYPE_MOSTLY_PXQN,     " PXQ-Next r1 allocator mix over N3/N3S8/N4/q8_0 (needs PXQN_TIERS)",},
 #endif
     { "PXQ6HQ",   LLAMA_FTYPE_MOSTLY_PXQ4HQ,   " deprecated alias for PXQ4-HQ (pre-re-ladder name)",},
@@ -337,7 +338,7 @@ static bool pxa_type_name_eq(const char * a, const char * b) {
 static bool pxa_type_not_written_here(ggml_type t) {
     return t == GGML_TYPE_PXQN3 || t == GGML_TYPE_PXQN3S8 || t == GGML_TYPE_PXQN4 ||
            t == GGML_TYPE_PXQN2 || t == GGML_TYPE_PXQN1   || t == GGML_TYPE_PXQN4S8 ||
-           t == GGML_TYPE_PXQN5;
+           t == GGML_TYPE_PXQN5 || t == GGML_TYPE_PXA4;
 }
 #endif
 
@@ -783,7 +784,8 @@ int main(int argc, char ** argv) {
             params.ftype == (llama_ftype) 260 || params.ftype == (llama_ftype) 261 ||
             // PXQN ladder (PXQN2 / PXQN1 / PXQN4S8 / PXQN5)
             params.ftype == (llama_ftype) 262 || params.ftype == (llama_ftype) 263 ||
-            params.ftype == (llama_ftype) 264 || params.ftype == (llama_ftype) 265;
+            params.ftype == (llama_ftype) 264 || params.ftype == (llama_ftype) 265 ||
+            params.ftype == (llama_ftype) 266;   // PXA4
 
         std::string base = fname_out;
         const size_t slash = base.find_last_of("/\\");
@@ -986,14 +988,14 @@ int main(int argc, char ** argv) {
                 params.ftype == (llama_ftype) 259 || params.ftype == (llama_ftype) 260 ||
                 params.ftype == (llama_ftype) 261 || params.ftype == (llama_ftype) 262 ||
                 params.ftype == (llama_ftype) 263 || params.ftype == (llama_ftype) 264 ||
-                params.ftype == (llama_ftype) 265 ||
+                params.ftype == (llama_ftype) 265 || params.ftype == (llama_ftype) 266 ||
                 is_pxq_type(params.output_tensor_type) || is_pxq_type(params.token_embedding_type);
             auto is_pxqn_type = [](ggml_type t) {
                 return t == GGML_TYPE_PXQN3 || t == GGML_TYPE_PXQN3S8 || t == GGML_TYPE_PXQN4 ||
                        t == GGML_TYPE_PXQN2 || t == GGML_TYPE_PXQN1   || t == GGML_TYPE_PXQN4S8 ||
-                       t == GGML_TYPE_PXQN5;
+                       t == GGML_TYPE_PXQN5 || t == GGML_TYPE_PXA4;
             };
-            bool want_pxqn = (int) params.ftype >= 258 && (int) params.ftype <= 265;
+            bool want_pxqn = (int) params.ftype >= 258 && (int) params.ftype <= 266;
             want_pxqn = want_pxqn || is_pxqn_type(params.output_tensor_type) || is_pxqn_type(params.token_embedding_type);
             for (const auto & rule : custom_quants) {
                 want_pxq  = want_pxq  || is_pxq_type(rule.second);

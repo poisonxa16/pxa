@@ -108,6 +108,43 @@ if (PXA_PXQN_CLOSED_SRC AND NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/pxqn
     message(FATAL_ERROR "PXA_PXQN_CLOSED_SRC=ON but this tree has no closed PXQN sources (the public tree): "
                         "configure with -DPXA_PXQN_CLOSED_SRC=OFF")
 endif()
+# The lever catalog the engine embeds (common/pxa-registry.cpp) is the PUBLIC table (owner 2026-10-08: no closed rows in
+# what ships, the binaries included). In a tree with the closed sources, scripts/pxa-lever-catalog.py --release-filter
+# drops the closed rows (closed levers, levers read only inside a closed file) and writes their names for the closed
+# library, which declares them at run time. The public tree has nothing to drop: its table is copied as it is.
+# PXA_LEVER_CATALOG_FULL=ON embeds the whole table (dev builds only, never a release).
+option(PXA_LEVER_CATALOG_FULL "pxa: embed the full lever catalog, closed rows included (dev builds only, never a release)" OFF)
+set(PXA_CATALOG_DIR ${CMAKE_BINARY_DIR}/pxa-catalog)
+file(MAKE_DIRECTORY ${PXA_CATALOG_DIR})
+set(_pxa_cat_src ${CMAKE_CURRENT_SOURCE_DIR}/common/pxa-lever-catalog.inc)
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/pxa-closed-levers.txt)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (NOT Python3_Interpreter_FOUND)
+        message(FATAL_ERROR "pxa: this tree has closed levers, and the public lever catalog it embeds is made by "
+                            "scripts/pxa-lever-catalog.py: install python3")
+    endif()
+    execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/pxa-lever-catalog.py
+                            --release-filter ${PXA_CATALOG_DIR}/pxa-lever-catalog-public.inc
+                            --closed-out ${PXA_CATALOG_DIR}/pxqn-closed-levers.inc
+                    RESULT_VARIABLE _pxa_cat_rc OUTPUT_VARIABLE _pxa_cat_out ERROR_VARIABLE _pxa_cat_err
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (NOT _pxa_cat_rc EQUAL 0)
+        message(FATAL_ERROR "pxa: lever catalog release filter failed: ${_pxa_cat_out} ${_pxa_cat_err}")
+    endif()
+    message(STATUS "${_pxa_cat_out}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_pxa_cat_src}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/pxa-lever-catalog.py
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/pxa-closed-levers.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/pxa-closed-files.txt)
+    if (PXA_LEVER_CATALOG_FULL)
+        message(WARNING "pxa: PXA_LEVER_CATALOG_FULL=ON embeds the closed lever rows: a dev build, never a release")
+        configure_file(${_pxa_cat_src} ${PXA_CATALOG_DIR}/pxa-lever-catalog-build.inc COPYONLY)
+    else()
+        configure_file(${PXA_CATALOG_DIR}/pxa-lever-catalog-public.inc ${PXA_CATALOG_DIR}/pxa-lever-catalog-build.inc COPYONLY)
+    endif()
+else()
+    configure_file(${_pxa_cat_src} ${PXA_CATALOG_DIR}/pxa-lever-catalog-build.inc COPYONLY)
+endif()
 # libggml-pxqn host code for baseline x86-64 (SSE2) so one library loads on any x86-64 CPU; the CPU-hot loops get an AVX2
 # clone chosen at run time (ggml/src/CMakeLists.txt, pxqn-cpu.c). OFF = inherit the engine's -mavx/-mavx2/-mfma/-mf16c.
 option(PXA_PXQN_BASELINE_X86 "pxa: build libggml-pxqn host code for baseline x86-64 with run-time AVX2 dispatch" ON)

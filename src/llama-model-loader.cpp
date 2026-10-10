@@ -450,7 +450,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             if (cur->type == GGML_TYPE_PXQN3 || cur->type == GGML_TYPE_PXQN3S8 || cur->type == GGML_TYPE_PXQN4 ||
                 cur->type == GGML_TYPE_PXQN2 || cur->type == GGML_TYPE_PXQN1 || cur->type == GGML_TYPE_PXQN4S8 ||
-                cur->type == GGML_TYPE_PXQN5) {
+                cur->type == GGML_TYPE_PXQN5 || cur->type == GGML_TYPE_PXA4) {
                 has_pxqn = true;
                 break;
             }
@@ -712,6 +712,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             case GGML_TYPE_PXQN1:   ftype = LLAMA_FTYPE_MOSTLY_PXQN1;   break;
             case GGML_TYPE_PXQN4S8: ftype = LLAMA_FTYPE_MOSTLY_PXQN4S8; break;
             case GGML_TYPE_PXQN5:   ftype = LLAMA_FTYPE_MOSTLY_PXQN5;   break;
+            case GGML_TYPE_PXA4:    ftype = LLAMA_FTYPE_MOSTLY_PXA4;    break;
             default:
                 {
                      LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));

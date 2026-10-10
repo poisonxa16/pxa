@@ -64,3 +64,5 @@ void dequantize_row_pxqn4s8_f16(const void * vx, half  * y, int64_t nrows, int64
 void dequantize_row_pxqn4s8_f32(const void * vx, float * y, int64_t nrows, int64_t n_per_row, cudaStream_t stream);
 void dequantize_row_pxqn5_f16  (const void * vx, half  * y, int64_t nrows, int64_t n_per_row, cudaStream_t stream);
 void dequantize_row_pxqn5_f32  (const void * vx, float * y, int64_t nrows, int64_t n_per_row, cudaStream_t stream);
+void dequantize_row_pxa4_f16   (const void * vx, half  * y, int64_t nrows, int64_t n_per_row, cudaStream_t stream);
+void dequantize_row_pxa4_f32   (const void * vx, float * y, int64_t nrows, int64_t n_per_row, cudaStream_t stream);

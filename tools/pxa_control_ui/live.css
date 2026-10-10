@@ -93,3 +93,7 @@
   #p-live .lv-big .stat .v{font-size:var(--fs-4)}
 }
 @media (prefers-reduced-motion:reduce){#p-live .lv-run{animation:none}}
+/* v3.1 history: the long-range buttons appear once PXA Control records history; the CSV links sit above the tiles */
+.seg button[hidden] { display: none; }
+.lv-histbar { margin: 0 0 var(--s3, 10px); min-height: 1em; }
+.lv-histbar a { color: inherit; text-decoration: underline; }

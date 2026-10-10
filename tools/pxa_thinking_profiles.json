@@ -1,0 +1,1550 @@
+{
+ "version": 2,
+ "note": "Per-model thinking profiles for PXA Control. Budgets are SUGGESTIONS (tokens of thinking per reply) for interactive chat, not measurements; 'small' applies to models of 10B parameters or fewer. enforce: engine = the engine's reasoning-budget sampler (per request thinking_budget_tokens, per server --reasoning-budget), template = the model's own budget kwarg, guard = only max_tokens can cap it.",
+ "answer_reserve": 1024,
+ "small_params_b": 10,
+ "methods_note": "methods.on / methods.off: how the switch is done, most preferred first (template-kwarg, soft-tag, empty-think-prefill, reasoning-budget, effort-level, default). The first one the model's template allows is used; the UI's fallback option takes the next.",
+ "families": [
+  {
+   "id": "qwen38-effort",
+   "label": "Qwen3.8 family (Swift, Flash-Next, Hemlock, Victoria, ThinkingCap)",
+   "mechanism": "kwarg+effort",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "levels": {
+    "key": "reasoning_effort",
+    "values": [
+     "low",
+     "medium",
+     "xhigh"
+    ],
+    "default": "xhigh"
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "enable_thinking",
+      "Reasoning effort is set to",
+      "<think>"
+     ]
+    },
+    "arch": [
+     "qwen35",
+     "qwen35moe",
+     "qwen4exp",
+     "dflash"
+    ],
+    "name": "(?i)qwen3\\.8|swift|flash.?next|hemlock|victoria|thinkingcap",
+    "requires": [
+     "enable_thinking"
+    ]
+   },
+   "source": "disk template 08a763ee5e33 (Swift/Flash-Next/Hemlock/Victoria/Qwen3.8-27B) and a7e79f8fe37f; reasoning_effort accepts only xhigh|medium|low (raise_exception otherwise)",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "pxa-froggeric",
+   "label": "PXA Coder / PXA Agent (Qwen3.6 froggeric template)",
+   "mechanism": "kwarg",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "fallback": {
+    "on": {
+     "system_prefix": "<|think_on|>"
+    },
+    "off": {
+     "system_prefix": "<|think_off|>"
+    }
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "enable_thinking",
+      "<|think_off|>"
+     ]
+    }
+   },
+   "source": "disk templates 804515ec77a1, 5a988eae8c64: enable_thinking default true; <|think_off|>/<|think_on|> in the system prompt also switch it; thinking auto-closes after 2 consecutive tool failures",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg",
+     "soft-tag"
+    ],
+    "off": [
+     "template-kwarg",
+     "soft-tag",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "gemma4",
+   "label": "Gemma 4 (12B, 26B-A4B, 31B; incl. MTP assistant)",
+   "mechanism": "kwarg",
+   "default": "off",
+   "on": {
+    "kwargs": {
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "tags": [
+    "<|channel>thought",
+    "<channel|>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<|channel>",
+      "<|think|>",
+      "enable_thinking"
+     ]
+    },
+    "arch": [
+     "gemma4",
+     "gemma4_mtp",
+     "gemma4-assistant"
+    ],
+    "requires": [
+     "enable_thinking"
+    ]
+   },
+   "source": "disk templates ad0bceafd1fe, 5a538c54b0fe; engine models/templates/google-gemma-4-31B-it.jinja. Thinking on = <|think|> in the system turn and an open thought channel; off = the prompt ends with an already-closed empty <|channel>thought<channel|>. The engine's PXA_AUTO turns it OFF by default (common/chat.cpp common_chat_auto_reasoning)",
+   "prefill": {
+    "open": "<|channel>thought\n",
+    "close": "<channel|>"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "gpt-oss",
+   "label": "gpt-oss (20B, 120B; harmony format)",
+   "mechanism": "effort",
+   "default": "always",
+   "on": {},
+   "off": null,
+   "levels": {
+    "key": "reasoning_effort",
+    "values": [
+     "low",
+     "medium",
+     "high"
+    ],
+    "default": "medium",
+    "off_value": "low"
+   },
+   "tags": [
+    "<|channel|>analysis",
+    "<|end|>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "guard"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<|channel|>",
+      "reasoning_effort"
+     ]
+    },
+    "arch": [
+     "gpt-oss"
+    ]
+   },
+   "source": "engine models/templates/openai-gpt-oss-120b.jinja: 'Reasoning: medium' in the system message; the analysis channel cannot be switched off, low is the minimum. The engine's gpt-oss handler sets no thinking tags, so --reasoning-budget does not arm: the budget is a max_tokens guard",
+   "prefill": {
+    "open": "",
+    "close": "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
+   },
+   "methods": {
+    "on": [
+     "effort-level"
+    ],
+    "off": [
+     "empty-think-prefill",
+     "effort-level"
+    ]
+   }
+  },
+  {
+   "id": "muse-glimmer",
+   "label": "Muse Glimmer (recipient harmony)",
+   "mechanism": "effort",
+   "default": "always",
+   "on": {},
+   "off": null,
+   "levels": {
+    "key": "reasoning_strength",
+    "values": [
+     "low",
+     "medium",
+     "high"
+    ],
+    "default": "high",
+    "off_value": "low"
+   },
+   "tags": [],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "guard"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<atem:function_calls>",
+      "reasoning_strength"
+     ]
+    },
+    "arch": [
+     "muse-glimmer"
+    ]
+   },
+   "source": "disk templates a508d59766d1, d6e113e32b08: 'Reasoning strength: <x>.' (free text, default high); reasoning goes to the 'self' recipient; no off switch",
+   "prefill": null,
+   "methods": {
+    "on": [
+     "effort-level"
+    ],
+    "off": [
+     "effort-level"
+    ]
+   }
+  },
+  {
+   "id": "hunyuan-v3",
+   "label": "Hunyuan V3 (hy_v3)",
+   "mechanism": "effort",
+   "default": "off",
+   "on": {
+    "kwargs": {
+     "reasoning_effort": "high"
+    }
+   },
+   "off": {
+    "kwargs": {
+     "reasoning_effort": "no_think"
+    }
+   },
+   "levels": {
+    "key": "reasoning_effort",
+    "values": [
+     "low",
+     "high"
+    ],
+    "default": "high",
+    "off_value": "no_think"
+   },
+   "tags": [
+    "<think:opensource>",
+    "</think:opensource>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "reasoning_effort",
+      "no_think",
+      "opensource"
+     ]
+    },
+    "arch": [
+     "hy_v3"
+    ]
+   },
+   "source": "engine models/templates/tencent-Hunyuan-V3.jinja: reasoning_effort no_think (default) | low | high",
+   "prefill": {
+    "open": "<think:opensource>",
+    "close": "</think:opensource>"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "glm5-effort",
+   "label": "GLM 5.x Flash (glm5next)",
+   "mechanism": "effort",
+   "default": "always",
+   "on": {},
+   "off": null,
+   "levels": {
+    "key": "reasoning_effort",
+    "values": [
+     "low",
+     "high",
+     "max"
+    ],
+    "default": "max",
+    "off_value": "low"
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "Reasoning Effort:",
+      "reasoning_effort",
+      "<think>"
+     ]
+    },
+    "arch": [
+     "glm5next"
+    ]
+   },
+   "source": "disk template 049a2a7f0788 (GLM 5.3 Flash): 'Reasoning Effort: Max' unless low|high; the generation prompt always opens <think>",
+   "prefill": {
+    "open": "<think>",
+    "close": "</think>"
+   },
+   "methods": {
+    "on": [
+     "effort-level"
+    ],
+    "off": [
+     "empty-think-prefill",
+     "effort-level"
+    ]
+   }
+  },
+  {
+   "id": "cohere-reasoning",
+   "label": "Cohere Command A Reasoning / Cohere2 MoE",
+   "mechanism": "kwarg",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "reasoning": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "reasoning": false
+    }
+   },
+   "tags": [
+    "<|START_THINKING|>",
+    "<|END_THINKING|>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<|START_THINKING|>",
+      "reasoning_effort"
+     ]
+    },
+    "arch": [
+     "cohere2_moe"
+    ],
+    "requires": [
+     "reasoning"
+    ]
+   },
+   "source": "engine models/templates/Cohere2MoE.jinja: reasoning (bool), or reasoning_effort 'none' = off",
+   "prefill": {
+    "open": "<|START_THINKING|>",
+    "close": "<|END_THINKING|>"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "command-r7b",
+   "label": "Command R7B (cohere2)",
+   "mechanism": "kwarg",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "tags": [
+    "<|START_THINKING|>",
+    "<|END_THINKING|>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 2048,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<|START_THINKING|>",
+      "enable_thinking"
+     ]
+    },
+    "arch": [
+     "cohere2"
+    ],
+    "name": "(?i)r7b",
+    "requires": [
+     "enable_thinking"
+    ]
+   },
+   "source": "engine models/templates/CohereForAI-c4ai-command-r7b-12-2024-tool_use.jinja: off = an empty <|START_THINKING|><|END_THINKING|> prefill",
+   "prefill": {
+    "open": "<|START_THINKING|>",
+    "close": "<|END_THINKING|>"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "seed-oss",
+   "label": "ByteDance Seed-OSS (native thinking budget)",
+   "mechanism": "budget-kwarg",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "thinking_budget": -1
+    }
+   },
+   "off": {
+    "kwargs": {
+     "thinking_budget": 0
+    }
+   },
+   "budget_kwarg": "thinking_budget",
+   "tags": [
+    "<seed:think>",
+    "</seed:think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "template",
+    "note": "the model is trained to respect thinking_budget (multiples of 512 recommended); 0 = answer directly"
+   },
+   "match": {
+    "template": {
+     "any": [
+      "<seed:think>",
+      "thinking_budget"
+     ]
+    },
+    "arch": [
+     "seed_oss"
+    ]
+   },
+   "source": "Seed-OSS model card (chat_template_kwargs thinking_budget); not on this box: detection by arch, template signature from the published template",
+   "prefill": null,
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg"
+    ]
+   }
+  },
+  {
+   "id": "smollm3",
+   "label": "SmolLM3",
+   "mechanism": "kwarg",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "fallback": {
+    "on": {
+     "system_prefix": "/think"
+    },
+    "off": {
+     "system_prefix": "/no_think"
+    }
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 2048,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "enable_thinking",
+      "Reasoning Mode",
+      "/no_think"
+     ]
+    },
+    "arch": [
+     "smollm3"
+    ]
+   },
+   "source": "engine models/templates/HuggingFaceTB-SmolLM3-3B.jinja: 'Reasoning Mode: /think|/no_think'",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg",
+     "soft-tag"
+    ],
+    "off": [
+     "template-kwarg",
+     "soft-tag",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "deepseek-hybrid",
+   "label": "DeepSeek V3.1 / V3.2 / V4 (hybrid thinking)",
+   "mechanism": "kwarg",
+   "default": "template",
+   "on": {
+    "kwargs": {
+     "thinking": true,
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "thinking": false,
+     "enable_thinking": false
+    }
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<｜Assistant｜>",
+      "<think>"
+     ],
+     "any": [
+      "thinking_mode",
+      "thinking is defined",
+      "set thinking"
+     ]
+    },
+    "arch": [
+     "deepseek2",
+     "deepseek4",
+     "deepseek4-dspark"
+    ],
+    "name": "(?i)v3\\.[12]|terminus|v4",
+    "requires": [
+     "thinking"
+    ]
+   },
+   "source": "engine models/templates/deepseek-ai-DeepSeek-V3.1/V3.2/V4.jinja, disk da05440f0f0a (V4 Flash stub): the official templates read 'thinking' (default off); llama.cpp's copies also read enable_thinking, so both keys are sent",
+   "prefill": {
+    "open": "<think>",
+    "close": "</think>"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "kimi-thinking",
+   "label": "Kimi K2 Thinking (always thinks)",
+   "mechanism": "always",
+   "default": "always",
+   "on": {},
+   "off": {
+    "budget_tokens": 0
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 8192,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<|im_assistant|>",
+      "<think>",
+      "<|tool_calls_section_begin|>"
+     ]
+    },
+    "arch": [
+     "deepseek2",
+     "kimi-k2"
+    ],
+    "name": "(?i)kimi.*think"
+   },
+   "source": "engine models/templates/Kimi-K2-Thinking.jinja; the engine's kimi_k2 handler sets the think tags, so 'off' = thinking_budget_tokens 0 (the sampler closes the block at once)",
+   "prefill": {
+    "open": "<think>",
+    "close": "</think>"
+   },
+   "methods": {
+    "on": [
+     "default"
+    ],
+    "off": [
+     "empty-think-prefill",
+     "reasoning-budget"
+    ]
+   }
+  },
+  {
+   "id": "apriel-thinker",
+   "label": "ServiceNow Apriel Thinker (always thinks, untagged)",
+   "mechanism": "always",
+   "default": "always",
+   "on": {},
+   "off": null,
+   "tags": [
+    "Here are my reasoning steps:",
+    "[BEGIN FINAL RESPONSE]"
+   ],
+   "launch": false,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "guard"
+   },
+   "match": {
+    "template": {
+     "any": [
+      "Here are my reasoning steps",
+      "[BEGIN FINAL RESPONSE]"
+     ]
+    }
+   },
+   "source": "engine models/templates/Apriel-1.6-15b-Thinker-fixed.jinja, unsloth-Apriel-1.5.jinja",
+   "prefill": {
+    "open": "Here are my reasoning steps:\n",
+    "close": "\n[BEGIN FINAL RESPONSE]\n"
+   },
+   "methods": {
+    "on": [
+     "default"
+    ],
+    "off": [
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "magistral",
+   "label": "Magistral / Ministral Reasoning ([THINK])",
+   "mechanism": "always",
+   "default": "always",
+   "on": {},
+   "off": {
+    "budget_tokens": 0
+   },
+   "tags": [
+    "[THINK]",
+    "[/THINK]"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "engine",
+    "note": "the default reasoning system prompt is injected only when the chat has no system message"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "[THINK]",
+      "[SYSTEM_PROMPT]"
+     ]
+    },
+    "arch": [
+     "mistral3",
+     "mistral4",
+     "llama"
+    ],
+    "name": "(?i)magistral|ministral.*reason"
+   },
+   "source": "engine models/templates/mistralai-Ministral-3-14B-Reasoning-2512.jinja and the ministral_3 handler ([THINK]/[/THINK] tags known to the engine)",
+   "prefill": {
+    "open": "[THINK]",
+    "close": "[/THINK]"
+   },
+   "methods": {
+    "on": [
+     "default"
+    ],
+    "off": [
+     "empty-think-prefill",
+     "reasoning-budget"
+    ]
+   }
+  },
+  {
+   "id": "granite-thinking",
+   "label": "IBM Granite 3.2 / 3.3 (thinking kwarg)",
+   "mechanism": "kwarg",
+   "default": "off",
+   "on": {
+    "kwargs": {
+     "thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "thinking": false
+    }
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 2048,
+    "small": 2048,
+    "enforce": "guard",
+    "note": "the switch only changes the system prompt; the engine sees no think tags in the template"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<|start_of_role|>",
+      "elif thinking"
+     ]
+    },
+    "arch": [
+     "granite",
+     "granitemoe"
+    ],
+    "name": "(?i)3\\.[23]",
+    "requires": [
+     "thinking"
+    ]
+   },
+   "source": "engine models/templates/ibm-granite-granite-3.3-2B-Instruct.jinja: 'thinking' adds the reasoning system prompt when the chat has no system message of its own",
+   "prefill": null,
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg"
+    ]
+   }
+  },
+  {
+   "id": "hermes4",
+   "label": "Hermes 4 (thinking kwarg)",
+   "mechanism": "kwarg",
+   "default": "off",
+   "on": {
+    "kwargs": {
+     "thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "thinking": false
+    }
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "guard"
+   },
+   "match": {
+    "arch": [
+     "llama",
+     "qwen3",
+     "qwen3moe"
+    ],
+    "name": "(?i)hermes.?4",
+    "requires": [
+     "thinking"
+    ]
+   },
+   "source": "Hermes 4 model card (chat_template_kwargs thinking=true); not on this box, heuristic only, cross-checked against the file's template",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "nemotron-detailed",
+   "label": "Llama Nemotron v1 (Nano 4B/8B, Super 49B, Ultra 253B)",
+   "mechanism": "system",
+   "default": "off",
+   "on": {
+    "system_prefix": "detailed thinking on"
+   },
+   "off": {
+    "system_prefix": "detailed thinking off"
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": false,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "guard"
+   },
+   "match": {
+    "arch": [
+     "llama",
+     "deci"
+    ],
+    "name": "(?i)nemotron.*(nano.?(4b|8b)|super.?49b|ultra.?253b)(?!.*v1\\.5)"
+   },
+   "source": "model card (system prompt 'detailed thinking on|off'); disk 4b588fb15154 (Llama-3.1-Nemotron-Nano-8B-v1) has no switch in its template",
+   "prefill": null,
+   "methods": {
+    "on": [
+     "soft-tag"
+    ],
+    "off": [
+     "soft-tag"
+    ]
+   }
+  },
+  {
+   "id": "nemotron-soft",
+   "label": "Nemotron v1.5 / Nano v2 (/think, /no_think in the system prompt)",
+   "mechanism": "system",
+   "default": "on",
+   "on": {
+    "system_prefix": "/think"
+   },
+   "off": {
+    "system_prefix": "/no_think"
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": false,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "match": {
+    "arch": [
+     "llama",
+     "deci",
+     "nemotron_h",
+     "nemotron-h"
+    ],
+    "name": "(?i)nemotron.*(v1\\.5|nano.?(9b|12b).?v2)"
+   },
+   "source": "model cards; not on this box (heuristic)",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "soft-tag"
+    ],
+    "off": [
+     "soft-tag",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "phi4-reasoning",
+   "label": "Phi-4 reasoning / mini-reasoning (always thinks)",
+   "mechanism": "always",
+   "default": "always",
+   "on": {},
+   "off": {
+    "budget_tokens": 0
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "engine",
+    "note": "enforcement depends on the engine detecting <think> in this template; the max_tokens guard is the fallback"
+   },
+   "match": {
+    "arch": [
+     "phi3"
+    ],
+    "name": "(?i)reason"
+   },
+   "source": "model card; not on this box (heuristic)",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "default"
+    ],
+    "off": [
+     "empty-think-prefill",
+     "reasoning-budget"
+    ]
+   }
+  },
+  {
+   "id": "minimax-m2",
+   "label": "MiniMax M2 (interleaved thinking, always on)",
+   "mechanism": "always",
+   "default": "always",
+   "on": {},
+   "off": {
+    "budget_tokens": 0
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 8192,
+    "enforce": "engine"
+   },
+   "match": {
+    "arch": [
+     "minimax-m2"
+    ]
+   },
+   "source": "model card; arch minimax-m2 (template not on this box)",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "default"
+    ],
+    "off": [
+     "empty-think-prefill",
+     "reasoning-budget"
+    ]
+   }
+  },
+  {
+   "id": "glm-hybrid",
+   "label": "GLM-4.5 / 4.6 / 4.7 (enable_thinking, /nothink)",
+   "mechanism": "kwarg",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "fallback": {
+    "on": {},
+    "off": {
+     "user_suffix": " /nothink"
+    }
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "[gMASK]",
+      "enable_thinking",
+      "<think>"
+     ]
+    },
+    "arch": [
+     "glm4moe",
+     "glm-dsa"
+    ],
+    "requires": [
+     "enable_thinking"
+    ]
+   },
+   "source": "engine models/templates/GLM-4.6.jinja, GLM-4.7-Flash.jinja",
+   "prefill": {
+    "open": "<think>",
+    "close": "</think>"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "soft-tag",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "qwen-hybrid",
+   "label": "Qwen3 hybrid / Qwen3.5 / Qwen3.6 and derivatives (Ornith, Fusion, GRM, Laguna, ...)",
+   "mechanism": "kwarg",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "fallback": {
+    "on": {
+     "user_suffix": " /think"
+    },
+    "off": {
+     "user_suffix": " /no_think"
+    }
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "enable_thinking",
+      "<think>"
+     ]
+    },
+    "arch": [
+     "qwen3",
+     "qwen3moe",
+     "qwen3next",
+     "qwen3vl",
+     "qwen3vlmoe",
+     "qwen35",
+     "qwen35moe",
+     "qwen4exp",
+     "laguna",
+     "hunyuan-moe",
+     "mimo2",
+     "internlm2"
+    ],
+    "name_not": "(?i)instruct-2507|thinking|coder|qwen3-(vl|next)-[0-9.]+b(-a[0-9]+b)?-instruct",
+    "requires": [
+     "enable_thinking"
+    ]
+   },
+   "source": "engine models/templates/Qwen-Qwen3-0.6B.jinja, Qwen3.5-4B.jinja; disk 2006cdc006d3, 2eb1912776fc, 71dc5117fbb5, 78c9fe670a12, 783cead953c5, 0ef7932a1deb, 4bad019e10ea, a692e2293a8a, b8ffbabb7a71, f54c154d3de0, f0ae8663a876. /think and /no_think are honoured only by Qwen3 (2504) templates",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg",
+     "soft-tag"
+    ],
+    "off": [
+     "template-kwarg",
+     "soft-tag",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "deepseek-r1",
+   "label": "DeepSeek R1 / R1 distills / QwQ / always-think <think> models",
+   "mechanism": "always",
+   "default": "always",
+   "on": {},
+   "off": {
+    "budget_tokens": 0
+   },
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "engine"
+   },
+   "match": {
+    "template": {
+     "all": [
+      "<｜Assistant｜>",
+      "<think>"
+     ]
+    },
+    "arch": [
+     "deepseek2",
+     "qwen2",
+     "llama",
+     "qwen3",
+     "qwen3moe",
+     "qwen3next",
+     "qwen3vl",
+     "qwen3vlmoe",
+     "step35",
+     "ernie4_5",
+     "ernie4_5-moe",
+     "bailingmoe2",
+     "glm4",
+     "olmo2",
+     "olmo3"
+    ],
+    "name": "(?i)deepseek.?r1|r1.?distill|qwq|thinking|step.?3\\.5|glm.?z1|ring"
+   },
+   "source": "engine models/templates/deepseek-ai-DeepSeek-R1-Distill-*.jinja, llama-cpp-deepseek-r1.jinja, Qwen-QwQ-32B.jinja, stepfun-ai-Step-3.5-Flash.jinja. 'Off' cannot remove the thought: the engine closes it at once (thinking_budget_tokens 0)",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "default"
+    ],
+    "off": [
+     "empty-think-prefill",
+     "reasoning-budget"
+    ]
+   }
+  },
+  {
+   "id": "generic-kwarg",
+   "label": "unknown model: template reads enable_thinking",
+   "mechanism": "kwarg",
+   "default": "on",
+   "on": {
+    "kwargs": {
+     "enable_thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "generic": true,
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "engine"
+   },
+   "source": "runtime template inspection",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "generic-thinking-kwarg",
+   "label": "unknown model: template reads 'thinking'",
+   "mechanism": "kwarg",
+   "default": "off",
+   "on": {
+    "kwargs": {
+     "thinking": true
+    }
+   },
+   "off": {
+    "kwargs": {
+     "thinking": false
+    }
+   },
+   "generic": true,
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "guard"
+   },
+   "source": "runtime template inspection",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "template-kwarg"
+    ],
+    "off": [
+     "template-kwarg",
+     "empty-think-prefill"
+    ]
+   }
+  },
+  {
+   "id": "generic-effort",
+   "label": "unknown model: template reads reasoning_effort",
+   "mechanism": "effort",
+   "default": "always",
+   "on": {},
+   "off": null,
+   "generic": true,
+   "levels": {
+    "key": "reasoning_effort",
+    "values": [
+     "low",
+     "medium",
+     "high"
+    ],
+    "default": "medium",
+    "off_value": "low"
+   },
+   "tags": [],
+   "launch": true,
+   "budget": {
+    "suggested": 4096,
+    "small": 2048,
+    "enforce": "guard"
+   },
+   "source": "runtime template inspection",
+   "prefill": null,
+   "methods": {
+    "on": [
+     "effort-level"
+    ],
+    "off": [
+     "effort-level"
+    ]
+   }
+  },
+  {
+   "id": "generic-always",
+   "label": "unknown model: the generation prompt always opens <think>",
+   "mechanism": "always",
+   "default": "always",
+   "on": {},
+   "off": {
+    "budget_tokens": 0
+   },
+   "generic": true,
+   "tags": [
+    "<think>",
+    "</think>"
+   ],
+   "launch": true,
+   "budget": {
+    "suggested": 8192,
+    "small": 4096,
+    "enforce": "engine"
+   },
+   "source": "runtime template inspection",
+   "prefill": {
+    "open": "<think>\n",
+    "close": "\n</think>\n\n"
+   },
+   "methods": {
+    "on": [
+     "default"
+    ],
+    "off": [
+     "empty-think-prefill",
+     "reasoning-budget"
+    ]
+   }
+  },
+  {
+   "id": "none",
+   "label": "no thinking mode",
+   "mechanism": "none",
+   "default": "none",
+   "on": null,
+   "off": null,
+   "tags": [],
+   "launch": false,
+   "budget": {
+    "suggested": 0,
+    "small": 0,
+    "enforce": "none"
+   },
+   "match": {
+    "arch": [
+     "llama",
+     "llama4",
+     "gemma",
+     "gemma2",
+     "gemma3",
+     "gemma3n",
+     "qwen",
+     "qwen2",
+     "qwen2moe",
+     "qwen2vl",
+     "qwen3",
+     "qwen3moe",
+     "qwen3next",
+     "qwen3vl",
+     "qwen3vlmoe",
+     "mistral3",
+     "command-r",
+     "cohere2",
+     "phi2",
+     "phi3",
+     "deepseek2",
+     "glm4",
+     "chatglm",
+     "granite",
+     "granitemoe",
+     "ernie4_5",
+     "ernie4_5-moe",
+     "bailingmoe2",
+     "dots1",
+     "falcon",
+     "mpt",
+     "baichuan",
+     "starcoder",
+     "starcoder2",
+     "bloom",
+     "stablelm",
+     "gpt2",
+     "gptj",
+     "gptneox",
+     "internlm2",
+     "minicpm",
+     "olmo",
+     "olmo2",
+     "dbrx",
+     "arctic",
+     "xverse",
+     "orion",
+     "plamo",
+     "codeshell",
+     "openelm",
+     "jais",
+     "bitnet",
+     "mellum",
+     "grok",
+     "deci",
+     "mamba",
+     "lfm2"
+    ],
+    "name": ".*"
+   },
+   "source": "Llama 3.x/4, Qwen2.5, Qwen3-2507 Instruct, Qwen3-Coder, Gemma 2/3, Mistral/Devstral, Command-R, Kimi K2 Instruct, Phi-3.5/4, LFM2, GigaChat ... (engine models/templates/*, disk 4b588fb15154, 5f150cdf2e4a, 7fd4a3534ed6, fa3f1e3beb64, b5b5ba98ad50, 6c510c876bda, 899134038234, f64773bd0298)",
+   "prefill": null,
+   "methods": {
+    "on": [],
+    "off": []
+   }
+  },
+  {
+   "id": "unknown",
+   "label": "unknown model (no template, no rule): toggle hidden",
+   "mechanism": "unknown",
+   "default": "none",
+   "on": null,
+   "off": null,
+   "tags": [],
+   "launch": false,
+   "budget": {
+    "suggested": 0,
+    "small": 0,
+    "enforce": "none"
+   },
+   "source": "safe default",
+   "prefill": null,
+   "methods": {
+    "on": [],
+    "off": []
+   }
+  }
+ ]
+}

@@ -1842,6 +1842,7 @@ class GGMLQuantizationType(IntEnum):
     PXQN1     = 261   # PXQN, 1.25 + 16/K bpw
     PXQN4S8   = 262   # PXQN, 4.50 + 16/K bpw
     PXQN5     = 263   # PXQN, 5.25 + 16/K bpw
+    PXA4      = 264   # PXA subscriber flagship tier (~5.06 bpw)
     Q8_0_X4   =  97
     Q8_1_X4   =  98
     Q8_2_X4   =  99
@@ -2087,6 +2088,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.PXQN1       : ( 128,   20),  # + 2 B/row anchor meta
     GGMLQuantizationType.PXQN4S8     : (  32,   18),  # + 2 B/row anchor meta
     GGMLQuantizationType.PXQN5       : ( 128,   84),  # + 2 B/row anchor meta
+    GGMLQuantizationType.PXA4        : ( 128,   81),  # + 2 B/row anchor meta
     GGMLQuantizationType.Q4_0_4_4    : (  32,   18),
     GGMLQuantizationType.Q4_0_4_8    : (  32,   18),
     GGMLQuantizationType.Q4_0_8_8    : (  32,   18),

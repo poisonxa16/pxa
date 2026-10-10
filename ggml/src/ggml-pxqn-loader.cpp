@@ -1,5 +1,7 @@
 // ggml-pxqn-loader.cpp -- finds and checks the closed PXQN library (see ggml-pxqn-api.h). Open.
 #include "ggml-pxqn-api.h"
+#include "ggml-pxqn-tune.h"
+#include "ggml-pxqn-levers.h"
 #include "ggml.h"
 
 #include <cstdio>
@@ -18,6 +20,14 @@ static const struct ggml_pxqn_lib_api * g_pxqn_lib = nullptr;
 static void * g_pxqn_handle = nullptr;
 static ggml_pxqn_cpu_mul_mat_fn          g_pxqn_mmv = nullptr;   // optional extra symbol of the library (ggml-pxqn-api.h)
 static const struct ggml_pxqn_xcache_policy * g_pxqn_xc = nullptr; // optional: the PXA_XCACHE online-adaptation policy
+static ggml_pxqn_xcache_learn_build_fn       g_pxqn_learn_build = nullptr;
+static ggml_pxqn_xcache_counts_pick_fn       g_pxqn_counts_pick = nullptr;
+static ggml_pxqn_xcache_speed_write_fn       g_pxqn_speed_write = nullptr;
+static ggml_pxqn_xcache_calib_step_fn        g_pxqn_calib_step = nullptr;
+static ggml_pxqn_xcache_calib_consider_fn    g_pxqn_calib_consider = nullptr;
+static ggml_pxqn_xcache_cpupool_create_fn    g_pxqn_cpupool_create = nullptr;
+static ggml_pxqn_xcache_cpupool_destroy_fn   g_pxqn_cpupool_destroy = nullptr;
+static ggml_pxqn_xcache_cpupool_step_fn      g_pxqn_cpupool_step = nullptr;
 
 static void * pxqn_try_open(const std::string & path, std::string & err) {
     void * h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -81,6 +91,14 @@ static const struct ggml_pxqn_lib_api * pxqn_load(void) {
         const struct ggml_pxqn_xcache_policy * xp = xg ? xg(GGML_PXQN_XCACHE_VERSION) : nullptr;
         if (xp && xp->version == GGML_PXQN_XCACHE_VERSION && xp->size == sizeof(struct ggml_pxqn_xcache_policy)) g_pxqn_xc = xp;
     }
+    g_pxqn_learn_build = (ggml_pxqn_xcache_learn_build_fn) dlsym(h, GGML_PXQN_XCACHE_LEARN_BUILD_SYM);
+    g_pxqn_counts_pick = (ggml_pxqn_xcache_counts_pick_fn) dlsym(h, GGML_PXQN_XCACHE_COUNTS_PICK_SYM);
+    g_pxqn_speed_write = (ggml_pxqn_xcache_speed_write_fn) dlsym(h, GGML_PXQN_XCACHE_SPEED_WRITE_SYM);
+    g_pxqn_calib_step = (ggml_pxqn_xcache_calib_step_fn) dlsym(h, GGML_PXQN_XCACHE_CALIB_STEP_SYM);
+    g_pxqn_calib_consider = (ggml_pxqn_xcache_calib_consider_fn) dlsym(h, GGML_PXQN_XCACHE_CALIB_CONSIDER_SYM);
+    g_pxqn_cpupool_create = (ggml_pxqn_xcache_cpupool_create_fn) dlsym(h, GGML_PXQN_XCACHE_CPUPOOL_CREATE_SYM);
+    g_pxqn_cpupool_destroy = (ggml_pxqn_xcache_cpupool_destroy_fn) dlsym(h, GGML_PXQN_XCACHE_CPUPOOL_DESTROY_SYM);
+    g_pxqn_cpupool_step = (ggml_pxqn_xcache_cpupool_step_fn) dlsym(h, GGML_PXQN_XCACHE_CPUPOOL_STEP_SYM);
     return api;   // never unloaded: its kernels and per-device state live for the process
 }
 
@@ -137,8 +155,40 @@ ggml_pxqn_cpu_mul_mat_fn ggml_pxqn_cpu_mul_mat_get(void) {
 const struct ggml_pxqn_xcache_policy * ggml_pxqn_xcache_policy_get(void) {
     return ggml_pxqn_lib() ? g_pxqn_xc : nullptr;
 }
+ggml_pxqn_xcache_learn_build_fn ggml_pxqn_xcache_learn_build_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_learn_build : nullptr;
+}
+ggml_pxqn_xcache_counts_pick_fn ggml_pxqn_xcache_counts_pick_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_counts_pick : nullptr;
+}
+ggml_pxqn_xcache_speed_write_fn ggml_pxqn_xcache_speed_write_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_speed_write : nullptr;
+}
+ggml_pxqn_xcache_calib_step_fn ggml_pxqn_xcache_calib_step_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_calib_step : nullptr;
+}
+ggml_pxqn_xcache_calib_consider_fn ggml_pxqn_xcache_calib_consider_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_calib_consider : nullptr;
+}
+ggml_pxqn_xcache_cpupool_create_fn ggml_pxqn_xcache_cpupool_create_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_cpupool_create : nullptr;
+}
+ggml_pxqn_xcache_cpupool_destroy_fn ggml_pxqn_xcache_cpupool_destroy_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_cpupool_destroy : nullptr;
+}
+ggml_pxqn_xcache_cpupool_step_fn ggml_pxqn_xcache_cpupool_step_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_cpupool_step : nullptr;
+}
 #else
 const struct ggml_pxqn_xcache_policy * ggml_pxqn_xcache_policy_get(void) { return nullptr; }
+ggml_pxqn_xcache_learn_build_fn ggml_pxqn_xcache_learn_build_get(void) { return nullptr; }
+ggml_pxqn_xcache_counts_pick_fn ggml_pxqn_xcache_counts_pick_get(void) { return nullptr; }
+ggml_pxqn_xcache_speed_write_fn ggml_pxqn_xcache_speed_write_get(void) { return nullptr; }
+ggml_pxqn_xcache_calib_step_fn ggml_pxqn_xcache_calib_step_get(void) { return nullptr; }
+ggml_pxqn_xcache_calib_consider_fn ggml_pxqn_xcache_calib_consider_get(void) { return nullptr; }
+ggml_pxqn_xcache_cpupool_create_fn ggml_pxqn_xcache_cpupool_create_get(void) { return nullptr; }
+ggml_pxqn_xcache_cpupool_destroy_fn ggml_pxqn_xcache_cpupool_destroy_get(void) { return nullptr; }
+ggml_pxqn_xcache_cpupool_step_fn ggml_pxqn_xcache_cpupool_step_get(void) { return nullptr; }
 #endif
 
 bool ggml_pxqn_cpu_mmv_available(void) {
@@ -246,3 +296,37 @@ int32_t ggml_pxqn_specdef_shortlist(const char * arch, int32_t n_vocab, int32_t 
     const auto * t = ggml_pxqn_specdef_table();
     return t ? t->shortlist(arch, n_vocab, head_type, n_dev, cc_min) : 0;
 }
+
+// ---- optional tuning switches (ggml-pxqn-tune.h): one more optional table of the library ----
+#if defined(_WIN32)
+uint32_t ggml_pxqn_tune_flags(void) { return 0; }
+#else
+uint32_t ggml_pxqn_tune_flags(void) {
+    static std::once_flag once;
+    static uint32_t f = 0;
+    std::call_once(once, [] {
+        if (!ggml_pxqn_lib() || !g_pxqn_handle) return;
+        auto get = (ggml_pxqn_get_tune_api_fn) dlsym(g_pxqn_handle, GGML_PXQN_TUNE_SYM);
+        const struct ggml_pxqn_tune_api * api = get ? get(GGML_PXQN_TUNE_VERSION) : nullptr;
+        if (api && api->version == GGML_PXQN_TUNE_VERSION && api->size == sizeof(struct ggml_pxqn_tune_api) && api->flags) {
+            f = api->flags();
+        }
+    });
+    return f;
+}
+#endif
+
+// ---- the levers the library reads (ggml-pxqn-levers.h): optional symbol of the library ----
+#if defined(_WIN32)
+int ggml_pxqn_lever_builtin(const char * name) { (void) name; return 0; }
+#else
+int ggml_pxqn_lever_builtin(const char * name) {
+    static std::once_flag once;
+    static ggml_pxqn_lever_known_fn fn = nullptr;
+    std::call_once(once, [] {
+        if (!ggml_pxqn_lib() || !g_pxqn_handle) return;
+        fn = (ggml_pxqn_lever_known_fn) dlsym(g_pxqn_handle, GGML_PXQN_LEVER_SYM);
+    });
+    return name && fn ? fn(name) : 0;
+}
+#endif

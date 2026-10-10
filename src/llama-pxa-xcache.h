@@ -33,5 +33,10 @@ bool llama_pxa_xcache_residency_blocks(void);
 // a decode that queued n_tokens just completed (llama_synchronize): advance the adaptation by one tick
 void llama_pxa_xcache_tick(llama_model & model, int n_tokens);
 
+// the speculation companion context takes the quiet path (a switch of the PXQN library, ggml-pxqn-tune.h; off without it):
+// its decodes only note their tokens (llama_pxa_xcache_note_tokens) instead of ticking
+bool llama_pxa_xcache_companion_quiet(void);
+void llama_pxa_xcache_note_tokens(llama_model & model, int n_tokens);
+
 // finish every copy in flight, print the summary, free the adaptor (the model destructor)
 void llama_pxa_xcache_adaptor_free(llama_model & model);

@@ -183,7 +183,7 @@ fi
 ## Latest Test Results (2025-07-23)
 
 ### Compilation Status: ✅ SUCCESS
-- **Build System**: CMake in `/root/pxa/build`
+- **Build System**: CMake in `<repo>/build`
 - **Command**: `make test-function-calls`
 - **Build Time**: ~2 seconds (incremental build)
 - **Target**: `./bin/test-function-calls` created successfully

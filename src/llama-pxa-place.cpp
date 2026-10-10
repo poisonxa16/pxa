@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <string>
 
 static const size_t MiB = size_t(1) << 20;
 
@@ -116,7 +117,7 @@ bool pxa_type_cpu_fast(int t) {
         // PXQN: fast when the closed library carries its CPU matmul (ggml_pxqn_cpu_mmv_available);
         // an older library, or PXA_PXQN_CPU_MMV=0, has only the row-dequant path (zero-copy over PCIe wins there)
         case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN2: case GGML_TYPE_PXQN3: case GGML_TYPE_PXQN3S8:
-        case GGML_TYPE_PXQN4: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXQN4: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5: case GGML_TYPE_PXA4:
             return ggml_pxqn_cpu_mmv_available();
         case GGML_TYPE_PXQ6:
             return false;
@@ -204,7 +205,34 @@ bool pxa_xc_choose(const std::vector<int> & layers, const std::vector<size_t> & 
     }
     const int nl = (int)layers.size();
     if (nl == 0 || n_expert <= 1 || (int)counts.size() != nl) return false;
-    struct item { double c; int l, e; };
+    // PXA_XCACHE_LAYER_WEIGHT (LEVERS-6 A1; default off = byte-identical plan): "il:w,il-il:w,..." scales the
+    // routing counts of those model layers for the CHOICE of the cold set only (item order + the per-cap
+    // layer rank); the reported miss stays in raw counts. The boot-corpus prior under-states how spread
+    // the live routing is on some layers (layers 0-2: live hit 63-69% vs ~80% elsewhere), so w > 1 keeps
+    // more of those layers' experts hot out of the same budget (pair with PXA_XCACHE_SLACK_MB to grow the
+    // budget itself). Weights are clamped to [0.05, 20].
+    std::vector<double> lw(nl, 1.0);
+    if (const char * ws = getenv("PXA_XCACHE_LAYER_WEIGHT")) {
+        std::string spec(ws);
+        size_t p = 0;
+        int n_set = 0;
+        while (p < spec.size()) {
+            size_t q = spec.find(',', p);
+            if (q == std::string::npos) q = spec.size();
+            const std::string tok = spec.substr(p, q - p);
+            p = q + 1;
+            const size_t c = tok.find(':');
+            if (c == std::string::npos) continue;
+            const std::string rg = tok.substr(0, c);
+            const size_t dash = rg.find('-');
+            const int a = atoi(rg.c_str());
+            const int b = dash == std::string::npos ? a : atoi(rg.c_str() + dash + 1);
+            const double w = std::min(20.0, std::max(0.05, atof(tok.c_str() + c + 1)));
+            for (int l = 0; l < nl; ++l) if (layers[l] >= a && layers[l] <= b) { lw[l] = w; ++n_set; }
+        }
+        fprintf(stderr, "PXA_XCACHE_LAYER_WEIGHT: %d layer weight(s) set from \"%s\" (cold-set choice only)\n", n_set, ws);
+    }
+    struct item { double c; int l, e; double raw; };
     std::vector<item> items;
     items.reserve((size_t)nl*n_expert);
     double total = 0;
@@ -213,10 +241,11 @@ bool pxa_xc_choose(const std::vector<int> & layers, const std::vector<size_t> & 
     for (int l = 0; l < nl; ++l) {
         if ((int)counts[l].size() != n_expert) return false;
         std::vector<double> c = counts[l];
+        if (lw[l] != 1.0) for (auto & v : c) v *= lw[l];
         std::sort(c.begin(), c.end());
         pre[l].assign(n_expert + 1, 0.0);
         for (int e = 0; e < n_expert; ++e) pre[l][e + 1] = pre[l][e] + c[e];
-        for (int e = 0; e < n_expert; ++e) { items.push_back({counts[l][e], l, e}); total += counts[l][e]; }
+        for (int e = 0; e < n_expert; ++e) { items.push_back({counts[l][e]*lw[l], l, e, counts[l][e]}); total += counts[l][e]; }
     }
     std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
         if (a.c != b.c) return a.c < b.c;
@@ -251,7 +280,7 @@ bool pxa_xc_choose(const std::vector<int> & layers, const std::vector<size_t> & 
             if (!allow[it.l] || cnt[it.l] >= cap) continue;
             ++cnt[it.l];
             bytes += expert_bytes[it.l];
-            miss  += it.c;
+            miss  += it.raw;
             max_l = std::max(max_l, (size_t)cnt[it.l]*expert_bytes[it.l]);
             max_t = std::max(max_t, (size_t)cnt[it.l]*max_tensor_bytes[it.l]);
             if (cold) (*cold)[it.l].push_back(it.e);

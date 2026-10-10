@@ -10,8 +10,9 @@ const EN = {
   rig: null, cards: store.get("enc.cards", null), other: store.get("enc.other", false), vram: store.get("enc.vram", ""),
   plan: null, planErr: "", planBusy: false, tier: null,
   adv: {work_dir: "", out_dir: "", keep: false, use_hessians: null, encode_card: "", licence_ack: false}, lock: store.get("enc.lock", null),
-  checks: null, checksErr: "", checksBusy: false,
+  checks: null, checksErr: "", checksBusy: false, advOpen: false, advFocus: null,
   job: null, logLines: [], logSeq: 0, jobTimer: null, pkgTimer: null, pkgDismissed: false, rtTimer: null, rtDismissed: false, rtAsked: false, showGet: false, showPicker: false, test: null, updAsked: false,
+  lib: null, libAsked: false, libMsg: "",
 };
 const enApi = (p, o) => api("/api/encode/" + p, o);
 const enBytes = n => { if (n == null) return "?"; const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0, v = +n; while (v >= 1024 && i < 4) { v /= 1024; i++; } return (i ? v.toFixed(v >= 100 ? 0 : 1) : String(v)) + " " + u[i]; };
@@ -37,6 +38,7 @@ async function encodeOpen() {
     EN.updAsked = true;
     enApi("update", {body: {}, timeout: 40000}).then(() => enLoadState(), () => {});
   }
+  if (!EN.libAsked) { EN.libAsked = true; enLoadLib(); }   // the licensed library's own update, cached server-side
 }
 if (typeof S !== "undefined" && S.tab === "encode") encodeOpen();
 
@@ -111,6 +113,75 @@ function runtimeBox(sel, rt) {
   return out;
 }
 
+// ------------------------------------------------------------------ the licensed library (v3.1)
+// The closed libggml-pxqn.so updates on its own, without a new engine: signed release, checksum, staged swap, rollback.
+// The page shows it beside the encoder's own Update row; the work itself is server-side (tools/pxa_lib_update.py).
+const LIB_ERR = {
+  not_valued: "The beta channel is for Valued Supporters. Your key stays on the stable channel.",
+  not_found: "No release is published on this channel yet.",
+  refused: "The licence server refused this computer's key, so there is no update. The installed library keeps running.",
+  not_active: "Your licence is not active, so updates are paused. The installed library keeps running.",
+  expired: "Your licence expired, so updates are paused. The installed library keeps running.",
+  unreachable: "The licence server could not be reached. The installed library keeps running.",
+};
+async function enLoadLib(check) {
+  try {
+    EN.lib = await api("/api/lib/update" + (check ? "?check=1" : ""), {timeout: check ? 60000 : 20000});
+    renderEncoder();
+  } catch (e) { toast("Library update check failed: " + e.message, true); }
+}
+async function enLibApply() {
+  const L = EN.lib || {};
+  if (!confirm("Install library " + (L.latest || "") + "? The one installed now is kept, so you can roll back.")) return;
+  EN.libMsg = "Installing " + (L.latest || "the update") + "…";
+  renderEncoder();
+  try { const r = await api("/api/lib/update/apply", {body: {}, timeout: 300000}); toast(r.message || "Library installed."); }
+  catch (e) { toast(e.message, true); }
+  EN.libMsg = "";
+  await enLoadLib(true);
+}
+async function enLibRollback() {
+  const v = ((EN.lib || {}).installed || {}).prev_version || "the library this engine shipped";
+  if (!confirm("Put back " + v + "?")) return;
+  EN.libMsg = "Rolling back…";
+  renderEncoder();
+  try { const r = await api("/api/lib/update/rollback", {body: {}, timeout: 120000}); toast(r.message || "Rolled back."); }
+  catch (e) { toast(e.message, true); }
+  EN.libMsg = "";
+  await enLoadLib(true);
+}
+async function enLibSet(patch) {
+  try { EN.lib = await api("/api/lib/update/settings", {body: patch, timeout: 20000}); renderEncoder(); }
+  catch (e) { toast(e.message, true); await enLoadLib(); }
+}
+function libBox() {
+  const L = EN.lib;
+  if (!L) return [];
+  if (!L.available) return [el("div", {class: "tiny", id: "en-lib", style: "margin-top:6px", text: (L.error && L.error.message) || "This PXA Control has no library updater."})];
+  const ins = L.installed || {}, ch = L.channel || "stable", busy = !!L.busy, out = [];
+  out.push(el("div", {class: "row", id: "en-lib", style: "margin-top:8px;align-items:center;gap:8px;flex-wrap:wrap"},
+    el("b", {text: "Licensed library"}),
+    el("span", {class: "chip " + (ins.version ? "pxqn" : ""), id: "en-libver", text: ins.version || "the engine's own"}),
+    el("span", {class: "tiny", id: "en-libch", text: "channel: " + ch}),
+    el("span", {class: "sp"}),
+    el("button", {class: "link", id: "en-libcheck", text: busy ? "Working…" : "Check now", disabled: busy, onclick: () => enLoadLib(true)})));
+  if (EN.libMsg) out.push(el("div", {class: "alert warn", id: "en-libwork", role: "status", "aria-live": "polite", style: "display:block;margin-top:6px", text: EN.libMsg}));
+  if (L.running) out.push(el("div", {class: "tiny", id: "en-librunning", style: "margin-top:4px", text: "A server is running. Stop it to install a library update; the installed library keeps working."}));
+  if (L.error && L.error.code === "no_key") out.push(el("div", {class: "alert info", id: "en-libinfo", role: "status", style: "display:block;margin-top:6px", text: "Add your supporter key to unlock Pro"}));
+  else if (L.error) out.push(el("div", {class: "alert " + (L.error.code === "not_valued" ? "warn" : "bad"), id: "en-liberr", role: "alert", style: "display:block;margin-top:6px"}, el("span", {text: LIB_ERR[L.error.code] || L.error.message})));
+  else if (L.update) out.push(el("div", {class: "alert ok en-upd", id: "en-libupd"},
+    el("span", {}, "Library update available: " + ch + " " + (ins.version || "the shipped one") + " → " + L.latest + ". " + (L.notice || "") + (L.min_engine ? " (needs engine " + L.min_engine + " or newer)" : "")),
+    el("button", {class: "b", id: "en-libinstall", text: "Install", disabled: busy || L.running, onclick: enLibApply})));
+  else if (!busy && L.latest) out.push(el("div", {class: "tiny", id: "en-libok", style: "margin-top:4px", text: "Up to date on " + ch + " (" + L.latest + ")."}));
+  if (ins.prev || ins.prev_version) out.push(el("div", {class: "row", style: "margin-top:4px"},
+    el("button", {class: "link", id: "en-librollback", text: "Roll back to " + (ins.prev_version || "the library this engine shipped"), disabled: busy, onclick: enLibRollback})));
+  out.push(el("label", {class: "tiny", style: "margin-top:6px;display:flex;gap:6px;align-items:center"},
+    el("input", {type: "checkbox", id: "en-libauto", checked: !!L.auto, onchange: e => enLibSet({auto: e.target.checked})}), "Install library updates without asking"));
+  if (L.beta !== false) out.push(el("label", {class: "tiny", style: "margin-top:4px;display:flex;gap:6px;align-items:center"},
+    el("input", {type: "checkbox", id: "en-libbeta", checked: ch === "beta", onchange: e => enLibSet({channel: e.target.checked ? "beta" : "stable"})}), "Beta library channel (early; it may change)"));
+  return out;
+}
+
 // ------------------------------------------------------------------ encoder panel
 function licLine(e, st) {
   const l = e.licence || {}, out = [];
@@ -166,6 +237,7 @@ function renderEncoder() {
     kids.push(el("div", {class: "alert ok en-upd"}, el("span", {}, "Update available: " + (u.edition === "pro" ? "Pro " : "Free ") + (u.version || u.build_id) + ". "),
       el("button", {class: "b", text: "Update", onclick: () => enGet(u.edition, true)})));
   for (const e of bad) kids.push(el("div", {class: "tiny", style: "margin-top:6px", text: "Found " + e.path + " but it did not answer: " + (e.error || "no details") + "."}));
+  kids.push(...libBox());
   kids.push(el("details", {style: "margin-top:8px", open: EN.showPicker}, el("summary", {text: "Use a Pro encoder I already downloaded…"}),
     el("div", {class: "row", style: "margin-top:6px"}, el("input", {type: "text", id: "en-addpath", placeholder: "/path/to/pxqe or the folder you unpacked it into", "aria-label": "path to the encoder", style: "flex:1;min-width:200px"}),
       el("button", {class: "b", id: "en-addgo", text: "Use it", onclick: async () => {
@@ -205,7 +277,7 @@ function renderGet() {
     el("p", {class: "tiny"}, "The PXQN tiers: the same size as the classic ones with much lower error. Support PXA on ", el("a", {href: "https://ko-fi.com/shatteredrealms1", target: "_blank", rel: "noopener", text: "Ko-fi"}),
       ", then type ", el("b", {text: "/encoder"}), " in the ", el("a", {href: "https://discord.gg/EqazvV9tf", target: "_blank", rel: "noopener", text: "PXA Network Discord"}), ": the bot gives you a key."),
     el("div", {class: "tiny", style: "margin:6px 0"}, "I have a key:"), keyRow,
-    el("div", {class: "tiny", style: "margin-top:6px"}, "The key is stored on this computer (file mode 600) and sent only to the PXA licence server (" + st.licence_server + ")."),
+    el("div", {class: "tiny", style: "margin-top:6px"}, "The key is stored on this computer (file mode 600) and sent only to the PXA licence server."),
     el("div", {class: "row", style: "margin-top:8px"}, el("button", {class: "b pri", id: "en-getpro", text: "Download Pro", disabled: running, onclick: () => enGet("pro")})));
   const kids = [el("h3", {}, "Get the encoder"), el("div", {class: "en-grid2"}, free, pro)];
   if (p.phase && p.phase !== "idle" && !EN.pkgDismissed) {
@@ -230,6 +302,7 @@ function renderWiz() {
   const body = [stepSource, stepTarget, stepChecks, stepRun, stepDone][EN.step - 1]();
   $("#en-wiz").replaceChildren(steps, body);
   if (EN.step === 4 || EN.step === 5) renderJobTop();
+  if (EN.step === 2 && EN.advFocus) enAdvFocus();
 }
 function enGo(n) { EN.step = n; renderWiz(); if (n === 2) { enLoadRigThenPlan(); } if (n === 3) enRunChecks(); window.scrollTo({top: $("#p-encode").offsetTop - 70, behavior: "smooth"}); }
 
@@ -302,6 +375,7 @@ async function enLoadRigThenPlan() {
   if (!sel.length && !EN.other) sel = have.slice();
   EN.cards = sel;
   renderWiz();
+  EN.advFocus = null;          // a jump from the Checks step is done: this render (with the fresh card list) focused the field
   await enPlan();
 }
 function enTarget() {
@@ -333,12 +407,25 @@ function stepTarget() {
     el("input", {type: "number", id: "en-vram", min: "2", max: "4096", value: EN.vram, onchange: ev => { EN.vram = ev.target.value; store.set("enc.vram", EN.vram); enPlan(); }}))));
   kids.push(el("div", {id: "en-tiers", style: "margin-top:14px"}));
   kids.push(el("div", {id: "en-lock", hidden: true}));
-  kids.push(el("details", {id: "en-adv", style: "margin-top:12px"}, el("summary", {text: "Advanced"}), advBody()));
+  kids.push(el("details", {id: "en-adv", style: "margin-top:12px", open: EN.advOpen, ontoggle: ev => { EN.advOpen = ev.target.open; }}, el("summary", {id: "en-adv-sum", text: "Advanced"}), advBody()));
   kids.push(el("div", {class: "row en-act", style: "margin-top:14px;justify-content:space-between"},
     el("button", {class: "b", id: "en-back2", text: "Back", onclick: () => enGo(1)}),
     el("button", {class: "b pri", id: "en-next2", text: "Check my machine", onclick: () => enGo(3)})));
   setTimeout(renderTiers, 0);
   return el("div", {class: "card"}, ...kids);
+}
+// A fix on the Checks step that needs an Advanced setting (work folder, output folder, encode card): Advanced is on THIS step,
+// folded, so the Checks row has a button that comes back here with it open and the field focused.
+const EN_ADV_FIELD = {work: "en-adv-work", out: "en-adv-out", card: "en-adv-card"};
+const EN_ADV_BTN = {work: "Change the work folder", out: "Change the output folder", card: "Pick another card"};
+function enGoAdvanced(focus) {
+  EN.advOpen = true; EN.advFocus = EN_ADV_FIELD[focus] || "en-adv-sum";
+  EN.step = 2; renderWiz(); enLoadRigThenPlan();
+}
+function enAdvFocus() {
+  const f = $("#" + EN.advFocus) || $("#en-adv-sum");
+  if (!f) return;
+  f.focus(); f.scrollIntoView({block: "center", behavior: "smooth"});
 }
 function advBody() {         // (an encoder with CLI version 2 always measures the weights first: `pxqe make` has no round-to-nearest mode, so no LDLQ switch)
   const st = EN.st, sel = (st.encoders || []).find(e => e.selected), feats = (sel && sel.features) || [];
@@ -452,11 +539,13 @@ function stepChecks() {
     kids.push(el("div", {id: "en-checks"}, ...c.checks.map(k => el("div", {class: "en-ck", "data-check": k.id},
       el("div", {}, badge(k.status, k.status === "ok" ? "OK" : k.status === "warn" ? "Check" : "Stop")),
       el("div", {}, el("div", {class: "lab", text: k.label}), el("div", {text: k.text}), k.fix ? el("div", {class: "fix", text: k.fix}) : null,
-        k.action === "runtime" ? el("div", {class: "row", style: "margin-top:6px"}, rtButton("en-ck-getrt", (EN.st && EN.st.runtime) || {})) : null)))));
+        k.action === "runtime" ? el("div", {class: "row", style: "margin-top:6px"}, rtButton("en-ck-getrt", (EN.st && EN.st.runtime) || {})) : null,
+        k.action === "advanced" ? el("div", {class: "row", style: "margin-top:6px"}, el("button", {class: "b", id: "en-ck-adv-" + k.id, "data-focus": k.focus || "",
+          text: (EN_ADV_BTN[k.focus] || "Open Advanced") + " (step 2, Advanced)", onclick: () => enGoAdvanced(k.focus)})) : null)))));
     const lic = c.checks.find(k => k.id === "src_licence");
     if (lic && lic.status !== "ok" && EN.src && EN.src.licence.level === "noderivs")
       kids.push(el("label", {class: "check", style: "margin-top:8px"}, el("input", {type: "checkbox", id: "en-ack", checked: EN.adv.licence_ack, onchange: ev => { EN.adv.licence_ack = ev.target.checked; enRunChecks(); }}), "I will not share the result"));
-    kids.push(el("div", {class: "en-facts", id: "en-est"}, fact("About how long", c.estimate.text), fact("Disk at the peak", c.disk.peak_h), fact("Final file", c.disk.output_h),
+    kids.push(el("div", {class: "en-facts", id: "en-est"}, fact("About how long", c.estimate.text), fact(c.disk.need_label || "Disk at the peak", c.disk.need_h || c.disk.peak_h), fact(c.disk.same_disk === false ? "Final file (output folder)" : "Final file", c.disk.output_h),
       fact("Work folder", c.work_dir), fact("Output folder", c.out_dir)));
     kids.push(el("details", {}, el("summary", {text: "What will happen"}), el("ol", {style: "margin:6px 0 0;padding-left:20px"}, ...c.stages.map(s => el("li", {text: s.label + (c.estimate.stages[s.id] ? "  (" + fmtDur(c.estimate.stages[s.id][0]) + " to " + fmtDur(c.estimate.stages[s.id][1]) + ")" : "")})))));
     if (!c.can_start) kids.push(el("div", {class: "alert bad", id: "en-refuse", role: "alert"}, "Cannot start yet: " + c.refusal));

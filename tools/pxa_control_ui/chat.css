@@ -1,0 +1,15 @@
+/* PXA Control: the classic chat's layout slots (chat.js). Plugins style their own parts in chat-<name>.css. */
+.cols.chat.has-side{grid-template-columns:minmax(170px,2.5fr) minmax(0,4fr) minmax(0,8fr)}
+@media (max-width:980px){.cols.chat.has-side{grid-template-columns:1fr}}
+.chat-side{display:flex;flex-direction:column;gap:var(--s3);max-height:80vh;overflow:auto}
+.chat-panel:empty{display:none}
+#chat-settings-sections:empty{display:none}
+.chat-sec{margin-top:var(--s4);padding-top:var(--s3);border-top:1px solid var(--line)}
+.chat-sec h4{margin:0 0 var(--s2);font-size:var(--fs-1);color:var(--dim);font-weight:600}
+.chat-tools{gap:6px;flex-wrap:wrap}
+.chat-tools:empty{display:none}
+#chat-side-toggle{margin-left:6px}
+.msg-actions{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+.msg-actions:empty{display:none}
+.msg-actions .b.msg-act{padding:2px 8px;font-size:var(--fs-0)}
+.chat-tool .ic,.msg-act .ic{margin-right:4px}

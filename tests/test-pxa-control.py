@@ -20,6 +20,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -117,6 +118,50 @@ class LeverValidation(unittest.TestCase):
         self.assertIn("PXA_ENHANCE", {r["name"] for r in rows})
 
 
+class BuiltinLevers(unittest.TestCase):
+    """A release catalog drops the levers the closed library reads and keeps only their hashes: those names are
+    accepted (no refusal, no lint warning), labelled built-in, and a typo is still refused."""
+    def setUp(self):
+        self.p = os.path.join(TMP, "cat-release.inc")
+        h = C.lever_hash
+        with open(self.p, "w") as f:
+            f.write('{ "PXA_ENHANCE", "level 2", "any", "default-on", "", "x" },\n')
+            f.write("// built-in: %s %s %s\n" % (h("PXA_HIDDEN_A"), h("PXA_LOCKY"), h("PXA_FAM*")))
+            f.write("// built-in-preset: %s %s\n" % (h("PXA_HIDDEN_A"), h("PXA_FAM*")))
+        rows, src = C.load_catalog(self.p)
+        self.rows = rows
+        self.names = C.LeverNames({r["name"] for r in rows}, *C.load_builtin(src))
+
+    def test_accepted_and_labelled(self):
+        ok, errs = C.validate_levers({"PXA_HIDDEN_A": "1", "PXA_FAM_X": "2", "PXA_LOCKY": "1", "PXA_ENHANCE": "1"}, self.names)
+        self.assertEqual(errs, [])
+        self.assertEqual(ok, {"PXA_HIDDEN_A": "1", "PXA_FAM_X": "2", "PXA_LOCKY": "1", "PXA_ENHANCE": "1"})
+        self.assertEqual(self.names.builtin("PXA_HIDDEN_A"), "preset")
+        self.assertEqual(self.names.builtin("PXA_FAM_X"), "preset")
+        self.assertEqual(self.names.builtin("PXA_LOCKY"), "builtin")
+        self.assertIsNone(self.names.builtin("PXA_ENHANCE"))
+        self.assertEqual(C.lint_levers({"PXA_HIDDEN_A": "1"}, self.rows), [])
+
+    def test_typo_still_refused(self):
+        _ok, errs = C.validate_levers({"PXA_HIDDEN_B": "1"}, self.names)
+        self.assertTrue(errs)
+        _ok, errs = C.validate_levers({"LD_PRELOAD": "x"}, self.names)
+        self.assertTrue(errs)
+
+    def test_full_catalog_has_no_builtin(self):
+        self.assertEqual(C.load_builtin(os.path.join(TMP, "nope.inc")), (set(), set()))
+
+    def test_hash_matches_catalog_script(self):
+        self.assertEqual(C.lever_hash("PXA_ENHANCE"), "%016x" % self._fnv(b"PXA_ENHANCE"))
+
+    @staticmethod
+    def _fnv(b):
+        h = 0xcbf29ce484222325
+        for x in b:
+            h = ((h ^ x) * 0x100000001b3) % (1 << 64)
+        return h
+
+
 class LaunchValidation(unittest.TestCase):
     def v(self, **kw):
         body = {"gpus": [0], "model": FAKE_MODEL}
@@ -163,12 +208,20 @@ class LaunchValidation(unittest.TestCase):
             f.write(b"GGUF")
         with self.assertRaises(C.Invalid):
             self.v(model=other)
-        # symlink escape out of the folder is refused too
+        # a link in the folder to a real GGUF elsewhere (an offloaded model) is allowed (2026-10-06);
+        # a link out of the folder to anything that is not a GGUF is still refused (SymlinkedModels)
         link = os.path.join(MODELS, "link.gguf")
         if not os.path.lexists(link):
             os.symlink(other, link)
+        self.assertEqual(self.v(model=link)["model"], link)
+        notg = os.path.join(TMP, "elsewhere-text.gguf")
+        with open(notg, "wb") as f:
+            f.write(b"text")
+        badlink = os.path.join(MODELS, "badlink.gguf")
+        if not os.path.lexists(badlink):
+            os.symlink(notg, badlink)
         with self.assertRaises(C.Invalid):
-            self.v(model=link)
+            self.v(model=badlink)
 
     def test_argv(self):
         r = self.v(gpus="1,0", ctx=16384, np=2, kv="q8_0", sm="tensor", fa="on", mtp=True, port=8123,
@@ -369,6 +422,56 @@ class EngineProxy(unittest.TestCase):
         self.assertTrue(any(r.get("decode_tps") == 42.5 and r.get("model") == "stub-model" for r in hist), hist)
 
 
+class AttachedSeatInFleet(unittest.TestCase):
+    """d7121574b5 (TucsonJohn, #general 2026-10-05): a seat ATTACHED to a server the launcher started (attach_port) serves, so the fleet must
+    carry attached + its port and the Speed/Chat/Report pickers must not call it '(stopped)'. The fix shipped without a test."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stub = socketserver.ThreadingTCPServer(("127.0.0.1", 0), StubEngine)
+        cls.stub.daemon_threads = True
+        threading.Thread(target=cls.stub.serve_forever, daemon=True).start()
+        cls.app = C.App(L, port=7777)
+        cls.srv, cls.port = serve_app(cls.app)
+
+    @classmethod
+    def tearDownClass(cls):
+        req(cls.port, "/api/attach", "POST", {"port": 0})        # leave no attach_port behind for later classes
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.stub.shutdown()
+
+    def main_row(self):
+        code, _, body = req(self.port, "/api/fleet?force=1")
+        self.assertEqual(code, 200, body)
+        rows = [x for x in json.loads(body)["instances"] if x.get("key") == "m:main"]
+        self.assertEqual(len(rows), 1, body)
+        return rows[0]
+
+    def test_attached_seat_is_attached_with_the_launcher_port(self):
+        sport = self.stub.server_address[1]
+        self.assertEqual(req(self.port, "/api/attach", "POST", {"port": sport})[0], 200)
+        row = self.main_row()
+        self.assertFalse(row["running"])                  # Control did not start it ...
+        self.assertTrue(row["attached"])                  # ... but it is attached, so not "stopped"
+        self.assertEqual(row["port"], sport)
+        st = json.loads(req(self.port, "/api/status")[2])
+        self.assertEqual((st["attached"], st["engine_port"]), (True, sport))   # the header and the pickers agree
+
+    def test_detached_seat_is_not_attached(self):
+        self.assertEqual(req(self.port, "/api/attach", "POST", {"port": 0})[0], 200)
+        row = self.main_row()
+        self.assertFalse(row["running"])
+        self.assertFalse(row["attached"])
+
+    def test_the_pickers_label_an_attached_seat_attached_not_stopped(self):
+        with open(os.path.join(TOOLS, "pxa_control_ui", "index.html"), encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn('x.attached ? " (attached)" : " (stopped)"', html)               # Speed / Report picker
+        self.assertIn('x.attached ? " :" + x.port + " (attached)" : " (stopped)"', html)  # Chat targets
+        self.assertIn("x.running || x.attached", html)                                    # an attached seat is picked as live
+
+
 class TokenAuth(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -554,6 +657,42 @@ class ReportBundle(unittest.TestCase):
             self.app.report_send({"payload": {"x": "y" * (C.REPORT_MAX + 10)}})
 
 
+    def test_engine_version_survives_the_log_ring(self):
+        seat = self.app.seat
+        seat._append("build: 4711 (abc1234)")
+        for i in range(seat.log.maxlen + 50):          # a chatty server pushes the build line out of the ring
+            seat._append(f"slot update_slots: id 0 | task {i} | n_past = {i}")
+        self.assertFalse(any("build:" in x[1] for x in seat.log))
+        self.assertEqual(self.app.report_bundle()["bundle"]["engine"]["version"], "4711 (abc1234)")
+        seat.log.clear()
+        seat.build_lines = []
+
+    def test_engine_version_from_the_binary_when_the_log_has_none(self):
+        d = tempfile.mkdtemp(prefix="pxa-engver-")
+        exe = os.path.join(d, "bin", "llama-server")
+        os.makedirs(os.path.dirname(exe))
+        with open(exe, "w") as f:
+            f.write("#!/bin/sh\necho 'version: 9999 (deadbee)' >&2\necho 'built with cc for x86_64' >&2\n")
+        os.chmod(exe, 0o755)
+        seat = self.app.seat
+        old = (seat.cmd, seat.req, list(seat.log), list(seat.build_lines))
+        try:
+            seat.cmd, seat.req = [exe, "-m", "x.gguf"], None
+            seat.log.clear()
+            seat.build_lines = []
+            v = self.app.report_bundle()["bundle"]["engine"]["version"]
+            self.assertEqual(v, "9999 (deadbee) (from --version)")
+            self.assertIn("9999 (deadbee)", self.app._engine_ver_cache.values())     # cached per binary + mtime
+        finally:
+            seat.cmd, seat.req = old[0], old[1]
+            seat.log.clear()
+            seat.log.extend(old[2])
+            seat.build_lines = old[3]
+            shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual(C.App.parse_engine_version("main: x\nbuild: 7046 (1a2b3c4) with gcc"), "7046 (1a2b3c4) with gcc")
+        self.assertIsNone(C.App.parse_engine_version("no version here"))
+
+
 class ScoreBoardClient(unittest.TestCase):
     def test_name_filter_matches_board(self):
         for bad in ("http://x.example", "see example.com", "@everyone", "f u c k", "sh1t", "<b>", ""):
@@ -690,6 +829,41 @@ class Servers(unittest.TestCase):
         self.assertEqual(self.app.conflicts(req, "b")["errors"], [])
         # auto port skips the ports other servers hold
         self.assertNotIn(self.app.validate({"gpus": [0], "model": FAKE_MODEL})["port"], self.app.held_ports())
+
+    def test_stop_then_start_on_the_same_port(self):
+        # regression (TucsonJohn, 2026-10-07): the engine listens with SO_REUSEPORT only (cpp-httplib), so
+        # the TIME_WAIT sockets its health polls leave on its port refused Control's SO_REUSEADDR probe for
+        # up to a minute after Stop: "port N is already in use by another program" until the port changed
+        engine = ("import socket, sys\n"
+                  "s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)\n"
+                  "s.bind(('127.0.0.1', 0)); s.listen(8); print(s.getsockname()[1], flush=True)\n"
+                  "while True:\n"
+                  "    c, _ = s.accept(); c.recv(1024); c.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n'); c.close()\n")
+        seat = self.app.get_seat("main")
+        seat.start((L.Plan(), [sys.executable, "-u", "-c", engine], {}, "0", {}, 4096),
+                   {"port": 0, "model": FAKE_MODEL, "gpus": [0]}, {})
+        t0 = time.time()
+        while not any(x[1].strip().isdigit() for x in seat.lines_since(0)) and time.time() - t0 < 20:
+            time.sleep(0.05)
+        port = int(next(x[1] for x in seat.lines_since(0) if x[1].strip().isdigit()))
+        seat.req["port"] = port
+        for _ in range(3):                      # health polls: the server closes first -> TIME_WAIT on its port
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+                c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                c.recv(1024)
+                time.sleep(0.05)
+        self.assertTrue(C.port_in_use(port))    # a live listener is still refused
+        self.assertTrue(self.app.stop("main"))
+        self.assertFalse(C.port_in_use(port))
+        req = self.app.validate({"gpus": [0], "model": FAKE_MODEL, "port": port}, resolve_port=False)
+        self.assertEqual(self.app.conflicts(req, "main")["errors"], [])
+        s2 = socket.socket()                    # and the next engine really binds there
+        s2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        try:
+            s2.bind(("127.0.0.1", port))
+            s2.listen(1)
+        finally:
+            s2.close()
 
     def test_first_plan_sees_discovered_servers(self):
         # regression: right after start the fleet cache was empty and the first plan saw no clash
@@ -1565,13 +1739,253 @@ class LiveHistory(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------
+# v3.1 telemetry history: the Live sampler keeps running in the background and fills telemetry.db
+# ---------------------------------------------------------------------------------------------
+class TelemetryHistory(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), ScriptedEngine)
+        cls.srv.daemon_threads = True
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.eport = cls.srv.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def setUp(self):
+        shutil.rmtree(C.config_dir(), ignore_errors=True)
+        for k in ("PXA_CONTROL_TELEMETRY", "PXA_CONTROL_METRICS", "PXA_CONTROL_TELEMETRY_DB"):
+            os.environ.pop(k, None)
+        self.apps = []
+        ScriptedEngine.state = {"slots": [slot(0, -1, False, 0)], "props": {"n_ctx": 1000, "kv_cache_used_cells": 250, "total_slots": 1}}
+
+    def tearDown(self):
+        for app, srv in self.apps:
+            if srv is not None:
+                srv.shutdown()
+                srv.server_close()
+            app.live.close()
+            app.stop_telemetry()
+        for k in ("PXA_CONTROL_TELEMETRY", "PXA_CONTROL_METRICS", "PXA_CONTROL_TELEMETRY_DB"):
+            os.environ.pop(k, None)
+
+    def make(self, key="m:main", lan=False, token=None, http=True):
+        app = C.App(L, port=7777, models_dirs=[MODELS], lan=lan, token=token)
+        snap = {"instances": [{"key": key, "kind": "managed" if key.startswith("m:") else "process", "name": "Server 1",
+                               "label": "Server 1", "running": True, "port": self.eport, "gpus": [0, 1], "health": "ok",
+                               "vram": {}, "model_file": "tiny.gguf"}], "cards": []}
+        app.fleet = lambda max_age=2.5: snap
+        srv = port = None
+        if http:
+            srv, port = serve_app(app)
+        self.apps.append((app, srv))
+        return app, port
+
+    def drive(self, app, n=4, every=10.0):
+        """n samples, `every` seconds apart, ending now; decoding at 50 t/s with two finished requests."""
+        t0 = time.time() - n * every
+        for i in range(n):
+            ScriptedEngine.state["slots"] = [slot(0, 7, True, 1 + int(50 * every * i), 100000)]
+            ScriptedEngine.state["records"] = [
+                {"ts": t0 + 1, "slot": 0, "n_prompt": 900, "n_cached": 100, "prompt_n": 800, "prompt_ms": 1000.0, "prefill_tps": 800.0,
+                 "n_gen": 100, "gen_ms": 2000.0, "decode_tps": 50.0, "draft_n": 0, "draft_acc": 0},
+                {"ts": t0 + every * i + 2, "slot": 0, "n_prompt": 50, "n_cached": 0, "prompt_n": 50, "prompt_ms": 100.0, "prefill_tps": 500.0,
+                 "n_gen": 10, "gen_ms": 200.0, "decode_tps": 50.0, "draft_n": 0, "draft_acc": 0}]
+            app.live.tick(now=t0 + every * i, wait=True)
+        app.telemetry.flush(force=True)
+        self.assertTrue(app.telemetry.sync())
+
+    def test_history_is_recorded_and_served(self):
+        app, port = self.make()
+        self.assertIsNotNone(app.start_telemetry())
+        self.assertTrue(app.telemetry.is_writer)
+        self.drive(app)
+        code, d = jreq(port, "/api/telemetry/series?kind=server&since=%d&step=10" % (time.time() - 3600))
+        self.assertEqual(code, 200)
+        self.assertEqual(d["source"], "raw")
+        s = d["series"][0]
+        self.assertEqual((s["key"], s["label"], s["info"]["model_file"]), ("m:main", "Server 1", "tiny.gguf"))
+        col = d["cols"].index
+        decs = [r[col("dec")] for r in s["rows"] if r[col("dec")] is not None]
+        self.assertTrue(decs and all(abs(v - 50.0) < 0.5 for v in decs), decs)
+        self.assertTrue(all(abs(r[col("ctx")] - 0.25) < 1e-6 for r in s["rows"]))
+        # the old record back-filled by the first poll is kept as a request but not counted into an interval
+        self.assertLessEqual(sum(r[col("req")] or 0 for r in s["rows"]), 4)
+        code, cards = jreq(port, "/api/telemetry/series?kind=card&since=%d" % (time.time() - 3600))
+        self.assertEqual(sorted(x["key"] for x in cards["series"]), ["0", "1"])
+        code, r = jreq(port, "/api/telemetry/requests?since=%d" % (time.time() - 3600))
+        self.assertGreaterEqual(len(r["rows"]), 2)
+        code, h = jreq(port, "/api/telemetry/history?since=%d" % (time.time() - 3600))
+        self.assertEqual(code, 200)
+        self.assertEqual(set(h["cols"]), {"card", "server", "host"})
+        self.assertEqual(h["servers"][0]["key"], "m:main")
+        code, st = jreq(port, "/api/telemetry")
+        self.assertTrue(st["recording"])
+        self.assertGreater(st["raw_rows"], 0)
+        self.assertIn("server", {x["kind"] for x in st["series_list"]})
+
+    def test_prompt_text_and_paths_never_reach_the_file(self):
+        app, port = self.make()
+        app.start_telemetry()
+        ScriptedEngine.state["props"]["model_alias"] = "/home/someone/secret-dir/tiny.gguf"
+        self.drive(app)
+        app.stop_telemetry()
+        blob = b""
+        for p in glob_db(C.config_dir()):
+            with open(p, "rb") as f:
+                blob += f.read()
+        self.assertNotIn(b"SECRET", blob)
+        self.assertNotIn(b"secret-dir", blob)
+
+    def test_csv_download(self):
+        app, port = self.make()
+        app.start_telemetry()
+        self.drive(app)
+        u = "http://127.0.0.1:%d/api/telemetry/csv?kind=card&since=%d&step=10" % (port, time.time() - 3600)
+        with urllib.request.urlopen(u, timeout=10) as r:
+            self.assertTrue(r.headers["Content-Type"].startswith("text/csv"))
+            self.assertIn("attachment;", r.headers["Content-Disposition"])
+            lines = r.read().decode().splitlines()
+        self.assertTrue(lines[0].startswith("time_utc,unix_s,card,label,mem"))
+        self.assertGreaterEqual(len(lines), 1 + 2)
+        self.assertEqual(req(port, "/api/telemetry/csv?kind=disk")[0], 400)
+
+    def test_off_by_env_and_by_setting(self):
+        os.environ["PXA_CONTROL_TELEMETRY"] = "0"
+        app, port = self.make()
+        self.assertIsNone(app.start_telemetry())
+        code, d = jreq(port, "/api/telemetry/series?kind=card")
+        self.assertEqual(code, 400)
+        self.assertIn("off", d["error"])
+        self.assertFalse(app.live.background)
+        os.environ.pop("PXA_CONTROL_TELEMETRY")
+        code, st = jreq(port, "/api/telemetry/settings", "POST", {"enabled": True, "raw_days": 3})
+        self.assertEqual(code, 200)
+        self.assertTrue(st["recording"])
+        self.assertEqual(st["settings"]["raw_days"], 3.0)
+        self.assertEqual(C.load_config()["telemetry"]["raw_days"], 3.0)
+        code, st = jreq(port, "/api/telemetry/settings", "POST", {"enabled": False})
+        self.assertFalse(st["recording"])
+        self.assertIsNone(app.telemetry)
+        self.assertEqual(req(port, "/api/telemetry/settings", "POST", {"colour": "red"})[0], 400)
+
+    def test_background_sampler_runs_with_nobody_looking(self):
+        app, port = self.make(http=False)
+        app.start_telemetry()
+        self.assertTrue(app.live.background)
+        app.live.bg_every = 0.25                     # test pace; the shipping floor is LIVE_FAST_S
+        app.live.last_any = time.time() - C.LIVE_IDLE_S - 60     # the last viewer left long ago
+        t = time.time()
+        while app.live.ticks < 3 and time.time() - t < 15:
+            time.sleep(0.1)
+        self.assertGreaterEqual(app.live.ticks, 3)
+        self.assertTrue(app.live.thread.is_alive())
+
+    def test_without_history_the_sampler_still_stops_when_idle(self):
+        app, port = self.make(http=False)
+        app.live.touch()
+        app.live.last_any = time.time() - C.LIVE_IDLE_S - 60
+        app.live.last_fast = 0
+        t = time.time()
+        while app.live.thread is not None and app.live.thread.is_alive() and time.time() - t < 15:
+            time.sleep(0.2)
+        self.assertFalse(app.live.thread is not None and app.live.thread.is_alive())
+
+    def test_second_control_reads_but_does_not_record(self):
+        a, _p = self.make(http=False)
+        a.start_telemetry()
+        b, port_b = self.make()
+        st = b.start_telemetry()
+        self.assertFalse(st.is_writer)
+        self.assertFalse(b.live.background)
+        self.drive(a)
+        code, d = jreq(port_b, "/api/telemetry/series?kind=card&since=%d" % (time.time() - 3600))
+        self.assertEqual(code, 200)
+        self.assertEqual(len(d["series"]), 2)
+        self.assertFalse(jreq(port_b, "/api/telemetry")[1]["recording"])
+
+    def test_bare_process_is_filed_under_its_port(self):
+        app, port = self.make(key="p:4242")
+        app.start_telemetry()
+        self.drive(app, n=2)
+        keys = [x["key"] for x in app.telemetry.list_series("server")]
+        self.assertEqual(keys, ["p@%d" % self.eport])
+
+    def test_metrics_is_off_until_asked_then_relabels_engine_counters(self):
+        app, port = self.make()
+        app.start_telemetry()
+        ScriptedEngine.state["metrics"] = {"tokens_predicted_total": 1000, "tokens_predicted_seconds_total": 30.0,
+                                           "prompt_tokens_total": 5000, "prompt_seconds_total": 6.0}
+        self.drive(app, n=2)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen("http://127.0.0.1:%d/metrics" % port, timeout=10)
+        self.assertEqual(cm.exception.code, 404)
+        jreq(port, "/api/telemetry/settings", "POST", {"prometheus": True})
+        with urllib.request.urlopen("http://127.0.0.1:%d/metrics" % port, timeout=10) as r:
+            self.assertTrue(r.headers["Content-Type"].startswith("text/plain"))
+            txt = r.read().decode()
+        self.assertIn('pxa_card_memory_used_mib{card="0"', txt)
+        self.assertIn('pxa_server_kv_used_ratio{server="m:main",name="Server 1"} 0.25', txt)
+        self.assertIn('llamacpp:tokens_predicted_total{server="m:main"} 1000', txt)
+        self.assertIn("pxa_server_requests_total", txt)
+
+    def test_metrics_on_a_lan_bind_needs_the_token_as_bearer(self):
+        os.environ["PXA_CONTROL_METRICS"] = "1"
+        app, port = self.make(lan=True, token="s3cret-token-0123456789")
+        app.start_telemetry()
+        self.drive(app, n=2)
+        code, body = raw_get(port, "/metrics")
+        self.assertEqual(code, 401)
+        self.assertIn(b"Bearer", body)
+        code, body = raw_get(port, "/metrics", {"Authorization": "Bearer s3cret-token-0123456789"})
+        self.assertEqual(code, 200)
+        self.assertIn(b"pxa_card_", body)
+        self.assertEqual(raw_get(port, "/metrics", {"Authorization": "Bearer wrong-token-0123456789"})[0], 401)
+
+
+def jreq(port, path, method="GET", body=None, headers=None):
+    code, _h, raw = req(port, path, method, body, headers)
+    try:
+        return code, json.loads(raw.decode() or "null")
+    except ValueError:
+        return code, raw
+
+
+def glob_db(d):
+    return [os.path.join(d, f) for f in os.listdir(d) if f.startswith("telemetry.db")] if os.path.isdir(d) else []
+
+
+def raw_get(port, path, headers=None):
+    rq = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), headers=dict(headers or {}, Host="127.0.0.1:%d" % port))
+    try:
+        with urllib.request.urlopen(rq, timeout=10) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+# ---------------------------------------------------------------------------------------------
 # PXA Control opens by itself (2026-10-05): the on/off rule, reuse of a running Control, the port
 # fallback, adoption of a server the launcher started (and Stop), and the idle exit of a Control
 # that started in the background. Real processes (sleeping children) and loopback sockets only.
 # ---------------------------------------------------------------------------------------------
 def sleeper(*args, secs=60):
     import subprocess
-    return subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({secs})"] + list(args))
+    p = subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({secs})"] + list(args))
+    # under load /proc/<pid>/cmdline can still show the parent (pre-exec) for a moment: wait for our argv
+    want = (list(args) or [f"time.sleep({secs})"])[-1].encode()
+    end = time.time() + 10
+    while time.time() < end:
+        try:
+            with open(f"/proc/{p.pid}/cmdline", "rb") as f:
+                if want in f.read():
+                    break
+        except OSError:
+            break
+        time.sleep(0.02)
+    return p
 
 
 def wait_until(fn, timeout=15.0, step=0.1):
@@ -2192,16 +2606,56 @@ class V3Plans(unittest.TestCase):
         finally:
             os.environ.pop("PXA_MEMINFO", None) if old is None else os.environ.__setitem__("PXA_MEMINFO", old)
 
-    def test_control_version_text_is_v3(self):
-        self.assertEqual(C.CONTROL_VERSION, "v3")
+    def test_control_version_comes_from_the_package(self):
+        with open(os.path.join(TOOLS, "pxa_control.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn('CONTROL_VERSION = "v3"', src)
+        with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as f:
+            tok = C.version_token(f.read())
+        self.assertEqual(tok, "v3.1")
+        self.assertEqual(C.version_token("tag:              v3.1\ncommit: abc\n"), "v3.1")
+        self.assertEqual(C.version_token("v3.1.4\n"), "v3.1.4")
+        self.assertEqual(C.version_token(""), "")
+        self.assertEqual(C.CONTROL_VERSION, tok)
+        d = tempfile.mkdtemp(dir=TMP)
+        self.assertEqual(C.version_from_dir(d), "")
+        os.makedirs(os.path.join(d, "pxa-v3.1.4"))
+        os.symlink("pxa-v3.1.4", os.path.join(d, "current"))
+        self.assertEqual(C.version_from_dir(d), "v3.1.4")
+        with open(os.path.join(d, "VERSION"), "w", encoding="utf-8") as f:
+            f.write("tag: v9.9\n")
+        self.assertEqual(C.version_from_dir(d), "v9.9")
+        with open(os.path.join(d, "pxa-v3.1.4", "VERSION"), "w", encoding="utf-8") as f:
+            f.write("tag: v8.8\n")
+        self.assertEqual(C.version_from_dir(d), "v8.8")
         app = C.App(L, port=7777, models_dirs=[MODELS])
         srv, port = serve_app(app)
         try:
-            d = json.loads(req(port, "/api/info")[2])
-            self.assertEqual(d["control_version"], "v3")
+            info = json.loads(req(port, "/api/info")[2])
+            self.assertEqual(info["control_version"], tok)
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class QuantizerTag(unittest.TestCase):
+    """_extra_facts exposes the pxa.quantizer.* KVs (prefix stripped) or None."""
+
+    def _facts(self, kv):
+        d = tempfile.mkdtemp(dir=TMP)
+        p = os.path.join(d, "m.gguf")
+        open(p, "wb").write(b"x")
+        fake = type("A", (), {})()
+        fake._prof_cache = {}
+        fake.L = type("LL", (), {"gguf_header": staticmethod(lambda path: {"kv": kv, "tensors": []}),
+                                  "PXQ_GGML_TYPE": {}, "NON_PXQ_GGML_TYPE": {}})
+        return C.App._extra_facts(fake, p)
+
+    def test_tagged_and_untagged(self):
+        q = self._facts({"general.name": "n", "pxa.quantizer.edition": "pro", "pxa.quantizer.licensee": "T",
+                         "pxa.quantizer.license_expires": 1791244800})["quantizer"]
+        self.assertEqual(q, {"edition": "pro", "licensee": "T", "license_expires": 1791244800})
+        self.assertIsNone(self._facts({"general.name": "n"})["quantizer"])
 
 
 def urllib_quote(p):
@@ -2212,6 +2666,299 @@ def urllib_quote(p):
 def stat_mode(p):
     import stat as _st
     return _st.S_IMODE(os.stat(p).st_mode)
+
+
+class SymlinkedModels(unittest.TestCase):
+    """A model offloaded to another disk and linked back into a model folder can be planned and
+    started; a link to anything that is not a regular GGUF, or a path that walks out, cannot."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="pxa-models-root-")
+        self.outside = tempfile.mkdtemp(prefix="pxa-models-outside-")
+        def w(name, data):
+            p = os.path.join(self.outside, name)
+            with open(p, "wb") as f:
+                f.write(data)
+            return p
+        self.real = w("real.gguf", b"GGUF\x03\x00\x00\x00" + b"\x00" * 16)
+        notg = w("secret.gguf", b"not a gguf at all")
+        plain = w("passwd", b"root:x:0:0::/root:/bin/sh\n")
+        os.symlink(self.real, os.path.join(self.root, "linked.gguf"))
+        os.symlink(notg, os.path.join(self.root, "fake.gguf"))
+        os.symlink(plain, os.path.join(self.root, "plain.gguf"))
+        os.symlink(os.path.join(self.outside, "gone.gguf"), os.path.join(self.root, "dangling.gguf"))
+        os.symlink(self.outside, os.path.join(self.root, "offload"))        # a linked folder
+        os.symlink(self.outside, os.path.join(self.root, "offload.gguf"))   # a directory named .gguf
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.outside, ignore_errors=True)
+
+    def check(self, model):
+        return C.validate_launch({"gpus": [0], "model": model}, {0, 1}, CATALOG, [self.root], resolve_port=False)
+
+    def test_link_to_a_gguf_outside_the_folders_is_allowed(self):
+        for m in (os.path.join(self.root, "linked.gguf"), os.path.join(self.root, "offload", "real.gguf")):
+            self.assertEqual(self.check(m)["model"], m)
+            self.assertTrue(C.model_path_ok(m, [self.root]))
+
+    def test_everything_else_outside_is_refused(self):
+        bad = [os.path.join(self.root, "fake.gguf"),             # a link to a file without the GGUF magic
+               os.path.join(self.root, "plain.gguf"),            # a link to a text file
+               os.path.join(self.root, "dangling.gguf"),         # a link to nothing
+               os.path.join(self.root, "offload.gguf"),          # a link to a directory
+               self.real,                                        # the target itself, named directly
+               os.path.join(self.root, "..", os.path.basename(self.outside), "real.gguf")]   # walking out
+        for m in bad:
+            with self.assertRaises(C.Invalid, msg=m):
+                self.check(m)
+        self.assertFalse(C.model_path_ok(self.real, [self.root]))
+
+    def test_api_thinking_follows_the_same_rule(self):
+        app = C.App(L, port=7777)
+        app.model_roots = lambda: [self.root]
+        prof, _st, src, model = app.thinking_target(urllib.parse.parse_qs("model=" + urllib.parse.quote(os.path.join(self.root, "linked.gguf"))))
+        self.assertEqual(model, os.path.join(self.root, "linked.gguf"))
+        with self.assertRaises(C.Invalid):
+            app.thinking_target(urllib.parse.parse_qs("model=" + urllib.parse.quote(os.path.join(self.root, "fake.gguf"))))
+
+
+class LaunchCtxAndLog(unittest.TestCase):
+    """The plan header's context is the -c on the command, and the log pane loads the backlog."""
+
+    def _args(self, ctx):
+        return type("A", (), {
+            "ctx": ctx, "sm": "layer", "model": FAKE_MODEL, "host": "127.0.0.1", "port": 9,
+            "ngl": 99, "np": 1, "ctk": "f16", "ctv": "f16", "threads": 2, "emit_threads": False,
+            "workload": "chat", "ub": 0, "b": 0, "ts": "", "spec": None, "draft_model": None,
+            "hot_model": [], "no_mmap": False,
+        })()
+
+    def _plan(self, picked):
+        plan = L.Plan()
+        plan.fa = "on"
+        plan.engine_ac = {"picks": {"c": {"value": str(picked), "status": "measured", "why": "test cell"}}}
+        return plan
+
+    def test_auto_ctx_returned_is_the_command_c(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd, env, ctx = L.build_llama_cmd(self._plan(32768), self._args(0),
+                                              [(0, "Tesla P100", 60, 16384, 0, "u")], {}, 4096, ["n/a"], None,
+                                              explain=True)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "32768")
+        self.assertEqual(ctx, 32768)
+        self.assertIn("was -c 4096", buf.getvalue())
+        with open(os.path.join(TOOLS, "pxa-launch.py"), encoding="utf-8") as f:
+            self.assertIn("cmd, env, ctx = build_llama_cmd", f.read())
+
+    def test_a_hand_set_ctx_is_not_replaced(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd, env, ctx = L.build_llama_cmd(self._plan(32768), self._args(16384),
+                                              [(0, "Tesla P100", 60, 16384, 0, "u")], {}, 16384, ["n/a"], None,
+                                              explain=True)
+        self.assertEqual((cmd[cmd.index("-c") + 1], ctx), ("16384", 16384))
+        self.assertNotIn("from the engine's registry", buf.getvalue())
+
+    def test_plan_dict_says_auto_only_when_the_request_left_it(self):
+        app = C.App(L, port=7777, models_dirs=[MODELS])
+        plan = L.Plan()
+        plan.engine = "llama"
+
+        class Cap(object):
+            code = 0
+            text = "plan"
+            thinking = None
+        cap = Cap()
+        cap.args = type("A", (), {"sm": "layer", "np": 1, "workload": "chat"})()
+        cap.value = (plan, ["llama-server", "-m", FAKE_MODEL, "-c", "32768"], {}, "0", {}, 32768)
+        auto = app.validate({"gpus": [0], "model": FAKE_MODEL, "ctx": 0}, resolve_port=False)
+        d = app._plan_dict(auto, cap, "main", {"errors": [], "warnings": []})
+        self.assertEqual(d["ctx"], 32768)
+        self.assertTrue(d["ctx_auto"])
+        self.assertIn("-c 32768", d["command"])
+        cap.value = (plan, ["llama-server", "-m", FAKE_MODEL, "-c", "16384"], {}, "0", {}, 16384)
+        hand = app.validate({"gpus": [0], "model": FAKE_MODEL, "ctx": 16384}, resolve_port=False)
+        d2 = app._plan_dict(hand, cap, "main", {"errors": [], "warnings": []})
+        self.assertEqual((d2["ctx"], d2["ctx_auto"]), (16384, False))
+
+    def test_page_loads_the_log_before_the_serving_line(self):
+        with open(os.path.join(TOOLS, "pxa_control_ui", "index.html"), encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn('ctx ${d.ctx_auto ? "auto " : ""}${d.ctx}', page)
+        poll = page[page.find("async function pollStatus"):page.find("function logRender")]
+        self.assertLess(poll.find("await loadLogBacklog()"), poll.find('badge("ok", "serving")'))
+        opened = page[page.find("function openLog"):page.find("async function pollLog")]
+        self.assertLess(opened.find("loadLogBacklog()"), opened.find("new EventSource"))
+        reset = page[page.find("function resetLog"):page.find("function loadLogBacklog")]
+        self.assertIn("clearTimeout(logAppend._t)", reset)
+        self.assertIn("pre.dataset.live", page)
+
+    def test_log_lines_written_before_attach_are_readable(self):
+        seat = C.Seat(L)
+        seat._append("$ llama-server -c 32768")
+        seat._append("llama_model_loader: mock")
+        items = seat.lines_since(0)
+        self.assertEqual([x[1] for x in items][0], "$ llama-server -c 32768")
+        self.assertEqual(items[-1][0], seat.seq)
+        self.assertEqual(seat.lines_since(items[0][0])[0][1], "llama_model_loader: mock")
+
+
+# ---------------------------------------------------------------------------------------------
+# The licensed-library routes (/api/lib/update) on the SAME stub licence server the updater's own
+# test uses (tests/test-pxa-lib-update.py).  That test covers tools/pxa_lib_update.py as a module;
+# this covers the four HTTP handlers and the settings validation that exists only in Control, driven
+# end to end: route -> LibUpdate -> tools/pxa_lib_update.py -> the fake licence server on loopback.
+# ---------------------------------------------------------------------------------------------
+_LUT_PATH = os.path.join(ROOT, "tests", "test-pxa-lib-update.py")
+_LUT = None
+if os.path.isfile(_LUT_PATH):
+    _lut_spec = importlib.util.spec_from_file_location("pxa_lib_update_under_test", _LUT_PATH)
+    _LUT = importlib.util.module_from_spec(_lut_spec)
+    _lut_spec.loader.exec_module(_LUT)
+
+
+@unittest.skipUnless(_LUT is not None, "tests/test-pxa-lib-update.py not present")
+class LibUpdateRoutes(unittest.TestCase):
+    """The library-update page's seams: status, a forced check, apply, rollback, and settings."""
+
+    def setUp(self):
+        self.ltmp = tempfile.mkdtemp(prefix="pxa-lib-routes-")
+        self.addCleanup(shutil.rmtree, self.ltmp, ignore_errors=True)
+        self.saved = {k: os.environ.get(k) for k in
+                      ("PXA_PACKAGE_PUBKEY", "PXA_CONTROL_CONFIG_DIR", "PXA_LICENCE_KEY",
+                       "PXA_LICENCE_URL", "PXA_ENGINE_DIR", "HOME")}
+        self.addCleanup(self._restore_env)
+        for k in ("PXA_LICENCE_URL", "PXA_LICENCE_KEY", "PXA_ENGINE_DIR"):
+            os.environ.pop(k, None)
+        os.environ["PXA_PACKAGE_PUBKEY"] = _LUT.F.PUB_HEX
+        os.environ["PXA_CONTROL_CONFIG_DIR"] = os.path.join(self.ltmp, "cfg")
+        os.environ["HOME"] = os.path.join(self.ltmp, "home")
+        os.makedirs(os.environ["PXA_CONTROL_CONFIG_DIR"], exist_ok=True)
+        os.makedirs(os.environ["HOME"], exist_ok=True)
+        self.ins, self.engine = self._make_install()
+        self.lic = _LUT.FakeLibLicence({_LUT.REL1["lib_id"]: _LUT.REL1},
+                                       {"stable": _LUT.REL1["lib_id"]}).start()
+        self.addCleanup(self.lic.stop)
+        os.environ["PXA_LICENCE_URL"] = self.lic.url
+        os.environ["PXA_LICENCE_KEY"] = _LUT.KEY
+        self.app = C.App(L, port=0, models_dirs=[MODELS])
+        # Pin the install under test to THIS temp tree.  On a real box rig_static()'s engine_dir is a
+        # live install, and a route test must never apply or roll back a library on someone's engine.
+        self.app.rig_static = lambda force=False: {"engine_dir": self.ins}
+        self.srv, self.port = serve_app(self.app)
+        self.addCleanup(self._stop)
+
+    def _restore_env(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _stop(self):
+        try:
+            self.srv.shutdown()
+            self.srv.server_close()
+        finally:
+            self.app.lib.close()
+
+    def _make_install(self):
+        """The engine's install tree exactly as the tarball lays it out: `current` -> pxa-v3, and the two
+        copies of libggml-pxqn.so hard-linked to each other."""
+        ins = os.path.join(self.ltmp, "install")
+        v = os.path.join(ins, "pxa-v3")
+        for sub in ("lib", "lib-compat", "bin"):
+            os.makedirs(os.path.join(v, sub))
+        with open(os.path.join(v, "VERSION"), "w") as f:
+            f.write("v3.1\n")
+        engine = b"\x7fELF the library the engine release shipped\n" * 40
+        with open(os.path.join(v, _LUT.COPIES[0]), "wb") as f:
+            f.write(engine)
+        os.link(os.path.join(v, _LUT.COPIES[0]), os.path.join(v, _LUT.COPIES[1]))
+        os.symlink("pxa-v3", os.path.join(ins, "current"))
+        return ins, engine
+
+    def _content(self, name):
+        with open(os.path.join(self.ins, "current", name), "rb") as f:
+            return f.read()
+
+    def get(self, path):
+        code, _, body = req(self.port, path)
+        return code, json.loads(body)
+
+    def post(self, path, body):
+        code, _, raw = req(self.port, path, "POST", body)
+        return code, json.loads(raw)
+
+    def test_status_is_pristine_then_a_forced_check_reports_the_release(self):
+        # A GET touches the page, which starts the background poller; it may already have refreshed
+        # the cache, so `update` on the first read is not pinned. What must hold: the install is
+        # pristine and the install's settings are the defaults.
+        code, d = self.get("/api/lib/update")
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d["available"], d)
+        self.assertEqual(d["installed"]["version"], "", d)
+        self.assertEqual(d["installed"]["lib_id"], None, d)
+        self.assertEqual(d["channel"], "stable", d)
+        self.assertFalse(d["auto"], d)
+        code, d = self.get("/api/lib/update?check=1")
+        self.assertEqual(code, 200, d)
+        self.assertEqual(d["latest"], _LUT.REL1["version"], d)
+        self.assertEqual(d["lib_id"], _LUT.REL1["lib_id"], d)
+        self.assertTrue(d["update"], d)
+        self.assertIsNone(d["error"], d)
+
+    def test_apply_installs_the_release_then_rollback_restores_the_shipped_library(self):
+        code, d = self.get("/api/lib/update?check=1")
+        self.assertTrue(d["update"], d)
+        code, a = self.post("/api/lib/update/apply", {})
+        self.assertEqual(code, 200, a)
+        self.assertTrue(a["applied"], a)
+        self.assertEqual(a["version"], _LUT.REL1["version"], a)
+        code, d = self.get("/api/lib/update")
+        self.assertEqual(d["installed"]["version"], _LUT.REL1["version"], d)
+        self.assertNotEqual(self._content(_LUT.COPIES[0]), self.engine, "the shipped bytes were swapped")
+        with open(os.path.join(self.ins, "lib", "lib-state.json")) as f:
+            self.assertNotIn(_LUT.KEY, f.read(), "the licence key is never written to the state")
+        code, r = self.post("/api/lib/update/rollback", {})
+        self.assertEqual(code, 200, r)
+        self.assertTrue(r["applied"], r)
+        self.assertEqual(self._content(_LUT.COPIES[0]), self.engine, "rollback did not restore the shipped library")
+        self.assertEqual(_LUT.LU.installed_version(self.ins), "", "the install is not back to shipped")
+
+    def test_settings_reject_a_bad_channel_and_a_non_boolean_auto(self):
+        code, d = self.post("/api/lib/update/settings", {"channel": "gamma"})
+        self.assertEqual(code, 400, d)
+        self.assertIn("channel must be one of", d["error"], d)
+        code, d = self.post("/api/lib/update/settings", {"auto": "yes"})
+        self.assertEqual(code, 400, d)
+        self.assertIn("auto must be true or false", d["error"], d)
+        code, d = self.post("/api/lib/update/settings", {"channel": "beta", "auto": True})
+        self.assertEqual(code, 200, d)
+        self.assertEqual((d["channel"], d["auto"]), ("beta", True), d)
+        code, d = self.get("/api/lib/update")
+        self.assertEqual((d["channel"], d["auto"]), ("beta", True), "settings did not persist")
+
+    def test_apply_refuses_with_a_sentence_while_a_server_is_running(self):
+        """The page is promised a 4xx and a plain sentence.  A refusal that reaches the page as a 500
+        is the one shape a browser cannot render, so the status is asserted, not only the text."""
+        saved = _LUT.LU.server_running
+        _LUT.LU.server_running = lambda d=None: True
+        self.addCleanup(lambda: setattr(_LUT.LU, "server_running", saved))
+        code, d = self.post("/api/lib/update/apply", {})
+        self.assertEqual(code, 400, d)
+        self.assertIn("running", d["error"].lower(), d)
+
+    def test_a_key_without_the_valued_role_is_refused_on_beta(self):
+        self.lic.valued = False
+        code, d = self.post("/api/lib/update/settings", {"channel": "beta"})
+        self.assertEqual(code, 200, d)
+        code, d = self.get("/api/lib/update?check=1")
+        self.assertEqual(code, 200, d)
+        self.assertEqual((d["error"] or {}).get("code"), "not_valued", d)
+        self.assertFalse(d["beta"], d)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,23 @@ def _s(b):
     return struct.pack("<Q", len(b)) + b
 
 
+def write_counts_csv(path, rows=6, broken=None):
+    """The expert-counts file a MoE model ships beside its GGUF: `tensor,expert,count`, one row per expert per expert tensor.
+    `broken` writes the kinds of damage the reader has to refuse (a wrong header, no rows, a count that is not a number) - a
+    file the engine would throw away without saying so, which is exactly what the open side must not pass off as a success."""
+    with open(path, "w") as f:
+        if broken == "header":
+            f.write("expert,count\n" + "".join("blk.0.ffn_gate_exps.weight,%d,%d\n" % (e, 10 + e) for e in range(rows)))
+        elif broken == "empty":
+            f.write("tensor,expert,count\n")
+        elif broken == "text":
+            f.write("tensor,expert,count\nblk.0.ffn_gate_exps.weight,zero,many\n")
+        else:
+            f.write("tensor,expert,count\n"
+                    + "".join("blk.%d.ffn_gate_exps.weight,%d,%d\n" % (l, e, 10 + e + l) for l in range(2) for e in range(rows)))
+    return path
+
+
 def write_gguf(path, n_layers, tier_type, arch="qwen3", base_type=8, embed_type=8, tmp_suffix="", lock_mode=None, lock_id="L-0123456789abcdef"):
     """A tiny GGUF. `lock_mode` (personal | supporters) writes it the way a locked Pro file is: the pxa.lock.* header keys, and the PXQN tensors listed
     under type id 4096 + their type."""
@@ -261,6 +278,9 @@ def tool_pxqe(d, a):
                 names += [("q8", "make the Q8_0 source", "pro"), ("skeleton", "write the quantized file's skeleton", "pro"), ("dump", "run the calibration text through the model", "pro"),
                           ("hess", "build the per-layer statistics", "pro"), ("encode", "encode the weights", "pro"), ("splice", "mix tiers", "pro")]
             o["stages"] = [{"name": n, "does": t, "edition": e, "ready": n not in nr, "reason": nr.get(n, "")} for n, t, e in names]
+            if c.get("counts_support"):         # an encoder that knows the expert-counts stage, and one that does not: the flag is only passed to the first
+                o["stages"].insert([s["name"] for s in o["stages"]].index("verify"),
+                                   {"name": "counts", "does": "count the expert routing", "edition": "both", "ready": True, "reason": ""})
             o["make"] = {"progress_prefix": "@pxqe ", "sources": ["hf-repo", "hf-dir", "gguf"], "classic_tiers": sorted(CLASSIC_NAMES),
                          "exit_codes": {"0": "done", "1": "a stage failed, run again to resume", "2": "cannot run here / bad arguments", "3": "refused by the licence server",
                                         "130": "stopped"}}
@@ -506,16 +526,20 @@ def pxqe_make(d, c, edition, a):
         gguf_q8 = all(ty == 8 for nm, ty in ts if nm.startswith("blk."))
         if gguf_q8 and not pxqn and not ("--allow-requantize" in qargs and "--i-know-this-is-double-lossy" in qargs):
             return fail("usage", "%s is quantized (q8_0); classic tiers are made from the original F16/BF16 weights." % src, 2)
+    want_counts = bool(pxqn and c.get("counts_support") and "--counts" in a)     # an encoder without the stage never sees the flag
     names = ["fetch"] if kind == "hf-repo" else []
     if kind in ("hf-repo", "hf-dir"):
         names.append("convert")
     if pxqn:
         if kind != "gguf" or not gguf_q8:
             names.append("q8")
-        names += ["skeleton", "dump", "hess", "encode", "verify"]
+        names += ["skeleton", "dump", "hess", "encode"]
+        if want_counts:
+            names.append("counts")               # a model with experts: the counts stage runs after the encode, before the check
+        names.append("verify")
     else:
         names += ["quantize", "verify"]
-    W = {"fetch": 8, "convert": 6, "q8": 4, "skeleton": 4, "dump": 30, "hess": 10, "encode": 32, "verify": 4, "quantize": 80}
+    W = {"fetch": 8, "convert": 6, "q8": 4, "skeleton": 4, "dump": 30, "hess": 10, "encode": 32, "counts": 2, "verify": 4, "quantize": 80}
     total = float(sum(W[n] for n in names))
     os.makedirs(work, exist_ok=True)
     stp = os.path.join(work, "state.json")
@@ -687,6 +711,13 @@ def pxqe_make(d, c, edition, a):
                 with open(dst, "ab") as f:
                     f.write(b"ENCODED")
                 files = ["encoded.gguf"]
+            elif n == "counts":
+                # the real stage runs the calibration text through the model and writes one row per expert per expert tensor. Here the
+                # rows are made up, but the file lands where the engine looks for it and in the format it accepts.
+                rows = int(c.get("counts_rows") or 6)
+                for i in range(2):
+                    prog(n, (i + 1) / 2.0, "expert %d of %d" % (i * (rows // 2) + 1, rows))
+                files = []
             elif n == "quantize":
                 base = P("model-bf16.gguf") if kind != "gguf" else src
                 ts = read_tensors(base)
@@ -720,6 +751,8 @@ def pxqe_make(d, c, edition, a):
             S["job"] = {"jid": jid, "status": "ok"}
             _wr(stp, S)
             print("licence: job %s ok" % jid)
+        if want_counts:
+            write_counts_csv(out + ".expert-counts.csv", rows=int(c.get("counts_rows") or 6), broken=c.get("counts_broken"))
         ev(event="done", out=out, sha256=h, size=size, tier=tier, **locked)
         print("done: %s sha256 %s" % (out, h))
         if not keep:

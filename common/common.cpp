@@ -1639,6 +1639,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.hot_models.push_back(argv[i]);
         return true;
     }
+    if (arg == "--sleep-idle-seconds") {
+        // PXA: after this many seconds with nothing in flight, park the model. The next request loads it back.
+        CHECK_ARG
+        params.sleep_idle_seconds = std::stoi(argv[i]);
+        if (params.sleep_idle_seconds < 0) {
+            invalid_param = true;
+        }
+        return true;
+    }
     if (arg == "-mu" || arg == "--model-url") {
         CHECK_ARG
         params.model_url = argv[i];
@@ -3381,6 +3390,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "in pinned host RAM, one is on the cards; the request's model field picks it and\n"
                                                                         "a switch re-uploads it in parallel over every card, parking the other model's KV\n"
                                                                         "cache in RAM. Flags after PATH apply to that model only (e.g. -c 8192 -sm layer)." });
+    options.push_back({ "server",      "       --sleep-idle-seconds N",
+                                                                        "with --hot-model: after N seconds with no request in flight, park the model and\n"
+                                                                        "free the cards. The next request loads it back. 0 (default) keeps the cards." });
     options.push_back({ "server",      "       --path PATH",            "path to serve static files from (default: %s)", params.public_path.c_str() });
     options.push_back({ "server",      "       --embedding(s)",         "restrict to only support embedding use case; use only with dedicated embedding models (default: %s)", params.embedding ? "enabled" : "disabled" });
     options.push_back({ "server",        "       --webui NAME",
@@ -4688,7 +4700,27 @@ static bool starts_with(const std::string & str, const std::string & prefix) {
     return str.rfind(prefix, 0) == 0;
 }
 
-static bool llama_download_file(const std::string & url, const std::string & path, const std::string & hf_token) {
+// Same rule as tools/pxa_expert_map.py counts_fetch_target. The curated map is named
+// <model>.expert-counts.csv. For a split GGUF the model path is shard 1, and the map
+// is fetched beside that file. Query and fragment are not part of the file name.
+static bool pxa_counts_fetch_target(const std::string & model_url, const std::string & local_path,
+                                    std::string & url_out, std::string & dest_out) {
+    if (model_url.empty() || local_path.empty()) return false;
+    std::string base = model_url;
+    const size_t hash = base.find('#');
+    if (hash != std::string::npos) base.erase(hash);
+    const size_t q = base.find('?');
+    if (q != std::string::npos) base.erase(q);
+    const size_t slash = base.find_last_of('/');
+    if (slash == std::string::npos || slash + 1 >= base.size()) return false;
+    const std::string remote = base.substr(slash + 1);
+    if (remote.empty() || remote.find('/') != std::string::npos) return false;
+    url_out = base.substr(0, slash + 1) + remote + ".expert-counts.csv";
+    dest_out = local_path + ".expert-counts.csv";
+    return true;
+}
+
+static bool llama_download_file(const std::string & url, const std::string & path, const std::string & hf_token, bool optional = false) {
 
     // Initialize libcurl
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), &curl_easy_cleanup);
@@ -4721,6 +4753,11 @@ static bool llama_download_file(const std::string & url, const std::string & pat
     // Check if the file already exists locally
     struct stat model_file_info;
     auto file_exists = (stat(path.c_str(), &model_file_info) == 0);
+
+    // An optional sidecar (the expert-counts map) must not replace a file already beside the model.
+    if (optional && file_exists) {
+        return true;
+    }
 
     // If the file exists, check its JSON metadata companion file.
     std::string metadata_path = path + ".json";
@@ -4800,6 +4837,11 @@ static bool llama_download_file(const std::string & url, const std::string & pat
         long http_code = 0;
         curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
         if (http_code != 200) {
+            if (optional) {
+                // A missing expert-counts map is not a failed model download.
+                fprintf(stderr, "%s: optional file not available (%ld): %s\n", __func__, http_code, url.c_str());
+                return false;
+            }
             // HEAD not supported, we don't know if the file has changed
             // force trigger downloading
             force_download = true;
@@ -4873,6 +4915,10 @@ static bool llama_download_file(const std::string & url, const std::string & pat
         auto res = curl_easy_perform(curl.get());
         if (res != CURLE_OK) {
             fprintf(stderr, "%s: curl_easy_perform() failed: %s\n", __func__, curl_easy_strerror(res));
+            if (optional) {
+                outfile.reset();
+                remove(path_temporary.c_str());
+            }
             return false;
         }
 
@@ -4880,6 +4926,10 @@ static bool llama_download_file(const std::string & url, const std::string & pat
         curl_easy_getinfo (curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
         if (http_code < 200 || http_code >= 400) {
             fprintf(stderr, "%s: invalid http status code received: %ld\n", __func__, http_code);
+            if (optional) {
+                outfile.reset();
+                remove(path_temporary.c_str());
+            }
             return false;
         }
 
@@ -4978,6 +5028,17 @@ struct llama_model * llama_load_model_from_url(
         for (auto & f : futures_download) {
             if (!f.get()) {
                 return NULL;
+            }
+        }
+    }
+
+    // The curated expert map is not a shard. Fetch it beside the model (shard 1 for a split
+    // file) after the shards themselves. Missing, or already present: the model still loads.
+    {
+        std::string counts_url, counts_dest;
+        if (pxa_counts_fetch_target(model_url, path_model, counts_url, counts_dest)) {
+            if (!llama_download_file(counts_url, counts_dest, hf_token, true)) {
+                fprintf(stderr, "%s: expert-counts file not downloaded; the server can build one on first start\n", __func__);
             }
         }
     }

@@ -23,6 +23,13 @@ What it adds on top of the CLI:
   * an Encode tab: a wizard that turns a Hugging Face model into a PXQ / PXQN file (tools/pxa_encode*.py). It drives the
     PXA Quantizer's command line as a subprocess and never touches its internals; the licence key it may hold is sent
     only to the licence server and never reaches a log, a bug report or a score.
+  * a per-model Thinking switch (on / off / auto) and thinking-token budget, mapped to whatever
+    mechanism the model's family uses (tools/pxa_thinking.py, tools/pxa_thinking_profiles.json):
+    applied at launch as llama-server flags and per chat request through the engine proxy.
+  * a Profiles tab (v3.1, tools/pxa_ctl/): per-card / per-group GPU profiles (power limit, clocks, persistence,
+    thermal guard, auto-start of saved servers with health wait and restart policy, schedules, Quiet mode), live per-card
+    readout. Changing a card needs "allow_gpu_control": true in control.json (default off) AND a typed confirm; a
+    reserved card, a lock file or maintenance mode refuses changes and launches onto that card.
 
 SAFETY (a web page drives GPUs, so every edge is closed on purpose):
   * binds 127.0.0.1 unless --lan; with --lan a random token is required (cookie after first visit);
@@ -35,6 +42,11 @@ SAFETY (a web page drives GPUs, so every edge is closed on purpose):
   * extra engine args are an allow-list of llama-server flags (no --path, no --log-file, ...);
   * a server it did not start is never stopped or restarted unless it was adopted with control
     switched on, and every such action names the container it acts on.
+  * the chat's host access (v3.1) is off by default, per session, allowlist-only (host-allow.json in the
+    config dir), argv-only with no shell, and refused outright when Control is on the LAN unless the owner
+    sets host_access_lan; every host call needs an approval card and writes a redacted audit record.
+  * every POST/DELETE body must be a JSON object; every error is {"error", "code"} with a matching HTTP status;
+    GET /api/health answers even when nvidia-smi is missing.
 """
 
 import ctypes
@@ -65,6 +77,46 @@ try:                                     # the Encode tab: a packaging without t
 except Exception as _enc_err:            # noqa: BLE001
     ENC = ENCPK = None
     ENC_IMPORT_ERROR = f"{_enc_err.__class__.__name__}: {_enc_err}"
+import pxa_thinking as TH
+
+try:                                     # the GPU profile backend (v3.1, tools/pxa_ctl/): without it, only the Profiles tab is lost
+    import pxa_ctl as CTL
+    from pxa_ctl import driver as CTL_DRV, service as CTL_SVC
+    CTL_IMPORT_ERROR = None
+    CTL_ERRORS = (CTL.CtlError,)
+except Exception as _ctl_err:            # noqa: BLE001
+    CTL = CTL_DRV = CTL_SVC = None
+    CTL_IMPORT_ERROR = f"{_ctl_err.__class__.__name__}: {_ctl_err}"
+    CTL_ERRORS = ()
+
+try:                                     # the history store behind the Live tab (v3.1): without it, Live is memory-only as before
+    import pxa_telemetry as TEL
+    TEL_IMPORT_ERROR = None
+except Exception as _tel_err:            # noqa: BLE001
+    TEL = None
+    TEL_IMPORT_ERROR = f"{_tel_err.__class__.__name__}: {_tel_err}"
+
+try:                                     # the in-house chat agent (v3.1, tools/pxa_chat/): without it, Chat is plain chat as before
+    import pxa_chat as CHAT
+    CHAT_IMPORT_ERROR = None
+except Exception as _chat_err:           # noqa: BLE001
+    CHAT = None
+    CHAT_IMPORT_ERROR = f"{_chat_err.__class__.__name__}: {_chat_err}"
+
+try:                                     # the licensed library updater (v3.1, tools/pxa_lib_update.py): without it, that one panel is lost
+    import pxa_lib_update as LU
+    LIB_IMPORT_ERROR = None
+except Exception as _lib_err:            # noqa: BLE001
+    LU = None
+    LIB_IMPORT_ERROR = f"{_lib_err.__class__.__name__}: {_lib_err}"
+PK_ERRORS = (ENCPK.PackageError,) if ENCPK is not None else ()   # the updater raises the package verifier's own error
+
+try:                                     # the optional MQTT publisher (v3.1, tools/pxa_mqtt.py): off unless the user turns it on
+    import pxa_mqtt as MQTT
+    MQTT_IMPORT_ERROR = None
+except Exception as _mqtt_err:           # noqa: BLE001
+    MQTT = None
+    MQTT_IMPORT_ERROR = f"{_mqtt_err.__class__.__name__}: {_mqtt_err}"
 
 DEFAULT_PORT = 7777
 DEFAULT_SERVER_PORT = 8080
@@ -105,6 +157,7 @@ def load_config():
     c.setdefault("presets", {})
     c.setdefault("attach_port", 0)
     c.setdefault("user_name", "")
+    c.setdefault("host_access_lan", False)     # chat host access over the network: off (see chat_host_policy)
     return c
 
 
@@ -482,6 +535,57 @@ def load_catalog(path=None):
     return [], None
 
 
+# Built-in levers (2026-10-08): a release catalog is the PUBLIC table, without the levers the closed PXQN library reads
+# (the Overdrive set the Flash-Next preset turns on among them). Its last lines carry their hashes, no names
+# ("// built-in:" every one, "// built-in-preset:" the preset's), so such a name is accepted (passed into the server's
+# environment like any lever) and shown as built-in instead of being refused as unknown.
+def lever_hash(name):
+    """FNV-1a 64, 16 hex digits (scripts/pxa-lever-catalog.py lever_hash; the page computes the same)."""
+    h = 0xcbf29ce484222325
+    for b in name.encode("utf-8"):
+        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return "%016x" % h
+
+
+def load_builtin(path):
+    """(every built-in hash, the preset's) from the catalog's trailing lines; empty sets for a full catalog."""
+    every, preset = set(), set()
+    if path and os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                for tag, dst in (("// built-in:", every), ("// built-in-preset:", preset)):
+                    if line.startswith(tag):
+                        dst.update(x for x in line[len(tag):].split() if re.match(r"^[0-9a-f]{16}$", x))
+    return every, preset
+
+
+def builtin_kind(name, every, preset):
+    """'preset' | 'builtin' | None for a lever name that is not in the catalog."""
+    if not every or not isinstance(name, str) or not LEVER_NAME_RE.match(name):
+        return None
+    cands = [name] + [name[:k] + "*" for k in range(5, len(name))]
+    hs = {lever_hash(c) for c in cands}
+    if hs & preset:
+        return "preset"
+    if hs & every:
+        return "builtin"
+    return None
+
+
+class LeverNames(set):
+    """The catalog's names; `in` also admits the built-in levers (validate_levers takes it as catalog_names)."""
+
+    def __init__(self, names=(), every=(), preset=()):
+        super().__init__(names)
+        self.every, self.preset = set(every), set(preset)
+
+    def __contains__(self, name):
+        return set.__contains__(self, name) or builtin_kind(name, self.every, self.preset) is not None
+
+    def builtin(self, name):
+        return None if set.__contains__(self, name) else builtin_kind(name, self.every, self.preset)
+
+
 def validate_levers(levers, catalog_names):
     """{name: value} -> (clean dict, errors[]). Only catalog names, only a narrow value charset;
     an empty value means 'not overridden' and is dropped."""
@@ -584,6 +688,7 @@ EXTRA_FLAGS = {
     "-wgt": 1, "--rope-scaling": 1, "--rope-freq-base": 1, "--rope-freq-scale": 1, "--yarn-orig-ctx": 1,
     "--defrag-thold": 1, "-dt": 1, "--timeout": 1, "-to": 1, "--threads-http": 1, "--n-cpu-moe": 1,
     "-ncmoe": 1, "--cpu-moe": 0, "-cmoe": 0, "--draft-max": 1, "--draft-min": 1, "--draft-p-min": 1,
+    "-md": 1, "--model-draft": 1, "--sleep-idle-seconds": 1,
     "--spec-replace": 2, "-sm": 1, "--split-mode": 1, "--numa": 1, "--prio": 1, "--poll": 1,
     "--keep": 1, "--no-warmup": 0, "--verbose": 0, "-v": 0, "--log-verbosity": 1, "-lv": 1,
 }
@@ -731,6 +836,13 @@ class Invalid(ValueError):
     pass
 
 
+class Reply(object):
+    """a route's answer that is not JSON (a CSV download, the Prometheus text)."""
+
+    def __init__(self, body, ctype, code=200, extra=None):
+        self.body, self.ctype, self.code, self.extra = body, ctype, code, extra or {}
+
+
 def content_length(headers, limit):
     """The request's Content-Length as a checked int: a missing header is 0; a negative, non-numeric
     or oversized one is refused (a negative length made rfile.read(-1) block the thread for good)."""
@@ -763,9 +875,40 @@ def port_in_use(port, host="127.0.0.1"):
         s.bind((host, port))
         return False
     except OSError:
-        return True
+        pass
     finally:
         s.close()
+    # The bind failed, but that alone does not mean a server is there. The engine (cpp-httplib) sets
+    # SO_REUSEPORT, not SO_REUSEADDR, so the TIME_WAIT/FIN_WAIT sockets a stopped engine leaves on
+    # its port (one per health poll) refuse a SO_REUSEADDR bind for up to a minute, while the next
+    # engine binds there fine. Only a LISTENING socket blocks a server (user report 2026-10-07:
+    # Stop, then Start on the same port refused until the port was changed or the GUI restarted).
+    listening = _listening_ports()
+    if listening is not None:
+        return port in listening
+    try:                                    # no /proc/net (not Linux): does anything answer?
+        with socket.create_connection(("127.0.0.1" if host in ("0.0.0.0", "") else host, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _listening_ports():
+    """{port} of every TCP socket in LISTEN state on this machine (Linux /proc/net/tcp{,6}), or None
+    when that table cannot be read."""
+    ports, seen = set(), False
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(f) as fh:
+                next(fh, None)
+                for ln in fh:
+                    p = ln.split()
+                    if len(p) > 3 and p[3] == "0A":         # TCP_LISTEN
+                        ports.add(int(p[1].rsplit(":", 1)[1], 16))
+            seen = True
+        except (OSError, ValueError, IndexError):
+            continue
+    return ports if seen else None
 
 
 def _int(body, key, lo, hi, default):
@@ -790,6 +933,94 @@ def path_under(path, roots):
         if rp == rr or rp.startswith(rr.rstrip("/") + "/"):
             return True
     return False
+
+
+def _lexically_under(path, roots):
+    """the path as written (.. folded, symlinks NOT followed) is inside a root, as written or resolved."""
+    ap = os.path.abspath(path)
+    for r in roots:
+        for rr in {os.path.abspath(os.path.expanduser(r)), os.path.realpath(os.path.expanduser(r))}:
+            if ap.startswith(rr.rstrip("/") + "/"):
+                return True
+    return False
+
+
+def is_gguf_file(path):
+    """a regular, readable file that starts with the GGUF magic (symlinks followed)."""
+    try:
+        import stat as _stat
+        if not _stat.S_ISREG(os.stat(path).st_mode) or not os.access(path, os.R_OK):
+            return False
+        with open(path, "rb") as f:
+            return f.read(4) == b"GGUF"
+    except OSError:
+        return False
+
+
+def model_path_ok(path, roots):
+    """A model may be served when it resolves inside a model folder, or when it is a link that sits
+    inside a model folder and points at a regular, readable GGUF somewhere else (models offloaded to
+    another disk and linked back). Anything else outside the folders is refused."""
+    if path_under(path, roots):
+        return True
+    return path.endswith(".gguf") and _lexically_under(path, roots) and is_gguf_file(path)
+
+
+def annotate_plan_text(text, pairs):
+    """The launcher explains its own flags; PXA Control appends more after it has planned (thinking
+    flags, the operator's extra args). Make the explanation match: rewrite the row of a flag that is
+    now passed, and add rows for flags the launcher does not list. pairs: [(flag, value, source)],
+    in command order (the last one of a flag wins, as on the engine's command line)."""
+    if not text or not pairs:
+        return text
+    final = {}
+    for flag, value, src in pairs:
+        final[flag] = (value, src)
+    lines = text.split("\n")
+    rowre = re.compile(r"^(\s*)(-[-\w]+)(\s+)(.*)$")
+    done, anchor, indent = set(), None, "  "
+    for i, ln in enumerate(lines):
+        m = rowre.match(ln)
+        if not m or len(m.group(1)) > 8:
+            continue
+        flag = m.group(2)
+        if flag in ("--reasoning-format", "--reasoning-budget"):
+            anchor, indent = i, m.group(1)
+        if flag in final and flag not in done and len(m.group(2) + m.group(3)) >= 20:
+            value, src = final[flag]
+            v = value if len(str(value)) <= 44 else str(value)[:41] + "..."
+            lines[i] = f"{m.group(1)}{flag:<20} {v:<44} {src}"
+            done.add(flag)
+            if flag in ("--reasoning-format", "--reasoning-budget"):
+                anchor = i
+    extra = []
+    for flag, (value, src) in final.items():
+        if flag in done:
+            continue
+        v = value if len(str(value)) <= 44 else str(value)[:41] + "..."
+        extra.append(f"{indent}{flag:<20} {v:<44} {src}")
+    if extra:
+        if anchor is not None:
+            lines[anchor + 1:anchor + 1] = extra
+        else:
+            lines += ["", "  added by PXA Control after the plan:"] + extra
+    return "\n".join(lines)
+
+
+def _flag_pairs(args, src):
+    """['--a', 'x', '--b', '--c', '-1'] -> [(--a, x), (--b, ''), (--c, -1)] (a value may start with '-' if numeric)."""
+    out, i = [], 0
+    while i < len(args):
+        a = str(args[i])
+        if a.startswith("-") and not re.fullmatch(r"-\d+(\.\d+)?", a):
+            v = ""
+            if i + 1 < len(args):
+                n = str(args[i + 1])
+                if not n.startswith("-") or re.fullmatch(r"-\d+(\.\d+)?", n):
+                    v, i = n, i + 1
+            out.append((a, v if v != "" else "on", src))
+        i += 1
+    return out
 
 
 def check_engine_dir(d):
@@ -840,7 +1071,7 @@ def validate_launch(body, gpu_indexes, catalog_names, model_roots, gui_port=None
     if check_model:
         if not os.path.isfile(model):
             raise Invalid(f"model file not found: {model}")
-        if not path_under(model, model_roots):
+        if not model_path_ok(model, model_roots):
             raise Invalid("the model must be inside one of your model folders (Models tab)")
     kv = body.get("kv", "auto") or "auto"
     if kv not in KV_TYPES:
@@ -874,8 +1105,82 @@ def validate_launch(body, gpu_indexes, catalog_names, model_roots, gui_port=None
         "levers": levers,
         "extra_args": validate_extra_args(body.get("extra_args")),
         "engine_dir": check_engine_dir(body.get("engine_dir")),
+        "thinking": clean_thinking(body.get("thinking")),
+        "draft_model": _draft_model(body, model, model_roots, check_model),
+        "hot_models": _hot_models(body, model, model_roots, check_model),
     }
     return out
+
+
+def _draft_model(body, model, model_roots, check_model):
+    draft = body.get("draft_model") or ""
+    if draft in ("", None):
+        return ""
+    if not isinstance(draft, str) or not draft.endswith(".gguf") or len(draft) > 4096 or "\x00" in draft:
+        raise Invalid("the drafter must be a .gguf file")
+    if check_model:
+        if not os.path.isfile(draft):
+            raise Invalid("drafter file not found: %s" % draft)
+        if not model_path_ok(draft, model_roots):
+            raise Invalid("the drafter must be inside one of your model folders (Models tab)")
+    return draft
+
+
+def _hot_models(body, model, model_roots, check_model):
+    """Extra models registered with --hot-model. Paths only; the launcher refuses Pascal and no-VMM cards."""
+    hots = body.get("hot_models") or []
+    if hots in ("", None):
+        return []
+    if isinstance(hots, str):
+        hots = [hots]
+    if not isinstance(hots, list) or len(hots) > 8:
+        raise Invalid("at most 8 extra models on one server")
+    out, seen = [], set()
+    main = os.path.abspath(model) if isinstance(model, str) else ""
+    for raw in hots:
+        if not isinstance(raw, str) or not raw.endswith(".gguf") or len(raw) > 4096 or "\x00" in raw:
+            raise Invalid("an extra model must be a .gguf path")
+        if any(c in raw for c in " \t"):
+            raise Invalid("an extra model path cannot contain spaces (the engine's --hot-model parser splits on them)")
+        if check_model:
+            if not os.path.isfile(raw):
+                raise Invalid("extra model file not found: %s" % raw)
+            if not model_path_ok(raw, model_roots):
+                raise Invalid("an extra model must be inside one of your model folders (Models tab)")
+        ap = os.path.abspath(raw)
+        if ap == main:
+            raise Invalid("an extra model is the one already chosen to start on the cards")
+        if ap in seen:
+            continue
+        seen.add(ap)
+        out.append(raw)
+    return out
+
+
+def hot_model_argv(paths):
+    """NAME=PATH tokens for --hot-model. The name is the file stem; a stem with '=' gets m2, m3, ..."""
+    used, out = set(), []
+    for i, path in enumerate(paths, start=2):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        name = stem if stem and "=" not in stem and " " not in stem else ("m%d" % i)
+        if name in used:
+            name = "%s-%d" % (name, i)
+        used.add(name)
+        out.append("%s=%s" % (name, path))
+    return out
+
+
+def clean_thinking(x):
+    """{mode: auto|on|off, budget: None|-1..N, level: None|str} (tools/pxa_thinking.py) or Invalid."""
+    try:
+        return TH.clean_settings(x)
+    except TH.Invalid as e:
+        raise Invalid(str(e))
+
+
+def thinking_is_default(t):
+    return not t or (t.get("mode", "auto") == "auto" and t.get("budget") is None and not t.get("level")
+                     and not t.get("effort"))
 
 
 def launcher_argv(req):
@@ -901,6 +1206,10 @@ def launcher_argv(req):
         argv += ["--accept-unmeasured"]
     if req["allow_busy"]:
         argv += ["--allow-busy"]
+    if req.get("draft_model"):
+        argv += ["--draft-model", req["draft_model"]]
+    for spec in hot_model_argv(req.get("hot_models") or []):
+        argv += ["--hot-model", spec]
     return argv
 
 
@@ -923,7 +1232,65 @@ def cli_line(req):
 # ---------------------------------------------------------------------------------------------
 # "Report a problem": a redacted bundle, shown to the user in full, sent only on a Send click
 # ---------------------------------------------------------------------------------------------
-CONTROL_VERSION = "v3"   # what the UI shows as "PXA Control v3" and what reports carry (the release is PXA v3)
+def version_token(text):
+    """First token of a VERSION file. A line that starts with 'tag:' yields the token after it.
+    The same rule as tools/pxa-update.c version_token."""
+    if not text:
+        return ""
+    line = str(text).splitlines()[0].strip()
+    if line.lower().startswith("tag:"):
+        line = line[4:].strip()
+    parts = line.split()
+    return parts[0] if parts else ""
+
+
+def version_from_dir(d):
+    """Package version in d: current/VERSION, then VERSION, then the current symlink's
+    basename with a leading 'pxa-' removed. Empty when none of those exist."""
+    if not d:
+        return ""
+    for rel in (os.path.join("current", "VERSION"), "VERSION"):
+        try:
+            with open(os.path.join(d, rel), encoding="utf-8") as f:
+                tok = version_token(f.read(4096))
+        except OSError:
+            continue
+        if tok:
+            return tok
+    cur = os.path.join(d, "current")
+    if not (os.path.islink(cur) or os.path.isdir(cur)):
+        return ""
+    base = os.path.basename(os.path.realpath(cur))
+    if base.startswith("pxa-"):
+        base = base[4:]
+    if base and base != os.path.basename(os.path.abspath(d)):
+        return base
+    return ""
+
+
+def package_version():
+    """Version of the package this Control is serving. The tree beside tools/ wins (a source
+    checkout and an unpacked tarball both keep VERSION there), then PXA_INSTALL_DIR, then the
+    per-user install. Empty when no package version can be read."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = [os.path.dirname(here)]
+    inst = os.environ.get("PXA_INSTALL_DIR")
+    if inst:
+        roots.append(inst)
+    roots.append(os.path.join(os.path.expanduser("~"), ".local", "share", "pxa"))
+    seen = set()
+    for d in roots:
+        d = os.path.abspath(d)
+        if d in seen:
+            continue
+        seen.add(d)
+        tok = version_from_dir(d)
+        if tok:
+            return tok
+    return ""
+
+
+CONTROL_VERSION = package_version()  # footer and reports: the token in the package VERSION file
 BUG_URL_DEFAULT = "https://bugs.pxanetwork.com/v1/report"
 REPORT_MAX = 256 * 1024                      # the intake refuses more than this
 BANNER_RE = re.compile(r"PXA_(REGISTRY|TSPLIT|AUTO)")
@@ -1061,6 +1428,7 @@ class Seat(object):
         self.cmd = None
         self.req = None
         self.log = deque(maxlen=6000)
+        self.build_lines = []          # the engine's first build/version lines, kept after the log ring drops them
         self.seq = 0
         self.phase = "stopped"
         self.started = None
@@ -1073,6 +1441,8 @@ class Seat(object):
         with self.cond:
             self.seq += 1
             self.log.append((self.seq, line))
+            if len(self.build_lines) < 6 and BUILD_RE.match(line.strip()):
+                self.build_lines.append(line)
             self.last_line_ts = time.time()
             self.cond.notify_all()
 
@@ -1092,6 +1462,7 @@ class Seat(object):
             e.update(self.L.device_env(cv)[0])
             e.update(lever_env)
             self.log.clear()
+            self.build_lines = []
             self.stopping, self.hidden = False, 0
             self._append("$ " + " ".join(f"{k}={v}" for k, v in sorted(lever_env.items()))
                          + (" " if lever_env else "") + " ".join(self.L.redact_cmd(cmd)))
@@ -1297,6 +1668,27 @@ def _http_json(port, path, timeout=1.5):
         return json.loads(r.read().decode("utf-8", "replace") or "null")
 
 
+def probe_registered_models(port, timeout=1.5):
+    """Models /v1/models lists when this server was started with --hot-model, else None.
+
+    The engine already reports which one is on the cards (pxa_hot_swap.active). A server with a
+    single model and no hot-swap object is left as None so the Servers tab does not grow a line.
+    """
+    try:
+        data = _http_json(port, "/v1/models", timeout)
+    except Exception:       # noqa: BLE001 - the fleet card still renders without this line
+        return None
+    rows = []
+    for m in (data or {}).get("data") or []:
+        if not isinstance(m, dict):
+            continue
+        hs = m.get("pxa_hot_swap")
+        if not isinstance(hs, dict) or "active" not in hs:
+            return None
+        rows.append({"id": m.get("id"), "active": bool(hs.get("active"))})
+    return rows or None
+
+
 def probe_health(port, timeout=1.5):
     """-> (state, detail): 'ok' | 'loading' | 'down' | 'http N'."""
     try:
@@ -1310,6 +1702,83 @@ def probe_health(port, timeout=1.5):
         return ("loading" if e.code == 503 else f"http {e.code}"), {}
     except Exception:       # noqa: BLE001
         return "down", {}
+
+
+# ---- the context the ENGINE resolved (BigBair 2026-10-08: "auto" must show the number it became) ----------------------
+CTX_LOG_RE = re.compile(r"\bn_ctx\s*[=:]\s*(\d+)")
+CTX_SLOT_LOG_RE = re.compile(r"\bn_ctx_(?:per_seq|seq|slot)\s*[=:]\s*(\d+)")
+
+
+def probe_ctx(port, timeout=1.5):
+    """-> {"n_ctx", "per_slot", "slots"} from the engine's own /props, or None. Never guessed: a server whose /props has no
+    n_ctx gives None. PXA engines put n_ctx at the top level; stock llama.cpp only has the slot's
+    default_generation_settings.n_ctx (the per-slot context)."""
+    try:
+        props = _http_json(port, "/props", timeout=timeout)
+    except Exception:       # noqa: BLE001
+        return None
+    if not isinstance(props, dict):
+        return None
+    top = _num(props.get("n_ctx"))
+    dgs = props.get("default_generation_settings") if isinstance(props.get("default_generation_settings"), dict) else {}
+    per = _num(dgs.get("n_ctx"))
+    slots = _num(props.get("total_slots"))
+    if not top and not per:
+        return None
+    return {"n_ctx": int(top) if top else None, "per_slot": int(per) if per else None, "slots": int(slots) if slots else None}
+
+
+def ctx_from_log(lines):
+    """-> (n_ctx, per_slot) from the engine's own load log (llama_context: n_ctx = 65536 / n_ctx_per_seq = 16384)."""
+    n = per = None
+    for ln in lines:
+        m = CTX_SLOT_LOG_RE.search(ln)
+        if m:
+            per = int(m.group(1))
+            continue
+        m = CTX_LOG_RE.search(ln)
+        if m:
+            n = int(m.group(1))
+    return n, per
+
+
+def context_info(requested, engine_arg, probed=None, log=None, cards=None):
+    """the Context line a server card shows: {mode, requested, launcher_arg, resolved, per_slot, slots, source, how}.
+    requested: what the user typed (0 / None = auto); engine_arg: the -c the engine was started with (the launcher's
+    pick when auto); probed: probe_ctx(); log: ctx_from_log()."""
+    try:
+        req = int(requested or 0)
+    except (TypeError, ValueError):
+        req = 0
+    try:
+        arg = int(engine_arg) if engine_arg not in (None, "") else None
+    except (TypeError, ValueError):
+        arg = None
+    res = per = slots = None
+    src = None
+    if probed:
+        res, per, slots = probed.get("n_ctx"), probed.get("per_slot"), probed.get("slots")
+        src = "engine /props"
+    if res is None and log and log[0]:
+        res, per = log[0], (log[1] or per)
+        src = "engine log"
+    if res is None and per is not None and slots:
+        src = src or "engine /props"
+    mode = "set" if req > 0 else "auto"
+    where = f" on card(s) {','.join(str(c) for c in cards)}" if cards else ""
+    if res is None and per is None:
+        how = "the engine has not reported its context yet (still loading, or its /props has no n_ctx)"
+    elif mode == "auto":
+        how = (f"Context was left on auto. The launcher sized it from the model's trained context and the VRAM free{where} "
+               f"(its fit check: weights + KV cache must fit), "
+               + (f"started the engine with -c {arg:,}, " if arg else "let the engine pick its default, ")
+               + f"and the engine reports {(res or per):,} ({src}).")
+    else:
+        how = f"Context set by hand to {req:,}; the engine reports {(res or per):,} ({src})."
+    if per and res and slots and slots > 1:
+        how += f" {slots} parallel slots share it: {per:,} each."
+    return {"mode": mode, "requested": req, "launcher_arg": arg, "resolved": res, "per_slot": per, "slots": slots,
+            "source": src, "how": how}
 
 
 PROM_RE = re.compile(r"^llamacpp:([a-z_]+)\s+([0-9.eE+\-]+)\s*$", re.M)
@@ -1511,14 +1980,250 @@ class EncodeHost(object):
 
 
 # ---------------------------------------------------------------------------------------------
+# the licensed library as its own updatable artifact (v3.1, tools/pxa_lib_update.py)
+# ---------------------------------------------------------------------------------------------
+# `libggml-pxqn.so` is the closed half of the engine and the only part of an install that is fixed on
+# its own schedule: a kernel fix, a card that now works, a bug in the PXQN runtime. Shipping that as a
+# whole engine release means downloading the engine again for one file, so the licence server hands out
+# the file itself - signed, checksummed, swapped by a symlink rename, and always reversible - and this
+# is the page's side of it: ask what is on the channel (a check changes nothing on disk but the
+# last-check stamp), say "library update available" the way the encoder says it, and apply on demand.
+# Never while a server from this install is running: the library is replaced underneath it.
+# Beta is a separate channel and the server, not this page, decides who may have it.
+LIB_CHECK_S = 6 * 3600          # how often the poller asks the licence server by itself
+LIB_PAGE_S = 60.0               # refresh the cached answer when the page asks and it is older than this
+LIB_CHANNELS = ("stable", "beta")   # the channels the licence server publishes; mirrored from the updater so a page can be refused without it
+
+
+class LibUpdate(object):
+    """The licensed library beside the Encode tab's encoder: same page, different artifact. Wraps tools/pxa_lib_update.py,
+    which does the signature, checksum, staging and swap; this only decides when to ask and what the page is told."""
+
+    def __init__(self, app):
+        self.app = app
+        self.lock = threading.Lock()
+        self.stop_ev = threading.Event()
+        self.thread = None
+        self._cache = None              # the last check: {checked, latest, update, notice, error, beta}
+        self._beta = None               # True/False once the server has said; None before the first beta attempt
+        self._busy = ""                 # "" | "check" | "apply" | "rollback": what is in flight, for the page
+        self._ask = 0.0
+        if LU is None:
+            self._cache = {"error": {"code": "unavailable", "message": "This PXA Control has no library updater (%s)." % (LIB_IMPORT_ERROR or "")}}
+
+    # ---- where and what ------------------------------------------------------------------------
+    def dir(self):
+        """The install the library belongs to: the engine directory Control runs from, else the per-user default."""
+        try:
+            return self.app.rig_static().get("engine_dir") or None
+        except Exception:        # noqa: BLE001
+            return None
+
+    def _cfg(self):
+        c = (self.app.cfg_load() if hasattr(self.app, "cfg_load") else load_config()) or {}
+        l = c.get("lib")
+        return l if isinstance(l, dict) else {}
+
+    def cfg_set(self, **kw):
+        def fn(c):
+            l = c.get("lib") if isinstance(c.get("lib"), dict) else {}
+            for k, v in kw.items():
+                if v is None:
+                    l.pop(k, None)
+                else:
+                    l[k] = v
+            c["lib"] = l
+        # App has no cfg_update of its own (only EncodeHost does), so fall back to the same
+        # load-modify-save the config helpers use, under the same lock: the page and the library
+        # poller both write this file.
+        if hasattr(self.app, "cfg_update"):
+            self.app.cfg_update(fn)
+        else:
+            with _cfg_lock:
+                c = load_config()
+                fn(c)
+                save_config(c)
+
+    def channel(self):
+        """The channel this install follows: the setting the user chose, else what the last install recorded, else stable.
+        The setting comes first because the check path stamps the channel it asked about into the state file, so a
+        state-first order would let one check pin the install and make the page's channel control a no-op."""
+        if LU is None:
+            return "stable"
+        ch = str(self._cfg().get("channel") or "").strip()
+        if not ch:
+            d = self.dir()
+            ch = str(LU.load_state(d).get("channel") or "").strip()
+        return ch if ch in ("stable", "beta") else "stable"
+
+    def auto(self):
+        return self._cfg().get("auto") is True
+
+    def installed(self):
+        if LU is None:
+            return {}
+        d = self.dir()
+        st = LU.load_state(d)
+        return {"version": str(st.get("version") or ""), "lib_id": st.get("lib_id") or None, "prev": st.get("prev") or None,
+                "prev_version": str(st.get("prev_version") or ""), "applied": st.get("applied"), "checked": st.get("checked"),
+                "links": LU.installed_links(d)}
+
+    # ---- what the page is told -----------------------------------------------------------------
+    def status(self):
+        """The cached answer, and never a network call: the page polls this. `check()` refreshes it."""
+        if LU is None:
+            return {"available": False, "error": (self._cache or {}).get("error"), "update": False, "running": False}
+        d = self.dir()
+        try:
+            running = LU.server_running(d)
+        except Exception:        # noqa: BLE001
+            running = False
+        out = {"available": True, "installed": self.installed(), "channel": self.channel(), "auto": self.auto(),
+               "beta": self._beta, "running": running, "busy": self._busy, "error": None, "latest": "",
+               "lib_id": None, "update": False, "notice": "", "min_engine": ""}
+        with self.lock:
+            c = dict(self._cache) if isinstance(self._cache, dict) else None
+        if c:
+            out["error"] = c.get("error")
+            out["latest"] = str(c.get("latest") or "")
+            out["lib_id"] = c.get("lib_id")
+            out["update"] = bool(c.get("update")) and not c.get("error")
+            out["notice"] = str(c.get("notice") or "")
+            out["min_engine"] = str(c.get("min_engine") or "")
+            if c.get("beta") is not None:
+                out["beta"] = c["beta"]
+            if c.get("checked"):
+                out["installed"]["checked"] = c["checked"]
+        return out
+
+    # ---- asking, applying ----------------------------------------------------------------------
+    def check(self, force=False, channel=None):
+        """Ask the licence server what is on the channel (writes nothing but the state's last-check stamp) and keep the answer
+        for the page. Does not raise: a server we cannot reach is a sentence in the payload, like everywhere else here."""
+        if LU is None:
+            return self.status()
+        now = time.time()
+        with self.lock:
+            fresh = self._cache is not None and (now - self._ask) < (LIB_PAGE_S if force else LIB_CHECK_S)
+            if fresh and not force:
+                return self.status()
+            self._busy = "check"
+        try:
+            d = self.dir()
+            ch = channel or self.channel()
+            rel, raw, cur = LU.check(d, channel=ch)
+            newer = bool(rel["version"]) and rel["version"] != cur
+            entry = {"checked": int(now), "latest": rel["version"], "lib_id": rel["lib_id"], "update": newer,
+                     "notice": str((raw or {}).get("notice") or ""), "min_engine": str(rel.get("min_engine") or ""), "error": None}
+            if ch == "beta":
+                self._beta = True
+        except PK_ERRORS as e:
+            entry = {"checked": int(now), "latest": "", "update": False, "notice": "", "error": _pkg_error(e)}
+            if getattr(e, "code", "") == "not_valued":
+                self._beta = False
+        except Exception as e:   # noqa: BLE001
+            entry = {"checked": int(now), "latest": "", "update": False, "notice": "",
+                     "error": {"code": "failed", "message": "%s: %s" % (e.__class__.__name__, e)}}
+        with self.lock:
+            self._cache = entry
+            self._ask = now
+            self._busy = ""
+        if entry["update"] and self.auto():
+            try:
+                self.apply()                     # off by default; the spec's rule is the owner turns it on
+            except Invalid:
+                pass
+        return self.status()
+
+    def apply(self, channel=None):
+        """Install the newest release on the channel. Raises Invalid with a plain sentence (the page shows it) when the server
+        refuses, a server from this install is running, or the engine is too old for the release."""
+        if LU is None:
+            raise Invalid("This PXA Control has no library updater (%s)." % (LIB_IMPORT_ERROR or ""))
+        return self._do("apply", lambda: self._apply(channel))
+
+    def rollback(self):
+        if LU is None:
+            raise Invalid("This PXA Control has no library updater (%s)." % (LIB_IMPORT_ERROR or ""))
+        return self._do("rollback", lambda: self._rollback())
+
+    def _do(self, what, fn):
+        with self.lock:
+            if self._busy:
+                raise Invalid("A library %s is already running; wait for it to finish." % self._busy)
+            self._busy = what
+        try:
+            done = fn()
+            self.check(force=True)
+            return done
+        except PK_ERRORS as e:
+            # the updater raises its own verifier error; the page is promised a plain sentence and a
+            # 4xx, so translate it here instead of letting the dispatcher report an internal 500.
+            err = Invalid(str(e))
+            err.code = str(getattr(e, "code", "") or "") or "lib_failed"
+            raise err
+        finally:
+            with self.lock:
+                self._busy = ""
+
+    def _apply(self, channel=None):
+        d, ch = self.dir(), channel or self.channel()
+        done, rel, cur = LU.apply(d, channel=ch)
+        if not done:
+            return {"applied": False, "version": cur, "message": "The library is already up to date."}
+        return {"applied": True, "version": rel["version"], "lib_id": rel["lib_id"],
+                "message": "Library %s installed (%s). Restart a server for it to take effect." % (rel["version"], rel["lib_id"])}
+
+    def _rollback(self):
+        d = self.dir()
+        ver, was = LU.rollback(d)
+        return {"applied": True, "version": ver, "was": was,
+                "message": ("Rolled back to %s." % ver) if ver else "Rolled back to the library the engine shipped."}
+
+    # ---- the poller ----------------------------------------------------------------------------
+    def touch(self):
+        """Somebody is looking at the page: start the background checker if it is not running."""
+        if LU is None:
+            return
+        with self.lock:
+            if (self.thread is None or not self.thread.is_alive()) and not self.stop_ev.is_set():
+                self.thread = threading.Thread(target=self._loop, daemon=True, name="pxa-lib")
+                self.thread.start()
+
+    def close(self):
+        self.stop_ev.set()
+
+    def _loop(self):
+        while not self.stop_ev.is_set():
+            try:
+                if self._cache is None:
+                    self.check()
+            except Exception:        # noqa: BLE001 - a failed check is a sentence on the page, never a dead thread
+                pass
+            self.stop_ev.wait(LIB_CHECK_S)
+
+    def _safe_check(self):
+        try:
+            self.check()
+        except Exception:            # noqa: BLE001
+            pass
+
+
+def _pkg_error(e):
+    return {"code": str(getattr(e, "code", "") or "failed"), "message": str(e)}
+
+
+# ---------------------------------------------------------------------------------------------
 # live history: the numbers behind the Live tab
 # ---------------------------------------------------------------------------------------------
-# One rolling sample per card and per server, taken by a small thread that only runs while somebody
-# is looking at PXA Control (a viewer asked within LIVE_IDLE_S). Everything is read from places that
+# One rolling sample per card and per server, taken by a small thread that runs while somebody is
+# looking at PXA Control (a viewer asked within LIVE_IDLE_S) and, with the telemetry history on (v3.1,
+# tools/pxa_telemetry.py, the default), all the time at its slower background pace: every sample then
+# also goes to the on-disk store, so the Live tab can draw days and weeks, not only what a page saw. Everything is read from places that
 # exist on every PXA engine build: nvidia-smi for the cards, and per server /slots, /props, /pxa/stats
 # (and /metrics when the server was started with --metrics, which is only used for exact rates).
-# Nothing is stored on disk and nothing leaves this machine; a request's prompt text, which /slots
-# carries, is dropped on the way in and never reaches the page.
+# Only numbers are stored (telemetry.db in the config dir) and nothing leaves this machine; a request's
+# prompt text, which /slots carries, is dropped on the way in and never reaches the page or the store.
 LIVE_KEEP_S = 3 * 3600          # history kept in memory
 LIVE_FAST_S = 2.0               # sample spacing while the Live tab is open
 LIVE_SLOW_S = 10.0              # ... while only another tab is
@@ -1596,6 +2301,25 @@ class Live(object):
         self.thread = None
         self.stop_ev = threading.Event()
         self._thr_field = None      # which nvidia-smi throttle-reason field this driver has
+        self.background = False     # the telemetry history is on: keep sampling with nobody looking
+        self.bg_every = LIVE_SLOW_S
+        self.bg_since = None
+
+    def start_background(self, every=None):
+        """sample with nobody looking, every `every` seconds (the telemetry store's sample_s)."""
+        with self.lock:
+            self.background = True
+            self.bg_every = max(LIVE_FAST_S, float(every or LIVE_SLOW_S))
+            if self.bg_since is None:
+                self.bg_since = time.time()
+            if (self.thread is None or not self.thread.is_alive()) and not self.stop_ev.is_set():
+                self.thread = threading.Thread(target=self._loop, daemon=True, name="pxa-live")
+                self.thread.start()
+
+    def stop_background(self):
+        with self.lock:
+            self.background = False
+            self.bg_since = None
 
     # ---- life cycle ---------------------------------------------------------------------------
     def touch(self, fast=False):
@@ -1622,11 +2346,13 @@ class Live(object):
         while not self.stop_ev.is_set():
             t0 = time.time()
             with self.lock:
-                if t0 - self.last_any > LIVE_IDLE_S:
+                idle = t0 - self.last_any > LIVE_IDLE_S
+                if idle and not self.background:
                     self.thread = None
                     return
                 fast = t0 - self.last_fast < LIVE_VIEW_S
-            self.stop_ev.wait(max(0.2, (LIVE_FAST_S if fast else LIVE_SLOW_S) - (time.time() - t0)))
+                every = LIVE_FAST_S if fast else (self.bg_every if idle else min(LIVE_SLOW_S, self.bg_every))
+            self.stop_ev.wait(max(0.2, every - (time.time() - t0)))
             if not self.stop_ev.is_set():
                 self._safe_tick()
 
@@ -1657,6 +2383,10 @@ class Live(object):
             self._prune(now)
             with self.lock:
                 self.ticks += 1
+            try:
+                self._feed(now)
+            except Exception:        # noqa: BLE001 - the history store is never allowed to break the Live tab
+                pass
         finally:
             self.tick_lock.release()
 
@@ -1899,6 +2629,90 @@ class Live(object):
                 meta["has_stats"] = False
         return row, meta, reqs
 
+    @staticmethod
+    def store_key(key, port):
+        """the history's name for a server: a bare process is p:<pid>, which changes at every restart, so the
+        store files it under its port instead (the same server on the same port keeps one line)."""
+        return f"p@{port}" if str(key).startswith("p:") and port else str(key)
+
+    def _feed(self, now):
+        """hand this tick's rows to the telemetry store (averaged there and written every sample_s)."""
+        tel = getattr(self.app, "telemetry", None)
+        if tel is None:
+            return
+        recent = now - max(30.0, 3 * self.bg_every)      # a server's first poll back-fills 3 h of requests: those
+        cards, srv, host = [], [], None                  # go to the request table, not into this interval's sums
+        with self.lock:
+            for i, dq in self.cards.items():
+                if dq and dq[-1][0] == now:
+                    m = self.card_meta.get(i, {})
+                    cards.append((str(i), m.get("name"), {"class": m.get("class"), "mem_total_mib": m.get("mem_total_mib")},
+                                  list(dq[-1][1:])))
+            if self.host and self.host[-1][0] == now:
+                host = list(self.host[-1][1:])
+            for key, st in self.srv.items():
+                m = st["meta"]
+                hw = st.get("fed_req", 0.0)
+                new = [r for r in st["reqs"] if r[0] > hw]
+                if new:
+                    st["fed_req"] = max(r[0] for r in new)
+                row = st["rows"][-1] if st["rows"] and st["rows"][-1][0] == now else None
+                if row is None and not new:
+                    continue
+                info = {"kind": m.get("kind"), "port": m.get("port"), "gpus": m.get("gpus"),
+                        "model_file": os.path.basename(str(m.get("model_file") or m.get("model") or "")) or None}
+                srv.append((self.store_key(key, m.get("port")), m.get("name"), info, row, new))
+        for k, name, info, vals in cards:
+            tel.record("card", k, now, vals, label=name, info=info)
+            try:
+                reasons = (self.card_meta.get(int(k)) or {}).get("throttle") or []
+            except (TypeError, ValueError):
+                reasons = []
+            if reasons:
+                tel.note_throttle(k, now, reasons)
+        if host is not None:
+            tel.record("host", "host", now, host, label="this machine", info={"ram_total_mib": self.host_meta.get("ram_total_mib")})
+        for k, name, info, row, new in srv:
+            if new:
+                tel.record_requests(k, new, label=name, info=info)
+            if row is not None:
+                fresh = [r for r in new if r[0] >= recent]
+                sums = [float(len(fresh)), sum(r[7] or 0 for r in fresh), sum(r[4] or 0 for r in fresh),
+                        sum(r[8] or 0 for r in fresh), sum(r[5] or 0 for r in fresh)]
+                tel.record("server", k, now, list(row[1:]) + sums, label=name, info=info)
+        tel.flush(now)
+
+    def latest(self, max_age=60.0, with_meta=False):
+        """the newest reading of every card, server and the host, for /metrics.
+
+        `with_meta` also carries what the row alone cannot say -- the server's phase, model name and
+        slot count, a card's total VRAM -- which is what the MQTT publisher needs to build entities.
+        The default is off so /metrics keeps exactly the shapes it had."""
+        now = time.time()
+        with self.lock:
+            cards = []
+            for i in sorted(self.cards):
+                dq = self.cards[i]
+                if dq and now - dq[-1][0] <= max_age:
+                    r = dq[-1]
+                    m = self.card_meta.get(i) or {}
+                    c = dict(zip(CARD_COLS, r), index=i, name=m.get("name"))
+                    if with_meta:
+                        c["mem_total_mib"] = m.get("mem_total_mib")
+                    cards.append(c)
+            servers = []
+            for key, st in self.srv.items():
+                if st["up"] and st["rows"] and now - st["rows"][-1][0] <= max_age:
+                    m = st["meta"]
+                    s = dict(zip(SRV_COLS, st["rows"][-1]), key=self.store_key(key, m.get("port")),
+                             name=m.get("name"), port=m.get("port"))
+                    if with_meta:
+                        s.update({k: m.get(k) for k in ("phase", "total_slots", "model", "n_ctx",
+                                                        "kind", "model_file")})
+                    servers.append(s)
+            host = dict(zip(HOST_COLS, self.host[-1])) if self.host and now - self.host[-1][0] <= max_age else None
+        return cards, servers, host
+
     def _prune(self, now):
         cut = now - LIVE_KEEP_S
         with self.lock:
@@ -1944,8 +2758,59 @@ class Live(object):
             host["rows"] = [_round_row(r, 1) for r in bucket_rows(host["rows"], step)]
         servers.sort(key=lambda s: s.get("slot", 0))
         return {"ts": now, "since": since, "history_from": first, "every": LIVE_FAST_S, "ticks": ticks,
+                "background": self.background, "background_since": self.bg_since,
                 "cols": {"card": CARD_COLS, "server": SRV_COLS, "req": REQ_COLS, "host": HOST_COLS}, "palette": LIVE_PALETTE,
                 "cards": cards, "servers": servers, "host": host}
+
+
+class AppLauncher(object):
+    """what the auto-start supervisor (tools/pxa_ctl/supervisor.py) may do: start / stop / ask about a SAVED server of
+    this Control, through App.start / App.stop, so an auto-start gets the same validation, conflict check, card lock and
+    plan as a click on Start."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def _settings(self, sid):
+        prof = self.app.profiles()
+        if sid not in prof:
+            raise Invalid(f"no saved server '{sid}'")
+        st = dict(prof[sid].get("settings") or {})
+        if not st.get("model"):
+            raise Invalid(f"server '{sid}' has no model saved: open it in Launch and Save")
+        return st
+
+    def start(self, sid, spec=None):
+        body = self._settings(sid)
+        body["sid"] = sid
+        if spec:                                   # a power user's per-auto-start extras, validated by App.start like any launch
+            if spec.get("extra_args"):
+                body["extra_args"] = validate_extra_args(body.get("extra_args")) + list(spec["extra_args"])
+            if spec.get("env"):
+                body["levers"] = dict(body.get("levers") or {}, **spec["env"])
+        r = self.app.start(body)
+        if not r.get("ok"):
+            tail = (r.get("text") or "").strip().splitlines()[-3:]
+            raise Invalid(f"server '{sid}' did not start: " + " / ".join(tail)[:300])
+        return r
+
+    def stop(self, sid):
+        return self.app.stop(sid)
+
+    def status(self, sid):
+        seat = self.app.seats.get(sid)
+        if seat is None:
+            return {"running": False, "healthy": False, "stopped_by_user": False, "exit_code": None}
+        d = seat.status()
+        healthy = False
+        if d["running"] and d.get("port"):
+            h, _detail = probe_health(d["port"], timeout=2)
+            healthy = h == "ok"
+        return {"running": d["running"], "healthy": healthy, "exit_code": d.get("exit_code"),
+                "stopped_by_user": (not d["running"]) and d.get("phase") == "stopped" and seat.proc is not None}
+
+    def cards(self, sid):
+        return self.app.cards_by_index(self._settings(sid).get("gpus") or [])
 
 
 class App(object):
@@ -1966,15 +2831,26 @@ class App(object):
         self._engines_cache = (0.0, None)
         self._default_limits = None
         self.catalog, self.catalog_src = load_catalog()
-        self.catalog_names = {r["name"] for r in self.catalog}
+        self.catalog_names = LeverNames({r["name"] for r in self.catalog}, *load_builtin(self.catalog_src))
         self._rig_cache = (0.0, None)
         self._doctor_cache = (0.0, None)
         self._prof_cache = {}
         self._models_cache = None
         self._enc = None
         self._enc_lock = threading.Lock()
+        self.lib = LibUpdate(self)
         self.live = Live(self)
+        self.telemetry = None                     # the on-disk history (start_telemetry), None when off
+        self.tel_cfg = TEL.settings(load_config()) if TEL is not None else {"enabled": False, "prometheus": False}
+        self.tel_error = TEL_IMPORT_ERROR
+        self.mqtt = None                          # the Home Assistant publisher thread (start_mqtt), None when off
+        self.mqtt_cfg = MQTT.settings(load_config()) if MQTT is not None else {"enabled": False}
+        self.mqtt_error = MQTT_IMPORT_ERROR
         self.bench = {"running": False, "lines": [], "result": None, "error": None}
+        self.started_at = time.time()
+        self.gpuctl = None                        # the Profiles backend (make_gpuctl), None when tools/pxa_ctl is missing
+        self.gpuctl_error = CTL_IMPORT_ERROR
+        self.make_gpuctl()
         self.companion = False                    # started in the background next to a server (serve(companion=True))
         self.idle_s = CONTROL_IDLE_S
         self.last_request = self.last_busy = time.time()
@@ -1988,6 +2864,351 @@ class App(object):
                     added = True
             if added:
                 save_config(c)
+
+    # ---- telemetry history (v3.1) ---------------------------------------------------------
+    def telemetry_path(self):
+        return os.environ.get("PXA_CONTROL_TELEMETRY_DB") or os.path.join(config_dir(), "telemetry.db")
+
+    def start_telemetry(self):
+        """open the history store and keep the Live sampler running in the background. One writer per
+        store file: a second PXA Control on the same config dir reads the history but does not record."""
+        if TEL is None:
+            return None
+        with _cfg_lock:
+            self.tel_cfg = TEL.settings(load_config())
+        if not self.tel_cfg["enabled"] or self.telemetry is not None:
+            return self.telemetry
+        try:
+            st = TEL.Store(self.telemetry_path(), self.tel_cfg)
+        except Exception as e:        # noqa: BLE001 - an unwritable config dir: Live stays memory-only
+            self.tel_error = f"{e.__class__.__name__}: {e}"
+            return None
+        if st.lock_writer():
+            st.start()
+            self.live.start_background(self.tel_cfg["sample_s"])
+        self.telemetry = st
+        self.tel_error = None
+        return st
+
+    def stop_telemetry(self):
+        st, self.telemetry = self.telemetry, None
+        self.live.stop_background()
+        if st is not None:
+            st.close()
+
+    def telemetry_status(self):
+        out = {"available": TEL is not None, "settings": dict(self.tel_cfg), "error": self.tel_error,
+               "recording": False, "env": {k: os.environ.get(v) for k, v in (TEL._ENV.items() if TEL else ())
+                                           if os.environ.get(v) is not None}}
+        if self.telemetry is not None:
+            out.update(self.telemetry.status())
+            out["recording"] = self.telemetry.is_writer and out.get("writer_alive", False)
+            out["writer_pid"] = self.telemetry.writer_pid()
+        out["sampling_since"] = self.live.bg_since
+        return out
+
+    def set_telemetry(self, body):
+        """POST /api/telemetry/settings: change and persist the history settings (an env var still wins)."""
+        if TEL is None:
+            raise Invalid("the telemetry module is missing from this PXA Control: " + (TEL_IMPORT_ERROR or ""))
+        body = body or {}
+        allowed = {k: body[k] for k in TEL.DEFAULTS if k in body}
+        if not allowed:
+            raise Invalid("nothing to change: send one of " + ", ".join(TEL.DEFAULTS))
+        with _cfg_lock:
+            c = load_config()
+            t = dict(c.get("telemetry") or {})
+            t.update(allowed)
+            c["telemetry"] = TEL.settings({"telemetry": t}, env={})
+            save_config(c)
+            new = TEL.settings(c)
+        was = self.tel_cfg
+        self.tel_cfg = new
+        if not new["enabled"] and self.telemetry is not None:
+            self.stop_telemetry()
+        elif new["enabled"] and self.telemetry is None:
+            self.start_telemetry()
+        elif self.telemetry is not None:
+            self.telemetry.cfg.update(new)
+            if new["sample_s"] != was.get("sample_s"):
+                self.live.start_background(new["sample_s"])
+            self.telemetry.maintain_now()
+        return self.telemetry_status()
+
+    def metrics_text(self):
+        """GET /metrics (Prometheus text format, off unless prometheus is on): PXA Control's own per-card,
+        per-server and host gauges, then every running server's own /metrics relabeled server="<key>"."""
+        self.live.touch()
+        cards, servers, host = self.live.latest()
+        engine = {}
+        ths = []
+
+        def one(s):
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{s['port']}/metrics", timeout=2.0) as r:
+                    engine[s["key"]] = r.read(1 << 20).decode("utf-8", "replace")
+            except Exception:        # noqa: BLE001 - started without --metrics: Control's gauges only
+                pass
+        for s in servers:
+            if s.get("port"):
+                th = threading.Thread(target=one, args=(s,), daemon=True)
+                th.start()
+                ths.append(th)
+        end = time.time() + 3.0
+        for th in ths:
+            th.join(max(0.05, end - time.time()))
+        counters = self.telemetry.counters if self.telemetry is not None else {}
+        return TEL.prom_text(cards, servers, host, counters=dict(counters), engine=dict(engine))
+
+    # ---- Home Assistant over MQTT (v3.1, tools/pxa_mqtt) ----------------------------------------
+    def mqtt_host_label(self):
+        """the name Home Assistant shows for this machine: the hostname, or PXA_CONTROL_MQTT_LABEL."""
+        return (os.environ.get("PXA_CONTROL_MQTT_LABEL") or socket.gethostname() or "pxa-control")
+
+    def mqtt_snapshot(self):
+        """the Live sampler's newest reading, shaped for the publisher: every card, every running
+        server (with the phase/model/slot count the row does not carry), the host, and the expert
+        map's learned-session count."""
+        self.live.touch()
+        cards, servers, host = self.live.latest(with_meta=True)
+        model_file = next((s.get("model_file") for s in servers if s.get("model_file")), None)
+        snap = {"cards": cards, "servers": servers, "host": host or {}}
+        try:
+            import pxa_expert_map as M                       # optional, like everywhere else in Control
+            st = M.status_dict(model_file)
+            # the KEY's presence is what says "there is a map to report on": with no module there is no
+            # map, and an "idle" published from an empty dict would claim one exists and is quiet.
+            snap["expert"] = {"sessions": st.get("sessions"), "learning": bool(st.get("learning"))}
+        except Exception:        # noqa: BLE001 - no expert map on this build/model: those entities are just absent
+            pass
+        return snap
+
+    def start_mqtt(self):
+        """start the Home Assistant publisher (off unless the settings say on). Publishing is
+        one thread on a plain socket; a broker that is down is recorded, never raised."""
+        if MQTT is None:
+            return None
+        with _cfg_lock:
+            self.mqtt_cfg = MQTT.settings(load_config())
+        if not self.mqtt_cfg["enabled"] or self.mqtt is not None:
+            return self.mqtt
+        if not self.mqtt_cfg.get("host"):
+            self.mqtt_error = "no broker host set"
+            return None
+        try:
+            p = MQTT.Publisher(self.mqtt_cfg, self.mqtt_snapshot, self.mqtt_host_label())
+            p.start()
+        except Exception as e:        # noqa: BLE001 - a bad setting must not take Control down
+            self.mqtt_error = f"{e.__class__.__name__}: {e}"
+            return None
+        self.mqtt, self.mqtt_error = p, None
+        return p
+
+    def stop_mqtt(self):
+        p, self.mqtt = self.mqtt, None
+        if p is not None:
+            p.stop()
+
+    def mqtt_status(self):
+        out = {"available": MQTT is not None, "settings": MQTT.public(self.mqtt_cfg) if MQTT else {},
+               "error": self.mqtt_error, "host_label": self.mqtt_host_label(),
+               "env": {k: os.environ.get(v) for k, v in (MQTT._ENV.items() if MQTT else ())
+                       if os.environ.get(v) is not None}}
+        if self.mqtt is not None:
+            out.update(self.mqtt.status())
+        return out
+
+    def set_mqtt(self, body):
+        """POST /api/mqtt/settings: change and persist the publisher's settings (an env var still wins)."""
+        if MQTT is None:
+            raise Invalid("the MQTT module is missing from this PXA Control: " + (MQTT_IMPORT_ERROR or ""))
+        body = body or {}
+        allowed = {k: body[k] for k in MQTT.DEFAULTS if k in body}
+        if "password" in body and body["password"] == "" and "password" not in allowed:
+            allowed["password"] = ""            # an explicit empty string clears the stored password
+        if not allowed:
+            raise Invalid("nothing to change: send one of " + ", ".join(MQTT.DEFAULTS))
+        if "base" in allowed and not MQTT.valid_topic_root(allowed["base"]):
+            raise Invalid("the base topic may not contain a space, '+' or '#', and may not start with '$'")
+        with _cfg_lock:
+            c = load_config()
+            m = dict(c.get("mqtt") or {})
+            m.update(allowed)
+            c["mqtt"] = MQTT.settings({"mqtt": m}, env={})
+            save_config(c)
+            new = MQTT.settings(c)
+        was = self.mqtt_cfg
+        self.mqtt_cfg = new
+        if not new["enabled"]:
+            self.stop_mqtt()
+        elif self.mqtt is None:
+            self.start_mqtt()
+        else:
+            p = self.mqtt
+            p.cfg = dict(new)
+            if (new["host"], new["port"], new["user"], new["password"], new["tls"], new["base"],
+                    new["prefix"]) != (was["host"], was["port"], was["user"], was["password"],
+                                       was["tls"], was["base"], was["prefix"]):
+                self.stop_mqtt()                # a changed link needs a fresh CONNECT: restart the thread
+                self.start_mqtt()
+        return self.mqtt_status()
+
+    def mqtt_test(self, body):
+        """POST /api/mqtt/test: connect to the broker as configured and prove the link with a
+        PINGREQ, publishing nothing -- so a test cannot leave a retained entity behind. Settings in
+        the body are tested instead of the saved ones, so the button works before you save."""
+        if MQTT is None:
+            raise Invalid("the MQTT module is missing from this PXA Control: " + (MQTT_IMPORT_ERROR or ""))
+        body = body or {}
+        cand = dict(self.mqtt_cfg)
+        cand.update({k: body[k] for k in MQTT.DEFAULTS if k in body})
+        if not body.get("password"):
+            cand["password"] = self.mqtt_cfg.get("password", "")   # keep the stored one when the page sent none
+        cand = MQTT.settings({"mqtt": cand}, env={})
+        if not cand.get("host"):
+            return {"ok": False, "error": "no broker host set"}
+        out = MQTT.test_connection(cand)
+        out["settings"] = MQTT.public(cand)
+        return out
+
+    # ---- GPU profiles (v3.1, tools/pxa_ctl) ------------------------------------------------------
+    def make_gpuctl(self, adapter=None):
+        """build the Profiles backend. It asks no driver anything until a page or a profile needs it."""
+        if CTL is None:
+            return None
+        try:
+            rows = None
+            if os.environ.get("PXA_LAUNCH_FAKE_GPUS"):
+                rows, _e = self.gpus()
+            ad = adapter or CTL_DRV.make_adapter(rows=rows)
+            self.gpuctl = CTL_SVC.GpuControl(config_dir(), CTL_SVC.settings_from(load_config()), adapter=ad,
+                                             launcher=AppLauncher(self))
+            self.gpuctl_error = None
+        except Exception as e:        # noqa: BLE001 - an unreadable config: Control works, the tab says why
+            self.gpuctl, self.gpuctl_error = None, f"{e.__class__.__name__}: {e}"
+        return self.gpuctl
+
+    def server_context(self, x=None, seat=None, healthy=False):
+        """the resolved context of a fleet instance or a seat (cached per port + pid: it cannot change while the process
+        lives). Read from the engine (/props, else its load log), never computed here."""
+        cache = self.__dict__.setdefault("_ctx_cache", {})
+        if seat is not None:
+            port, pid = seat.port(), (seat.proc.pid if seat.proc else None)
+            requested = (seat.req or {}).get("ctx")
+            arg = _argv_value(seat.cmd or [], "-c", "--ctx-size")
+            cards = (seat.req or {}).get("gpus")
+        else:
+            port, pid = x.get("port"), x.get("pid")
+            seat = self.seats.get(x["sid"]) if x.get("kind") == "managed" and x.get("sid") else None
+            if seat is not None and seat.running():
+                return self.server_context(seat=seat, healthy=healthy)
+            requested = x.get("ctx")
+            arg = x.get("ctx")
+            cards = x.get("gpus")
+        key = (port, pid)
+        probed = cache.get(key)
+        if probed is None and port and healthy:
+            probed = probe_ctx(port)
+            if probed:
+                if len(cache) > 64:
+                    cache.clear()
+                cache[key] = probed
+        log = None
+        if not probed and seat is not None:
+            with seat.cond:
+                lines = [ln for _q, ln in list(seat.log)[-4000:] if "n_ctx" in ln]
+            log = ctx_from_log(lines)
+        if not probed and not (log and log[0]) and not (seat is not None and seat.running()) and not port:
+            return None
+        return context_info(requested, arg, probed, log, cards)
+
+    def need_gpuctl(self):
+        if self.gpuctl is None:
+            raise Invalid("GPU profiles are not available in this PXA Control: " + (self.gpuctl_error or "tools/pxa_ctl missing"))
+        return self.gpuctl
+
+    def cards_by_index(self, indexes):
+        """[(uuid, index)] of the launcher's card indexes (a launch names cards by index)."""
+        rows, _e = self.gpus()
+        by = {g[0]: g[5] for g in rows}
+        return [(by.get(i, f"index-{i}"), i) for i in indexes]
+
+    def gpu_state(self):
+        """GET /api/gpu/state: the backend's state plus what only Control knows: who runs on each card, the speed of
+        the servers there (tok/s per watt), a power / temperature sparkline (the history store when it records, else
+        the Live tab's memory) and the saved servers an auto-start can name."""
+        g = self.need_gpuctl()
+        st = g.state()
+        self.live.touch()                         # keeps the in-memory sampler alive while the page is open (10 s steps)
+        try:
+            fl = self.fleet(max_age=15)
+        except Exception:             # noqa: BLE001
+            fl = {"cards": [], "instances": []}
+        users = {c["index"]: c for c in fl.get("cards") or []}
+        names = {x["key"]: (x.get("label") or x.get("name")) for x in fl.get("instances") or []}
+        now = time.time()
+        spark = self._gpu_spark([c["index"] for c in st["cards"]], now)
+        speed = self._gpu_speed(st["cards"], now)
+        for c in st["cards"]:
+            u = users.get(c["index"]) or {}
+            c["users"] = [{"name": names.get(x.get("key")) or x.get("name"), "mib": x.get("mib"), "key": x.get("key")}
+                          for x in u.get("users") or []]
+            c["other_mib"] = u.get("other_mib") or 0
+            c["other_names"] = u.get("other_names") or []
+            c["spark"] = spark.get(c["index"], [])
+            c["tps"], c["tps_per_w"] = speed.get(c["index"], (None, None))
+        prof = self.profiles()
+        st["servers"] = [{"sid": k, "name": v.get("name", k), "model": os.path.basename(str((v.get("settings") or {}).get("model") or "")),
+                          "gpus": (v.get("settings") or {}).get("gpus") or []} for k, v in sorted(prof.items())]
+        st["telemetry"] = self.telemetry is not None
+        return st
+
+    def _gpu_spark(self, indexes, now, span=3600, points=60):
+        out = {}
+        tel = self.telemetry
+        if tel is not None:
+            try:
+                d = tel.series("card", keys=[str(i) for i in indexes], since=now - span, until=now, max_points=points,
+                               cols=["power", "temp"])
+                for m in d.get("series") or []:
+                    out[int(m["key"])] = [[r[0], r[1], r[2]] for r in m["rows"]]
+            except Exception:         # noqa: BLE001 - no history: the in-memory rows below
+                out = {}
+        with self.live.lock:
+            for i in indexes:
+                if out.get(i):
+                    continue
+                rows = [r for r in self.live.cards.get(i, ()) if r[0] >= now - span]
+                step = max(1, len(rows) // points)
+                out[i] = [[round(r[0], 1), r[4], r[3]] for r in rows[::step]]
+        return out
+
+    def _gpu_speed(self, cards, now):
+        """{index: (tok/s on this card, tok/s per watt)}: each running server's decode speed shared over its cards by
+        their power draw (a server on two cards at 120 W and 80 W: 60 % / 40 %)."""
+        power = {c["index"]: c.get("power_w") for c in cards}
+        tps = {}
+        with self.live.lock:
+            for st in self.live.srv.values():
+                if not st.get("up") or not st["rows"] or now - st["rows"][-1][0] > 60:
+                    continue
+                dec = st["rows"][-1][1]
+                gp = []
+                for x in st["meta"].get("gpus") or []:
+                    try:
+                        gp.append(int(x))
+                    except (TypeError, ValueError):
+                        continue
+                tot = sum(power.get(i) or 0 for i in gp)
+                if not dec or not gp or tot <= 0:
+                    continue
+                for i in gp:
+                    tps[i] = tps.get(i, 0.0) + dec * (power.get(i) or 0) / tot
+        out = {}
+        for i, v in tps.items():
+            p = power.get(i)
+            out[i] = (round(v, 2), round(v / p, 4) if p else None)
+        return out
 
     # ---- rig ------------------------------------------------------------------------------
     def gpus(self, max_age=1.5):
@@ -2206,8 +3427,20 @@ class App(object):
         kvs = h.get("kv") or {}
         name = self.L.PXQ_GGML_TYPE.get(dom) or self.L.NON_PXQ_GGML_TYPE.get(dom) or (
             f"ggml type {dom}" if dom is not None else None)
+        quant = {k[len("pxa.quantizer."):]: v for k, v in kvs.items() if k.startswith("pxa.quantizer.")} or None
         d = {"params": params, "size_label": kvs.get("general.size_label"),
-             "name": kvs.get("general.name"), "dominant_type": name}
+             "name": kvs.get("general.name"), "dominant_type": name, "quantizer": quant}
+        try:
+            tp = TH.detect(arch=kvs.get("general.architecture"), name=kvs.get("general.name"),
+                           basename=kvs.get("general.basename"), template=kvs.get("tokenizer.chat_template"),
+                           path=path, params=params, size_label=kvs.get("general.size_label"))
+            d["thinking"] = {k: tp[k] for k in ("family", "label", "mechanism", "supported", "default", "can_disable",
+                                                 "partial_off", "levels", "summary", "detected_by", "confidence",
+                                                 "methods", "on_method", "off_method")}
+            d["thinking"]["budget"] = tp["budget"]["suggested"]
+            d["thinking"]["enforce"] = tp["budget"]["enforce"]
+        except Exception as e:      # noqa: BLE001 - a profile table problem must not hide the model list
+            d["thinking"] = {"family": "unknown", "supported": False, "summary": f"thinking profile error: {e}"}
         self._prof_cache[key] = d
         return d
 
@@ -2222,17 +3455,32 @@ class App(object):
             x = self._extra_facts(e["path"])
             tier = e.get("tier") or ""
             codec = "PXQN" if tier.startswith("PXQN") else ("PXQ" if tier.startswith("PXQ") else "other")
+            notice = ""
+            if not e.get("err"):
+                notice = self.L.standard_gguf_notice(
+                    e["path"], tier=e.get("tier"), tier_kv=e.get("tier_kv"), inspected=True)
             out.append({"path": e["path"], "file": os.path.basename(e["path"]), "size": e.get("size"),
                         "size_h": self.L.human_bytes(e.get("size")), "family": self.L.family_label(e),
                         "arch": e.get("arch"), "tier": tier or None, "codec": codec,
                         "type": tier or x.get("dominant_type"), "params": x.get("params"),
-                        "size_label": x.get("size_label"), "n_ctx_train": e.get("n_ctx_train"),
+                        "size_label": x.get("size_label"), "quantizer": x.get("quantizer"), "n_ctx_train": e.get("n_ctx_train"),
                         "vision": e.get("vision"), "err": e.get("err"),
                         "kv_bytes_tok": e.get("kv_bytes_tok"), "ple_bytes": e.get("ple_bytes"),
                         "ple": e.get("ple"), "shards_missing": e.get("shards_missing"),
-                        "n_expert": e.get("n_expert") or 0, "expert_bytes": e.get("expert_bytes") or 0})
+                        "n_expert": e.get("n_expert") or 0, "expert_bytes": e.get("expert_bytes") or 0,
+                        "thinking": x.get("thinking"), "notice": notice})
         self._models_cache = {"roots": roots, "models": out, "notes": notes}
         return self._models_cache
+
+    def _quant_notice(self, model):
+        """One line when this loaded model is a standard GGUF quant. Empty for a PXA quant
+        and when the name alone does not say which kind of file it is."""
+        if not isinstance(model, str) or not model.strip():
+            return ""
+        for e in ((self._models_cache or {}).get("models") or []):
+            if e.get("path") == model:
+                return e.get("notice") or ""
+        return self.L.standard_gguf_notice(model)
 
     def fits(self, model_entry, card_rows, ctx=0):
         """'fits' | 'tight' | 'ram' | 'no' for this model on these cards, from the launcher's
@@ -2359,6 +3607,181 @@ class App(object):
                 c["last_launch"] = req
             save_config(c)
 
+    # ---- thinking (per model: tools/pxa_thinking.py) ------------------------------------------
+    def thinking_for_model(self, path, verify=False):
+        """the full thinking profile of a model file (header read once, cached by size and mtime)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return TH.detect()
+        key = ("think", path, st.st_size, st.st_mtime_ns)
+        hit = self._prof_cache.get(key)
+        if hit is None:
+            h = self.L.gguf_header(path)
+            kv = h.get("kv") or {}
+            params = sum(t[2] for t in h.get("tensors") or [] if len(t) > 2) or None
+            tmpl = kv.get("tokenizer.chat_template")
+            hit = TH.detect(arch=kv.get("general.architecture"), name=kv.get("general.name"),
+                            basename=kv.get("general.basename"), template=tmpl, path=path, params=params,
+                            size_label=kv.get("general.size_label"))
+            hit["_template"] = tmpl
+            self._prof_cache[key] = hit
+        return self._with_verify(hit, verify)
+
+    def _with_verify(self, prof, verify):
+        out = {k: v for k, v in prof.items() if k != "_template"}
+        if verify:
+            if "_verify" not in prof:
+                prof["_verify"] = TH.verify_render(prof.get("_template"), prof) if prof.get("_template") else \
+                    {"ok": False, "error": "the model file carries no chat template"}
+            out["verify"] = prof["_verify"]
+        out.pop("_verify", None)
+        return out
+
+    def thinking_for_port(self, port, verify=False):
+        """the profile of a server this GUI did not start: its /props (template, model path)."""
+        try:
+            props = _http_json(port, "/props", timeout=3.0) or {}
+        except Exception:       # noqa: BLE001 - an old or busy server: decide from nothing (toggle hidden)
+            props = {}
+        props = props if isinstance(props, dict) else {}
+        tmpl = props.get("chat_template") if isinstance(props.get("chat_template"), str) else None
+        mp = props.get("model_path") if isinstance(props.get("model_path"), str) else ""
+        if mp.endswith(".gguf") and os.path.isfile(mp):
+            prof = self.thinking_for_model(mp, verify=verify)
+            if not tmpl or prof.get("template", {}).get("sha1") == TH.template_facts(tmpl)["sha1"]:
+                return prof
+            # the server renders another template (--chat-template-file): the server's own one wins
+        key = ("think-port", port, TH.template_facts(tmpl).get("sha1") if tmpl else None, mp)
+        hit = self._prof_cache.get(key)
+        if hit is None:
+            hit = TH.detect(template=tmpl, path=mp or None)
+            hit["_template"] = tmpl
+            self._prof_cache[key] = hit
+        return self._with_verify(hit, verify)
+
+    def thinking_overrides(self):
+        c = load_config()
+        t = c.get("thinking_models")
+        return t if isinstance(t, dict) else {}
+
+    def set_thinking_override(self, model, settings):
+        if not isinstance(model, str) or not model.endswith(".gguf") or len(model) > 4096 or "\x00" in model:
+            raise Invalid("thinking override: model must be a .gguf path")
+        clean = None if settings is None else clean_thinking(settings)
+        with _cfg_lock:
+            c = load_config()
+            t = c.get("thinking_models") if isinstance(c.get("thinking_models"), dict) else {}
+            if clean is None or thinking_is_default(clean):
+                t.pop(model, None)
+            else:
+                if model not in t and len(t) >= 512:
+                    raise Invalid("at most 512 per-model thinking settings")
+                t[model] = clean
+            c["thinking_models"] = t
+            save_config(c)
+        return clean
+
+    def thinking_settings_for(self, req):
+        """what a launch uses: the server's own setting, else the model's remembered one, else auto."""
+        t = req.get("thinking") or {}
+        if not thinking_is_default(t):
+            return t, "server"
+        o = self.thinking_overrides().get(req.get("model") or "")
+        if o:
+            return clean_thinking(o), "model"
+        return clean_thinking(None), "auto"
+
+    def thinking_launch(self, req):
+        try:
+            prof = self.thinking_for_model(req["model"])
+            st, src = self.thinking_settings_for(req)
+            args, notes = TH.launch_args(prof, st)
+        except Exception as e:      # noqa: BLE001 - never block a launch on the thinking profile
+            return {"args": [], "notes": [f"profile error ({e.__class__.__name__}: {e}); no thinking flags"],
+                    "family": "unknown", "settings": None, "source": "error"}
+        if args:
+            notes = [f"{prof['label']}: {' '.join(args)} (from the {src} setting)"] + notes
+        return {"args": args, "notes": notes, "family": prof["family"], "settings": st, "source": src,
+                "supported": prof["supported"]}
+
+    def _seat_on_port(self, port):
+        for sid, seat in list(self.seats.items()):
+            if seat.req and seat.running() and seat.port() == port:
+                return sid, seat
+        return None, None
+
+    def thinking_target(self, query, verify=False):
+        """-> (profile, settings, source, model) for ?model= | ?sid= | ?port= (or main/attach)."""
+        model = _q(query, "model")
+        if model:
+            if not os.path.isfile(model) or not model_path_ok(model, self.model_roots()):
+                raise Invalid("the model must be a file inside one of your model folders")
+            o = self.thinking_overrides().get(model)
+            return self.thinking_for_model(model, verify), clean_thinking(o), ("model" if o else "auto"), model
+        sid = _q(query, "sid")
+        seat = self.seats.get(sid) if sid else None
+        if seat is not None and seat.req and seat.running():
+            st, src = self.thinking_settings_for(seat.req)
+            return self.thinking_for_model(seat.req["model"], verify), st, src, seat.req["model"]
+        if sid and sid in self.profiles():
+            s = self.profiles()[sid].get("settings") or {}
+            if s.get("model"):
+                st, src = self.thinking_settings_for({"model": s["model"], "thinking": s.get("thinking")})
+                return self.thinking_for_model(s["model"], verify), st, src, s["model"]
+        port = self.target_port(query)
+        if not port:
+            raise Invalid("no server running")
+        msid, mseat = self._seat_on_port(port)
+        if mseat is not None:
+            st, src = self.thinking_settings_for(mseat.req)
+            return self.thinking_for_model(mseat.req["model"], verify), st, src, mseat.req["model"]
+        prof = self.thinking_for_port(port, verify)
+        return prof, clean_thinking(None), "auto", None
+
+    def thinking_info(self, query):
+        prof, st, src, model = self.thinking_target(query, verify=_q(query, "verify", "1") != "0")
+        eff = dict(st)
+        eff["budget_effective"] = TH.effective_budget(prof, st)
+        return {"profile": prof, "settings": st, "source": src, "model": model, "effective": eff,
+                "override": self.thinking_overrides().get(model) if model else None}
+
+    def thinking_rewrite(self, data, query):
+        """the engine proxy's hook: a chat body carrying pxa_thinking {mode, budget, level, fallback}
+        -> the body this model needs (pxa_thinking removed), and notes for an X-PXA-Thinking header."""
+        try:
+            body = json.loads(data.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            return data, None
+        if not isinstance(body, dict):
+            return data, None
+        if "pxa_thinking" not in body:
+            # the admin's effort selector (default off: no effort saved = byte-for-byte passthrough)
+            try:
+                prof, st, _src, _m = self.thinking_target(query)
+            except Exception:       # noqa: BLE001 - never block a chat on the thinking profile
+                return data, None
+            st = st or {}
+            if st.get("effort") and (st.get("lock") or not TH.client_thinking(body)):
+                body, notes = TH.apply_effort(body, prof, st)
+            elif "reasoning_effort" in body:
+                body, notes = TH.map_client_effort(body, prof)
+            else:
+                return data, None
+            return json.dumps(body).encode(), {"family": prof.get("family"), "label": prof.get("label"),
+                                               "notes": notes}
+        want = body.pop("pxa_thinking")
+        try:
+            want = want if isinstance(want, dict) else {}
+            st = clean_thinking({k: want.get(k) for k in ("mode", "budget", "level")})
+            prof, _st, _src, _m = self.thinking_target(query)
+            body, notes = TH.apply_request(body, prof, st["mode"], st["budget"], st["level"],
+                                           use_fallback=bool(want.get("fallback")))
+            info = {"family": prof["family"], "label": prof["label"], "notes": notes}
+        except Invalid as e:
+            info = {"family": "unknown", "notes": [f"not applied: {e}"]}
+        return json.dumps(body).encode(), info
+
     # ---- conflicts --------------------------------------------------------------------------
     def held_ports(self, except_sid=None):
         """{port: who} for every port another server of this GUI, or a discovered server, holds."""
@@ -2468,9 +3891,14 @@ class App(object):
                     else:
                         os.environ[k] = v
         cap.args = a
-        if cap.code == 0 and cap.value is not None and req.get("extra_args"):
+        cap.thinking = self.thinking_launch(req)
+        tail = list(cap.thinking["args"]) + list(req.get("extra_args") or [])
+        if tail:
+            cap.text = annotate_plan_text(cap.text, _flag_pairs(cap.thinking["args"], "PXA Control (thinking)")
+                                          + _flag_pairs(req.get("extra_args") or [], "YOURS (extra args)"))
+        if cap.code == 0 and cap.value is not None and tail:
             plan, cmd, env, cv, prof, ctx = cap.value
-            cap.value = (plan, list(cmd) + list(req["extra_args"]), env, cv, prof, ctx)
+            cap.value = (plan, list(cmd) + tail, env, cv, prof, ctx)
         return cap
 
     def validate(self, body, check_model=True, resolve_port=True, sid=None):
@@ -2489,10 +3917,16 @@ class App(object):
             full_env = dict(env, **self.L.device_env(cv)[0], **req["levers"])
             d.update({"engine": plan.engine, "command": " ".join(self.L.redact_cmd(cmd)),
                       "shell": shell_line(full_env, self.L.redact_cmd(cmd)),
-                      "env": dict(env, **req["levers"]), "cards": cv, "ctx": ctx, "port": req["port"],
+                      "env": dict(env, **req["levers"]), "cards": cv, "ctx": ctx,
+                      "ctx_auto": not req.get("ctx"), "port": req["port"],
                       "notes": list(plan.notes), "blockers": list(plan.blockers),
                       "sm": cap.args.sm, "np": cap.args.np, "workload": cap.args.workload,
                       "extra_args": req.get("extra_args") or []})
+        th = getattr(cap, "thinking", None)
+        if th:
+            d["thinking"] = th
+            if ok:
+                d["notes"] = d["notes"] + ["thinking: " + n for n in th["notes"]]
         if conflicts is not None:
             d["conflicts"] = conflicts
             if ok:
@@ -2528,6 +3962,8 @@ class App(object):
         cf = self.conflicts(req, sid)
         if cf["errors"]:
             raise Invalid("; ".join(cf["errors"]))
+        if self.gpuctl is not None and self.gpuctl.guard.locks():   # a reserved card, a race lock file, maintenance: 423
+            self.gpuctl.check_launch(self.cards_by_index(req["gpus"]), f"start server '{sid}'")
         cap = self._build(req, explain=False)
         if cap.code != 0 or cap.value is None:
             return {"ok": False, "exit": cap.code, "text": cap.text, "sid": sid}
@@ -2597,6 +4033,10 @@ class App(object):
             d["health_detail"] = detail
             if h == "ok" and d["running"]:
                 d["phase"] = "serving"
+        try:
+            d["context"] = self.server_context(seat=seat, healthy=d.get("health") == "ok") if d["running"] else None
+        except Exception:            # noqa: BLE001
+            d["context"] = None
         return d
 
     # ---- the fleet dashboard ----------------------------------------------------------------
@@ -2699,6 +4139,7 @@ class App(object):
             if argv:
                 x["cmd"] = " ".join(self.L.redact_cmd(argv))
             x["model_file"] = os.path.basename(x["model"]) if isinstance(x.get("model"), str) else None
+            x["quant_notice"] = self._quant_notice(x.get("model"))
         names = {}
         for pid, _g, _m in apps:
             argv = (table.get(pid) or (0, []))[1]
@@ -2721,6 +4162,11 @@ class App(object):
             h, detail = probe_health(x["port"])
             x["health"], x["slots_idle"], x["slots_processing"] = h, detail.get("slots_idle"), detail.get("slots_processing")
             x["metrics"] = probe_metrics(x["port"]) if h == "ok" else {}
+            x["models"] = probe_registered_models(x["port"]) if h == "ok" else None
+            try:
+                x["context"] = self.server_context(x, healthy=(h == "ok"))
+            except Exception:        # noqa: BLE001 - the context line is information, never a reason to fail the scan
+                x["context"] = None
             if h == "ok" and x["kind"] == "managed":
                 x["phase"] = "serving"          # same word as /api/status uses
         ths = [threading.Thread(target=probe, args=(x,), daemon=True) for x in live]
@@ -2977,7 +4423,54 @@ class App(object):
                          "throttle_reasons": reasons if reasons is not None else [f[8]]})
         return rows
 
-    REPORT_BUDGET_S = {"gpus": 8, "rig": 5, "telemetry": 8}     # per slow source, seconds
+    REPORT_BUDGET_S = {"gpus": 8, "rig": 5, "telemetry": 8, "engine": 6}     # per slow source, seconds
+
+    @staticmethod
+    def parse_engine_version(text):
+        """'4711 (abc1234)' from the engine's 'build: ...' / 'version: ...' lines, or None."""
+        for ln in (text or "").splitlines():
+            m = re.search(r"^\s*(?:build|version)\s*[:=]\s*(\S.*)", ln, re.I)
+            if m:
+                return m.group(1).strip()[:80]
+        return None
+
+    def engine_version_probe(self, sid="main"):
+        """the version of the llama-server binary a seat runs (or the detected engine), from `--version`;
+        cached per binary and mtime. For reports whose log no longer holds the build line and whose server is
+        down or still loading: 9 of the 17 Discord reports read on 2026-10-06 said 'engine: unknown'."""
+        seat = self.seats.get(sid) or self.seat
+        exe = None
+        if seat.cmd and isinstance(seat.cmd[0], str) and os.path.isfile(seat.cmd[0]):
+            exe = seat.cmd[0]
+        else:
+            st = self._rig_cache[1] or {}
+            E = st.get("engine_dir")
+            if E and os.path.isfile(f"{E}/bin/llama-server"):
+                exe = f"{E}/bin/llama-server"
+        if not exe:
+            return None
+        try:
+            key = (os.path.realpath(exe), os.path.getmtime(exe))
+        except OSError:
+            return None
+        cache = self.__dict__.setdefault("_engine_ver_cache", {})
+        if key in cache:
+            return cache[key]
+        env = dict(os.environ)
+        try:
+            E = os.path.dirname(os.path.dirname(os.path.realpath(exe)))
+            env["LD_LIBRARY_PATH"], _ = self.L.engine_ld_path(E)
+        except Exception:
+            pass
+        try:
+            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10, env=env,
+                               stdin=subprocess.DEVNULL, errors="replace")
+            ver = self.parse_engine_version((r.stdout or "") + "\n" + (r.stderr or ""))
+        except Exception:
+            ver = None
+        if ver:
+            cache[key] = ver
+        return ver
 
     def report_bundle(self, sid=None):
         """The whole report, already redacted, exactly as the page will show it (and send it).
@@ -2989,7 +4482,7 @@ class App(object):
         with seat.cond:
             log = [x[1] for x in seat.log]
         banner = [ln for ln in log if BANNER_RE.search(ln)][:40]
-        build = [ln for ln in log if BUILD_RE.match(ln.strip())][:6]
+        build = list(seat.build_lines[:6]) or [ln for ln in log if BUILD_RE.match(ln.strip())][:6]
         version = "unknown"
         for ln in build:
             m = re.search(r"(?:build|version)\s*[:=]\s*(\S.*)", ln, re.I)
@@ -3006,6 +4499,10 @@ class App(object):
                             version = str(bi)[:80]
             except Exception:
                 pass
+        if version == "unknown":        # the build line left the log ring and the server is down or still loading
+            v = bounded(lambda: self.engine_version_probe(sid), self.REPORT_BUDGET_S.get("engine", 6), None)
+            if v:
+                version = v + " (from --version)"
         rows, _err = bounded(self.gpus, self.REPORT_BUDGET_S["gpus"], ([], "timed out"))
         if not rows and _err == "timed out":
             notes.append(f"nvidia-smi did not answer within {self.REPORT_BUDGET_S['gpus']} s (driver busy or hung)")
@@ -3052,8 +4549,23 @@ class App(object):
             "benchmarks": bench,
             "other_servers": others,
             "collection_notes": notes,
+            "heat_24h": self._heat_24h(),
         }
         return {"version": CONTROL_VERSION, "app": "pxa-control", "bundle": redact_obj(bundle), "contact": ""}
+
+    def _heat_24h(self):
+        """Max temperature, minutes at or above 80 C, and throttle-reason counts, last 24 h.
+
+        From the history store (the same samples the Live tab graphs). Empty when the store is off
+        or has not been written yet. Bounded so a stuck disk does not stall Report a problem.
+        """
+        tel = getattr(self, "telemetry", None)
+        if tel is None:
+            return {"cards": [], "note": "history store is off"}
+        summary = bounded(lambda: tel.heat_summary(), 1.5, None)
+        if summary is None:
+            return {"cards": [], "note": "history store did not answer within 1.5 s"}
+        return summary
 
     def report_send(self, body):
         """POST the payload the user saw (and maybe edited) to the intake. Only ever called from a Send click."""
@@ -3634,8 +5146,33 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/encode.css": ("encode.css", "text/css; charset=utf-8"),
           "/live.js": ("live.js", "application/javascript; charset=utf-8"),
           "/live.css": ("live.css", "text/css; charset=utf-8"),
+          "/profiles.js": ("profiles.js", "application/javascript; charset=utf-8"),
+          "/profiles.css": ("profiles.css", "text/css; charset=utf-8"),
+          "/mqtt.js": ("mqtt.js", "application/javascript; charset=utf-8"),
           "/mark.png": ("mark.png", "image/png"),
           "/favicon.png": ("mark.png", "image/png")}
+# the Chat tab's Classic view: chat.js (the PXAChat core) and its plugins chat-<name>.js / .css
+# (tools/pxa_control_ui/CHAT-PLUGINS.md). The Assistant view's agent-<name> plugins are registered
+# by pxa_chat.register, not here.
+CHAT_PLUGINS = ("history", "markdown", "actions", "stream", "attach", "params", "context", "ux")
+for _n in ("chat",) + tuple("chat-" + p for p in CHAT_PLUGINS):
+    STATIC["/" + _n + ".js"] = (_n + ".js", "application/javascript; charset=utf-8")
+    STATIC["/" + _n + ".css"] = (_n + ".css", "text/css; charset=utf-8")
+
+
+_REQ = threading.local()          # who is asking, for the GPU audit log (never a token)
+
+
+def req_who():
+    return getattr(_REQ, "who", None) or "api"
+
+
+def err_body(msg, code="invalid", status=400, detail=None):
+    """every error PXA Control answers: {"error": human text, "code": machine word, "status": http status}"""
+    d = {"error": str(msg), "code": code, "status": status}
+    if detail is not None:
+        d["detail"] = detail
+    return d
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -3686,8 +5223,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """-> (ok, set_cookie). Token from cookie, X-PXA-Token header or ?token=."""
         if not self.app.token:
             return True, False
+        auth = self.headers.get("Authorization") or ""
+        bearer = auth[7:].strip() if auth[:7].lower() == "bearer " else None     # a Prometheus scrape job
         for cand, from_query in ((self._cookie_token(), False), (self.headers.get("X-PXA-Token"), False),
-                                 ((query.get("token") or [None])[0], True)):
+                                 (bearer, False), ((query.get("token") or [None])[0], True)):
             if cand and hmac.compare_digest(str(cand), self.app.token):
                 return True, from_query
         return False, False
@@ -3718,9 +5257,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         n = content_length(self.headers, MAX_BODY)
         raw = self.rfile.read(n) if n else b"{}"
         try:
-            return json.loads(raw.decode("utf-8") or "{}")
+            body = json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
             raise Invalid("request body is not JSON")
+        if not isinstance(body, dict):              # every route reads fields: a list or a number was a 500 before
+            raise Invalid("request body must be a JSON object")
+        return body
 
     def _login_page(self):
         return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
@@ -3752,13 +5294,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         path, query = u.path, urllib.parse.parse_qs(u.query)
         if not self._host_ok():
-            return self._send(421, {"error": "unexpected Host header"})
+            return self._send(421, err_body("unexpected Host header", "bad_host", 421))
         ok, set_cookie = self._auth(query)
         if not ok:
+            if path == "/metrics":
+                return self._send(401, "token required (Authorization: Bearer <token>)\n", "text/plain; charset=utf-8")
             if method == "GET" and not path.startswith("/api/"):
                 return self._send(401, self._login_page(), "text/html; charset=utf-8")
-            return self._send(401, {"error": "token required"})
-        self.app.last_request = time.time()     # a page is looking: a background Control stays up
+            return self._send(401, err_body("token required", "unauthorized", 401))
+        self.app.last_request = time.time()
+        _REQ.who = f"page {self.client_address[0]}" if self.client_address else "api"     # a page is looking: a background Control stays up
         if set_cookie and method == "GET":
             # drop the token from the address bar once it is in a cookie
             q = {k: v for k, v in query.items() if k != "token"}
@@ -3770,7 +5315,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         if method != "GET" and not self._origin_ok():
-            return self._send(403, {"error": "cross-origin request refused"})
+            return self._send(403, err_body("cross-origin request refused", "cross_origin", 403))
         try:
             if method == "GET" and path in STATIC:
                 fn, ctype = STATIC[path]
@@ -3786,18 +5331,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._log_stream(query)
             route = ROUTES.get((method, path))
             if route is None:
-                return self._send(404, {"error": "not found"})
+                if any(p == path for (_m, p) in ROUTES):
+                    return self._send(405, err_body(f"{method} is not allowed on {path}", "method_not_allowed", 405))
+                return self._send(404, err_body("not found", "not_found", 404))
             body = self._json_body() if method in ("POST", "DELETE") else None
             res = route(self.app, body, query)
+            if hasattr(res, "stream_to"):          # a live event stream (the chat agent's /api/chat/events)
+                return res.stream_to(self)
+            if isinstance(res, Reply):
+                return self._send(res.code, res.body, res.ctype, res.extra)
             return self._send(200, res)
         except Invalid as e:
-            return self._send(400, {"error": str(e)})
+            return self._send(getattr(e, "status", 400), err_body(e, getattr(e, "code", "invalid"), getattr(e, "status", 400)))
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as e:
+            if CTL_ERRORS and isinstance(e, CTL_ERRORS):      # the Profiles backend's refusals: locked 423, forbidden 403, ...
+                return self._send(e.status, err_body(e, e.code, e.status, getattr(e, "detail", None)))
             import traceback
             traceback.print_exc()
-            return self._send(500, {"error": f"{e.__class__.__name__}: {e}"})
+            return self._send(500, err_body(f"{e.__class__.__name__}: {e}", "internal", 500))
 
     # ---- SSE log --------------------------------------------------------------------------
     def _log_stream(self, query):
@@ -3840,6 +5393,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fwd = urllib.parse.urlencode({k: v for k, v in query.items() if k not in ("sid", "port", "token")}, doseq=True)
         url = f"http://127.0.0.1:{port}/{sub}" + (("?" + fwd) if fwd and method == "GET" else "")
         data = None
+        think_info = None
         hdr = {"Accept": self.headers.get("Accept") or "*/*"}
         if method == "POST":
             try:
@@ -3848,6 +5402,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(413 if "large" in str(e) else 400, {"error": str(e)})
             data = self.rfile.read(n)
             hdr["Content-Type"] = "application/json"
+            if sub == "v1/chat/completions":
+                data, think_info = self.app.thinking_rewrite(data, query)
         req = urllib.request.Request(url, data=data, headers=hdr, method=method)
         try:
             r = urllib.request.urlopen(req, timeout=900)
@@ -3868,10 +5424,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pass
             if sub == "pxa/speed":
                 ctype = "text/html; charset=utf-8"
-            return self._send(r.status, body, ctype)
+            return self._send(r.status, body, ctype, extra=_think_header(think_info))
         self.send_response(r.status)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
+        for k, v in _think_header(think_info).items():
+            self.send_header(k, v)
         self.end_headers()
         tail = b""
         try:
@@ -3899,12 +5457,304 @@ def _q(query, k, default=None):
     return (query.get(k) or [default])[0]
 
 
+def _think_header(info):
+    """X-PXA-Thinking: what the proxy did to a chat body (ASCII JSON, bounded)."""
+    if not info:
+        return {}
+    return {"X-PXA-Thinking": json.dumps(info, ensure_ascii=True, separators=(",", ":"))[:2000]}
+
+
+def r_thinking(app, body, query):
+    return app.thinking_info(query)
+
+
+def r_thinking_override(app, body, query):
+    body = body or {}
+    return {"model": body.get("model"), "saved": app.set_thinking_override(body.get("model"), body.get("thinking"))}
+
+
+def r_thinking_table(app, body, query):
+    t = TH.load_table()
+    return {"version": t.get("version"), "note": t.get("note"), "answer_reserve": t.get("answer_reserve"),
+            "families": [{k: f.get(k) for k in ("id", "label", "mechanism", "default", "levels", "budget", "source")}
+                         for f in t["families"]]}
+
+
+
+def _pxa_update_bin():
+    """the pxa-update binary shipped next to this install, or none."""
+    env = os.environ.get("PXA_UPDATE_BIN")
+    if env and os.path.isfile(env) and os.access(env, os.X_OK):
+        return env
+    for c in (os.path.join(HERE, "pxa-update"), os.path.join(os.path.dirname(HERE), "bin", "pxa-update")):
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _pxa_update_check(bin):
+    p = subprocess.run([bin, "check"], capture_output=True, text=True, timeout=40)
+    line = ""
+    if p.stdout:
+        lines = [x for x in p.stdout.splitlines() if x.startswith("current=")]
+        line = lines[-1] if lines else ""
+    info = {"ok": p.returncode == 0, "binary": True, "update": False}
+    for part in line.split():
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k in ("current", "latest"):
+                info[k] = v
+            elif k == "update":
+                info["update"] = v == "yes"
+    if p.returncode != 0:
+        info["error"] = ((p.stderr or "could not check for an update").strip())[:300]
+    return info
+
+
+def r_pxa_update(app, body, query):
+    """GET /api/update: ask the pxa-update binary. Python does not download anything."""
+    n = len([s for s in app.seats.values() if s.running()])
+    b = _pxa_update_bin()
+    if not b:
+        return {"ok": True, "binary": False, "update": False, "servers_running": n}
+    info = _pxa_update_check(b)
+    info["servers_running"] = n
+    return info
+
+
+def r_pxa_update_apply(app, body, query):
+    """POST /api/update/apply: run pxa-update apply. Refuses while a server is running."""
+    if any(s.running() for s in app.seats.values()):
+        e = Invalid("Stop the running servers first. PXA will not restart them.")
+        e.status, e.code = 409, "servers_running"
+        raise e
+    b = _pxa_update_bin()
+    if not b:
+        e = Invalid("pxa-update is not in this install")
+        e.status, e.code = 404, "no_updater"
+        raise e
+    try:
+        p = subprocess.run([b, "apply"], capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        e = Invalid("The update took too long and was stopped. Try again.")
+        e.status, e.code = 504, "update_timeout"
+        raise e
+    if p.returncode != 0:
+        e = Invalid(((p.stderr or p.stdout or "update failed").strip())[:400])
+        e.status, e.code = (409 if p.returncode == 2 else 500), "update_failed"
+        raise e
+    return {"ok": True, "output": (p.stdout or "").strip()[:400]}
+
+
+def r_lib_update(app, body, query):
+    """GET /api/lib/update: the licensed library's update state. ?check=1 asks the licence server now, otherwise the
+    cached answer is returned and the poller refreshes it in the background."""
+    app.lib.touch()
+    if str(_q(query, "check", "")).lower() in ("1", "true", "yes", "on"):
+        return app.lib.check(force=True)
+    return app.lib.status()
+
+
+def r_lib_update_apply(app, body, query):
+    """POST /api/lib/update/apply: install the newest release on the channel. Refuses while a server is running, on a
+    refused or unverifiable manifest, and on an engine older than the release asks for."""
+    app.lib.touch()
+    return app.lib.apply(channel=(_b(body).get("channel") or None))
+
+
+def r_lib_update_rollback(app, body, query):
+    """POST /api/lib/update/rollback: put back the previous library, or the one the engine shipped."""
+    app.lib.touch()
+    return app.lib.rollback()
+
+
+def r_lib_update_settings(app, body, query):
+    """POST /api/lib/update/settings {channel, auto}: the channel this install follows and whether a newer release is
+    applied without asking. Both are off until set; the beta channel is still refused by the server for a key without
+    the valued role."""
+    app.lib.touch()
+    b = _b(body)
+    ch, auto = b.get("channel"), b.get("auto")
+    if ch is not None and ch not in LIB_CHANNELS:
+        raise Invalid("channel must be one of: %s" % ", ".join(LIB_CHANNELS))
+    if auto is not None and not isinstance(auto, bool):
+        raise Invalid("auto must be true or false")
+    app.lib.cfg_set(channel=ch, auto=auto)
+    return app.lib.status()
+
+
+def r_expert_map(app, body, query):
+    """GET /api/expert-map: the adaptive map, in plain words, and where it stands."""
+    import pxa_expert_map as M
+    model = _q(query, "model", "") or ""
+    return M.status_dict(model or None)
+
+
+def r_expert_map_rebuild(app, body, query):
+    """POST /api/expert-map/rebuild: start from the curated csv. Calibration is the builder."""
+    import pxa_expert_map as M
+    body = body or {}
+    model = body.get("model") or ""
+    curated = body.get("curated") or ""
+    dest = body.get("dest") or (M.beside_model(model) if model else "")
+    if model and curated:
+        try:
+            M.curated_start(model, curated, dest)
+        except ValueError as e:
+            err = Invalid(str(e))
+            err.status, err.code = 400, "bad_map"
+            raise err
+    out = M.status_dict(model or None, dest or None)
+    out["ok"] = True
+    out["note"] = (
+        "The curated map is the starting point. Each calibration pass is measured. "
+        "The builder stops when decode speed stops rising and keeps the fastest map. "
+        "Leave online adapt on after that."
+    )
+    return out
+
+
+def r_expert_map_reset(app, body, query):
+    """POST /api/expert-map/reset: drop learned counts. The curated file stays."""
+    import pxa_expert_map as M
+    body = body or {}
+    model = body.get("model") or ""
+    if not model:
+        err = Invalid("name the model")
+        err.status, err.code = 400, "bad_map"
+        raise err
+    try:
+        M.reset_learned([M.learned_beside(model), M.cache_learned(model)])
+    except ValueError as e:
+        err = Invalid(str(e))
+        err.status, err.code = 400, "bad_map"
+        raise err
+    out = M.status_dict(model)
+    out["ok"] = True
+    out["note"] = "Learned counts cleared. The map that shipped with the model is unchanged."
+    return out
+
+
+def r_health(app, body, query):
+    """GET /api/health: is this Control alive and what can it do. Cheap: no nvidia-smi call, no server probe."""
+    seats = [s for s in app.seats.values() if s.running()]
+    d = {"ok": True, "control_version": CONTROL_VERSION, "pid": os.getpid(), "uptime_s": round(time.time() - app.started_at, 1),
+         "servers_running": len(seats), "nvidia_smi": shutil_which("nvidia-smi") is not None,
+         "telemetry": {"available": TEL is not None, "recording": app.telemetry is not None},
+         "encode": ENC is not None, "gpu_profiles": None, "errors": []}
+    if app.gpuctl is not None:
+        try:
+            d["gpu_profiles"] = app.gpuctl.health()
+        except Exception as e:        # noqa: BLE001 - health answers even when the backend is broken
+            d["errors"].append(f"gpu profiles: {e.__class__.__name__}: {e}")
+    elif app.gpuctl_error:
+        d["errors"].append("gpu profiles: " + app.gpuctl_error)
+    return d
+
+
+def _limit(query, default=200, hi=2000):
+    v = _q(query, "limit", str(default))
+    if not str(v).isdigit():
+        raise Invalid("limit: a whole number")
+    return max(1, min(hi, int(v)))
+
+
+def r_gpu_state(app, body, query):
+    return app.gpu_state()
+
+
+def r_gpu_profiles(app, body, query):
+    g = app.need_gpuctl()
+    return {"profiles": list(g.store.profiles().values()), "presets": CTL.store.PRESETS}
+
+
+def r_gpu_profile_save(app, body, query):
+    return {"profile": app.need_gpuctl().save_profile(body, who=req_who())}
+
+
+def r_gpu_profile_delete(app, body, query):
+    return app.need_gpuctl().delete_profile(body, who=req_who())
+
+
+def r_gpu_plan(app, body, query):
+    return app.need_gpuctl().plan(body)
+
+
+def r_gpu_apply(app, body, query):
+    return app.need_gpuctl().apply(body, who=req_who())
+
+
+def r_gpu_reset(app, body, query):
+    return app.need_gpuctl().reset(body, who=req_who())
+
+
+def r_gpu_reserve(app, body, query):
+    return app.need_gpuctl().reserve(body, who=req_who())
+
+
+def r_gpu_maintenance(app, body, query):
+    return app.need_gpuctl().maintenance(body, who=req_who())
+
+
+def r_gpu_quiet(app, body, query):
+    return app.need_gpuctl().quiet(body, who=req_who())
+
+
+def r_gpu_audit(app, body, query):
+    return app.need_gpuctl().audit_read(limit=_limit(query))
+
+
+def r_gpu_export(app, body, query):
+    d = app.need_gpuctl().export()
+    return Reply(json.dumps(d, indent=1), "application/json; charset=utf-8",
+                 extra={"Content-Disposition": 'attachment; filename="pxa-gpu-profiles.json"'})
+
+
+def r_gpu_import(app, body, query):
+    return app.need_gpuctl().import_(body, who=req_who())
+
+
+def r_gpu_schedules(app, body, query):
+    return app.need_gpuctl().set_schedules(body, who=req_who())
+
+
+def r_gpu_supervisor(app, body, query):
+    return app.need_gpuctl().supervisor_action(body, who=req_who())
+
+
+def r_gpu_undo(app, body, query):
+    return app.need_gpuctl().undo(body, who=req_who())
+
+
+def r_gpu_ui(app, body, query):
+    """POST /api/gpu/ui {"mode": "simple" | "advanced"}: the Profiles page's Simple / Advanced switch, remembered in
+    control.json (the page also keeps it per browser)."""
+    mode = (body or {}).get("mode")
+    if mode not in ("simple", "advanced"):
+        raise Invalid("mode: simple or advanced")
+    with _cfg_lock:
+        c = load_config()
+        c["ui_mode"] = mode
+        save_config(c)
+    if app.gpuctl is not None:
+        app.gpuctl.settings["ui_mode"] = mode
+    return {"mode": mode}
+
+
+def r_gpu_power(app, body, query):
+    return app.need_gpuctl().set_power(body, who=req_who())
+
+
+def r_gpu_clocks(app, body, query):
+    return app.need_gpuctl().clocks(_q(query, "uuid"))
+
+
 def r_info(app, body, query):
     return {"version": 1, "control_version": CONTROL_VERSION, "lan": app.lan, "port": app.port,
             "companion": app.companion, "idle_exit_s": app.idle_s if app.companion else None,
             "catalog_src": app.catalog_src, "levers": len(app.catalog), "kv_types": KV_TYPES,
             "split_modes": SPLIT_MODES, "config": config_path(), "docker": docker_bin() is not None,
-            "extra_flags": sorted(EXTRA_FLAGS)}
+            "extra_flags": sorted(EXTRA_FLAGS), "thinking": True}
 
 
 def r_rig(app, body, query):
@@ -3918,6 +5768,26 @@ def r_rig_live(app, body, query):
 
 def r_doctor(app, body, query):
     return app.doctor(force=_q(query, "force") == "1")
+
+
+def r_companions(app, body, query):
+    """Drafter next to the chosen model, and whether --hot-model may be offered for these cards."""
+    model = _q(query, "model") or ""
+    raw = _q(query, "gpus") or ""
+    want = set()
+    for part in raw.replace(",", " ").split():
+        try:
+            want.add(int(part))
+        except ValueError:
+            raise Invalid("card %r is not an index" % part)
+    rows, _err = app.gpus()
+    sel = [g for g in rows if g[0] in want] if want else []
+    drafters = []
+    if isinstance(model, str) and model.endswith(".gguf") and os.path.isfile(model):
+        sib = app.L.gemma4_assistant_siblings(model)
+        if sib:
+            drafters.append({"path": sib, "file": os.path.basename(sib)})
+    return {"drafters": drafters, "vmm": bool(sel) and app.L.vmm_offered(sel)}
 
 
 def r_models(app, body, query):
@@ -3936,8 +5806,14 @@ def r_fits(app, body, query):
 
 
 def r_levers(app, body, query):
+    names = app.catalog_names
+    every, preset = getattr(names, "every", set()), getattr(names, "preset", set())
+    # built-in levers set where Control was started (the Flash-Next preset's env): counted, not named; they reach the
+    # server through the inherited environment
+    env_on = sum(1 for k, v in os.environ.items() if v and isinstance(names, LeverNames) and names.builtin(k))
     return {"src": app.catalog_src,
-            "levers": [dict(r, kind=lever_kind(r), default_state=lever_default_state(r)) for r in app.catalog]}
+            "levers": [dict(r, kind=lever_kind(r), default_state=lever_default_state(r)) for r in app.catalog],
+            "builtin": {"hashes": sorted(every), "preset": sorted(preset), "env_on": env_on}}
 
 
 def r_levers_lint(app, body, query):
@@ -4013,6 +5889,103 @@ def r_live(app, body, query):
     since = _num(_q(query, "since"))
     since = None if since is None else min(max(since, now - LIVE_KEEP_S), now)
     return app.live.snapshot(since, max(0.0, min(_num(_q(query, "step")) or 0.0, 600.0)))
+
+
+def _tel(app):
+    if app.telemetry is None:
+        if app.tel_cfg.get("enabled") and not app.tel_error:
+            raise Invalid("this PXA Control does not record history (it was started without it)")
+        raise Invalid("the telemetry history is off" + (f" ({app.tel_error})" if app.tel_error else "") +
+                      ": turn it on with POST /api/telemetry/settings {\"enabled\": true} or unset PXA_CONTROL_TELEMETRY=0")
+    return app.telemetry
+
+
+def _tel_args(query):
+    keys = [k for k in (_q(query, "key") or "").split(",") if k.strip()] or None
+    return keys, _num(_q(query, "since")), _num(_q(query, "until")), _num(_q(query, "step"))
+
+
+def r_tel_status(app, body, query):
+    """GET /api/telemetry: is the history on, where it lives, how big, which series it holds."""
+    st = app.telemetry_status()
+    if app.telemetry is not None:
+        try:
+            st["series_list"] = app.telemetry.list_series()
+        except Exception as e:        # noqa: BLE001
+            st["series_list"] = []
+            st["error"] = st.get("error") or str(e)
+    return st
+
+
+def r_tel_series(app, body, query):
+    """GET /api/telemetry/series?kind=card|server|host&key=a,b&since=&until=&step=&points=&source=auto|raw|1m"""
+    keys, since, until, step = _tel_args(query)
+    kind = _q(query, "kind", "card")
+    if kind not in ("card", "server", "host"):
+        raise Invalid("kind must be card, server or host")
+    pts = int(min(max(_num(_q(query, "points")) or 600, 10), 5000))
+    src = _q(query, "source", "auto")
+    if src not in ("auto", "raw", "1m"):
+        raise Invalid("source must be auto, raw or 1m")
+    return _tel(app).series(kind, keys, since, until, step, max_points=pts, source=src)
+
+
+def r_tel_history(app, body, query):
+    """GET /api/telemetry/history?since=&until=&points=: cards, servers and the host in the shape the Live tab draws."""
+    st = _tel(app)
+    _k, since, until, step = _tel_args(query)
+    pts = int(min(max(_num(_q(query, "points")) or 600, 10), 5000))
+    c = st.series("card", None, since, until, step, max_points=pts)
+    s = st.series("server", None, since, until, step, max_points=pts)
+    h = st.series("host", None, since, until, step, max_points=pts)
+    return {"ts": time.time(), "since": c["since"], "until": c["until"], "step": c["step"], "source": c["source"],
+            "cols": {"card": c["cols"], "server": s["cols"], "host": h["cols"]},
+            "cards": c["series"], "servers": s["series"], "host": (h["series"] or [None])[0]}
+
+
+def r_tel_requests(app, body, query):
+    """GET /api/telemetry/requests?key=&since=&until=&limit=: every finished request the store kept (raw retention)."""
+    keys, since, until, _s = _tel_args(query)
+    return _tel(app).requests(keys, since, until, int(_num(_q(query, "limit")) or 2000))
+
+
+def r_tel_csv(app, body, query):
+    """GET /api/telemetry/csv?kind=card|server|host|requests&key=&since=&until=&step=: a spreadsheet download."""
+    keys, since, until, step = _tel_args(query)
+    kind = _q(query, "kind", "card")
+    if kind not in ("card", "server", "host", "requests"):
+        raise Invalid("kind must be card, server, host or requests")
+    text = _tel(app).csv_text(kind, keys, since, until, step, source=_q(query, "source", "auto"))
+    name = "pxa-telemetry-%s-%s.csv" % (kind, time.strftime("%Y%m%d-%H%M", time.localtime()))
+    return Reply(text, "text/csv; charset=utf-8", extra={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+def r_tel_settings(app, body, query):
+    return app.set_telemetry(body)
+
+
+def r_metrics(app, body, query):
+    """GET /metrics: Prometheus text, only when the history's prometheus setting (or PXA_CONTROL_METRICS=1) is on."""
+    if TEL is None or not app.tel_cfg.get("prometheus"):
+        return Reply("PXA Control /metrics is off: set PXA_CONTROL_METRICS=1 or POST /api/telemetry/settings "
+                     "{\"prometheus\": true}\n", "text/plain; charset=utf-8", code=404)
+    return Reply(app.metrics_text(), "text/plain; version=0.0.4; charset=utf-8")
+
+
+def r_mqtt_status(app, body, query):
+    """GET /api/mqtt: is the Home Assistant publisher on, is it connected, what has it published."""
+    return app.mqtt_status()
+
+
+def r_mqtt_settings(app, body, query):
+    """POST /api/mqtt/settings: turn the publisher on/off and set the broker. The password is stored
+    and reported as `password_set` only, never echoed back."""
+    return app.set_mqtt(body)
+
+
+def r_mqtt_test(app, body, query):
+    """POST /api/mqtt/test: connect to the broker and prove the link, publishing nothing."""
+    return app.mqtt_test(body)
 
 
 def r_fleet_adopt(app, body, query):
@@ -4212,6 +6185,7 @@ ROUTES = {
     ("GET", "/api/rig/live"): r_rig_live,
     ("GET", "/api/doctor"): r_doctor,
     ("GET", "/api/models"): r_models,
+    ("GET", "/api/launch/companions"): r_companions,
     ("POST", "/api/models/dirs"): r_model_dirs,
     ("POST", "/api/models/fits"): r_fits,
     ("GET", "/api/levers"): r_levers,
@@ -4221,6 +6195,16 @@ ROUTES = {
     ("DELETE", "/api/servers"): r_server_delete,
     ("GET", "/api/fleet"): r_fleet,
     ("GET", "/api/live"): r_live,
+    ("GET", "/api/telemetry"): r_tel_status,
+    ("GET", "/api/telemetry/series"): r_tel_series,
+    ("GET", "/api/telemetry/history"): r_tel_history,
+    ("GET", "/api/telemetry/requests"): r_tel_requests,
+    ("GET", "/api/telemetry/csv"): r_tel_csv,
+    ("POST", "/api/telemetry/settings"): r_tel_settings,
+    ("GET", "/metrics"): r_metrics,
+    ("GET", "/api/mqtt"): r_mqtt_status,
+    ("POST", "/api/mqtt/settings"): r_mqtt_settings,
+    ("POST", "/api/mqtt/test"): r_mqtt_test,
     ("POST", "/api/fleet/adopt"): r_fleet_adopt,
     ("DELETE", "/api/fleet/adopt"): r_fleet_unadopt,
     ("POST", "/api/fleet/control"): r_fleet_control,
@@ -4242,6 +6226,9 @@ ROUTES = {
     ("GET", "/api/report/bundle"): r_report_bundle,
     ("POST", "/api/report/send"): r_report_send,
     ("GET", "/api/score/check"): r_score_check,
+    ("GET", "/api/thinking"): r_thinking,
+    ("POST", "/api/thinking/override"): r_thinking_override,
+    ("GET", "/api/thinking/table"): r_thinking_table,
     ("POST", "/api/score/send"): r_score_send,
     ("GET", "/api/score/detail"): r_score_detail,
     ("GET", "/api/user"): r_user,
@@ -4270,7 +6257,57 @@ ROUTES = {
     ("POST", "/api/encode/discard"): r_enc_discard,
     ("POST", "/api/encode/test"): r_enc_test,
     ("GET", "/api/encode/browse"): r_enc_browse,
+    ("GET", "/api/update"): r_pxa_update,
+    ("GET", "/api/lib/update"): r_lib_update,
+    ("POST", "/api/lib/update/apply"): r_lib_update_apply,
+    ("POST", "/api/lib/update/rollback"): r_lib_update_rollback,
+    ("POST", "/api/lib/update/settings"): r_lib_update_settings,
+    ("GET", "/api/expert-map"): r_expert_map,
+    ("POST", "/api/expert-map/rebuild"): r_expert_map_rebuild,
+    ("POST", "/api/expert-map/reset"): r_expert_map_reset,
+    ("POST", "/api/update/apply"): r_pxa_update_apply,
+    ("GET", "/api/health"): r_health,
+    ("GET", "/api/gpu/state"): r_gpu_state,
+    ("GET", "/api/gpu/profiles"): r_gpu_profiles,
+    ("POST", "/api/gpu/profiles"): r_gpu_profile_save,
+    ("DELETE", "/api/gpu/profiles"): r_gpu_profile_delete,
+    ("POST", "/api/gpu/plan"): r_gpu_plan,
+    ("POST", "/api/gpu/apply"): r_gpu_apply,
+    ("POST", "/api/gpu/reset"): r_gpu_reset,
+    ("POST", "/api/gpu/reserve"): r_gpu_reserve,
+    ("POST", "/api/gpu/maintenance"): r_gpu_maintenance,
+    ("POST", "/api/gpu/quiet"): r_gpu_quiet,
+    ("GET", "/api/gpu/audit"): r_gpu_audit,
+    ("GET", "/api/gpu/export"): r_gpu_export,
+    ("POST", "/api/gpu/import"): r_gpu_import,
+    ("POST", "/api/gpu/schedules"): r_gpu_schedules,
+    ("POST", "/api/gpu/supervisor"): r_gpu_supervisor,
+    ("GET", "/api/gpu/clocks"): r_gpu_clocks,
+    ("POST", "/api/gpu/power"): r_gpu_power,
+    ("POST", "/api/gpu/undo"): r_gpu_undo,
+    ("POST", "/api/gpu/ui"): r_gpu_ui,
 }
+
+def chat_host_policy(app):
+    """Host access for the chat agent (v3.1). A Control bound to this machine may offer it; a Control on
+    the LAN (--lan) refuses it unless the owner has set host_access_lan in the config, because on the LAN
+    the person approving a command is not necessarily the person at the keyboard. The allowlist file and
+    the audit log live in the config dir; the audit record is redacted like every other Control record."""
+    def gate():
+        c = load_config()
+        if getattr(app, "lan", False) and not c.get("host_access_lan"):
+            return False, ("host access is off over the network. Control is reachable from other machines, "
+                           "so this stays off until you set host_access_lan in the Control config.")
+        return True, ""
+    return CHAT.HostPolicy(gate=gate, allow_path=os.path.join(config_dir(), "host-allow.json"),
+                           audit=lambda rec: append_jsonl("host-audit.jsonl", redact_obj(rec)))
+
+
+if CHAT is not None:                     # the chat agent's routes + agent.js/agent.css: one ROUTES.update()/STATIC.update() block
+    try:
+        CHAT.register(ROUTES, STATIC, Reply, config_dir, load_config, host=chat_host_policy)
+    except Exception as _chat_err:       # noqa: BLE001
+        CHAT, CHAT_IMPORT_ERROR = None, f"{_chat_err.__class__.__name__}: {_chat_err}"
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -4310,6 +6347,33 @@ def _mins(sec):
 def has_desktop(environ=None):
     env = environ if environ is not None else os.environ
     return bool(env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")) or sys.platform in ("darwin", "win32")
+
+
+def headless_hint(port, lan=False, environ=None, user=None):
+    """-> [lines]: the "no desktop here" help, or [] when there is a display or Control is already on
+    the LAN. Headless = neither DISPLAY nor WAYLAND_DISPLAY (an SSH session without X forwarding is
+    that case). The ssh line uses the server address SSH_CONNECTION carries (3rd field) and the
+    login name; where they are unknown it keeps <user> / <this-machine> placeholders."""
+    env = environ if environ is not None else os.environ
+    if lan or has_desktop(env):
+        return []
+    parts = (env.get("SSH_CONNECTION") or "").split()
+    host = parts[2] if len(parts) >= 4 else "<this-machine>"
+    if user is None:
+        try:
+            import getpass
+            user = getpass.getuser()
+        except Exception:       # noqa: BLE001
+            user = "<user>"
+    port = int(port)
+    return [
+        "  No desktop here, and PXA Control listens on this machine only (127.0.0.1), so another computer cannot reach it as it is.",
+        f"  A) rerun with `pxa --gui --lan`: it listens on every interface (0.0.0.0), port {DEFAULT_PORT} by default, plain http,",
+        "     behind a random access token. Open the address it prints (it ends in ?token=...); a cookie remembers it after that.",
+        "     No other approval step. Use it on a network you trust.",
+        f"  B) or from your own computer: ssh -L {port}:127.0.0.1:{port} {user}@{host}   then open http://127.0.0.1:{port}",
+        "     The text menu instead: pxa --tui",
+    ]
 
 
 def open_in_browser(url, wait=False):
@@ -4373,10 +6437,39 @@ def serve(L, port=DEFAULT_PORT, lan=False, open_browser=True, models_dirs=None, 
             print(f"        (or any of this machine's other {len(ips) - 3} addresses, same port and token)")
     else:
         print("  this machine only (--lan to share it)")
-        if not companion and not has_desktop():
-            print(f"  no desktop here: from your own computer, `ssh -L {port}:127.0.0.1:{port} <this machine>`, then open "
-                  "the address above. The text menu: pxa --tui")
+        if not companion:
+            for _ln in headless_hint(port, lan):
+                print(_ln)
     print(f"  config: {config_path()}   levers: {len(app.catalog)} from {app.catalog_src or 'NOT FOUND'}")
+    tel = app.start_telemetry()                   # the Live tab's history on disk (PXA_CONTROL_TELEMETRY=0: off)
+    if tel is not None:
+        print(f"  history: {tel.path} (a sample every {app.tel_cfg['sample_s']:g} s, kept {app.tel_cfg['raw_days']:g} days, "
+              f"minutes {app.tel_cfg['rollup_days']:g} days)" + ("" if tel.is_writer else
+              f"; another PXA Control (pid {tel.writer_pid()}) records it, this one reads"))
+    elif app.tel_error:
+        print(f"  history: off ({app.tel_error})")
+    mq = app.start_mqtt()                         # Home Assistant over MQTT (PXA_CONTROL_MQTT=1: on)
+    if mq is not None:
+        print(f"  home assistant: mqtt -> {app.mqtt_cfg['host']}:{app.mqtt_cfg['port']} "
+              f"every {app.mqtt_cfg['interval']:g} s under '{app.mqtt_cfg['base']}'")
+    elif app.mqtt_error:
+        print(f"  home assistant: off ({app.mqtt_error})")
+    if app.gpuctl is not None:                    # Profiles: background only when a switch needs it (default: none)
+        g = app.gpuctl
+        print(f"  GPU profiles: adapter {g.adapter.kind}; changes {'ALLOWED' if g.settings['allow_gpu_control'] else 'off'}"
+              f", auto-start {'on' if g.settings['autostart'] else 'off'}, schedules {'on' if g.settings['schedules'] else 'off'}"
+              + (f", {len(g.guard.locks())} lock(s) in force" if g.guard.locks() else ""))
+        if g.needs_background():
+            g.start_background()
+            try:
+                b = g.boot()
+                if b["reapplied"] or b["queued"] or b["errors"]:
+                    print(f"  GPU profiles at start: re-applied {len(b['reapplied'])}, queued {len(b['queued'])} auto-start(s)"
+                          + (f", errors: {'; '.join(b['errors'])}" if b["errors"] else ""))
+            except Exception as e:      # noqa: BLE001
+                print(f"  GPU profiles at start: {e.__class__.__name__}: {e}")
+    elif app.gpuctl_error:
+        print(f"  GPU profiles: off ({app.gpuctl_error})")
     print("=" * 78)
     sys.stdout.flush()
     # read the model headers once in the background: the first scan of a spinning-disk library takes
@@ -4416,6 +6509,8 @@ def serve(L, port=DEFAULT_PORT, lan=False, open_browser=True, models_dirs=None, 
     finally:
         stop_ev.set()
         SERVING.pop(port, None)
+        if app.gpuctl is not None:                # first: no auto-start may restart a server we are about to stop
+            _quiet(app.gpuctl.stop)
         if run_rec:
             try:
                 os.unlink(run_rec)
@@ -4427,5 +6522,7 @@ def serve(L, port=DEFAULT_PORT, lan=False, open_browser=True, models_dirs=None, 
                 seat.stop()
         app.encode_shutdown()
         app.live.close()
+        _quiet(app.stop_telemetry)
+        _quiet(app.stop_mqtt)
         srv.server_close()
     return 0

@@ -766,6 +766,29 @@ curl http://localhost:8080/v1/responses \
 
 This endpoint works by converting Responses requests into Chat Completions requests.
 
+### POST `/v1/messages`: Anthropic-style Messages API
+
+The same server speaks the Messages route used by Anthropic clients. A request is converted into a chat completion, and the reply is converted back. `--jinja` is required for tools, the same as `/v1/chat/completions`.
+
+`messages` is the conversation. A string `content` is plain text. An array may hold `text`, `thinking`, `tool_use`, `tool_result`, and `image` blocks. A previous `thinking` block is kept as reasoning and is not shown to the user as the answer.
+
+`tools` use `name`, `description`, and `input_schema`. `tool_choice` of `{"type":"any"}` or `{"type":"tool"}` requires a tool call. A tool call comes back as a `tool_use` block and `stop_reason` `tool_use`.
+
+`thinking` of `{"type":"enabled","budget_tokens":N}` sets the reasoning budget. When the model actually writes reasoning, the reply carries a `thinking` block (`thinking` text and an empty `signature`) ahead of the text. A model whose template has no thinking channel accepts the field and answers in text.
+
+`stream: true` is server-sent events: `message_start`, `content_block_start`, `content_block_delta` (`text_delta`, `thinking_delta`, or `input_json_delta`), `content_block_stop`, `message_delta`, `message_stop`.
+
+```shell
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": "Say hello."}]
+  }'
+```
+
+
 ### POST `/v1/embeddings`: OpenAI-compatible embeddings API
 
     *Options:*

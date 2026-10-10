@@ -222,6 +222,7 @@ struct common_sampler {
     std::string grammar_root;
 
     llama_grammar * grammar;
+    llama_sampler * llg = nullptr; // %llguidance requests; not a GBNF grammar
 
     // TODO: replace with ring-buffer
     std::vector<llama_token>      prev;
@@ -433,6 +434,18 @@ float common_sampler_prob_topk_renorm(int n, const float * logits, float max_val
 // The top-k form is also cheaper: k exponentials instead of n_vocab.
 llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob = nullptr, int p_min_top_k = 0);
 
+// PXA_MTP_DRAFT_GUARD (default OFF): a temperature-0 request whose repetition guard is armed
+// (repeat penalty and/or DRY) verifies against the PENALISED argmax, while the drafter proposes the RAW
+// argmax -- so every place the guard bends the answer is a rejected draft (one-card MTP3 on fn32 v1:
+// acceptance 64% -> 27%). With the lever on, the draft is the argmax of the draft head's top-W window
+// after the request's own repetition penalty (history = the request's prev tail + the drafts already in
+// this chain) and its own DRY stage (cloned and fed the chain). Only the PROPOSAL changes: the verify
+// is the unchanged exact match against the request's sampler, so the emitted text is byte-identical.
+// Returns -1 when the request is not such a request (the caller keeps its argmax path).
+bool common_sampler_draft_guard_wanted(const struct common_sampler * gsmpl);
+llama_token common_sampler_draft_greedy_guarded(struct common_sampler * gsmpl, struct llama_context * ctx, int idx,
+        const std::vector<llama_token> * chain, float * out_prob);
+
 // PXA_SPEC_SAMPLED (default ON since v2026.10): draw the draft token from the draft head's own distribution,
 // filtered with this request's sampler parameters, and hand that distribution back in `q_out` so the
 // verifier can run the lossless accept/residual rule on it. Returns the drawn token, or -1 when this
@@ -471,5 +484,5 @@ void common_expiring_logit_bias_apply(struct common_sampler* ctx_sampling, float
 
 void common_expiring_logit_bias_accept(struct common_sampler* ctx_sampling, struct llama_context * ctx_main);
 
-llama_grammar* llama_sampler_init_llg(const llama_vocab* vocab,
-    const char* grammar_kind, const char* grammar_data);
+llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab,
+    const char * grammar_kind, const char * grammar_data);

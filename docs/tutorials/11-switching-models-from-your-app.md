@@ -6,10 +6,18 @@ different shape: an app (a coding assistant, a tool that scripts several models,
 pick a model by name in its request) that wants to choose between several models you have on disk,
 without you hand-starting a different server for each one.
 
-This engine does not do that by itself. What it does do — and what makes it possible — is print
+One server can hold several models when the cards support it. On Volta (V100) and newer cards that
+report CUDA virtual memory, register Qwen-family models with `./pxa --hot-model NAME=PATH` (repeat the
+flag for each extra file). They wait in pinned host RAM. The model you start with is the one on
+the cards, and the request's `model` field switches. Sliding-window models, including Gemma 4, are
+refused. Pascal is refused. PXA Control's Launch
+page has the same choice ("Also keep loaded"), and the Servers tab shows which model is on the
+cards and which are parked.
+
+The other way is a proxy that starts and stops a separate server per model. Use that when the
+cards cannot do hot swap, or when you want each model in its own process. The launcher prints
 the **exact command line** it would start a given model with, for your exact cards, without
-guessing. The rest of this page is about handing that command to a small proxy that starts and
-stops servers on demand, keyed by the model name in the request.
+guessing. The rest of this page is about handing that command to the proxy.
 
 ---
 

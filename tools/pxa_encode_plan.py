@@ -359,7 +359,7 @@ def facts_from_config(cfg):
             "vocab": t.get("vocab_size") or cfg.get("vocab_size"),
             "tie": bool(t.get("tie_word_embeddings", cfg.get("tie_word_embeddings", False))),
             "n_ctx_train": t.get("max_position_embeddings"), "kv_bytes_tok": kv_bytes_per_token_config(cfg),
-            "experts": t.get("num_experts") or t.get("n_routed_experts") or 0}
+            "experts": t.get("num_experts") or t.get("n_routed_experts") or t.get("num_local_experts") or t.get("moe_num_experts") or 0}
 
 
 def param_label(n):
@@ -578,6 +578,21 @@ def stage_sizes(src, tier_bytes, plan_stages):
     return {"live": live, "peak": peak, "out": skel, "keep_extra": 0 if "quantize" in plan_stages else q8 + (hess if ldlq else 0)}
 
 
+def disk_need(src, tier_bytes, plan_stages, same_disk=True):
+    """The ONE disk figure the Checks step shows, both in the Disk space row and in the facts under it.
+    The work folder holds the download and the intermediate files (stage_sizes peak); the finished file is written to the output folder.
+    On one disk they add up: need = work peak + final file. On two disks each folder gets its own share.
+    -> {"same_disk", "work_peak", "result", "work", "out", "need", "keep_extra"} (bytes; `work` / `out` = what each folder must hold)"""
+    sz = stage_sizes(src, tier_bytes, plan_stages)
+    peak, res = sz["peak"], sz["out"]
+    if same_disk:
+        work, out = peak + res, peak + res          # one filesystem: the same bytes, counted once
+    else:
+        work, out = peak, res
+    return {"same_disk": bool(same_disk), "work_peak": peak, "result": res, "work": work, "out": out,
+            "need": peak + res if same_disk else peak, "keep_extra": sz["keep_extra"]}
+
+
 def time_estimate(src, plan_stages, n_gpu_cards=1, bpw_factor=1.0):
     """-> {"stages": {stage: (low_s, high_s)}, "low", "high"}. Rough, from the measured spread (see SEC_PER_B)."""
     p = (src.get("params") or 0) / 1e9
@@ -625,3 +640,112 @@ def ram_need_bytes(hidden, inter):
     """Host RAM for the Hessian stage and the encode: the largest Hessian twice plus slack."""
     k = max(int(inter or 0), int(hidden or 0)) or 8192
     return int(2 * k * k * 4 + (2 << 30))
+
+
+# ---------------------------------------------------------------------------------------------
+# expert routing counts: the last stage a mixture-of-experts model gets, and the file it writes
+# ---------------------------------------------------------------------------------------------
+# The engine plans its expert cache from `<model>.expert-counts.csv` beside the GGUF (src/llama.cpp
+# pxa_xcache_counts_candidates) and, without it, bootstraps a profile at load. A dense model has no experts and
+# gets no file. The encoder writes it during `make`, in the format llama-imatrix writes with PXA_MOE_COUNTS_CSV:
+# `tensor,expert,count`, one row per tensor per expert.
+COUNTS_STAGE = "counts"
+COUNTS_SUFFIX = ".expert-counts.csv"
+COUNTS_HEADER = "tensor,expert,count"
+# the config.json / inspection-dict keys that hold a routed-expert count (a GGUF reads <arch>.expert_count instead).
+# num_experts_per_tok is deliberately absent: it is how many experts one token uses, not how many exist.
+COUNT_KEYS = ("experts", "num_experts", "n_routed_experts", "num_local_experts", "moe_num_experts", "expert_count")
+# GGUF metadata value types (the format spec's ids), so the reader can skip a key it does not want
+_GGUF_SCALAR = {0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2), 4: ("<I", 4), 5: ("<i", 4), 6: ("<f", 4), 7: ("<?", 1),
+                10: ("<Q", 8), 11: ("<q", 8), 12: ("<d", 8)}
+_GGUF_INTS = (0, 1, 2, 3, 4, 5, 10, 11)
+_GGUF_STR, _GGUF_ARR = 8, 9
+
+
+def counts_file(model_path):
+    """`<model>.expert-counts.csv`, the only path the engine looks for beside the GGUF."""
+    return model_path + COUNTS_SUFFIX
+
+
+def _gguf_value(f, typ, depth=0):
+    """One GGUF metadata value. An array is walked element by element (its values are not needed, only consumed)."""
+    if typ in _GGUF_SCALAR:
+        fmt, n = _GGUF_SCALAR[typ]
+        v = struct.unpack(fmt, f.read(n))[0]
+        return int(v) if typ in _GGUF_INTS else v
+    if typ == _GGUF_STR:
+        n = struct.unpack("<Q", f.read(8))[0]
+        if n > 1 << 24:                                   # not a string this size, so not a header we understand
+            raise ValueError("string too long")
+        return f.read(n).decode("utf-8", "replace")
+    if typ == _GGUF_ARR:
+        if depth > 2:
+            raise ValueError("nested array")
+        et = struct.unpack("<I", f.read(4))[0]
+        n = struct.unpack("<Q", f.read(8))[0]
+        if n > 1 << 24:
+            raise ValueError("array too long")
+        return [_gguf_value(f, et, depth + 1) for _ in range(n)]
+    raise ValueError("unknown gguf type %s" % typ)
+
+
+def gguf_kvs(path, want):
+    """The `want` metadata keys of a GGUF -> {key: value}, stdlib only. The k/v block sits at the head of the file, so
+    nothing large is read and the tensor data is never touched. {} when the file is not a GGUF or is unreadable."""
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return {}
+            f.read(4)                                     # version
+            f.read(8)                                     # tensor count
+            n_kv = struct.unpack("<Q", f.read(8))[0]
+            if n_kv > 1 << 20:
+                return {}
+            for _ in range(n_kv):
+                klen = struct.unpack("<Q", f.read(8))[0]
+                if klen > 4096:
+                    return out
+                key = f.read(klen).decode("utf-8", "replace")
+                val = _gguf_value(f, struct.unpack("<I", f.read(4))[0])
+                if key in want:
+                    out[key] = val
+    except (OSError, struct.error, ValueError):
+        return out
+    return out
+
+
+def expert_count(src):
+    """The model's routed-expert count, 0 when it is dense or the source does not say (0 = no counts stage, the old behaviour).
+    `src` is the step-2 inspection dict (a GGUF's `<arch>.expert_count` as pxa_encode reads it, or a config.json's
+    num_experts / n_routed_experts / ...) or a path to a .gguf, whose metadata is read here."""
+    if isinstance(src, str):
+        arch = gguf_kvs(src, {"general.architecture"}).get("general.architecture")
+        if not isinstance(arch, str) or not arch:
+            return 0
+        key = "%s.expert_count" % arch
+        v = gguf_kvs(src, {key}).get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+    if not isinstance(src, dict):
+        return 0
+    for k in COUNT_KEYS:
+        v = src.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+    return 0
+
+
+def counts_needed(src):
+    """True when this source must ship a counts file: it has experts. A dense model, or one whose facts do not say,
+    -> False and no file (the engine then bootstraps its own profile, exactly as before)."""
+    return expert_count(src) > 0
+
+
+def with_counts_stage(stages, src):
+    """`stages` with the counts stage inserted before `verify` when the model has experts; the same stages otherwise.
+    It runs last but one because it reads the finished file: the encoder writes the CSV beside the GGUF it just made."""
+    st = list(stages)
+    if COUNTS_STAGE in st or not counts_needed(src):
+        return st
+    st.insert(st.index("verify") if "verify" in st else len(st), COUNTS_STAGE)
+    return st

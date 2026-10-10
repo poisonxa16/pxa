@@ -1436,6 +1436,7 @@ static inline bool ggml_backend_sched_offload_enabled(ggml_backend_sched_t sched
 // Bumped whenever the scheduler re-plans or re-reserves the compute arena, so a captured CUDA
 // graph holding addresses into that arena is recaptured rather than replayed.
 extern "C" void ggml_cuda_alloc_generation_bump(void);
+extern "C" bool ggml_cuda_alloc_generation_bump_backend(ggml_backend_t backend);
 #endif
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2274,7 +2275,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #ifdef GGML_USE_CUDA
         // a re-plan can move every intermediate; any captured CUDA graph holding addresses into
         // the compute arena must be recaptured, not replayed
-        ggml_cuda_alloc_generation_bump();
+        // PXA_CUDA_GRAPH_REPLAN_KEEP (default off): the bump is global, so with speculation on
+        // (target plain / verify-width slots / MTP draft scheds re-planning in turn) every re-plan of ANY
+        // scheduler invalidated every captured graph of every other one: G3 (PXQN2 FN, P100, MTP3) showed
+        // every verify width captured 3-4 times and then DISABLE too-many-updates with no property
+        // mismatch logged. A re-plan only moves intermediates of THIS scheduler's graph, and those
+        // addresses are node / src data pointers the per-node property compare already checks before a
+        // replay; =1 skips the global bump on a re-plan (reserve and every cudaFree site still bump).
+        static const bool pxa_replan_keep = [] { const char * e = getenv("PXA_CUDA_GRAPH_REPLAN_KEEP"); return e && atoi(e) != 0; }();
+        if (!pxa_replan_keep) {
+            ggml_cuda_alloc_generation_bump();
+        }
 #endif
         static const bool pxa_sched_debug = getenv("PXA_SCHED_DEBUG") != NULL;
         if (pxa_sched_debug) {
@@ -4489,7 +4500,20 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 #ifdef GGML_USE_CUDA
     // a reserve reallocates the compute arena; see the note on ggml_cuda_graph::alloc_generation
-    ggml_cuda_alloc_generation_bump();
+    // LEVERS-8 F2 (PXA_CUDA_ARENA_GEN=1, default off): bump only this scheduler's CUDA backends'
+    // generation, so other contexts' captured execs survive. Not with PXA_TSPLIT_REPLAY (its replay
+    // reads the global counter only).
+    {
+        static const bool pxa_arena = [] { const char * e = getenv("PXA_CUDA_ARENA_GEN"); const char * t = getenv("PXA_TSPLIT_REPLAY");
+            const bool on = e && atoi(e) != 0 && !(t && atoi(t) != 0);
+            if (on) fprintf(stderr, "PXA_CUDA_ARENA_GEN: 1 (a reserve invalidates only its own scheduler's graphs; LEVERS-8 F2)\n");
+            return on; }();
+        bool done = false;
+        if (pxa_arena) {
+            for (int b = 0; b < sched->n_backends; ++b) done |= ggml_cuda_alloc_generation_bump_backend(sched->backends[b]);
+        }
+        if (!done) ggml_cuda_alloc_generation_bump();
+    }
 #endif
 
     ggml_backend_sched_split_graph(sched, measure_graph);

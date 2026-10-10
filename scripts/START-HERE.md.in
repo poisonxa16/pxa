@@ -144,6 +144,20 @@ before the server's own log): the server live, its speed, a chat box and a Stop 
 on this machine only. `--no-control` (or `PXA_CONTROL=0`) skips it; a script or a service without a
 terminal never gets it unless `PXA_CONTROL=1`.
 
+**Headless / over SSH.** PXA Control listens on `127.0.0.1` only, so on a rig with no display you
+cannot open it from another computer as it is (a plain `./pxa` over SSH gives you the text menu
+and the server's own web page, not Control). Two ways in:
+
+- **A. `./pxa --gui --lan`**: Control listens on every interface (`0.0.0.0`), port 7777 by default,
+  plain http, behind a random access token. Open the address it prints (it ends in `?token=...`);
+  a cookie remembers the token after that. There is no other approval step. Use it on a network you trust.
+- **B. An SSH tunnel**: from your own computer run `ssh -L 7777:127.0.0.1:7777 <user>@<this-machine>`,
+  then open `http://127.0.0.1:7777`. Nothing is exposed to the network. (Use the port Control printed
+  if it is not 7777.)
+
+The launcher prints this itself when it starts Control and finds no display. Start the server and
+run "Benchmark my rig" from inside Control (it benchmarks a server Control started or attached to).
+
 If you would rather click than type flags, run **`./pxa`** with no arguments: PXA Control opens and
 you pick the cards and the model there. `./pxa --tui` asks the same questions in the terminal, and
 prints the command and the measurement behind every choice before it starts anything.

@@ -471,10 +471,15 @@ class TestNameMap(unittest.TestCase):
             for m in mods:
                 self.assertNotIn(m.rsplit(".", 1)[-1], NM.UNSERVABLE_PXQ4_MODULES,
                                  f"{pol} serves {m}")
-            # lm_head is a linear-shaped module the dispatcher WILL be asked about, so it
-            # must be explicitly ignored. embed_tokens is a VocabParallelEmbedding and never
-            # reaches the LinearBase branch, so it needs no entry.
-            self.assertIn("lm_head", NM.ignore_list(pol), pol)
+            # lm_head is a linear-shaped module the dispatcher WILL be asked about.
+            # Panel policies leave it in ignore (a PXQ4 head is not servable). m3 serves
+            # it as int8, and ignore_list drops q8 modules so the int8 tensors are not
+            # routed to fp16. embed_tokens never reaches LinearBase, so it needs no entry.
+            ig = NM.ignore_list(pol)
+            if "lm_head" in NM.q8_list(pol):
+                self.assertNotIn("lm_head", ig, pol)
+            else:
+                self.assertIn("lm_head", ig, pol)
 
     def test_blocked_policy_is_refused_by_name(self):
         # p2b minus the head is p2a. Refuse it instead of silently aliasing it,
@@ -926,7 +931,8 @@ class TestGdnPlanGate(unittest.TestCase):
             if e.kind == "copy":
                 continue
             if NM.ggml_suffix(e.src) not in NM._GDN_MAP:
-                self.assertEqual(e.perm, "", e.name)
+                # perm also carries a non-reorder value transform (gemma RMSNorm stores w, HF stores w-1).
+                self.assertIn(e.perm, ("", "value transform"), e.name)
 
 
 if __name__ == "__main__":

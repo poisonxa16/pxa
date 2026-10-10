@@ -5,6 +5,7 @@
 #include "pxa-registry.h"
 
 #include "ggml.h"
+#include "ggml-pxqn-levers.h"
 #include "llama.h"
 
 #if defined(GGML_USE_CUDA)
@@ -27,7 +28,8 @@ extern char ** environ;
 // The catalog. Generated; see scripts/pxa-lever-catalog.py.
 // ---------------------------------------------------------------------------------------------
 static const pxa_lever_decl k_pxa_levers[] = {
-#include "pxa-lever-catalog.inc"
+// the build copy (top-level CMakeLists.txt): the PUBLIC table; the closed library declares its own levers
+#include "pxa-lever-catalog-build.inc"
 };
 
 const pxa_lever_decl * pxa_lever_catalog(size_t * n) {
@@ -1118,6 +1120,8 @@ void pxa_registry_banner(FILE * out, const pxa_topology & topo, const pxa_model_
         const pxa_lever_decl * d = pxa_lever_find(name.c_str());
         if (d) {
             fprintf(out, "PXA_REGISTRY: set %s=%s (default %s; %s)\n", name.c_str(), eq + 1, d->deflt, d->status);
+        } else if (ggml_pxqn_lever_builtin(name.c_str())) {
+            fprintf(out, "PXA_REGISTRY: set %s=%s (built-in: read by the closed PXQN code)\n", name.c_str(), eq + 1);
         } else {
             fprintf(out, "PXA_REGISTRY: WARNING %s=%s is not a lever this build declares - a typo does nothing\n",
                     name.c_str(), eq + 1);

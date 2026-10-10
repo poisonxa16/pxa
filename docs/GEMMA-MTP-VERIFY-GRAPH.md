@@ -1,6 +1,6 @@
 # Gemma-4 26B-A4B MTP verify step: CUDA-graph capture/replay (ticket gemma-mtp-verify-kernel)
 
-Grok Bot, 2026-10-02, branch grokbot/gemma-verify-graph (from grokbot/gemma-verify-2row 6228ea7507).
+2026-10-02, branch gemma-verify-graph (from gemma-verify-2row 6228ea7507).
 This branch has no code change. It records why a new PXA_MTP_VERIFY_GRAPH lever was not added.
 
 ## Why graphs never replay for the verify graph by default (single V100)

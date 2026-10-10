@@ -7,3 +7,4 @@ ggml-common.h
 !fixtures
 !fixtures/glm4-moe-lite-tiny
 !fixtures/dsv4-tiny
+!fixtures/thinking

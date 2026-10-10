@@ -474,7 +474,7 @@ still ranges 0.68 to 0.93 across those placements, which is the mixture-of-exper
 described above and not a return of the defect. The twelve-prompt fixed sequence is byte-identical
 across three fresh boots, none unstable.
 
-The captured gate output is in [`bench/gate/LAST-RUN.md`](../bench/gate/LAST-RUN.md).
+The captured gate output is in `bench/gate/LAST-RUN.md`.
 
 ## What else merged, and where each lever stands
 

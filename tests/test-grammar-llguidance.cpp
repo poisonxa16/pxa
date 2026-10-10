@@ -4,6 +4,7 @@
 
 #include "unicode.h"
 #include "sampling.h"
+#include "common.h"
 
 #include <cassert>
 #include <string>
@@ -37,10 +38,7 @@ static bool match_string(const std::string & input, llama_sampler * grammar) {
 
     // do we allow EOS at the end? if so the grammar is accepting
 
-    auto tok_eos = llama_vocab_eot(vocab);
-    if (tok_eos == LLAMA_TOKEN_NULL) {
-        tok_eos = llama_vocab_eos(vocab);
-    }
+    auto tok_eos = llama_vocab_eos(vocab);
 
     cur[tok_eos].logit = 0.0f;
     llama_sampler_apply(grammar, &tok_arr);
@@ -1123,7 +1121,7 @@ int main(int argc, const char ** argv) {
 
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to load vocab '%s'\n", __func__, vocab_file);
-            llama_model_free(model);
+            llama_free_model(model);
             return 1;
         }
     }

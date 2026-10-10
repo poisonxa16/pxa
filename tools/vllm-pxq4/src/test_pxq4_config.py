@@ -545,7 +545,8 @@ def test_abc_surface():
     assert c.get_name() == "pxq4"
     assert c.get_supported_act_dtypes() == [torch.float16]
     assert torch.bfloat16 not in c.get_supported_act_dtypes()  # no bf16 on sm_70
-    assert cfg.PXQ4Config.get_min_capability() == 70
+    # Pascal is in: get_min_capability returns 60 (sm_60 kernel, same numbers as sm_70).
+    assert cfg.PXQ4Config.get_min_capability() == 60
     assert cfg.PXQ4Config.get_config_filenames() == []
 
 

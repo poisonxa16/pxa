@@ -1854,6 +1854,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_pxqn4s8_f16;
         case GGML_TYPE_PXQN5:
             return dequantize_row_pxqn5_f16;
+        case GGML_TYPE_PXA4:
+            return dequantize_row_pxa4_f16;
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_cuda;
         case GGML_TYPE_IQ3_S:
@@ -1933,6 +1935,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_pxqn4s8_f32;
         case GGML_TYPE_PXQN5:
             return dequantize_row_pxqn5_f32;
+        case GGML_TYPE_PXA4:
+            return dequantize_row_pxa4_f32;
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_cuda;
         case GGML_TYPE_IQ3_S:

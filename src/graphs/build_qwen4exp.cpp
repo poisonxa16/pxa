@@ -900,6 +900,9 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
 
         ggml_tensor * cur = build_qwen4exp_mtp(mtp_layer, hidden_states_from_main_model, n_embd_head, gf, inp_pos);
         ggml_build_forward_expand(gf, cur);
+        // PXA_VERIFY_NO_LOGITS_COPY (M2): the head's argmax node(s); empty unless the lever attached one
+        for (auto * t : lctx.pxa_head_extra) ggml_build_forward_expand(gf, t);
+        lctx.pxa_head_extra.clear();
 
         return gf;
     }
@@ -1419,6 +1422,9 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
     cb(cur, "result_output", -1);
 
     ggml_build_forward_expand(gf, cur);
+    // PXA_VERIFY_NO_LOGITS_COPY (M2): the head's argmax node(s); empty unless the lever attached one
+    for (auto * t : lctx.pxa_head_extra) ggml_build_forward_expand(gf, t);
+    lctx.pxa_head_extra.clear();
 
     if (pxa_qsa_prof_on()) {
         const llama_kpool_dims pd = qsa ? llama_kpool_get_dims(lctx) : llama_kpool_dims();

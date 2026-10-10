@@ -1,6 +1,7 @@
 <!doctype html>
 <!--
-  PXA Control (pxa-launch --gui). One self-contained page: no CDN, no external library, no build step.
+  PXA Control (pxa-launch --gui). One self-contained page: no CDN, no build step.
+  KaTeX 0.16.22 is vendored under /vendor/katex (MIT, see vendor/katex/LICENSE).
   It talks only to the PXA Control server that served it (/api/*); the engine is reached through that
   server's fixed proxy (/api/engine/*). Palette = the PXA/hive design tokens (hive/ui/tokens.css).
 -->
@@ -10,8 +11,29 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>PXA Control</title>
 <link rel="icon" href="/favicon.png">
+<link rel="manifest" href="/agent-manifest.json">
 <link rel="stylesheet" href="/encode.css">
 <link rel="stylesheet" href="/live.css">
+<link rel="stylesheet" href="/profiles.css">
+<link rel="stylesheet" href="/agent.css">
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="/agent-markdown.css">
+<link rel="stylesheet" href="/agent-attach.css">
+<link rel="stylesheet" href="/agent-actions.css">
+<link rel="stylesheet" href="/agent-params.css">
+<link rel="stylesheet" href="/agent-context.css">
+<link rel="stylesheet" href="/agent-ux.css">
+<link rel="stylesheet" href="/agent-stream.css">
+<link rel="stylesheet" href="/agent-memory.css">
+<link rel="stylesheet" href="/chat.css">
+<link rel="stylesheet" href="/chat-history.css">
+<link rel="stylesheet" href="/chat-markdown.css">
+<link rel="stylesheet" href="/chat-actions.css">
+<link rel="stylesheet" href="/chat-stream.css">
+<link rel="stylesheet" href="/chat-attach.css">
+<link rel="stylesheet" href="/chat-params.css">
+<link rel="stylesheet" href="/chat-context.css">
+<link rel="stylesheet" href="/chat-ux.css">
 <style>
 :root{
   color-scheme:dark;
@@ -169,7 +191,7 @@ canvas.chart{width:100%;height:260px;display:block}
 .msg pre code{background:none;padding:0}
 .msg h1,.msg h2,.msg h3,.msg h4{font-size:var(--fs-2);margin:.5em 0 .2em}
 .msg ul,.msg ol{margin:.3em 0;padding-left:1.4em}
-.think{border-left:2px solid var(--line-2);padding-left:8px;color:var(--dim);font-size:var(--fs-1);white-space:pre-wrap;margin-bottom:6px;max-height:220px;overflow:auto}
+.msg .think{border-left:2px solid var(--line-2);padding-left:8px;color:var(--dim);font-size:var(--fs-1);white-space:pre-wrap;margin-bottom:6px;max-height:220px;overflow:auto}
 .toast{position:fixed;left:50%;bottom:calc(28px + var(--safe));transform:translateX(-50%);background:var(--surface-3);border:1px solid var(--line-2);padding:10px 16px;border-radius:10px;font-size:var(--fs-1);z-index:50;max-width:92vw;box-shadow:var(--shadow);display:flex;gap:8px;align-items:center}
 .toast.bad{border-color:var(--bad);color:var(--bad)}
 .empty{color:var(--dim);font-size:var(--fs-1);padding:var(--s4) 0;display:flex;gap:10px;align-items:center}
@@ -183,6 +205,7 @@ canvas.chart{width:100%;height:260px;display:block}
 .alert.bad{border-color:color-mix(in srgb,var(--bad) 50%,transparent);background:var(--bad-bg)}
 .alert.ok{border-color:color-mix(in srgb,var(--ok) 50%,transparent);background:var(--ok-bg)}
 .alert.warn{border-color:color-mix(in srgb,var(--warn) 50%,transparent);background:var(--warn-bg)}
+.alert.info{border-color:var(--line-2);background:var(--surface-2);color:var(--text)}
 /* quick start */
 .qs{border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
 .step{display:grid;grid-template-columns:28px minmax(0,1fr);gap:var(--s3);padding:var(--s3) 0}
@@ -202,6 +225,14 @@ canvas.chart{width:100%;height:260px;display:block}
 .tile:has(input:checked) .tick{background:var(--accent);border-color:var(--accent)}
 .tile:has(input:checked) .tick::after{content:"";position:absolute;left:4.5px;top:1.5px;width:4px;height:8px;border:solid var(--on-accent);border-width:0 2px 2px 0;transform:rotate(45deg)}
 .fit{margin-top:8px}
+.think{margin-top:4px}.think .seg button{padding:6px 10px}
+/* Launch and Chat share .think with a reasoning bubble. No switch means the note
+   only: the control row stays out, with no border and no min-height. */
+#l-think.think,#c-think.think{white-space:normal;max-height:none;min-height:0;overflow:visible;border:0;padding:0}
+#l-think-info,#c-think-info{margin-top:6px}
+#l-think.note-only,#c-think.note-only{margin-top:6px;min-height:0;border:0;padding:0;background:transparent;box-shadow:none}
+#l-think.note-only #l-think-ctl,#c-think.note-only #c-think-ctl{display:none!important;min-height:0;margin:0;padding:0;border:0}
+#l-think.note-only #l-think-info,#c-think.note-only #c-think-info{margin:0;min-height:0;border:0;padding:0}
 .heatwarn{margin:6px 0;padding:6px 8px;border:1px solid var(--bad);border-radius:6px;font-size:var(--fs-1);font-weight:600}
 .auto-note{font-size:var(--fs-0);color:var(--dim);margin-top:10px;line-height:1.5}
 @media (max-width:820px){
@@ -270,6 +301,8 @@ canvas.chart{width:100%;height:260px;display:block}
 mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;border-radius:2px}
 .ln-err{color:var(--bad)}.ln-warn{color:var(--warn)}
 .lv-hint{font-size:var(--fs-0);color:var(--warn);margin-top:3px}
+.qnote{font-size:var(--fs-0);color:var(--warn);margin-top:4px;line-height:1.4;overflow-wrap:anywhere}
+.qnote a{color:inherit;text-underline-offset:2px}
 .lv-def{font-size:10.5px;font-weight:700;padding:0 6px;border-radius:var(--pill);border:1px solid var(--line-2);color:var(--dim)}
 .lv-def.on{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 50%,transparent)}
 .lv-def.off{color:var(--faint)}
@@ -278,6 +311,14 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
 .dlg{width:min(900px,96vw);max-height:92vh;border:1px solid var(--line-2);border-radius:14px;background:var(--surface);color:var(--text);padding:var(--s4);box-shadow:var(--shadow)}
 .dlg::backdrop{background:rgba(0,0,0,.55)}
 .dlg h2{margin:0 0 8px;font-size:var(--fs-3)}
+
+.up-track{position:relative;height:52px;margin-top:12px;border:1px solid var(--line);border-radius:var(--r2);background:var(--surface-2);overflow:hidden;touch-action:none;user-select:none}
+.up-track.is-blocked{opacity:.55}
+.up-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--grad);opacity:.45;pointer-events:none}
+.up-label{position:absolute;inset:0;display:grid;place-items:center;color:var(--dim);font-size:var(--fs-1);font-weight:600;pointer-events:none}
+.up-thumb{position:absolute;top:5px;left:5px;width:42px;height:42px;border-radius:var(--r1);border:1px solid var(--line-2);background:var(--surface);color:var(--text);box-shadow:var(--shadow);display:grid;place-items:center;cursor:grab;padding:0}
+.up-thumb svg{width:18px;height:18px}
+#sv-up{margin-left:8px;height:28px;padding:0 10px}
 .dlg pre.log{height:min(60vh,520px)}
 .target{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .target select{min-width:180px;flex:1}
@@ -307,6 +348,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
     <button role="tab" data-tab="speed"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 20h18M6 16l4-5 3 3 5-7"/></svg>Speed</button>
     <button role="tab" data-tab="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg>Chat</button>
     <button role="tab" data-tab="encode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h13l-3-3M20 17H7l3 3"/></svg>Encode</button>
+    <button role="tab" data-tab="profiles"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Profiles</button>
   </nav>
   <span class="sp"></span>
   <span class="pill" id="health" title="server health" role="status" aria-live="polite"><span class="dot" id="hdot"></span><span id="htext">no server</span></span>
@@ -325,13 +367,13 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
   <div class="grid" id="sv-list"><div class="skel"></div><div class="skel"></div></div>
   <h3 style="margin-top:var(--s5)">Cards <span class="tiny">who holds what, live</span></h3>
   <div class="gstrip" id="sv-cards"></div>
-  <div class="foot"><a href="https://discord.gg/EqazvV9tf" target="_blank" rel="noopener">PXA Network Discord</a><a href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener">&#9829; Support PXA</a><span id="sv-ver"></span></div>
+  <div class="foot"><a href="https://discord.gg/EqazvV9tf" target="_blank" rel="noopener">PXA Network Discord</a><a href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener">&#9829; Support PXA</a><span id="sv-ver"></span><button class="b" id="sv-up" type="button" hidden>Update</button></div>
 </section>
 
 <!-- ============================== LIVE ============================== -->
 <section id="p-live" data-page="live" hidden>
   <div class="ph"><div><h2>Live</h2><p id="lv-sub">Reading the first sample ...</p></div><span class="sp"></span>
-    <span class="seg" id="lv-range" data-v="900" aria-label="time range"><button data-v="300">5 min</button><button data-v="900">15 min</button><button data-v="3600">1 h</button></span></div>
+    <span class="seg" id="lv-range" data-v="900" aria-label="time range"><button data-v="300">5 min</button><button data-v="900">15 min</button><button data-v="3600">1 h</button><button data-v="21600" class="lv-long" hidden>6 h</button><button data-v="86400" class="lv-long" hidden>24 h</button><button data-v="604800" class="lv-long" hidden>7 d</button><button data-v="2592000" class="lv-long" hidden>30 d</button><button data-v="7776000" class="lv-long" hidden>90 d</button></span></div>
   <div id="lv-root"><div class="skel"></div></div>
 </section>
 
@@ -361,10 +403,23 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
     </div>
     <div class="tiny" id="models-notes" style="margin-top:6px"></div>
   </div>
+  <div class="card" id="emap">
+    <h3>Expert map</h3>
+    <p class="tiny" id="emap-status">For a mixture-of-experts model that does not fit on the card. Rebuild starts from the map shipped with the model. Further passes stop when the speed stops rising. The fastest map is kept. The model file is not changed.</p>
+    <!-- The server's own words about what this map is and is not (tools/pxa_expert_map.py DISCLAIMER, served by
+         GET /api/expert-map). It is filled in by emapRefresh() from the response, never hard-coded here, so the
+         page cannot drift from what the server says. -->
+    <p class="tiny" id="emap-disclaimer"></p>
+    <p class="tiny" id="emap-learn">No learned sessions yet.</p>
+    <div class="row" style="margin-top:8px">
+      <button class="b" id="emap-rebuild" type="button">Rebuild</button>
+      <button class="b" id="emap-reset" type="button">Reset learned</button>
+    </div>
+  </div>
   <div class="card">
     <h3>Library <span class="tiny" id="models-count"></span></h3>
     <div class="tiny" style="margin-bottom:8px">"Fits on" is the launcher's own VRAM check (weights + KV estimate at one 4096-token slot) on idle cards: <span class="chip ok">&#10003; fits</span> <span class="chip warn">! tight</span> <span class="chip bad">&#10005; no</span></div>
-    <div class="tw"><table class="resp"><thead><tr><th>Model</th><th>Codec</th><th>Type</th><th>Params</th><th>Size</th><th>Family</th><th>Fits on</th></tr></thead><tbody id="models-body"><tr><td colspan="7"><div class="empty"><span class="spin"></span>Reading model headers ... the first scan of a big library on a spinning disk can take half a minute.</div></td></tr></tbody></table></div>
+    <div class="tw"><table class="resp"><thead><tr><th>Model</th><th>Codec</th><th>Type</th><th>Params</th><th>Size</th><th>Family</th><th>Thinking</th><th>Fits on</th></tr></thead><tbody id="models-body"><tr><td colspan="8"><div class="empty"><span class="spin"></span>Reading model headers ... the first scan of a big library on a spinning disk can take half a minute.</div></td></tr></tbody></table></div>
   </div>
 </section>
 
@@ -388,7 +443,19 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
         <div class="step" id="st2"><span class="num">2</span><div><h4>Choose a model</h4>
           <select id="l-model" style="width:100%" aria-label="model"></select>
           <div class="tiny" id="l-model-info" style="margin-top:6px"></div>
-          <div id="l-fit" class="fit"></div></div></div>
+          <div id="l-model-note"></div>
+          <div id="l-fit" class="fit"></div>
+          <div class="think" id="l-think" hidden>
+            <div class="row" id="l-think-ctl" style="align-items:flex-end;gap:10px;margin-top:10px;flex-wrap:wrap">
+              <div class="f"><span class="tiny">Thinking</span><span class="seg" id="l-think-mode" data-v="auto" aria-label="thinking on, off or auto"><button data-v="auto" title="leave it to the model and the engine">auto</button><button data-v="on">on</button><button data-v="off">off</button></span></div>
+              <label class="f" style="width:150px">Thinking budget<input type="number" id="l-think-budget" min="-1" max="262144" step="512" placeholder="suggested" title="tokens of thinking per reply; empty = the suggestion, -1 = unlimited, 0 = none"></label>
+              <label class="f" id="l-think-level-w" style="width:130px" hidden>Effort<select id="l-think-level"></select></label>
+              <label class="f" style="width:140px" title="maps to a thinking-token budget: off 0, low 1024, medium 4096, high 16384, max unlimited">Effort budget<select id="l-think-effort"><option value="">default (none)</option><option value="off">off</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="max">max</option></select></label>
+              <label class="check" title="by default the client's own thinking setting (enable_thinking, reasoning_effort, a budget, /think) wins"><input type="checkbox" id="l-think-lock"> Override client setting (lock)</label>
+              <span class="tiny" id="l-think-lock-hint">By default the client's own thinking setting wins.</span>
+            </div>
+            <div class="tiny" id="l-think-info"></div>
+          </div></div></div>
         <div class="step" id="st3"><span class="num">3</span><div><h4>Start serving</h4>
           <div class="row"><button class="b pri big" id="b-start">Start</button><button class="b danger" id="b-stop" style="height:48px">Stop</button></div>
           <div class="auto-note">Everything else is automatic. Settings below are optional; leave them on auto unless you know you need one.</div></div></div>
@@ -397,7 +464,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
         <details id="adv-settings">
           <summary>Advanced settings (optional)</summary>
           <div class="form" style="margin-top:10px">
-            <label class="f">Context (0 = auto)<input type="number" id="l-ctx" min="0" step="1024" value="0"></label>
+            <label class="f">Context (0 = auto)<input type="number" id="l-ctx" min="0" step="1024" value="0"><span class="tiny" id="l-ctx-res" style="text-transform:none;letter-spacing:0;font-weight:500"></span><button class="link" id="l-ctx-auto" type="button" hidden style="text-transform:none;letter-spacing:0;justify-self:start">What would auto pick?</button></label>
             <label class="f">Parallel slots (0 = auto)<input type="number" id="l-np" min="0" max="64" value="0"></label>
             <label class="f">KV cache type<select id="l-kv"></select></label>
             <label class="f">Server port (empty = auto)<input type="number" id="l-port" min="0" max="65535" placeholder="auto"></label>
@@ -406,6 +473,8 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
             <div class="row"><span class="tiny" style="width:120px">Split mode</span><span class="seg" id="l-sm" data-v="auto"><button data-v="auto">auto</button><button data-v="layer">layer</button><button data-v="tensor">tensor</button></span></div>
             <div class="row"><span class="tiny" style="width:120px">Flash attention</span><span class="seg" id="l-fa" data-v="auto"><button data-v="auto">auto</button><button data-v="on">on</button><button data-v="off">off</button></span></div>
             <label class="check"><input type="checkbox" id="l-mtp"> MTP speculation (--spec mtp, needs MTP tensors in the file)</label>
+            <label class="f" id="l-draft-wrap" hidden>Gemma 4 drafter<select id="l-draft"><option value="">none</option></select><span class="tiny">The measured assistant file next to this model (159-167 t/s on one V100). The engine also finds it if you leave this on none.</span></label>
+            <label class="f" id="l-hot-wrap" hidden>Also keep loaded<select id="l-hot" multiple size="4" aria-label="other models on this server"></select><span class="tiny">Registered with --hot-model. The model above is the one on the cards when the server opens. Shown only when every selected card reports CUDA virtual memory, and not on Pascal.</span></label>
             <label class="check"><input type="checkbox" id="l-expose"> Serve on the network (--host 0.0.0.0)</label>
             <label class="check"><input type="checkbox" id="l-unmeasured"> Accept UNMEASURED branches (--accept-unmeasured)</label>
             <label class="check"><input type="checkbox" id="l-busy"> Allow busy cards (--allow-busy)</label>
@@ -434,6 +503,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
             </div>
             <div class="setchips" id="adv-set"></div>
             <div class="tiny" id="adv-warn" style="color:var(--warn)"></div>
+            <div class="tiny" id="adv-builtin" hidden></div>
             <div class="levers" id="adv-list"></div>
             <input type="checkbox" id="adv-all" hidden>
           </details>
@@ -447,6 +517,12 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
             <input type="text" id="p-name" placeholder="preset name" aria-label="preset name" style="flex:1;min-width:120px" maxlength="48">
             <button class="b" id="p-save">Save current</button>
           </div>
+          <h3 style="margin-top:16px">Home Assistant</h3>
+          <div class="tiny" style="margin:0 0 8px">Publish these numbers to Home Assistant over MQTT, where they
+            appear as ready-made entities. Off unless you turn it on; your broker stays on your network.</div>
+          <div id="mq-panel" class="form">
+            <div class="tiny">Loading…</div>
+          </div>
         </details>
       </div>
     </div>
@@ -458,6 +534,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
           <button class="b" id="b-restart">Restart</button>
         </div>
         <div class="tiny" id="s-info" style="margin-top:8px"></div>
+        <div class="kv" id="s-ctx" hidden></div>
         <div id="s-alert"></div>
       </div>
       <div class="card">
@@ -525,6 +602,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
 <section id="p-chat" data-page="chat" hidden>
   <div class="ph"><div><h2>Chat <span class="tiny" id="chat-model"></span></h2><p>Streams from the running server's OpenAI endpoint.</p></div></div>
   <div class="cols chat">
+    <aside class="card chat-side" id="chat-sidebar" aria-label="chat panels" hidden></aside>
     <div class="card chat-set">
       <h3>Settings</h3>
       <label class="f" style="margin-bottom:12px">Talk to<select id="c-target" aria-label="server to chat with"></select></label>
@@ -533,19 +611,48 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
         <label class="f">Temperature<input type="number" id="c-temp" min="0" max="2" step="0.1" value="0.7"></label>
         <label class="f">Max tokens<input type="number" id="c-max" min="1" max="32768" value="1024"></label>
       </div>
-      <label class="check" style="margin-top:12px"><input type="checkbox" id="c-think"> Thinking (chat_template_kwargs.enable_thinking)</label>
-      <div class="row" style="margin-top:14px"><button class="b" id="c-clear">New chat</button></div>
+      <div class="think" id="c-think" hidden>
+            <div class="row" id="c-think-ctl" style="align-items:flex-end;gap:10px;margin-top:10px;flex-wrap:wrap">
+              <div class="f"><span class="tiny">Thinking</span><span class="seg" id="c-think-mode" data-v="auto" aria-label="thinking on, off or auto"><button data-v="auto" title="leave it to the model and the engine">auto</button><button data-v="on">on</button><button data-v="off">off</button></span></div>
+              <label class="f" style="width:150px">Thinking budget<input type="number" id="c-think-budget" min="-1" max="262144" step="512" placeholder="suggested" title="tokens of thinking per reply; empty = the suggestion, -1 = unlimited, 0 = none"></label>
+              <label class="f" id="c-think-level-w" style="width:130px" hidden>Effort<select id="c-think-level"></select></label>
+              <label class="check" id="c-think-fb-w" hidden title="use the model's next method: the soft tag (/no_think) instead of the template kwarg, or the reasoning budget instead of the empty-think prefill"><input type="checkbox" id="c-think-fb"> fallback method</label>
+            </div>
+            <div class="tiny" id="c-think-info"></div>
+          </div>
+      <div id="chat-settings-sections"></div>
+      <div class="row" style="margin-top:14px"><button class="b" id="c-clear">New chat</button><button class="b" id="chat-side-toggle" aria-controls="chat-sidebar" aria-expanded="false" hidden>Panels</button></div>
       <div class="tiny" style="margin-top:14px">Attach to a server started elsewhere on this machine (0 = detach):</div>
       <div class="row" style="margin-top:6px"><input type="number" id="c-attach" min="0" max="65535" placeholder="port" aria-label="port to attach to" style="width:120px"><button class="b" id="c-attach-b">Attach</button></div>
     </div>
-    <div class="card">
+    <div class="card chat-main">
       <div class="msgs" id="msgs" aria-live="polite"><div class="empty center" id="msgs-empty"><b>No conversation yet</b><span>Start a server on the Launch tab, then say something.</span></div></div>
-      <div class="row" style="margin-top:12px;align-items:flex-end;flex-wrap:nowrap">
+      <div class="row chat-tools" id="chat-composer-tools" style="margin-top:12px"></div>
+      <div class="row chat-composer" style="margin-top:12px;align-items:flex-end;flex-wrap:nowrap">
         <textarea id="c-in" rows="3" placeholder="Write a prompt. Enter sends, Shift+Enter is a new line." aria-label="prompt" style="flex:1;min-width:0"></textarea>
         <div style="display:grid;gap:6px"><button class="b pri" id="c-send">Send</button><button class="b" id="c-stop" disabled>Stop</button></div>
       </div>
+      <div id="c-qnote"></div>
     </div>
   </div>
+</section>
+
+<!-- ============================== PROFILES ============================== -->
+<section id="p-profiles" data-page="profiles" hidden>
+  <div class="ph"><div><h2>Profiles</h2><p>Make your cards quieter, cooler or faster with one click, and pick which servers start on them. Every change shows you what will happen first, and you can undo it anytime.</p></div><span class="sp"></span>
+    <button class="b" id="pf-quiet" title="for a fair speed test: keep the test cards free, pause auto-starts, slow the other cards down">Benchmark mode</button>
+    <button class="b" id="pf-export">Export</button><button class="b" id="pf-import">Import</button><button class="b pri" id="pf-new">New profile</button></div>
+  <div class="pf-banner" id="pf-banner"></div>
+  <h3>Cards <span class="tiny" id="pf-cards-sub">live</span></h3>
+  <div class="pf-cards" id="pf-cards"><div class="skel" style="min-height:300px"></div><div class="skel" style="min-height:300px"></div><div class="skel" style="min-height:300px"></div></div>
+  <h3>Profiles <span class="tiny">apply one to its cards; its auto-starts follow</span></h3>
+  <div class="grid pf-list" id="pf-list"></div>
+  <div class="pf-two">
+    <div class="card"><h3>Schedules <span class="tiny" id="pf-sched-sub"></span><span class="sp"></span><button class="b" id="pf-sched-add">Add</button><button class="b pri" id="pf-sched-save">Save</button></h3><div id="pf-sched"></div></div>
+    <div class="card"><h3>Auto-start <span class="tiny" id="pf-sup-sub"></span><span class="sp"></span><button class="b" id="pf-sup-toggle">Pause</button></h3><div id="pf-sup"></div></div>
+  </div>
+  <div class="card"><h3>Changes <span class="tiny">every change, who and when (gpu_audit.jsonl)</span><span class="sp"></span><button class="b" id="pf-audit-reload">Reload</button></h3>
+    <div class="tw" style="max-height:340px"><table class="pf-audit"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Target</th><th>Result</th></tr></thead><tbody id="pf-audit"></tbody></table></div></div>
 </section>
 
 <!-- ============================== ENCODE ============================== -->
@@ -587,6 +694,45 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
   <input type="text" id="cf-in" autocomplete="off" spellcheck="false" aria-label="type to confirm" style="width:100%">
   <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="b" id="cf-cancel">Cancel</button><button class="b danger" id="cf-ok">Do it</button></div>
 </dialog>
+<dialog class="dlg" id="up" aria-labelledby="up-h" style="width:min(520px,96vw);height:auto">
+  <h2 id="up-h">Install update</h2>
+  <p class="tiny" id="up-sub"></p>
+  <p id="up-body">PXA will not restart a running server.</p>
+  <div class="up-track" id="up-track">
+    <div class="up-fill" id="up-fill"></div>
+    <div class="up-label" id="up-label">Slide fully, then hold 5 seconds</div>
+    <button type="button" class="up-thumb" id="up-thumb" aria-label="slide to install the update"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
+  </div>
+  <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="b" id="up-cancel" type="button">Cancel</button></div>
+</dialog>
+<dialog class="dlg pf-dlg" id="pf-ed" aria-labelledby="pf-ed-h">
+  <h2 id="pf-ed-h">Profile</h2>
+  <div class="pf-scroll" id="pf-ed-body"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:10px"><span class="tiny" id="pf-ed-msg" style="flex:1"></span><button class="b" id="pf-ed-cancel">Cancel</button><button class="b" id="pf-ed-preview">Preview</button><button class="b pri" id="pf-ed-save">Save</button></div>
+</dialog>
+<dialog class="dlg pf-dlg" id="pf-plan" aria-labelledby="pf-plan-h">
+  <h2 id="pf-plan-h">Preview</h2>
+  <div class="pf-scroll" id="pf-plan-body"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="b" id="pf-plan-close">Close</button><button class="b pri" id="pf-plan-apply">Apply</button></div>
+</dialog>
+<dialog class="dlg pf-dlg" id="pf-pw" aria-labelledby="pf-pw-h" style="width:min(560px,96vw)">
+  <h2 id="pf-pw-h">Power limit</h2>
+  <div id="pf-pw-body"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="b" id="pf-pw-cancel">Close</button><button class="b" id="pf-pw-default">Stock limit</button><button class="b pri" id="pf-pw-ok">Set</button></div>
+</dialog>
+<dialog class="dlg pf-dlg" id="pf-qd" aria-labelledby="pf-qd-h" style="width:min(720px,96vw)">
+  <h2 id="pf-qd-h">Benchmark mode</h2>
+  <div id="pf-qd-body"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="b" id="pf-qd-cancel">Cancel</button><button class="b pri" id="pf-qd-ok">Turn on</button></div>
+</dialog>
+<dialog class="dlg pf-dlg" id="pf-imp" aria-labelledby="pf-imp-h" style="width:min(720px,96vw)">
+  <h2 id="pf-imp-h">Import profiles</h2>
+  <p class="tiny">Paste a file made by Export (or choose it). Profiles with the same id are replaced; the others stay unless you tick Replace all.</p>
+  <input type="file" id="pf-imp-file" accept="application/json,.json" style="margin-bottom:8px">
+  <textarea id="pf-imp-text" rows="12" class="mono" spellcheck="false" style="height:260px"></textarea>
+  <label class="check" style="margin-top:8px"><input type="checkbox" id="pf-imp-replace"> Replace all profiles and schedules</label>
+  <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="b" id="pf-imp-cancel">Cancel</button><button class="b pri" id="pf-imp-ok">Import</button></div>
+</dialog>
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
 <script>
@@ -627,6 +773,14 @@ async function api(path, opts) {
 window.addEventListener("unhandledrejection", e => { const m = e.reason && e.reason.message; if (m) toast(m, true); });
 function qsTarget(t) { t = t || {}; return t.sid ? "sid=" + encodeURIComponent(t.sid) : t.port ? "port=" + t.port : ""; }
 function withQ(path, q) { return q ? path + (path.includes("?") ? "&" : "?") + q : path; }
+// is the chat/speed target actually serving? the page remembers the last one (a stopped server is normal),
+// and asking the engine about a server that is not up is an error the page would only log and show as nothing
+function targetUp(t) {
+  if (!t) return !!(S.status && S.status.engine_port);
+  const xs = (S.fleet && S.fleet.instances) || [];
+  if (t.sid) { const x = xs.find(i => i.sid === t.sid); return !!(x && (x.running || x.attached)); }
+  return t.port ? xs.some(i => i.running && i.port === t.port) : false;
+}
 async function copyText(txt) {
   try { await navigator.clipboard.writeText(txt); toast("copied"); }
   catch (e) { const ta = el("textarea", {style: "position:fixed;opacity:0"}); ta.value = txt; document.body.append(ta); ta.select();
@@ -637,6 +791,15 @@ const PROBLEM_RE = /error|fail|fatal|abort|out of memory|oom|refus|panic|excepti
 function renderLogInto(pre, lines, q, errOnly, follow, countEl) {
   // filter + highlight without innerHTML of untrusted text: text nodes and <mark> elements only
   const ql = (q || "").toLowerCase();
+  // an empty pane keeps the placeholder until a real line arrives (a filter of nothing is a result)
+  if (!lines.length && !ql && !errOnly) {
+    if (pre.dataset.live) {
+      delete pre.dataset.live;
+      pre.replaceChildren(el("span", {class: "muted", text: "The server's output appears here once it starts."}));
+      if (countEl) countEl.textContent = "";
+    }
+    return;
+  }
   const sel = lines.filter(l => (!errOnly || PROBLEM_RE.test(l)) && (!ql || l.toLowerCase().includes(ql)));
   const shown = sel.slice(-3000), frag = document.createDocumentFragment();
   for (const l of shown) {
@@ -647,6 +810,7 @@ function renderLogInto(pre, lines, q, errOnly, follow, countEl) {
     frag.append(span, "\n");
   }
   pre.replaceChildren(frag);
+  if (lines.length) pre.dataset.live = "1";
   if (countEl) countEl.textContent = (q || errOnly) ? `${sel.length} of ${lines.length} lines` : `${lines.length} lines`;
   if (follow) pre.scrollTop = pre.scrollHeight;
 }
@@ -742,16 +906,33 @@ function showTab(t) {
   if (t === "models") loadModels();
   if (t === "launch") { loadModels(); renderLaunchCards(); loadFleet().then(() => { if (S.tab === "launch") renderLaunchCards(); }); }
   if (t === "speed") { fillTargets(); loadSpeed(); }
-  if (t === "chat") { fillTargets(); if (!matchMedia("(max-width: 820px)").matches) $("#c-in").focus(); }
+  if (t === "chat") { fillTargets().then(loadThinkChat); if (!matchMedia("(max-width: 820px)").matches) $("#c-in").focus(); }
   if (t === "encode" && window.encodeOpen) encodeOpen();
+  if (t === "profiles") { if (window.profilesOpen) profilesOpen(); } else if (window.profilesClose) profilesClose();
   if (location.hash !== "#" + t) history.replaceState(null, "", "#" + t);
 }
 $$("#tabs button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
-const TABS = ["servers", "live", "rig", "models", "launch", "speed", "chat", "encode"];
+const TABS = ["servers", "live", "rig", "models", "launch", "speed", "chat", "encode", "profiles"];
 // a typed or bookmarked #tab (and Back/Forward) switches the page; it used to leave the old tab showing
 window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (TABS.includes(t) && t !== S.tab) showTab(t); });
 const MARK = {ok: "\u2713", warn: "!", bad: "\u2715"};
 function badge(level, text) { return el("span", {class: "chip " + level}, el("span", {"aria-hidden": "true", text: MARK[level] || ""}), text); }
+function quantNotice(text) {
+  if (!text) return null;
+  const href = "https://huggingface.co/poisonxa";
+  const i = text.lastIndexOf(href);
+  const box = el("div", {class: "qnote"});
+  if (i < 0) { box.textContent = text; return box; }
+  box.append(document.createTextNode(text.slice(0, i)));
+  box.append(el("a", {href: href, target: "_blank", rel: "noopener", text: href}));
+  return box;
+}
+function stdBadge(notice) {
+  if (!notice) return null;
+  const b = badge("warn", "standard GGUF");
+  b.title = notice;
+  return b;
+}
 
 // ---------------- SERVERS (the fleet dashboard) ----------------
 const KIND = {managed: "this GUI", docker: "docker", process: "process"};
@@ -812,9 +993,12 @@ function fleetCard(x, color) {
     el("h3", {}, el("span", {class: "dot " + lv}), el("span", {style: "overflow-wrap:anywhere", text: name}), el("span", {class: "sp"}),
       el("span", {class: "kind", text: x.origin === "launcher" ? "command line" : (KIND[x.kind] || x.kind)}), ro ? badge("", "read-only") : null, x.adopted ? badge("ok", "adopted") : null),
     el("div", {class: "tiny", style: "overflow-wrap:anywhere", text: x.model_file || x.alias || (x.kind === "managed" ? "no model chosen yet" : "")}),
+    x.quant_notice ? quantNotice(x.quant_notice) : null,
+    x.models && x.models.length ? el("div", {class: "kv"}, "models", el("b", {text: x.models.map(m => (m.id || "?") + (m.active ? " (on the cards)" : " (parked)")).join(", ")})) : null,
     el("div", {class: "kv"}, "state", el("b", {text: phase + (x.running && upFor(x) ? " · up " + upFor(x) : "")})),
     el("div", {class: "kv"}, "port", el("b", {class: "mono", text: x.port ? `${x.host === "0.0.0.0" ? "0.0.0.0" : "127.0.0.1"}:${x.port}` : "auto"})),
     el("div", {class: "kv"}, "cards", el("b", {class: "mono", text: (x.gpus && x.gpus.length) ? x.gpus.join(",") : "-"})),
+    x.running && x.context ? el("div", {class: "kv", title: x.context.how}, "context", el("b", {text: ctxText(x.context)})) : null,
     x.running ? el("div", {class: "kv"}, "VRAM", el("b", {class: "mono", text: vram || "-"})) : null,
     x.running && x.health === "ok" ? el("div", {class: "metric"},
       el("div", {}, el("span", {text: "decode"}), el("b", {text: m.decode_median ? fmtNum(m.decode_median) : "-"}), el("span", {text: m.decode_last ? "last " + fmtNum(m.decode_last) : "t/s median"})),
@@ -822,6 +1006,23 @@ function fleetCard(x, color) {
       el("div", {}, el("span", {text: "requests"}), el("b", {text: m.requests != null ? m.requests : "-"}), el("span", {text: m.src === "/metrics" ? "total" : "last hour"}))) : null,
     x.last_line_age > 120 && x.running && x.health !== "ok" ? el("div", {class: "alert warn"}, `No log output for ${fmtDur(x.last_line_age)}: the load may be stuck. Report a problem works now; Stop kills it.`) : null,
     el("div", {class: "acts"}, ...acts));
+}
+// the context the ENGINE resolved, in plain words: "Auto (picked 65,536 tokens to fit your card)"; the tooltip says how
+function ctxText(c) {
+  if (!c) return "-";
+  const n = c.resolved || c.per_slot, f = v => Number(v).toLocaleString("en-US");
+  if (!n) return c.mode === "auto" ? "Auto (waiting for the server to report it)" : f(c.requested) + " tokens (waiting for the server)";
+  const cards = c.slots ? "" : "";
+  return (c.mode === "auto" ? `Auto (picked ${f(n)} tokens to fit your card${cards})` : `${f(n)} tokens (set by you)`) +
+    (!c.resolved && c.per_slot ? " per chat" : "") + (c.resolved && c.per_slot && c.slots > 1 ? ` \u00b7 ${c.slots} chats at once, ${f(c.per_slot)} each` : "");
+}
+// a manual context: say what auto would have picked (the launcher's own plan with context 0; nothing is started)
+async function ctxAutoPick() {
+  const out = $("#l-ctx-res"); out.dataset.auto = "1"; out.textContent = "asking the planner ...";
+  try { const b = launchBody(); b.ctx = 0; const r = await api("/api/plan", {body: b, timeout: 60000});
+    out.textContent = r.ctx ? `Auto would pick ${Number(r.ctx).toLocaleString("en-US")} tokens on these cards` : "Auto lets the server choose on these cards";
+    out.title = "from the launcher's plan with Context 0: it sizes the context to the model and the free VRAM (fit check)"; }
+  catch (e) { out.textContent = "could not ask: " + e.message; }
 }
 function targetOf(x) { return x.kind === "managed" ? {sid: x.sid, label: x.label || x.name} : {port: x.port, label: x.label || x.name}; }
 async function fleetAct(x, action) {
@@ -950,8 +1151,52 @@ async function fillTargets() {
   // not to a stopped "Server 1" while another one serves
   const known = S.target && opts.some(o => { const a = JSON.parse(o.v); return (a.sid && a.sid === S.target.sid) || (a.port && a.port === S.target.port); });
   if (!known && opts.length) { S.target = JSON.parse((opts.find(o => o.run) || opts[0]).v); const cm = $("#chat-model"); if (cm) cm.textContent = targetLabel(S.target); }
+  chatQuantNote();
 }
-for (const id of ["#c-target", "#sp-target"]) $(id).addEventListener("change", e => { try { setTarget(JSON.parse(e.target.value)); if (id === "#sp-target") loadSpeed(); else $("#chat-model").textContent = targetLabel(S.target); } catch (x) { /* */ } });
+function fleetInst(t) {
+  const insts = (S.fleet && S.fleet.instances) || [];
+  if (!t) return null;
+  return insts.find(x => (t.sid && x.sid === t.sid) || (t.port && Number(x.port) === Number(t.port)) || (t.fleet_key && x.key === t.fleet_key)) || null;
+}
+function fleetQuantNotice(t) {
+  const inst = fleetInst(t);
+  return (inst && inst.quant_notice) || "";
+}
+function chatServerFor(t) {
+  const servers = (window.PXAAgent && PXAAgent.state && PXAAgent.state.servers) || [];
+  if (!t || !servers.length) return null;
+  return servers.find(s => (t.sid && s.sid === t.sid) || (t.port && Number(s.port) === Number(t.port)) || (t.fleet_key && (s.fleet_key === t.fleet_key || s.key === t.fleet_key))) || null;
+}
+function selectedModelNotice() {
+  // The Launch picker is the selection. A stopped profile does not count until that picker has a file.
+  const path = $("#l-model") && $("#l-model").value;
+  if (!path) return "";
+  const m = S.models && S.models.models && S.models.models.find(x => x.path === path);
+  return (m && m.notice) || "";
+}
+function noteForTarget(t) {
+  const s = chatServerFor(t);
+  // Up: the server has named the model it is serving, and an empty line means that file is a PXA quant.
+  if (s && (s.status === "ready" || s.status === "busy")) return s.quant_notice || "";
+  return selectedModelNotice();
+}
+function paintQuantNote(box, note) {
+  if (!box) return;
+  if (note) box.replaceChildren(quantNotice(note));
+  else box.replaceChildren();
+}
+function assistantQuantTarget() {
+  const st = window.PXAAgent && PXAAgent.state;
+  const srv = st && (st.servers || []).find(s => s.key === st.selected);
+  if (srv && (srv.status === "ready" || srv.status === "busy")) return {sid: srv.sid, port: srv.port, fleet_key: srv.fleet_key};
+  // Nothing is serving. The footer uses the picked model, not a stopped profile the chat did not choose.
+  return ($("#l-model") && $("#l-model").value) ? (S.target || {sid: S.sid}) : null;
+}
+function chatQuantNote() {
+  paintQuantNote($("#c-qnote"), noteForTarget(S.target));
+  paintQuantNote($("#ag-qnote"), noteForTarget(assistantQuantTarget()));
+}
+for (const id of ["#c-target", "#sp-target"]) $(id).addEventListener("change", e => { try { setTarget(JSON.parse(e.target.value)); if (id === "#sp-target") loadSpeed(); else { $("#chat-model").textContent = targetLabel(S.target); loadThinkChat(); } } catch (x) { /* */ } });
 
 // ---------------- RIG ----------------
 async function loadRig(force) {
@@ -980,10 +1225,11 @@ function renderRigCards(live) {
   box.replaceChildren(...live.cards.map(c => {
     const pct = c.mem_total_mib ? Math.round(100 * c.mem_used_mib / c.mem_total_mib) : 0;
     const link = c.pcie_width ? `x${c.pcie_width} gen${c.pcie_gen}` + ((c.pcie_width_max && (c.pcie_width_max !== c.pcie_width || c.pcie_gen_max !== c.pcie_gen)) ? ` (max x${c.pcie_width_max} gen${c.pcie_gen_max})` : "") : "?";
-    const busy = c.procs.length || c.mem_used_mib > 512;
+    const heavy = c.mem_used_mib > 512, held = (c.procs || []).length;
     const hot = c.temp_c != null && c.temp_c >= 80;
+    const mark = heavy ? badge("warn", "busy") : held ? badge("warn", "in use") : badge("ok", "idle");
     return el("div", {class: "card"},
-      el("h3", {}, el("span", {class: "mono", text: "#" + c.index}), c.name, busy ? badge("warn", "busy") : badge("ok", "idle")),
+      el("h3", {}, el("span", {class: "mono", text: "#" + c.index}), c.name, mark),
       el("div", {class: "tiny", text: c.class}),
       c.heat_warning ? el("div", {class: "heatwarn", role: "alert"}, el("span", {"aria-hidden": "true", text: "\u26A0 "}), c.heat_warning) : null,
       el("div", {class: "bar"}, el("i", {style: `width:${pct}%`})),
@@ -1050,15 +1296,16 @@ function renderModels() {
   $("#models-body").replaceChildren(...(m.models.length ? m.models.map(x => {
     const fits = (S.fits && S.fits[x.path]) || [];
     return el("tr", {class: "click" + (x.path === sel ? " sel" : ""), onclick: () => { $("#l-model").value = x.path; store.set("model", x.path); modelInfo(); showTab("launch"); }},
-      el("td", {}, el("div", {style: "font-weight:600;overflow-wrap:anywhere", text: x.file}), el("div", {class: "tiny mono hide-sm", style: "overflow-wrap:anywhere", text: x.path})),
+      el("td", {}, el("div", {style: "font-weight:600;overflow-wrap:anywhere", text: x.file}), el("div", {class: "tiny mono hide-sm", style: "overflow-wrap:anywhere", text: x.path}), stdBadge(x.notice)),
       el("td", {}, el("span", {class: "chip " + (x.codec === "PXQ" ? "pxq" : x.codec === "PXQN" ? "pxqn" : ""), text: x.codec})),
       el("td", {class: "mono", text: x.type || (x.err ? "unreadable" : "-")}),
       el("td", {"data-l": "params", text: x.size_label || fmtParams(x.params)}),
       el("td", {"data-l": "size", text: x.size_h}),
       el("td", {}, x.family, el("div", {class: "tiny hide-sm", text: x.arch || ""})),
+      el("td", {"data-l": "thinking", title: x.thinking ? (x.thinking.label || "") + ": " + (x.thinking.summary || "") : ""}, thinkChip(x.thinking)),
       el("td", {style: "min-width:150px"}, ...fits.map((f, i) => { const lv = f.verdict === "fits" || f.verdict === "ram" ? "ok" : f.verdict === "tight" ? "warn" : "bad";
         const b = badge(lv, (S.fitSets[i] ? S.fitSets[i].label : f.cards.join(",")) + (f.verdict === "ram" ? " + RAM" : "")); b.title = f.why || ""; b.style.margin = "1px"; return b; })));
-  }) : [el("tr", {}, el("td", {colspan: 7, class: "empty", text: m.roots.length ? "No .gguf files under these folders." : "Add a model folder above to see your models here."}))]));
+  }) : [el("tr", {}, el("td", {colspan: 8, class: "empty", text: m.roots.length ? "No .gguf files under these folders." : "Add a model folder above to see your models here."}))]));
   fillModelSelect();
 }
 async function saveDirs(dirs) {
@@ -1070,6 +1317,28 @@ $("#models-rescan").addEventListener("click", () => loadModels(true));
 
 // ---------------- LAUNCH ----------------
 function selectedCards() { return $$("#l-cards input:checked").map(i => +i.value); }
+function cardBadge(c, holders) {
+  // Above half a GiB the card is busy. A compute process on a quieter card is named, not "busy 0.0 GiB".
+  holders = holders || [];
+  const procs = c.procs || [];
+  const heavy = c.mem_used_mib > 512;
+  if (holders.length) {
+    const b = badge("warn", "used by " + holders.join(", "));
+    b.title = holders.concat(procs.map(p => p.name)).join(", ");
+    return b;
+  }
+  if (heavy) {
+    const b = badge("warn", "busy " + (c.mem_used_mib / 1024).toFixed(1) + " GiB");
+    if (procs.length) b.title = procs.map(p => p.name).join(", ");
+    return b;
+  }
+  if (procs.length) {
+    const b = badge("warn", "in use by another process");
+    b.title = procs.map(p => p.name + " " + p.mib + " MiB").join(", ");
+    return b;
+  }
+  return badge("ok", "idle");
+}
 function renderLaunchCards() {
   const keep = new Set(store.get("cards", []));
   const box = $("#l-cards");
@@ -1078,13 +1347,10 @@ function renderLaunchCards() {
   box.replaceChildren(...S.gpus.map(c => {
     const fc = S.fleet ? (S.fleet.cards || []).find(f => f.index === c.index) : null;
     const holders = fc ? fc.users.filter(u => !(u.sid && u.sid === S.sid)).map(u => u.name) : [];
-    const busy = holders.length || c.procs.length || c.mem_used_mib > 512;
     const short = c.name.replace(/^(Tesla |GeForce )/, "").replace(/-PCIE.*$/, "");
-    const st = holders.length ? badge("warn", "used by " + holders.join(", "))
-      : busy ? badge("warn", `busy ${(c.mem_used_mib / 1024).toFixed(1)} GiB`) : badge("ok", "idle");
-    if (busy) st.title = holders.concat(c.procs.map(p => p.name)).join(", ");
+    const st = cardBadge(c, holders);
     return el("label", {class: "tile"},
-      el("input", {type: "checkbox", value: c.index, checked: prev.has(c.index), "aria-label": `card ${c.index} ${c.name}`, onchange: () => { store.set("cards", selectedCards()); loadFits(); steps(); }}),
+      el("input", {type: "checkbox", value: c.index, checked: prev.has(c.index), "aria-label": `card ${c.index} ${c.name}`, onchange: () => { store.set("cards", selectedCards()); loadFits(); steps(); loadCompanions(); }}),
       el("span", {class: "tick", "aria-hidden": "true"}),
       el("span", {class: "t1"}, el("span", {class: "mono", text: "#" + c.index}), short),
       el("span", {class: "t2", text: `${(c.mem_total_mib / 1024).toFixed(0)} GiB · sm_${c.sm}`}),
@@ -1129,11 +1395,55 @@ function fillModelSelect() {
   if (s.value !== cur) s.value = "";
   modelInfo(); steps();
 }
+function quantizerText(q) {
+  if (!q) return "";
+  let t = [q.edition, q.version].filter(Boolean).join(" ");
+  if (q.build_tag) t += ` (build ${q.build_tag})`;
+  if (q.licensee) t += `, licensee ${q.licensee}`;
+  const e = Number(q.license_expires);
+  if (e > 0) t += `, expires ${new Date(e * 1000).toISOString().slice(0, 10)}`;
+  return t ? `, quantizer ${t}` : "";
+}
 function modelInfo() {
   const m = S.models && S.models.models.find(x => x.path === $("#l-model").value);
-  $("#l-model-info").textContent = m ? `${m.family}, arch ${m.arch || "?"}, ${m.size_label || fmtParams(m.params)} params, trained ctx ${m.n_ctx_train || "?"}${m.vision ? ", vision" : ""}` : "";
+  if (TK.l.model !== $("#l-model").value) loadThinkModel();
+  $("#l-model-info").textContent = m ? `${m.family}, arch ${m.arch || "?"}, ${m.size_label || fmtParams(m.params)} params, trained ctx ${m.n_ctx_train || "?"}${m.vision ? ", vision" : ""}${quantizerText(m.quantizer)}` : "";
+  const note = $("#l-model-note");
+  if (note) {
+    if (m && m.notice) note.replaceChildren(quantNotice(m.notice));
+    else note.replaceChildren();
+  }
+  chatQuantNote();
 }
-$("#l-model").addEventListener("change", () => { store.set("model", $("#l-model").value); modelInfo(); steps(); });
+$("#l-model").addEventListener("change", () => { store.set("model", $("#l-model").value); modelInfo(); steps(); loadThinkModel(); loadCompanions(); });
+async function loadCompanions() {
+  const dw = $("#l-draft-wrap"), hw = $("#l-hot-wrap");
+  if (!dw || !hw) return;
+  const model = $("#l-model").value;
+  if (!model) { dw.hidden = true; hw.hidden = true; return; }
+  let d;
+  try { d = await api("/api/launch/companions?model=" + encodeURIComponent(model) + "&gpus=" + encodeURIComponent(selectedCards().join(","))); }
+  catch (e) { dw.hidden = true; hw.hidden = true; return; }
+  const sel = $("#l-draft");
+  const want = S.pendingDraft != null ? S.pendingDraft : sel.value;
+  S.pendingDraft = null;
+  sel.replaceChildren(el("option", {value: "", text: "none"}));
+  for (const x of (d.drafters || [])) sel.appendChild(el("option", {value: x.path, text: x.file}));
+  if (want) sel.value = want;
+  dw.hidden = !(d.drafters && d.drafters.length);
+  const hot = $("#l-hot");
+  const keep = new Set(S.pendingHot || [...hot.selectedOptions].map(o => o.value));
+  S.pendingHot = null;
+  hot.replaceChildren();
+  for (const m of ((S.models && S.models.models) || [])) {
+    if (m.path === model) continue;
+    const o = el("option", {value: m.path, text: m.file});
+    if (keep.has(m.path)) o.selected = true;
+    hot.appendChild(o);
+  }
+  hw.hidden = !d.vmm;
+  if (!d.vmm) [...hot.options].forEach(o => o.selected = false);
+}
 segInit($("#l-sm")); segInit($("#l-fa"));
 function launchBody() {
   const levers = {};
@@ -1142,20 +1452,24 @@ function launchBody() {
           kv: $("#l-kv").value, port: +$("#l-port").value || 0, sm: $("#l-sm").dataset.v, fa: $("#l-fa").dataset.v,
           mtp: $("#l-mtp").checked, expose: $("#l-expose").checked, accept_unmeasured: $("#l-unmeasured").checked,
           allow_busy: $("#l-busy").checked, levers, extra_args: $("#l-extra").value.trim(),
-          engine_dir: $("#l-engine-path").value.trim() || $("#l-engine").value};
+          draft_model: ($("#l-draft-wrap") && !$("#l-draft-wrap").hidden) ? $("#l-draft").value : "",
+          hot_models: ($("#l-hot-wrap") && !$("#l-hot-wrap").hidden) ? [...$("#l-hot").selectedOptions].map(o => o.value) : [],
+          engine_dir: $("#l-engine-path").value.trim() || $("#l-engine").value, thinking: thinkVal("l")};
 }
 function applyBody(b) {
   if (!b) return;
   store.set("cards", b.gpus || []); renderLaunchCards();
   $$("#l-cards input").forEach(i => i.checked = (b.gpus || []).includes(+i.value));
   if (b.model) { $("#l-model").value = b.model; store.set("model", b.model); modelInfo(); }
-  $("#l-ctx").value = b.ctx || 0; $("#l-np").value = b.np || 0; $("#l-kv").value = b.kv || "auto"; $("#l-port").value = b.port || "";
+  $("#l-ctx").value = b.ctx || 0; if (window.ctxManualUi) setTimeout(ctxManualUi, 0); $("#l-np").value = b.np || 0; $("#l-kv").value = b.kv || "auto"; $("#l-port").value = b.port || "";
   $("#l-sm").setv(b.sm || "auto"); $("#l-fa").setv(b.fa || "auto");
   $("#l-mtp").checked = !!b.mtp; $("#l-expose").checked = !!b.expose; $("#l-unmeasured").checked = !!b.accept_unmeasured; $("#l-busy").checked = !!b.allow_busy;
+  S.pendingDraft = b.draft_model || ""; S.pendingHot = b.hot_models || []; loadCompanions();
   $("#l-extra").value = Array.isArray(b.extra_args) ? b.extra_args.map(a => /^[\w.,:=+\-\/]+$/.test(a) ? a : "'" + a.replace(/'/g, "'\\''") + "'").join(" ") : (b.extra_args || "");
   const ed = b.engine_dir || ""; const known = $$("#l-engine option").some(o => o.value === ed);
   $("#l-engine").value = known ? ed : ""; $("#l-engine-path").value = known ? "" : ed;
   S.leverVals = Object.assign({}, b.levers || {}); store.set("levers", S.leverVals); renderLevers();
+  loadThinkModel(b.thinking);
 }
 function renderFitBox(fit) {
   const box = $("#plan-fit"); if (!fit || fit.error) { box.replaceChildren(fit && fit.error ? el("span", {class: "tiny", text: "VRAM estimate unavailable: " + fit.error}) : ""); return; }
@@ -1173,7 +1487,7 @@ function renderPlan(d) {
   renderFitBox(d.fit);
   const lw = (d.lever_warnings || []).map(n => el("div", {class: "find"}, el("span", {class: "dot warn"}), el("span", {text: "lever: " + n})));
   if (d.ok) {
-    $("#plan-engine").textContent = `engine ${d.engine}, cards ${d.cards}, port ${d.port}, ctx ${d.ctx}, -sm ${d.sm}`;
+    $("#plan-engine").textContent = `engine ${d.engine}, cards ${d.cards}, port ${d.port}, ctx ${d.ctx_auto ? "auto " : ""}${d.ctx}, -sm ${d.sm}`;
     $("#plan-cmd").textContent = d.shell || d.command;
     $("#plan-notes").replaceChildren(...(d.blockers || []).map(n => el("div", {class: "find"}, el("span", {class: "dot bad"}), el("span", {text: n}))),
       ...(d.notes || []).map(n => el("div", {class: "find"}, el("span", {class: "dot warn"}), el("span", {text: n}))), ...lw);
@@ -1197,9 +1511,9 @@ async function doStart() {
   try {
     const d = await api("/api/start", {body: launchBody(), timeout: 180000});
     if (!d.ok) { renderPlan(d); toast("the launcher refused; see the plan", true); }
-    else { toast("server starting: loading the model can take a minute or two"); openLog(); S.startedAt = Date.now();
+    else { toast("server starting: loading the model can take a minute or two"); S.startedAt = Date.now();
       if (matchMedia("(max-width: 980px)").matches) $("#s-phase").closest(".card").scrollIntoView({behavior: "smooth", block: "start"});
-      if (d.plan) renderPlan(d.plan); loadServers(); }
+      if (d.plan) renderPlan(d.plan); await openLog(); loadServers(); }
   } catch (e) { toast(e.message, true); }
   await pollStatus(); steps();
 }
@@ -1207,14 +1521,28 @@ $("#b-plan").addEventListener("click", doPlan);
 $("#b-start").addEventListener("click", doStart);
 $("#b-stop").addEventListener("click", async () => { $("#b-stop").disabled = true; try { const d = await api("/api/stop", {body: {sid: S.sid}, timeout: 60000}); toast(d.stopped ? "server stopped" : (d.status && d.status.phase) || "not running", !d.stopped); } catch (e) { toast(e.message, true); } pollStatus(); loadServers(); });
 $("#b-restart").addEventListener("click", async () => {
-  try { const d = await api("/api/restart", {body: launchBody(), timeout: 180000}); if (!d.ok) { renderPlan(d); toast("the launcher refused", true); } else { toast("restarting"); S.startedAt = Date.now(); if (d.plan) renderPlan(d.plan); openLog(); } }
+  try { const d = await api("/api/restart", {body: launchBody(), timeout: 180000}); if (!d.ok) { renderPlan(d); toast("the launcher refused", true); } else { toast("restarting"); S.startedAt = Date.now(); if (d.plan) renderPlan(d.plan); await openLog(); } }
   catch (e) { toast(e.message, true); } pollStatus();
 });
 
 // levers
 async function loadLevers() {
-  try { const d = await api("/api/levers"); S.levers = d.levers; $("#adv-src").textContent = d.src || "catalog not found"; renderLevers(); } catch (e) { /* optional */ }
+  try { const d = await api("/api/levers"); S.levers = d.levers; S.builtin = d.builtin || null; $("#adv-src").textContent = d.src || "catalog not found"; renderLevers(); } catch (e) { /* optional */ }
 }
+// built-in levers: not in a release catalog (the closed library reads them), known by hash; the server accepts them
+function leverHash(name) {
+  let h = 0xcbf29ce484222325n;
+  for (const b of new TextEncoder().encode(name)) h = ((h ^ BigInt(b)) * 0x100000001b3n) & 0xFFFFFFFFFFFFFFFFn;
+  return h.toString(16).padStart(16, "0");
+}
+function builtinKind(name) {
+  const B = S.builtin; if (!B || !B.hashes || !B.hashes.length || !/^PX[AQ]_[A-Z0-9_]{1,64}$/.test(name)) return null;
+  const hs = [name]; for (let k = 5; k < name.length; k++) hs.push(name.slice(0, k) + "*");
+  const H = hs.map(leverHash);
+  if (H.some(h => B.preset.includes(h))) return "preset";
+  return H.some(h => B.hashes.includes(h)) ? "builtin" : null;
+}
+const BUILTIN_LABEL = {preset: "built-in (Flash-Next preset)", builtin: "built-in"};
 function leverHint(l, v) {
   // the same hints the server's lint gives, shown while typing (never a refusal: the catalog check is)
   if (!v) return "";
@@ -1234,10 +1562,14 @@ function renderLevers() {
   const q = $("#adv-q").value.trim().toUpperCase(), mode = $("#adv-st").value;
   const set = Object.keys(S.leverVals).filter(k => S.leverVals[k] !== "");
   $("#adv-count").textContent = S.levers.length ? `(${S.levers.length}${set.length ? ", " + set.length + " set" : ""})` : "";
-  $("#adv-set").replaceChildren(...set.map(k => { const c = badge("warn", `${k}=${S.leverVals[k]}`); c.title = "click to remove"; c.onclick = () => { delete S.leverVals[k]; store.set("levers", S.leverVals); renderLevers(); }; return c; }));
   const by = Object.fromEntries(S.levers.map(l => [l.name, l]));
-  const warns = set.map(k => by[k] ? leverHint(by[k], S.leverVals[k]) && `${k}: ${leverHint(by[k], S.leverVals[k])}` : `${k} is not in this catalog (it will be refused)`).filter(Boolean);
+  $("#adv-set").replaceChildren(...set.map(k => { const bk = !by[k] && builtinKind(k);
+    const c = badge(bk ? "ok" : "warn", bk ? `${k}=${S.leverVals[k]} · ${BUILTIN_LABEL[bk]}` : `${k}=${S.leverVals[k]}`); c.title = "click to remove"; c.onclick = () => { delete S.leverVals[k]; store.set("levers", S.leverVals); renderLevers(); }; return c; }));
+  const warns = set.map(k => by[k] ? leverHint(by[k], S.leverVals[k]) && `${k}: ${leverHint(by[k], S.leverVals[k])}` : builtinKind(k) ? "" : `${k} is not in this catalog (it will be refused)`).filter(Boolean);
   $("#adv-warn").textContent = warns.join(" · ");
+  const nOn = (S.builtin && S.builtin.env_on) || 0, bi = $("#adv-builtin");
+  bi.hidden = !nOn;
+  bi.textContent = nOn ? `${nOn} built-in lever${nOn === 1 ? "" : "s"} (Flash-Next preset) ${nOn === 1 ? "is" : "are"} on: set where PXA Control was started, passed to the server as they are. Built-in levers are not listed here.` : "";
   const keep = l => {
     if (S.leverVals[l.name]) return mode !== "diag" || ["diagnostic", "site"].includes(l.status);
     if (mode === "set") return false;
@@ -1289,8 +1621,16 @@ $("#p-del").addEventListener("click", async () => {
 async function pollStatus() {
   try {
     const s = await api("/api/status?sid=" + encodeURIComponent(S.sid), {timeout: 15000}); S.status = s;
-    $("#s-name").textContent = s.name || "";
     const h = s.health, run = s.running || s.attached;
+    const servingNow = !!(s.running && h === "ok");
+    if (s.log_seq < S.logSeq) resetLog();
+    // Lines the server already wrote are loaded before the serving line is painted, and again
+    // whenever the sequence moves, including when the live stream is already open.
+    if ((servingNow && !S.servingSeen) || s.log_seq > S.logSeq) await loadLogBacklog();
+    if (!s.running) S.servingSeen = false;
+    else if (servingNow) S.servingSeen = true;
+    if (!S.es && (s.running || s.attached)) openLog();
+    $("#s-name").textContent = s.name || "";
     const failed = !s.running && s.exit_code != null && s.exit_code !== 0 && /^exited/.test(s.phase || "");
     const cls = h === "ok" ? "ok" : (h === "loading" || (s.running && h !== "ok")) ? "warn pulse" : (run || failed) ? "bad" : "";
     $("#hdot").className = "dot " + cls; $("#s-dot").className = "dot " + cls;
@@ -1301,13 +1641,29 @@ async function pollStatus() {
     const name = s.model ? s.model.split("/").pop() : (s.attached ? "attached :" + s.engine_port : "");
     const others = S.fleet ? S.fleet.instances.filter(x => x.health === "ok" && !(x.kind === "managed" && x.sid === S.sid)).length : 0;
     $("#htext").textContent = (run ? `${s.name ? s.name + ": " : ""}${h === "ok" ? "serving" : s.phase || h}${name ? " · " + name : ""}` : failed ? `${s.name || "server"} exited` : "no server") + (others ? ` (+${others} serving)` : "");
-    $("#s-phase").textContent = s.running ? (h === "ok" ? "serving" : s.phase) : s.attached ? `attached to :${s.engine_port} (${h === "ok" ? "serving" : h})` : (s.phase || "stopped");
-    $("#s-info").textContent = s.running ? `pid ${s.pid} · port ${s.port} · cards ${s.gpus} · up ${fmtDur(Date.now() / 1000 - s.started)}` : (s.exit_code != null ? `last run: exit code ${s.exit_code}` : "Not running.");
+    if (s.running) {
+      $("#s-phase").textContent = h === "ok" ? "serving" : s.phase;
+      $("#s-info").textContent = `pid ${s.pid} · port ${s.port} · cards ${s.gpus} · up ${fmtDur(Date.now() / 1000 - s.started)}`;
+    } else if (s.attached) {
+      // This page did not start the process. Say so, and do not call a live server "Not running".
+      if (h === "ok") {
+        $("#s-phase").textContent = "serving";
+        $("#s-info").textContent = `Attached to an external server on port ${s.engine_port}. This page did not start it.`;
+      } else {
+        $("#s-phase").textContent = "attached";
+        $("#s-info").textContent = `Attached to port ${s.engine_port}. It is not serving.`;
+      }
+    } else {
+      $("#s-phase").textContent = s.phase || "stopped";
+      $("#s-info").textContent = s.exit_code != null ? `last run: exit code ${s.exit_code}` : "Not running.";
+    }
+    const cx = $("#s-ctx"), cxr = $("#l-ctx-res");
+    if (s.running && s.context) { cx.hidden = false; cx.title = s.context.how; cx.replaceChildren("Context", el("b", {text: ctxText(s.context)})); if (!cxr.dataset.auto) { cxr.textContent = "running now: " + ctxText(s.context); cxr.title = s.context.how; } }
+    else { cx.hidden = true; if (!cxr.dataset.auto) { cxr.textContent = ""; cxr.title = ""; } }
     $("#b-stop").disabled = !s.running; $("#b-restart").disabled = !s.running && s.exit_code == null;
     steps();
     $("#chat-model").textContent = S.target ? targetLabel(S.target) : name;
-    if (s.log_seq > S.logSeq && !S.es) openLog();
-    if (s.log_seq < S.logSeq) resetLog();         // a new run of this server: its log restarted
+    chatQuantNote();
   } catch (e) { $("#htext").textContent = "PXA Control unreachable"; $("#hdot").className = "dot bad"; }
 }
 function logRender() { renderLogInto($("#log"), S.logLines, $("#log-q").value, $("#log-err").checked, $("#log-follow").checked, $("#log-count")); }
@@ -1317,23 +1673,55 @@ function logAppend(lines) {
 }
 function resetLog() {
   if (S.es) { S.es.close(); S.es = null; }
-  S.logSeq = 0; S.logLines = []; S.logGen = (S.logGen || 0) + 1;
-  $("#log").replaceChildren(el("span", {class: "muted", text: "The server's output appears here once it starts."})); $("#log-count").textContent = "";
+  clearTimeout(logAppend._t);
+  S.logSeq = 0; S.logLines = []; S.logGen = (S.logGen || 0) + 1; S.servingSeen = false;
+  const pre = $("#log"); delete pre.dataset.live;
+  pre.replaceChildren(el("span", {class: "muted", text: "The server's output appears here once it starts."})); $("#log-count").textContent = "";
+}
+// GET is the only writer, and calls run one after another, so a stream batch that overlaps a
+// backlog fetch is not appended twice.
+function loadLogBacklog() {
+  const gen = S.logGen || 0, sid = S.sid;
+  const job = (S._logChain || Promise.resolve()).then(async () => {
+    if (gen !== (S.logGen || 0) || sid !== S.sid) return;
+    const d = await api(`/api/log?sid=${encodeURIComponent(sid)}&since=${S.logSeq}`);
+    if (gen !== (S.logGen || 0) || sid !== S.sid) return;
+    if (d.seq > S.logSeq && d.lines && d.lines.length) {
+      S.logSeq = d.seq;
+      S.logLines.push(...d.lines);
+      if (S.logLines.length > 12000) S.logLines = S.logLines.slice(-8000);
+      logRender();
+    } else if (d.seq > S.logSeq) S.logSeq = d.seq;
+  }).catch(() => {});
+  S._logChain = job;
+  return job;
 }
 function openLog() {
-  if (S.es) return;
+  if (S.es || S._opening) return loadLogBacklog();
+  S._opening = true;
   const sid = S.sid, gen = S.logGen || 0;
-  if (window.EventSource) {
-    const es = new EventSource(`/api/log/stream?sid=${encodeURIComponent(sid)}&since=${S.logSeq}`); S.es = es; $("#log-mode").textContent = "live (SSE)";
-    es.onmessage = ev => { if (S.es !== es) return; const d = JSON.parse(ev.data); S.logSeq = d.seq; logAppend(d.lines); };
+  return loadLogBacklog().then(() => {
+    if (S.es || gen !== (S.logGen || 0) || sid !== S.sid) return;
+    if (!window.EventSource) { pollLog(gen); return; }
+    const es = new EventSource(`/api/log/stream?sid=${encodeURIComponent(sid)}&since=${S.logSeq}`);
+    S.es = es; $("#log-mode").textContent = "live (SSE)";
+    es.onmessage = ev => {
+      if (S.es !== es) return;
+      let d; try { d = JSON.parse(ev.data); } catch (e) { return; }
+      if (!d || !(d.seq > S.logSeq)) return;
+      loadLogBacklog();
+    };
     es.onerror = () => { es.close(); if (S.es === es) { S.es = null; $("#log-mode").textContent = "polling"; pollLog(gen); } };
-  } else pollLog(gen);
+  }).finally(() => { S._opening = false; });
 }
 async function pollLog(gen) {
   if (S.es || gen !== (S.logGen || 0)) return;
-  try { const d = await api(`/api/log?sid=${encodeURIComponent(S.sid)}&since=${S.logSeq}`); if (d.lines.length) { S.logSeq = d.seq; logAppend(d.lines); } } catch (e) { /* retry */ }
+  try { await loadLogBacklog(); } catch (e) { /* retry */ }
   setTimeout(() => pollLog(gen), 2000);
 }
+function ctxManualUi() { const v = +$("#l-ctx").value || 0; $("#l-ctx-auto").hidden = v <= 0; const r = $("#l-ctx-res"); if (r.dataset.auto) { delete r.dataset.auto; r.textContent = ""; } }
+$("#l-ctx").addEventListener("input", ctxManualUi);
+$("#l-ctx-auto").addEventListener("click", ev => { ev.preventDefault(); ctxAutoPick(); });
 $("#log-q").addEventListener("input", logRender); $("#log-err").addEventListener("change", logRender);
 $("#log-dl").addEventListener("click", () => download(`pxa-${S.sid}.log`, S.logLines.join("\n") + "\n"));
 setInterval(() => { if (!document.hidden) pollStatus(); }, 3000);
@@ -1528,92 +1916,88 @@ $("#bn-run").addEventListener("click", async () => {
   try { await api("/api/bench", {body: Object.assign({warmup: +$("#bn-warm").value, reps: +$("#bn-reps").value}, S.target && S.target.sid ? {sid: S.target.sid} : S.target && S.target.port ? {port: S.target.port} : {})}); loadBench(); } catch (e) { toast(e.message, true); }
 });
 
-// ---------------- CHAT ----------------
-function esc(s) { return s.replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c])); }
-function inline(s) {
-  // s is already escaped
-  return s.replace(/`([^`\n]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+// ---------------- CHAT: chat.js (window.PXAChat) and its chat-*.js plugins, loaded at the end ----------------
+
+// ---------------- thinking: one switch, the right mechanism per model (tools/pxa_thinking.py) ----------------
+const TK = {l: {prof: null, model: null, timer: null}, c: {prof: null, key: null}};
+function thinkChip(t) {
+  if (!t) return "-";
+  if (!t.supported) return el("span", {class: "tiny", text: t.family === "unknown" ? "unknown" : "none"});
+  const d = t.default === "always" ? "always" : t.default === "off" ? "off" : t.default === "on" ? "on" : "tmpl";
+  return el("span", {}, el("span", {class: "chip", text: d}), el("span", {class: "tiny", text: " " + (t.budget ? t.budget : "")}));
 }
-function md(src) {
-  const out = [], parts = src.split(/```/);
-  parts.forEach((p, i) => {
-    if (i % 2) { const nl = p.indexOf("\n"); const body = nl >= 0 ? p.slice(nl + 1) : p; out.push("<pre><code>" + esc(body.replace(/\n$/, "")) + "</code></pre>"); return; }
-    let list = null, para = [];
-    const flush = () => { if (para.length) { out.push("<p>" + inline(esc(para.join("\n"))).replace(/\n/g, "<br>") + "</p>"); para = []; } };
-    const endList = () => { if (list) { out.push(`</${list}>`); list = null; } };
-    for (const line of p.split("\n")) {
-      let m;
-      if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); endList(); out.push(`<h4>${inline(esc(m[2]))}</h4>`); }
-      else if ((m = line.match(/^\s*[-*]\s+(.*)$/))) { flush(); if (list !== "ul") { endList(); out.push("<ul>"); list = "ul"; } out.push(`<li>${inline(esc(m[1]))}</li>`); }
-      else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flush(); if (list !== "ol") { endList(); out.push("<ol>"); list = "ol"; } out.push(`<li>${inline(esc(m[1]))}</li>`); }
-      else if (!line.trim()) { flush(); endList(); }
-      else { endList(); para.push(line); }
-    }
-    flush(); endList();
-  });
-  return out.join("");
+function thinkVal(px) {
+  const box = $("#" + px + "-think"); if (!box || box.hidden || !TK[px].prof || !TK[px].prof.supported) return {mode: "auto", budget: null, level: null};
+  const b = $("#" + px + "-think-budget").value.trim();
+  const r = {mode: $("#" + px + "-think-mode").dataset.v || "auto", budget: b === "" ? null : Math.round(+b), level: $("#" + px + "-think-level").value || null};
+  const fb = $("#" + px + "-think-fb"); if (fb && fb.checked) r.fallback = true;
+  const ef = $("#" + px + "-think-effort"); if (ef && ef.value) r.effort = ef.value;
+  const lk = $("#" + px + "-think-lock"); if (lk && lk.checked && r.effort) r.lock = true;
+  return r;
 }
-function addMsg(role, text) {
-  $("#msgs-empty") && $("#msgs-empty").remove();
-  const body = el("div", {class: "body"}), think = el("div", {class: "think", hidden: true}), meta = el("div", {class: "meta"});
-  const m = el("div", {class: "msg " + role}, think, body, meta);
-  if (role === "user") body.textContent = text; else body.innerHTML = md(text || "");
-  $("#msgs").append(m); $("#msgs").scrollTop = $("#msgs").scrollHeight;
-  return {m, body, think, meta};
+function setThink(px, st) {
+  st = st || {}; $("#" + px + "-think-mode").setv(st.mode || "auto");
+  $("#" + px + "-think-budget").value = st.budget == null ? "" : st.budget;
+  const lv = $("#" + px + "-think-level"); lv.value = st.level || ""; if (lv.value !== (st.level || "")) lv.value = "";
+  const fb = $("#" + px + "-think-fb"); if (fb) fb.checked = !!st.fallback;
+  const ef = $("#" + px + "-think-effort"); if (ef) ef.value = st.effort || "";
+  const lk = $("#" + px + "-think-lock"); if (lk) lk.checked = !!st.lock;
 }
-async function send() {
-  const text = $("#c-in").value.trim(); if (!text || S.abort) return;
-  $("#c-in").value = "";
-  S.chat.push({role: "user", content: text}); addMsg("user", text);
-  const ui = addMsg("assistant", ""); ui.meta.textContent = "thinking ...";
-  const msgs = []; const sys = $("#c-sys").value.trim(); if (sys) msgs.push({role: "system", content: sys});
-  msgs.push(...S.chat);
-  const body = {messages: msgs, stream: true, temperature: +$("#c-temp").value, max_tokens: +$("#c-max").value || 1024,
-                chat_template_kwargs: {enable_thinking: $("#c-think").checked}, stream_options: {include_usage: true}};
-  const ac = new AbortController(); S.abort = ac; $("#c-send").disabled = true; $("#c-stop").disabled = false;
-  let content = "", reasoning = "", timings = null, usage = null, n = 0; const t0 = performance.now(); let tFirst = null;
+function thinkInfo(px) {
+  const p = TK[px].prof, info = $("#" + px + "-think-info"); if (!p) { info.textContent = ""; return; }
+  if (!p.supported) { info.textContent = `No thinking switch for this model (${p.label}; ${p.detected_by}). The toggle is hidden.`; return; }
+  const v = thinkVal(px), b = p.budget, enf = {engine: "the engine cuts the thought at the budget", template: "the model's own budget kwarg", guard: "only a max_tokens cap: the engine cannot cut this model's thought"}[b.enforce] || b.enforce;
+  const ver = p.verify ? (p.verify.ok ? (p.verify.differs ? " · verified: the template renders on and off differently" : (p.verify.off_closes_thought ? " · the template always opens the thought; off is done by the engine" : " · note: on and off render the same here")) : " · not verified (" + p.verify.error + ")") : "";
+  const txt = `${p.label}: ${p.summary}. Suggested budget ${b.suggested} tokens (a suggestion; empty = use it, -1 = unlimited); ${enf}. Detected by ${p.detected_by} (${p.confidence})${ver}.`;
+  const ML = {"template-kwarg": "the template kwarg", "soft-tag": "a soft tag in the prompt", "empty-think-prefill": "an empty thought pre-filled at the start of the answer", "reasoning-budget": "the engine closing the thought at once (--reasoning-budget 0)", "effort-level": "the lowest effort", "default": "the model's default"};
+  const ms = (p.methods && p.methods[v.mode === "on" ? "on" : "off"]) || [], m = v.fallback && ms.length > 1 ? ms[1] : ms[0];
+  const cant = v.mode === "off" && !p.can_disable ? " This model cannot stop thinking: off means the lowest effort." : (v.mode !== "auto" && m ? ` ${v.mode === "on" ? "On" : "Off"} is done by ${ML[m] || m}${m === "empty-think-prefill" && p.prefill ? " " + JSON.stringify(p.prefill) : ""}.` : "");
+  info.textContent = txt + cant + (p.notes && p.notes.length ? " " + p.notes.join(" ") : "");
+}
+function renderThink(px, d, st) {
+  const box = $("#" + px + "-think"), p = d && d.profile; TK[px].prof = p || null;
+  if (!p) { box.hidden = true; box.classList.remove("note-only"); return; }
+  const bare = !p.supported;
+  box.hidden = false;
+  box.classList.toggle("note-only", bare);
+  $("#" + px + "-think-ctl").hidden = bare;
+  const lw = $("#" + px + "-think-level-w"), lv = $("#" + px + "-think-level");
+  if (p.levels) { const vals = p.levels.values.slice(); if (p.levels.off_value && !vals.includes(p.levels.off_value)) vals.unshift(p.levels.off_value);
+    lv.replaceChildren(el("option", {value: "", text: "default (" + p.levels.default + ")"}), ...vals.map(x => el("option", {value: x, text: x}))); lw.hidden = false; }
+  else { lv.replaceChildren(el("option", {value: "", text: "-"})); lw.hidden = true; }
+  const fw = $("#" + px + "-think-fb-w"); if (fw) fw.hidden = !(p.methods && ((p.methods.on || []).length > 1 || (p.methods.off || []).length > 1));
+  $("#" + px + "-think-budget").placeholder = p.supported ? "suggested " + p.budget.suggested : "-";
+  setThink(px, st || d.settings); thinkInfo(px);
+}
+async function loadThinkModel(serverThinking) {
+  const m = $("#l-model").value, seq = TK.l.seq = (TK.l.seq || 0) + 1; TK.l.model = m;
+  if (!m) { renderThink("l", null); return; }
   try {
-    const r = await fetch(withQ("/api/engine/v1/chat/completions", qsTarget(S.target)), {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body), signal: ac.signal});
-    if (!r.ok) { let j = null; try { j = await r.json(); } catch (e) { /* */ } throw new Error((j && (j.error && (j.error.message || j.error))) || "HTTP " + r.status); }
-    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
-    for (;;) {
-      const {value, done} = await rd.read(); if (done) break;
-      buf += dec.decode(value, {stream: true});
-      let i; while ((i = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-        if (!line.startsWith("data:")) continue; const data = line.slice(5).trim(); if (data === "[DONE]") continue;
-        let j; try { j = JSON.parse(data); } catch (e) { continue; }
-        if (j.timings) timings = j.timings; if (j.usage) usage = j.usage;
-        const d = j.choices && j.choices[0] && j.choices[0].delta; if (!d) continue;
-        if (d.reasoning_content) { reasoning += d.reasoning_content; ui.think.hidden = false; ui.think.textContent = reasoning; n++; }
-        if (d.content) { content += d.content; n++; ui.body.innerHTML = md(content); }
-        if (tFirst == null && (d.content || d.reasoning_content)) tFirst = performance.now();
-        ui.meta.textContent = `${n} tokens ...`; $("#msgs").scrollTop = $("#msgs").scrollHeight;
-      }
-    }
-  } catch (e) { if (e.name !== "AbortError") { ui.meta.textContent = "error: " + (/no server/.test(e.message) ? "no server is running: start one on the Launch tab" : e.message); ui.m.style.borderColor = "var(--bad)"; } }
-  finally {
-    S.abort = null; $("#c-send").disabled = false; $("#c-stop").disabled = true;
-    if (content || reasoning) {
-      S.chat.push({role: "assistant", content});
-      const secs = ((performance.now() - (tFirst || t0)) / 1000);
-      ui.meta.textContent = timings ? `${fmtNum(timings.predicted_per_second)} t/s decode · ${fmtNum(timings.prompt_per_second)} t/s prefill · ${timings.predicted_n} tokens`
-        : `${fmtNum(n / Math.max(secs, 1e-3))} t/s (measured in the browser) · ${usage ? usage.completion_tokens : n} tokens`;
-    }
-  }
+    const d = await api("/api/thinking?model=" + encodeURIComponent(m), {timeout: 60000});
+    if ($("#l-model").value !== m || seq !== TK.l.seq) return;
+    const own = serverThinking && (serverThinking.mode !== "auto" || serverThinking.budget != null || serverThinking.level || serverThinking.effort);
+    renderThink("l", d, own ? serverThinking : d.settings);
+  } catch (e) { const box = $("#l-think"); box.hidden = false; box.classList.add("note-only"); $("#l-think-ctl").hidden = true; $("#l-think-info").textContent = "thinking profile unavailable: " + e.message; }
 }
-$("#c-send").addEventListener("click", send);
-$("#c-stop").addEventListener("click", () => S.abort && S.abort.abort());
-$("#c-in").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
-$("#c-clear").addEventListener("click", () => { S.chat = []; $("#msgs").replaceChildren(el("div", {class: "empty center", id: "msgs-empty"}, el("b", {text: "New chat"}), el("span", {text: "Say something."}))); });
-$("#c-attach-b").addEventListener("click", async () => {
-  try { const d = await api("/api/attach", {body: {port: +$("#c-attach").value || 0}}); toast(d.attach_port ? "attached to :" + d.attach_port : "detached"); pollStatus(); } catch (e) { toast(e.message, true); }
-});
-["c-sys", "c-temp", "c-max"].forEach(id => { const v = store.get(id); if (v != null) $("#" + id).value = v; $("#" + id).addEventListener("change", e => store.set(id, e.target.value)); });
-$("#c-think").checked = store.get("c-think", false); $("#c-think").addEventListener("change", e => store.set("c-think", e.target.checked));
+function saveThinkModel() {   // the per-model setting, remembered in control.json (thinking_models)
+  clearTimeout(TK.l.timer); thinkInfo("l");
+  const m = TK.l.model; if (!m || !TK.l.prof || !TK.l.prof.supported) return;
+  TK.l.timer = setTimeout(async () => { try { await api("/api/thinking/override", {body: {model: m, thinking: thinkVal("l")}}); } catch (e) { toast(e.message, true); } }, 500);
+}
+async function loadThinkChat() {
+  const key = JSON.stringify(S.target || {}); TK.c.key = key;
+  if (!targetUp(S.target)) { renderThink("c", null); return; }   // a stopped server has no profile to show
+  try {
+    const d = await api(withQ("/api/thinking", qsTarget(S.target)), {timeout: 60000});
+    if (TK.c.key !== key) return;
+    TK.c.storeKey = "think." + (d.model || key);
+    renderThink("c", d, store.get(TK.c.storeKey, null) || d.settings);
+  } catch (e) { renderThink("c", null); }
+}
+function saveThinkChat() { thinkInfo("c"); if (TK.c.storeKey) store.set(TK.c.storeKey, thinkVal("c")); }
+segInit($("#l-think-mode"), saveThinkModel); segInit($("#c-think-mode"), saveThinkChat);
+$("#l-think-budget").addEventListener("change", saveThinkModel); $("#l-think-level").addEventListener("change", saveThinkModel); $("#l-think-effort").addEventListener("change", saveThinkModel); $("#l-think-lock").addEventListener("change", saveThinkModel);
+$("#c-think-budget").addEventListener("change", saveThinkChat); $("#c-think-fb").addEventListener("change", saveThinkChat); $("#c-think-level").addEventListener("change", saveThinkChat);
 
 async function loadEngines(force) {
   try {
@@ -1625,18 +2009,142 @@ async function loadEngines(force) {
   } catch (e) { $("#l-engine-note").textContent = "could not list the builds: " + e.message; }
 }
 
+
+let UP = {x: 5, hold: null, start: 0};
+function resetSlide() {
+  clearInterval(UP.hold); UP.hold = null; UP.x = 5;
+  const thumb = $("#up-thumb"), fill = $("#up-fill"), label = $("#up-label");
+  if (!thumb) return;
+  thumb.style.left = "5px"; fill.style.width = "0";
+  label.textContent = $("#up-track").classList.contains("is-blocked") ? "Stop the running servers first" : "Slide fully, then hold 5 seconds";
+}
+function openUpdate() {
+  const d = S.update || {};
+  const n = d.servers_running || 0;
+  $("#up-sub").textContent = n + " running · " + (d.latest || "update") + " available";
+  $("#up-body").textContent = n ? "Stop the running servers first. PXA will not restart them." : "Install " + (d.latest || "the update") + ". PXA will not restart a running server.";
+  $("#up-track").classList.toggle("is-blocked", n > 0);
+  resetSlide();
+  $("#up").showModal();
+}
+function armSlide() {
+  const track = $("#up-track"), thumb = $("#up-thumb");
+  if (!track || track.dataset.armed) return;
+  track.dataset.armed = "1";
+  let drag = false, holdT = 0;
+  function maxX() { return Math.max(5, track.clientWidth - thumb.offsetWidth - 5); }
+  function atEnd() { return UP.x >= maxX() - 2; }
+  thumb.addEventListener("pointerdown", (e) => {
+    if (track.classList.contains("is-blocked") || UP.hold) return;
+    drag = true; thumb.setPointerCapture(e.pointerId); thumb.style.cursor = "grabbing";
+  });
+  thumb.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const r = track.getBoundingClientRect();
+    UP.x = Math.min(maxX(), Math.max(5, e.clientX - r.left - thumb.offsetWidth / 2));
+    thumb.style.left = UP.x + "px";
+    if (!atEnd()) {
+      if (UP.hold) { clearInterval(UP.hold); UP.hold = null; }
+      $("#up-fill").style.width = "0";
+      $("#up-label").textContent = "Slide fully, then hold 5 seconds";
+      return;
+    }
+    if (!UP.hold) {
+      holdT = performance.now();
+      $("#up-label").textContent = "Hold";
+      UP.hold = setInterval(() => {
+        const p = Math.min(1, (performance.now() - holdT) / 5000);
+        $("#up-fill").style.width = (p * 100) + "%";
+        if (p >= 1) { clearInterval(UP.hold); UP.hold = null; drag = false; applyUpdate(); }
+      }, 50);
+    }
+  });
+  function cancel(e) {
+    if (!drag && !UP.hold) return;
+    drag = false;
+    if (UP.hold && performance.now() - holdT < 5000) resetSlide();
+    try { thumb.releasePointerCapture(e.pointerId); } catch (err) {}
+    thumb.style.cursor = "grab";
+  }
+  thumb.addEventListener("pointerup", cancel);
+  thumb.addEventListener("pointercancel", cancel);
+  $("#up-cancel").addEventListener("click", () => { resetSlide(); $("#up").close(); });
+  $("#sv-up").addEventListener("click", openUpdate);
+}
+async function checkUpdate() {
+  try {
+    S.update = await api("/api/update", {timeout: 20000});
+    $("#sv-up").hidden = !(S.update && S.update.update);
+    armSlide();
+  } catch (e) { /* the rest of Control still works */ }
+}
+async function applyUpdate() {
+  $("#up-label").textContent = "Installing";
+  try {
+    const d = await api("/api/update/apply", {method: "POST", body: {}, timeout: 600000});
+    $("#up-body").textContent = (d && d.output) || "Installed. Open PXA Control again to use the new version.";
+    $("#up-label").textContent = "Installed";
+    $("#sv-up").hidden = true;
+  } catch (e) {
+    $("#up-body").textContent = e.message;
+    resetSlide();
+  }
+}
+
+async function emapRefresh() {
+  const el = $("#emap-learn");
+  if (!el) return;
+  const model = store.get("model", "") || "";
+  try {
+    const d = await api("/api/expert-map" + (model ? "?model=" + encodeURIComponent(model) : ""));
+    const n = d.sessions || 0;
+    const word = n === 1 ? "session" : "sessions";
+    let line = d.learning ? ("Learning. " + n + " " + word + " saved.")
+      : (n ? ("Learned " + n + " " + word + ".") : "No learned sessions yet.");
+    if (d.cache_warning) line += " " + d.cache_warning;
+    el.textContent = line;
+    const dc = $("#emap-disclaimer");
+    if (dc) dc.textContent = d.disclaimer || "";
+  } catch (e) { /* the card stays quiet if this install has no map route */ }
+}
+$("#emap-rebuild").addEventListener("click", async () => {
+  const btn = $("#emap-rebuild");
+  btn.disabled = true;
+  try {
+    const model = store.get("model", "") || "";
+    const d = await api("/api/expert-map/rebuild", {body: model ? {model} : {}});
+    toast(d.note || "Expert map ready");
+    emapRefresh();
+  } catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; }
+});
+$("#emap-reset").addEventListener("click", async () => {
+  const model = store.get("model", "") || "";
+  if (!model) { toast("Choose a model first", true); return; }
+  if (!confirm("Clear learned expert counts? The map that shipped with the model stays.")) return;
+  const btn = $("#emap-reset");
+  btn.disabled = true;
+  try {
+    const d = await api("/api/expert-map/reset", {body: {model}});
+    toast(d.note || "Learned counts cleared");
+    emapRefresh();
+  } catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; }
+});
+
 // ---------------- boot ----------------
 (async function boot() {
   const params = new URLSearchParams(location.search);
   applyTheme(params.get("theme") || store.get("theme", null) || defaultTheme());
   try { S.info = await api("/api/info"); $("#l-kv").replaceChildren(...S.info.kv_types.map(k => el("option", {value: k, text: k})));
-    $("#l-extra-help").textContent = "Allowed: " + S.info.extra_flags.join(" "); $("#sv-ver").textContent = "PXA Control " + (S.info.control_version || ""); } catch (e) { toast(e.message, true); }
+    $("#l-extra-help").textContent = "Allowed: " + S.info.extra_flags.join(" "); $("#sv-ver").textContent = "PXA Control " + (S.info.control_version || ""); checkUpdate(); } catch (e) { toast(e.message, true); }
   loadLevers(); loadPresets(); loadEngines();
   await loadServers();
   pollStatus();
   const tab = (location.hash || "").slice(1) || store.get("tab", "servers");
   showTab(TABS.includes(tab) ? tab : "servers");
   await loadModels();
+  emapRefresh();
   // a running server wins over the last form: the Launch tab shows what is actually serving
   const st = await api("/api/status?sid=" + encodeURIComponent(S.sid)).catch(() => null);
   const sv = currentServer(), last = store.get("lastBody." + S.sid, null) || (S.sid === "main" ? store.get("lastBody", null) : null);
@@ -1646,5 +2154,26 @@ async function loadEngines(force) {
 </script>
 <script src="/encode.js"></script>
 <script src="/live.js"></script>
+<script src="/profiles.js"></script>
+<script src="/mqtt.js"></script>
+<script src="/agent.js"></script>
+<script src="/vendor/katex/katex.min.js"></script>
+<script src="/agent-markdown.js"></script>
+<script src="/agent-attach.js"></script>
+<script src="/agent-actions.js"></script>
+<script src="/agent-params.js"></script>
+<script src="/agent-context.js"></script>
+<script src="/agent-ux.js"></script>
+<script src="/agent-stream.js"></script>
+<script src="/agent-memory.js"></script>
+<script src="/chat.js"></script>
+<script src="/chat-history.js"></script>
+<script src="/chat-markdown.js"></script>
+<script src="/chat-actions.js"></script>
+<script src="/chat-stream.js"></script>
+<script src="/chat-attach.js"></script>
+<script src="/chat-params.js"></script>
+<script src="/chat-context.js"></script>
+<script src="/chat-ux.js"></script>
 </body>
 </html>

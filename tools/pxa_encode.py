@@ -45,12 +45,23 @@ import pxa_encode_pkg as PK
 import pxa_encode_plan as PL
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STAGES = ["download", "convert", "quantize", "reference", "skeleton", "dump", "hessians", "encode", "verify"]
+STAGES = ["download", "convert", "quantize", "reference", "skeleton", "dump", "hessians", "encode", "counts", "verify"]
 STAGE_LABEL = {"download": "Download the model", "convert": "Convert to GGUF", "quantize": "Quantize (classic PXQ)",
                "reference": "Make the reference copy (Q8_0)",
                "skeleton": "Lay out the new file", "dump": "Run the calibration text through the model",
-               "hessians": "Measure the weights", "encode": "Encode", "verify": "Check the result"}
+               "hessians": "Measure the weights", "encode": "Encode", "counts": "Count the expert routing",
+               "verify": "Check the result"}
 LIVE_STATES = ("running", "paused", "queued")
+# The Checks step (3) fixes that need a setting from Advanced. Advanced is the folded section on step 2 ("Which cards will run it?"),
+# not on this page, so the sentence says where it is; the row also carries action "advanced" + focus, a button that goes there.
+# the `info --json` feature an encoder lists once its PXQN stages can encode mixture-of-experts models (none does yet, 2026-10-07: the
+# skeleton refuses routed experts). Until then Control's checks refuse a PXQN tier for a MoE source; the classic tiers are fine.
+MOE_PXQN_FEATURE = "moe-pxqn"
+
+ADV_FIX = {"work": "Go back to step 2 and open Advanced to pick another work folder, or free some space.",
+           "out": "Go back to step 2 and open Advanced to pick another output folder, or free some space there.",
+           "both": "Go back to step 2 and open Advanced to pick other folders, or free some space.",
+           "card": "Stop whatever is using the card (Servers tab), or go back to step 2 and open Advanced to pick another card."}
 NAME_RE = re.compile(r"^[A-Za-z0-9._\-]{1,96}$")
 JOB_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
 
@@ -618,7 +629,7 @@ class EncodeService(object):
         facts = PL.facts_from_config(cfg) if cfg else {}
         out.update({"arch": facts.get("arch"), "layers": facts.get("layers"), "hidden": facts.get("hidden"), "inter": facts.get("inter"),
                     "kv_bytes_tok": facts.get("kv_bytes_tok"), "n_ctx_train": facts.get("n_ctx_train"), "tied": facts.get("tie", False),
-                    "moe": bool(facts.get("experts"))})
+                    "moe": bool(facts.get("experts")), "experts": facts.get("experts") if isinstance(facts.get("experts"), int) else 0})
         out["support"] = PL.arch_support(out["arch"], self.converter_names())
         out["licence"] = PL.classify_licence(license_id)
         out["param_label"] = PL.param_label(out.get("params"))
@@ -714,7 +725,8 @@ class EncodeService(object):
                "gguf_kind": kind, "notes": [], "arch": arch, "layers": kv.get("%s.block_count" % arch) if arch else None,
                "hidden": kv.get("%s.embedding_length" % arch) if arch else None, "inter": kv.get("%s.feed_forward_length" % arch) if arch else None,
                "kv_bytes_tok": kvb, "n_ctx_train": kv.get("%s.context_length" % arch) if arch else None, "tied": not head,
-               "moe": bool(kv.get("%s.expert_count" % arch)) if arch else False}
+               "moe": bool(kv.get("%s.expert_count" % arch)) if arch else False,
+               "experts": (kv.get("%s.expert_count" % arch) if isinstance(kv.get("%s.expert_count" % arch), int) else 0) if arch else 0}
         if isinstance(out["inter"], list):
             out["inter"] = max(out["inter"] or [0])
         out["support"] = PL.arch_support(arch, None)
@@ -819,7 +831,10 @@ class EncodeService(object):
         if use_hess:
             s += ["dump", "hessians"]
         s += ["encode", "verify"]
-        return s
+        # a model with experts also gets the expert-counts stage: the file written beside the GGUF is what the engine's
+        # expert cache plans from, so a model shipped without it pays a startup bootstrap at every load. Only an encoder
+        # that lists the stage gets asked for it, so an older one is not handed a flag it would refuse the run over.
+        return PL.with_counts_stage(s, src) if AD.supports_counts(info) else s
 
     def _use_hess(self, info, tier, body):
         if AD.is_classic(tier):
@@ -938,9 +953,13 @@ class EncodeService(object):
         src, info, tier, row = q["src"], q["info"], q["tier"], q["row"]
         out = []
 
-        def add(cid, label, status, text, fix="", action=None):
-            out.append({"id": cid, "label": label, "status": status, "text": text, "fix": fix} if not action else
-                       {"id": cid, "label": label, "status": status, "text": text, "fix": fix, "action": action})
+        def add(cid, label, status, text, fix="", action=None, focus=None):
+            r = {"id": cid, "label": label, "status": status, "text": text, "fix": fix}
+            if action:
+                r["action"] = action
+            if focus:
+                r["focus"] = focus          # action "advanced": the Advanced field (on step 2) the page opens for this fix: work | out | card
+            out.append(r)
 
         # the encoder and the licence
         if not info:
@@ -963,9 +982,11 @@ class EncodeService(object):
                 elif st == "paused":
                     add("licence", "Licence key", "bad", "This key is paused because it was used from too many networks in one day.",
                         "Ask an admin in the PXA Network Discord to resume it. A new key does not help while this one is paused.")
-                elif st in ("expired", "revoked", "suspended"):
-                    add("licence", "Licence key", "bad", "The licence server refused this key: it is %s." % st,
-                        "Get a fresh key from the PXA Network Discord (/encoder), or use the Free encoder.")
+                elif st in ("expired", "revoked", "suspended", "disabled"):
+                    add("licence", "Licence key", "bad", {"expired": "This key has expired.", "revoked": "This key was revoked.",
+                                                          "suspended": "This key is suspended.", "disabled": "Your PXA account is disabled."}[st],
+                        "Ask an admin in the PXA Network Discord." if st in ("suspended", "disabled") else
+                        "Run /encoder in the PXA Network Discord for a fresh key, or use the Free encoder.")
                 elif st == "refused":
                     add("licence", "Licence key", "bad", "The licence server refused this key%s." % ((": " + lic["reason"]) if lic.get("reason") else ""),
                         "Check the key, or get a fresh one from the PXA Network Discord (/encoder).")
@@ -1031,29 +1052,38 @@ class EncodeService(object):
             add("arch", "Architecture", "warn", src["support"]["text"])
         else:
             add("arch", "Architecture", "ok", "%s: %s" % (src["arch"] or "", src["support"]["text"]))
-        # disk
+        # a mixture-of-experts model with a PXQN tier: the encoder's PXQN stages cannot encode routed experts unless it says so (feature MOE_PXQN_FEATURE).
+        # Said here, before the download, so nobody fetches 70 GB to be refused at the skeleton; the classic tiers work for these models.
+        if src.get("moe") and info and not q["classic"] and MOE_PXQN_FEATURE not in (info.get("features") or ()):
+            add("moe", "Mixture of experts", "bad", "This is a mixture-of-experts model%s, and the PXQN tiers of this encoder cannot encode mixture-of-experts "
+                "layers yet." % ((" (%d experts)" % src["experts"]) if src.get("experts") else ""), "Pick a classic tier (PXQ1 to PXQ6): those work for this model.")
+        # disk: one figure (PL.disk_need) for the Disk space row and the facts under the list, so the two always match
         tb = row["size_bytes"] or 0
-        sz = PL.stage_sizes(src, tb, q["stages"])
-        peak, outb = sz["peak"], tb
         same = _dev(q["work"]) == _dev(q["out"])
+        dn = PL.disk_need(src, tb, q["stages"], same_disk=same)
+        peak, outb = dn["work_peak"], dn["result"]
         fw, fo = _free_bytes(q["work"]), _free_bytes(q["out"])
         if same:
-            need, free = peak + outb, fw
+            need, free = dn["need"], fw
             ok = free is None or free >= need * 1.05
             add("disk", "Disk space", "ok" if ok else "bad",
-                "Needs about %s at the peak (download, intermediate files and the result), %s free on %s." % (PL.human_bytes(need), PL.human_bytes(free or 0), q["work"]) if not ok
-                else "About %s needed at the peak; %s free." % (PL.human_bytes(need), PL.human_bytes(free or 0)),
-                "Pick another work folder in Advanced, or free some space." if not ok else "")
+                "Needs about %s at the peak (download, intermediate files and the final file), %s free on %s." % (PL.human_bytes(need), PL.human_bytes(free or 0), q["work"]) if not ok
+                else "About %s needed at the peak, final file included; %s free." % (PL.human_bytes(need), PL.human_bytes(free or 0)),
+                ADV_FIX["work"] if not ok else "", action="advanced" if not ok else None, focus="work" if not ok else None)
         else:
-            problems = []
-            if fw is not None and fw < peak * 1.05:
-                problems.append("work folder needs %s, has %s" % (PL.human_bytes(peak), PL.human_bytes(fw)))
-            if fo is not None and fo < outb * 1.05:
-                problems.append("output folder needs %s, has %s" % (PL.human_bytes(outb), PL.human_bytes(fo)))
+            problems, short = [], []
+            if fw is not None and fw < dn["work"] * 1.05:
+                problems.append("work folder needs %s, has %s" % (PL.human_bytes(dn["work"]), PL.human_bytes(fw)))
+                short.append("work")
+            if fo is not None and fo < dn["out"] * 1.05:
+                problems.append("output folder needs %s, has %s" % (PL.human_bytes(dn["out"]), PL.human_bytes(fo)))
+                short.append("out")
             add("disk", "Disk space", "bad" if problems else "ok",
                 ("Not enough space: " + "; ".join(problems) + ".") if problems else
-                "Work folder %s of %s free; output folder %s." % (PL.human_bytes(fw or 0), PL.human_bytes(peak), PL.human_bytes(fo or 0)),
-                "Pick another folder in Advanced." if problems else "")
+                "Work folder: about %s needed at the peak, %s free. Output folder: %s for the final file, %s free." % (
+                    PL.human_bytes(dn["work"]), PL.human_bytes(fw or 0), PL.human_bytes(dn["out"]), PL.human_bytes(fo or 0)),
+                (ADV_FIX["both"] if len(short) > 1 else ADV_FIX[short[0]]) if problems else "",
+                action="advanced" if problems else None, focus=short[0] if problems else None)
         # RAM
         ram_free = _meminfo_available()
         ram_need = (3 << 30) if q["classic"] else PL.ram_need_bytes(src.get("hidden"), src.get("inter"))
@@ -1073,7 +1103,7 @@ class EncodeService(object):
             free_b = card["free_mib"] * PL.MIB
             st = "ok" if free_b >= need_v * 1.15 else "bad"
             add("vram", "Graphics card", st, "Card %d (%s) has %s free; the encode needs about %s." % (card["index"], card["name"], PL.human_bytes(free_b), PL.human_bytes(need_v)),
-                "Stop whatever is using the card (Servers tab) or pick another card in Advanced." if st == "bad" else "")
+                ADV_FIX["card"] if st == "bad" else "", action="advanced" if st == "bad" else None, focus="card" if st == "bad" else None)
         # tools
         if q["flow"] == "make":
             miss = self._make_missing(q, info)
@@ -1110,7 +1140,9 @@ class EncodeService(object):
         return {"checks": out, "can_start": not bad, "refusal": bad[0]["text"] if bad else None,
                 "estimate": {"low_s": est["low"], "high_s": est["high"], "text": "%s to %s" % (PL.human_dur(est["low"]), PL.human_dur(est["high"])),
                              "stages": {k: [v[0], v[1]] for k, v in est["stages"].items()}},
-                "disk": {"peak": peak, "output": outb, "peak_h": PL.human_bytes(peak), "output_h": PL.human_bytes(outb), "intermediates_h": PL.human_bytes(sz["keep_extra"])},
+                "disk": {"peak": peak, "output": outb, "peak_h": PL.human_bytes(peak), "output_h": PL.human_bytes(outb), "intermediates_h": PL.human_bytes(dn["keep_extra"]),
+                         "same_disk": same, "need": dn["need"], "need_h": PL.human_bytes(dn["need"]),
+                         "need_label": "Disk at the peak (final file included)" if same else "Work folder at the peak"},
                 "stages": [{"id": s, "label": STAGE_LABEL[s]} for s in q["stages"]], "work_dir": q["work"], "out_dir": q["out"],
                 "use_hessians": q["use_hess"], "encode_card": q["enc_card"], "lock": q["lock"]}
 
@@ -1226,7 +1258,9 @@ class EncodeService(object):
         if "verify" in weights:       # a slice of the bar, never most of it (its estimate has a fixed part that dwarfs a small model)
             weights["verify"] = max(2.0, 0.03 * sum(w for k, w in weights.items() if k != "verify"))
         j = {"id": jid, "created": time.time(), "updated": time.time(), "status": "queued",
-             "params": {"source": {k: q["src"].get(k) for k in ("kind", "id", "name", "arch", "params", "layers", "hidden", "inter", "gguf_kind", "download_bytes", "files", "emb", "head", "tied", "src_dir")},
+             # `moe` and `experts` are kept with the rest: the runner reads them back off this copy to decide whether the run asks the
+             # encoder to count the expert routing, and a job resumed from its own params must still make that same decision
+             "params": {"source": {k: q["src"].get(k) for k in ("kind", "id", "name", "arch", "params", "layers", "hidden", "inter", "moe", "experts", "gguf_kind", "download_bytes", "files", "emb", "head", "tied", "src_dir")},
                         "tier": q["tier"], "tier_name": tname, "cls": q["row"]["cls"], "name": name, "work": q["work"], "out": q["out"], "enc_card": q["enc_card"],
                         "dump_cards": q["dump_cards"], "keep": q["keep"], "use_hess": q["use_hess"], "encoder": q["info"]["path"] if q["info"] else None,
                         "edition": q["info"]["edition"] if q["info"] else None, "size_estimate": q["row"]["size_bytes"], "targets": q["targets"],
@@ -2046,7 +2080,8 @@ class EncodeService(object):
         requant = AD.is_classic(P["tier"]) and src["kind"] == "gguf" and src.get("gguf_kind") == "q8_0"       # a second lossy pass: the quantizer wants both flags
         argv = AD.argv_make(info["path"], src["id"], tier, out_file, wd, device=0 if cards and not AD.is_classic(P["tier"]) else None, python=py,
                             engine=engine, gpu_layers=ngl, threads=self._threads(), keep_work=bool(P.get("keep")),
-                            quantizer_args=AD.REQUANTIZE_ARGS if requant else (), lock=P.get("lock") if AD.supports_lock(info) else None)
+                            quantizer_args=AD.REQUANTIZE_ARGS if requant else (), lock=P.get("lock") if AD.supports_lock(info) else None,
+                            counts=True if (PL.counts_needed(src) and AD.supports_counts(info)) else None)
         env = AD.make_env(info, P["tier"], self._key(), self.licence_server(), py)
         env.update(self._rt_env(info))
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -2093,16 +2128,33 @@ class EncodeService(object):
                 pxq_counts[nm] = pxq_counts.get(nm, 0) + 1
         if want not in {k.upper() for k in pxq_counts} and AD.norm_tier(P["tier"]) != "pxquniversal":
             self._log(j, "note: the file holds no %s tensors by its type ids; the encoder's own check passed" % P["tier_name"])
+        counts = self._finish_counts(j, out)
         for s in j["stages"]:
             if s["status"] not in ("done", "skipped"):
                 self._set(j, s["id"], status="done")
         j["counts"].update({"encoded": 0, "exact": 0, "bad": 0})
         j["result"] = {"path": out, "sha256": ev["sha256"], "size": ev["size"], "tier": P["tier_name"], "cls": P["cls"], "name": P["name"],
                        "encoded": 0, "exact": 0, "tier_tensors": pxq_counts.get(want, sum(pxq_counts.values())), "types": pxq_counts,
-                       "lock": self._lock_result(j, h, ev)}
+                       "lock": self._lock_result(j, h, ev), "counts": counts}
         self._log(j, "sha256 %s  %s" % (ev["sha256"], out))
         if not P.get("keep"):
             shutil.rmtree(wd, ignore_errors=True)               # the finished file is already in the output folder; nothing else in here is needed
+
+    def _finish_counts(self, j, out):
+        """The run planned a counts stage: read the file it is supposed to have written the way the engine will read it, and hold the
+        run to it. The model file is what the user made, but a file shipped without counts pays the startup bootstrap at every load
+        and nothing on the Done screen would have said so - so a counts stage that says done and left nothing usable is a failure to
+        press Resume on, not a quiet success. Returns None when the run planned no counts stage (a dense model, a classic tier, or an
+        encoder that does not know the stage)."""
+        if not any(s["id"] == "counts" for s in j["stages"]):
+            return None
+        csv = AD.counts_file(out)
+        chk = AD.counts_check(csv)
+        if not chk["ok"]:
+            raise _StageFailed("counts-failed", "The model is finished, but its expert counts are not usable: %s." % chk["why"],
+                               "Press Resume to count the expert routing again; the file is slower to load without it, not broken.")
+        self._log(j, "expert counts: %d rows, %d expert tensors, %s" % (chk["rows"], chk["tensors"], csv))
+        return {"file": csv, "rows": chk["rows"], "tensors": chk["tensors"]}
 
     def _lock_result(self, j, h, ev):
         """The lock of a finished PXQN file by the Pro encoder, for the Done screen: what the FILE'S OWN header says (pxa.lock.mode; a locked file's

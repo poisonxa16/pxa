@@ -1036,6 +1036,7 @@ static size_t pxa_pxq_slab_size(ggml_type t, int64_t K, int64_t R, int64_t E) {
         case GGML_TYPE_PXQN1:   return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/128)*(int64_t)PXQN1_SLAB_BYTES);
         case GGML_TYPE_PXQN4S8: return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/32)*(int64_t)PXQN4S8_SLAB_BYTES);
         case GGML_TYPE_PXQN5:   return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/128)*(int64_t)PXQN5_SLAB_BYTES);
+        case GGML_TYPE_PXA4:    return (size_t) E*(R/64)*(PXQN_HDR_BYTES + (K/128)*(int64_t)(64*PXA4_TYPE_SIZE));
         default:               return 0;
     }
 }
@@ -1282,7 +1283,7 @@ static void pxa_errbudget_report(const std::map<std::string, pxa_err_acc> & acc,
 static bool llama_ftype_is_pxqn(llama_ftype f) {
     return f == LLAMA_FTYPE_MOSTLY_PXQN3 || f == LLAMA_FTYPE_MOSTLY_PXQN3S8 || f == LLAMA_FTYPE_MOSTLY_PXQN4 ||
            f == LLAMA_FTYPE_MOSTLY_PXQN2 || f == LLAMA_FTYPE_MOSTLY_PXQN1 || f == LLAMA_FTYPE_MOSTLY_PXQN4S8 ||
-           f == LLAMA_FTYPE_MOSTLY_PXQN5 ||
+           f == LLAMA_FTYPE_MOSTLY_PXQN5 || f == LLAMA_FTYPE_MOSTLY_PXA4 ||
            f == LLAMA_FTYPE_MOSTLY_PXQN;
 }
 
@@ -2996,13 +2997,11 @@ QuantizationDone:;
                 } else if (params->dry_run && !is_preflight) {
                     // an explicit --dry-run: report it, there is no output to keep or delete
                     throw std::runtime_error(std::string(msg) + " (dry run: nothing was written; the real run "
-                        "is refused at its start, before any tensor is encoded, unless "
-                        "PXA_PXQ_COMPOSITION_OVERRIDE=1.)");
+                        "is refused at its start, before any tensor is encoded.) " + pxa_comp::hint(cr));
                 } else if (is_preflight) {
                     // nothing has been encoded or written: this is the cheap place to say no
-                    throw std::runtime_error(std::string(msg) + " REFUSED BEFORE ENCODING: nothing was written. "
-                        "Fix the tier map / --custom-q, or set PXA_PXQ_COMPOSITION_OVERRIDE=1 "
-                        "(--pxq-composition-override) to encode it anyway.");
+                    throw std::runtime_error(std::string(msg) + " REFUSED BEFORE ENCODING: nothing was written. " +
+                        pxa_comp::hint(cr));
                 } else {
                     // The preflight said yes and the real landing disagrees, or the preflight was
                     // skipped. Either way the file is finished work: keep it.
@@ -3011,7 +3010,7 @@ QuantizationDone:;
                         kept += (kept.empty() ? "" : ", ") + f;
                     }
                     throw std::runtime_error(std::string(msg) + " The output was KEPT, not deleted (" + kept +
-                        "): it is mislabelled for this target - rename it or re-encode.");
+                        "): it is mislabelled for this target - rename it or re-encode. " + pxa_comp::hint(cr));
                 }
             }
         }
@@ -3082,7 +3081,7 @@ static bool pxa_request_targets_pxqn(const llama_model_quantize_params * params)
     auto is_pxqn = [](ggml_type t) {
         return t == GGML_TYPE_PXQN3 || t == GGML_TYPE_PXQN3S8 || t == GGML_TYPE_PXQN4 ||
                t == GGML_TYPE_PXQN2 || t == GGML_TYPE_PXQN1   || t == GGML_TYPE_PXQN4S8 ||
-               t == GGML_TYPE_PXQN5;
+               t == GGML_TYPE_PXQN5 || t == GGML_TYPE_PXA4;
     };
     if (!params) {
         return false;

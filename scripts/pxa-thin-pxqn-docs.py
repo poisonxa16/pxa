@@ -38,10 +38,14 @@ for rel, rows in ROWS.items():
         lines[hits[0]] = new
     p.write_text('\n'.join(lines))
     print(f"ok: {rel}: {len(rows)} rows thinned")
-# docs/lab/LEVERS.md is the full lab table (kernel-level notes). Many shipped docs link to it, so the public tree and
-# the tarball carry it as the public lever page instead of dropping it (no dead links, no lab notes).
+# docs/lab/ is a closed directory. The public-tree omit pass removes it. Leave it removed:
+# creating the directory again makes a closed directory entry a no-op.
+# A package stage still has the file, because keep_doc copied the lab table in before this
+# script runs. Replace that copy with the public lever page so the package does not ship the lab table.
 lab, pub = T / 'docs/lab/LEVERS.md', T / 'docs/LEVERS.md'
-if pub.exists() and not bad:
+if not lab.exists() and not lab.is_symlink():
+    print("ok: docs/lab/ stays out")
+elif pub.exists() and not bad:
     if lab.is_symlink():
         lab.unlink()
     lab.parent.mkdir(parents=True, exist_ok=True)

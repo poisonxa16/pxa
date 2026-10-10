@@ -63,6 +63,8 @@
 #
 # Dry run: `scripts/make-release-tarball.sh --list-targets` prints the build targets and the bin
 # lists and exits, touching no git, no docker and no build directory.
+# `scripts/make-release-tarball.sh --selftest` checks the finished-tarball membership test on a
+# small archive. It does not compile, and it does not need docker.
 #
 # Idempotent: reruns overwrite the same-named output tar/sha in OUT_DIR, and skip the build step
 # entirely once BUILD_DIR/bin/llama-server exists. Safe with NVIDIA_VISIBLE_DEVICES=none —
@@ -91,6 +93,9 @@ SKIP_COMPAT=${SKIP_COMPAT:-}
 CCACHE_HOST_DIR=${CCACHE_HOST_DIR:-}
 CMAKE_EXTRA=${CMAKE_EXTRA:-}
 JOBS=${JOBS:-6}
+# LLGuidance (faster JSON-schema / tool grammars) is added by the self-build below when the
+# build image has cargo. docker/Dockerfile.release-build installs the Rust toolchain for that.
+# An image without cargo keeps the previous grammar engine, so an old image still packages.
 # THE RELEASE RECIPE, in one place: the fast build and the lib-compat build differ ONLY in the CPU flags. GGML_NATIVE=OFF is
 # not optional: ggml's default is -march=native of the machine that compiles, which puts that machine's AVX-512 (or anything
 # else) into a package other people run. The stubs link flags let a container without a driver link the CUDA driver symbols.
@@ -115,6 +120,26 @@ err()  { echo "make-release-tarball.sh: $*" >&2; }
 die()  { err "$*"; exit 1; }
 info() { echo "make-release-tarball.sh: $*"; }
 
+# True when MEMBER is an exact line of the tarball listing.
+# Write the listing to a file, then match. A quiet grep on a pipe is wrong in
+# this file: pipefail is on, the quiet grep exits at the first hit, and the
+# producer is still writing. The producer dies on SIGPIPE and pipefail reports
+# failure even though the member is present. A short listing fits in the pipe
+# and hides it. A release listing does not. Holding the listing in a shell
+# variable and then printing it into a quiet grep has the same shape.
+tar_has_member() {
+  local list rc
+  list=$(mktemp)
+  if ! tar -tzf "$1" > "$list"; then
+    rm -f "$list"
+    return 1
+  fi
+  grep -qx -- "$2" "$list"
+  rc=$?
+  rm -f "$list"
+  return "$rc"
+}
+
 # ---------------------------------------------------------------------------------------------
 # arguments. This script is configured by environment variables (above); the only flags it takes
 # are informational ones that run nothing.
@@ -133,13 +158,50 @@ case "${1:-}" in
     echo "also staged:            tools/convert_hf_to_gguf.py tools/gguf-py/ tools/requirements-convert.txt tools/pxa-cpu-check.sh"
     exit 0
     ;;
+  --selftest)
+    # No git, no docker, no compile. The fixture is long enough that the old
+    # pipeline reports a present member as missing; the real check must not.
+    st=$(mktemp -d /tmp/pxq-tar-member-XXXXXX)
+    trap 'rm -rf "$st"' EXIT
+    python3 - "$st" <<'PY'
+import os, sys
+base = os.path.join(sys.argv[1], "tree", "pkg", "bin")
+os.makedirs(base)
+for i in range(8000):
+    with open(os.path.join(base, "a%d" % i), "w") as f:
+        f.write("x")
+with open(os.path.join(base, "pxa-update"), "w") as f:
+    f.write("x")
+for i in range(8000):
+    with open(os.path.join(base, "b%d" % i), "w") as f:
+        f.write("x")
+PY
+    [ $? -eq 0 ] || die "selftest fixture failed"
+    tar -C "$st/tree" -czf "$st/pkg.tar.gz" pkg
+    member="pkg/bin/pxa-update"
+    # Build the old pipeline without a source line the scanner below would flag.
+    listcmd=(tar -tzf "$st/pkg.tar.gz")
+    if "${listcmd[@]}" | grep -qx -- "$member"; then
+      die "selftest fixture did not trip the pipefail miss; the guard did not run"
+    fi
+    tar_has_member "$st/pkg.tar.gz" "$member" || die "selftest: present member reported missing"
+    if tar_has_member "$st/pkg.tar.gz" "pkg/bin/no-such"; then
+      die "selftest: absent member reported present"
+    fi
+    if grep -nE 'tar -tzf[^|#]*\|[[:space:]]*grep -q' "$0" >/dev/null; then
+      die "selftest: a tar listing is still judged with grep -q under pipefail"
+    fi
+    info "selftest ok"
+    exit 0
+    ;;
   -h|--help)
     sed -n '2,/^set -u$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
     echo "flags: --list-targets   print the build targets and the bin/ manifest, then exit"
+    echo "       --selftest       check tarball membership on a small archive, then exit"
     exit 0
     ;;
   "") ;;
-  *) die "unknown argument: $1 (this script is configured with the environment variables documented at the top of the file; the only flags are --list-targets and --help)" ;;
+  *) die "unknown argument: $1 (this script is configured with the environment variables documented at the top of the file; the only flags are --list-targets, --selftest and --help)" ;;
 esac
 
 # Run a bash script inside DEV_IMAGE, BYPASSING the image's nvidia_entrypoint.sh via
@@ -255,7 +317,7 @@ else
   # source checkout, and without ever touching this worktree's own checkout.
   docker run --rm --name "pxq-pkg-selfbuild-$$" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=none "${CCACHE_ARGS[@]}" \
     -v "$BUILD_SRC:/work" -v "$BUILD_DIR:/work/build-out" -w /work "$BUILD_IMAGE" \
-    bash -c "nice -n 19 cmake -B build-out -S . $RECIPE_FAST -DPXA_BUILD_NUMBER=$BI_NUMBER -DPXA_BUILD_COMMIT=$BI_COMMIT $CMAKE_EXTRA && nice -n 19 cmake --build build-out -j$JOBS --target $BUILD_TARGETS" \
+    bash -c "LLG=; command -v cargo >/dev/null 2>&1 && LLG=-DLLAMA_LLGUIDANCE=ON; nice -n 19 cmake -B build-out -S . $RECIPE_FAST -DPXA_BUILD_NUMBER=$BI_NUMBER -DPXA_BUILD_COMMIT=$BI_COMMIT \$LLG $CMAKE_EXTRA && nice -n 19 cmake --build build-out -j$JOBS --target $BUILD_TARGETS" \
     || die "self-build failed (see docker output above)"
   [ -x "$BUILD_DIR/bin/llama-server" ] || die "self-build finished but $BUILD_DIR/bin/llama-server is still missing"
   SELF_BUILT=1
@@ -343,7 +405,11 @@ req LICENSE
 req LICENSING.md
 req README.md
 
-RELNOTES=$(ls "$EXPORT"/RELEASE-NOTES-*.md 2>/dev/null | sort | tail -1)
+if [ -f "$EXPORT/RELEASE-NOTES-v3.1.md" ]; then
+  RELNOTES=$EXPORT/RELEASE-NOTES-v3.1.md
+else
+  RELNOTES=$(ls "$EXPORT"/RELEASE-NOTES-*.md 2>/dev/null | sort | tail -1)
+fi
 [ -n "$RELNOTES" ] || die "no RELEASE-NOTES-*.md found at REF $REF"
 info "using release notes: $(basename "$RELNOTES")"
 
@@ -376,6 +442,17 @@ for b in $OPTIONAL_BIN; do
     info "optional binary not built, skipping: $b"
   fi
 done
+
+# pxa-update is a host tool, not a CUDA target. Built from the archived tree, same commit as the rest.
+# This runs for every ARCH_TAG, so both the Ubuntu 24.04 tarball and the Ubuntu 22.04 tarball ship it.
+# The binary is not committed; the source is tools/pxa-update.c.
+[ -f "$EXPORT/tools/pxa-update.c" ] || die "tools/pxa-update.c is missing; bin/pxa-update must be in every release tarball"
+info "building pxa-update"
+docker run --rm --name "pxq-pkg-update-$$" -v "$EXPORT":/src -v "$STAGE":/stage "$DEV_IMAGE" \
+  gcc -O2 -o /stage/bin/pxa-update /src/tools/pxa-update.c \
+  || die "could not build pxa-update"
+[ -x "$STAGE/bin/pxa-update" ] || die "bin/pxa-update was not staged"
+
 [ -x "$STAGE/bin/llama-quantize" ] || err "WARNING: llama-quantize could not be included (not built, and the on-demand build failed or was skipped)"
 # Not a warning: the README's and docs/COOKBOOK.md's "leave PXQ" recipe is two commands, and this
 # is the first one. A package that cannot run it is not shippable.
@@ -651,7 +728,11 @@ cp -a "$EXPORT/tools/pxa-launch.py" "$STAGE/tools/pxa-launch.py"
 chmod +x "$STAGE/tools/pxa-launch.py"
 # the CPU preflight the wrappers source (lib/ or lib-compat/); the Python twin is inside pxa-launch.py
 cp -a "$EXPORT/tools/pxa-cpu-check.sh" "$STAGE/tools/pxa-cpu-check.sh"
+# The source file is mode 0666. cp -a keeps that, and a package script the
+# entrypoint executes must be executable.
+chmod +x "$STAGE/tools/pxa-cpu-check.sh"
 [ -s "$STAGE/tools/pxa-cpu-check.sh" ] || die "tools/pxa-cpu-check.sh did not survive staging"
+[ -x "$STAGE/tools/pxa-cpu-check.sh" ] || die "tools/pxa-cpu-check.sh is not executable"
 
 # ---------------------------------------------------------------------------------------------
 # The Encode tab's open tools. PXA Control's Encode tab (tools/pxa_encode.py) looks for them in the install, in this order:
@@ -677,14 +758,54 @@ sh "$EXPORT/scripts/make-convert-requirements.sh" "$EXPORT/requirements" > "$STA
   || die "could not render tools/requirements-convert.txt (scripts/make-convert-requirements.sh)"
 # PXA Control (pxa-launch --gui): the web front end, its page, the bench prompts it reuses and the
 # lever catalog its Advanced panel validates against (found at tools/../common/ by pxa_control.py).
-for f in pxa_control.py pxa-bench.py pxa_explain_footer.py pxa_encode.py pxa_encode_adapter.py pxa_encode_pkg.py pxa_encode_plan.py pxa_encode_cells.json; do
+for f in pxa_control.py pxa_telemetry.py pxa_mqtt.py pxa-bench.py pxa_explain_footer.py pxa_thinking.py pxa_thinking_profiles.json pxa_encode.py pxa_encode_adapter.py pxa_encode_pkg.py pxa_encode_plan.py pxa_encode_cells.json; do
   if [ -f "$EXPORT/tools/$f" ]; then cp -a "$EXPORT/tools/$f" "$STAGE/tools/$f"; fi
 done
+# `pxa-update lib check|apply|rollback` hands over to tools/pxa_lib_update.py, which verifies the signed library release
+# with tools/pxa_encode_pkg.py's Ed25519 verifier: BOTH must be in every release tarball. The loop above skips a missing
+# file in silence, which here would ship a `lib` subcommand that cannot run - so these two are fatal.
+#
+# tools/pxa_expert_map.py is imported by PXA Control's Expert map routes (tools/pxa_control.py
+# r_expert_map / r_expert_map_rebuild / r_expert_map_reset). The loop above skips a missing file in
+# silence, so a package without it would build cleanly and answer every Expert map request with
+# ModuleNotFoundError -- found 2026-10-09 by calling the route from a layout staged exactly as this
+# script stages it. Fatal here, for the same reason as the two below.
+#
+# tools/pxa_mqtt.py is the Home Assistant publisher PXA Control imports (guarded, so the module may be
+# absent, but every release carries it: the HA settings panel is part of the shipped page -- main's rule
+# is that a new tools file is named in BOTH lists, this fatal one and the loop above).
+for f in pxa_expert_map.py pxa_mqtt.py pxa_lib_update.py pxa_encode_pkg.py; do
+  cp -a "$EXPORT/tools/$f" "$STAGE/tools/$f" || die "tools/$f is missing from the build tree; a shipped tool imports it"
+done
+[ -s "$STAGE/tools/pxa_lib_update.py" ] && [ -s "$STAGE/tools/pxa_encode_pkg.py" ] || die "the library updater did not survive staging"
 if [ -d "$EXPORT/tools/pxa_control_ui" ]; then
   cp -a "$EXPORT/tools/pxa_control_ui" "$STAGE/tools/pxa_control_ui"
 fi
+if [ -d "$EXPORT/tools/pxa_ctl" ]; then        # the Profiles tab's backend package
+  mkdir -p "$STAGE/tools/pxa_ctl" && cp -a "$EXPORT/tools/pxa_ctl/"*.py "$STAGE/tools/pxa_ctl/"
+fi
+# the Chat tab's in-house agent (tools/pxa_chat: stdlib package, optional import)
+if [ -d "$EXPORT/tools/pxa_chat" ]; then
+  cp -a "$EXPORT/tools/pxa_chat" "$STAGE/tools/pxa_chat"
+  find "$STAGE/tools/pxa_chat" -name __pycache__ -prune -exec rm -rf {} +
+fi
+# The shipped catalog is the PUBLIC table (owner 2026-10-08: no closed rows in what ships), the one the engine embeds:
+# a REF with the closed sources goes through the release filter, and then the catalog copy and every shipped binary but
+# the closed library itself are checked for closed lever names (a BUILD_DIR configured with PXA_LEVER_CATALOG_FULL=ON,
+# or built before the filter existed, stops here).
 if [ -f "$EXPORT/common/pxa-lever-catalog.inc" ]; then
-  mkdir -p "$STAGE/common" && cp -a "$EXPORT/common/pxa-lever-catalog.inc" "$STAGE/common/"
+  mkdir -p "$STAGE/common"
+  if [ -f "$EXPORT/scripts/pxa-closed-levers.txt" ]; then
+    python3 "$EXPORT/scripts/pxa-lever-catalog.py" --release-filter "$STAGE/common/pxa-lever-catalog.inc" \
+      --closed-out "$WORK/pxqn-closed-levers.inc" || die "lever catalog release filter failed (scripts/pxa-lever-catalog.py)"
+    CLEAN_FILES=("$STAGE/common/pxa-lever-catalog.inc")
+    while IFS= read -r -d '' f; do CLEAN_FILES+=("$f"); done < <(find "$STAGE/bin" "$STAGE/lib" "$STAGE/lib-compat" \
+      -type f ! -name 'libggml-pxqn.so*' \( -perm -u+x -o -name '*.so*' \) -print0 2>/dev/null)
+    python3 "$EXPORT/scripts/pxa-lever-catalog.py" --assert-clean "$WORK/pxqn-closed-levers.inc" "${CLEAN_FILES[@]}" \
+      || die "closed lever names in the package (above): rebuild BUILD_DIR from REF without PXA_LEVER_CATALOG_FULL"
+  else
+    cp -a "$EXPORT/common/pxa-lever-catalog.inc" "$STAGE/common/"
+  fi
 fi
 
 # pxa-entrypoint: the container ENTRYPOINT (no args -> pxa-launch; engine args -> straight through
@@ -741,6 +862,14 @@ keep bench/gate/prompts/coherence.txt
 keep bench/gate/prompts/needle20801.txt
 keep bench/gate/prompts/needle3121.txt
 
+# The Overdrive preset (main #16694, 2026-10-09).  docs/COOKBOOK.md's "1x P100 -- Flash-Next Overdrive"
+# recipe tells the user to load this file as the server environment, so a package without it ships a
+# recipe whose first line names nothing.  Kept by EXACT PATH, not by a presets/* glob: the file names the
+# closed PXQN levers verbatim, and the gates that sweep shipped text for those names
+# (post-build-gates.sh gate 6, check-public-tree-v31.sh rule f) allow this one path and nothing else.
+# The public TREE omits it (PUBLIC-OMIT-v31.txt); the package is where a user needs it.
+keep presets/pxa-overdrive-flashnext-pxqn2-1xp100.env
+
 cp -a "$EXPORT/bench/fair-battle.md" "$STAGE/bench/fair-battle.md"
 
 cp -a "$EXPORT/README.md" "$STAGE/docs/README.md"
@@ -784,6 +913,10 @@ keep_doc() { # path relative to EXPORT == path relative to STAGE
 keep_doc docs/LEVERS.md
 keep_doc docs/lab/LEVERS.md
 keep_doc docs/DEFAULTS.md
+# Named by the dead-link guard (2026-10-08): docs/LAUNCHER.md points at docs/THINKING.md.
+keep_doc docs/THINKING.md
+# Named by the README (v3.1): the Home Assistant REST sensors and the MQTT page.
+keep_doc docs/HOME-ASSISTANT.md
 # PXQN ships compiled-only: the shipped lever docs are the public page, never the lab table
 python3 "$EXPORT/scripts/pxa-thin-pxqn-docs.py" "$STAGE" --allow-missing || die "PXQN doc thinning failed (scripts/pxa-thin-pxqn-docs.py)"
 keep_doc docs/QUANTIZING.md
@@ -853,6 +986,9 @@ keep_doc docs/PXQ4-KERNELS.md   # was pxa/pxq4/README.md: a pxa/ directory in th
 keep_doc NOTICE
 keep_doc MODELS.md
 keep_doc RELEASE-NOTES-2026-09-20.md
+# Named by the dead-link guard (2026-10-08): README.md still links the v3 notes,
+# and the v3.1 picker no longer auto-stages RELEASE-NOTES-v3.md.
+keep_doc RELEASE-NOTES-v3.md
 keep_doc docker/COMPOSE.md
 keep_doc docker/docker-compose.yml
 keep_doc docker/.env.example
@@ -870,6 +1006,9 @@ keep_doc docs/tutorials/08-long-chats.md
 keep_doc docs/tutorials/09-measure-your-card.md
 keep_doc docs/tutorials/10-when-something-goes-wrong.md
 keep_doc docs/tutorials/11-switching-models-from-your-app.md
+# Grafana import for the Control /metrics gauges. The package check looks
+# for this file before it contacts Grafana.
+keep_doc docs/grafana/pxa-control.json
 
 # The two files copied INTO docs/ carry links written for the repo ROOT, so every one of them breaks
 # by exactly one directory (docs/README.md alone accounted for 15 of the 25 dead links). Rewrite the
@@ -1060,6 +1199,30 @@ $DEADLINK
 fi
 
 # ---------------------------------------------------------------------------------------------
+# STAGED-IMPORTS GUARD -- refuse to TAR a package whose own python files import a module it does
+# not carry
+# ---------------------------------------------------------------------------------------------
+# Same shape as the dead-link guard above, and the same lesson one level down: the tool lists in
+# this script and the COPY lines in docker/Dockerfile are both explicit, and BOTH skip a file that
+# was never named -- in silence. Found 2026-10-09: tools/pxa_expert_map.py is imported by the Expert
+# map routes in tools/pxa_control.py (r_expert_map / r_expert_map_rebuild / r_expert_map_reset) and
+# is named in neither list, so a package built from this tree would answer every Expert map request
+# with ModuleNotFoundError -- a headline v3.1 feature, with measured numbers in the release notes.
+# The check reads the TREE to learn what a module name means and the STAGE to see whether it
+# travelled (a third-party or optional module resolves in neither and is left alone).
+python3 "$EXPORT/scripts/pxa-staged-imports.py" "$STAGE" --tree "$EXPORT" \
+  || die "staged package drops a module its own tools import (above) -- name it in the tool lists in
+       this script AND on the docker/Dockerfile COPY line, or the image and the tarball will differ"
+
+# The IMAGE is a second package with its own explicit COPY list, and it carries its own copy of
+# PXA Control under /usr/local/bin. Check it too: the tarball and the image must not drift, and the
+# tarball is the artifact whose build turns first.
+if [ -f "$EXPORT/docker/Dockerfile" ]; then
+  python3 "$EXPORT/scripts/pxa-staged-imports.py" --image "$EXPORT/docker/Dockerfile" --tree "$EXPORT" \
+    || die "the container image COPY list drops a module its own tools import (above)"
+fi
+
+# ---------------------------------------------------------------------------------------------
 # leak guard -- refuse to TAR a package that carries build-machine paths
 # ---------------------------------------------------------------------------------------------
 # The staging rules in this script have now twice been the difference between a clean package and
@@ -1091,6 +1254,14 @@ info "listing (pre-tar):"
 find "$STAGE" -maxdepth 2 | sed "s#$STAGE#  pxa-$TAG#"
 
 tar -C "$WORK" -czf "$TARPATH" "pxa-$TAG"
+# tar_has_member reads the whole listing first. A quiet grep on the listing pipe
+# used to report bin/pxa-update missing when the member was in the archive.
+tar_has_member "$TARPATH" "pxa-${TAG}/bin/pxa-update" \
+  || die "tarball $TARNAME is missing bin/pxa-update"
+tar_has_member "$TARPATH" "pxa-${TAG}/tools/pxa_lib_update.py" \
+  || die "tarball $TARNAME is missing tools/pxa_lib_update.py (pxa-update lib)"
+tar_has_member "$TARPATH" "pxa-${TAG}/docs/grafana/pxa-control.json" \
+  || die "tarball $TARNAME is missing docs/grafana/pxa-control.json"
 ( cd "$OUT_DIR" && sha256sum "$TARNAME" > "$TARNAME.sha256" )
 
 TARSIZE=$(du -h "$TARPATH" | awk '{print $1}')

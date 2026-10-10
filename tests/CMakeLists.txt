@@ -385,6 +385,57 @@ if (PXA_PYTHON3)
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-control.py)
 endif()
 
+# PXA Control's Profiles backend (tools/pxa_ctl): validation, clamping, apply + verify + rollback, undo and the safety
+# watch, the auto-start supervisor, schedules, lock files / reserved cards, Benchmark mode, the /api/gpu routes and the
+# resolved-context helpers. The mock adapter only: no GPU, no nvidia-smi, loopback only.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-ctl
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-ctl.py)
+endif()
+
+# PXA Control's history store (v3.1, tools/pxa_telemetry.py): settings, averaging and sums, minute rollups, retention and the
+# size cap, bucketed reads, CSV, one writer per file, the Prometheus text. Temp files and a fake clock; no GPU, no network.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-telemetry
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-telemetry.py)
+    add_test(NAME test-pxa-v31-gaps
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-v31-gaps.py)
+endif()
+
+# PXA Control's Home Assistant MQTT publisher (v3.1, tools/pxa_mqtt.py): the settings and their environment
+# overrides with the password masked, the topic root, the packet framing on the wire (the fixed header is ONE
+# type byte then a varint length), the discovery payload Home Assistant consumes, the topic shapes, and the
+# availability behaviour on both shutdown paths. No broker, no network; a fake socket and a fake snapshot.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-mqtt
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-mqtt.py)
+endif()
+
+# PXA Control's in-house chat agent (v3.1, tools/pxa_chat): the text tool-call parser, the folder fence, the guards, approvals,
+# picker selection, the agent loop (native tools, text protocol, plain chat, cancel, max steps, step timeout, re-attach) and the
+# /api/chat routes inside a Control instance, all against a stdlib mock OpenAI server (tests/pxa_chat_mock.py). No GPU.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-chat
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-chat.py)
+endif()
+
+# What a release stages must be import-complete: every sibling module a shipped PXA Control tool imports has to be
+# named in scripts/make-release-tarball.sh and docker/Dockerfile too. A file that was never named is skipped in
+# silence by both, so the package builds and the tool breaks at its first call (tools/pxa_expert_map.py did).
+if (PXA_PYTHON3)
+    add_test(NAME test-staged-tools
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-staged-tools.py)
+endif()
+
+# A path a shipped doc tells the user to mount must be one the image's own user can write. The image runs
+# as pxq (home /work) and /root is 0700 root, so /root/.cache/pxa is unreachable inside the container: the
+# v3.1 docs, compose file and entrypoint all named it for the learned expert map, which could therefore
+# never persist. Reads the tree only.
+if (PXA_PYTHON3)
+    add_test(NAME test-container-paths
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-container-paths.py)
+endif()
+
 # PXA Control's Encode tab: the adapter that is the only code that knows the quantizer's command line, the fit math and tier
 # recommendation, the disk / RAM / VRAM / licence checks, the resumable job runner, and the signed "Get the encoder" download.
 # Fake encoder, fake engine tools, fake Hugging Face and licence servers on loopback; no GPU. (tests/encode-gui-check.py is the
@@ -394,11 +445,26 @@ if (PXA_PYTHON3)
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-encode.py)
 endif()
 
+# The licensed PXQN library as its own updatable artifact (tools/pxa_lib_update.py, driven by `pxa-update lib`): the signed
+# release manifest, the download tickets, the staged swap of lib/current that moves BOTH copies at once, and the rollback to
+# the previous release or to the library the engine shipped. Fake licence server on loopback, real install tree, no GPU.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-lib-update
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-lib-update.py)
+endif()
+
 # The CPU preflight that picks lib/ (fast) or lib-compat/ (any x86-64 CPU) from /proc/cpuinfo: tools/pxa-cpu-check.sh and its Python
 # twin in tools/pxa-launch.py, on cpuinfo fixtures (qemu64, Nehalem, Sandy/Ivy Bridge, Haswell, Zen 4, no flags line). No engine, no GPU.
 if (PXA_PYTHON3)
     add_test(NAME test-pxa-cpu-check
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-cpu-check.py)
+endif()
+
+# The per-model thinking switch (tools/pxa_thinking.py): detection, on/off renders of each family's
+# template (jinja2 if present), launch flags, the request rewrite, and the Control wiring. No GPU.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-thinking
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-thinking.py)
 endif()
 
 # PXQN (ggml-pxqn.h): GGML_OP_PXQN_RHT on the CPU against the explicit H128 definition, the
@@ -612,6 +678,15 @@ if (GGML_CUDA)
     # language has to be enabled here before a .cu target can be declared.
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+
+    # CUDA supports_op(DELTA_NET) must only claim the 64/128 head widths the kernel has (other
+    # widths fall back to the CPU; before 3456321f68 tests/fixtures/tiny_qwen4exp.gguf aborted).
+    # Needs a CUDA context but launches nothing; run by hand inside a GPU lock window, not
+    # registered with llama_test(). Prints SKIP without a device.
+    add_executable(test-delta-net-cuda-supports test-delta-net-cuda-supports.cpp)
+    target_include_directories(test-delta-net-cuda-supports PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/include)
+    target_link_libraries(test-delta-net-cuda-supports PRIVATE ggml CUDA::cuda_driver)
+    install(TARGETS test-delta-net-cuda-supports RUNTIME)
 
     # K8 / K8-C: PXQ wide-store dequant bit-exactness + prefetch-arena race harness.
     # Not registered with llama_test(): it needs a real CUDA device and is run by hand inside

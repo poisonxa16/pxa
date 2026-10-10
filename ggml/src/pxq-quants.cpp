@@ -928,7 +928,8 @@ bool pxa_validate_tensor(const ggml_tensor * tensor) {
         case GGML_TYPE_PXQN2:
         case GGML_TYPE_PXQN1:
         case GGML_TYPE_PXQN4S8:
-        case GGML_TYPE_PXQN5:      return pxa_check_pxq_anchors(tensor);
+        case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXA4:       return pxa_check_pxq_anchors(tensor);
         case GGML_TYPE_IQ2_XXS:    return check_tensor_for_blocks_256_fp16<block_iq2_xxs>(tensor);
         case GGML_TYPE_IQ2_XS:     return check_tensor_for_blocks_256_fp16<block_iq2_xs>(tensor);
         case GGML_TYPE_IQ2_S:      return check_tensor_for_blocks_256_fp16<block_iq2_s>(tensor);

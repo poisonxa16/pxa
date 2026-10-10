@@ -11,7 +11,7 @@ folder it is `./pxa`; in a source checkout it is `python3 tools/pxa-launch.py` (
 ./pxa --gpus 0 --model your-model.gguf --yes    # start a server straight away: Control opens next to it
 ```
 
-PXA Control listens on this machine only (`127.0.0.1`). No desktop on this box, for example over
+PXA Control listens on this machine only (`127.0.0.1`). No desktop on this machine, for example over
 SSH? `pxa` prints the address and the tunnel line to open it from your own computer; or use
 `pxa --tui`. Starting a server from the command line, with `pxa` or `run-server.sh`, also starts
 Control in the background and prints `PXA Control: http://127.0.0.1:7777`, with that server
@@ -317,8 +317,22 @@ watch its log, chart its speed and talk to it, from a desk or a phone.
 python3 tools/pxa-launch.py --gui                     # http://127.0.0.1:7777/ on this machine
 python3 tools/pxa-launch.py --gui --port 8800         # another port
 python3 tools/pxa-launch.py --gui --lan               # on your network, behind a token
-docker run --runtime=nvidia -p 7777:7777 -v /models:/models IMAGE gui   # in the container
+docker run --runtime=nvidia -p 7777:7777 -v /models:/models -v pxa-cache:/work/.cache/pxa -e PXA_CACHE_DIR=/work/.cache/pxa IMAGE gui   # in the container
 ```
+
+### Updating
+
+The install can move to a newer release without copying your models.
+
+```bash
+pxa-update check      # is there a newer release
+pxa-update apply      # download, check the checksum, switch to it
+pxa-update rollback   # switch back to the previous version
+```
+
+`apply` unpacks into a new folder and then switches the `current` link. The previous folder stays. `rollback` only moves that link. Stop any server started from this install first.
+
+Models, Control settings, and `*.expert-counts.csv` are not inside the folder that gets switched, and the updater refuses a download that contains them. There is no beta channel in v3.1. That comes later.
 
 ### PXA Control opens by itself
 
@@ -360,7 +374,7 @@ and prints the `pxa-launch ...` line that would do the same thing from a shell.
 | Tab | What it shows |
 |---|---|
 | **Servers** | The opening page: every llama-server on the machine, one card each. The servers this GUI manages (as many as you like, each with its own name, cards, model, port, levers and extra args, kept in `control.json`), plus the docker containers and bare processes started some other way (found from `docker ps`, the process table and `nvidia-smi`'s compute apps). Each card shows the state (loading, serving, stopped, exit code, "no output for N s" while loading), port, cards, VRAM per card, decode/prefill medians and requests from `/pxa/stats`, and its actions: Start, Stop, Restart, Log (live, with search and problems-only), Edit, Chat, Speed. A strip of the cards shows which server holds how much of each. Discovered servers are read-only. **Adopt** gives one a name; with *allow control* on, Stop/Start/Restart become available for that container, and each asks you to type the container's name. |
-| **Live** | What the servers and the cards are doing right now, with a history (5 min, 15 min or 1 h). One tile per server: state (idle, reading the prompt, writing), decode speed now (or of the last request when idle), prefill speed, busy slots with a progress bar for each, KV-cache fill, speculative draft acceptance and expert-cache hit rate when the server uses them. Charts, one line per server in the server's own colour (the same colour as on the Servers tab): decode speed, prefill speed per request, draft acceptance, expert-cache hit rate. A request timeline: one bar per request in a lane per server slot, the pale part is the prompt being read and the solid part the answer being written; hover a bar for prompt tokens (and how many were reused), prefill and decode speed and draft acceptance. A strip per card with memory, load, temperature (a line marks 80 °C) and power, and a chip for a power or thermal cap. Hover any chart for the exact values at that time; each chart has a table view. Axes start at zero or a fixed range, never auto-zoomed, one y axis per chart. Numbers come from `nvidia-smi` (one call per sample) and from each server's own `/slots`, `/props` and `/pxa/stats`; with `--metrics` on the server the speeds are exact engine counters, without it they are counted from slot progress. A sampler thread runs only while PXA Control has a viewer (every 2 s with this tab open, every 10 s with another tab open, and it stops after 10 idle minutes); history lives in memory (3 h) and is never written to disk. A request's prompt text, which `/slots` carries, is dropped before it reaches the page. |
+| **Live** | What the servers and the cards are doing right now, with a history (5 min, 15 min or 1 h). One tile per server: state (idle, reading the prompt, writing), decode speed now (or of the last request when idle), prefill speed, busy slots with a progress bar for each, KV-cache fill, speculative draft acceptance and expert-cache hit rate when the server uses them. Charts, one line per server in the server's own colour (the same colour as on the Servers tab): decode speed, prefill speed per request, draft acceptance, expert-cache hit rate. A request timeline: one bar per request in a lane per server slot, the pale part is the prompt being read and the solid part the answer being written; hover a bar for prompt tokens (and how many were reused), prefill and decode speed and draft acceptance. A strip per card with memory, load, temperature (a line marks 80 °C) and power, and a chip for a power or thermal cap. Hover any chart for the exact values at that time; each chart has a table view. Axes start at zero or a fixed range, never auto-zoomed, one y axis per chart. Numbers come from `nvidia-smi` (one call per sample) and from each server's own `/slots`, `/props` and `/pxa/stats`; with `--metrics` on the server the speeds are exact engine counters, without it they are counted from slot progress. The sampler runs every 2 s with this tab open and every 10 s otherwise. Since v3.1 PXA Control also keeps the numbers on disk, page open or not (see *History on disk* below), and the 6 h, 24 h, 7 d, 30 d and 90 d buttons draw from that store, with CSV links for the shown range; without it (history off) the sampler runs only while PXA Control has a viewer, stops after 10 idle minutes and keeps 3 h in memory. A request's prompt text, which `/slots` carries, is dropped before it reaches the page and is never stored. |
 | **Rig** | Every card: name, VRAM used/total, temperature, power, utilisation, PCIe link generation and width (a narrow link is flagged), and the processes resident on it. Also the driver and CUDA version, `/dev/shm` and the container kind, the engine build it found, and the `--doctor` findings in colour (red stops a launch, amber is a warning). Refreshed every 3 s. |
 | **Models** | The folders you add, remembered in `~/.config/pxa/control.json` (or `$XDG_CONFIG_HOME/pxa/`; `--models-dir` and `PXA_MODELS_DIR` add to it). One row per `.gguf` with the codec (PXQ / PXQN / other), the type (the PXQ tier from the tensor directory, else the dominant ggml type), parameters, size, family and arch, all read from the file's header the way the launcher reads it. **Fits on** badges come from the launcher's own VRAM check (`vram_check`: weights plus the KV estimate at one 4096-token slot, on idle cards) for your current pick, one card of each kind, and all cards of each kind. Click a row to use it. |
 | **Launch** | Cards, model, context, parallel slots, KV cache type, MTP on/off (`--spec mtp`), split mode auto/layer/tensor, flash attention auto/on/off (on = the chat/serve regime, off = long documents, which is how the launcher expresses it), port, serve on the network, `--accept-unmeasured`, `--allow-busy`. **Show plan** runs the decision and starts nothing. **Start / Restart / Stop** run the planned command the way the CLI does (the same environment, `CUDA_DEVICE_ORDER` pinned next to the card list); Stop sends SIGTERM to that PID, then kills it. The log streams live (server-sent events, falling back to polling), and the header shows the health (`/health`: loading, ok, down). **Presets** save the whole form by name into `control.json`. A **server** selector at the top picks which managed server the form edits (New, Save, Rename, Delete). The plan shows a fit verdict for the cards as they are now, any clash with another server's port or cards (refused before anything is spawned), lever warnings, and copy buttons for the exact shell line and the `pxa-launch` line. **Extra args** appends llama-server flags from an allow-list (`--alias`, `-t`, `-ot`, `--temp`, `--metrics` ...); flags that read or write files or change who can reach the server (`--path`, `--log-file`, `--host`, `--api-key`, `-m` ...) are refused. **Engine build** picks one of the llama-server builds found (`PXA_ENGINE_DIR`, `./build*/bin`, the checkout's `build*/bin`, the image's). |
@@ -480,6 +494,19 @@ server, real Hugging Face, one encode; not in CTest).
 - The launcher's refusals are shown as they are. A busy card is refused (R-20) unless you tick
   *Allow busy cards*, and an UNMEASURED branch unless you tick *Accept UNMEASURED*.
 
+### Thinking on/off
+
+Each model that can think gets a Thinking switch (auto / on / off), a thinking budget and, where
+the model has them, effort levels: on the Launch tab (the server's default, sent as
+`--reasoning`, `--chat-template-kwargs`, `--reasoning-budget`), on the Chat tab (per request) and
+as a column on the Models tab. PXA Control recognises the family from the GGUF's chat template,
+then its architecture and name, then by inspecting the template; unknown models get no switch.
+A per-model setting is saved in `control.json` and used when the server profile says auto.
+Off is done by the template kwarg where the model has one, then a soft tag (`/no_think`, a system
+line), then an empty thought pre-filled at the start of the answer (models that always think);
+`--reasoning-budget 0` is the server-wide fallback. Budgets are suggestions. The families, what on and off do for each, and the suggested budgets
+are in [THINKING.md](THINKING.md).
+
 ### In a container
 
 `docker run ... IMAGE gui` runs `pxa-launch --gui --lan --no-browser --models-dir /models`. A
@@ -515,7 +542,181 @@ the page, retention and bucketing) and `tests/live-gui-check.py`, which starts `
 both themes at 1280 px and 390 px: structure, series colours, 2 px solid lines, legends, hover tooltips,
 theme change, no horizontal scroll, no page error.
 
+`tests/test-pxa-thinking.py` (CTest `test-pxa-thinking`) covers the thinking switch: family
+detection from every template in `models/templates/` and `tests/fixtures/thinking/` (copied from
+PXANET's GGUFs), from architecture + name alone, and for unknown models; each family's template
+rendered with thinking on and off (needs jinja2, skipped without it), including the soft tags and
+the empty-think prefill; the launch flags; the request rewrite (budget, `max_tokens` guard); the plan
+text showing the flags PXA Control adds; and the Control wiring (validation, per-model settings, the
+proxy rewrite against a stub server). `SymlinkedModels` in `test-pxa-control.py` covers models
+linked into a model folder from another disk (allowed when the target is a regular GGUF).
+
+### History on disk (v3.1)
+
+PXA Control records what the Live tab shows into one SQLite file, `telemetry.db` in its config
+directory (mode 0600, WAL, about 100 MB for 8 cards and 3 servers at the defaults), whether a page is
+open or not. Per card: memory, load, temperature, power and its limit, SM clock. Per server: decode and
+prefill tokens per second, busy and total slots, KV-cache fill, expert-cache hits, draft acceptance,
+finished requests with their prompt and generated tokens, and one row per finished request (token
+counts and speeds only; no prompt text, no file paths). This machine: RAM, CPU, swap.
+
+- **Sampling.** The Live sampler keeps running in the background, every 10 s (`sample_s`), and one
+  writer thread writes the averages in one transaction per sample. Only one PXA Control writes a given
+  file (a lock next to it); a second one on the same config directory reads it and says so.
+- **Retention.** Every sample for 7 days (`raw_days`), minute averages for 90 days (`rollup_days`),
+  checked every 5 minutes; past `max_mb` (512) the oldest day goes first. A server not seen for
+  `rollup_days` is forgotten.
+- **Settings.** The `telemetry` object in `control.json` (`enabled`, `sample_s`, `raw_days`,
+  `rollup_days`, `max_mb`, `prometheus`), `POST /api/telemetry/settings` with any of those keys, or the
+  `PXA_CONTROL_TELEMETRY*` variables (a variable wins). `PXA_CONTROL_TELEMETRY=0` gives the
+  pre-v3.1 behaviour.
+- **Reading it.** `GET /api/telemetry` (state, size, the series it knows),
+  `GET /api/telemetry/series?kind=card|server|host&key=...&since=...&until=...&step=...&points=...`
+  (bucketed averages; every sample when the range is inside `raw_days` and the step under 5 minutes,
+  else the minute averages), `GET /api/telemetry/history?since=...` (what the Live tab draws),
+  `GET /api/telemetry/requests` and `GET /api/telemetry/csv?kind=card|server|host|requests&since=...`.
+  Times are Unix seconds. Server keys are `m:<profile>` for PXA Control's own servers, `d:<name>` for
+  containers and `p@<port>` for a server started from a terminal.
+- **Prometheus.** With `prometheus` on (`PXA_CONTROL_METRICS=1`), `GET /metrics` serves
+  `pxa_card_*`, `pxa_server_*` and `pxa_host_*` gauges, `pxa_server_requests_total` and token counters,
+  and every running server's own `/metrics` with a `server="<key>"` label added. On `--lan` it needs
+  the token (`Authorization: Bearer <token>`).
+
+`tests/test-pxa-telemetry.py` covers the store (averaging, rollups, rows written behind a rollup,
+retention, the size cap, bucketing, CSV, one writer, the Prometheus text);
+`tests/test-pxa-control.py` covers the routes, the background sampler with no page open, the read-only
+second PXA Control and `/metrics`. `python3 tests/live_env.py --backfill-days 3` starts the fake
+environment with three made-up days of history to look at the long ranges.
+
 ---
+
+### Profiles: power, clocks and auto-starts per card (v3.1)
+
+The **Profiles** tab makes the cards quieter, cooler or faster and chooses which saved servers start on them. A
+profile names its cards **by UUID**, so it still finds them after a re-cabled bus changes the order. It holds:
+
+| | Simple mode | Advanced mode |
+|---|---|---|
+| Power limit | one slider, 60–100 % of the card's stock limit, with a **Reset to default** button | watts, % of stock, % of max or stock; the card's full hardware range (going outside the recommended band shows a warning) |
+| Presets | Quiet (60 %), Balanced (80 %), Max Speed | also Benchmark (factory settings) and Overnight (55 %), plus your own: clone, edit, import/export JSON |
+| Cards | tick the cards | also "all P100" style groups and a UUID list (cards not plugged in now are kept and skipped) |
+| Temperature guard | one checkbox: slow down by itself when hot | warn / act temperatures and the action (alert, lower the power, pause auto-starts) |
+| Clocks, persistence | hidden | application clocks (snapped to a supported pair), locked clocks (Volta and newer), persistence mode; a card that cannot do one says so and is skipped |
+| Auto-start | hidden | saved servers with order, delay, health wait, restart (never / on-failure with exponential backoff and a retry cap), on-boot, extra engine args and PXA_/PXQ_ settings |
+| Schedules, history | hidden | time-of-day switches; the change history (every step, who, before/after); **Copy as curl** on every action; the raw dry-run diff |
+
+The Simple / Advanced choice is remembered per browser and in `control.json` (`"ui_mode"`).
+
+Each card tile shows live power against its limit (with lowest / stock / highest marked), temperature against the
+card's own slowdown point, memory, how busy it is, the servers on it, the active profile, **tok/s** and **tok/s per
+watt** (for A/B comparisons), and the last hour as a sparkline. **Power limit…** on a tile sets one card's limit
+directly: it is clamped to the card's range, asks in plain words ("Card 2 power: 250 W → 180 W. You can undo this
+anytime."), and lands in the same history and Undo.
+
+Every change: **preview** (a dry run that changes nothing) → confirm → apply in a fixed order (persistence, clocks,
+power last) → **read every value back** → if any step fails or reads back wrong, **every card already changed is put
+back**, newest first. Applying the same profile twice is a no-op. After a change the page offers **Undo**, and for 30 s
+a safety watch undoes the change by itself if a changed card stops answering the driver or reaches its slowdown
+temperature.
+
+Server cards and the Launch view also show the context the engine actually runs with, read from the engine itself
+(its `/props`, else its load log), never guessed: *Context: Auto (picked 65,536 tokens to fit your card)*, with a
+tooltip saying how it was chosen. With a hand-set context, Advanced users get **What would auto pick?** (the
+launcher's own plan with context 0; nothing starts).
+
+**Everything that changes a card is off until you switch it on.** The switches live in `control.json` (or the
+environment) only; the page can never turn them on:
+
+| `control.json` | environment | default | what it allows |
+|---|---|---|---|
+| `"allow_gpu_control": true` | `PXA_CONTROL_ALLOW_GPU=1` | off | power limit, clocks and persistence changes (the page is look-and-preview only without it) |
+| `"gpu_autostart": true` | `PXA_CONTROL_AUTOSTART=1` | off | a profile's servers start (and restart on failure) |
+| `"gpu_schedules": true` | `PXA_CONTROL_SCHEDULES=1` | off | schedules fire |
+| `"gpu_boot_apply": true` | `PXA_CONTROL_BOOT_APPLY=1` | off | at Control start, re-apply the profiles that were active (the driver forgets limits at reboot) |
+| `"gpu_lock_files": [paths]` | `PXA_CONTROL_LOCK_FILES=a:b` | none | while a file exists, its cards are kept free (content `{"gpus":[0,"GPU-…"],"why":"…"}` or `gpus=0,1`; no scope = every card) |
+| `"gpu_lock_if_missing": [paths]` | `PXA_CONTROL_LOCK_IF_MISSING=a:b` | none | while a file is MISSING, every card is kept free (e.g. a benchmark's done-marker) |
+
+A card that is **kept free** (a lock file, a missing wait-for file, maintenance mode, a card reserved from the page,
+**Benchmark mode**) is refused for every change *and* for every server start PXA Control makes onto it, including
+Start on the Servers tab (HTTP 423 with the reasons). **Benchmark mode** keeps the test cards free, pauses auto-starts
+and (only with `allow_gpu_control`) lowers the other cards to a share of their stock limit; ending it puts everything
+back.
+
+Driver access: NVML when `pynvml` is installed, else `nvidia-smi` (argv only, by UUID, with timeouts), else read-only.
+`PXA_CONTROL_GPU_ADAPTER=auto|nvml|smi|mock|none` picks one; `mock` (with `PXA_CONTROL_GPU_MOCK=p100,v100,1080ti`, or
+automatically with `PXA_LAUNCH_FAKE_GPUS`) is an in-memory rig for tests and demos. Without any driver the tab says so
+and the rest of PXA Control works as before. Files, next to `control.json`: `gpu_profiles.json` (versioned, validated,
+0600, atomic, previous copy as `.bak`) and `gpu_audit.jsonl` (the history, rotated at 2 MiB).
+
+Routes (same token / Host / Origin rules as the rest; errors are `{"error", "code", "status"}`):
+`GET /api/health`, `GET /api/gpu/state`, `GET|POST|DELETE /api/gpu/profiles`, `POST /api/gpu/plan` (dry run),
+`POST /api/gpu/apply` (`confirm` = the profile id), `POST /api/gpu/power` (`{uuid, watts|"default", confirm}`),
+`POST /api/gpu/undo`, `POST /api/gpu/reset` (`confirm: "reset"`), `POST /api/gpu/reserve`, `POST /api/gpu/maintenance`,
+`POST /api/gpu/quiet` (Benchmark mode, `confirm: "quiet"`), `POST /api/gpu/schedules`, `POST /api/gpu/supervisor`
+(pause / resume / run / forget), `GET /api/gpu/clocks?uuid=`, `GET /api/gpu/audit`, `GET /api/gpu/export`,
+`POST /api/gpu/import`, `POST /api/gpu/ui`.
+
+First real use, safest order: set `"allow_gpu_control": true`, restart Control, make a profile for ONE card,
+**Preview**, apply, watch the tile and the history, press **Undo**.
+
+### Assistant chat (v3.1)
+
+**Chat → Assistant** is an in-house assistant (`tools/pxa_chat`, stdlib Python + vanilla JS) that talks to a
+running server's OpenAI endpoint and can use tools. **Classic chat** (the plain streaming chat) is unchanged
+behind the switch in the page header.
+
+- **Layout.** A chat list on the left (New chat, auto-titled, grouped *Today* / *Earlier*, rename and delete
+  inline, collapsible), a wide centred conversation, and a composer at the bottom. User messages are right
+  bubbles; replies are full-width Markdown (headings, lists, tables, code blocks with a language label and a
+  Copy button), rendered by a small escaping renderer: HTML in a reply is shown as text, links are http(s) only.
+- **Replies are the model's own words.** PXA never wraps an answer in a fixed prefix or suffix. Only when the
+  model sends an *empty* final turn after using a tool does PXA write one short line from the last result
+  (e.g. `**441** (2450×18/100 = 441)` or "Skipped saving notes.md because you said no.").
+- **Tool steps** are compact rows (*Calculated 2450×18/100*, *Read notes.txt*, *Fetched example.com*) that
+  expand to show the input and output. Thinking is one collapsed *Thought for 3s* row.
+- **Approvals** (saving files, opening an address on your own network, running a command) are inline cards in
+  the conversation: *Allow once*, *Always for this chat* (not offered for commands), *Deny*. Unanswered cards
+  are skipped after `PXA_CHAT_APPROVAL_TIMEOUT` seconds (default 300).
+- **Composer.** Enter sends, Shift+Enter is a new line, Send turns into Stop while streaming. The *Mode* chip
+  picks Chat / Assistant / Researcher / Coder; the server chip picks the model (it auto-selects the last used
+  server if it is up, otherwise the healthiest). Ctrl+K starts a new chat, Esc stops the reply.
+- **Per message.** Hover a reply for Copy and Regenerate (latest reply) plus tokens and tok/s; hover your own
+  message for Copy and Edit-and-resend (the chat branches from there).
+- **Simple / Advanced.** Advanced opens a settings drawer on the right: system prompt, temperature, top P/K,
+  min P, max tokens, step limit, thinking on/off, tool-call mode (native / text protocol), tool switches, and
+  Copy as curl. Chat and Assistant modes send `enable_thinking: false` by default (quick answers from reasoning
+  models); Researcher and Coder leave thinking to the server.
+- **Saved chats** live in Control's config folder (`chat/sessions/<id>.json`, mode 0600; each chat's files in
+  `chat/sandbox/<id>/`, mode 0700) and export as Markdown or JSON from the download button in the conversation
+  header. Deleting a chat deletes its sandbox folder too.
+- Routes: `GET /api/chat/servers|presets|sessions|session|events|export`, `POST /api/chat/run` (`rewind: N`
+  replaces turn N and everything after it: regenerate / edit), `POST /api/chat/cancel|approve|select|rename`,
+  `DELETE /api/chat/session`.
+- UI check (by hand): `node tests/agent-ui-check.js http://127.0.0.1:<port>/ /tmp/shots [--real]` against a
+  Control attached to `tests/pxa_chat_mock.py` or a real server.
+
+#### Memory across chats
+
+The assistant can remember short facts about you ("The user is vegetarian.") and use them in every later chat,
+on any server. It belongs to you, not to a chat or a model.
+
+- **How it saves:** the model calls `remember(fact)` when you tell it something lasting (name, place, diet, units,
+  tools, projects) and `forget(fact_or_id)` when you ask. Each save shows a **Memory updated** row in the chat;
+  expand it to see the fact, press **Undo** to take it back.
+- **How it recalls:** before every message, PXA Control picks the facts that share words with what you wrote
+  (rare words count more), plus every **pinned** fact, then the newest ones while room is left, and puts them in a
+  clearly marked `<memory>` block in the system prompt, within a token budget (default 8 facts / 400 tokens).
+- **Never saved:** passwords, API keys, tokens, card numbers, private keys (a pattern screen refuses them), and
+  rules about how to reply ("keep answers short"): those make every later answer worse, so they are refused too.
+- **Memory panel** (sidebar, **Memory**): the switch **Remember things across chats** (on by default), add, edit,
+  pin, delete (with Undo) and **Clear all**. Advanced mode adds facts-per-message, token budget, Export/Import
+  (JSON) and the raw facts, and the settings drawer gets **Use memory in this chat** (off = the chat neither sees
+  nor saves memories).
+- **Where:** `<config>/chat/memory.json`, owner-only (0600), written atomically; up to 200 facts, the oldest unpinned
+  fact makes room. Saving the same fact again updates it instead of adding a twin.
+- **API:** `GET /api/chat/memory`, `POST /api/chat/memory` with `op` = add, update, pin, delete, restore, clear
+  (`confirm: true`), settings (`enabled`, `k`, `budget`), import (`facts`, `replace`); `GET /api/chat/memory/export`.
+  A run takes `use_memory: false` to switch memory off for that chat; its answer lists the recalled fact ids.
 
 ## The screens
 
@@ -1110,20 +1311,21 @@ else. Every number attributed to such a tag was really produced by the image
 **plus** those host paths.
 
 Those paths are site-local, so **none are hardcoded**. Declare them in a JSON
-descriptor and point `PXA_VLLM_HOST_ENV` at it:
+descriptor and point `PXA_VLLM_HOST_ENV` at it. The paths in the example below are
+placeholders — use your own:
 
 ```json
 {"pxa-sm60-dev": {
-   "mounts":   {"/srv/pxa": "/c"},
-   "requires": ["/srv/pxa/venv/pyvenv.cfg",
-                "/srv/pxa/venv/bin/python",
-                "/srv/pxa/venv/lib/python3.12/site-packages/torch",
-                "/srv/pxa/vllm-src/vllm/__init__.py",
-                "/srv/pxa/kernels/libpxq4_sm60_v10.so"],
-   "python":   "/c/venv/bin/python",
-   "env":      {"PYTHONPATH": "/c/site",
-                "PXQ4_LIB":  "/c/kernels/libpxq4_sm60_v10.so"},
-   "editable_source": "/srv/pxa/vllm-src",
+   "mounts":   {"/path/to/pxa": "/host"},
+   "requires": ["/path/to/pxa/venv/pyvenv.cfg",
+                "/path/to/pxa/venv/bin/python",
+                "/path/to/pxa/venv/lib/python3.12/site-packages/torch",
+                "/path/to/pxa/vllm-src/vllm/__init__.py",
+                "/path/to/pxa/kernels/libpxq4_sm60_v10.so"],
+   "python":   "/host/venv/bin/python",
+   "env":      {"PYTHONPATH": "/host/site",
+                "PXQ4_LIB":  "/host/kernels/libpxq4_sm60_v10.so"},
+   "editable_source": "/path/to/pxa/vllm-src",
    "why": "how you traced it, so the next reader does not have to"}}
 ```
 
@@ -1535,7 +1737,7 @@ Everything else warns:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--spec METHOD[:k=v,...]` | — | e.g. `mtp:n_max=1`, `ngram-mod:n_max=4`. A bare `mtp` expands to `mtp:n_max=1` — **not** the old `n_max=4,n_min=2`, which was a measured loss emitted by default. |
-| `--draft-model PATH` | — | External draft-model speculation. Zero coverage in this bench → R-25. |
+| `--draft-model PATH` | — | Gemma 4 assistant drafter next to the model (`-md`). Any other file is refused (R-25) unless `--accept-unmeasured` is also set. Measured 159-167 t/s on one V100. |
 
 ### vLLM specifics
 
@@ -1549,6 +1751,7 @@ Everything else warns:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--host` / `--port` | `0.0.0.0` / `8080` | |
+| `--hot-model NAME=PATH` | — | Repeatable. Register another model on this same server. The engine keeps each one in host RAM and puts one on the cards. Needs CUDA virtual memory on every selected card. Supported for Qwen-family models on Volta (V100) and newer. Sliding-window models, including Gemma 4, are refused (R-33). The launcher also refuses the flag on cards below compute 7.0 (R-31, R-32). The request's `model` field switches. |
 | `--explain` | off | Decide and print; run nothing. Exits 5 if the plan carries known-fatal blockers, 0 if clean. |
 | `--selftest` | off | Run the decision table against this machine's real cards. |
 | `--accept-unmeasured` | off | Execute a branch the launcher labels `[INFERRED]`/`UNMEASURED`. |
@@ -1610,7 +1813,7 @@ than enforced, because this process `exec`s the server and cannot observe it.
 | **R-14** | `--spec mtp` with vLLM. No MTP drafter there, and ngram will **not** be substituted: on this model class the two have opposite verdicts (ngram +23.0% code; MTP −8.6%). Substituting a lever's meaning is worse than dropping it. |
 | **R-15A** | `mtp:n_max≥2` — a measured loss on both architectures. |
 | **R-15B** | `--spec mtp` on a file with **no** nextn/mtp tensors. Two shipped f16 files declare `nextn_predict_layers=1` with zero such tensors — the head was dropped in the pipeline and the flag survived. |
-| **R-25** | `--draft-model`. Zero coverage in this bench on any cell. Escape: `--accept-unmeasured` (llama.cpp only; no vLLM draft path is emitted at all). |
+| **R-25** | `--draft-model` other than the Gemma 4 assistant file next to its target. That one case is measured (159-167 t/s on one V100, 85 of 104 drafts accepted). Every other file has zero coverage. Escape for those: `--accept-unmeasured` (llama.cpp only; no vLLM draft path is emitted at all). |
 
 ### Configuration and envelope
 
@@ -2012,6 +2215,13 @@ card count, and a table of medians per model and prompt size (<1k, 1-4k, 4-16k, 
 | `PXA_CONTROL` | `0` (or `off`): never start PXA Control by itself. `1` (or `on`): start it even without a terminal or inside a container. Unset: start it for a person at a terminal, outside a container. |
 | `PXA_CONTROL_IDLE_S` | Seconds a background PXA Control waits, with no server running and no page open, before it closes. Default 600. |
 | `PXA_CONTROL_TOKEN` | The `--lan` access token (16 or more of `A-Z a-z 0-9 _ -`) instead of the one kept in `~/.config/pxa/token`. |
+| `PXA_CONTROL_TELEMETRY` | `0` turns PXA Control's history on disk off (Live keeps 3 h in memory, as before v3.1); `1` forces it on. Default on. |
+| `PXA_CONTROL_TELEMETRY_SAMPLE_S` | Seconds between history samples, 2 to 3600. Default 10. |
+| `PXA_CONTROL_TELEMETRY_RAW_DAYS` | Days the history keeps every sample. Default 7 (never more than the minute averages). |
+| `PXA_CONTROL_TELEMETRY_ROLLUP_DAYS` | Days the history keeps minute averages. Default 90. |
+| `PXA_CONTROL_TELEMETRY_MAX_MB` | Size cap of the history file in MB; past it the oldest day goes first. Default 512. |
+| `PXA_CONTROL_TELEMETRY_DB` | Path of the history file instead of `telemetry.db` in PXA Control's config directory. |
+| `PXA_CONTROL_METRICS` | `1` serves `GET /metrics` (Prometheus text) from PXA Control. Default off. |
 | `PXA_API_KEY` | Read by a saved restart script, never by the launcher itself. The key is deliberately not stored in the script. |
 
 Engine auto-detection, when `PXA_ENGINE_DIR` is unset, looks in this order: build
@@ -2113,3 +2323,22 @@ Use it after changing images, drivers or card layout to see what the launcher
 | `src/llama-model-loader.cpp` | How the loader detects PXQ1, by tensor type |
 | `ggml/include/ggml.h` | The ggml type ids this launcher dispatches on |
 | `docs/RENAME-MAP.md` | The PXQ tier display-name ladder and retired ids |
+| `docs/HOME-ASSISTANT.md` | Your server's numbers in Home Assistant: the four REST sensors, or MQTT with auto-discovery (Control → Advanced settings → Home Assistant) |
+
+## Web search in Chat
+
+The Researcher preset (and any chat with the tools switched on) can search the web and read pages. It works out of the box: nothing to install, no account, no key.
+
+By default the search is "built-in". PXA Control asks DuckDuckGo's plain HTML page, and Bing's if DuckDuckGo refuses, then reads the pages it finds with a normal web request and strips the markup. Every result carries its address, and the assistant is told to cite them. Niche queries can come back thin on the built-in search. If you want better results, pick one of these in Chat, under the magnifier button at the top:
+
+- **SearXNG**: the address of your own SearXNG with JSON output turned on (`search.formats` in its settings.yml must include `json`).
+- **Brave Search API** or **Tavily**: paste your key. Both have free tiers. Keys are stored on this computer, in the chat folder next to Control's config, and are never shown back to you.
+- **Page reader** (optional): the address of a crawl4ai service, for cleaner text from heavy pages, plus its token if it has one.
+
+"Test search" runs one query with what is on screen and shows the results or the plain-English error. If the provider you picked fails, the chat says so and uses the built-in search for that question.
+
+If PXA Control sees a SearXNG on ports 8080 or 8888, or crawl4ai on 11235 or 8082, on this computer, the panel offers it ("found on this machine, use it?"). It never switches to it on its own.
+
+The same panel has a switch for this chat: turn web search off and the assistant neither searches nor opens pages.
+
+Privacy: your search words go to the provider you chose (DuckDuckGo or Bing for the built-in one, otherwise your SearXNG, Brave or Tavily), and a page you ask it to open is fetched from that site. Nothing is sent to PXA. Pages on your own network are only opened if you approve it.

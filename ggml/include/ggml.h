@@ -521,6 +521,9 @@ extern "C" {
         GGML_TYPE_PXQN1    = 261,
         GGML_TYPE_PXQN4S8  = 262,
         GGML_TYPE_PXQN5    = 263,
+        // PXA4: PXA subscriber flagship tier, ~5.06 bpw
+        //   (closed decoder in libggml-pxqn).
+        GGML_TYPE_PXA4     = 264,
 
 
         // PINNED, deliberately, to 400 -- do NOT let this go back to taking
@@ -1750,6 +1753,12 @@ extern "C" {
             struct ggml_tensor  * cur,        // F32 [n_embd, 1, n_tokens] (or [n_embd, n_tokens]), contiguous
             struct ggml_tensor  * ids_cold,   // I32 [n_used, n_tokens] from ggml_moe_split_ids(side 1)
             void                * slot);
+    // PXA_XCACHE_SPLIT_ONE: both sides of ggml_moe_split_ids in one node, [n_used, n_tok, 2] (plane 0 hot, plane 1 cold)
+    GGML_API struct ggml_tensor * ggml_moe_split_ids_both(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * map);
+
     GGML_API struct ggml_tensor * ggml_moe_cold_wait(
             struct ggml_context * ctx,
             struct ggml_tensor  * ticket,     // from ggml_moe_cold_submit

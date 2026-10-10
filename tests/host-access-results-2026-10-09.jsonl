@@ -1,0 +1,1 @@
+{"what": "control-host-access", "suite": "tests/test_host_access.py", "tests": 42, "secs": 0.17, "routes": 2, "bad_request_status": 400, "bad_request_cases": 2, "lan_help_line": 151, "date": "2026-10-09", "run": "python3 -m pytest tests/ -k host_access -q", "wiring": "pxa_control.py: chat_host_policy -> CHAT.register(host=...)"}

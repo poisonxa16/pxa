@@ -36,6 +36,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <map>
 #include <set>
 #include <mutex>
 #include <thread>
@@ -523,6 +524,36 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
 
 // read general.architecture from the gguf header (metadata only, no tensor data) — the
 // posture layer runs BEFORE model load but needs the arch for MLA-class exceptions.
+// True when the file is sliding-window / ISWA attention: n_swa > 0, or a Gemma 4 file.
+// Metadata only, same pre-load open as pxa_gguf_arch. An unreadable file is not treated as
+// sliding-window; the loader reports that failure itself.
+static bool pxa_gguf_sliding_window(const std::string & fname) {
+    struct gguf_init_params ip = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    struct gguf_context * g = gguf_init_from_file(fname.c_str(), ip);
+    if (!g) return false;
+    bool swa = false;
+    const int ia = gguf_find_key(g, "general.architecture");
+    if (ia >= 0) {
+        const std::string arch = gguf_get_val_str(g, ia);
+        if (arch == "gemma4" || arch == "gemma4_mtp") swa = true;
+        const std::string key = arch + ".attention.sliding_window";
+        const int ik = gguf_find_key(g, key.c_str());
+        if (ik >= 0) {
+            int64_t n = 0;
+            switch (gguf_get_kv_type(g, ik)) {
+                case GGUF_TYPE_UINT32: n = gguf_get_val_u32(g, ik); break;
+                case GGUF_TYPE_INT32:  n = gguf_get_val_i32(g, ik); break;
+                case GGUF_TYPE_UINT64: n = (int64_t) gguf_get_val_u64(g, ik); break;
+                case GGUF_TYPE_INT64:  n = gguf_get_val_i64(g, ik); break;
+                default: break;
+            }
+            if (n > 0) swa = true;
+        }
+    }
+    gguf_free(g);
+    return swa;
+}
+
 static std::string pxa_gguf_arch(const std::string & fname) {
     struct gguf_init_params ip = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
     struct gguf_context * g = gguf_init_from_file(fname.c_str(), ip);
@@ -2979,6 +3010,39 @@ int main(int argc, char ** argv) {
                             "this build or driver has none\n");
             return 1;
         }
+#if defined(GGML_USE_CUDA)
+        {
+            // Pascal reports VMM, so the check above does not refuse it. The launcher's
+            // R-31 refusal is not on the engine-argument path (a leading '-' goes straight
+            // to llama-server). ggml's cc is 100*major+10*minor; Volta is 700.
+            const int ndev = ggml_backend_cuda_get_device_count();
+            for (int d = 0; d < ndev; ++d) {
+                const int cc = ggml_backend_cuda_get_device_cc(d);
+                if (cc < 700) {
+                    fprintf(stderr,
+                        "hot swap: --hot-model refused on device %d (compute capability %d). "
+                        "Pascal and older stay off until that path has a soak; pick a Volta-or-newer card\n",
+                        d, cc);
+                    return 1;
+                }
+            }
+        }
+#endif
+        // Same product boundary as the launcher's R-33. Either file is enough: the model on
+        // the cards at open, or any model registered with --hot-model.
+        {
+            const char * swa_msg = "hot swap supports models without sliding-window attention for now; Gemma support is coming";
+            if (pxa_gguf_sliding_window(params.model)) {
+                fprintf(stderr, "hot swap: --hot-model refused for '%s': %s\n", params.model.c_str(), swa_msg);
+                return 1;
+            }
+            for (const auto & sp : specs) {
+                if (pxa_gguf_sliding_window(sp.path)) {
+                    fprintf(stderr, "hot swap: --hot-model refused for '%s': %s\n", sp.path.c_str(), swa_msg);
+                    return 1;
+                }
+            }
+        }
         if (getenv("PXA_EXPERT_SHARD")) {
             fprintf(stderr, "hot swap: PXA_EXPERT_SHARD keeps a process-wide expert table keyed by tensor name and "
                             "cannot serve two models; unset it or register one model\n");
@@ -3449,6 +3513,43 @@ int main(int argc, char ** argv) {
                 prometheus << "# HELP llamacpp:" << name << " " << help  << "\n"
                             << "# TYPE llamacpp:" << name << " " << type  << "\n"
                             << "llamacpp:"        << name << " " << value << "\n";
+            }
+        }
+
+        // PXA spec metrics: drafted and accepted tokens, split by drafter type. The slot
+        // snapshot above already carries the totals; this only publishes them on /metrics.
+        {
+            uint64_t drafted_all = 0, accepted_all = 0;
+            std::map<std::string, std::pair<uint64_t, uint64_t>> by_type;
+            if (data.contains("slots") && data.at("slots").is_array()) {
+                for (const auto & s : data.at("slots")) {
+                    drafted_all  += json_value(s, "n_draft_total", (uint64_t) 0);
+                    accepted_all += json_value(s, "n_draft_accepted", (uint64_t) 0);
+                    if (!s.contains("draft_by_type") || !s.at("draft_by_type").is_object()) continue;
+                    for (auto it = s.at("draft_by_type").begin(); it != s.at("draft_by_type").end(); ++it) {
+                        auto & acc = by_type[it.key()];
+                        acc.first  += json_value(it.value(), "drafted", (uint64_t) 0);
+                        acc.second += json_value(it.value(), "accepted", (uint64_t) 0);
+                    }
+                }
+            }
+            uint64_t typed_d = 0, typed_a = 0;
+            for (const auto & kv : by_type) { typed_d += kv.second.first; typed_a += kv.second.second; }
+            if (drafted_all > typed_d || accepted_all > typed_a) {
+                auto & rest = by_type["none"];
+                rest.first  += drafted_all - typed_d;
+                rest.second += accepted_all - typed_a;
+            }
+            if (by_type.empty()) by_type["none"] = {0, 0};
+            prometheus << "# HELP llamacpp:draft_tokens_total Draft tokens proposed, labelled by speculative type.\n";
+            prometheus << "# TYPE llamacpp:draft_tokens_total counter\n";
+            prometheus << "# HELP llamacpp:draft_tokens_accepted_total Draft tokens the target accepted, labelled by speculative type.\n";
+            prometheus << "# TYPE llamacpp:draft_tokens_accepted_total counter\n";
+            for (const auto & kv : by_type) {
+                std::string lab = kv.first;
+                for (char & ch : lab) if (ch == '"' || ch == '\\' || ch == '\n') ch = '_';
+                prometheus << "llamacpp:draft_tokens_total{type=\"" << lab << "\"} " << kv.second.first << "\n";
+                prometheus << "llamacpp:draft_tokens_accepted_total{type=\"" << lab << "\"} " << kv.second.second << "\n";
             }
         }
 
@@ -5023,7 +5124,10 @@ int main(int argc, char ** argv) {
         pxa_wire_queue(*m.ctx);
     }
 
+    std::atomic<bool> pxa_sleep_stop{false};
+    std::thread pxa_sleep_thread;
     shutdown_handler = [&](int) {
+        pxa_sleep_stop.store(true);
         ctx_server.queue_tasks.terminate();
         for (auto & m : hs_models) {
             m.ctx->queue_tasks.terminate();
@@ -5117,6 +5221,34 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // PXA sleep-idle: hot swap already knows how to park a model and load it on the next request.
+    // This only decides when. Off unless --sleep-idle-seconds is set and more than one model is registered.
+    if (params.sleep_idle_seconds > 0 && hs_router) {
+        const int pxa_sleep_s = params.sleep_idle_seconds;
+        pxa_sleep_thread = std::thread([router = hs_router.get(), pxa_sleep_s, &pxa_sleep_stop]() {
+            int quiet = 0;
+            while (!pxa_sleep_stop.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (pxa_sleep_stop.load()) {
+                    return;
+                }
+                if (!router->idle_for_sleep()) {
+                    quiet = 0;
+                    continue;
+                }
+                if (++quiet < pxa_sleep_s) {
+                    continue;
+                }
+                quiet = 0;
+                std::string err;
+                if (router->try_sleep(err)) {
+                    LOG_INFO("sleep-idle: the cards are free; the next request loads the model back", {"seconds", pxa_sleep_s});
+                }
+            }
+        });
+        LOG_INFO("sleep-idle armed", {"seconds", pxa_sleep_s});
+    }
+
     // PXA hot swap: every registered model runs its own task loop; parked ones wait in it
     for (auto & m : hs_models) {
         server_context * c = m.ctx.get();
@@ -5126,6 +5258,11 @@ int main(int argc, char ** argv) {
     }
 
     ctx_server.queue_tasks.start_loop();
+
+    pxa_sleep_stop.store(true);
+    if (pxa_sleep_thread.joinable()) {
+        pxa_sleep_thread.join();
+    }
 
     for (auto & m : hs_models) {
         m.ctx->queue_tasks.terminate();

@@ -153,7 +153,7 @@ static_assert(sizeof(struct ggml_pxqn_rowmap) == sizeof(struct pxa_pxq_rowmap) &
 static inline bool pxa_pxq_is_pxqn(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN2: case GGML_TYPE_PXQN3: case GGML_TYPE_PXQN3S8:
-        case GGML_TYPE_PXQN4: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXQN4: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5: case GGML_TYPE_PXA4:
             return true;
         default:
             return false;
@@ -176,6 +176,7 @@ bool pxa_pxq_is_cpu_supported(enum ggml_type type) {
         case GGML_TYPE_PXQN1:
         case GGML_TYPE_PXQN4S8:
         case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXA4:
             return ggml_pxqn_available();   // the closed libggml-pxqn decodes them
         default:
             return false;
@@ -336,6 +337,7 @@ void pxa_pxq_dequant_row(enum ggml_type type, const void * data, int64_t row, in
         case GGML_TYPE_PXQN2:
         case GGML_TYPE_PXQN1:
         case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXA4:
         case GGML_TYPE_PXQN4S8: pxa_pxqn_deq_row_fwd(type, data, row, k, dst); break;
         default: PXA_PXQ_ASSERT(!"pxa_pxq_dequant_row: not a PXQ type");
     }
@@ -534,7 +536,8 @@ void pxa_pxq_mul_mat_cpu(
         // the library's shape contract: 64-row panels, K a multiple of the tier's slab (32 for N4 / N4S8, else 128); anything
         // else keeps the row-dequant path below
         const int64_t qk = (type == GGML_TYPE_PXQN4 || type == GGML_TYPE_PXQN4S8) ? 32 : 128;
-        if (mm && nr0 % 64 == 0 && k % qk == 0) {
+        // PXA4: no SIMD tier in the library's CPU matmul yet -> the row-dequant + f32 dot below
+        if (mm && type != GGML_TYPE_PXA4 && nr0 % 64 == 0 && k % qk == 0) {
             mm(type, a, nr0, k, src1f, nb11, nb12, dst, nb1, nb2, (const struct ggml_pxqn_rowmap *) rows, ne11, ny, ith, nth);
             return;
         }

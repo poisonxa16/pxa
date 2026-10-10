@@ -1,3 +1,4 @@
+#include "ggml-pxqn-tune.h"
 #include <cstdlib>
 #include <atomic>
 #include <stdexcept>
@@ -1630,12 +1631,27 @@ llm_expert_gating_func_type   gating_op,
     ggml_tensor * experts = nullptr;
     if (xcl) {
         GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b);
-        ggml_tensor * ids_hot  = ggml_moe_split_ids(ctx, selected_experts, xcl->ffn_exps_xmap, 0);
+        // PXA_XCACHE_SPLIT_ONE (default off, exact): one split node writes both id sets (two views) instead of two nodes
+        static const bool pxa_split_one = [] { const char * e = getenv("PXA_XCACHE_SPLIT_ONE"); const bool v = e && atoi(e) != 0;
+            if (v) fprintf(stderr, "PXA_XCACHE_SPLIT_ONE: 1 (hot and cold expert ids from one split node; exact)\n");
+            return v; }();
+        ggml_tensor * ids_hot = nullptr, * ids_cold = nullptr;
+        if (pxa_split_one) {
+            ggml_tensor * both = ggml_moe_split_ids_both(ctx, selected_experts, xcl->ffn_exps_xmap);
+            if (xcl->ffn_exps_xmap->ne[0] >= 2*n_expert + 8) ((int32_t *) both->op_params)[1] = (int32_t) n_expert;
+            cb(both, "ffn_moe_ids_both", il);
+            ids_hot  = ggml_view_2d(ctx, both, both->ne[0], both->ne[1], both->nb[1], 0);
+            ids_cold = ggml_view_2d(ctx, both, both->ne[0], both->ne[1], both->nb[1], both->nb[2]);
+            cb(ids_hot, "ffn_moe_ids_hot", il);
+            cb(ids_cold, "ffn_moe_ids_cold", il);
+        } else {
+        ids_hot  = ggml_moe_split_ids(ctx, selected_experts, xcl->ffn_exps_xmap, 0);
         // the map tensor carries [map][routing counters][stats]: the side-0 op counts routings on the device (online adaptation)
         if (xcl->ffn_exps_xmap->ne[0] >= 2*n_expert + 8) ((int32_t *) ids_hot->op_params)[1] = (int32_t) n_expert;
         cb(ids_hot, "ffn_moe_ids_hot", il);
-        ggml_tensor * ids_cold = ggml_moe_split_ids(ctx, selected_experts, xcl->ffn_exps_xmap, 1);
+        ids_cold = ggml_moe_split_ids(ctx, selected_experts, xcl->ffn_exps_xmap, 1);
         cb(ids_cold, "ffn_moe_ids_cold", il);
+        }
         // PXA_XCACHE_ASYNC: a narrow graph (decode, a verify batch) whose cold stacks the CPU reads hands its cold half to the host
         // worker: submit before the hot half, wait after it, no scheduler split and no host sync (src/llama-pxa-xcache-async.h).
         // Only the plain routed-expert chain qualifies (the CPU sub-graph repeats exactly the nodes build_experts makes for it).
@@ -1665,6 +1681,9 @@ llm_expert_gating_func_type   gating_op,
             if (g_pxa_xca_overlap && *g_pxa_xca_overlap) {
                 std::function<void()> overlap = std::move(*g_pxa_xca_overlap);
                 g_pxa_xca_overlap = nullptr;
+                // node order supplied by the PXQN library (ggml-pxqn-tune.h; off without it)
+                static const bool pxa_xca_order = (ggml_pxqn_tune_flags() & GGML_PXQN_TUNE_ORDER) != 0;
+                if (pxa_xca_order && graph) ggml_build_forward_expand(graph, exp_hot);
                 overlap();                       // queued after the hot experts, before the wait
             }
             exp_cold = ggml_moe_cold_wait(ctx, ticket, ids_cold, n_embd, xc_async);
@@ -2372,7 +2391,7 @@ static bool pxa_fa_node_runs_on_gpu(
     return ok;
 }
 
-// PXA_TSPLIT_D512_MARK=1 (default off, 2026-10-03, grokbot/gemma-tsplit) -- the ONE door to the fused
+// PXA_TSPLIT_D512_MARK=1 (default off, 2026-10-03, gemma-tsplit) -- the ONE door to the fused
 // 512/512 route, opened for the split-attention builder (src/graphs/build_gemma4.cpp, '-sm tensor' /
 // '-sm attn'). Same fences as llm_build_kqv above, in the same order: the GPU fallback is armed, the
 // query batch is no wider than PXA_FA_D512_FUSED_MAXCOLS, the context is at least
@@ -3120,6 +3139,9 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
     return {Qcur, Kcur, Vcur};
 }
 
+static bool pxa_amax_q4_ok(const llama_context & lctx);
+static bool pxa_amax_head(const llama_context & lctx, const ggml_tensor * output);
+static void pxa_amax_attach(llama_context & lctx, ggml_context * ctx, const std::vector<ggml_tensor *> & parts, bool shortlist);
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
         ggml_tensor * output, const llm_build_cb & cb) {
     // lm_head
@@ -3150,6 +3172,12 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
         }
     } else {
         cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
+    }
+    // PXA_VERIFY_NO_LOGITS_COPY on qwen4exp (LEVERS-6 M2): qwen4exp's target head and its MTP tail head come through
+    // THIS overload (no output_norm), so the argmax node is attached here too. The builder expands pxa_head_extra.
+    // Not inside an MTP fold graph (two heads in one graph; the fold has its own argmax).
+    if (pxa_amax_q4_ok(lctx) && !lctx.pxa_fold_active && pxa_amax_head(lctx, output)) {
+        pxa_amax_attach(lctx, ctx, { cur }, output != lctx.model.output);
     }
     return cur;
 }
@@ -3205,9 +3233,30 @@ ggml_tensor * pxa_ggml_argmax_val(ggml_context * ctx, ggml_tensor * a) {
     r->op_params[0] = 1;
     return r;
 }
-static void pxa_amax_attach(llama_context & lctx, ggml_context * ctx, const std::vector<ggml_tensor *> & parts) {
-    if (!pxa_verify_argmax_on() || lctx.cparams.mtp_op_type != MTP_OP_NONE || lctx.cparams.embeddings) return;
-    if (!(lctx.model.arch == LLM_ARCH_QWEN35 || lctx.model.arch == LLM_ARCH_QWEN35MOE)) return;
+bool pxa_verify_no_logits_copy_on();
+// PXA_VERIFY_NO_LOGITS_COPY on qwen4exp (LEVERS-6 M2; default off with the env): the target head AND the MTP
+// companion's head (DRAFT_GEN / UPDATE_ACCEPTED, the PXA_MTP_SHORTLIST prefix head when there is one) carry the
+// same per-row argmax_val node the qwen35 verify uses, so the server's pure-greedy verify and the drafter's
+// argmax draw copy 3 floats per row instead of w x 248320 (verify) / 81920 (draft) logits. A shortlisted head
+// marks its node (op_params[2] = 1): the index is a shortlist position, mapped to a token id at read time.
+static bool pxa_amax_q4_ok(const llama_context & lctx) {
+    if (lctx.model.arch != LLM_ARCH_QWEN4EXP || !pxa_verify_no_logits_copy_on()) return false;
+    if (lctx.cparams.embeddings && lctx.cparams.pooling_type > LLAMA_POOLING_TYPE_NONE) return false;
+    const auto op = lctx.cparams.mtp_op_type;
+    return op == MTP_OP_NONE || op == MTP_OP_DRAFT_GEN || op == MTP_OP_UPDATE_ACCEPTED;
+}
+static bool pxa_amax_head(const llama_context & lctx, const ggml_tensor * output) {
+    if (output == lctx.model.output) return true;
+    return output != nullptr && output == lctx.model.output_mtp_shortlist && pxa_amax_q4_ok(lctx);
+}
+static void pxa_amax_attach(llama_context & lctx, ggml_context * ctx, const std::vector<ggml_tensor *> & parts,
+                            bool shortlist) {
+    if (!pxa_verify_argmax_on()) return;
+    const bool q4 = pxa_amax_q4_ok(lctx);
+    if (!q4) {
+        if (lctx.cparams.mtp_op_type != MTP_OP_NONE || lctx.cparams.embeddings) return;
+        if (!(lctx.model.arch == LLM_ARCH_QWEN35 || lctx.model.arch == LLM_ARCH_QWEN35MOE)) return;
+    }
     int64_t off = 0;
     for (auto * t : parts) {
         if (t == nullptr || t->type != GGML_TYPE_F32 || t->ne[2] != 1 || t->ne[3] != 1 ||
@@ -3219,12 +3268,19 @@ static void pxa_amax_attach(llama_context & lctx, ggml_context * ctx, const std:
         ggml_tensor * a = pxa_ggml_argmax_val(ctx, t);
         ggml_set_name(a, "pxa_amax");
         a->op_params[1] = (int32_t) off;   // first vocab column of this slice (read by the decode)
+        a->op_params[2] = shortlist ? 1 : 0;   // qwen4exp MTP shortlist head: index = shortlist position
         ggml_set_output(a);
+        if (q4) ggml_set_output(t);          // the logit rows keep their own storage for the full-copy fallback
         lctx.pxa_head_extra.push_back(a);
         lctx.pxa_amax_parts.push_back(a);
         off += t->ne[0];
     }
     lctx.pxa_amax_built = true;
+    if (q4) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 2) LLAMA_LOG_INFO("%s: PXA_VERIFY_NO_LOGITS_COPY: qwen4exp argmax node on the %s head (mtp_op %d, %lld columns)\n",
+                __func__, shortlist ? "MTP shortlist" : "output", (int) lctx.cparams.mtp_op_type, (long long) off);
+    }
 }
 
 // PXA_VERIFY_NO_LOGITS_COPY (ticket gemma-mtp-verify-kernel, 2026-10-02; default OFF, =1 on). Extends
@@ -3306,7 +3362,7 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
         GGML_ASSERT(!o.empty());
         if (o.size() == 1) {
             cur = o.front();
-            if (output == lctx.model.output) pxa_amax_attach(lctx, ctx, { cur });   // PXA_VERIFY_ARGMAX
+            if (pxa_amax_head(lctx, output)) pxa_amax_attach(lctx, ctx, { cur }, output != lctx.model.output);   // PXA_VERIFY_ARGMAX
         }
         else if (pxa_head_direct_ok(lctx)) {
             // PXA_TSPLIT_LMHEAD_DIRECT: no gather. The leading slices go to the builder (expanded into
@@ -3320,14 +3376,14 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             }
             cur = o.back();
             ggml_set_output(cur);
-            if (output == lctx.model.output) pxa_amax_attach(lctx, ctx, o);   // PXA_VERIFY_ARGMAX: one argmax per slice, in column order
+            if (pxa_amax_head(lctx, output)) pxa_amax_attach(lctx, ctx, o, output != lctx.model.output);   // PXA_VERIFY_ARGMAX: one argmax per slice, in column order
         }
         else {
             cur = ggml_concat(ctx, o[0], o[1], 0);
             for (int id = 2; id < int(o.size()); ++id) {
                 cur = ggml_concat(ctx, cur, o[id], 0);
             }
-            if (output == lctx.model.output) pxa_amax_attach(lctx, ctx, { cur });   // PXA_VERIFY_ARGMAX
+            if (pxa_amax_head(lctx, output)) pxa_amax_attach(lctx, ctx, { cur }, output != lctx.model.output);   // PXA_VERIFY_ARGMAX
         }
     } else {
         int idx = lctx.model.default_layer_device[lctx.model.hparams.n_layer];
@@ -3348,8 +3404,8 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             }
         }
         cur = build_output_head_mm(lctx, ctx, output, cur);
-        if (output == lctx.model.output) {
-            pxa_amax_attach(lctx, ctx, { cur });   // PXA_VERIFY_ARGMAX (single-device head)
+        if (pxa_amax_head(lctx, output)) {
+            pxa_amax_attach(lctx, ctx, { cur }, output != lctx.model.output);   // PXA_VERIFY_ARGMAX (single-device head)
         }
     }
     return cur;
@@ -3367,7 +3423,7 @@ static bool pxa_type_is_pxq_panel_head(ggml_type t) {
         case GGML_TYPE_PXQ1: case GGML_TYPE_PXQ2: case GGML_TYPE_PXQ3: case GGML_TYPE_PXQ4:
         case GGML_TYPE_PXQ4HQ: case GGML_TYPE_PXQ6:
         case GGML_TYPE_PXQN3: case GGML_TYPE_PXQN3S8: case GGML_TYPE_PXQN4:
-        case GGML_TYPE_PXQN2: case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXQN2: case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5: case GGML_TYPE_PXA4:
             return true;
         default:
             return false;
@@ -3393,7 +3449,7 @@ ggml_tensor * llm_build_context::build_output_head_mm(llama_context & lctx, ggml
     }();
     const bool is_pxqn_head = output->type == GGML_TYPE_PXQN3 || output->type == GGML_TYPE_PXQN3S8 ||
         output->type == GGML_TYPE_PXQN4 || output->type == GGML_TYPE_PXQN2 || output->type == GGML_TYPE_PXQN1 ||
-        output->type == GGML_TYPE_PXQN4S8 || output->type == GGML_TYPE_PXQN5;
+        output->type == GGML_TYPE_PXQN4S8 || output->type == GGML_TYPE_PXQN5 || output->type == GGML_TYPE_PXA4;
     const int64_t n_rows = output->ne[1];
     if (is_pxqn_head && chunk_pxqn == 0) {
         return llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);

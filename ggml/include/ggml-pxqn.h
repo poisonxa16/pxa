@@ -67,6 +67,16 @@ extern "C" {
 #define PXQN5_NIB_BYTES       64      // offset of the hi-bit plane inside a code row
 #define PXQN5_SLAB_BYTES      5376    // 256 + 64*80
 
+// PXA4 (subscriber tier): block of 128 elements, 81 B.
+// The slab layout lives in the closed library only (ggml-pxqn-codec.h).
+#define PXA4_QK               128
+#define PXA4_TYPE_SIZE        81
+//
+// (kept at this line count on purpose: the public headers' line layout
+//  matches the earlier revision, so ccache's preprocessed-mode hashes
+//  still hit for every file that includes this header)
+//
+
 #define PXQN_REV              1u      // the revision this build reads and writes
 
 // Rotation granularity along K: every rotated tensor (any type) cuts at multiples of this.

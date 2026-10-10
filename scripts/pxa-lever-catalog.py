@@ -19,6 +19,11 @@ Sources, in order of authority:
 
   scripts/pxa-lever-catalog.py           regenerate the .inc
   scripts/pxa-lever-catalog.py --check   exit 1 when a lever in the tree has no row (CI / ctest)
+  scripts/pxa-lever-catalog.py --public-filter   drop the CLOSED_LEVERS rows from the existing .inc (public-tree export)
+  scripts/pxa-lever-catalog.py --release-filter OUT [--closed-out INC]
+        write the PUBLIC table to OUT without touching the tree (what a release build embeds and ships, even when
+        it has the closed sources); INC = the dropped names, for the closed library (CMake runs this)
+  scripts/pxa-lever-catalog.py --assert-clean INC FILE...   release guard: exit 1 if a FILE holds a name from INC
 """
 import os, re, sys
 
@@ -110,7 +115,7 @@ CURATED = {
                             "virtual range reserved per card per class for split slices (address space only)"),
     "PXA_HOT_UNKNOWN": ("404", "--hot-model", "lever-off", "",
                         "=active: a request naming an unregistered model is served by the model on the cards instead of a 404"),
-    # ---- Gemma 4 MTP verify / prefill / tsplit levers (grokbot, 2026-10-03; docs/GEMMA-MTP-VERIFY-LEVERS.md); all default off --
+    # ---- Gemma 4 MTP verify / prefill / tsplit levers (2026-10-03; docs/GEMMA-MTP-VERIFY-LEVERS.md); all default off --
     "PXA_MOE_VERIFY2": ("off (=1 on)", "MoE id-GEMV, 2..4-token verify batches", "lever-off", "",
         "=1: one expert-grouped id-GEMV launch per MoE projection for a 2..4-token verify batch; bit-identical (tests/test-moe-verify2); stands aside under PXA_MMVQ_MOE_NWARPS=2/4 (docs/GEMMA-MTP-VERIFY-LEVERS.md)"),
     "PXA_MOE_VERIFY2_MAX_NY": ("4", "PXA_MOE_VERIFY2=1", "site", "",
@@ -191,6 +196,28 @@ CURATED = {
         "=1: pin every thread of the process to the CPUs of the NUMA node the cards hang off (within the affinity it already had) and prefer that node for memory, before the first weight is allocated; the expert cache's CPU cold path and the per-layer-embedding gather then read local pages"),
     "PXA_XCACHE_ASYNC": ("off (=1 on)", "PXA_XCACHE cache layers on the CPU cold path (pinned stacks the CPU reads); graphs of 1..PXA_XCACHE_ASYNC_MAXTOK tokens; CUDA", "lever-off", "xcache-async-cold-op",
         "=1: the cold experts of a split layer are computed by a host worker thread that the GPU stream hands work to through flags in pinned memory (no scheduler split, no cudaStreamSynchronize and no ids / activation / result copy call per cold layer); the CPU sub-graph is the one the split path runs, so the output is bit-identical; wider graphs keep the split path; CUDA-graph capture is off for graphs that carry the nodes"),
+    "PXA_XCACHE_CPUPOOL": ("off (=1 on)", "PXA_XCACHE_ASYNC on", "lever-off", "xcache-cpu-miss-compute",
+        "off; needs the PXQN library; bit-identical"),
+    "PXA_XCACHE_IDLE_BACKOFF_MS": ("0 (off)", "PXA_XCACHE_ASYNC on", "lever-off", "xcache-cpu-miss-compute",
+        "N>0: an idle cold-path thread waits longer between checks. The result is unchanged."),
+    "PXA_CUDA_GRAPH_REPLAN_KEEP": ("off (=1 on)", "CUDA graphs on (sm_60 needs PXA_CUDA_GRAPHS_PASCAL)", "lever-off", "xcache-next",
+        "=1 (default): a scheduler re-plan no longer bumps the global CUDA-graph allocation generation (every captured graph of every scheduler was recaptured, so verify-width / MTP graphs hit too-many-updates and ran eager); the per-node property compare still forces a recapture when an address moved; reserve and cudaFree sites still bump"),
+    "PXA_XCACHE_CPUPOOL_THREADS": ("the async worker's thread count", "PXA_XCACHE_CPUPOOL on", "site", "xcache-cpu-miss-compute",
+        "how many threads the library uses"),
+    "PXA_XCACHE_CPUPOOL_CPUS": ("unpinned", "PXA_XCACHE_CPUPOOL on", "site", "xcache-cpu-miss-compute",
+        "host CPUs the library may pin threads to"),
+    "PXA_XCACHE_CPUPOOL_ROWS_A": ("see the library", "PXA_XCACHE_CPUPOOL on", "site", "xcache-cpu-miss-compute",
+        "chosen by the library"),
+    "PXA_XCACHE_CPUPOOL_ROWS_C": ("see the library", "PXA_XCACHE_CPUPOOL on", "site", "xcache-cpu-miss-compute",
+        "chosen by the library"),
+    "PXA_XCACHE_ASYNC_GRAPH": ("off (=1 on)", "PXA_XCACHE_ASYNC on; CUDA graphs otherwise allowed (sm_60 needs PXA_CUDA_GRAPHS_PASCAL; MoE needs PXA_CUDA_GRAPH_MOE)", "lever-off", "xcache-next",
+        "=1 (default): a graph carrying the cold submit / wait nodes stays capturable (the kernels keep their request number in device memory, the host worker only watches pinned flags), so the decode step replays as one CUDA graph"),
+    "PXA_MTP_DRAFT_GUARD": ("off (=1 on)", "MTP drafting; temp-0 requests whose repetition guard / penalties / DRY are armed", "lever-off", "exact-mtp-default",
+        "=1 (default): the draft token is the argmax of the draft head's top-W window after the request's own repeat penalty (prev tail + chain) and DRY (cloned, fed the chain); only the proposal changes, verify stays the exact match, output byte-identical"),
+    "PXA_MTP_DRAFT_GUARD_W": ("16", "PXA_MTP_DRAFT_GUARD on", "site", "exact-mtp-default",
+        "candidate window (2..128) the penalties are applied over"),
+    "PXA_MTP_DRAFT_GUARD_STATS": ("off", "PXA_MTP_DRAFT_GUARD on", "diagnostic", "exact-mtp-default",
+        "print draws / moved-off-argmax every 512 draws"),
     "PXA_XCACHE_ASYNC_MAXTOK": ("8", "PXA_XCACHE_ASYNC on", "site", "xcache-async-cold-op",
         "widest graph (tokens) that takes the async cold path: a decode and an MTP / n-gram verify batch; a prefill ubatch keeps the scheduler split"),
     "PXA_XCACHE_ASYNC_THREADS": ("the context's -t (-tb above one token)", "PXA_XCACHE_ASYNC on", "site", "xcache-async-cold-op",
@@ -354,6 +381,7 @@ SITES = {}   # name -> (relpath, line no, the site's text and the two lines afte
 GATE_RE = re.compile(r'PXA_PXQ6_GATE\(\s*\w+\s*,\s*"(PX[AQ]_[A-Z0-9_]+)"\s*,\s*(true|false|[01])\s*,\s*"([^"]*)"')
 TABLE_RE = re.compile(r'\{\s*"(PX[AQ]_[A-Z0-9_]+)"\s*,\s*"[A-Z0-9_]+"\s*,\s*(-?\d+)\s*,\s*((?:"[^"]*"\s*)+)\}', re.S)
 FROM_CODE = {}   # name -> (default, status, rule) read off a lever table row or a gate macro
+EXCLUDE = None   # rel path -> True: not scanned (--release-filter: the closed files)
 
 
 def scan():
@@ -365,6 +393,8 @@ def scan():
         files = [p] if os.path.isfile(p) else sorted(os.path.join(r, f) for r, _, fs in os.walk(p) for f in fs)
         for f in files:
             if not f.endswith(SCAN_EXT) or f.endswith("pxa-lever-catalog.inc"):
+                continue
+            if EXCLUDE is not None and EXCLUDE(os.path.relpath(f, ROOT)):
                 continue
             try:
                 txt = open(f, encoding="utf-8", errors="replace").read()
@@ -483,7 +513,178 @@ def emit(rows):
     return "\n".join(lines) + "\n"
 
 
+# Levers read only inside the closed library: their names come from scripts/pxa-closed-levers.txt (one name or
+# NAME* prefix per line; the file ships with the closed sources, not in the public tree). --public-filter
+# drops those rows from the .inc for the public export.
+def closed_set():
+    f = os.path.join(ROOT, "scripts", "pxa-closed-levers.txt")
+    names, prefixes = set(), []
+    if os.path.exists(f):
+        for line in open(f, encoding="utf-8"):
+            line = line.split("#", 1)[0].strip()
+            if line.endswith("*"):
+                prefixes.append(line[:-1])
+            elif line:
+                names.add(line)
+    return names, tuple(prefixes)
+
+
+def public_filter():
+    names, prefixes = closed_set()
+    in_tree, _ = generate()          # the levers this (public) tree still reads, and where
+    have = open(OUT, encoding="utf-8").read().splitlines(True)
+    keep, dropped, moved = [], 0, 0
+    for l in have:
+        if not l.startswith('{ "'):
+            keep.append(l)
+            continue
+        name = l[3:].split('"', 1)[0]
+        if name in names or (prefixes and name.startswith(prefixes)):
+            dropped += 1
+            continue
+        m = re.search(r'"read at ([^":]+)(:\d+)?"', l)
+        if m and not os.path.exists(os.path.join(ROOT, m.group(1))):   # the read site is an omitted closed file
+            if name not in in_tree:
+                dropped += 1
+                continue
+            l = l[:m.start()] + '"read at %s"' % in_tree[name] + l[m.end():]   # still read in an open file: point there
+            moved += 1
+        keep.append(l)
+    with open(OUT, "w", encoding="utf-8") as f:
+        f.writelines(keep)
+    print("pxa-lever-catalog: public filter dropped %d closed row(s), re-pointed %d" % (dropped, moved))
+    return 0
+
+
+# Release builds (2026-10-08, owner: no closed rows in what ships): the engine's embedded table, Control's copy and
+# the image's copy are the PUBLIC catalog even when the build has the closed sources. The closed files are the public
+# tree's omit list (scripts/pxa-closed-files.txt, itself closed); a row is dropped when its lever is closed or is read
+# only inside a closed file, re-pointed when an open file reads it too, and any closed path left in its text is
+# replaced. The table ends with one "// built-in:" line of name hashes (no names) so PXA Control accepts the dropped
+# levers a preset sets; INC (--closed-out) lists the dropped names for the closed library, which declares them at run
+# time (ggml_pxqn_lever_known), so the engine does not call them typos.
+def closed_files():
+    f = os.path.join(ROOT, "scripts", "pxa-closed-files.txt")
+    out = []
+    if os.path.exists(f):
+        for line in open(f, encoding="utf-8"):
+            line = line.split("#", 1)[0].strip().rstrip("/")
+            if line:
+                out.append(line)
+    return out
+
+
+def lever_hash(name):
+    """FNV-1a 64 of the name, 16 hex digits (PXA Control computes the same in Python and in the page)."""
+    h = 0xcbf29ce484222325
+    for b in name.encode("utf-8"):
+        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return "%016x" % h
+
+
+def release_filter(out_path, closed_out=None):
+    global EXCLUDE
+    paths = closed_files()
+
+    def is_closed_path(rel):
+        rel = rel.replace(os.sep, "/")
+        return any(rel == p or rel.startswith(p + "/") for p in paths)
+
+    EXCLUDE = is_closed_path
+    in_tree = scan()                 # the levers the OPEN files read, and where
+    names, prefixes = closed_set()
+    path_res = [re.compile(r'(?<![\w./-])' + re.escape(p) + r'(/[^\s",;:)]*)?(:\d+)?(?![\w.-])') for p in paths]
+    have = open(OUT, encoding="utf-8").read().splitlines(True)
+    keep, dropped, moved, scrubbed = [], [], 0, 0
+    for l in have:
+        if not l.startswith('{ "'):
+            keep.append(l)
+            continue
+        name = l[3:].split('"', 1)[0]
+        if name in names or (prefixes and name.startswith(prefixes)):
+            dropped.append(name)
+            continue
+        m = re.search(r'"read at ([^":]+)(:\d+)?"', l)
+        if m and is_closed_path(m.group(1)):
+            if name not in in_tree:
+                dropped.append(name)
+                continue
+            l = l[:m.start()] + '"read at %s"' % in_tree[name] + l[m.end():]
+            moved += 1
+        for r in path_res:
+            l2 = r.sub("the PXQN library", l)
+            if l2 != l:
+                scrubbed += 1
+                l = l2
+        keep.append(l)
+    hashes = sorted({lever_hash(n) for n in dropped} | {lever_hash(p + "*") for p in prefixes})
+    keep.append("// built-in: " + " ".join(hashes) + "\n")
+    # the closed LEVERS (scripts/pxa-closed-levers.txt: the Overdrive set the Flash-Next preset turns on, PXA4, Tierpipe)
+    keep.append("// built-in-preset: " + " ".join(sorted({lever_hash(n) for n in names} |
+                                                          {lever_hash(p + "*") for p in prefixes})) + "\n")
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(keep)
+    os.replace(tmp, out_path)
+    if closed_out:
+        allc = sorted(set(dropped) | {p + "*" for p in prefixes})
+        tmp = closed_out + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("// GENERATED by scripts/pxa-lever-catalog.py --release-filter: the levers the closed library reads\n")
+            f.writelines('"%s",\n' % n for n in allc)
+        os.replace(tmp, closed_out)
+    print("pxa-lever-catalog: release filter kept %d rows, dropped %d closed, re-pointed %d, scrubbed %d"
+          % (sum(1 for l in keep if l.startswith('{ "')), len(dropped), moved, scrubbed))
+    return 0
+
+
+# --assert-clean INC FILE...: the release guard (make-release-tarball.sh, docker/Dockerfile). Exit 1 naming every FILE
+# that holds closed content: a catalog copy (.inc/.txt) any name from INC (the --closed-out list) or a closed path; a
+# binary any closed LEVER name (scripts/pxa-closed-levers.txt; the other dropped names belong to closed code that private
+# builds compile in, e.g. the lock in libggml-pxqn).
+def assert_clean(inc, files):
+    every = [l.strip().rstrip(",").strip('"') for l in open(inc, encoding="utf-8") if l.startswith('"')]
+    cn, cp = closed_set()
+    levers = sorted(cn) + [p + "*" for p in cp]
+
+    def pats(names):
+        return [(n, re.compile(re.escape(n[:-1]).encode() if n.endswith("*")
+                               else re.escape(n).encode() + rb"(?![A-Z0-9_])")) for n in names]
+    p_every, p_levers = pats(every), pats(levers)
+    paths = [p for p in closed_files() if "/" in p]
+    names = every
+    bad = 0
+    for f in files:
+        text = f.endswith(".inc") or f.endswith(".txt")
+        try:
+            data = open(f, "rb").read()
+        except OSError as e:
+            print("pxa-lever-catalog: cannot read %s: %s" % (f, e))
+            bad += 1
+            continue
+        hits = sorted({n for n, p in (p_every if text else p_levers) if p.search(data)})
+        if text:
+            t = data.decode("utf-8", "replace")
+            hits += sorted({p for p in paths if p in t})
+        if hits:
+            bad += 1
+            print("pxa-lever-catalog: CLOSED content in %s: %s" % (f, " ".join(hits[:12]) + (" ..." if len(hits) > 12 else "")))
+    if not bad:
+        print("pxa-lever-catalog: clean: %d file(s), no closed lever name (%d checked)" % (len(files), len(names)))
+    return 1 if bad else 0
+
+
 def main():
+    if "--public-filter" in sys.argv:
+        return public_filter()
+    if "--assert-clean" in sys.argv:
+        a = sys.argv[sys.argv.index("--assert-clean") + 1:]
+        return assert_clean(a[0], a[1:])
+    if "--release-filter" in sys.argv:
+        a = sys.argv[1:]
+        out = a[a.index("--release-filter") + 1]
+        co = a[a.index("--closed-out") + 1] if "--closed-out" in a else None
+        return release_filter(out, co)
     names, rows = generate()
     text = emit(rows)
     if "--check" in sys.argv:

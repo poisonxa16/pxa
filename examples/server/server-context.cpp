@@ -22,6 +22,7 @@
 #include "pxa-spec-load.h"
 #include "pxa-stats.h"         // PXA_SPEED_STATS_v1
 #include "pxa-spec-fixed-width.h"
+#include "pxa-shift-keep.h"
 
 #include <algorithm> // PXA_KV_UNIFIED_v1: std::sort over reclaim victims
 #include <cstring>
@@ -1204,8 +1205,9 @@ void server_slot::reset() {
     n_softfail_consecutive = 0; // PXA_SOFTFAIL_BREAKER_v1
     n_past = 0;
     n_past_prompt = 0;
-    n_discarded_prompt = 0;
-    n_kept_prompt = 0;
+    // n_discarded_prompt and n_kept_prompt describe cache_tokens, which reset()
+    // keeps. Zeroing them made the next over-long prompt discard that cache
+    // again, so a hot-swap resume re-prefilled a history that still fit.
     n_prompt_tokens_forked = 0; // PXA_SLOT_FORK_v1
     n_sent_text = 0;
     drafted.clear();
@@ -1252,6 +1254,10 @@ void server_slot::reset() {
     // Reset speculative decoding stats
     n_draft_total = 0;
     n_draft_accepted = 0;
+    for (int _ti = 0; _ti < COMMON_SPECULATIVE_TYPE_COUNT; ++_ti) {
+        n_draft_total_by_type[_ti] = 0;
+        n_draft_accepted_by_type[_ti] = 0;
+    }
 
     // PXA_MTP_ADAPTIVE: reset the adaptive draft-length controller (optimistic so cold-start drafts full)
     spec_accept_ema      = 0.70f;
@@ -4202,6 +4208,17 @@ void server_context::process_single_task(server_task&& task) {
             slot_data["n_draft_total"]    = slot.n_draft_total;
             slot_data["n_draft_accepted"] = slot.n_draft_accepted;
             slot_data["spec_accept_ema"]  = slot.spec_accept_ema;
+            {
+                json by_type = json::object();
+                for (int ti = 1; ti < COMMON_SPECULATIVE_TYPE_COUNT; ++ti) {
+                    if (!slot.n_draft_total_by_type[ti] && !slot.n_draft_accepted_by_type[ti]) continue;
+                    by_type[common_speculative_type_to_str(static_cast<common_speculative_type>(ti))] = {
+                        {"drafted",  slot.n_draft_total_by_type[ti]},
+                        {"accepted", slot.n_draft_accepted_by_type[ti]},
+                    };
+                }
+                if (!by_type.empty()) slot_data["draft_by_type"] = std::move(by_type);
+            }
 
             if (slot_data["state"] == SLOT_STATE_IDLE) {
                 n_idle_slots++;
@@ -4783,7 +4800,11 @@ void server_context::print_tokens(const server_tokens& prompt, const server_toke
 void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_slot& slot, int32_t n_keep, int32_t n_discard) {
     auto kv_keep = slot.cache_tokens.pos_next(n_keep);
     auto kv_discard = slot.cache_tokens.pos_next(n_keep + n_discard) - kv_keep;
-    auto kv_past = slot.cache_tokens.pos_next(slot.n_past);
+    // Prompt shift runs after n_past was set to 0. pos_next(0) makes seq_add's
+    // range empty, so the kept tail is removed and never moved down. Generation
+    // shifts pass n_past > 0 and keep that index.
+    const int32_t past_idx = slot.n_past > 0 ? slot.n_past : (int32_t) slot.cache_tokens.size();
+    auto kv_past = slot.cache_tokens.pos_next(past_idx);
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
     llama_synchronize(ctx); // PXA_WAVE4_FIX_v1: context-shift trim is the same teardown class
@@ -4873,7 +4894,23 @@ void server_context::context_shift_find_n_tokens(llama_context* ctx, const serve
 }
 
 void server_context::context_shift_prompt(llama_context* ctx, server_slot& slot, bool exact) {
+    // An inherited discard is the kept view of THIS conversation. Trust it only
+    // when the new prompt still matches what the cache kept: the n_keep prefix
+    // (the BOS token, on a model that adds one) and the suffix after the hole.
+    // Otherwise the while loop below starts from zero, same as a fresh prompt.
     int n_keep = std::max(0, slot.params.n_keep + add_bos_token);
+    if (slot.n_discarded_prompt > 0) {
+        const int32_t off = slot.n_discarded_prompt;
+        const bool match = pxa_shift_keep_matches(
+            slot.prompt_tokens, (int32_t) slot.prompt_tokens.size(),
+            slot.cache_tokens, (int32_t) slot.cache_tokens.size(),
+            off, (int32_t) n_keep);
+        if (!match) {
+            LLAMA_LOG_INFO("PXA shift keep: discarded prefix %d does not match the cache, shifting from scratch\n", off);
+            slot.n_discarded_prompt = 0;
+            slot.n_kept_prompt = 0;
+        }
+    }
     const int n_left = slot.n_ctx - n_keep;
     int n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 2);
     adjust_n_to_support_context_shift(slot.prompt_tokens, n_keep, n_discard);
@@ -4917,6 +4954,11 @@ void server_context::release_slots()
             slot.command = SLOT_COMMAND_NONE;
             slot.t_last_used = ggml_time_us();
 
+            llama_pos pos_lo = -1;
+            llama_pos pos_hi = -1;
+            const int32_t n_cells = llama_kv_cache_seq_span(slot.ctx, slot.id, &pos_lo, &pos_hi);
+            LLAMA_LOG_INFO("PXA kv span: seq=%d n_cache=%zu n_cells=%d pos_lo=%d pos_hi=%d\n",
+                slot.id, slot.cache_tokens.size(), n_cells, (int) pos_lo, (int) pos_hi);
             LOG_INFO("slot released", {
                 {"id_slot",         slot.id},
                 {"id_task",         slot.id_task},
@@ -5888,6 +5930,10 @@ void server_context::add_sampled_tokens() {
 
             // keep track of total number of drafted tokens tested
             slot.n_draft_total += draft.size();
+            if (slot.drafted_spec_type > COMMON_SPECULATIVE_TYPE_NONE &&
+                slot.drafted_spec_type < COMMON_SPECULATIVE_TYPE_COUNT) {
+                slot.n_draft_total_by_type[slot.drafted_spec_type] += (int32_t) draft.size();
+            }
 
             // PXA_SPEC_FIXED_WIDTH (pxa-spec-fixed-width.h): filler rows after the real draft so
             // the verify width is the slot's ceiling, not this step's draft length.
@@ -7136,6 +7182,10 @@ void server_context::speculative_decoding_accept() {
 
         // update how many tokens out of those tested were accepted
         slot.n_draft_accepted += ids.size() - 1;
+        if (!ids.empty() && spec_type_used > COMMON_SPECULATIVE_TYPE_NONE &&
+            spec_type_used < COMMON_SPECULATIVE_TYPE_COUNT) {
+            slot.n_draft_accepted_by_type[spec_type_used] += (int32_t) (ids.size() - 1);
+        }
 
         // PXA_MTP_ADAPTIVE: feed the per-slot acceptance EMA. Only steps that actually drafted reach
         // this function (i_batch_dft non-empty), so skip-tier steps never decay the EMA - the

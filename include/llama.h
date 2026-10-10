@@ -216,6 +216,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_PXQN1         = 263, // PXQN, 1.25 + 16/K bpw
         LLAMA_FTYPE_MOSTLY_PXQN4S8       = 264, // PXQN, 4.50 + 16/K bpw
         LLAMA_FTYPE_MOSTLY_PXQN5         = 265, // PXQN, 5.25 + 16/K bpw
+        LLAMA_FTYPE_MOSTLY_PXA4          = 266, // PXA4 subscriber flagship tier, ~5.06 bpw (gguf type 264)
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_KV         = 149, // except 1d tensors
@@ -1148,10 +1149,21 @@ extern "C" {
             struct llama_context * ctx,
                     llama_seq_id   seq_id);
 
-    // Returns the smallest position present in the KV cache for the specified sequence
+    // Returns the smallest position present in the KV cache for the specified sequence.
+    // This is the position of the first occupied cell, not a true minimum once
+    // cells are no longer packed in position order.
     LLAMA_API llama_pos llama_kv_cache_seq_pos_min(
         struct llama_context * ctx,
         llama_seq_id   seq_id);
+
+    // Occupied cell count for one sequence, plus the true minimum and maximum
+    // position. n_cells is 0 when the sequence is empty; *pos_lo and *pos_hi
+    // are then -1. Either pointer may be NULL.
+    LLAMA_API int32_t llama_kv_cache_seq_span(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos * pos_lo,
+                       llama_pos * pos_hi);
 
     // PXA_SOFTFAIL_BREAKER_v1: true if the most recent rng token-sample degraded to the
     // unsampleable-distribution fallback (all-non-finite logits).
@@ -1793,6 +1805,9 @@ extern "C" {
 
 
 LLAMA_API void                   llama_sampler_reset(struct llama_sampler* smpl);
+LLAMA_API void                   llama_sampler_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p);
+LLAMA_API void                   llama_sampler_accept(struct llama_sampler * smpl, llama_token token);
+LLAMA_API void                   llama_sampler_free(struct llama_sampler * smpl);
 
 /// @details Intializes a GBNF grammar, see grammars/README.md for details.
 /// @param vocab The vocabulary that this grammar will be used with.
@@ -1985,3 +2000,10 @@ llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_
 size_t llama_fill_from_utf8(void* utf8, void* cpts, void* scripts);
 
 #endif // LLAMA_H
+
+// PXA_XCACHE_MTP_RESIDENT: estimated extra microseconds a draft verify would spend on experts not in the GPU cache. 0 until the cache query is wired.
+LLAMA_API int llama_xcache_draft_miss_us(const llama_token * tokens, int n);
+// PXA_XCACHE_MISS_TOKEN: the longest draft prefix (>= 1) whose measured per-token cold-expert bill stays within budget_us (n when off)
+LLAMA_API int llama_xcache_draft_keep(const llama_token * tokens, int n, int budget_us);
+// PXA_XCACHE_MISS_TOKEN: measured cold-expert slots a token pays as an input row (EMA); -1 when the lever is off
+LLAMA_API float llama_xcache_token_slots(llama_token tok);

@@ -1434,6 +1434,22 @@ void llama_sampler_reset(struct llama_sampler* smpl) {
     }
 }
 
+void llama_sampler_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    smpl->iface->apply(smpl, cur_p);
+}
+
+void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) {
+    if (smpl->iface->accept) {
+        smpl->iface->accept(smpl, token);
+    }
+}
+
+void llama_sampler_free(struct llama_sampler * smpl) {
+    if (!smpl) return;
+    if (smpl->iface->free) smpl->iface->free(smpl);
+    delete smpl;
+}
+
 // Fwd declare to break reset --> init_impl --> llama_sampler_grammar_i --> reset cycle.
 static struct llama_grammar* llama_sampler_init_grammar_impl(
     const struct llama_vocab* vocab,

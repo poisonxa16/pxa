@@ -1,6 +1,6 @@
 # Gemma-4 26B-A4B MTP verify levers: summary (ticket gemma-mtp-verify-kernel)
 
-Grok Bot, 2026-10-03. Branches grokbot/gemma-verify-2row -> -logits -> -moe -> -dense (this one); see also
+2026-10-03. Branches gemma-verify-2row -> -logits -> -moe -> -dense (this one); see also
 docs/GEMMA-MTP-VERIFY-GRAPH.md (graphs: measured GPU-bound, no lever). Every lever is default OFF.
 
 Setup for all numbers: one V100 (GPU 4), gemma-4-26B-A4B-it QAT Q4_0 + its MTP assistant drafter, c16384, ub256,

@@ -18,6 +18,7 @@
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "ggml.h"
+#include "ggml-pxa-lean.h"
 // ggml_backend_buffer_is_host(): the fusion guards below need to know whether a weight lives
 // on a device or on the host, because that is what decides which backend runs its node.
 #include "ggml-backend.h"
@@ -1346,6 +1347,16 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .type_name                = "pxqn5",
         .blck_size                = 128,
         .type_size                = 84,
+        .is_quantized             = true,
+        .vec_dot                  = pxa_vec_dot_pxqn_no_cpu,
+        .nrows                    = 1,
+        .row_meta_size            = 2,
+    },
+    // PXA4: subscriber flagship tier; decoded by the closed libggml-pxqn only
+    [GGML_TYPE_PXA4] = {
+        .type_name                = "pxa4",
+        .blck_size                = 128,
+        .type_size                = 81,
         .is_quantized             = true,
         .vec_dot                  = pxa_vec_dot_pxqn_no_cpu,
         .nrows                    = 1,
@@ -10144,6 +10155,24 @@ struct ggml_tensor * ggml_moe_split_ids(
     return result;
 }
 
+// PXA_XCACHE_SPLIT_ONE: the hot (side 0) and cold (side 1) splits of the same ids in ONE node, [n_used, n_tok, 2] I32:
+// plane 0 = the hot ids, plane 1 = the cold ids (the caller takes two views). Same values as the two separate nodes.
+struct ggml_tensor * ggml_moe_split_ids_both(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * map) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(map));
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1], 2);
+    result->op     = GGML_OP_MOE_SPLIT_IDS;
+    result->src[0] = ids;
+    result->src[1] = map;
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_i32(result, 2, 1);
+    return result;
+}
+
 // PXA_XCACHE_ASYNC (see ggml.h): sides 2 and 3 of GGML_OP_MOE_SPLIT_IDS. op_params: [0] side, [2..3] the slot pointer.
 struct ggml_tensor * ggml_moe_cold_submit(
         struct ggml_context * ctx,
@@ -12603,13 +12632,15 @@ static void ggml_compute_forward_dup_q(
         return;
     }
 
-    if (dst->type != GGML_TYPE_F32) {
+    // PXA (2026-10-06): F16 destination (quantized V -> f16 before the transposed copy, PXA_FA_CHAIN_QV):
+    // dequantize each row into a per-thread f32 scratch row, then convert with the fp32->fp16 row helper.
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) {
         printf("%s: %s -> %s is of type %s\n", __func__, dst->src[0]->name, dst->name, ggml_type_name(dst->type));
         GGML_ABORT("fatal error");
     }
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
     struct ggml_tensor * src0 = dst->src[0];
     GGML_ASSERT(src0->ne[0] == dst->ne[0] && src0->nb[0] == ggml_type_size(src0->type));
+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
 
     ggml_to_float_t to_float = type_traits[src0->type].to_float;
     GGML_ASSERT(to_float != NULL);
@@ -12620,6 +12651,10 @@ static void ggml_compute_forward_dup_q(
     int64_t first_row = ith*n_per_thread;
     if (first_row >= nrows) return;
     int64_t last_row = MIN(first_row + n_per_thread, nrows);
+
+    const int64_t ne0 = src0->ne[0];
+    float * scratch = dst->type == GGML_TYPE_F16 ? (float *) malloc(ne0*sizeof(float)) : NULL;
+    GGML_ASSERT(dst->type != GGML_TYPE_F16 || scratch != NULL);
 
     for (int64_t ir = first_row; ir < last_row; ++ir) {
         int64_t i03 = ir/(src0->ne[1]*src0->ne[2]);
@@ -12632,9 +12667,15 @@ static void ggml_compute_forward_dup_q(
         const char * q = (const char *)src0->data + i03*src0->nb[3] + i02*src0->nb[2] + i01*src0->nb[1];
               char * f = (      char *)dst->data  +  i3* dst->nb[3] +  i2* dst->nb[2] +  i1* dst->nb[1];
 
-        to_float((const void *)q, (float *)f, src0->ne[0]);
+        if (scratch) {
+            to_float((const void *)q, scratch, ne0);
+            ggml_fp32_to_fp16_row(scratch, (ggml_fp16_t *)f, ne0);
+        } else {
+            to_float((const void *)q, (float *)f, ne0);
+        }
     }
 
+    free(scratch);
 }
 
 static void ggml_compute_forward_dup(
@@ -17628,6 +17669,37 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
 #undef MMID_MATRIX_ROW
+}
+
+// PXA_XCACHE_LEAN (2026-10-06): the exact per-expert / per-row pieces of the CPU MUL_MAT_ID and FUSED_MUL_UNARY kernels
+// above, exported so the PXA_XCACHE_ASYNC cold executor (src/llama-pxa-xcache-async-core.cpp) can run a cold layer's sub-graph on
+// its own persistent thread team (task-split across experts, two barriers) instead of ggml_graph_compute (four nodes, an OMP team
+// per call, a barrier per node). Same functions, same operands, same per-row arithmetic: the rows are bit-identical to the graph's
+// (tests/test-pxa-xcache-async.cpp --lean compares them byte for byte). Nothing here runs unless the lever is on.
+bool ggml_pxa_lean_mmid_ok(const struct ggml_tensor * node) {
+    if (!node || node->op != GGML_OP_MUL_MAT_ID) return false;
+    const struct ggml_tensor * src0 = node->src[0], * src1 = node->src[1], * ids = node->src[2];
+    if (!src0 || !src1 || !ids || ids->type != GGML_TYPE_I32) return false;
+    if (!pxa_pxq_is_cpu_supported(src0->type)) return false;
+    if (src1->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 || src1->ne[3] != 1) return false;
+    if (src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != sizeof(float) || node->nb[0] != sizeof(float)) return false;
+    if (ids->ne[1] != node->ne[2] || src0->ne[3] != 1) return false;
+    return true;
+}
+
+void ggml_pxa_lean_mmid_expert(const struct ggml_tensor * node, int expert, const int32_t * rows, int64_t ny, int ith, int nth) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+    const char * src0_cur = (const char *) src0->data + (size_t) expert*src0->nb[2];
+    pxa_pxq_mul_mat_cpu(src0->type, src0_cur, src0->ne[1], src0->ne[0],
+            (const char *) src1->data, src1->nb[1], src1->nb[2],
+            (char *) node->data, node->nb[1], node->nb[2],
+            (const struct pxa_pxq_rowmap *) rows, (int) src1->ne[1], ny, ith, nth);
+}
+
+void ggml_pxa_lean_fused_mul_unary(struct ggml_tensor * node, int ith, int nth) {
+    struct ggml_compute_params params = { /*.ith =*/ ith, /*.nth =*/ nth, /*.wsize =*/ 0, /*.wdata =*/ NULL, /*.shared =*/ NULL };
+    ggml_compute_forward_fused_mul_unary(&params, node);
 }
 
 
@@ -23143,6 +23215,7 @@ static void ggml_compute_forward_moe_split_ids(
     const int64_t n_map = ggml_get_op_params_i32(dst, 1) > 0 ? (int64_t) ggml_get_op_params_i32(dst, 1) : ggml_nelements(map);
     const int32_t * m = (const int32_t *) map->data;
     const int64_t nr = ids->ne[1];
+    const int both = ggml_get_op_params_i32(dst, 2);
     const int64_t r0 = (nr * params->ith) / params->nth;
     const int64_t r1 = (nr * (params->ith + 1)) / params->nth;
     for (int64_t i1 = r0; i1 < r1; ++i1) {
@@ -23156,6 +23229,11 @@ static void ggml_compute_forward_moe_split_ids(
                 else           r = v <= -2 ? -2 - v : -1;
             }
             y[i0] = r;
+            if (both) {   // PXA_XCACHE_SPLIT_ONE: the cold side in the second [n_used, n_tok] half
+                int32_t rc = -1;
+                if (e >= 0 && e < n_map && m[e] <= -2) rc = -2 - m[e];
+                ((int32_t *) ((char *) dst->data + nr*dst->nb[1] + i1*dst->nb[1]))[i0] = rc;
+            }
         }
     }
 }

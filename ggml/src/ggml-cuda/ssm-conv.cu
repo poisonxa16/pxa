@@ -591,6 +591,17 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         GGML_ASSERT(ggml_nelements(src4) >= (nc - 1)*nr*n_t);
     }
 
+    // PXA_SSMCONV_DBG=N (diagnostic, default off): print the shape / branch of the first N calls with n_t > 1
+    {
+        static const int dbg = [] { const char * e = getenv("PXA_SSMCONV_DBG"); return e ? atoi(e) : 0; }();
+        static int dbg_n = 0;
+        if (dbg > 0 && n_t > 1 && n_t <= 8 && dbg_n < dbg) {
+            ++dbg_n;
+            fprintf(stderr, "PXA_SSMCONV_DBG: %s nc=%d nr=%d n_t=%d n_kv=%d src3_ne0=%lld src4=%s sv_row=%d sv_step=%d src1_nb1=%zu src4_dev=%d\n",
+                    dst->name, nc, nr, n_t, n_kv, (long long) src3->ne[0], src4 ? "yes" : "no", dst->op_params[2], dst->op_params[3],
+                    src1->nb[1], src4 && src4->buffer ? (int) ggml_backend_buffer_is_host(src4->buffer) : -1);
+        }
+    }
     float * dst_data = (float *) dst->data;
     float * dst_x = dst_data;
     float * dst_state = dst_data + (size_t) nr * n_t;

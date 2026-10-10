@@ -184,3 +184,10 @@ pxa-bench/pxq-universal/*.gguf
 
 # per-box path overrides for the pxq4 harnesses (never committed)
 pxa/pxq4/box.env
+
+# prebuilt closed PXQN library dropped in for a public-source image build (never committed)
+/docker/prebuilt/
+
+# pxa-update binary (built into the tarball; never commit it)
+/tools/pxa-update
+/bin/pxa-update

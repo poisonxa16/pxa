@@ -6,6 +6,7 @@
 
 #include "ggml.h"
 #include "ggml-cuda-xcache.h"
+#include "ggml-pxa-lean.h"
 
 #include <atomic>
 #include <cstdint>
@@ -30,6 +31,7 @@ struct pxa_xca_totals {
     uint64_t compute_us = 0;     // wall time of the CPU sub-graphs
     uint64_t max_us = 0;         // the longest one
     uint64_t errors = 0;         // sub-graph missing / failed: those layers' rows are zero (must stay 0)
+    uint64_t lean = 0;           // PXA_XCACHE_LEAN: requests served by the lean executor (the rest ran the ggml sub-graph)
     // GPU side, summed over the slots (needs the stats callback)
     uint64_t gpu_waits = 0, gpu_skipped = 0, gpu_timeouts = 0;
     double   gpu_wait_us = 0, gpu_wait_max_us = 0;
@@ -75,6 +77,17 @@ private:
     std::atomic<bool>     stop_{false};
     std::thread           th_;
     bool                  started_ = false;
+    // PXA_XCACHE_HANGDUMP_S (diagnostic, default off): the layer the worker is serving (-1 idle) and when it started (us)
+    std::atomic<int>      cur_il_{-1};
+    std::atomic<int64_t>  cur_t0_{0};
+    std::thread           dump_th_;
     int                   spin_us_ = 3000;
     int                   cpu_ = -1;
+    // PXA_XCACHE_CPUPOOL=1 (default off). Absent library: off.
+    void *                lean_ = nullptr;
+    uint64_t              n_lean_ = 0;       // worker only
+    bool lean_run(pxa_xca_sub * sb, struct ggml_cuda_cold_slot * slot, int ntok);
 };
+
+// PXA_XCACHE_CPUPOOL=1
+bool pxa_xca_lean_wanted(void);

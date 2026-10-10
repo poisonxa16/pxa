@@ -154,5 +154,6 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_include_directories(${TARGET} PRIVATE ${PXA_CATALOG_DIR})   # pxa-lever-catalog-build.inc (top-level CMakeLists.txt)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)

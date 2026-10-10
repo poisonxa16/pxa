@@ -232,6 +232,11 @@ public:
             }
             if (!swapping_ && !queue_.empty() && queue_.front() == &t) {
                 if (active_ < 0) {
+                    // asleep: the next request, named or not, loads the parked model back
+                    if (slept_ >= 0 && inflight_ == 0) {
+                        swap_locked(lk, slept_);
+                        continue;
+                    }
                     drop_locked(&t);
                     cv_.notify_all();
                     err = "no model is on the cards (the last swap failed); name a model to load one";
@@ -274,6 +279,44 @@ public:
         if (inflight_ == 0) {
             cv_.notify_all();
         }
+    }
+
+    // True when nothing is in flight, nothing is waiting, and a model is on the cards.
+    // The idle watcher uses this; try_sleep is the only thing that parks that model.
+    bool idle_for_sleep() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return !swapping_ && inflight_ == 0 && queue_.empty() && active_ >= 0;
+    }
+
+    // Park the model on the cards and leave none there. Returns false when a request holds
+    // a lease, a swap is running, or someone is waiting. The next acquire loads a model back.
+    bool try_sleep(std::string & err) {
+        std::unique_lock<std::mutex> lk(mu_);
+        if (swapping_ || inflight_ != 0 || !queue_.empty() || active_ < 0) {
+            err = "not idle";
+            return false;
+        }
+        swapping_ = true;
+        const int from = active_;
+        if (log_) log_("sleep: parking '" + stats_[from].name + "'");
+        lk.unlock();
+
+        const auto tp = std::chrono::steady_clock::now();
+        const bool parked = ops_->park(from, -1, err);
+        const double ms = ms_since(tp);
+
+        lk.lock();
+        swapping_ = false;
+        if (parked) {
+            active_ = -1;
+            slept_  = from;
+            stats_[from].ms_last_park = ms;
+            if (log_) log_("asleep: '" + stats_[from].name + "' is in host RAM, the cards are free");
+        } else if (log_) {
+            log_("sleep of '" + stats_[from].name + "' FAILED: " + err);
+        }
+        cv_.notify_all();
+        return parked;
     }
 
     int active() const {
@@ -406,6 +449,7 @@ private:
         last_ = rec;
         if (in) {
             active_ = to;
+            slept_  = -1;
             stats_[to].n_swaps_in++;
             stats_[to].ms_last_unpark = rec.ms_unpark;
             if (from >= 0) stats_[from].ms_last_park = rec.ms_park;
@@ -434,6 +478,7 @@ private:
     mutable std::mutex          mu_;
     std::condition_variable     cv_;
     int                         active_   = -1;
+    int                         slept_    = -1;   // parked by try_sleep; the next request loads it back
     int                         inflight_ = 0;
     bool                        swapping_ = false;
     int                         swap_to_  = -1;

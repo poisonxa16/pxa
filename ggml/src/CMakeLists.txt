@@ -352,6 +352,7 @@ if (GGML_CUDA)
             ggml-cuda/pxa/pxqn-epi.cu
             ggml-cuda/pxa/pxqn-api-impl.cu
             ggml-cuda/pxa/pxq4-rb.cu
+            ggml-cuda/pxa/pxqn-tune.cu
             ggml-cuda/pxa/template-instances/mmvq-instance-pxqn4.cu
             ggml-cuda/pxa/template-instances/mmvq-instance-pxqn4s8.cu)
         foreach(_pxqn_src ${GGML_SOURCES_PXQN_CUDA})
@@ -1615,7 +1616,7 @@ if (PXA_PXQN_CLOSED_SRC)
         message(WARNING "PXA_PXQN_CLOSED_SRC=ON needs BUILD_SHARED_LIBS=ON (libggml-pxqn is loaded next to libggml.so); "
                         "this static build has no PXQN support")
     else()
-        set(_pxqn_srcs pxqn-cpu.c pxqn-cpu-mmv.c pxqn-lib.cpp pxqn-lock.cpp pxqn-spec-select.cpp pxqn-spec-defaults.cpp pxqn-xcache-policy.cpp)
+        set(_pxqn_srcs pxqn-cpu.c pxqn-cpu-mmv.c pxqn-lib.cpp pxqn-lock.cpp pxqn-spec-select.cpp pxqn-spec-defaults.cpp pxqn-xcache-policy.cpp pxqn-tune.cpp pxqn-xcache-learn.cpp pxqn-xcache-cpupool.cpp)
         # the CPU matmul (pxqn-cpu-mmv.c): its AVX2 and baseline copies must produce the same bits (no FMA contraction, ever),
         # and the file is baseline x86-64 whatever the directory-scope ARCH flags say: the AVX2 clone sits behind
         # target("avx2") and a run-time cpuid choice, everything else must run on the oldest x86-64 CPU
@@ -1637,6 +1638,10 @@ if (PXA_PXQN_CLOSED_SRC)
         target_compile_definitions(ggml-pxqn PRIVATE ${GGML_CDEF_PUBLIC} GGML_SHARED GGML_BUILD
                                    $<$<CONFIG:Release>:NDEBUG> PXA_PXQN_BUILD_ID="${_pxqn_rev}")
         target_include_directories(ggml-pxqn PRIVATE . ../include ${GGML_EXTRA_INCLUDES})
+        # pxqn-closed-levers.inc: the lever names the library reads (generated with the public catalog, top-level CMakeLists.txt)
+        if (PXA_CATALOG_DIR)
+            target_include_directories(ggml-pxqn PRIVATE ${PXA_CATALOG_DIR})
+        endif()
         # locked models (pxqn-lock.cpp): the licence server's lock-signing public key(s) the library trusts, "kid:hex64[;kid:hex64]" (-DPXA_LOCK_PUBKEYS=...)
         string(REPLACE ";" "," _pxqn_lock_pubkeys "${PXA_LOCK_PUBKEYS}")
         target_compile_definitions(ggml-pxqn PRIVATE PXA_LOCK_PUBKEYS="${_pxqn_lock_pubkeys}")

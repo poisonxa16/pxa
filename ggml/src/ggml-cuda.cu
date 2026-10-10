@@ -246,7 +246,7 @@ static void pxa_sub_dump() {
     int n = 0;
     fprintf(stderr, "---- S top name buckets (us/count(avg) per width) ----\n");
     for (auto & e : v) {
-        if (++n > 40) break;
+        if (++n > 80) break;
         auto & pr = g_pxa_sub_name_us[*e.second];
         fprintf(stderr, "  S %-40s", e.second->c_str());
         for (int wi=0; wi<PXA_SUB_W; ++wi) {
@@ -1965,6 +1965,7 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_set_tensor([[maybe_unused]]
         { GGML_TYPE_PXQN1,   64 },
         { GGML_TYPE_PXQN4S8, 64 },
         { GGML_TYPE_PXQN5,   64 },
+        { GGML_TYPE_PXA4,    64 },   // PXA4: blck 128, same panel + header
     };
 
     // split tensors must always be set in their entirety at once
@@ -4668,6 +4669,91 @@ static inline void pxa_glue_topk_miss(const ggml_cgraph * g, int i) {
 }
 // =================== end PXA_SHEXP_GATE_FUSE + PXA_GLUE_DBG =====================
 
+// PXA_SMALLN_FLOAT (2026-10-07, default OFF): float-weight (F32/F16/BF16) GEMV at speculative-verify
+// widths (ne11 2..8). Every small float GEMV fast path in this file (mul_mat_1row, the router GEMV, the f16
+// small-R GEMV) gates on ne11 == 1, so at an MTP verify width the hyper-connection projections (hc_inject /
+// hc_down / hc_up), router logits and gates fall through to a bare cuBLAS GEMM. Measured on Flash-Next
+// PXQN2 1x P100 (PXA_OP_SUBMIT+PXA_OP_DEVTIME census): hc_inject 18 us/call at width 1 -> 161 us at width 4,
+// MUL_MAT overall 40 -> 85 us/call. One block per output row, all columns at once (the weight row is read
+// once for every token of the verify batch). Summation order differs from cuBLAS: not bit-exact.
+static __device__ __forceinline__ float pxa_snf_load(const float * p, int64_t i) { return p[i]; }
+static __device__ __forceinline__ float pxa_snf_load(const half * p, int64_t i) { return __half2float(p[i]); }
+static __device__ __forceinline__ float pxa_snf_load(const nv_bfloat16 * p, int64_t i) { return __bfloat162float(p[i]); }
+
+template <typename T, int NC>
+static __global__ void k_pxa_smalln_float(const T * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int K, const int ncols, const int64_t w_row_stride, const int64_t x_col_stride, const int64_t y_col_stride) {
+    const int row = blockIdx.x;
+    const T * wr = w + (int64_t) row*w_row_stride;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        const float wv = pxa_snf_load(wr, k);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) if (c < ncols) acc[c] += wv*x[(int64_t) c*x_col_stride + k];
+    }
+    __shared__ float red[NC][32];
+    const int lane = threadIdx.x % WARP_SIZE, wid = threadIdx.x / WARP_SIZE, nw = blockDim.x / WARP_SIZE;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        float v = acc[c];
+#pragma unroll
+        for (int o = WARP_SIZE/2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o, WARP_SIZE);
+        if (lane == 0) red[c][wid] = v;
+    }
+    __syncthreads();
+    if (wid == 0) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            float v = lane < nw ? red[c][lane] : 0.0f;
+#pragma unroll
+            for (int o = WARP_SIZE/2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o, WARP_SIZE);
+            if (lane == 0 && c < ncols) y[(int64_t) c*y_col_stride + row] = v;
+        }
+    }
+}
+
+static bool pxa_smalln_float_on() {
+    static const bool on = [] { const char * e = getenv("PXA_SMALLN_FLOAT"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+// true when it handled the node
+static bool pxa_smalln_float_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!pxa_smalln_float_on()) return false;
+    const int64_t nc = src1->ne[1];
+    if (nc < 2 || nc > 8) return false;
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) return false;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    if (src0->buffer && ggml_backend_buffer_is_cuda_split(src0->buffer)) return false;
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1)) return false;
+    const size_t ts = ggml_type_size(src0->type);
+    if (src0->nb[0] != ts || src0->nb[1] % ts != 0) return false;
+    if (src1->nb[0] != sizeof(float) || src1->nb[1] % sizeof(float) != 0) return false;
+    if (dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0) return false;
+    if (src0->ne[1] > 65535 || src0->ne[1] > 4096) return false;     // small-R family only; never a vocab head or a dense FFN
+    const int K = (int) src0->ne[0];
+    const int64_t ws = src0->nb[1]/ts, xs = src1->nb[1]/sizeof(float), ys = dst->nb[1]/sizeof(float);
+    const dim3 grid((unsigned) src0->ne[1]);
+    const int bs = K >= 1024 ? 256 : 128;
+    const float * x = (const float *) src1->data; float * y = (float *) dst->data;
+    switch (src0->type) {
+        case GGML_TYPE_F32:  k_pxa_smalln_float<float, 8><<<grid, bs, 0, ctx.stream()>>>((const float *) src0->data, x, y, K, (int) nc, ws, xs, ys); break;
+        case GGML_TYPE_F16:  k_pxa_smalln_float<half, 8><<<grid, bs, 0, ctx.stream()>>>((const half *) src0->data, x, y, K, (int) nc, ws, xs, ys); break;
+        default:             k_pxa_smalln_float<nv_bfloat16, 8><<<grid, bs, 0, ctx.stream()>>>((const nv_bfloat16 *) src0->data, x, y, K, (int) nc, ws, xs, ys); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    static std::atomic<bool> banner{false};
+    bool exp = false;
+    if (banner.compare_exchange_strong(exp, true)) {
+        fprintf(stderr, "PXA_SMALLN_FLOAT: FIRING (first: %s %s [%lld x %lld] x ne11=%lld; =0 reverts)\n", dst->name,
+                ggml_type_name(src0->type), (long long) src0->ne[0], (long long) src0->ne[1], (long long) nc);
+    }
+    return true;
+}
+
 static void mul_mat_1row(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, ggml_backend_cuda_context & ctx) {
     constexpr int kBlockSize = 256;
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
@@ -5544,6 +5630,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // PXA 0a hygiene pattern already used in this TU at :2233 and :4002. Identical at
     // DEFAULT/ENHANCE (the resolver returns true when unset); REFERENCE now really does take the
     // ne11==1-only path its own comment documents.
+    if (pxa_smalln_float_try(ctx, src0, src1, dst)) return node_n;   // PXA_SMALLN_FLOAT (default off)
     static const bool pxa_spec_1row = pxa_spec_1row_resolve();
     if (ggml_nrows(src0) == 1 && (src1->ne[1] == 1 || (pxa_spec_1row && src1->ne[1] <= 8)) && src1->ne[2]*src1->ne[3] == 1
         && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
@@ -6648,7 +6735,7 @@ static int pxa_pxq_mmv_2d(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 // interleaved in 4 blocks with a fresh server per arm per block, `-c 8192 -b 2048 -ub 2048`:
 //   2xV100 -ts 1.05,0.95, mode 2 : prefill 1718.3 -> 1757.9 t/s = +2.30%, decode flat (+0.4%)
 //   4xP100 -ts 1,1,1,1,  mode 1 : prefill  799.6 ->  806.7 t/s = +0.89%, decode flat (-0.03%)
-// Complete rank separation within both the cold-rep and warm-rep strata on both arches, so the
+// Complete rank separation within both the cold-rep and warm-rep groups on both arches, so the
 // direction is not noise -- but both are BELOW the +3% pre-registered keep line, hence default 0.
 //
 // >>> SUPERSEDED ON sm_70 (2026-07-28). The +2.30% above was measured against the PRE-COALESCING
@@ -10614,6 +10701,22 @@ extern "C" void ggml_cuda_alloc_generation_bump(void) {
     pxa_cuda_alloc_gen.fetch_add(1, std::memory_order_release);
 }
 
+// LEVERS-8 F2 (PXA_CUDA_ARENA_GEN=1, default off): a scheduler reserve bumps a generation owned by
+// the CUDA backend contexts of THAT scheduler instead of the process-global one, so an MTP-context
+// re-reserve no longer invalidates the target context's captured execs (and vice versa). A graph's
+// effective generation is global + its own context's; the global bump sites (cudaFree, re-plan
+// without REPLAN_KEEP) still invalidate everything. Kept in a side table so common.cuh is untouched.
+static std::mutex pxa_arena_gen_mu;
+static std::unordered_map<const void *, uint64_t> pxa_arena_gen_tab;
+static uint64_t pxa_arena_gen_of(const void * ctx) {
+    std::lock_guard<std::mutex> lk(pxa_arena_gen_mu);
+    auto it = pxa_arena_gen_tab.find(ctx);
+    return it == pxa_arena_gen_tab.end() ? 0 : it->second;
+}
+static uint64_t pxa_alloc_gen_for(const void * ctx) {
+    return pxa_cuda_alloc_gen.load(std::memory_order_acquire) + pxa_arena_gen_of(ctx);
+}
+
 static int pxa_tsplit_replay_level(void) {
     static const int v = [] {
         const char * e = getenv("PXA_TSPLIT_REPLAY");
@@ -10852,6 +10955,11 @@ static void pxa_cgraph_stats_arm_atexit() {
     std::call_once(once, [] { atexit(pxa_cgraph_atexit_summary); });
 }
 
+static bool pxa_cuda_graph_kvkey_enabled() {
+    static const bool v = [] { const char * e = getenv("PXA_CUDA_GRAPH_KVKEY"); const bool on = e && atoi(e) != 0;
+        if (on) fprintf(stderr, "PXA_CUDA_GRAPH_KVKEY: 1 (graph key folds the FA KV length; LEVERS-9 N3)\n"); return on; }();
+    return v;
+}
 static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     if (!pxa_cuda_graph_batch_enabled() && !pxa_cuda_graph_v2_enabled() && !pxa_cuda_graph_mainline_policy()
             && !pxa_tsplit_replay_here()) {
@@ -10884,6 +10992,16 @@ static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     if (n > 0) {
         const ggml_tensor * t = cgraph->nodes[n-1];
         fold((uint64_t)t->op); fold((uint64_t)t->ne[0]); fold((uint64_t)t->ne[1]); fold((uint64_t)t->ne[2]);
+    }
+    // LEVERS-9 N3 (PXA_CUDA_GRAPH_KVKEY=1, default off): fold the KV length the first flash-attention
+    // node reads (the FA K view, padded to 256 cells) into the key, so each KV pad bucket keeps its own
+    // exec instead of recapturing every time the view crosses a 256-cell boundary. No eviction is added
+    // (the non-V2 map is unbounded). Correctness still rests on the per-node compare, as above.
+    if (pxa_cuda_graph_kvkey_enabled()) {
+        for (int i = 0; i < n; ++i) {
+            const ggml_tensor * t = cgraph->nodes[i];
+            if (t->op == GGML_OP_FLASH_ATTN_EXT && t->src[1]) { fold(0x4b56ULL); fold((uint64_t)t->src[1]->ne[1]); break; }
+        }
     }
     return (const void *)(uintptr_t)h;
 }
@@ -10969,7 +11087,12 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
         // PXA_XCACHE_ASYNC: the cold submit / wait pair rendezvous with a host thread through flags in pinned memory. The kernels
         // are stateless (the request number is in device memory), but a graph that waits on the host is not a graph to capture and
         // replay blindly: a graph carrying them runs eager.
-        if (node->op == GGML_OP_MOE_SPLIT_IDS && node->op_params[0] >= 2) {
+        // PXA_XCACHE_ASYNC_GRAPH (default off): the submit / wait kernels keep no per-token state on the host side (the
+        // request number lives in device memory and is bumped by the submit kernel itself, the host worker only watches the
+        // pinned flags), so a captured graph replays them exactly like an eager launch. With the lever on, a graph carrying
+        // them stays capturable and the ~2,900 eager launches of a decode step collapse into one replay.
+        static const bool pxa_async_graph = [] { const char * e = getenv("PXA_XCACHE_ASYNC_GRAPH"); return e && atoi(e) != 0; }();
+        if (node->op == GGML_OP_MOE_SPLIT_IDS && node->op_params[0] >= 2 && !pxa_async_graph) {
             use_cuda_graph = false;
             break;
         }
@@ -11365,6 +11488,11 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     if (g_pxa_sub_on > 0) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * nd = cgraph->nodes[i];
+            // qwen4exp (Flash-Next) has no rope in most splits: its hyper-connection norm is [hc*n_embd, n_tokens]
+            if (nd->name[0] == 'h' && strncmp(nd->name, "hc_norm", 7) == 0 && ggml_n_dims(nd) == 2) {
+                g_pxa_step_width = (int)nd->ne[1];
+                break;
+            }
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 const ggml_tensor * sr = nd->src[s];
                 // PREFIX match: the scheduler renames a split's input copies ("inp_pos#CUDA0#0"),
@@ -11410,7 +11538,7 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                     double _sus = (double)(ggml_time_us() - _pxs0);
                     const int _wi = pxa_sub_widx(g_pxa_step_width);
                     int _so = (int)node->op; if (_so >= 0 && _so < 128) { g_pxa_sub_us[_wi][_so] += _sus; g_pxa_sub_cnt[_wi][_so]++; }
-                    auto & _spr = g_pxa_sub_name_us[pxa_name_bucket(node->name)][_wi]; _spr.first += _sus; _spr.second++;
+                    auto & _spr = g_pxa_sub_name_us[node->op == GGML_OP_GET_ROWS && node->src[0] ? std::string("GET_ROWS<") + pxa_name_bucket(node->src[0]->name) + ">" : pxa_name_bucket(node->name)][_wi]; _spr.first += _sus; _spr.second++;
                     if ((++g_pxa_sub_total % g_pxa_sub_every) == 0) pxa_sub_dump();
                 }
                 if (!ok) {
@@ -12232,7 +12360,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
             }
             graph->pool_generation = pxa_pool_gen;
 
-            const uint64_t pxa_alloc_gen = pxa_cuda_alloc_gen.load(std::memory_order_acquire);
+            const uint64_t pxa_alloc_gen = pxa_alloc_gen_for(cuda_ctx);
             if (!cuda_graph_update_required && pxa_alloc_gen != graph->alloc_generation) {
                 cuda_graph_update_required = true;
                 if (pxa_glog) fprintf(stderr, "PXA_CGRAPH update-required key=%p reason=alloc-generation %llu->%llu\n",
@@ -12305,7 +12433,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
         // same allocator-generation guard as the branch above; a re-plan or re-reserve invalidates
         // every address a captured exec baked into the compute arena
         {
-            const uint64_t pxa_alloc_gen = pxa_cuda_alloc_gen.load(std::memory_order_acquire);
+            const uint64_t pxa_alloc_gen = pxa_alloc_gen_for(cuda_ctx);
             if (!cuda_graph_update_required && pxa_alloc_gen != graph->alloc_generation) {
                 cuda_graph_update_required = true;
             }
@@ -12505,6 +12633,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_PXQN1:
                     case GGML_TYPE_PXQN4S8:
                     case GGML_TYPE_PXQN5:
+                    case GGML_TYPE_PXA4:      // lane pxa4
                         return true;
                     default:
                         return false;
@@ -13135,6 +13264,14 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
 
 GGML_CALL bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+// LEVERS-8 F2: see pxa_arena_gen_tab. Returns false for a non-CUDA backend.
+extern "C" bool ggml_cuda_alloc_generation_bump_backend(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) return false;
+    std::lock_guard<std::mutex> lk(pxa_arena_gen_mu);
+    pxa_arena_gen_tab[backend->context]++;
+    return true;
 }
 
 // Bug #266 (pool headroom). The compute-buffer reservation (gallocr) never sees the temporaries

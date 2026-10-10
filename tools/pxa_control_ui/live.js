@@ -1,8 +1,9 @@
 "use strict";
 /* PXA Control: the Live tab. Rolling charts of what the servers and the cards are doing right now.
    Loaded by index.html after its own script, so it uses that script's helpers ($, $$, el, api, toast, store, segInit, fmtNum,
-   showTab, S). It reads one thing, GET /api/live, which PXA Control fills from nvidia-smi and from each server's own
-   /slots, /props and /pxa/stats. Plain SVG, no library. Everything that came from a server is put on the page as text.
+   showTab, S). It reads GET /api/live, which PXA Control fills from nvidia-smi and from each server's own
+   /slots, /props and /pxa/stats, and for the ranges past one hour (v3.1) GET /api/telemetry/history: the same numbers from
+   the on-disk history PXA Control records in the background (tools/pxa_telemetry.py), one point per bucket. Plain SVG, no library. Everything that came from a server is put on the page as text.
    Colour follows the entity: a server keeps its colour (the same one on the Servers tab), a card keeps the colour of its
    index. Axes always start where the quantity starts (0, or a fixed range for percent and temperature), so a wobble
    never looks like a spike. One y axis per chart. */
@@ -10,7 +11,9 @@
 const LV = {
   range: store.get("lv.range", 900), cards: new Map(), servers: new Map(), ghosts: [], seen: new Set(),
   ci: null, ts: 0, lastT: 0, histFrom: 0, timer: null, busy: false, built: false, err: "", fails: 0, open: false, host: null,
+  hist: null, histAt: 0, histRange: 0, tel: null, telAt: 0,
 };
+let R = LV;                                   // what the charts draw: LV (live, in memory) or LV.hist (the on-disk history)
 const LV_KEEP = 3700;                        // seconds of history held in the page
 let LV_CLIP = 0;                              // chart clip ids
 const LV_HOT_C = 80;                         // the card temperature the rig page also warns at
@@ -28,14 +31,23 @@ function lvClock(t, sec) {
   const d = new Date(t * 1000), p = n => String(n).padStart(2, "0");
   return p(d.getHours()) + ":" + p(d.getMinutes()) + (sec ? ":" + p(d.getSeconds()) : "");
 }
+const LV_MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function lvDay(t) { const d = new Date(t * 1000); return LV_MON[d.getMonth()] + " " + d.getDate(); }
+function lvWhen(t, sec) { return R.hist ? lvDay(t) + " " + lvClock(t, false) : lvClock(t, sec); }      // a tooltip's time
+function lvDur(s) { return s >= 172800 ? Math.round(s / 86400) + " days" : s >= 5400 ? Math.round(s / 3600) + " h" : fmtDur(s); }
 function lvShort(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 function lvTok(n) { return n == null ? "-" : n >= 10000 ? Math.round(n / 1000) + "k" : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(Math.round(n)); }
 function lvNice(max) { return 4 * niceMax(Math.max(1e-9, max) * 1.08 / 4); }          // four even, round steps
 function lvTimeTicks(t0, t1, maxN) {
-  const span = t1 - t0, steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
-  const step = steps.find(s => span / s <= maxN) || 3600, off = -new Date().getTimezoneOffset() * 60, out = [];
+  const span = t1 - t0, steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+  const step = steps.find(s => span / s <= maxN) || 604800, off = -new Date().getTimezoneOffset() * 60, out = [];
   for (let t = Math.ceil((t0 + off) / step) * step - off; t <= t1; t += step) out.push(t);
-  return {ticks: out, sec: step < 60};
+  return {ticks: out, sec: step < 60, day: step >= 86400, mixed: step < 86400 && span > 86400};
+}
+function lvTick(t, tk) {                      // an axis label: 14:05, or Oct 6, or Oct 6 18:00 on a multi-day range
+  if (tk.day) return lvDay(t);
+  if (tk.mixed) { const d = new Date(t * 1000); return d.getHours() === 0 && d.getMinutes() === 0 ? lvDay(t) : lvClock(t, false); }
+  return lvClock(t, tk.sec);
 }
 function lvSearch(pts, t) {                    // index of the point nearest to t (pts sorted by time)
   let lo = 0, hi = pts.length - 1;
@@ -74,7 +86,7 @@ function lvChart(host, spec) {
     tk.ticks.forEach((t, i) => {
       const xx = Math.round(X(t)) + .5;
       svg.append(lvSvg("line", {x1: xx, x2: xx, y1: T, y2: T + ph, class: "lv-grid"}));
-      svg.append(lvSvg("text", {x: xx, y: H - 7, class: "lv-tick", "text-anchor": i === 0 && X(t) - L < 20 ? "start" : "middle"}, lvClock(t, tk.sec)));
+      svg.append(lvSvg("text", {x: xx, y: H - 7, class: "lv-tick", "text-anchor": i === 0 && X(t) - L < 20 ? "start" : "middle"}, lvTick(t, tk)));
     });
   } else {
     svg.append(lvSvg("line", {x1: L, x2: W - R, y1: Math.round(Y(ymin)) + .5, y2: Math.round(Y(ymin)) + .5, class: "lv-axis"}));
@@ -140,7 +152,7 @@ function lvChart(host, spec) {
     const xx = Math.round(X(tt[0])) + .5;
     cross.setAttribute("x1", xx); cross.setAttribute("x2", xx); cross.setAttribute("visibility", "visible");
     hov.forEach((c, i) => { const q = near[i]; if (q) { c.setAttribute("cx", X(q[0])); c.setAttribute("cy", Y(q[1])); c.setAttribute("visibility", "visible"); } else c.setAttribute("visibility", "hidden"); });
-    tip.replaceChildren(el("div", {class: "tt-h", text: lvClock(tt[0], true) + (spec.tipNote ? " · " + spec.tipNote : "")}),
+    tip.replaceChildren(el("div", {class: "tt-h", text: lvWhen(tt[0], true) + (spec.tipNote ? " · " + spec.tipNote : "")}),
       ...series.map((s, i) => near[i] ? el("div", {class: "tt-r"}, el("i", {class: "tt-k", style: `background:${s.color}`}), el("b", {text: lvFmt(near[i][1], y.digits) + (y.unit ? " " + y.unit : "")}), el("span", {text: s.name})) : null).filter(Boolean));
     tip.hidden = false;
     const w = tip.offsetWidth, hh = tip.offsetHeight;
@@ -177,7 +189,7 @@ function lvTimeline(host, spec) {
   tk.ticks.forEach(t => {
     const xx = Math.round(X(t)) + .5;
     svg.append(lvSvg("line", {x1: xx, x2: xx, y1: T, y2: H - B, class: "lv-grid"}));
-    svg.append(lvSvg("text", {x: xx, y: H - 7, class: "lv-tick", "text-anchor": "middle"}, lvClock(t, tk.sec)));
+    svg.append(lvSvg("text", {x: xx, y: H - 7, class: "lv-tick", "text-anchor": "middle"}, lvTick(t, tk)));
   });
   let tip = host._tip; if (!tip) tip = host._tip = el("div", {class: "lv-tip", role: "status", hidden: true});
   const showTip = (b, e) => {
@@ -216,7 +228,7 @@ function lvTimeline(host, spec) {
 function lvMerge(d) {
   const idx = c => Object.fromEntries(c.map((n, i) => [n, i]));
   LV.ci = {card: idx(d.cols.card), server: idx(d.cols.server), req: idx(d.cols.req), host: idx(d.cols.host)};
-  LV.ts = d.ts; LV.histFrom = d.history_from; LV.every = d.every;
+  LV.ts = d.ts; LV.histFrom = d.history_from; LV.every = d.every; LV.background = !!d.background;
   const cut = d.ts - LV_KEEP;
   const take = (e, rows) => { const last = e.rows.length ? e.rows[e.rows.length - 1][0] : 0; for (const r of rows) if (r[0] > last) e.rows.push(r); while (e.rows.length && e.rows[0][0] < cut) e.rows.shift(); if (e.rows.length) LV.lastT = Math.max(LV.lastT, e.rows[e.rows.length - 1][0]); };
   const have = new Set();
@@ -244,18 +256,54 @@ async function lvFetch() {
   const d = await api("/api/live?since=" + since.toFixed(1) + (step ? "&step=" + step : ""), {timeout: 15000});
   lvMerge(d); LV.err = ""; LV.fails = 0;
 }
+/* ---- the on-disk history (ranges past one hour): fetched again when the range changes or every max(20 s, one bucket) */
+const lvStoreKey = m => String(m.key).startsWith("p:") && m.port ? "p@" + m.port : m.key;      // as PXA Control files it
+async function lvTel(force) {
+  if (!force && LV.tel && Date.now() / 1000 - LV.telAt < 60) return LV.tel;
+  try { LV.tel = await api("/api/telemetry", {timeout: 15000}); } catch (e) { LV.tel = {available: false, error: e.message}; }
+  LV.telAt = Date.now() / 1000;
+  const on = !!(LV.tel && LV.tel.available && (LV.tel.recording || (LV.tel.series || 0) > 0));
+  $$("#lv-range .lv-long").forEach(b => { b.hidden = !on; });
+  if (!on && LV.range > LV_KEEP) { LV.range = 3600; $("#lv-range").setv("3600"); }
+  return LV.tel;
+}
+function lvHistSource(d) {
+  const idx = c => Object.fromEntries(c.map((n, i) => [n, i]));
+  const ci = {card: idx(d.cols.card), server: idx(d.cols.server), host: idx(d.cols.host), req: LV.ci ? LV.ci.req : {}};
+  const live = new Map([...LV.servers.values()].map(s => [lvStoreKey(s.meta), s]));
+  const cards = new Map(), servers = new Map();
+  for (const c of d.cards) {
+    const i = +c.key, lc = LV.cards.get(i);
+    cards.set(i, {ci, rows: c.rows, meta: {index: i, name: c.label, class: (c.info || {}).class, mem_total_mib: (c.info || {}).mem_total_mib,
+                                         slot: i % 8, throttle: lc ? lc.meta.throttle : []}});
+  }
+  d.servers.forEach((s, n) => {
+    const ls = live.get(s.key), info = s.info || {};
+    servers.set(s.key, {ci, rows: s.rows, reqs: [], meta: {key: s.key, name: s.label || s.key, slot: ls ? ls.meta.slot : (n + 4) % 8, up: !!ls,
+      phase: "idle", gpus: info.gpus || [], port: info.port, model_file: info.model_file,
+      has_spec: s.rows.some(r => r[ci.server.acc] != null), has_xcache: s.rows.some(r => r[ci.server.xhit] != null)}});
+  });
+  const host = d.host ? {ci, rows: d.host.rows, meta: {ram_total_mib: (d.host.info || {}).ram_total_mib, swap_total_mib: LV.host && LV.host.meta ? LV.host.meta.swap_total_mib : 0}} : null;
+  return {hist: true, ci, cards, servers, host, ts: d.until, histFrom: d.since, step: d.step, source: d.source, every: LV.every};
+}
+async function lvHistFetch() {
+  const now = Date.now() / 1000, W = Math.max(300, ($("#lv-root") || {}).clientWidth || 900);
+  if (LV.hist && LV.histRange === LV.range && now - LV.histAt < Math.max(20, LV.hist.step || 0)) return;
+  const d = await api(`/api/telemetry/history?since=${Math.floor(now - LV.range)}&points=${Math.min(1500, Math.round(W / 2))}`, {timeout: 30000});
+  LV.hist = lvHistSource(d); LV.histAt = now; LV.histRange = LV.range;
+}
 async function lvLoop() {
   clearTimeout(LV.timer);
   if (!LV.open) return;
   if (!document.hidden && S.tab === "live" && !LV.busy) {
     LV.busy = true;
-    try { await lvFetch(); lvRender(); }
+    try { await lvFetch(); if (LV.range > LV_KEEP) await lvHistFetch(); lvRender(); }
     catch (e) { LV.err = e.message; if (++LV.fails === 3) toast("Live: " + e.message, true); lvStatus(); }
     finally { LV.busy = false; }
   }
   LV.timer = setTimeout(lvLoop, (LV.every || 2) * 1000);
 }
-function liveOpen() { if (!LV.built) lvBuild(); LV.open = true; lvRender(); lvLoop(); }
+function liveOpen() { if (!LV.built) lvBuild(); LV.open = true; lvTel(true).then(() => lvRender()); lvRender(); lvLoop(); }
 function liveClose() { LV.open = false; clearTimeout(LV.timer); }
 
 /* ------------------------------------------------------------------ page
@@ -270,6 +318,7 @@ function lvBuild() {
   LV.built = true;
   const root = $("#lv-root");
   root.replaceChildren(
+    el("div", {id: "lv-hist", class: "tiny lv-histbar"}),
     el("div", {id: "lv-tiles", class: "lv-tiles"}),
     el("div", {id: "lv-charts", class: "lv-charts"}, ...LV_CHARTS.map(c =>
       el("div", {class: "card lv-card", id: "lc-" + c.id},
@@ -285,19 +334,41 @@ function lvBuild() {
     el("div", {id: "lv-cards", class: "lv-cards"}),
     el("div", {id: "lv-host", class: "lv-cards lv-hostbox"}),
     el("p", {class: "tiny lv-note", id: "lv-note"}));
-  segInit($("#lv-range"), v => { LV.range = +v; store.set("lv.range", LV.range); lvRender(); });
+  segInit($("#lv-range"), v => {
+    LV.range = +v; store.set("lv.range", LV.range); lvRender();
+    if (LV.range > LV_KEEP) { LV.busy = true; lvHistFetch().then(lvRender, e => { LV.err = e.message; lvStatus(); }).finally(() => { LV.busy = false; }); }
+  });
   $("#lv-range").setv(String(LV.range));
   window.addEventListener("resize", () => { if (LV.open) lvRender(); });
 }
 function lvStatus() {
   const sub = $("#lv-sub"); if (!sub) return;
   if (LV.err) { sub.textContent = "Cannot reach PXA Control: " + LV.err; return; }
-  const span = LV.ts - LV.histFrom;
-  sub.textContent = !LV.ts ? "Reading the first sample ..." :
-    `Updated ${lvClock(LV.ts, true)} · a sample every ${LV.every || 2} s · ` + (span < LV.range - 10 ? `history starts ${lvClock(LV.histFrom, false)}, when PXA Control first had a viewer` : "last " + fmtDur(LV.range));
+  const span = LV.ts - LV.histFrom, tel = LV.tel || {}, bar = $("#lv-hist");
+  if (R.hist) {
+    const first = tel.first_ts ? lvDay(tel.first_ts) + " " + lvClock(tel.first_ts, false) : null;
+    sub.textContent = `Last ${lvDur(LV.range)} from the history PXA Control records on this machine · one point per ${lvDur(R.step)}` +
+      (first ? ` · recorded since ${first}` : "");
+  } else {
+    sub.textContent = !LV.ts ? "Reading the first sample ..." :
+      `Updated ${lvClock(LV.ts, true)} · a sample every ${LV.every || 2} s · ` + (span < LV.range - 10 ?
+        (LV.background ? `history starts ${lvClock(LV.histFrom, false)}, when PXA Control started recording` : `history starts ${lvClock(LV.histFrom, false)}, when PXA Control first had a viewer`) :
+        "last " + fmtDur(LV.range));
+  }
+  if (!bar) return;
+  if (tel.available && tel.recording) {
+    const since = Math.floor(Date.now() / 1000 - LV.range), q = k => `/api/telemetry/csv?kind=${k}&since=${since}`;
+    bar.replaceChildren("Recorded in the background, also with this page closed" + (tel.settings ? ` (kept ${tel.settings.raw_days} days, minute averages ${tel.settings.rollup_days} days)` : "") + " · CSV of this range: ",
+      el("a", {href: q("card"), download: "", text: "cards"}), " · ", el("a", {href: q("server"), download: "", text: "servers"}), " · ",
+      el("a", {href: q("requests"), download: "", text: "requests"}), " · ", el("a", {href: q("host"), download: "", text: "this machine"}));
+  } else if (tel.available && tel.writer_pid) {
+    bar.textContent = `History is recorded by another PXA Control on this machine (pid ${tel.writer_pid}); this one reads it.`;
+  } else if (tel.available === false || (tel.settings && tel.settings.enabled === false)) {
+    bar.textContent = "History is off: the charts keep the last hour in memory only" + (tel.error ? ` (${tel.error})` : "") + ".";
+  } else bar.textContent = "";
 }
 function lvSeries(e, kind, col, t0, scale) {
-  const i = LV.ci[kind][col];
+  const i = (e.ci || LV.ci)[kind][col];
   return e.rows.filter(r => r[0] >= t0 - 60).map(r => [r[0], r[i] == null ? null : (scale ? r[i] * scale : r[i])]);
 }
 function lvLast(e, kind, col, maxAge) {
@@ -307,10 +378,13 @@ function lvLast(e, kind, col, maxAge) {
 }
 function lvRender() {
   if (!LV.ci) { lvStatus(); return; }
-  const t1 = LV.ts, t0 = t1 - LV.range;
+  R = LV.range > LV_KEEP && LV.hist && LV.histRange === LV.range ? LV.hist : LV;
+  const t1 = R.hist ? Math.max(R.ts, LV.ts) : LV.ts, t0 = t1 - LV.range;
   lvStatus();
-  const servers = [...LV.servers.values()].sort((a, b) => a.meta.slot - b.meta.slot);
-  lvTiles(servers, t0, t1);
+  const liveServers = [...LV.servers.values()].sort((a, b) => a.meta.slot - b.meta.slot);
+  lvTiles(liveServers, LV.ts - 180, LV.ts);                        // the tiles are always "now"
+  const servers = R.hist ? [...R.servers.values()].sort((a, b) => a.meta.slot - b.meta.slot) : liveServers;
+  const gap = R.hist ? Math.max(25, 2.5 * (R.step || 60)) : 25;
   // the charts: one series per server, coloured by server
   const hold = id => $("#lh-" + id).dataset.hold;
   for (const c of LV_CHARTS) {
@@ -320,18 +394,19 @@ function lvRender() {
     const mk = (s, pts) => ({id: s.meta.key, name: s.meta.name, color: lvColor(s.meta.slot), pts});
     let series;
     if (c.id === "dec") series = use.map(s => mk(s, lvSeries(s, "server", "dec", t0)));
+    else if (c.id === "pre" && R.hist) series = use.map(s => mk(s, lvSeries(s, "server", "pre_req", t0)));
     else if (c.id === "pre") series = use.map(s => mk(s, s.reqs.filter(r => (r[LV.ci.req.prefill_tps] || 0) > 0 && (r[LV.ci.req.prompt_n] || 0) >= 64).map(r => [r[0] - (r[LV.ci.req.gen_ms] || 0) / 1000, r[LV.ci.req.prefill_tps]])));
     else if (c.id === "acc") series = use.map(s => mk(s, lvSeries(s, "server", "acc", t0, 100)));
     else series = use.map(s => mk(s, lvSeries(s, "server", "xhit", t0, 100)));
     const spec = {series, t0, t1, y: c.pct ? {min: 0, max: 100, unit: "%", digits: 0} : {min: 0, unit: c.unit, digits: 1}, area: false,
-                  gap: c.id === "pre" ? 1e9 : 25, dots: c.id === "pre", label: c.title + ", " + c.sub,
+                  gap: c.id === "pre" && !R.hist ? 1e9 : gap, dots: c.id === "pre" && !R.hist, label: c.title + ", " + c.sub,
                   empty: !servers.length ? "no server is running" : c.id === "pre" ? "no finished request in this range yet" : "no data in this range yet"};
     if (!hold(c.id)) lvChart(host, spec);
     lvTable($("#lt-" + c.id), series, c.pct ? "%" : c.unit, c.pct ? 0 : 1);
   }
-  lvTimelineRender(servers, t0, t1);
-  lvCards(t0, t1);
-  lvHost(t0, t1);
+  if (R.hist) lvHistSummary(servers, t0); else lvTimelineRender(servers, t0, t1);
+  lvCards(t0, t1, gap);
+  lvHost(t0, t1, gap);
   $("#lv-note").textContent = "Decode speed is the tokens each server wrote per second, averaged over every sample (exact engine counters when the server runs with --metrics, " +
     "otherwise counted from slot progress). Prefill speed and the request bars come from the server's own record of each finished request. " +
     "Speculation and expert-cache charts appear when a server uses them. A red line marks " + LV_HOT_C + " °C, where cards begin to throttle.";
@@ -410,6 +485,20 @@ function lvTiles(servers, t0, t1) {
   }
 }
 
+/* ---- a long range: no bars (thousands of requests), the totals of what the store counted per bucket instead */
+function lvHistSummary(servers, t0) {
+  const ci = R.ci.server, sum = {n: 0, read: 0, readMs: 0, gen: 0, genMs: 0};
+  for (const s of servers) for (const r of s.rows) if (r[0] >= t0) {
+    sum.n += r[ci.req] || 0; sum.read += r[ci.prompt_tok] || 0; sum.readMs += r[ci.prompt_ms] || 0; sum.gen += r[ci.gen_tok] || 0; sum.genMs += r[ci.gen_ms] || 0;
+  }
+  $("#lv-tl-sum").textContent = !sum.n ? "no finished request recorded in this range" :
+    `${Math.round(sum.n).toLocaleString("en-US")} requests in the last ${lvDur(LV.range)} \u00b7 ${lvTok(sum.read)} prompt tokens read` +
+    (sum.readMs > 0 && sum.read >= 64 ? ` at ${lvFmt(sum.read / (sum.readMs / 1000), 0)} t/s` : "") + ` \u00b7 ${lvTok(sum.gen)} tokens written` +
+    (sum.genMs > 0 ? ` at ${lvFmt(sum.gen / (sum.genMs / 1000))} t/s` : "");
+  $("#lv-tl").replaceChildren(el("div", {class: "tiny", text: "One bar per request is drawn for ranges up to 1 h. Every request of the last days is in the requests CSV above."}));
+  $("#lt-tl").replaceChildren();
+}
+
 /* ---- the request timeline */
 function lvTimelineRender(servers, t0, t1) {
   const host = $("#lv-tl");
@@ -474,12 +563,12 @@ function lvStripMake(label, titles) {
   return st;
 }
 function lvFill(p, color, big, unit, sub, pts, o, t0, t1, what) {       // the number, its caption and the line of one panel
-  p.v.replaceChildren(big, unit ? el("small", {text: " " + unit}) : null); p.s.textContent = sub || "\u00a0";
+  p.v.replaceChildren(big, ...(unit ? [el("small", {text: " " + unit})] : [])); p.s.textContent = sub || "\u00a0";
   if (!p.host.dataset.hold) lvChart(p.host, Object.assign({series: [{id: p.title, name: p.title, color, pts}], t0, t1, mini: true, area: true, label: `${what} ${p.title}`, tipNote: p.title}, o));
 }
-function lvCards(t0, t1) {
-  const box = $("#lv-cards"), ci = LV.ci.card;
-  const cards = [...LV.cards.values()].sort((a, b) => a.meta.index - b.meta.index);
+function lvCards(t0, t1, gap) {
+  const box = $("#lv-cards"), ci = R.ci.card, fresh = R.hist ? Math.max(60, 3 * (R.step || 60)) : 15;
+  const cards = [...R.cards.values()].sort((a, b) => a.meta.index - b.meta.index);
   LV.strips = LV.strips || new Map();
   if (!cards.length) { LV.strips.clear(); box.replaceChildren(el("div", {class: "empty", text: "no NVIDIA cards visible"})); return; }
   const idx = cards.map(c => c.meta.index);
@@ -490,14 +579,14 @@ function lvCards(t0, t1) {
   for (const s of LV.servers.values()) for (const g of s.meta.gpus || []) { if (!holders.has(g)) holders.set(g, []); holders.get(g).push(s.meta.name); }
   for (const c of cards) {
     const m = c.meta, st = LV.strips.get(m.index), color = lvColor(m.slot), tot = m.mem_total_mib || null;
-    const lastv = k => { for (let i = c.rows.length - 1; i >= 0; i--) { if (t1 - c.rows[i][0] > 15) return null; if (c.rows[i][ci[k]] != null) return c.rows[i][ci[k]]; } return null; };
+    const lastv = k => { for (let i = c.rows.length - 1; i >= 0; i--) { if (t1 - c.rows[i][0] > fresh) return null; if (c.rows[i][ci[k]] != null) return c.rows[i][ci[k]]; } return null; };
     const mem = lastv("mem"), util = lastv("util"), temp = lastv("temp"), pow = lastv("power"), lim = lastv("limit"), clk = lastv("clock");
     const hot = temp != null && temp >= LV_HOT_C, used = holders.get(m.index);
     st.sw.style.background = color; st.name.textContent = m.name || ""; st.cls.textContent = m.class || "";
     st.chips.replaceChildren(used ? el("span", {class: "chip", title: used.join(", "), text: lvShort(used.join(", "), 24)}) : el("span", {class: "chip", text: "free"}),
       ...(m.throttle || []).map(r => el("span", {class: "chip warn", text: "⚠ " + r.replace(/^(sw_|hw_)/, "").replace(/_/g, " ")})));
     const pts = (k, f) => c.rows.filter(r => r[0] >= t0 - 60).map(r => [r[0], r[ci[k]] == null ? null : f(r[ci[k]])]);
-    const fill = (p, big, unit, sub, spec, o) => lvFill(p, color, big, unit, sub, spec, o, t0, t1, `card ${m.index}`);
+    const fill = (p, big, unit, sub, spec, o) => lvFill(p, color, big, unit, sub, spec, Object.assign({gap}, o), t0, t1, `card ${m.index}`);
     const P = st.panels, pmax = Math.ceil((lim || Math.max(100, ...c.rows.map(r => r[ci.power] || 0))) / 50) * 50;
     fill(P.mem, mem == null ? "-" : lvFmt(mem / 1024), "GiB", tot ? `of ${lvFmt(tot / 1024, tot >= 10240 ? 0 : 1)} GiB · ${mem == null ? "-" : Math.round(100 * mem / tot)} %` : "",
       pts("mem", v => tot ? 100 * v / tot : v), {y: {min: 0, max: 100, unit: "%", digits: 0}});
@@ -507,21 +596,21 @@ function lvCards(t0, t1) {
   }
 }
 /* ---- this machine: memory and CPU (where a model's host-side tables and offloaded experts live) */
-function lvHost(t0, t1) {
-  const box = $("#lv-host"), h = LV.host;
+function lvHost(t0, t1, gap) {
+  const box = $("#lv-host"), h = R.host, fresh = R.hist ? Math.max(60, 3 * (R.step || 60)) : 15;
   if (!h || !h.rows.length) { box.replaceChildren(); return; }
-  const hi = LV.ci.host, color = lvColor(6), tot = h.meta.ram_total_mib, swapTot = h.meta.swap_total_mib || 0;
+  const hi = R.ci.host, color = lvColor(6), tot = h.meta.ram_total_mib, swapTot = h.meta.swap_total_mib || 0;
   if (!LV.hostStrip) { LV.hostStrip = lvStripMake("", {ram: "memory", cpu: "CPU", swap: "swap"}); LV.hostStrip.name.textContent = "This machine"; LV.hostStrip.sw.style.background = color; }
   const st = LV.hostStrip;
   if (box.firstChild !== st.root) box.replaceChildren(st.root);
-  const lastv = k => { for (let i = h.rows.length - 1; i >= 0; i--) { if (LV.ts - h.rows[i][0] > 15) return null; if (h.rows[i][hi[k]] != null) return h.rows[i][hi[k]]; } return null; };
+  const lastv = k => { for (let i = h.rows.length - 1; i >= 0; i--) { if (t1 - h.rows[i][0] > fresh) return null; if (h.rows[i][hi[k]] != null) return h.rows[i][hi[k]]; } return null; };
   const ram = lastv("ram"), cpu = lastv("cpu"), swap = lastv("swap");
   const pts = (k, f) => h.rows.filter(r => r[0] >= t0 - 60).map(r => [r[0], r[hi[k]] == null ? null : f(r[hi[k]])]);
   const full = ram != null && tot && ram / tot > 0.92, swapping = swap != null && swap > 1024;
   st.chips.replaceChildren(...[full ? el("span", {class: "chip warn", text: "\u26A0 memory almost full"}) : null, swapping ? el("span", {class: "chip warn", text: "\u26A0 swapping"}) : null].filter(Boolean));
   const P = st.panels, GiB = v => lvFmt(v / 1024, v / 1024 >= 100 ? 0 : 1);
-  lvFill(P.ram, color, ram == null ? "-" : GiB(ram), "GiB", tot ? `of ${GiB(tot)} GiB \u00b7 ${ram == null ? "-" : Math.round(100 * ram / tot)} % in use` : "", pts("ram", v => tot ? 100 * v / tot : v), {y: {min: 0, max: 100, unit: "%", digits: 0}}, t0, t1, "this machine");
-  lvFill(P.cpu, color, cpu == null ? "-" : lvFmt(cpu, 0), "%", "all cores", pts("cpu", v => v), {y: {min: 0, max: 100, unit: "%", digits: 0}}, t0, t1, "this machine");
-  lvFill(P.swap, color, swapTot ? (swap == null ? "-" : GiB(swap)) : "none", swapTot ? "GiB" : "", swapTot ? `of ${GiB(swapTot)} GiB` : "no swap on this machine", swapTot ? pts("swap", v => 100 * v / swapTot) : [], {y: {min: 0, max: 100, unit: "%", digits: 0}}, t0, t1, "this machine");
+  lvFill(P.ram, color, ram == null ? "-" : GiB(ram), "GiB", tot ? `of ${GiB(tot)} GiB \u00b7 ${ram == null ? "-" : Math.round(100 * ram / tot)} % in use` : "", pts("ram", v => tot ? 100 * v / tot : v), {y: {min: 0, max: 100, unit: "%", digits: 0}, gap}, t0, t1, "this machine");
+  lvFill(P.cpu, color, cpu == null ? "-" : lvFmt(cpu, 0), "%", "all cores", pts("cpu", v => v), {y: {min: 0, max: 100, unit: "%", digits: 0}, gap}, t0, t1, "this machine");
+  lvFill(P.swap, color, swapTot ? (swap == null ? "-" : GiB(swap)) : "none", swapTot ? "GiB" : "", swapTot ? `of ${GiB(swapTot)} GiB` : "no swap on this machine", swapTot ? pts("swap", v => 100 * v / swapTot) : [], {y: {min: 0, max: 100, unit: "%", digits: 0}, gap}, t0, t1, "this machine");
 }
 if (typeof S !== "undefined" && S.tab === "live") liveOpen();

@@ -20,6 +20,23 @@ async function waitText(sel, text, timeout) {
 async function text(sel) { return (await page.locator(sel).first().innerText()).replace(/\s+/g, ' ').trim(); }
 async function count(sel) { return page.locator(sel).count(); }
 async function snap(name) { shot++; await page.screenshot({path: `${OUT}/${WIDTH}-${String(shot).padStart(2, '0')}-${name}.png`, fullPage: true}); }
+// wait for something on the page without turning a slow answer into a crashed scenario (no throw, a false)
+async function waitAny(sels, ms) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < (ms || T)) {
+    for (const s of sels) { if (await page.locator(s).count() && await page.locator(s).first().isVisible()) return true; }
+    await sleep(150);
+  }
+  return false;
+}
+async function waitUntil(fn, ms) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < (ms || 20000)) { if (await fn()) return true; await sleep(100); }
+  return false;
+}
+async function waitGone(sel, ms) {          // true once nothing there is visible any more
+  return waitUntil(async () => !(await page.locator(sel).count()) || !(await page.locator(sel).first().isVisible()), ms);
+}
 async function api(path, body) {
   return page.evaluate(async ([p, b]) => { const r = await fetch(p, b ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b)} : {}); return {status: r.status, body: await r.text()}; }, [path, body]);
 }
@@ -470,6 +487,92 @@ async function runChecks() {
   check(logs.length > 100 && !logs.includes(KEY_SECRET), 'job logs carry no key (the fake encoder printed it once on purpose: ' + (logs.includes('<key>') ? 'scrubbed' : 'not printed') + ')');
   const cfg = await ctl('config');
   check(cfg.encode && cfg.encode.licence_key === GOOD_KEY, 'the key is stored in the Control config (and only there)');
+
+  // ---------------------------------------------------------------- the licensed library (v3.1)
+  console.log('STEP 14: the licensed library has its own row, and updating it is one click');
+  await page.goto(BASE + '/#encode');
+  await page.waitForSelector('#en-lib', {timeout: T});
+  check((await text('#en-lib')).includes('Licensed library'), 'the Encode tab shows the licensed library row: ' + (await text('#en-lib')).slice(0, 90));
+  check((await text('#en-libver')).length > 0, 'it says which library is installed: ' + (await text('#en-libver')));
+  check((await text('#en-libch')).includes('channel:'), 'it names the channel it follows: ' + (await text('#en-libch')));
+  check(await page.locator('#en-libcheck').isEnabled(), 'Check now is there and enabled');
+  // the row must be honest with the real backend before anything is stubbed: asking it returns a sentence, not a stack
+  await page.click('#en-libcheck');
+  check(await waitAny(['#en-libupd', '#en-libok', '#en-liberr', '#en-libinfo'], T), 'asking the real licence server answers the row (nothing to install, or why not)');
+  const realErr = (await count('#en-liberr')) ? await text('#en-liberr') : '';
+  const realInfo = (await count('#en-libinfo')) ? await text('#en-libinfo') : '';
+  check(!/Traceback|Error:|at \w+\./.test(realErr + realInfo), 'and it is written for a person' + ((realErr || realInfo) ? ': ' + (realErr || realInfo).slice(0, 90) : ' (no error: something to install or up to date)'));
+  if (realInfo) {
+    check(realInfo.includes('Add your supporter key to unlock Pro'), 'a missing key is a hint: ' + realInfo.slice(0, 90));
+    check((await count('#en-liberr')) === 0, 'and that hint is not the red error box');
+  }
+
+  // from here the licence server is faked, so every branch of the row can be seen
+  const libCalls = [];
+  let LIB = null;
+  const base = () => ({available: true, installed: {version: '2026.09.1', lib_id: 'pxqn-2026.09.1', prev: 'libggml-pxqn.so.2026.08.1', prev_version: '2026.08.1', applied: 1759000000, checked: 1759100000, links: []},
+                       channel: 'stable', auto: false, beta: null, running: false, busy: '', error: null, latest: '', lib_id: null, update: false, notice: '', min_engine: ''});
+  await page.route('**/api/lib/update**', route => {
+    const req = route.request(), u = new URL(req.url());
+    libCalls.push(req.method() + ' ' + u.pathname + u.search + (req.postData() ? ' ' + req.postData() : ''));
+    if (!LIB) return route.continue();
+    const send = o => route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify(o)});
+    if (u.pathname.endsWith('/settings')) { const b = JSON.parse(req.postData() || '{}'); return send(Object.assign({}, LIB, b)); }
+    if (u.pathname.endsWith('/apply') || u.pathname.endsWith('/rollback')) return send({ok: true, message: u.pathname.endsWith('/apply') ? 'Library installed.' : 'Rolled back.'});
+    return send(LIB);
+  });
+
+  LIB = Object.assign(base(), {latest: '2026.10.1', update: true, notice: 'a kernel fix for sm_61', min_engine: '2026.10'});
+  await page.click('#en-libcheck');
+  check(await waitAny(['#en-libupd'], T), 'an update on the channel is offered in its own row');
+  check((await text('#en-libupd')).includes('2026.10.1') && (await text('#en-libupd')).includes('2026.09.1'), 'the row names both versions: ' + (await text('#en-libupd')).slice(0, 110));
+  check(await page.locator('#en-libinstall').isEnabled(), 'Install is offered');
+  await page.click('#en-libinstall');                       // the confirm() is accepted by the dialog handler
+  check(await waitUntil(() => libCalls.some(c => c.startsWith('POST /api/lib/update/apply'))), 'clicking Install calls the apply it names: ' + libCalls.filter(c => c.includes('apply')).join(' | '));
+  check(await waitAny(['#en-libupd', '#en-libok'], T), 'and the row comes back after the install');
+
+  LIB = Object.assign(base(), {latest: '2026.10.1', update: true, running: true});
+  await page.click('#en-libcheck');
+  check(await waitAny(['#en-librunning'], T), 'while a server runs it says so');
+  check(await page.locator('#en-libinstall').isDisabled(), 'and Install is refused for as long as it runs (the library would be swapped under it)');
+  LIB = null;
+  await page.click('#en-libcheck');                          // back to the real backend, no stub
+  check(await waitGone('#en-librunning'), 'with the server stopped the line goes away');
+
+  LIB = Object.assign(base(), {latest: '2026.10.1', installed: Object.assign(base().installed, {version: '2026.10.1', prev: 'libggml-pxqn.so.2026.08.1', prev_version: '2026.08.1'})});
+  await page.click('#en-libcheck');
+  check(await waitAny(['#en-libok'], T), 'up to date is said plainly: ' + (await text('#en-libok')).slice(0, 80));
+  check(await count('#en-librollback') === 1, 'and the library it replaced is still offered as a rollback');
+  await page.click('#en-librollback');
+  check(await waitUntil(() => libCalls.some(c => c.startsWith('POST /api/lib/update/rollback'))), 'rolling back calls the rollback it names: ' + libCalls.filter(c => c.includes('rollback')).join(' | '));
+
+  LIB = Object.assign(base(), {error: {code: 'no_key', message: 'No licence key is set. Put one in PXA Control (or PXA_LICENCE_KEY) and try again.'}});
+  await page.click('#en-libcheck');
+  check(await waitAny(['#en-libinfo'], T), 'a missing key is a neutral hint');
+  check((await text('#en-libinfo')).includes('Add your supporter key to unlock Pro'), 'the hint invites a supporter key: ' + (await text('#en-libinfo')).slice(0, 90));
+  check((await count('#en-liberr')) === 0, 'and it is not the red error box');
+  check(!(await text('#en-libinfo')).includes('No licence key is set'), 'and it does not repeat the server sentence');
+
+  LIB = Object.assign(base(), {error: {code: 'refused', message: 'no'}});
+  await page.click('#en-libcheck');
+  check(await waitAny(['#en-liberr'], T), 'a refused key stays a red error');
+  check(/refused/i.test(await text('#en-liberr')), 'the refusal says why: ' + (await text('#en-liberr')).slice(0, 90));
+  check((await count('#en-libinfo')) === 0, 'and the neutral hint is gone');
+
+  LIB = Object.assign(base(), {error: {code: 'not_valued', message: 'Valued Supporters only.'}, beta: false});
+  await page.click('#en-libcheck');
+  check(await waitAny(['#en-liberr'], T), 'a refusal is a sentence in the row, not a dead button');
+  check(/Valued Supporter/.test(await text('#en-liberr')), 'the refusal says why: ' + (await text('#en-liberr')).slice(0, 90));
+  check(!(await page.locator('#en-libbeta').isVisible()), 'and a channel this key may not have is not offered at all');
+
+  LIB = Object.assign(base(), {beta: null});
+  await page.click('#en-libcheck');
+  check(await waitAny(['#en-libbeta'], T), 'the beta switch is offered while the server has not refused it');
+  await page.click('#en-libauto');
+  check(await waitUntil(() => libCalls.some(c => c.includes('/api/lib/update/settings'))), 'the auto switch is saved where the poller reads it: ' + libCalls.filter(c => c.includes('settings')).join(' | '));
+  check((libCalls.find(c => c.includes('/api/lib/update/settings')) || '').includes('"auto":true'), 'and it is saved as on');
+  check(await page.locator('#en-libauto').isChecked(), 'and it comes back checked');
+  await page.unroute('**/api/lib/update**');
 
   console.log('PAGE ERRORS:', errors.length ? errors.join(' | ') : 'none', '(browser notices for handled 4xx refusals and the planned restart: ' + notices + ')');
   check(errors.length === 0, 'zero page errors');

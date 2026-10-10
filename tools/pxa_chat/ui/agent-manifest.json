@@ -1,0 +1,14 @@
+{
+  "name": "PXA Control",
+  "short_name": "PXA",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#111214",
+  "theme_color": "#111214",
+  "icons": [
+    {"src": "/agent-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/agent-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "/agent-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"},
+    {"src": "/agent-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}

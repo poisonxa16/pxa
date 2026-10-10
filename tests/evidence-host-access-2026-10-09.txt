@@ -1,0 +1,28 @@
+host-access evidence, dflash, 2026-10-09
+
+== pytest ==
+..........................................                               [100%]
+42 passed in 0.17s
+
+== import smoke ==
+<function execute at 0x145ab506b600>
+
+== route smoke ==
+GET           {"allow": {"commands": [["nvidia-smi", "-L"]], "read_paths": ["/tmp/tmp5i0tksdd/docs"]}, "available": true, "chat": "c1", "on": false, "why": ""}
+POST on c1    {"allow": {"commands": [["nvidia-smi", "-L"]], "read_paths": ["/tmp/tmp5i0tksdd/docs"]}, "available": true, "chat": "c1", "on": true, "why": ""}
+ctx c1, c2    True False
+POST off c1   {"allow": {"commands": [["nvidia-smi", "-L"]], "read_paths": ["/tmp/tmp5i0tksdd/docs"]}, "available": true, "chat": "c1", "on": false, "why": ""}
+non-bool on    {"body": {"code": "bad_request", "error": "send on: true or on: false"}, "status": 400}
+non-dict body {"body": {"code": "bad_request", "error": "the request body must be a JSON object"}, "status": 400}
+--lan gate    {"available": false, "on": false, "why": "host access is off over the network"}
+
+== the spec's own --help line, and the real CLI ==
+$ python3 tools/pxa_control.py --help
+rc=0 (no output: pxa_control.py has no argparse -- it is a library)
+$ grep -n "^\s*--lan" on pxa-launch.py --help
+151:  --lan                 PXA Control listens on every interface (0.0.0.0)
+152-                        instead of 127.0.0.1. A random access token is then
+153-                        required; it is printed at start and kept in a cookie
+154-                        after the first visit. Applies to --gui, a bare `pxa`
+155-                        and the Control that starts next to a server. On the
+156-                        LAN the chat's host access (see `host_access_lan` in

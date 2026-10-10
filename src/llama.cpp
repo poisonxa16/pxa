@@ -825,6 +825,7 @@ void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
         }
     }
     cparams.mtp_op_type = value;
+    if (value != MTP_OP_NONE) pxa_xc_companion = true;   // sticky: this context is the speculation companion
 }
 
 // PXA_VERIFY_GRAPH_CACHE: the input-tensor pointers and cache-copy records a graph build binds into
@@ -874,6 +875,7 @@ static void pxa_bind_apply(llama_context & c, const pxa_graph_binding & b) {
 
 struct llama_context::pxa_gslot {
     int                   width = 0;
+    int                   mtp_op = 0;      // PXA_MTP_GRAPH_SLOTS: != 0 -> an MTP companion slot (swaps prev_mtp, not prev)
     ggml_backend_sched_t  sched = nullptr;
     std::vector<uint8_t>  meta;
     std::unique_ptr<Prev> prev;
@@ -883,6 +885,10 @@ struct llama_context::pxa_gslot {
 
 llama_context::~llama_context() {
     for (auto & it : pxa_gslots) {
+        if (it.second && it.second->mtp_op) {
+            LLAMA_LOG_INFO("PXA_MTP_GRAPH_SLOTS: slot op %d width %d: entered %lld, graph builds %lld\n",
+                    it.second->mtp_op, it.second->width, (long long) it.second->n_enter, (long long) it.second->n_build);
+        }
         if (it.second) {
             ggml_backend_sched_free(it.second->sched);
             delete it.second;
@@ -2404,7 +2410,18 @@ struct pxa_restore_seg { ggml_backend_t backend; void * dst; const void * src; s
 // (llama_context::pxa_gslot). ENHANCE default 6, =0 off; N = the widest verify cached (<= 16).
 extern "C" ggml_backend_sched_t pxa_ggml_backend_sched_clone(ggml_backend_sched_t src, size_t graph_size);
 bool pxa_verify_argmax_on();   // llama-build-context.cpp (PXA_VERIFY_ARGMAX)
+static bool pxa_nlc_check_on();   // PXA_NLC_CHECK (below, next to llama_get_argmax_ith)
 bool pxa_verify_no_logits_copy_on();   // llama-build-context.cpp (PXA_VERIFY_NO_LOGITS_COPY)
+// PXA_MTP_GRAPH_SLOTS=1 (LEVERS-6 M3, default off): the MTP companion's commit (UPDATE_ACCEPTED, w = A+1) and
+// draft step (DRAFT_GEN, w = 1) alternate, and the context keeps ONE prev_mtp reuse record, so every op switch
+// rebuilt the graph and re-ran the allocator -- new node addresses, so the CUDA graph cache could not replay it
+// either. Each (op, width) gets the verify-cache machinery instead: its own scheduler clone (own arena, stable
+// addresses), reuse record and input binding, swapped in for the ubatch and out again at any exit. Same graph,
+// same allocation per slot: byte-exact by construction.
+static bool pxa_mtp_gslots_on() {
+    static const bool v = [] { const char * e = getenv("PXA_MTP_GRAPH_SLOTS"); return e && *e && atoi(e) != 0; }();
+    return v;
+}
 static int pxa_vgc_maxw() {
     static const int v = [] {
         const char * e = getenv("PXA_VERIFY_GRAPH_CACHE");
@@ -3044,6 +3061,34 @@ static llama_pos llama_kv_cache_seq_pos_min(struct llama_kv_cache & cache, llama
     return result;
 }
 
+static int32_t kv_cache_seq_span_cells(struct llama_kv_cache & cache, llama_seq_id seq_id, llama_pos * pos_lo, llama_pos * pos_hi) {
+    int32_t n = 0;
+    llama_pos lo = -1;
+    llama_pos hi = -1;
+
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        const auto & cell = cache.cells[i];
+        if (!cell.has_seq_id(seq_id) || cell.pos < 0) {
+            continue;
+        }
+        if (n == 0 || cell.pos < lo) {
+            lo = cell.pos;
+        }
+        if (cell.pos > hi) {
+            hi = cell.pos;
+        }
+        ++n;
+    }
+
+    if (pos_lo) {
+        *pos_lo = lo;
+    }
+    if (pos_hi) {
+        *pos_hi = hi;
+    }
+    return n;
+}
+
 static void llama_kv_cache_defrag(struct llama_kv_cache & cache) {
     cache.do_defrag = true;
 }
@@ -3189,6 +3234,33 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
 
     // general kv
     LLAMA_LOG_INFO("%s: general.name     = %s\n",    __func__, model.name.c_str());
+
+    // PXA quantizer tag (read-only: key names only, nothing is checked)
+    {
+        auto qstr = [&](const char * k) -> std::string {
+            const int id = gguf_find_key(ml.meta, k);
+            return (id >= 0 && gguf_get_kv_type(ml.meta, id) == GGUF_TYPE_STRING) ? std::string(gguf_get_val_str(ml.meta, id)) : std::string();
+        };
+        const std::string q_ed = qstr("pxa.quantizer.edition"), q_ver = qstr("pxa.quantizer.version"),
+                          q_bt = qstr("pxa.quantizer.build_tag"), q_lic = qstr("pxa.quantizer.licensee");
+        const int q_exp_id = gguf_find_key(ml.meta, "pxa.quantizer.license_expires");
+        if (!q_ed.empty() || !q_ver.empty() || !q_bt.empty() || !q_lic.empty() || q_exp_id >= 0) {
+            std::string line = q_ed.empty() ? "?" : q_ed;
+            if (!q_ver.empty()) line += " " + q_ver;
+            if (!q_bt.empty())  line += " (build " + q_bt + ")";
+            // name only: logs get pasted into bug reports, so the " (discord:<id>)" part stays out of them
+            // (PXA Control, local only, shows the full value)
+            if (!q_lic.empty()) line += ", licensee " + q_lic.substr(0, q_lic.find(" ("));
+            if (q_exp_id >= 0 && gguf_get_kv_type(ml.meta, q_exp_id) == GGUF_TYPE_UINT64) {
+                const time_t t = (time_t) gguf_get_val_u64(ml.meta, q_exp_id);
+                char d[16] = "";
+                struct tm tmv;
+                if (t > 0 && gmtime_r(&t, &tmv)) strftime(d, sizeof d, "%Y-%m-%d", &tmv);
+                if (d[0]) line += std::string(", expires ") + d;
+            }
+            LLAMA_LOG_INFO("%s: PXA quantizer    = %s\n", __func__, line.c_str());
+        }
+    }
 
     if (model.is_mla_model()) {
         LLAMA_LOG_INFO("%s: n_layer_dense_lead   = %d\n",     __func__, hparams.n_layer_dense_lead);
@@ -5512,8 +5584,10 @@ static size_t pxa_meminfo_kb(const char * key) {
 }
 
 // PXA_XCACHE routing counts: where they are read from and written to. An explicit PXA_XCACHE_COUNTS names the one file (read
-// when it exists, written when it does not). Otherwise <model>.expert-counts.csv next to the GGUF, then the per-user cache
-// (PXA_CACHE_DIR, else $XDG_CACHE_HOME/pxa, else $HOME/.cache/pxa) for a model directory that is read-only (containers mount it :ro).
+// when it exists, written when it does not) and is never replaced. Otherwise <model>.expert-counts.csv next to the GGUF, then
+// the per-user cache (PXA_CACHE_DIR, else $XDG_CACHE_HOME/pxa, else $HOME/.cache/pxa) when the model directory is read-only.
+// Learned counts are a different file, <model>.expert-counts.learned.csv (or the same name in the cache).
+// The library chooses which file a boot opens. No library: the curated file, never a learned one.
 static std::vector<std::string> pxa_xcache_counts_candidates(const std::string & model_path) {
     std::vector<std::string> v;
     if (const char * p = getenv("PXA_XCACHE_COUNTS")) { v.push_back(p); return v; }
@@ -5551,6 +5625,81 @@ static std::string pxa_xcache_counts_writable(const std::vector<std::string> & c
     }
     return "";
 }
+
+static std::string pxa_xcache_cache_dir() {
+    if (const char * c = getenv("PXA_CACHE_DIR"); c && *c) return c;
+    if (const char * x = getenv("XDG_CACHE_HOME"); x && *x) return std::string(x) + "/pxa";
+    if (const char * h = getenv("HOME"); h && *h) return std::string(h) + "/.cache/pxa";
+    return "";
+}
+
+static bool pxa_file_exists(const std::string & p) {
+    if (p.empty()) return false;
+    FILE * f = fopen(p.c_str(), "r");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static std::vector<std::string> pxa_xcache_learned_candidates(const std::string & model_path) {
+    std::vector<std::string> v;
+    if (model_path.empty()) return v;
+    v.push_back(model_path + ".expert-counts.learned.csv");
+    const size_t sl = model_path.find_last_of('/');
+    const std::string base = sl == std::string::npos ? model_path : model_path.substr(sl + 1);
+    const std::string dir = pxa_xcache_cache_dir();
+    if (!dir.empty() && !base.empty()) v.push_back(dir + "/" + base + ".expert-counts.learned.csv");
+    return v;
+}
+
+// Where a session may write. Never the curated name. Empty if nowhere is writable.
+static std::string pxa_xcache_learned_writable(const std::string & model_path) {
+    return pxa_xcache_counts_writable(pxa_xcache_learned_candidates(model_path));
+}
+
+bool llama_pxa_xcache_learned_path(const llama_model * model, char * buf, size_t n);
+bool llama_pxa_xcache_learned_path(const llama_model * model, char * buf, size_t n) {
+    if (!model || !buf || n < 2) return false;
+    const std::string p = pxa_xcache_learned_writable(model->pxa_model_path);
+    if (p.empty() || p.size() + 1 > n) return false;
+    snprintf(buf, n, "%s", p.c_str());
+    return true;
+}
+
+// Which file a boot opens. An explicit PXA_XCACHE_COUNTS is passed through and is not swapped.
+// The library decides. No library: the curated file, never a learned one.
+static std::string pxa_xcache_counts_select(const std::string & model_path, const std::vector<std::string> & cands) {
+    std::string curated;
+    for (const auto & c : cands) {
+        if (pxa_file_exists(c)) { curated = c; break; }
+    }
+    const bool explicit_flag = getenv("PXA_XCACHE_COUNTS") != nullptr;
+    std::string learned;
+    if (!explicit_flag) {
+        for (const auto & c : pxa_xcache_learned_candidates(model_path)) {
+            if (pxa_file_exists(c)) { learned = c; break; }
+        }
+    }
+    ggml_pxqn_xcache_counts_pick_fn pick = ggml_pxqn_xcache_counts_pick_get();
+    if (!pick) {
+        if (!learned.empty()) {
+            LLAMA_LOG_WARN("PXA_XCACHE: not using learned counts %s; the library that chooses them is not loaded\n", learned.c_str());
+        }
+        if (!curated.empty()) LLAMA_LOG_INFO("PXA_XCACHE: using curated counts %s\n", curated.c_str());
+        return curated;
+    }
+    double learned_mean = -1, curated_mean = -1;
+    const int use = pick(curated.empty() ? nullptr : curated.c_str(),
+                         learned.empty() ? nullptr : learned.c_str(),
+                         explicit_flag ? 1 : 0, &learned_mean, &curated_mean);
+    if (use == 1 && !learned.empty()) {
+        LLAMA_LOG_INFO("PXA_XCACHE: using learned counts %s\n", learned.c_str());
+        return learned;
+    }
+    if (!curated.empty()) LLAMA_LOG_INFO("PXA_XCACHE: using curated counts %s\n", curated.c_str());
+    return curated;
+}
+
 
 // ---- PXA_XCACHE slot table access (the hook an online adaptor drives) --------------------------------------------------------
 // The expert cache is a SLOT TABLE per planned layer: the hot stack's slot k holds expert hot[k] (device), the cold stack's slot k
@@ -5621,21 +5770,23 @@ bool llama_pxa_xcache_counts_write(const struct llama_model * model, const uint6
     FILE * f = fopen(tmp.c_str(), "w");
     if (!f) return false;
     fprintf(f, "tensor,expert,count\n");
+    // The hot/cold split replaces the original expert tensor, so blk.N.ffn_down_exps.weight
+    // may no longer be in tensors_by_name. The loader still reads that name. Write every layer
+    // that actually has counts.
     long rows = 0;
     for (int il = 0; il < n_layers; ++il) {
         char nm[128];
         snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", il);
-        bool have = false;
-        for (const auto & kv : model->tensors_by_name) if (kv.first == nm) { have = true; break; }
-        if (!have) continue;
         uint64_t tot = 0;
         for (int e = 0; e < n_expert; ++e) tot += counts[(size_t) il*n_expert + e];
         if (tot == 0) continue;
         for (int e = 0; e < n_expert; ++e) { fprintf(f, "%s,%d,%llu\n", nm, e, (unsigned long long) counts[(size_t) il*n_expert + e]); ++rows; }
     }
-    const bool ok = fclose(f) == 0 && rows > 0 && rename(tmp.c_str(), path) == 0;
-    if (!ok) remove(tmp.c_str());
-    return ok;
+    if (fclose(f) != 0 || rows <= 0 || rename(tmp.c_str(), path) != 0) {
+        remove(tmp.c_str());
+        return false;
+    }
+    return true;
 }
 
 // PXA_XCACHE online adaptation (src/llama-pxa-xcache.cpp): spare hot slots per split layer, 0 = static plan (adaptation off,
@@ -5789,7 +5940,7 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
         for (const auto & w : ml.weights) {
             const ggml_tensor * t = w.tensor;
             if (!t || strncmp(t->name, "blk.", 4) != 0 || !strstr(t->name, "_exps.weight")) continue;
-            const bool pxqn = t->type >= GGML_TYPE_PXQN3 && t->type <= GGML_TYPE_PXQN5;
+            const bool pxqn = t->type >= GGML_TYPE_PXQN3 && t->type <= GGML_TYPE_PXA4;
             if (!pxa_type_cpu_fast(t->type) || (pxqn && pcie_wide)) {
                 zc = true;
                 if (slow.empty()) slow = std::string(ggml_type_name(t->type)) + (pxa_type_cpu_fast(t->type) ? " on a PCIe x16 link" : "");
@@ -5806,7 +5957,7 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
             bool pxqn_exps = false;
             for (const auto & w : ml.weights) {
                 const ggml_tensor * t = w.tensor;
-                if (t && strncmp(t->name, "blk.", 4) == 0 && strstr(t->name, "_exps.weight") && t->type >= GGML_TYPE_PXQN3 && t->type <= GGML_TYPE_PXQN5) pxqn_exps = true;
+                if (t && strncmp(t->name, "blk.", 4) == 0 && strstr(t->name, "_exps.weight") && t->type >= GGML_TYPE_PXQN3 && t->type <= GGML_TYPE_PXA4) pxqn_exps = true;
             }
             in.xc_cold_pxqn = !zc && pxqn_exps && ggml_pxqn_cpu_mmv_available();
         }
@@ -5886,9 +6037,7 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
         }
         std::string path;
         pxa_xc_cands = pxa_xcache_counts_candidates(model.pxa_model_path);
-        for (const auto & c : pxa_xc_cands) {   // the first candidate that exists
-            if (FILE * t = fopen(c.c_str(), "r")) { fclose(t); path = c; break; }
-        }
+        path = pxa_xcache_counts_select(model.pxa_model_path, pxa_xc_cands);
         if (path.empty() && !pxa_xc_cands.empty()) path = pxa_xc_cands.front();
         const int n_exp = (int)model.hparams.n_expert;
         bool biased = false;   // expert biases / merged-by-the-loader up_gate are not split (yet)
@@ -7565,7 +7714,7 @@ static bool llm_load_tensors(
 // the load banner and llama_model_pxq_file_desc() can never disagree about what a file is.
 // Order of the counters: pxq1, pxq2, pxq3, pxq4 (incl. PXQ4HQ), pxq6, pxqn3, pxqn3s8, pxqn4,
 // pxqn2, pxqn1, pxqn4s8, pxqn5 (the ladder).
-enum { LLAMA_PXQ_TIER_COUNT = 12 };
+enum { LLAMA_PXQ_TIER_COUNT = 13 };
 
 static void llama_pxq_census_add(enum ggml_type type, int counts[LLAMA_PXQ_TIER_COUNT]) {
     switch (type) {
@@ -7582,6 +7731,7 @@ static void llama_pxq_census_add(enum ggml_type type, int counts[LLAMA_PXQ_TIER_
         case GGML_TYPE_PXQN1:   counts[9]++; break;
         case GGML_TYPE_PXQN4S8: counts[10]++; break;
         case GGML_TYPE_PXQN5:   counts[11]++; break;
+        case GGML_TYPE_PXA4:    counts[12]++; break;
         default: break;
     }
 }
@@ -7598,7 +7748,7 @@ static int llama_pxq_census_total(const int counts[LLAMA_PXQ_TIER_COUNT]) {
 // census alongside it, so this headline can never hide a mixed (--pxq-universal) file.
 static const char * llama_pxq_census_codec(const int counts[LLAMA_PXQ_TIER_COUNT]) {
     static const char * const names[LLAMA_PXQ_TIER_COUNT] = { "PXQ1", "PXQ2", "PXQ3", "PXQ4", "PXQ6", "PXQN3", "PXQN3S8", "PXQN4",
-                                                                     "PXQN2", "PXQN1", "PXQN4S8", "PXQN5" };
+                                                                     "PXQN2", "PXQN1", "PXQN4S8", "PXQN5", "PXA4" };
     int best = -1;
     int best_i = 3;   // PXQ4 -- only reached when every counter is 0, and callers gate on that
     for (int i = 0; i < LLAMA_PXQ_TIER_COUNT; ++i) {
@@ -10393,7 +10543,7 @@ static int llama_decode_internal(
                 if (!s) return;
                 std::swap(c.sched, s->sched);
                 std::swap(c.buf_compute_meta, s->meta);
-                std::swap(c.prev, s->prev);
+                std::swap(s->mtp_op ? c.prev_mtp : c.prev, s->prev);
                 pxa_bind_capture(c, s->bind);
                 pxa_bind_apply(c, main_bind);
             }
@@ -10419,6 +10569,33 @@ static int llama_decode_internal(
                 std::swap(lctx.sched, slot->sched);
                 std::swap(lctx.buf_compute_meta, slot->meta);
                 std::swap(lctx.prev, slot->prev);
+                pxa_gs.s = slot;
+                slot->n_enter++;
+            }
+        } else if (pxa_mtp_gslots_on() && cparams.graph_reuse &&
+                (cparams.mtp_op_type == MTP_OP_DRAFT_GEN || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) &&
+                u_batch.embd == nullptr && n_tokens == n_tokens_all && (int) n_tokens >= 1 && (int) n_tokens <= 16 &&
+                ggml_backend_sched_get_n_copies(lctx.sched) == 1) {
+            const int key = 1000 + 32*(int) cparams.mtp_op_type + (int) n_tokens;   // never collides with a verify width
+            auto & slot = lctx.pxa_gslots[key];
+            if (slot == nullptr) {
+                slot = new llama_context::pxa_gslot();
+                slot->width  = (int) n_tokens;
+                slot->mtp_op = (int) cparams.mtp_op_type;
+                const size_t gsize = lctx.max_nodes((int) std::min(cparams.n_ctx, cparams.n_ubatch), cparams.n_ctx);
+                slot->sched = pxa_ggml_backend_sched_clone(lctx.sched, gsize);
+                slot->meta.resize(lctx.buf_compute_meta.size());
+                slot->bind.cache_copies = lctx.cache_copies;
+                for (auto & cc : slot->bind.cache_copies) { cc.cpy = nullptr; cc.step = 0; }
+                LLAMA_LOG_INFO("%s: PXA_MTP_GRAPH_SLOTS: graph slot for MTP op %d width %d %s\n", __func__,
+                        (int) cparams.mtp_op_type, (int) n_tokens, slot->sched ? "created" : "could not be created (runs on the main graph)");
+            }
+            if (slot->sched) {
+                pxa_bind_capture(lctx, pxa_gs.main_bind);
+                pxa_bind_apply(lctx, slot->bind);
+                std::swap(lctx.sched, slot->sched);
+                std::swap(lctx.buf_compute_meta, slot->meta);
+                std::swap(lctx.prev_mtp, slot->prev);
                 pxa_gs.s = slot;
                 slot->n_enter++;
             }
@@ -10594,7 +10771,7 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
             const bool pxa_alloc_ok = ggml_backend_sched_alloc_graph(lctx.sched, gf);
-            // PXA_ALLOC_FAIL_CLEAN=1 (default off, grokbot/gemma-cleanfail): the return value was
+            // PXA_ALLOC_FAIL_CLEAN=1 (default off, gemma-cleanfail): the return value was
             // ignored, so a graph the device could not hold (cudaMalloc out of memory inside
             // ggml_gallocr) was computed anyway with unallocated tensors and the process died with
             // SIGSEGV (Gemma-4 26B, one V100, -c 32768 f16 KV: the 1-token BOS warmup builds the
@@ -10857,6 +11034,7 @@ static int llama_decode_internal(
                     lctx.pxa_amax_rows_graph = (int32_t) rows_g;
                     lctx.pxa_amax_off.resize(parts.size());
                     lctx.pxa_amax_raw.resize(parts.size() * (size_t) rows_g * 3);
+                    lctx.pxa_amax_sl = parts[0]->op_params[2] != 0;   // qwen4exp MTP shortlist head (M2)
                     for (size_t k = 0; k < parts.size(); ++k) {
                         lctx.pxa_amax_off[k] = parts[k]->op_params[1];
                         ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(lctx.sched, parts[k]);
@@ -10885,7 +11063,7 @@ static int llama_decode_internal(
                 }
             }
             // Do not process logits if MTP is only updating the KV cache.
-            if (!pxa_amax_done && cparams.mtp_op_type != MTP_OP_WARMUP) { // && cparams.mtp_op_type != MTP_OP_UPDATE_ACCEPTED) {
+            if ((!pxa_amax_done || pxa_nlc_check_on()) && cparams.mtp_op_type != MTP_OP_WARMUP) { // && cparams.mtp_op_type != MTP_OP_UPDATE_ACCEPTED) {
                 ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
                 GGML_ASSERT(backend_res != nullptr);
                 GGML_ASSERT(lctx.logits != nullptr);
@@ -13586,7 +13764,7 @@ struct llama_context * llama_init_from_model(
             // its own lever is set rather than being listed unconditionally above.
             const bool arch_ported = swa_kv_ported.count(model->arch) > 0 || want_g4;
 
-            // PXA_TSPLIT_ISWA_GUARD=1 (default off, grokbot/gemma-tsplit): the Gemma 4 split-attention
+            // PXA_TSPLIT_ISWA_GUARD=1 (default off, gemma-tsplit): the Gemma 4 split-attention
             // builder (build_gemma4_graph_parallel, '-sm tensor' / 'attn' / 'graph') reads every layer's
             // K/V from kv_self.k_l[il]->extra and never routes the sliding layers to kv_swa, so with the
             // window cache armed (any -c above ~n_swa + 2 ubatches) the sliding layers' kv_self tensors
@@ -15938,6 +16116,10 @@ llama_pos llama_kv_cache_seq_pos_max(struct llama_context * ctx, llama_seq_id se
     return llama_kv_cache_seq_pos_max(ctx->kv_self, seq_id);
 }
 
+int32_t llama_kv_cache_seq_span(struct llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_lo, llama_pos * pos_hi) {
+    return kv_cache_seq_span_cells(ctx->kv_self, seq_id, pos_lo, pos_hi);
+}
+
 void llama_kv_cache_defrag(struct llama_context * ctx) {
     llama_kv_cache_defrag(ctx->kv_self);
 }
@@ -17657,9 +17839,15 @@ int32_t llama_encode(
     return ret;
 }
 
+bool llama_pxa_tokmiss_on();
+void llama_pxa_tokmiss_note_batch(const llama_token * tok, int n);
 int32_t llama_decode(
         struct llama_context * ctx,
           struct llama_batch   batch) {
+    // PXA_XCACHE_MISS_TOKEN: the main model's input tokens of this step (the worker attributes its cold slots to the rows)
+    if (llama_pxa_tokmiss_on() && ctx->cparams.mtp_op_type == MTP_OP_NONE && batch.token && !ctx->model.pxa_xc.empty()) {
+        llama_pxa_tokmiss_note_batch(batch.token, batch.n_tokens);
+    }
     const int ret = llama_decode_internal(*ctx, batch);
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
@@ -17763,7 +17951,13 @@ void llama_synchronize(struct llama_context * ctx) {
     const int64_t pxa_xc_tokens = ctx->n_queued_tokens;
     ctx->n_queued_tokens = 0;
     ctx->t_compute_start_us = 0;
-    if (pxa_xc_tokens > 0 && !ctx->model.pxa_xc.empty()) llama_pxa_xcache_tick(const_cast<llama_model &>(ctx->model), (int) pxa_xc_tokens);
+    if (pxa_xc_tokens > 0 && !ctx->model.pxa_xc.empty()) {
+        if (ctx->pxa_xc_companion && llama_pxa_xcache_companion_quiet()) {
+            llama_pxa_xcache_note_tokens(const_cast<llama_model &>(ctx->model), (int) pxa_xc_tokens);
+        } else {
+            llama_pxa_xcache_tick(const_cast<llama_model &>(ctx->model), (int) pxa_xc_tokens);
+        }
+    }
 }
 
 int32_t llama_n_logits(const struct llama_context * ctx) {
@@ -17827,6 +18021,39 @@ float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
     }
 }
 
+// PXA_NLC_CHECK=1 (diagnostic, LEVERS-6 M2): an argmax-only decode ALSO copies the logit rows, and every
+// llama_get_argmax_ith compares the device argmax with the host's strict-greater (lowest id on ties) scan of
+// the same row. Counts are printed every 2000 rows and at exit; any mismatch is printed with its row.
+static bool pxa_nlc_check_on() {
+    static const bool v = [] { const char * e = getenv("PXA_NLC_CHECK"); return e && *e && atoi(e) != 0; }();
+    return v;
+}
+static std::atomic<long> g_pxa_nlc_rows{0}, g_pxa_nlc_bad{0}, g_pxa_nlc_ties{0}, g_pxa_nlc_sl{0};
+static void pxa_nlc_check_dump() {
+    LLAMA_LOG_INFO("PXA_NLC_CHECK: %ld argmax rows checked (%ld on the MTP shortlist head), %ld mismatches, %ld rows with an exact tie at the max\n",
+            g_pxa_nlc_rows.load(), g_pxa_nlc_sl.load(), g_pxa_nlc_bad.load(), g_pxa_nlc_ties.load());
+}
+static void pxa_nlc_check_row(const llama_context * ctx, int32_t j, int64_t dev_col) {
+    static const bool armed = [] { atexit(pxa_nlc_check_dump); return true; }();
+    (void) armed;
+    if (!ctx->logits) return;
+    const int64_t n_vocab = ctx->model.hparams.n_vocab;
+    const int64_t W = ctx->n_logits_width > 0 ? ctx->n_logits_width : n_vocab;
+    const float * L = ctx->logits + (size_t) j * n_vocab;
+    int64_t hb = 0; float hv = L[0];
+    for (int64_t i = 1; i < W; ++i) if (L[i] > hv) { hv = L[i]; hb = i; }
+    int ties = 0;
+    for (int64_t i = 0; i < W; ++i) if (L[i] == hv) ++ties;
+    if (ties > 1) g_pxa_nlc_ties++;
+    if (ctx->pxa_amax_sl) g_pxa_nlc_sl++;
+    if (hb != dev_col) {
+        g_pxa_nlc_bad++;
+        LLAMA_LOG_WARN("PXA_NLC_CHECK: MISMATCH row %d: device column %lld (%.9g), host column %lld (%.9g), width %lld, shortlist %d\n",
+                (int) j, (long long) dev_col, dev_col >= 0 && dev_col < W ? L[dev_col] : NAN, (long long) hb, hv, (long long) W, (int) ctx->pxa_amax_sl);
+    }
+    if (++g_pxa_nlc_rows % 2000 == 0) pxa_nlc_check_dump();
+}
+
 void llama_set_argmax_only(struct llama_context * ctx, bool on) {
     ctx->pxa_amax_only = on;
 }
@@ -17859,6 +18086,13 @@ int32_t llama_get_argmax_ith(struct llama_context * ctx, int32_t i, float * p_to
         const float * r = ctx->pxa_amax_raw.data() + ((size_t) k * rows_g + row) * 3;
         const int64_t id = ctx->pxa_amax_off[k] + (int64_t) r[0];
         if (best_id < 0 || r[1] > best_v) { best_v = r[1]; best_id = id; }
+    }
+    if (pxa_nlc_check_on()) pxa_nlc_check_row(ctx, j, best_id);
+    if (ctx->pxa_amax_sl) {   // PXA_VERIFY_NO_LOGITS_COPY qwen4exp: a shortlist position -> its token id
+        const auto & sl = ctx->model.mtp_shortlist_rows;
+        if (best_id < 0 || best_id >= (int64_t) sl.size()) return -1;   // the caller falls back to the logits draw
+        best_id = sl[best_id];
+        llama_mtp_shortlist_count_draw();
     }
     if (p_top) {
         double se = 0.0;
@@ -19372,3 +19606,5 @@ void llama_pxa_context_drop_graphs(struct llama_context * ctx) {
     ctx->prev.reset();
     ctx->prev_mtp.reset();
 }
+
+

@@ -38,7 +38,8 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 # shipped without a patched RPATH). NOT installing apt's cmake here on purpose -- see below.
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
-      python3 python3-venv python3-pip ninja-build git \
+      python3 python3-venv python3-pip ninja-build git curl \
+      pkg-config libssl-dev \
       build-essential patchelf binutils ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
@@ -51,5 +52,13 @@ RUN apt-get update -qq && \
 # apt's /usr/bin/cmake on PATH -- this does NOT change the compiler or glibc floor, only the
 # build tool's own understanding of newer CUDA/C++ dialects.
 RUN pip3 install --no-cache-dir "cmake>=3.28"
+
+# LLGuidance (common/CMakeLists.txt, LLAMA_LLGUIDANCE) builds a Rust static lib during the
+# engine build. openssl-sys, which that crate pulls in, needs pkg-config and libssl-dev.
+# The release script passes -DLLAMA_LLGUIDANCE=ON only when `cargo` is on PATH,
+# which this image provides. Minimal profile: rustc and cargo, no docs.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+ENV PATH="/opt/cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 
 WORKDIR /work

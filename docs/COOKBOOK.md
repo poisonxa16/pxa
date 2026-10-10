@@ -245,6 +245,54 @@ Same command shape as PXQU-16 with `fusion2-35b-U12.gguf`. Measured on the 16 GB
   see *Speculation*, below. `--spec-type mtp:n_max=3,p_min=0.5` pins the head alone and, because an
   explicit `--spec-type` replaces the auto choice, drops the n-gram stage.
 
+## 1× P100 — Flash-Next Overdrive
+
+One Tesla P100 16 GB plus system RAM. This preset is for the Flash-Next PXQN file on **one** card.
+Splitting that model across cards did not go faster. Load the preset as the server's environment
+(`docker run --env-file`, or `set -a` and source it). It turns on the switches overdrive adds to the
+expert cache. The preset, and what it is measured at, are in
+[`docs/LEVERS.md`](LEVERS.md) under "Flash-Next Overdrive". Do not retype the switches by hand.
+
+```bash
+# presets/pxa-overdrive-flashnext-pxqn2-1xp100.env is the environment.
+# The line below is the server arguments that measurement used.
+./run-server.sh -m Swift-1.5-Qwen3.8-Flash-Next-PXQN-32GB.gguf \
+  -ot 'per_layer_token_embd\.weight=CPU' -ngl 99 -fa on -np 1 -t 16 \
+  --jinja --no-context-shift --cache-ram 0 -c 16384 \
+  -ctk q8_0 -ctv q8_0 --spec-type mtp:n_max=3,p_min=0.75
+```
+
+The preset also turns on the expert cache, MTP together with that cache, and the v2 planner, and it
+forces the repetition guard off. On a machine with more than one CPU socket a container needs
+`--cap-add SYS_NICE` so the memory policy can apply.
+
+**Overdrive, preset off against preset on.** Measured 2026-10-09, one P100 16 GB, the Flash-Next PXQN2
+file, greedy, 512 tokens, three runs, one window, the arms alternating.
+
+| | prose | code |
+|---|---:|---:|
+| preset off | 26.91 t/s | 32.28 t/s |
+| preset on | 30.70 t/s | 37.96 t/s |
+
+**Curated expert map.** `<model>.expert-counts.csv` beside the GGUF (beside shard 1 of a split
+file). A download from a URL (`--model-url` or `-hf`) fetches this file next to the model after
+the shards. A missing file does not fail the download, and a file already beside the model is
+left as it is. If it is still missing at startup, the server profiles the model once and writes
+it. `PXA_XCACHE_COUNTS=<csv>` names a different file and is never replaced.
+
+**Learned expert map.** `<model>.expert-counts.learned.csv`, beside the model or in the cache
+directory (`$PXA_CACHE_DIR`, else `$XDG_CACHE_HOME/pxa`, else `~/.cache/pxa`). The learned file
+is used when a measurement says it is faster. An explicit `PXA_XCACHE_COUNTS` is never swapped.
+
+Measured 2026-10-09 on the 32 GB file, one P100 16 GB, the command line above, the Overdrive
+environment, adaptation off (`PXA_XCACHE_ADAPT=0`; the preset itself leaves adaptation on), greedy,
+512 tokens, three runs, two fresh boots each way. The one-minute load was under 4 and the card was
+idle at the start of each arm. Each arm named its own map with `PXA_XCACHE_COUNTS`. Pooled means,
+to two decimals: prose 28.50 curated / 32.59 learned, code 31.59 / 35.07.
+
+In Docker the learned file survives only on the named `pxa-cache` volume. The README's container
+line mounts it.
+
 ## 4xp100-flashnext — 4× Tesla P100, hybrid MoE
 
 The lever set below needs the pipeline-scheduler fixes, the host-overhead cuts and the ported

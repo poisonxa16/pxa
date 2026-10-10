@@ -156,6 +156,40 @@ int main() {
         check(!evaluate({}, FAMILY, -1, true).fails(), "an empty list is not refused");
     }
 
+    // ---- the refusal names its next step (todo quantizer-composition-hint) -----------------------------------
+    {
+        // a ~0.6B model, untied: the q8_0 head is most of the resident non-PXQ bytes (token_embd itself is host-side)
+        std::vector<tensor> small = {
+            T("token_embd.weight",     151936, Q6_K, 120 * 1024 * 1024),
+            T("output.weight",         151936, Q8_0, 160 * 1024 * 1024),
+            T("blk.0.attn_k.weight",   1024,   Q8_0,  20 * 1024 * 1024),
+            T("blk.0.ffn_down.weight", 1024,   PXQ4, 150 * 1024 * 1024),
+        };
+        const result r = evaluate(small, FAMILY, PXQ4, true);
+        const std::string h = hint(r);
+        check(r.below_floor,                                              "small model: refused (150 / 330 MiB resident)");
+        check(h.find("--pxq-composition-override") != std::string::npos,  "small model: the hint names --pxq-composition-override");
+        check(h.find("PXA_PXQ_COMPOSITION_OVERRIDE=1") != std::string::npos, "small model: ... and its env twin");
+        check(h.find("small model") != std::string::npos,                 "small model: the hint says why (embedding/output tables)");
+        check(h.find("89%") != std::string::npos,                         "small model: the table share is 160 of 180 MiB non-PXQ = 89%");
+        // tied: token_embd is the head and resident, same diagnosis
+        std::vector<tensor> tied = { T("token_embd.weight", 151936, Q8_0, 300 * 1024 * 1024), T("blk.0.ffn_up.weight", 1024, PXQ4, 200 * 1024 * 1024) };
+        check(hint(evaluate(tied, FAMILY, PXQ4, false)).find("small model") != std::string::npos, "tied small model: same diagnosis");
+        // a mislabelled big file (MXFP4 backbone majority) is NOT called a small model, but still names the flag
+        std::vector<tensor> big = {
+            T("output.weight",         151936, Q8_0,   1 * GiB),
+            T("blk.0.ffn_down.weight", 4096,   MXFP4, 90 * GiB),
+            T("blk.0.attn_q.weight",   4096,   PXQ4,  10 * GiB),
+        };
+        const std::string hb = hint(evaluate(big, FAMILY, -1, true));
+        check(hb.find("small model") == std::string::npos,                "MXFP4 majority: not blamed on the tables");
+        check(hb.find("tier map") != std::string::npos && hb.find("--pxq-composition-override") != std::string::npos,
+              "MXFP4 majority: points at the tier map, and names the flag");
+        // a uniform target with ZERO named-tier bytes but a passing share: the generic hint
+        std::vector<tensor> absent = { T("blk.0.ffn_down_exps.weight", 2048, PXQ3, 90 * GiB), T("output.weight", 151936, Q8_0, 1 * GiB) };
+        check(hint(evaluate(absent, FAMILY, PXQ6, true)).find("small model") == std::string::npos, "ZERO-named-tier refusal: generic hint");
+    }
+
     // ---- the override env stays what it was: any non-zero integer ------------------------------------------
     check(override_requested("1"),       "PXA_PXQ_COMPOSITION_OVERRIDE=1 overrides");
     check(override_requested("2"),       "PXA_PXQ_COMPOSITION_OVERRIDE=2 overrides (any non-zero integer)");

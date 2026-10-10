@@ -218,9 +218,12 @@ static int run_host(pxa_xca_core & core, const stack_t & st, int n_used, int n_c
     size_t n_nonzero = 0;
     for (int c = 0; c < n_cases; ++c) {
         const int l = c % n_layers;
-        const int w = 1 + (c*7 + c/3) % max_tok;
+        // XCA_WIDTH / XCA_PCOLD (PXA_XCACHE_LEAN timing): a fixed width and cold share instead of the mixed sweep
+        static const int fw = getenv("XCA_WIDTH") ? atoi(getenv("XCA_WIDTH")) : 0;
+        static const float fp = getenv("XCA_PCOLD") ? (float) atof(getenv("XCA_PCOLD")) : -1.0f;
+        const int w = fw >= 1 && fw <= max_tok ? fw : 1 + (c*7 + c/3) % max_tok;
         std::vector<int32_t> ids; std::vector<float> cur;
-        make_case(rng, st.n_embd, n_used, w, st.n_slots, ids, cur, (c % 5 == 0) ? 0.05f : (c % 5 == 1 ? 1.0f : 0.5f));
+        make_case(rng, st.n_embd, n_used, w, st.n_slots, ids, cur, fp >= 0 ? fp : ((c % 5 == 0) ? 0.05f : (c % 5 == 1 ? 1.0f : 0.5f)));
         ggml_cuda_cold_slot * s = slots[l];
         // submit
         memcpy(s->h_ids, ids.data(), ids.size()*4);

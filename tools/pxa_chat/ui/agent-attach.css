@@ -1,0 +1,8 @@
+/* agent-attach.css: file chips under the composer. Empty until a file is attached. */
+#ag-attach[hidden]{display:none}
+.ag-drop{outline:2px dashed var(--accent, #e08a3c);outline-offset:2px}
+.ag-files{display:flex;flex-wrap:wrap;gap:6px}
+.ag-files:empty{display:none}
+.ag-file{display:inline-flex;align-items:center;gap:6px;max-width:100%;border:1px solid var(--line);border-radius:999px;padding:2px 8px 2px 2px;font-size:12px}
+.ag-file img{width:22px;height:22px;border-radius:50%;object-fit:cover}
+.ag-file-x{border:0;background:none;color:var(--dim);cursor:pointer;font-size:11px}

@@ -44,7 +44,10 @@ services:
       # - "${PXA_CONTROL_PORT:-7777}:7777"
     volumes:
       - ${MODELS_DIR:?set MODELS_DIR in .env to the directory holding your model files}:/models:ro
+      # Learned expert counts. Named volume, so they survive container removal.
+      - pxa-cache:/work/.cache/pxa
     environment:
+      PXA_CACHE_DIR: /work/.cache/pxa
       # PXA_CONTROL: "1" starts PXA Control next to the server (uncomment the port line above too).
       # Unset or "0": no web page, exactly as before.
       PXA_CONTROL: ${PXA_CONTROL:-0}
@@ -170,3 +173,6 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     runtime: nvidia
+
+volumes:
+  pxa-cache:

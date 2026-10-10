@@ -118,6 +118,59 @@ typedef const struct ggml_pxqn_xcache_policy * (*ggml_pxqn_xcache_get_fn)(uint32
 // NULL when the library is absent, has no policy, or PXA_PXQN_XCACHE=0
 GGML_API const struct ggml_pxqn_xcache_policy * ggml_pxqn_xcache_policy_get(void);
 
+// Optional symbol: build one learned counts table from a packed prior and packed device rows.
+// The engine writes the csv. NULL when the library is absent: the engine does not save learned counts.
+// 0 = out_counts filled, 1 = nothing observed, 2 = *wait_layer is not ready, -1 = bad arguments.
+#define GGML_PXQN_XCACHE_LEARN_BUILD_SYM "ggml_pxqn_xcache_learn_build"
+typedef int (*ggml_pxqn_xcache_learn_build_fn)(int n_layer, int n_expert, int n_main,
+                                               const double * prior,
+                                               const int * obs_il, int n_obs, const uint32_t * obs,
+                                               const uint8_t * routed,
+                                               uint64_t * out_counts,
+                                               int * wait_layer);
+GGML_API ggml_pxqn_xcache_learn_build_fn ggml_pxqn_xcache_learn_build_get(void);
+
+// Optional symbol: which counts file a boot opens. 0 = curated, 1 = learned.
+// explicit_flag nonzero returns 0. Means are filled when a measurement was read, else -1.
+// NULL when the library is absent: the engine keeps the curated file and does not open a learned one.
+#define GGML_PXQN_XCACHE_COUNTS_PICK_SYM "ggml_pxqn_xcache_counts_pick"
+typedef int (*ggml_pxqn_xcache_counts_pick_fn)(const char * curated, const char * learned, int explicit_flag,
+                                               double * learned_mean, double * curated_mean);
+GGML_API ggml_pxqn_xcache_counts_pick_fn ggml_pxqn_xcache_counts_pick_get(void);
+
+#define GGML_PXQN_XCACHE_SPEED_WRITE_SYM "ggml_pxqn_xcache_speed_write"
+typedef int (*ggml_pxqn_xcache_speed_write_fn)(const char * csv_path, double prose, double code);
+GGML_API ggml_pxqn_xcache_speed_write_fn ggml_pxqn_xcache_speed_write_get(void);
+
+// Optional symbol: the next calibration step. which 0 logs; which 1 measures.
+// Writes kind and prompt. 1 = a step, 0 = past the end, -1 = bad arguments.
+// NULL when the library is absent: the tool does not calibrate.
+#define GGML_PXQN_XCACHE_CALIB_STEP_SYM "ggml_pxqn_xcache_calib_step"
+typedef int (*ggml_pxqn_xcache_calib_step_fn)(int which, int index, char * kind, size_t kind_n,
+                                              char * prompt, size_t prompt_n, int * n_predict, double * temperature);
+GGML_API ggml_pxqn_xcache_calib_step_fn ggml_pxqn_xcache_calib_step_get(void);
+
+// Optional symbol: whether the newest measurement is kept. hist is prose,code pairs.
+// 0 = keep it, 1 = stop, -1 = bad arguments. *best_index is the kept row.
+#define GGML_PXQN_XCACHE_CALIB_CONSIDER_SYM "ggml_pxqn_xcache_calib_consider"
+typedef int (*ggml_pxqn_xcache_calib_consider_fn)(const double * hist, int n_hist, double prose, double code, int * best_index);
+GGML_API ggml_pxqn_xcache_calib_consider_fn ggml_pxqn_xcache_calib_consider_get(void);
+
+// Optional symbols: the cold-expert CPU pool. NULL when the library is absent: the switch stays off.
+#define GGML_PXQN_XCACHE_CPUPOOL_CREATE_SYM "ggml_pxqn_xcache_cpupool_create"
+typedef void * (*ggml_pxqn_xcache_cpupool_create_fn)(int n_threads_hint, int spin_us);
+GGML_API ggml_pxqn_xcache_cpupool_create_fn ggml_pxqn_xcache_cpupool_create_get(void);
+
+#define GGML_PXQN_XCACHE_CPUPOOL_DESTROY_SYM "ggml_pxqn_xcache_cpupool_destroy"
+typedef void (*ggml_pxqn_xcache_cpupool_destroy_fn)(void * pool);
+GGML_API ggml_pxqn_xcache_cpupool_destroy_fn ggml_pxqn_xcache_cpupool_destroy_get(void);
+
+#define GGML_PXQN_XCACHE_CPUPOOL_STEP_SYM "ggml_pxqn_xcache_cpupool_step"
+typedef int (*ggml_pxqn_xcache_cpupool_step_fn)(void * pool, struct ggml_tensor * up, struct ggml_tensor * gate,
+                                                struct ggml_tensor * unary, struct ggml_tensor * down,
+                                                const int32_t * ids, int n_used, int ntok);
+GGML_API ggml_pxqn_xcache_cpupool_step_fn ggml_pxqn_xcache_cpupool_step_get(void);
+
 struct ggml_pxqn_lib_api {
     uint32_t                         version;   // GGML_PXQN_LIB_VERSION
     uint32_t                         size;      // sizeof(struct ggml_pxqn_lib_api)

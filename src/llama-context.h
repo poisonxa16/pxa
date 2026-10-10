@@ -740,6 +740,7 @@ struct llama_context {
     // context while the lever is on so the graph shape never depends on the request. A decode run
     // with pxa_amax_only set copies only these [3, rows] tensors back instead of the logit rows.
     bool                 pxa_amax_built = false;   // the LAST built graph carries pxa_amax nodes
+    bool                 pxa_amax_sl    = false;   // the last argmax-only decode read a shortlisted (MTP) head
     bool                 pxa_amax_only  = false;   // request for the next decode (server sets, decode clears)
     bool                 pxa_amax_valid = false;   // the last decode filled pxa_amax_rows instead of logits
     int32_t              pxa_amax_nparts = 0;
@@ -757,6 +758,7 @@ struct llama_context {
     // next round's first draft token for whichever prefix is accepted -- the separate commit decode
     // goes away. Only for a single-sequence pure-greedy verify (the rows need the target's own argmax).
     struct llama_context *   pxa_fold_ctx     = nullptr;  // the companion (llama_set_mtp_fold_ctx)
+    bool                     pxa_xc_companion = false;    // this ctx has run an MTP op (the speculation companion)
     bool                     pxa_fold_req     = false;    // request for the next decode
     bool                     pxa_fold_active  = false;    // this decode builds/uses the fold
     bool                     pxa_fold_valid   = false;    // the last decode produced fold rows

@@ -1,0 +1,5 @@
+/* agent-memory.css: the compact marker. Shown only after a compaction. The default transcript does not include these nodes. */
+.ag-marker.compact{flex-wrap:wrap}
+.ag-marker .ag-compact-btn{border:0;background:transparent;color:var(--accent);font:inherit;cursor:pointer;padding:0 4px}
+.ag-compact-sum{display:none;flex-basis:100%;white-space:pre-wrap;font:inherit;color:var(--dim);margin:4px 0 0;max-height:200px;overflow:auto}
+.ag-marker.compact.open .ag-compact-sum{display:block}

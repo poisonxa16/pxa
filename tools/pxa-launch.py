@@ -307,6 +307,7 @@ PXQ_GGML_TYPE = {
     261: "PXQN1",    # ggml.h GGML_TYPE_PXQN1
     262: "PXQN4S8",  # ggml.h GGML_TYPE_PXQN4S8
     263: "PXQN5",    # ggml.h GGML_TYPE_PXQN5
+    264: "PXA4",     # ggml.h GGML_TYPE_PXA4
 }
 # Everything else a PXQ file legitimately contains (backbone carriers).
 NON_PXQ_GGML_TYPE = {0: "f32", 1: "f16", 8: "q8_0", 14: "q6_K", 30: "bf16", 39: "MXFP4"}
@@ -1240,6 +1241,140 @@ def _run(cmd, timeout=20):
 # ---------------------------------------------------------------------------
 # HARDWARE INTROSPECTION (H1..H8)
 # ---------------------------------------------------------------------------
+# CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED. ggml-cuda.cu asks for
+# CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, which the CUDA header aliases to this.
+_VMM_ATTR = 102
+GEMMA4_DRAFT_NOTE = (
+    "Gemma 4 assistant drafter: measured 159-167 t/s on one V100, 85 of 104 drafts accepted. "
+    "-md names that file. Leaving -md off is also fine: the engine looks beside the target itself."
+)
+_GEMMA4_MTP_ARCH = ("gemma4_mtp", "gemma4-assistant")
+
+
+def gemma4_assistant_match(target_kv, candidates):
+    """The engine's sibling rule (pxa_find_gemma4_assistant), on headers already read.
+
+    target_kv is the target file's GGUF metadata. candidates is (path, kv, size_bytes).
+    One match, under 4 GiB, arch gemma4_mtp or gemma4-assistant, embedding width equal to
+    gemma4.embedding_length. '' when the target is not Gemma 4, or zero or several match.
+    """
+    if not isinstance(target_kv, dict) or target_kv.get("general.architecture") != "gemma4":
+        return ""
+    try:
+        want = int(target_kv.get("gemma4.embedding_length"))
+    except (TypeError, ValueError):
+        return ""
+    if want <= 0:
+        return ""
+    found = []
+    for path, kv, size in candidates:
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            continue
+        if size <= 0 or size > (4 << 30) or not isinstance(kv, dict):
+            continue
+        if kv.get("general.architecture") not in _GEMMA4_MTP_ARCH:
+            continue
+        try:
+            got = int(kv.get("gemma4-assistant.embedding_length_out"))
+        except (TypeError, ValueError):
+            continue
+        if got == want:
+            found.append(path)
+    return found[0] if len(found) == 1 else ""
+
+
+def gemma4_assistant_siblings(model_path):
+    """Path of the one Gemma 4 assistant drafter next to model_path, or ''."""
+    if not model_path:
+        return ""
+    h = gguf_header(model_path)
+    if not h.get("ok"):
+        return ""
+    directory = os.path.dirname(os.path.abspath(model_path)) or "."
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return ""
+    cands, n = [], 0
+    target = os.path.abspath(model_path)
+    for name in names:
+        if n >= 256 or not name.endswith(".gguf"):
+            continue
+        path = os.path.join(directory, name)
+        if os.path.abspath(path) == target:
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size <= 0 or size > (4 << 30):
+            continue
+        n += 1
+        ch = gguf_header(path)
+        if ch.get("ok"):
+            cands.append((path, ch.get("kv") or {}, size))
+    return gemma4_assistant_match(h.get("kv") or {}, cands)
+
+
+def gemma4_draft_measured(model_path, draft_path):
+    """True when draft_path is exactly the assistant the engine would attach."""
+    if not model_path or not draft_path:
+        return False
+    sib = gemma4_assistant_siblings(model_path)
+    return bool(sib) and os.path.abspath(sib) == os.path.abspath(draft_path)
+
+
+def cuda_vmm_indexes(indexes):
+    """True/False if libcuda can answer, None if it cannot (the engine remains the judge).
+
+    Same attribute ggml-cuda.cu stores in devices[id].vmm. indexes are nvidia-smi indexes,
+    which match the CUDA ordinal only because this launcher pins CUDA_DEVICE_ORDER=PCI_BUS_ID.
+    No indexes is None, not a refusal: the caller has not picked cards yet.
+    """
+    if not indexes:
+        return None
+    import ctypes
+    lib = None
+    for name in ("libcuda.so.1", "libcuda.so"):
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            lib = None
+    if lib is None or lib.cuInit(0) != 0:
+        return None
+    for i in indexes:
+        dev = ctypes.c_int()
+        if lib.cuDeviceGet(ctypes.byref(dev), int(i)) != 0:
+            return None
+        val = ctypes.c_int()
+        if lib.cuDeviceGetAttribute(ctypes.byref(val), _VMM_ATTR, dev) != 0:
+            return None
+        if not val.value:
+            return False
+    return True
+
+
+def vmm_offered(rows):
+    """Control may offer --hot-model only when every selected card is Volta or newer and reports VMM.
+
+    Pascal (and anything older) stays hidden until that path is measured, even if the attribute
+    reads yes. A fake GPU table (PXA_LAUNCH_FAKE_GPUS) does not touch the real driver: cc >= 70
+    counts as offered so a dry run can print the flag.
+    """
+    if not rows:
+        return False
+    for r in rows:
+        cc = r[2] if not isinstance(r, dict) else r.get("cc")
+        if not isinstance(cc, int) or cc < 70:
+            return False
+    if os.environ.get("PXA_LAUNCH_FAKE_GPUS", "").strip():
+        return True
+    return cuda_vmm_indexes([r[0] for r in rows]) is True
+
+
 def gpu_table():
     """[(index, name, cc_int, mem_total_MiB, mem_used_MiB, uuid)] or (None, error).
 
@@ -1689,6 +1824,61 @@ def tier_from_provenance_kv(kv):
     return None
 
 
+# One sentence, shared by the launcher and by PXA Control. A standard GGUF quant
+# loads and runs. The speed work (kernels, planner, measured tables) targets the
+# PXQ / PXQN files. Do not describe a standard quant as broken or unusable.
+PXA_QUANT_HREF = "https://huggingface.co/poisonxa"
+STANDARD_GGUF_NOTICE = (
+    "This is a standard GGUF quant. PXA runs it, but its speed work targets PXA quants. "
+    "Get the PXA version: " + PXA_QUANT_HREF)
+_PXA_NAME_RE = re.compile(r"(?:PXQN\d+|PXQ\d+|PXQU|PXQ_UNIVERSAL|PXA4)", re.I)
+_STD_QUANT_RE = re.compile(
+    r"(?:IQ\d(?:_[A-Z0-9]+)?|Q\d_K(?:_[SML])?|Q\d_\d|MXFP4|F16|BF16)", re.I)
+
+
+def is_pxa_quant(name="", kv=None, tensors=None, tier=None, tier_kv=None):
+    """True when the file is one of our tiers (PXQ, PXQN, PXQU, PXA4).
+
+    Any one signal is enough: a tier marker in the filename, a tier the tensor
+    walk already named, a tensor whose ggml type is one of ours, or a provenance
+    key the quantizer writes for those tiers. A plain Q4_K_M / q4_0 / Q8_0 file
+    has none of those.
+    """
+    if _PXA_NAME_RE.search(os.path.basename(str(name or ""))):
+        return True
+    for t in (tier, tier_kv):
+        u = str(t or "").upper()
+        if u.startswith("PXQ") or u.startswith("PXA"):
+            return True
+    if tensors:
+        named, _, _ = tier_from_tensors(tensors)
+        if named:
+            return True
+    if kv:
+        if tier_from_provenance_kv(kv):
+            return True
+        for k in kv:
+            ks = str(k)
+            if ks.startswith("pxa.pxq") or ks.startswith("pxa.pxa"):
+                return True
+    return False
+
+
+def standard_gguf_notice(name="", kv=None, tensors=None, tier=None, tier_kv=None, inspected=False):
+    """The one line for a standard GGUF quant. Empty for a PXA quant.
+
+    `inspected` means the header was read (tier None is then a real answer).
+    A name alone notices only when it names an ordinary quant (Q4_K_M, Q8_0, ...).
+    """
+    if is_pxa_quant(name, kv=kv, tensors=tensors, tier=tier, tier_kv=tier_kv):
+        return ""
+    looked = inspected or tensors is not None or kv is not None
+    named_std = bool(_STD_QUANT_RE.search(os.path.basename(str(name or ""))))
+    if looked or named_std:
+        return STANDARD_GGUF_NOTICE
+    return ""
+
+
 def model_kind(path):
     """M10. gguf | gguf_broken | vllm_dir | hf_dir | lora_dir | weightless_dir |
     not_a_model_file | not_a_model | missing
@@ -1806,6 +1996,11 @@ def model_profile(path, kind):
         p["arch"] = kv.get("general.architecture")
         p["ftype"] = kv.get("general.file_type")
         arch = p["arch"] or ""
+        raw_swa = kv.get(f"{arch}.attention.sliding_window") if arch else None
+        n_swa = raw_swa if isinstance(raw_swa, int) and raw_swa > 0 else 0
+        p["n_swa"] = n_swa
+        # Gemma 4 is interleaved sliding-window attention even when a header omits the count.
+        p["swa"] = n_swa > 0 or arch in GEMMA4_ARCHES
         p["n_expert"] = int(kv.get(f"{arch}.expert_count") or 0)
         if not p["n_expert"]:
             for k, v in kv.items():
@@ -2323,8 +2518,20 @@ R = {
  "R-25": ("REFUSING: --draft-model (external draft-model speculation) has ZERO coverage in this "
           "corpus - no decode, prefill, acceptance or quality number exists for it on any cell. "
           "The only measured speculation here is ngram-mod self-speculation (+23.0% code) and "
-          "MTP n_max=1 (a LOSS on sparse MoE). Re-run with --accept-unmeasured to try it anyway. "
+          "MTP n_max=1 (a LOSS on sparse MoE). The one exception is the Gemma 4 assistant drafter "
+          "that sits next to its target (159-167 t/s on one V100, 85 of 104 drafts accepted). "
+          "Re-run with --accept-unmeasured to try any other file anyway. "
           "vLLM: no draft-model path is emitted by this launcher at all."),
+ "R-31": ("REFUSING: --hot-model on card {i} (compute capability {cc}). Several models in one "
+          "server need CUDA virtual memory, and this launcher keeps that path off on Pascal and "
+          "older until there is a soak test on one. It has run on a P100 in a functional test "
+          "(two 1B models registered on one card and served, one afternoon); that is not a soak. "
+          "Drop --hot-model, or pick a Volta-or-newer card."),
+ "R-32": ("REFUSING: --hot-model needs CUDA virtual memory management on every selected card. "
+          "Card {i} does not report it. This is the same device attribute the engine checks "
+          "before it will register a second model."),
+ "R-33": ("REFUSING: --hot-model on {which}. hot swap supports models without "
+          "sliding-window attention for now; Gemma support is coming"),
  "R-26": ("REFUSING: --np {n}. Concurrency must be >= 1; -c would compute to {ctx} and "
           "--max-num-seqs {n} would be emitted verbatim."),
  "R-27": ("REFUSING: this is a multimodal/VL checkpoint (vision_config / vision tensors present) "
@@ -3623,6 +3830,11 @@ def doctor(a, gpus, gpu_err):
         mb = model_bytes(a.model, kind)
         cls = "MoE" if prof.get("is_moe") else "dense"
         print(f"model        {a.model}")
+        if kind in ("gguf", "gguf_broken") and not prof.get("hdr_err"):
+            _qnote = standard_gguf_notice(a.model, tier=prof.get("tier"), tier_kv=prof.get("tier_kv"),
+                                          inspected=True)
+            if _qnote:
+                print("             " + _qnote)
         print(f"             {mb / BYTES_PER_GIB:.2f} GiB, arch {prof.get('arch') or '?'}, {cls}"
               f"{(' ' + str(prof['n_expert']) + ' experts') if prof.get('is_moe') else ''}, "
               f"tier {prof.get('tier') or 'not PXQ'}, kv heads {prof.get('n_head_kv') or '?'}"
@@ -3994,6 +4206,8 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
               "prompt cache stays off (the release gate ran this way).")
     if a.draft_model:
         cmd += ["-md", a.draft_model]
+    for _hot in a.hot_model or []:
+        cmd += ["--hot-model", _hot]
     if mmproj:
         cmd += ["--mmproj", mmproj]
 
@@ -4073,7 +4287,7 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
     # corpus; a previous version of this file set it unconditionally and its effect
     # on the anchors is UNMEASURED (invariant I-11: never set a lever the anchor was
     # not measured with).
-    return cmd, env
+    return cmd, env, ctx
 
 
 MEASURED_LADDER = [1, 2, 4, 8]      # MEASURED; the fix for the [1,2] cliff at 3+ (task #78)
@@ -6583,6 +6797,11 @@ def plan_and_build(a, gpus):
     print(f"pxa-launch: ENGINE = {plan.engine}")
     size = f", {mbytes / BYTES_PER_GIB:.2f} GiB" if mbytes else ""
     print(f"  model:  {a.model}  [{kind}{size}]")
+    if kind in ("gguf", "gguf_broken") and not prof.get("hdr_err"):
+        _qnote = standard_gguf_notice(a.model, tier=prof.get("tier"), tier_kv=prof.get("tier_kv"),
+                                      inspected=True)
+        if _qnote:
+            print("  " + _qnote)
     if prof.get("shards", 1) > 1:
         print(f"  shards: {prof['shards']} (sized, tiered and fit-checked over all of them)")
         for miss in prof.get("shards_missing") or []:
@@ -6778,7 +6997,39 @@ def plan_and_build(a, gpus):
         if (a.ctk, a.ctv) != ("auto", "auto") and (a.ctk, a.ctv) not in COMPILED_CTKV_PAIRS:
             plan.refuse("R-13L", code=3, k=a.ctk, v=a.ctv)
         if a.draft_model and not a.accept_unmeasured:
-            plan.refuse("R-25", code=3)
+            if gemma4_draft_measured(a.model, a.draft_model):
+                plan.notes.append(GEMMA4_DRAFT_NOTE)
+                print("  ** " + GEMMA4_DRAFT_NOTE)
+            else:
+                plan.refuse("R-25", code=3)
+        if a.hot_model:
+            swa_hit = a.model if prof.get("swa") else None
+            if not swa_hit:
+                for spec in a.hot_model:
+                    tok = (spec or "").split()
+                    head = tok[0] if tok else ""
+                    eq = head.find("=")
+                    path = head[eq + 1:] if eq > 0 else ""
+                    if path and os.path.isfile(path) and model_profile(path, "gguf").get("swa"):
+                        swa_hit = path
+                        break
+            if swa_hit:
+                plan.refuse("R-33", code=3, which=swa_hit)
+            blocked = None
+            for g in sel or []:
+                if not isinstance(g[2], int) or g[2] < 70:
+                    blocked = g
+                    break
+            if blocked is not None:
+                plan.refuse("R-31", code=3, i=blocked[0], cc=blocked[2])
+            elif not os.environ.get("PXA_LAUNCH_FAKE_GPUS", "").strip():
+                verdict = cuda_vmm_indexes([g[0] for g in (sel or [])])
+                if verdict is False:
+                    missing = next((g for g in (sel or []) if cuda_vmm_indexes([g[0]]) is False), None)
+                    plan.refuse("R-32", code=3, i=(missing[0] if missing else "?"))
+                elif verdict is None:
+                    plan.notes.append("--hot-model: this process could not ask libcuda about virtual "
+                                      "memory. The engine still refuses the flag when a card has none.")
     # spec / MTP gates apply on both engines
     m, params = parse_spec(a.spec)
     if m == "mtp":
@@ -6894,8 +7145,8 @@ def plan_and_build(a, gpus):
     # ---- build the command --------------------------------------------------
     ub_expect = sorted({ub_for_card(g[3]) for g in sel}) if sel else ["n/a"]
     if plan.engine == "llama":
-        cmd, env = build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj,
-                                   explain=a.explain)
+        cmd, env, ctx = build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj,
+                                        explain=a.explain)
         used = sel
     else:
         used = plan.elig or sel
@@ -7169,7 +7420,13 @@ def build_parser():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--spec", default="")
-    ap.add_argument("--draft-model", default="")
+    ap.add_argument("--draft-model", default="",
+                    help="Gemma 4 assistant drafter next to the model (-md). Any other file is "
+                         "refused (R-25) unless --accept-unmeasured is also set.")
+    ap.add_argument("--hot-model", action="append", default=None, metavar="NAME=PATH",
+                    help="register another model on this same server (repeatable). The engine "
+                         "keeps each one in host RAM and puts one on the cards. Needs CUDA "
+                         "virtual memory on every selected card; refused on Pascal.")
     ap.add_argument("--ts", default="")
     ap.add_argument("--sm", default="auto",
                     help="split mode: auto (default) | layer | tensor | graph | attn. 'auto' "
@@ -7269,7 +7526,9 @@ def build_parser():
                     help="PXA Control listens on every interface (0.0.0.0) instead of 127.0.0.1. A random "
                          "access token is then required; it is printed at start and kept in a cookie after "
                          "the first visit. Applies to --gui, a bare `pxa` and the Control that starts next "
-                         "to a server.")
+                         "to a server. On the LAN the chat's host access (see `host_access_lan` in the "
+                         "Control config) stays off, because the person approving a command is not "
+                         "necessarily the person at the keyboard.")
     ap.add_argument("--no-browser", action="store_true",
                     help="PXA Control: do not try to open a browser")
     ap.add_argument("--tui", action="store_true",
@@ -7356,8 +7615,8 @@ def run_control(a, argv, L=None):
         print(f"PXA Control: {r['url']}")
         print(f"  already running (pid {r['pid']}), so this did not start a second one.")
         if not a.no_browser and not r.get("lan") and not PC.open_in_browser(r["url"], wait=True):
-            print(f"  no desktop here: from your own computer, `ssh -L {r['port']}:127.0.0.1:{r['port']} "
-                  "<this machine>`, then open the address above. The text menu: pxa --tui")
+            for _ln in PC.headless_hint(r["port"]):
+                print(_ln)
         return 0
     port = explicit
     if not port:
@@ -7395,6 +7654,9 @@ def control_alongside(a, cv=None, pid=None, by="pxa-launch", port=None, model=No
         print(f"  PXA Control: {r['url']}   (already open: this server is on its Servers tab)")
     else:
         print(f"  PXA Control: {r['url']}   (this server live in a browser; --no-control turns it off)")
+    if r.get("port") and not r.get("error"):
+        for _ln in PC.headless_hint(r["port"], r.get("lan")):
+            print(_ln)
     sys.stdout.flush()
     return r
 

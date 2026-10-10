@@ -1,6 +1,8 @@
 // pxa / PXA expert-cache online adaptation -- authored by PXA Network (https://pxanetwork.com).
 // llama-pxa-xcache.cpp -- see llama-pxa-xcache.h for the design. The policy (what to swap, how many per step) is the closed
 // library's (ggml_pxqn_xcache_policy); this file is the mechanism: counter read-back, the two-phase slot copy, the map flips.
+#include "ggml-pxqn-tune.h"
+#include "llama-pxa-tokmiss.h"
 #include "llama-pxa-xcache.h"
 #include "llama.h"
 
@@ -17,6 +19,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -28,8 +32,16 @@
 
 bool llama_pxa_xcache_residency_blocks(void) { return false; }
 void llama_pxa_xcache_tick(llama_model &, int) {}
+bool llama_pxa_xcache_companion_quiet(void) { return false; }
+void llama_pxa_xcache_note_tokens(llama_model &, int) {}
 void llama_pxa_xcache_adaptor_free(llama_model &) {}
 bool llama_pxa_xcache_stats(const struct llama_model *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *) { return false; }
+bool llama_pxa_tokmiss_on() { return false; }
+void llama_pxa_tokmiss_note_request(const int32_t *, int, int, uint64_t) {}
+void llama_pxa_tokmiss_note_batch(const llama_token *, int) {}
+int llama_xcache_draft_keep(const llama_token *, int n, int) { return n; }
+float llama_xcache_token_slots(llama_token) { return -1.f; }
+int llama_xcache_draft_miss_us(const llama_token *, int) { return 0; }   // no expert cache without CUDA: no draft miss bill
 
 #else
 
@@ -81,6 +93,29 @@ static double pxa_xc_probe_cpu_gbs(const void * base, size_t bytes, int threads)
     if (keep == 0x9e3779b97f4a7c15ull) fputc(0, stderr);   // the sums are used
     return us > 0 ? (double) n/(us*1e3) : 0.0;
 }
+
+// The directory we will write. A container whose cache is on its own disk loses the file on remove.
+static void pxa_warn_learned_cache(const std::string & path) {
+    if (path.empty()) return;
+    std::string dir = path;
+    const size_t sl = dir.find_last_of('/');
+    if (sl == std::string::npos) dir = ".";
+    else if (sl == 0) dir = "/";
+    else dir = dir.substr(0, sl);
+    if (access(dir.c_str(), W_OK) != 0) {
+        LLAMA_LOG_WARN("PXA_XCACHE: learned counts cannot be saved. %s is not writable, so they are lost when this process ends.\n", dir.c_str());
+        return;
+    }
+    if (access("/.dockerenv", F_OK) != 0) return;
+    struct stat st_dir, st_root;
+    if (stat(dir.c_str(), &st_dir) != 0 || stat("/", &st_root) != 0) return;
+    if (st_dir.st_dev == st_root.st_dev) {
+        LLAMA_LOG_WARN("PXA_XCACHE: learned counts in %s will be deleted when this container is removed. They are on the container's own disk. Mount a volume on %s and set PXA_CACHE_DIR to that path.\n", dir.c_str(), dir.c_str());
+    }
+}
+
+// llama.cpp. Empty when the learned csv has nowhere writable. Never the curated path.
+bool llama_pxa_xcache_learned_path(const llama_model * model, char * buf, size_t n);
 
 struct llama_model::pxa_xc_adaptor {
     struct lay {
@@ -137,17 +172,23 @@ struct llama_model::pxa_xc_adaptor {
     double pcie_gbs = 0;
     uint64_t n_obs = 0, n_planned = 0, n_started = 0, n_admitted = 0, n_evicted = 0, n_waits = 0;
     int64_t  us_tick = 0, us_obs = 0, n_ticks = 0;     // host time the adaptation itself costs the decode thread
+    uint64_t n_skip_ticks = 0;                          // companion decodes on the quiet path (llama_pxa_xcache_companion_quiet)
     std::vector<uint32_t> prev_hit, prev_miss;       // per layer: counters at the last observation
     std::vector<uint64_t> lay_hit, lay_miss;         // per layer: routings served by the hot stack / sent to the cold path since the start
     uint64_t tot_hit = 0, tot_miss = 0;               // routings served by the hot stack / that went to the cold stack since the start
     uint64_t win_hit = 0, win_miss = 0;               // the same since the last log line
     std::mutex mu;
+    bool learn = false;             // this session writes <model>.expert-counts.learned.csv
+    bool learn_saved = false;       // one log line for the periodic save
+    bool learn_wait_logged = false;
+    std::string learn_path;
 
     explicit pxa_xc_adaptor(llama_model & m) : model(m) {}
 
     ~pxa_xc_adaptor() {
         if (trace) fclose(trace);
         drain();
+        if (learn) persist_learned(true);
         if (pst && pol) pol->destroy(pst);
         pst = nullptr;
         if (stage) ggml_backend_cuda_xcache_pinned_free(stage);
@@ -278,6 +319,7 @@ struct llama_model::pxa_xc_adaptor {
         }
         LLAMA_LOG_INFO("PXA_XCACHE: online adaptation %s: %zu split layers, %zu free cold slots, re-rank every %d decodes, link %.2f GB/s, %s schedule\n",
                 adapt ? "ON" : "observing only", L.size(), any_spare, obs_every, pcie_gbs, det ? "deterministic" : "copy-completion");
+        if (adapt) arm_learn();
         return true;
     }
 
@@ -405,6 +447,138 @@ struct llama_model::pxa_xc_adaptor {
         return c == '0';
     }
 
+
+    int learn_sessions() const {
+        int sessions = 0;
+        FILE * f = fopen((learn_path + ".state").c_str(), "r");
+        if (!f) return 0;
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            int n = 0;
+            if (sscanf(line, "sessions %d", &n) == 1 && n > 0) sessions = n;
+        }
+        fclose(f);
+        return sessions;
+    }
+
+    void learn_write_state(int sessions, int learning) const {
+        if (learn_path.empty()) return;
+        const std::string st = learn_path + ".state";
+        const std::string tmp = st + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "w");
+        if (!f) return;
+        fprintf(f, "sessions %d\nlearning %d\n", sessions < 0 ? 0 : sessions, learning ? 1 : 0);
+        const bool ok = fclose(f) == 0 && rename(tmp.c_str(), st.c_str()) == 0;
+        if (!ok) std::remove(tmp.c_str());
+    }
+
+    void arm_learn() {
+        char buf[4096];
+        if (!llama_pxa_xcache_learned_path(&model, buf, sizeof(buf))) {
+            LLAMA_LOG_WARN("PXA_XCACHE: not saving learned counts. There is no writable directory beside the model or in the cache, so they are lost when this process ends.\n");
+            return;
+        }
+        learn_path = buf;
+        const std::string suf = ".expert-counts.learned.csv";
+        if (learn_path.size() < suf.size() || learn_path.compare(learn_path.size() - suf.size(), suf.size(), suf) != 0) {
+            learn_path.clear();
+            return;
+        }
+        if (const char * forced = getenv("PXA_XCACHE_COUNTS")) {
+            if (learn_path == forced) { learn_path.clear(); return; }
+        }
+        learn = true;
+        learn_write_state(learn_sessions(), 1);
+        pxa_warn_learned_cache(learn_path);
+        LLAMA_LOG_INFO("PXA_XCACHE: learning on; saving counts to %s. The curated file is left as it is.\n", learn_path.c_str());
+    }
+
+    void maybe_persist() {
+        if (learn && n_obs > 0 && (n_obs % 32ull) == 0) persist_learned(false);
+    }
+
+    // The library builds the learned rows. This function packs the prior and the device
+    // counters, then writes the csv. The curated file is never opened for write.
+    // No library: this session does not save learned counts.
+    void persist_learned(bool shutdown) {
+        if (!learn || learn_path.empty() || !stage) return;
+        if (!read_counters()) {
+            if (shutdown) learn_write_state(learn_sessions(), 0);
+            return;
+        }
+        const int n_layer = (int) model.hparams.n_layer;
+        const int n_expert = (int) model.hparams.n_expert;
+        if (n_layer <= 0 || n_expert <= 0) return;
+        int n_main = n_layer - (int) model.hparams.nextn_predict_layers;
+        if (n_main < 0) n_main = 0;
+        if (n_main > n_layer) n_main = n_layer;
+        ggml_pxqn_xcache_learn_build_fn build = ggml_pxqn_xcache_learn_build_get();
+        if (!build) {
+            if (!learn_wait_logged) {
+                LLAMA_LOG_WARN("PXA_XCACHE: not saving learned counts; the library that builds them is not loaded\n");
+                learn_wait_logged = true;
+            }
+            if (shutdown) learn_write_state(learn_sessions(), 0);
+            return;
+        }
+        std::vector<double> prior((size_t) n_layer * (size_t) n_expert, 0.0);
+        for (int il = 0; il < n_layer && il < (int) model.pxa_xc_prior.size(); ++il) {
+            const auto & row = model.pxa_xc_prior[(size_t) il];
+            if ((int) row.size() != n_expert) continue;
+            for (int e = 0; e < n_expert; ++e) prior[(size_t) il * (size_t) n_expert + (size_t) e] = row[(size_t) e];
+        }
+        std::vector<int> obs_il;
+        std::vector<uint32_t> obs;
+        for (size_t i = 0; i < L.size(); ++i) {
+            const int il = L[i].il;
+            if (il < 0 || il >= n_layer || L[i].n_expert != n_expert) continue;
+            const uint32_t * b = stage + L[i].stage_off;
+            obs_il.push_back(il);
+            obs.insert(obs.end(), b, b + n_expert);
+        }
+        std::vector<uint8_t> routed((size_t) n_layer, 0);
+        for (const auto & kv : model.tensors_by_name) {
+            const std::string & name = kv.first;
+            if (name.size() < 4 || name.compare(0, 4, "blk.") != 0) continue;
+            if (name.find("ffn_down_exps.weight") == std::string::npos) continue;
+            const int il = atoi(name.c_str() + 4);
+            if (il >= 0 && il < n_layer) routed[(size_t) il] = 1;
+        }
+        std::vector<uint64_t> counts((size_t) n_layer * (size_t) n_expert, 0);
+        int wait_layer = -1;
+        const int rc = build(n_layer, n_expert, n_main, prior.data(),
+                             obs_il.empty() ? nullptr : obs_il.data(), (int) obs_il.size(),
+                             obs.empty() ? nullptr : obs.data(), routed.data(), counts.data(), &wait_layer);
+        if (rc == 1) {
+            if (shutdown) learn_write_state(learn_sessions(), 0);
+            return;
+        }
+        if (rc == 2) {
+            if (shutdown) learn_write_state(learn_sessions(), 0);
+            if (!learn_wait_logged) {
+                LLAMA_LOG_WARN("PXA_XCACHE: not saving learned counts; layer %d has no counts yet\n", wait_layer);
+                learn_wait_logged = true;
+            }
+            return;
+        }
+        if (rc != 0) {
+            if (shutdown) learn_write_state(learn_sessions(), 0);
+            return;
+        }
+        if (!llama_pxa_xcache_counts_write(&model, counts.data(), n_layer, n_expert, learn_path.c_str())) {
+            if (shutdown) learn_write_state(learn_sessions(), 0);
+            LLAMA_LOG_WARN("PXA_XCACHE: could not save learned counts to %s\n", learn_path.c_str());
+            return;
+        }
+        if (shutdown) {
+            learn_write_state(learn_sessions() + 1, 0);
+            LLAMA_LOG_INFO("PXA_XCACHE: saved learned counts to %s\n", learn_path.c_str());
+        } else if (!learn_saved) {
+            learn_saved = true;
+            LLAMA_LOG_INFO("PXA_XCACHE: saved learned counts to %s\n", learn_path.c_str());
+        }
+    }
+
     void observe_and_plan() {
         if (!read_counters()) return;
         for (size_t i = 0; i < L.size(); ++i) {
@@ -421,9 +595,9 @@ struct llama_model::pxa_xc_adaptor {
         const uint32_t n_tok = tokens_since_obs;
         tokens_since_obs = 0;
         ticks_since_obs = 0;
-        if (!pst) return;
+        if (!pst) { maybe_persist(); return; }
         pol->observe(pst, n_tok, obs.data());
-        if (!adapt || broken || held()) return;
+        if (!adapt || broken || held()) { maybe_persist(); return; }
         size_t eb_sum = 0;
         for (size_t i = 0; i < L.size(); ++i) {
             views[i].map     = L[i].map.data();
@@ -449,14 +623,16 @@ struct llama_model::pxa_xc_adaptor {
             }
             n_planned += n;
             for (int32_t k = 0; k < n; ++k) start_swap(plan_out[k]);
+            maybe_persist();
             return;
         }
         const int32_t n_budget = pol->swap_budget(pst, n_tok);
-        if (n_budget <= 0) return;
+        if (n_budget <= 0) { maybe_persist(); return; }
         const uint64_t budget_bytes = (uint64_t) n_budget * (eb_sum / L.size());
         const int32_t n = pol->plan(pst, views.data(), budget_bytes, plan_out.data(), (int32_t) plan_out.size());
         n_planned += n > 0 ? n : 0;
         for (int32_t k = 0; k < n; ++k) start_swap(plan_out[k]);
+        maybe_persist();
     }
 
     void start_swap(const ggml_pxqn_xc_swap & sw) {
@@ -582,6 +758,8 @@ struct llama_model::pxa_xc_adaptor {
                 (unsigned long long) n_started, (unsigned long long) n_admitted, (unsigned long long) n_evicted, ops.size(),
                 (unsigned long long) n_waits, (unsigned long long) n_obs,
                 n_ticks ? (double) us_tick/(double) n_ticks : 0.0, n_obs ? (double) us_obs/(double) n_obs : 0.0);
+        if (n_skip_ticks) LLAMA_LOG_INFO("PXA_XCACHE%s: skipped %llu companion ticks (their tokens still count toward the swap budget)\n",
+                tag, (unsigned long long) n_skip_ticks);
         win_hit = win_miss = 0;
         if (tag && *tag && env_int("PXA_XCACHE_SUMMARY_LAYERS", 1)) {      // the summary also names where the misses are
             std::string ln;
@@ -614,10 +792,64 @@ struct llama_model::pxa_xc_adaptor {
     }
 };
 
-void llama_pxa_xcache_tick(llama_model & model, int n_tokens) {
+
+static llama_model * pxa_xc_miss_model = nullptr;
+
+// PXA_XCACHE_MISS_TOKEN (default off): the token-aware bill (src/llama-pxa-tokmiss.h). The worker reports every served cold
+// request, llama_decode reports every main-model batch; the bill of a draft is the measured cold slots of its tokens.
+static pxa_tokmiss g_pxa_tokmiss;
+bool llama_pxa_tokmiss_on() {
+    static const bool on = [] { const char * e = getenv("PXA_XCACHE_MISS_TOKEN"); const bool v = e && atoi(e) != 0;
+        if (v) fprintf(stderr, "PXA_XCACHE_MISS_TOKEN: 1 (draft miss bill from measured per-token cold slots)\n");
+        return v; }();
+    return on;
+}
+static double pxa_tokmiss_fallback_us() {
+    static const double v = [] { const char * e = getenv("PXA_XCACHE_MISS_SLOT_US"); return e && atof(e) > 0 ? atof(e) : 60.0; }();
+    return v;
+}
+void llama_pxa_tokmiss_note_request(const int32_t * ids, int n_used, int ntok, uint64_t us) {
+    g_pxa_tokmiss.note_request(ids, n_used, ntok, us);
+}
+void llama_pxa_tokmiss_note_batch(const llama_token * tok, int n) { g_pxa_tokmiss.note_batch(tok, n); }
+int llama_xcache_draft_keep(const llama_token * tokens, int n, int budget_us) {
+    if (!llama_pxa_tokmiss_on() || n <= 1 || !tokens) return n;
+    return g_pxa_tokmiss.keep(tokens, n, budget_us, pxa_tokmiss_fallback_us());
+}
+
+float llama_xcache_token_slots(llama_token tok) { return llama_pxa_tokmiss_on() ? g_pxa_tokmiss.slots(tok) : -1.f; }
+
+int llama_xcache_draft_miss_us(const llama_token * tokens, int n) {
+    if (llama_pxa_tokmiss_on() && tokens && n > 0) return g_pxa_tokmiss.bill_us(tokens, n, pxa_tokmiss_fallback_us());
+    llama_model * m = pxa_xc_miss_model;
+    if (!m || n <= 0 || m->pxa_xc.empty()) return 0;
+    int cold = 0;
+    for (const auto & lay : m->pxa_xc) if (!lay.cold.empty()) cold++;
+    // Measured 484 us per cold layer at width 4. Scale by draft length. Not a per-token router yet.
+    return cold * 484 * n / 4;
+}
+
+static std::mutex & pxa_xc_tick_mu() { static std::mutex mu; return mu; }
+
+bool llama_pxa_xcache_companion_quiet(void) {
+    static const bool on = (ggml_pxqn_tune_flags() & GGML_PXQN_TUNE_COMPANION) != 0;
+    return on;
+}
+
+void llama_pxa_xcache_note_tokens(llama_model & model, int n_tokens) {
     if (model.pxa_xc.empty()) return;
-    static std::mutex g_mu;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(pxa_xc_tick_mu());
+    auto * a = model.pxa_xc_ad;
+    if (!a || !a->active) return;   // not initialised yet: the first target tick does that
+    a->tokens_since_obs += (uint32_t) std::max(n_tokens, 0);
+    ++a->n_skip_ticks;
+}
+
+void llama_pxa_xcache_tick(llama_model & model, int n_tokens) {
+    // PXA_XCACHE_CPU_OVERLAP is not implemented. Do not bump n_tokens and call it overlap.
+    pxa_xc_miss_model = &model;
+    if (model.pxa_xc.empty()) return;
+    std::lock_guard<std::mutex> lock(pxa_xc_tick_mu());
     if (!model.pxa_xc_ad) {
         auto * a = new llama_model::pxa_xc_adaptor(model);
         a->active = a->init();

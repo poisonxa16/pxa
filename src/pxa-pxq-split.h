@@ -48,6 +48,7 @@ static inline bool pxa_pxq_type_is_panel(enum ggml_type t) {
         case GGML_TYPE_PXQN1:
         case GGML_TYPE_PXQN4S8:
         case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXA4:      // blck_size 128
             return true;
         default:
             return false;
@@ -124,7 +125,7 @@ static inline bool pxa_kwin_get(const struct ggml_tensor * t, int * lo, int * hi
 static inline bool pxa_type_is_pxqn(enum ggml_type t) {
     switch (t) {
         case GGML_TYPE_PXQN3: case GGML_TYPE_PXQN3S8: case GGML_TYPE_PXQN4: case GGML_TYPE_PXQN2:
-        case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5: case GGML_TYPE_PXA4:
             return true;
         default:
             return false;

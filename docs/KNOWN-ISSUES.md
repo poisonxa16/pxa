@@ -424,8 +424,8 @@ empty one.
 own access code and its own name, sent concurrently to a two-slot server: **8 of 8** answers
 carried their own code and their own name and never the other request's, and **6 of 6** sequentially.
 Attention, the masks and the KV cache are right with two sequences resident. The gate that proves
-it is `cneedle.py` in the speed-campaign tree, and it is what I now run against a two-slot server
-instead of comparing a checksum on a degenerate prompt.
+it is the two-slot needle test described here: two different retrieval prompts sent at once,
+each hiding its own access code and its own name, instead of one checksum on a degenerate prompt.
 
 **What moves, then.** When two slots prefill at the same time, one ubatch ends up carrying the tail
 of one prompt and the head of the other. The tokens and the mask are right, but the ubatch is a

@@ -162,8 +162,9 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
     const std::string & grammar_str = common_grammar_value(params.grammar);
     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
 #ifdef LLAMA_USE_LLGUIDANCE
-        grmr = llama_sampler_init_llg(vocab, "lark", params.grammar.c_str());
-        result->grammar = grmr;
+        const char * src = grammar_str.c_str() + 11;
+        if (*src == ' ' || *src == '\n') ++src;
+        result->llg = llama_sampler_init_llg(vocab, "lark", src);
 #else
         GGML_ABORT("llguidance (cmake -DLLAMA_LLGUIDANCE=ON) is not enabled");
 #endif // LLAMA_USE_LLGUIDANCE
@@ -342,6 +343,9 @@ void common_sampler_free(struct common_sampler * ctx) {
     if (ctx->grammar) {
         llama_grammar_free(ctx->grammar);
     }
+    if (ctx->llg) {
+        llama_sampler_free(ctx->llg);
+    }
     if (ctx->smpl)
         llama_sampler_dry_free(ctx->smpl);
     if (ctx->adapt_p_ctx)
@@ -378,6 +382,7 @@ void common_sampler_reset(common_sampler * ctx) {
         ctx->params.dry_multiplier = ctx->user_dry;
     }
     llama_sampler_dry_reset(ctx->smpl);
+    if (ctx->llg) llama_sampler_reset(ctx->llg);
 }
 
 void common_sampler_review(common_sampler * ctx, const size_t n_unsent, const bool rewind_status) {
@@ -412,6 +417,13 @@ void common_sampler_clone(common_sampler * src, common_sampler * dst) {
         dst->grammar_root = src->grammar_root;
         dst->grammar_str = src->grammar_str;
         dst->grammar = llama_grammar_copy(src->grammar);
+    }
+    if (dst->llg) {
+        llama_sampler_free(dst->llg);
+        dst->llg = nullptr;
+    }
+    if (src->llg && src->llg->iface->clone) {
+        dst->llg = src->llg->iface->clone(src->llg);
     }
 
     dst->prev = src->prev;
@@ -1055,6 +1067,9 @@ static llama_token llama_sampling_sample_impl_default(
     float * logits = llama_get_logits_ith(ctx_main, idx);
     // apply reasoning budget first
     common_reasoning_budget_apply(rbudget, &cur_p);
+    if (ctx_sampling->llg) {
+        llama_sampler_apply(ctx_sampling->llg, &cur_p);
+    }
     // Sample grammar first for resampling
     if (ctx_sampling->grammar != NULL && grammar_first && grammar_should_apply(ctx_sampling)) {
         // Apply grammar constraints to all candidates
@@ -1308,6 +1323,9 @@ void common_sampler_accept(
 
     if (ctx_sampling->grammar && accept_grammar) {
         llama_grammar_accept_token(ctx_sampling->grammar, ctx_main, token);
+    }
+    if (ctx_sampling->llg && accept_grammar) {
+        llama_sampler_accept(ctx_sampling->llg, token);
     }
     if (ctx_sampling->smpl) {
         llama_sampler_dry_accept(ctx_sampling->smpl, token);
@@ -2380,4 +2398,88 @@ llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, str
         return shortlist[best_id];
     }
     return best_id;
+}
+
+// PXA_MTP_DRAFT_GUARD: see sampling.h.
+bool common_sampler_draft_guard_wanted(const struct common_sampler * cs) {
+    if (cs == nullptr) return false;
+    if (!(cs->params.temp <= 0.0f)) return false;      // temp > 0 has its own lossless rule (PXA_SPEC_SAMPLED)
+    if (cs->grammar != nullptr) return false;
+    return pxa_topk_raw_penalties_active(cs) || common_sampler_dry_active(cs);
+}
+
+llama_token common_sampler_draft_greedy_guarded(struct common_sampler * cs, struct llama_context * ctx, int idx,
+        const std::vector<llama_token> * chain, float * out_prob) {
+    if (!common_sampler_draft_guard_wanted(cs)) return -1;
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (logits == nullptr) return -1;
+    const llama_model * model = llama_get_model(ctx);
+    const int n_vocab  = llama_n_vocab(model);
+    const int n_logits = llama_n_logits(ctx);
+    const int32_t * shortlist = n_logits < n_vocab ? llama_mtp_shortlist_rows(model) : nullptr;
+    if (shortlist && llama_mtp_shortlist_n_rows(model) != n_logits) shortlist = nullptr;
+    const int n_scan = shortlist ? n_logits : n_vocab;
+
+    static const int W_env = [] { const char * e = getenv("PXA_MTP_DRAFT_GUARD_W"); const int v = e ? atoi(e) : 16; return v >= 2 && v <= 128 ? v : 16; }();
+    pxa_topk_window w;
+    w.W = std::min(W_env, n_scan);
+    pxa_topk_scan(logits, nullptr, n_scan, w);
+    if (w.cnt <= 0) return -1;
+
+    std::vector<llama_token_data> cand(w.cnt);
+    for (int i = 0; i < w.cnt; ++i) cand[i] = { shortlist ? shortlist[w.wid[i]] : (llama_token) w.wid[i], w.wl[i], 0.0f };
+    if (shortlist) llama_mtp_shortlist_count_draw();
+
+    const auto & params = cs->params;
+    // 1. repetition penalty over the last penalty_last_n tokens of (prev ++ chain), the verify path's formula
+    if (pxa_topk_raw_penalties_active(cs)) {
+        const int32_t penalty_last_n = params.penalty_last_n < 0 ? params.n_prev : params.penalty_last_n;
+        const auto & base = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : cs->prev;
+        const int n_chain = chain ? (int) chain->size() : 0;
+        const int total   = (int) base.size() + n_chain;
+        const int used    = std::min(total, penalty_last_n);
+        std::unordered_map<llama_token, int> count;
+        for (int k = total - used; k < total; ++k) {
+            const llama_token t = k < (int) base.size() ? base[k] : (*chain)[k - (int) base.size()];
+            count[t]++;
+        }
+        const llama_token nl_token = llama_token_nl(model);
+        for (auto & c : cand) {
+            if (!params.penalize_nl && c.id == nl_token) continue;
+            const auto it = count.find(c.id);
+            if (it == count.end()) continue;
+            if (c.logit <= 0) c.logit *= params.penalty_repeat; else c.logit /= params.penalty_repeat;
+            c.logit -= float(it->second) * params.penalty_freq + float(it->second > 0) * params.penalty_present;
+        }
+    }
+    // 2. the request's DRY stage, fed the chain on a clone so the request's own state is untouched
+    llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+    if (common_sampler_dry_active(cs)) {
+        if (chain == nullptr || chain->empty()) {
+            llama_sample_dry(ctx, cs->smpl, &arr);
+        } else {
+            llama_sampler_dry * d = llama_sampler_dry_clone(cs->smpl);
+            if (d) {
+                for (const llama_token t : *chain) llama_sampler_dry_accept(d, t);
+                llama_sample_dry(ctx, d, &arr);
+                llama_sampler_dry_free(d);
+            }
+        }
+    }
+    // 3. argmax of the penalised window (ties: the earlier, i.e. raw-higher, candidate)
+    size_t best = 0;
+    for (size_t i = 1; i < arr.size; ++i) if (arr.data[i].logit > arr.data[best].logit) best = i;
+    if (out_prob) {
+        double z = 0.0;
+        const float mx = arr.data[best].logit;
+        for (size_t i = 0; i < arr.size; ++i) z += std::exp((double) (arr.data[i].logit - mx));
+        *out_prob = (float) (1.0 / z);
+    }
+    static std::atomic<long long> n_draw{0}, n_moved{0};
+    const long long nd = ++n_draw; if (best != 0) n_moved++;
+    static const bool stats = getenv("PXA_MTP_DRAFT_GUARD_STATS") != nullptr;
+    if (stats && (nd % 512) == 0) {
+        fprintf(stderr, "PXA_MTP_DRAFT_GUARD: %lld draws, %lld moved off the raw argmax\n", nd, n_moved.load());
+    }
+    return arr.data[best].id;
 }

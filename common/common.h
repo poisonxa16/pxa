@@ -381,6 +381,7 @@ struct gpt_params {
     std::string model                = ""; // model path
     std::string model_alias          = "unknown"; // model alias
     std::vector<std::string> hot_models;          // PXA hot swap: --hot-model 'NAME=PATH [flags]' (server)
+    int sleep_idle_seconds       = 0;              // PXA: park the model after this many idle seconds (0 = off)
     std::string model_url            = ""; // model url to download
     std::string hf_token             = ""; // HF token
     std::string hf_repo              = ""; // HF repo

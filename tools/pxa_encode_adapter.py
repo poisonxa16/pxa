@@ -23,6 +23,8 @@ Contract (from the licence server's PACKAGE.md; each item below is one function 
       --lock auto|personal|supporters|open (Pro, PXQN tiers; an encoder that knows it lists `make.lock_modes` in `info --json`). What the licence server allows
       for the key comes back as `lock: {enabled, allowed_modes, default_mode, epoch}` in `pxqe status` and in `licence.lock` of `info --json --check-licence`;
       the `done` line then carries `lock`, `lock_file_id`, `lock_epoch` of a locked file.
+      --counts | --no-counts and --allow-no-counts (a model with experts gets an `expert counts` stage that writes
+      `<out>.expert-counts.csv`; without --allow-no-counts a failed stage fails the run, so a file is not shipped without it).
       stdout lines that start with `@pxqe ` carry one JSON object each: plan / stage (start|progress|done|skipped) / done / error;
       exit codes 0 done, 1 a stage failed (state kept), 2 cannot run here / bad arguments, 3 refused by the licence server, 130 stopped.
       The SAME command again resumes from <work>/state.json. The key goes in the environment (PXQE_KEY / PXQE_SERVER), never argv.
@@ -55,7 +57,7 @@ REQUANTIZE_ARGS = ("--allow-requantize", "--i-know-this-is-double-lossy")
 # licence.state words the encoder may use -> the few states the page knows. Unknown words are "unknown":
 # the page never trusts this for anything but wording (the encoder and the licence server enforce).
 _STATE_MAP = {"valid": "valid", "ok": "valid", "active": "valid", "licensed": "valid",
-              "expired": "expired", "revoked": "revoked", "disabled": "revoked", "banned": "revoked", "suspended": "suspended", "paused": "paused",
+              "expired": "expired", "revoked": "revoked", "disabled": "disabled", "banned": "revoked", "suspended": "suspended", "paused": "paused",
               "refused": "refused", "none": "no_key", "missing": "no_key", "no_key": "no_key", "nokey": "no_key", "unset": "no_key",
               "no_server": "no_server", "unchecked": "unchecked", "unknown": "unchecked", "offline": "offline", "unreachable": "offline",
               "no_quota": "no_quota", "exhausted": "no_quota", "quota": "no_quota"}
@@ -475,6 +477,122 @@ def argv_run(cli, src, dst, hdir=None, act=None, device=None, resume=None, layer
     return cli_argv(cli, a)
 
 
+COUNTS_SUFFIX = ".expert-counts.csv"
+COUNTS_HEADER = "tensor,expert,count"
+
+
+def counts_file(model_gguf):
+    """Where the routing counts of a made GGUF live: `<model>.expert-counts.csv`, beside the file. This is the path the
+    engine looks for first (`src/llama.cpp` pxa_xcache_counts_candidates), so the encoder must write exactly this one."""
+    return model_gguf + COUNTS_SUFFIX
+
+
+def argv_counts(cli, model_gguf, calib, out_csv):
+    """`pxqe counts --src FILE.gguf --calib CALIB.txt --out CSV`: the per-expert routing counts of a finished model, in the
+    `tensor,expert,count` format the engine reads. `make` runs this stage itself for a model with experts; this verb is for a
+    file made before the stage existed, or by another tool. The calibration text is the same kind of mixed prose + code."""
+    return cli_argv(cli, ["counts", "--src", model_gguf, "--calib", calib, "--out", out_csv])
+
+
+def counts_check(path, max_bad=5):
+    """Read a counts file the way the engine will, and say whether it is usable: -> {"ok", "rows", "tensors", "why"}.
+    The header must be exactly `tensor,expert,count` and every row `name,int,int`; a file with no rows is not usable (the
+    planner would fall back to the startup bootstrap, which is the thing this file exists to avoid). `why` is a plain
+    sentence for the log; the first few bad lines are named, the rest are counted."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        return {"ok": False, "rows": 0, "tensors": 0, "why": "cannot read it: %s" % e.strerror}
+    if not lines:
+        return {"ok": False, "rows": 0, "tensors": 0, "why": "the file is empty"}
+    if lines[0].strip() != COUNTS_HEADER:
+        return {"ok": False, "rows": 0, "tensors": 0, "why": "the header is %r, not %r" % (lines[0].strip()[:60], COUNTS_HEADER)}
+    tensors, rows, bad = set(), 0, []
+    for n, line in enumerate(lines[1:], 2):
+        if not line.strip():
+            continue
+        parts = line.split(",")
+        if len(parts) != 3 or not parts[0] or not parts[0].strip():
+            if len(bad) < max_bad:
+                bad.append("line %d: %s" % (n, line[:60]))
+            continue
+        try:
+            ex, ct = int(parts[1]), int(parts[2])
+        except ValueError:
+            if len(bad) < max_bad:
+                bad.append("line %d: %s" % (n, line[:60]))
+            continue
+        if ex < 0 or ct < 0:
+            if len(bad) < max_bad:
+                bad.append("line %d: %s" % (n, line[:60]))
+            continue
+        tensors.add(parts[0].strip())
+        rows += 1
+    if bad:
+        return {"ok": False, "rows": rows, "tensors": len(tensors), "why": "not a counts file: %s" % "; ".join(bad)}
+    if not rows:
+        return {"ok": False, "rows": 0, "tensors": 0, "why": "it has the header but no expert rows"}
+    return {"ok": True, "rows": rows, "tensors": len(tensors), "why": ""}
+
+
+COUNTS_TIMEOUT_S = 3600          # counting reads the whole model once, at calibration speed: a long job, not a probe
+
+
+def counts_temp(out_csv):
+    """The name a counts run writes while it runs. The file appears at `out_csv` only by rename(), so a run that dies
+    half-way leaves a `.part` next to the model and never a CSV the engine would read as if it were finished."""
+    return out_csv + ".part"
+
+
+def counts_run(cli, model_gguf, calib, out_csv, timeout=COUNTS_TIMEOUT_S, overwrite=False):
+    """Run `pxqe counts` for one finished model and put the file in place only when it is usable: -> {"ok","rows",
+    "tensors","why","code","argv"}. This is the one path that writes a counts file from Control, so it is also the path
+    that must never leave a partial one: the encoder writes to a temp name, the result is read back the way the engine
+    will read it, and only then is it renamed onto `out_csv`. An existing file is kept unless `overwrite` - the counts
+    of a model are a fact about that model, and a second run must not quietly replace one that is already there."""
+    argv = argv_counts(cli, model_gguf, calib, counts_temp(out_csv))
+    res = {"ok": False, "rows": 0, "tensors": 0, "why": "", "code": "", "argv": argv}
+    if os.path.isfile(out_csv) and not overwrite:
+        res["why"] = "it already exists (tick overwrite to count the model again)"
+        res["code"] = "counts-exists"
+        return res
+    tmp = counts_temp(out_csv)
+    try:                                  # a stale .part from an earlier crash must not be read as this run's output
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+    rc, _out, err = run_cli(cli, argv[1:], timeout=timeout)
+    if rc != 0:
+        res["why"] = (err.strip().splitlines() or [""])[-1][:200] or ("the encoder stopped with code %d" % rc)
+        res["code"] = "counts-failed"
+        _unlink(tmp)
+        return res
+    chk = counts_check(tmp)
+    if not chk["ok"]:
+        res["why"] = chk["why"]
+        res["code"] = "counts-failed"
+        _unlink(tmp)
+        return res
+    try:
+        os.replace(tmp, out_csv)          # same folder, so this is one rename: the CSV is complete or absent, never half
+    except OSError as e:
+        res["why"] = "counted, but the file could not be put in place: %s" % e.strerror
+        res["code"] = "counts-failed"
+        _unlink(tmp)
+        return res
+    res.update({"ok": True, "rows": chk["rows"], "tensors": chk["tensors"]})
+    return res
+
+
+def _unlink(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def argv_quantize(cli, src, dst, ftype, threads, allow_requantize=False):
     """The classic tiers (both editions): `pxqe quantize [flags] SRC DST FTYPE THREADS`. Quantizing from a Q8_0 GGUF is a second lossy
     pass: the public quantizer refuses it unless BOTH --allow-requantize and --i-know-this-is-double-lossy are given (so the
@@ -499,7 +617,7 @@ def is_classic(tier):
 # ---------------------------------------------------------------------------------------------
 # make's stage names -> the ids of the stage bars on Control's page (the page's words are older than the encoder's).
 MAKE_STAGE_ID = {"fetch": "download", "convert": "convert", "q8": "reference", "skeleton": "skeleton", "dump": "dump", "hess": "hessians",
-                 "encode": "encode", "quantize": "quantize", "verify": "verify"}
+                 "encode": "encode", "quantize": "quantize", "counts": "counts", "verify": "verify"}
 JOB_STAGE_MAKE = {v: k for k, v in MAKE_STAGE_ID.items()}
 _MAKE_STATES = ("start", "progress", "done", "skipped")
 
@@ -525,12 +643,14 @@ def make_env(info, tier, key=None, server=None, python=None):
 
 
 def argv_make(cli, source, tier, out, work, device=None, python=None, engine=None, gpu_layers=None, threads=None, keep_work=False,
-              overwrite=False, quantizer_args=(), lock=None):
+              overwrite=False, quantizer_args=(), lock=None, counts=None, allow_no_counts=False):
     """`pxqe make SOURCE --tier T --out FILE --work DIR [...]`. SOURCE is a Hugging Face repo, a model folder or a .gguf. The SAME argv again
     resumes (state lives in <work>/state.json), so a job keeps its argv. `device` is the CUDA device for the GPU stages (an index into the
     job's CUDA_VISIBLE_DEVICES); `engine` is a PXA engine folder whose GPU calibration tool is used when it carries the hook. `lock` is who may load the
     finished file (personal | supporters | open; Pro, PXQN tiers, an encoder that lists make.lock_modes), or None for no flag. The lock is part of
-    what a started job is, so a resume passes the same one."""
+    what a started job is, so a resume passes the same one. `counts` asks for the expert-counts stage (True / False / None = whatever the
+    encoder decides from the model: on for a model with experts) and `allow_no_counts` makes a counts failure a warning instead of a failed
+    run, which is what a Control that will publish the file must NOT set."""
     a = ["make", source, "--tier", tier, "--out", out, "--work", work]
     if device is not None:
         a += ["--device", str(int(device))]
@@ -546,11 +666,23 @@ def argv_make(cli, source, tier, out, work, device=None, python=None, engine=Non
         a.append("--keep-work")
     if overwrite:
         a.append("--overwrite")
+    if counts is True:
+        a.append("--counts")
+    elif counts is False:
+        a.append("--no-counts")
+    if allow_no_counts:
+        a.append("--allow-no-counts")
     for q in quantizer_args or ():
         a.append("--quantizer-arg=" + q)
     if lock in LOCK_MODES:
         a += ["--lock", lock]
     return cli_argv(cli, a)
+
+
+def supports_counts(info):
+    """An encoder whose `info --json` lists a `counts` stage writes the expert-counts file during `make`. An older
+    encoder does not, and Control must not pass it the flag: it would refuse the whole run over an unknown argument."""
+    return any(isinstance(r, dict) and r.get("name") == "counts" for r in (info or {}).get("stages") or [])
 
 
 def stages_not_ready(info, needed):
@@ -637,7 +769,7 @@ _MAKE_HINT = {
     "gated": "Accept the model's licence on huggingface.co and set HF_TOKEN, then press Resume.",
     "not-found": "Check the model name.",
     "no-weights": "Pick a model that has .safetensors files, or a GGUF file.",
-    "disk-full": "Free some space (or pick another work folder in Advanced) and press Resume.",
+    "disk-full": "Free some space and press Resume. (A started job keeps its folders: for another work folder, start a new encode and pick it in step 2, Advanced.)",
     "no-tool": "Encode tab, Rescan. If it stays, reinstall the encoder (Get the encoder).",
     "no-runtime": "Encode tab, Download the GPU runtime (one time), then press Resume.",
     "no-python-packages": "Install them with pip (the Checks list names them), then start again.",
@@ -651,6 +783,8 @@ _MAKE_HINT = {
     "bad-gguf": "Pick a complete GGUF file.",
     "no-file": "Pick a file that exists.",
     "stopped": "Press Resume to continue where it stopped.",
+    "counts-failed": "The model file itself is finished. Press Resume to write the expert counts again; a file without them is "
+                     "slower to load, not broken.",
 }
 
 
@@ -671,6 +805,11 @@ def explain_make_failure(rc, err=None, text=""):
         return dict(ex, resumable=False)
     if code == "stopped" or rc == 130:
         return {"code": "stopped", "message": MAKE_EXIT_TEXT[130], "hint": "", "resumable": True}
+    if code == "counts-failed":
+        # the model file is written; only the routing counts are missing, so this is a warning that needs one more step, not a lost run
+        return {"code": "counts-failed",
+                "message": msg if msg.endswith((".", "!", "?")) else (msg + "." if msg else "The expert routing counts could not be written."),
+                "hint": _MAKE_HINT["counts-failed"], "resumable": True}
     if code == "quantize-failed" and _RX_COMPOSITION.search(blob):
         return dict(explain_failure(blob, rc), resumable=False)
     if msg:
@@ -678,7 +817,7 @@ def explain_make_failure(rc, err=None, text=""):
         pre = explain_failure(blob, rc)
         if pre["code"] in ("device_limit", "paused"):          # Resume on this machine cannot succeed until the key is moved or resumed
             return dict(pre, resumable=False)
-        if pre["code"] in ("no_quota", "revoked", "bad_key", "old_build", "offline", "lib_unloadable", "runtime_missing", "no_driver", "oom", "tier_locked") + LOCK_CODES:
+        if pre["code"] in ("no_quota", "revoked", "expired", "suspended", "disabled", "bad_key", "old_build", "offline", "lib_unloadable", "runtime_missing", "no_driver", "oom", "tier_locked") + LOCK_CODES:
             return dict(pre, resumable=resumable)
         return {"code": code or "failed", "message": msg if msg.endswith((".", "!", "?")) else msg + ".",
                 "hint": _MAKE_HINT.get(code) or ("Press Resume to try again." if resumable else "Open the log for details."), "resumable": resumable}
@@ -825,9 +964,18 @@ _FAILS = [
     (r"(?:said|HTTP) 402|no encodes left|quota", "no_quota",
      "You have no encodes left on this key.",
      "Encodes come back when your monthly quota resets. Meanwhile the Free encoder (classic PXQ tiers) still works."),
-    (r"(?:said|HTTP) 403|revoked|has expired|key (is )?expired|suspended|account disabled", "revoked",
-     "The licence server refused this key: it is revoked, expired or suspended.",
-     "Check your supporter role in the PXA Network Discord (use /encoder) for a fresh key, or use the Free encoder."),
+    (r"has expired|key (is )?expired", "expired",
+     "This key has expired.",
+     "Run /encoder in the PXA Network Discord for a fresh key (your supporter role must be active), or use the Free encoder."),
+    (r"suspended", "suspended",
+     "This key is suspended.",
+     "Ask an admin in the PXA Network Discord; a new key does not help while it is suspended. The Free encoder still works."),
+    (r"account (is )?disabled|disabled account|user (is )?disabled", "disabled",
+     "Your PXA account is disabled.",
+     "Ask an admin in the PXA Network Discord. The Free encoder still works."),
+    (r"(?:said|HTTP) 403|revoked", "revoked",
+     "The licence server refused this key: it was revoked.",
+     "Run /encoder in the PXA Network Discord for a fresh key (your supporter role must be active), or use the Free encoder."),
     (r"(?:said|HTTP) 401|invalid key|not recognised", "bad_key",
      "The licence server does not recognise this key.", "Check the key you pasted (it starts with pxk1.), or ask for a new one in the PXA Network Discord (/encoder)."),
     (r"(?:said|HTTP) 409|unknown build|build .* (not accepted|unknown)|not supported any more", "old_build",
@@ -853,7 +1001,7 @@ _FAILS = [
     (r"out of memory|cudaErrorMemoryAllocation|CUDA error: out of memory|cusolver.*alloc", "oom",
      "The card ran out of memory during the encode.",
      "Stop any server using it (Servers tab) and Resume, or pick a card with more free memory."),
-    (r"No space left on device|disk full", "disk_full", "The disk is full.", "Free some space (or pick another work folder) and Resume."),
+    (r"No space left on device|disk full", "disk_full", "The disk is full.", "Free some space and Resume. (A started job keeps its folders: for another work folder, start a new encode and pick it in step 2, Advanced.)"),
     (r"tier .*not (allowed|licensed)|not allowed for this key", "tier_locked",
      "This key does not include that tier.", "Pick another tier, or upgrade (Valued Supporter has all tiers)."),
     (r"invalid ftype|unknown quant|unrecognized quantization|not a valid quantization", "bad_tier",
@@ -861,7 +1009,9 @@ _FAILS = [
 ]
 
 
-_RX_COMPOSITION = re.compile(r"PXQ composition assertion: target (\S+).*?produced ([\d.]+)% PXQ-family bytes \(floor (\d+)%")
+# Two wordings: the v2026.10 / v3 quantizer says "produced 43.8% PXQ-family bytes (floor 50%; ...)"; since 2026-10-04 (c232f82b3c, resident-only
+# floor) it says "produced 36.4% PXQ-family bytes of its resident weights (0.62 GiB; ...) [and ZERO bytes of the named tier X] (floor 50%; ...)".
+_RX_COMPOSITION = re.compile(r"PXQ composition assertion: target (\S+).*?produced ([\d.]+)% PXQ-family bytes\b.*?\(floor (\d+)%")
 _RX_INFORMATIVE = re.compile(r"(failed to quantize:|error|assert|cannot|can't|refus|invalid|unsupported|not supported)", re.I)
 
 
@@ -934,7 +1084,7 @@ def explain_failure(text, rc=None):
     m = _RX_COMPOSITION.search(blob)
     if m:       # the public quantizer's own refusal on a small model (the embedding table is a big share of the file)
         return {"code": "composition", "message": "The quantizer refused to write this file: only %s%% of it would be in the %s tier (it needs at least %s%%), so the "
-                "file would misrepresent what it contains. This happens on small models, where the embedding table is a large part of the file." % (m.group(2), m.group(1), m.group(3)),
+                "file would misrepresent what it contains. This happens on small models, where the embedding and output tables are a large part of the file." % (m.group(2), m.group(1), m.group(3)),
                 "hint": "Pick a higher tier, or a larger model."}
     for rx, code, msg, hint in _FAILS:
         if re.search(rx, blob, re.I):

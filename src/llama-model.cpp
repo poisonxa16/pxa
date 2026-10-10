@@ -2075,6 +2075,7 @@ std::string llama_model_ftype_name_from_content(const llama_model & model) {
         { GGML_TYPE_PXQN1,   "PXQN1 - 1.25 bpw" },
         { GGML_TYPE_PXQN4S8, "PXQN4S8 - 4.50 bpw" },
         { GGML_TYPE_PXQN5,   "PXQN5 - 5.25 bpw" },
+        { GGML_TYPE_PXA4,    "PXA4 - 5.06 bpw" },
     };
     size_t best = 0; const char * best_name = nullptr;
     size_t pxq_total = 0;
@@ -2148,6 +2149,7 @@ std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_PXQN1:    return "PXQN1 - 1.25 bpw, sign book x E16-row scales, 128-K slabs";
         case LLAMA_FTYPE_MOSTLY_PXQN4S8:  return "PXQN4S8 - 4.50 bpw, N4 int book x E8-row scales, slab layout";
         case LLAMA_FTYPE_MOSTLY_PXQN5:    return "PXQN5 - 5.25 bpw, 5-bit uniform int book x E16-row scales, 128-K slabs";
+        case LLAMA_FTYPE_MOSTLY_PXA4:     return "PXA4 - 5.06 bpw, PXA subscriber flagship tier";
         case LLAMA_FTYPE_MOSTLY_Q1_0_G128:return "Q1_0_G128 - 1.125 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return "IQ4_XS - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_S:    return "IQ3_S - 3.4375 bpw";

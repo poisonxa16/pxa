@@ -22,6 +22,35 @@
 
 set -e
 
+# A named volume is created root:root and hides the chown in the image.
+# Start as root, and chown the cache only when it is empty and owned by uid 0
+# (a fresh named volume). A host bind that already has files, or a directory
+# someone else owns, is left alone. A failed mkdir or chown warns and continues.
+# setpriv execs this script again, so the server ends up as pid 1 and receives
+# SIGTERM. runuser would stay pid 1 and the engine would not.
+# `docker run --user pxq` skips this and the writable check below warns.
+if [ "$(id -u)" -eq 0 ]; then
+    cache=${PXA_CACHE_DIR:-/work/.cache/pxa}
+    if mkdir -p "$cache" 2>/dev/null; then
+        owner=$(stat -c '%u' "$cache" 2>/dev/null || true)
+        # One entry is enough. -quit stops at the first name, so a full cache
+        # directory is not listed. A failure means "do not chown".
+        nonempty=$(find "$cache" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || echo FAIL)
+        if [ "$owner" = "0" ] && [ -z "$nonempty" ]; then
+            if ! chown pxq:pxq "$cache"; then
+                echo "pxa-entrypoint: could not chown $cache; continuing" >&2
+            fi
+        elif [ "$nonempty" = "FAIL" ]; then
+            echo "pxa-entrypoint: could not read $cache; not changing its owner" >&2
+        fi
+    else
+        echo "pxa-entrypoint: could not create $cache; continuing" >&2
+    fi
+    export PXA_CACHE_DIR="$cache"
+    export HOME=/work
+    exec setpriv --reuid=pxq --regid=pxq --init-groups -- "$0" "$@"
+fi
+
 HERE=$(dirname "$(readlink -f "$0")")
 # PXA_HOME: the release tarball puts this script in the dist ROOT (next to run-server.sh, bin/,
 # pxa-launch); the source tree keeps it in tools/. Pick whichever layout is actually here.
@@ -44,6 +73,27 @@ find_bin() {
 # path). NCCL's shared-memory transport carries the multi-card reduce and lives in /dev/shm, which
 # docker and podman size at 64 MiB unless told otherwise. Warn, never stop: one card, or a big
 # enough /dev/shm, says nothing.
+# Learned expert counts live under PXA_CACHE_DIR. A container that does not mount
+# a volume there loses them on remove. Warn, never stop.
+cache_check() {
+    dir=${PXA_CACHE_DIR:-${HOME:-/work}/.cache/pxa}
+    export PXA_CACHE_DIR="$dir"
+    if ! mkdir -p "$dir" 2>/dev/null || [ ! -w "$dir" ]; then
+        echo "pxa-entrypoint: the expert-count cache $dir is not writable. Learned counts will not be kept." >&2
+        echo "  Mount a volume: -v pxa-cache:$dir -e PXA_CACHE_DIR=$dir" >&2
+        return 0
+    fi
+    if [ -e /.dockerenv ]; then
+        root_dev=$(stat -c '%d' / 2>/dev/null || true)
+        dir_dev=$(stat -c '%d' "$dir" 2>/dev/null || true)
+        if [ -n "$root_dev" ] && [ "$root_dev" = "$dir_dev" ]; then
+            echo "pxa-entrypoint: the expert-count cache $dir is on the container's own disk." >&2
+            echo "  Learned counts are deleted when this container is removed." >&2
+            echo "  Mount a volume: -v pxa-cache:$dir -e PXA_CACHE_DIR=$dir" >&2
+        fi
+    fi
+}
+
 shm_check() {
     if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
         n=$(printf '%s\n' "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c . || true)
@@ -91,6 +141,7 @@ launcher_py() {
 }
 
 engine() {
+    cache_check
     shm_check
     if control_wanted && command -v python3 >/dev/null 2>&1; then
         LP=$(launcher_py) && python3 "$LP" --control-for-pid $$ --lan || true
@@ -105,6 +156,7 @@ engine() {
 }
 
 launcher() {
+    cache_check
     if [ -x "$PXA_HOME/pxa-launch" ]; then
         exec "$PXA_HOME/pxa-launch" "$@"
     fi

@@ -4,6 +4,7 @@ a fake `nvidia-smi` on PATH whose numbers follow the load of the fake servers, N
 (in this process) with those servers as its own. No GPU, no model, no network beyond 127.0.0.1.
 
     python3 tests/live_env.py [--port 7791] [--cards 4]      starts it and prints the address (Ctrl-C stops it)
+    ... [--history] [--backfill-days 3]                       also record the on-disk history (v3.1), with N made-up past days
 """
 import http.server
 import json
@@ -217,8 +218,9 @@ CARD_KINDS = [("Tesla V100-PCIE-16GB", "7.0", 16384, 250), ("Tesla P100-PCIE-16G
 
 
 class Env(object):
-    def __init__(self, cards=4, servers=None, port=0, real=None):
+    def __init__(self, cards=4, servers=None, port=0, real=None, history=False):
         self.tmp = tempfile.mkdtemp(prefix="pxa-live-env-")
+        self.history = history
         self.cards_n = cards
         self.real = real or []          # [{name, port, gpus}]: servers that already run (a real llama-server): Control just watches them
         self.port = port
@@ -308,7 +310,50 @@ class Env(object):
         self.srv = C.make_server(self.app, "127.0.0.1", self.port)
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        if self.history:
+            self.app.start_telemetry()
         return self
+
+    def backfill(self, days, step=60, wait=30.0):
+        """made-up past days in the history store for every card / server / host the sampler has seen by now (a
+        daily rhythm plus noise), so the 24 h .. 90 d ranges have something to draw without waiting for days."""
+        tel = self.app.telemetry
+        t_end = time.time() + wait
+        while time.time() < t_end and len({s["kind"] for s in tel.list_series()}) < 3:
+            time.sleep(0.5)
+        tel.flush(force=True)
+        tel.sync()
+        series = tel.list_series()
+        first = min((s["first_ts"] for s in series), default=time.time())
+        rnd = random.Random(11)
+        t0 = int(first - days * 86400) // step * step
+        batch = []
+        for t in range(t0, int(first) - step, step):
+            day = .5 + .5 * math.sin((t % 86400) / 86400 * 2 * math.pi - 1.6)
+            for s in series:
+                k, info = s["kind"], s.get("info") or {}
+                if k == "card":
+                    i = int(s["key"])
+                    load = max(0.0, min(1.0, day * (.6 + .3 * math.sin(t / 5400 + i)) + rnd.uniform(-.08, .08)))
+                    v = [4000 + 9000 * load + 300 * i, 100 * load, 34 + 45 * load, 30 + 190 * load, 250, 1300 + 230 * load]
+                elif k == "server":
+                    busy = max(0.0, min(1.0, day + rnd.uniform(-.2, .2)))
+                    req = rnd.choice([0, 0, 1, 1, 2, 3]) if busy > .2 else 0
+                    v = [28 * busy + rnd.uniform(0, 3), 700 * busy * rnd.random(), 2 * busy, 2, 4000 + 20000 * busy, None, None,
+                         .7 + .1 * rnd.random() if s["label"] and "Qwen" in s["label"] else None, None]
+                    v = v[:9] + [req, 400.0 * req, 1800.0 * req, 400.0 * req / 28 * 1000, 1800.0 * req / 800 * 1000]
+                else:
+                    v = [12000 + 9000 * day, 8 + 40 * day * rnd.random(), 0]
+                batch.append((k, s["key"], s["label"], info, t, v, 1))
+            if len(batch) > 5000:
+                tel._put(("rows", batch))
+                batch = []
+        if batch:
+            tel._put(("rows", batch))
+        tel.sync(timeout=120)
+        tel.maintain_now()
+        tel.sync(timeout=120)
+        return len(series)
 
     @property
     def url(self):
@@ -338,9 +383,13 @@ if __name__ == "__main__":
     ap.add_argument("--cards", type=int, default=4)
     ap.add_argument("--real-port", type=int, default=0, help="also watch a real llama-server already running on this port, and keep it busy")
     ap.add_argument("--no-fake", action="store_true", help="no fake servers (only --real-port)")
+    ap.add_argument("--history", action="store_true", help="also record the on-disk history (v3.1 telemetry store)")
+    ap.add_argument("--backfill-days", type=float, default=0, help="with --history: N made-up past days of history")
     a = ap.parse_args()
     real = [{"name": "tiny model (real engine)", "port": a.real_port, "gpus": [a.cards - 1]}] if a.real_port else []    # a profile needs a card
-    env = Env(cards=a.cards, port=a.port, real=real, servers=[] if a.no_fake else None).start()
+    env = Env(cards=a.cards, port=a.port, real=real, servers=[] if a.no_fake else None, history=a.history or a.backfill_days > 0).start()
+    if a.backfill_days > 0:
+        print("back-filled", env.backfill(a.backfill_days), "series", flush=True)
     if a.real_port:
         def keep_busy():
             import urllib.request

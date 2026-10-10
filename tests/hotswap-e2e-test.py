@@ -154,8 +154,35 @@ try:
     gen("beta", P2, 8)
     n2, _ = chat("alpha", m1 + [{"role": "assistant", "content": t1}, {"role": "user", "content": "Shorter."}])
     print(f"resume: turn 1 evaluated {n1} prompt tokens, turn 2 after the round trip evaluated {n2}", flush=True)
-    if not n2 < n1 / 4:
+    if not (n2 < n1 / 4 and n2 < 128):
         fail(f"turn 2 re-evaluated {n2} prompt tokens of a {n1}-token history (KV was not kept)")
+    log_text = open(os.path.join(LOGDIR, "hotswap.log"), errors="replace").read()
+    ntrim = log_text.count("PXA shift trim:")
+    print(f"resume: PXA shift trim lines = {ntrim}", flush=True)
+    if ntrim != 1:
+        fail(f"expected one PXA shift trim (the first over-long prompt only), found {ntrim}")
+    spans = []
+    for line in log_text.splitlines():
+        if "PXA kv span:" not in line:
+            continue
+        parts = {}
+        for tok in line.split("PXA kv span:", 1)[-1].split():
+            if "=" not in tok:
+                continue
+            k, v = tok.split("=", 1)
+            try:
+                parts[k] = int(v.rstrip(","))
+            except ValueError:
+                pass
+        if "n_cache" in parts:
+            spans.append(parts)
+            print("resume span:", parts, flush=True)
+    long_spans = [s for s in spans if s.get("n_cache", 0) >= 512]
+    if not long_spans:
+        fail("no PXA kv span line for the long history")
+    for s in long_spans:
+        if s.get("pos_lo") != 0 or s.get("n_cells", 0) < int(0.9 * s["n_cache"]):
+            fail(f"KV span is not a 0-based history: {s}")
 
     st, props = req("GET", "/props")
     h = props["hot_swap"]
@@ -172,6 +199,7 @@ finally:
 hs_lines = [l.rstrip() for l in open(os.path.join(LOGDIR, "hotswap.log"), errors="replace") if "hot swap" in l]
 for l in hs_lines[-6:]:
     print("  log:", l[:300])
+print(f"logs: {LOGDIR}", flush=True)
 if fails:
     print(f"hotswap-e2e: {len(fails)} FAILED (logs in {LOGDIR})")
     sys.exit(1)

@@ -28,10 +28,10 @@
 // per routed expert; the hit/miss pair is reduced per block first.
 static __global__ void k_pxa_moe_split_ids(const char * __restrict__ ids, const size_t nb0, const size_t nb1,
         const int32_t * __restrict__ map, const int n_map, int32_t * __restrict__ dst,
-        const int n_used, const int n_rows, const int side, uint32_t * __restrict__ cnt) {
+        const int n_used, const int n_rows, const int side, uint32_t * __restrict__ cnt, const int both = 0) {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     const bool valid = i < n_used*n_rows;
-    int32_t r = -1;
+    int32_t r = -1, rc = -1;
     int hit = 0, miss = 0;
     if (valid) {
         const int k = i % n_used, t = i / n_used;
@@ -39,9 +39,14 @@ static __global__ void k_pxa_moe_split_ids(const char * __restrict__ ids, const 
         if (e >= 0 && e < n_map) {
             const int32_t v = map[e];
             r = side == 0 ? (v >= 0 ? v : -1) : (v <= -2 ? -2 - v : -1);
-            if (cnt) { atomicAdd(cnt + e, 1u); hit = v >= 0; miss = v < 0; }
+            if (both) rc = v <= -2 ? -2 - v : -1;
+            if (cnt) {
+                atomicAdd(cnt + e, 1u);
+                hit = v >= 0; miss = v < 0;
+            }
         }
         dst[i] = r;
+        if (both) dst[n_used*n_rows + i] = rc;   // PXA_XCACHE_SPLIT_ONE: the cold ids in the second half
     }
     if (cnt) {
         __shared__ int s_hit, s_miss;
@@ -78,7 +83,8 @@ static void ggml_cuda_op_moe_split_ids(ggml_backend_cuda_context & ctx, ggml_ten
     uint32_t * cnt = (n_exp > 0 && side == 0 && ggml_nelements(map) >= 2*(int64_t)n_exp + 8)
             ? (uint32_t *)((int32_t *)map->data + n_exp) : nullptr;
     k_pxa_moe_split_ids<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const char *)ids->data, ids->nb[0], ids->nb[1],
-            (const int32_t *)map->data, n_map, (int32_t *)dst->data, n_used, n_rows, side, cnt);
+            (const int32_t *)map->data, n_map, (int32_t *)dst->data, n_used, n_rows, side, cnt,
+            ((const int32_t *)dst->op_params)[2]);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -126,11 +132,7 @@ static void ggml_cuda_op_moe_merge(ggml_backend_cuda_context & ctx, ggml_tensor 
 // per-token state. Data words written by one side and read by the other are fenced at system scope before the flag that publishes
 // them; the host side does the same (llama-pxa-xcache-async.cpp). The wait gives up after PXA_XCACHE_ASYNC_TIMEOUT_S (default 30 s)
 // instead of hanging the card: the timeout is counted, reported at exit, and the rows of that layer are zero.
-struct pxa_cold_dev {
-    volatile uint64_t * req; volatile uint32_t * done;
-    int32_t * ids; float * cur; float * out;
-    uint32_t * seq; unsigned long long * stat;
-};
+#include "pxa-cold-dev.cuh"   // struct pxa_cold_dev + the optional library cold-wait route
 
 static __global__ void k_pxa_cold_submit(const pxa_cold_dev s, const float * __restrict__ cur, const char * __restrict__ ids,
         const size_t inb0, const size_t inb1, const int n_embd, const int n_used, const int n_tok, int32_t * __restrict__ ticket) {
@@ -163,7 +165,6 @@ static __global__ void k_pxa_cold_submit(const pxa_cold_dev s, const float * __r
         const uint32_t q = *s.seq + 1u;
         *s.seq = q;
         ticket[0] = (int32_t) q;
-        ticket[1] = s_cold;
         if (s_cold > 0) *s.req = (uint64_t) q | ((uint64_t) (unsigned) n_tok << 32); else { *s.done = q; atomicAdd(s.stat + 2, 1ull); }
         __threadfence_system();
     }
@@ -171,8 +172,9 @@ static __global__ void k_pxa_cold_submit(const pxa_cold_dev s, const float * __r
 
 static __global__ void k_pxa_cold_wait(const pxa_cold_dev s, const char * __restrict__ ids, const size_t inb0, const size_t inb1,
         float * __restrict__ dst, const size_t dnb1, const size_t dnb2, const int n_embd, const int n_used, const int n_tok,
-        const long long timeout_clk) {
+        const long long timeout_clk, const int32_t * __restrict__ ticket) {
     __shared__ int s_timeout;
+    (void) ticket;
     if (threadIdx.x == 0) {
         const uint32_t q = *s.seq;
         const long long t0 = clock64();
@@ -293,8 +295,13 @@ static void ggml_cuda_op_moe_cold_async(ggml_backend_cuda_context & ctx, ggml_te
         GGML_ASSERT(side == 3 && dst->ne[0] == slot->n_embd && ggml_is_contiguous(dst));
         static const double timeout_s = [] { const char * e = getenv("PXA_XCACHE_ASYNC_TIMEOUT_S"); return e && atof(e) > 0 ? atof(e) : 30.0; }();
         const long long timeout_clk = (long long) (timeout_s * 1000.0 * ggml_backend_cuda_cold_clock_khz(ctx.device));
+        // an optional cold-wait route of the PXQN library (pxa-cold-dev.cuh); false = not taken, run the wait below
+        if (ggml_cuda_pxqn_cold_wait(s, (const char *) ids->data, ids->nb[0], ids->nb[1], (float *) dst->data, dst->nb[1], dst->nb[2],
+                slot->n_embd, n_used, n_tok, timeout_clk, nullptr, ctx.stream())) {
+            return;
+        }
         k_pxa_cold_wait<<<1, 256, 0, ctx.stream()>>>(s, (const char *) ids->data, ids->nb[0], ids->nb[1],
-                (float *) dst->data, dst->nb[1], dst->nb[2], slot->n_embd, n_used, n_tok, timeout_clk);
+                (float *) dst->data, dst->nb[1], dst->nb[2], slot->n_embd, n_used, n_tok, timeout_clk, nullptr);
     }
     CUDA_CHECK(cudaGetLastError());
 }

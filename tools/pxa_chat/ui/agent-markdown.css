@@ -1,0 +1,9 @@
+/* agent-markdown.css: token colours and the offline math spans. Works in the light theme and the dark one. */
+.ag-tok-kw{font-weight:700;color:var(--accent-text, var(--accent, #c56a1a))}
+.ag-tok-str{color:var(--ok, #2f7d4a)}
+.ag-tok-com{opacity:.65;font-style:italic}
+.ag-tok-num{font-weight:600}
+.ag-math{padding:0 .15em;border-radius:4px}
+.ag-math-raw{font-family:var(--mono, ui-monospace, monospace);background:color-mix(in srgb, var(--accent, #e08a3c) 14%, transparent)}
+.ag-math-block{display:block;margin:6px 0;padding:4px 8px}
+.ag-frac{white-space:nowrap}

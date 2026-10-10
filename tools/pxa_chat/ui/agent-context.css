@@ -1,0 +1,3 @@
+/* agent-context.css: the token meter under the composer. */
+#ag-ctx-meter{font-size:11px;color:var(--faint);padding:0 4px 4px;text-align:right}
+#ag-ctx-meter.ag-ctx-hot{color:var(--warn, #b86e00)}

@@ -135,8 +135,8 @@ static size_t llama_sampler_llg_tokenize_fn(const void * user_data, const uint8_
     const llama_vocab * vocab = (const llama_vocab *) user_data;
     int                 r     = 0;
     try {
-        r = llama_tokenize(vocab, (const char *) bytes, bytes_len, (int32_t *) output_tokens, output_tokens_len, false,
-                           true);
+        r = llama_vocab_tokenize(vocab, (const char *) bytes, (int32_t) bytes_len, (llama_token *) output_tokens,
+                                 (int32_t) output_tokens_len, false, true);
     } catch (const std::exception & e) {
         GGML_ABORT("llama_tokenize failed: %s\n", e.what());
     }
@@ -155,10 +155,7 @@ static LlgTokenizer * llama_sampler_llg_new_tokenizer(const llama_vocab * vocab)
         return llg_clone_tokenizer(tokenizer_cache);
     }
 
-    auto tok_eos = llama_vocab_eot(vocab);
-    if (tok_eos == LLAMA_TOKEN_NULL) {
-        tok_eos = llama_vocab_eos(vocab);
-    }
+    auto tok_eos = llama_vocab_eos(vocab);
 
     size_t vocab_size = llama_vocab_n_tokens(vocab);
 
@@ -262,7 +259,7 @@ llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab, const char * g
 
 #else
 
-llama_grammar * llama_sampler_init_llg(const llama_vocab *, const char *, const char *) {
+llama_sampler * llama_sampler_init_llg(const llama_vocab *, const char *, const char *) {
     LOG("llguidance (cmake -DLLAMA_LLGUIDANCE=ON) is not enabled");
     return nullptr;
 }

@@ -159,6 +159,31 @@ nothing is sent anywhere. Details in `LAUNCHER.md`, "Speed history".
 
 ---
 
+## Flash-Next Overdrive (PXQN2 on one P100)
+
+Overdrive: a single-card speed preset for Flash-Next. Flash-Next is a Mixture-of-Experts file that does
+not fit a 16 GB card, so the expert cache (`PXA_XCACHE`) carries it from system RAM. The preset is the
+shipped switch set for that model on one P100 16 GB and it is expanded by the PXQN library, so on a build
+or a card without that library it does nothing. Measured on one P100 16 GB with the Flash-Next PXQN2 file,
+greedy at 512 tokens, three runs per cell: **preset off 26.91 t/s prose / 32.28 code; preset on 30.70 /
+37.96** (+14% / +18%).
+
+One lever in this area is public and documented here:
+
+| variable | default | what it does for you | how to turn it off |
+|---|---|---|---|
+| `<model>.expert-counts.learned.csv` | not used | A second expert map, separate from the curated `<model>.expert-counts.csv`. The server writes it beside the model after a session, or under `$PXA_CACHE_DIR`, else `$XDG_CACHE_HOME/pxa`, else `~/.cache/pxa`, when the model directory is not writable. The learned file is used when a measurement says it is faster. An explicit `PXA_XCACHE_COUNTS` is never swapped. Measured 2026-10-09, Flash-Next PXQN 32 GB file, one P100 16 GB, the Overdrive server line in the cookbook, adaptation off (`PXA_XCACHE_ADAPT=0`), greedy, 512 tokens, three runs, two fresh boots each way, one-minute load under 4 and the card idle at the start of each arm. Each arm named its map with `PXA_XCACHE_COUNTS`. Pooled means, to two decimals: prose 28.50 curated / 32.59 learned, code 31.59 / 35.07. | Delete the learned csv. `PXA_XCACHE_COUNTS=<curated csv>` forces the named file. |
+
+Load the preset as the server's environment (`presets/pxa-overdrive-flashnext-pxqn2-1xp100.env`, via
+`docker run --env-file` or `set -a` and source) rather than setting switches by hand. The recipe is in the
+cookbook under "1× P100 — Flash-Next Overdrive"; what each switch in the preset does, the mechanism it
+turns on and the measurement behind it, is documented with the licensed PXQN library.
+The per-model expert map (`<model>.expert-counts.csv`) downloads beside the model's shards, and if it is
+missing the server builds it once on first start. The learned map above is not that file, and a download
+does not switch the boot onto it.
+
+---
+
 ## What this page leaves out, on purpose
 
 Every other `PXA_*` name you might find in a log line, a forum post, or an old command someone

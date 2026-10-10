@@ -807,6 +807,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
     // runs stay reproducible) and the proposal distributions of the draft this seq last produced,
     // one entry per drafted token and in draft order.
     std::unordered_map<llama_seq_id, common_sampler *> pxa_req_smpl_by_seq;
+    // PXA_MTP_DRAFT_GUARD: per-seq request sampler, registered whatever PXA_SPEC_SAMPLED says
+    std::unordered_map<llama_seq_id, common_sampler *> pxa_guard_smpl_by_seq;
     std::unordered_map<llama_seq_id, std::vector<std::vector<pxa_spec_cand>>> pxa_draft_q_by_seq;
 
     // Gemma-4 assistant drafter acceptance gate (PXA_GEMMA4_MTP_GATE, default on). One MTP cycle costs a
@@ -1056,6 +1058,42 @@ struct common_speculative_state_mtp : public common_speculative_state {
             constant_draft_positions
         );
         pxa_g4_drafted = constant_draft_positions ? (uint32_t) result.size() : 0;
+
+        // PXA_XCACHE_MTP_RESIDENT (2026-10-07, expert-cache draft budget): default off. A 4-wide verify is 1.8-1.9x a
+        // plain round, and about 70% of rounds already fall back to plain. When armed, drop the
+        // unaccepted tail if the draft miss bill exceeds PXA_XCACHE_MTP_RESIDENT_MS (default 3000).
+        // Bill is cold layers * 484 us * draft_len / 4. Budget is microseconds, default 3000.
+        if (!result.empty()) {
+            static const int arm = getenv("PXA_XCACHE_MTP_RESIDENT") ? atoi(getenv("PXA_XCACHE_MTP_RESIDENT")) : 0;
+            static const int budget = getenv("PXA_XCACHE_MTP_RESIDENT_MS") ? atoi(getenv("PXA_XCACHE_MTP_RESIDENT_MS")) : 3000;
+            if (arm && budget > 0) {
+                const int miss_us = llama_xcache_draft_miss_us(result.data(), (int) result.size());
+                if (miss_us > budget && result.size() > 1) {
+                    result.resize(1);
+                } else if (result.size() > 2) {
+                    // PXA_XCACHE_MTP_RESIDENT_HALF (default off): same bill, cut to 2 tokens when the miss is
+                    // over half the budget. Exact when off. Does not change accepted-token numerics, only width.
+                    static const int half = getenv("PXA_XCACHE_MTP_RESIDENT_HALF") ? atoi(getenv("PXA_XCACHE_MTP_RESIDENT_HALF")) : 0;
+                    if (half && miss_us > budget / 2) result.resize(2);
+                    // PXA_XCACHE_MTP_EXPERT_BIAS (default off, experimental): no per-token router in this cut.
+                    // If the layer bill is already positive, drop the last draft token so the verify touches fewer experts.
+                }
+            }
+            // PXA_XCACHE_MTP_TOKCUT (default off, needs PXA_XCACHE_MISS_TOKEN=1): keep the longest draft prefix whose measured
+            // per-token cold-expert bill stays within PXA_XCACHE_MTP_TOKCUT_US (default 2000). Output unchanged (verify is exact).
+            static const int tokcut = getenv("PXA_XCACHE_MTP_TOKCUT") ? atoi(getenv("PXA_XCACHE_MTP_TOKCUT")) : 0;
+            static const int tokcut_us = getenv("PXA_XCACHE_MTP_TOKCUT_US") ? atoi(getenv("PXA_XCACHE_MTP_TOKCUT_US")) : 2000;
+            if (tokcut && result.size() > 1) {
+                const int keep = llama_xcache_draft_keep(result.data(), (int) result.size(), tokcut_us);
+                if (keep >= 1 && keep < (int) result.size()) result.resize(keep);
+            }
+            // PXA_XCACHE_MTP_EXPERT_BIAS (default off): works alone. Any positive miss bill drops one draft token.
+            static const int bias = getenv("PXA_XCACHE_MTP_EXPERT_BIAS") ? atoi(getenv("PXA_XCACHE_MTP_EXPERT_BIAS")) : 0;
+            if (bias && result.size() > 1) {
+                const int miss_us = llama_xcache_draft_miss_us(result.data(), (int) result.size());
+                if (miss_us > 0) result.resize(result.size() - 1);
+            }
+        }
     }
 
     // PXA_SPEC_CHAIN_ACCEPT_v1 + PXA_SPEC_MTP_LAZY_v1: another stage won this step, so the run
@@ -3472,6 +3510,18 @@ static mtp_last_embd & mtp_get_last_embd(common_speculative_state_mtp & state, l
 // PXA_SPEC_SAMPLED: the request sampler to draw this seq's draft tokens with, or nullptr when the
 // lever is off or the server never registered one (then the drafter keeps its argmax and the
 // verifier keeps exact matching -- the baseline path, byte for byte).
+// PXA_MTP_DRAFT_GUARD (default off): see common_sampler_draft_greedy_guarded in sampling.h.
+static bool pxa_mtp_draft_guard_on() {
+    static const bool v = [] { const char * e = getenv("PXA_MTP_DRAFT_GUARD"); return e && atoi(e) != 0; }();
+    return v;
+}
+static common_sampler * pxa_guard_req_sampler(common_speculative_state_mtp & state, llama_seq_id seq_id) {
+    if (!pxa_mtp_draft_guard_on()) return nullptr;
+    const auto it = state.pxa_guard_smpl_by_seq.find(seq_id);
+    if (it == state.pxa_guard_smpl_by_seq.end() || !common_sampler_draft_guard_wanted(it->second)) return nullptr;
+    return it->second;
+}
+
 static common_sampler * pxa_spec_req_sampler(common_speculative_state_mtp & state, llama_seq_id seq_id) {
     if (!common_sampler_spec_sampled_active()) {
         return nullptr;
@@ -3483,7 +3533,8 @@ static common_sampler * pxa_spec_req_sampler(common_speculative_state_mtp & stat
 // Draw one draft token: sampled from q when the lever allows it for this request, argmax otherwise.
 // `q_out` is filled only in the sampled case, and a refusal anywhere falls back cleanly.
 static llama_token pxa_spec_draw_draft(common_speculative_state_mtp & state, llama_seq_id seq_id,
-        llama_context * ctx, int idx, float * out_prob, std::vector<pxa_spec_cand> & q_out) {
+        llama_context * ctx, int idx, float * out_prob, std::vector<pxa_spec_cand> & q_out,
+        const std::vector<llama_token> * chain = nullptr) {
     q_out.clear();
     if (common_sampler * rs = pxa_spec_req_sampler(state, seq_id)) {
         const llama_token id = common_sampler_draft_sample_dist(rs, ctx, idx, q_out, out_prob);
@@ -3491,6 +3542,12 @@ static llama_token pxa_spec_draw_draft(common_speculative_state_mtp & state, lla
             return id;
         }
         q_out.clear();
+    }
+    if (common_sampler * gs = pxa_guard_req_sampler(state, seq_id)) {   // PXA_MTP_DRAFT_GUARD
+        const llama_token id = common_sampler_draft_greedy_guarded(gs, ctx, idx, chain, out_prob);
+        if (id >= 0) {
+            return id;
+        }
     }
     // PXA_VERIFY_NO_LOGITS_COPY: the last decode on ctx was argmax-only (pxa_nlc_request) -> its row
     if (pxa_nlc_on()) {
@@ -3520,6 +3577,7 @@ static void pxa_nlc_request(common_speculative_state_mtp & state, llama_seq_id s
     if (common_sampler * rs = pxa_spec_req_sampler(state, seq_id)) {
         if (common_sampler_spec_sampled_ok(rs, ctx)) return;
     }
+    if (pxa_guard_req_sampler(state, seq_id)) return;   // PXA_MTP_DRAFT_GUARD reads the row
     static const bool readback_check = getenv("PXA_MTP_READBACK_CHECK") != nullptr;
     if (readback_check) return;
     llama_set_argmax_only(ctx, true);
@@ -4331,8 +4389,14 @@ void common_speculative_set_request_sampler(common_speculative * spec, llama_seq
         // read back off would otherwise keep the stale entry.
         if (auto * mtp_state = common_speculative_get_mtp_state(spec)) {
             mtp_state->pxa_req_smpl_by_seq.erase(seq_id);
+            mtp_state->pxa_guard_smpl_by_seq.erase(seq_id);   // PXA_MTP_DRAFT_GUARD
         }
         return;
+    }
+    if (pxa_mtp_draft_guard_on()) {
+        if (auto * mtp_state = common_speculative_get_mtp_state(spec)) {
+            mtp_state->pxa_guard_smpl_by_seq[seq_id] = smpl;
+        }
     }
     if (!common_sampler_spec_sampled_active()) {
         return;
@@ -4524,7 +4588,33 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         }
 
         std::vector<pxa_spec_cand> pxa_q;   // PXA_SPEC_SAMPLED: empty unless this token was drawn from q
-        llama_token id_next = pxa_spec_draw_draft(state, seq_id, ctx, 0, prob_ptr, pxa_q);
+        llama_token id_next = pxa_spec_draw_draft(state, seq_id, ctx, 0, prob_ptr, pxa_q, &drafts);
+        // PXA_XCACHE_MTP_PICK (default off, needs PXA_XCACHE_MISS_TOKEN=1): expert-aware greedy draft (pxa_expert_bias_pick,
+        // mailbox 15722). Among the head's candidates within PXA_XCACHE_MTP_PICK_MARGIN logits (default 0.1) of the argmax, draft
+        // the one whose measured cold-expert bill is lowest, when it beats the argmax by >= PXA_XCACHE_MTP_PICK_MIN slots (default
+        // 1). Greedy drafts only (not a sampled q); output unchanged (the verify is exact), only acceptance and verify cost move.
+        {
+            static const int pick = getenv("PXA_XCACHE_MTP_PICK") ? atoi(getenv("PXA_XCACHE_MTP_PICK")) : 0;
+            static const float margin = getenv("PXA_XCACHE_MTP_PICK_MARGIN") ? (float) atof(getenv("PXA_XCACHE_MTP_PICK_MARGIN")) : 0.1f;
+            static const float pmin_slots = getenv("PXA_XCACHE_MTP_PICK_MIN") ? (float) atof(getenv("PXA_XCACHE_MTP_PICK_MIN")) : 1.0f;
+            const float * lg = (pick && pxa_q.empty() && id_next >= 0) ? llama_get_logits_ith(ctx, 0) : nullptr;
+            const float s0 = lg ? llama_xcache_token_slots(id_next) : -1.f;
+            if (lg && s0 > 0.f) {
+                const int n_vocab = llama_n_vocab(llama_get_model(ctx));
+                const float top = lg[id_next];
+                llama_token best = id_next; float best_s = s0;
+                for (int v = 0; v < n_vocab; ++v) {
+                    if (v == id_next || lg[v] < top - margin) continue;
+                    const float sv = llama_xcache_token_slots(v);
+                    if (sv >= 0.f && sv + pmin_slots <= best_s) { best = v; best_s = sv; }
+                }
+                if (best != id_next) {
+                    static std::atomic<uint64_t> n_pick{0};
+                    if (n_pick.fetch_add(1) < 3) LOG_INF("PXA_XCACHE_MTP_PICK: draft %d (%.1f cold slots) -> %d (%.1f)\n", (int) id_next, s0, (int) best, best_s);
+                    id_next = best;
+                }
+            }
+        }
         if (pxa_st.on && prob_ptr) {
             pxa_st.p_sum += (double) prob;
             pxa_st.p_n   += 1;

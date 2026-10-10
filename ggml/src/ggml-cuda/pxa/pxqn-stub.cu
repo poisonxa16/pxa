@@ -33,7 +33,7 @@ static inline const ggml_pxqn_cuda_api * T() {
 bool ggml_cuda_pxqn_type(ggml_type t) {
     switch (t) {
         case GGML_TYPE_PXQN3: case GGML_TYPE_PXQN3S8: case GGML_TYPE_PXQN4: case GGML_TYPE_PXQN2:
-        case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5:
+        case GGML_TYPE_PXQN1: case GGML_TYPE_PXQN4S8: case GGML_TYPE_PXQN5: case GGML_TYPE_PXA4:
             return true;
         default:
             return false;
@@ -121,6 +121,8 @@ PXQN_DEQ_FWD(dequantize_row_pxqn4s8_f16, half)
 PXQN_DEQ_FWD(dequantize_row_pxqn4s8_f32, float)
 PXQN_DEQ_FWD(dequantize_row_pxqn5_f16,   half)
 PXQN_DEQ_FWD(dequantize_row_pxqn5_f32,   float)
+PXQN_DEQ_FWD(dequantize_row_pxa4_f16,    half)
+PXQN_DEQ_FWD(dequantize_row_pxa4_f32,    float)
 #undef PXQN_DEQ_FWD
 
 GGML_CALL void ggml_backend_cuda_pxqn_gu_counters_reset(void) { if (T()) T()->p_ggml_backend_cuda_pxqn_gu_counters_reset(); }
@@ -155,4 +157,9 @@ bool mul_mat_vec_pxqn4_q8_1_group_cuda(mmvq_group_args & g, cudaStream_t stream)
 }
 bool mul_mat_vec_pxqn4s8_q8_1_group_cuda(mmvq_group_args & g, cudaStream_t stream) {
     return T() ? T()->p_mul_mat_vec_pxqn4s8_q8_1_group_cuda(g, stream) : false;
+}
+
+bool ggml_cuda_pxqn_cold_wait(const pxa_cold_dev & s, const char * ids, size_t inb0, size_t inb1, float * dst, size_t dnb1, size_t dnb2,
+                              int n_embd, int n_used, int n_tok, long long timeout_clk, const int32_t * ticket, cudaStream_t stream) {
+    return T() ? T()->p_ggml_cuda_pxqn_cold_wait(s, ids, inb0, inb1, dst, dnb1, dnb2, n_embd, n_used, n_tok, timeout_clk, ticket, stream) : false;
 }

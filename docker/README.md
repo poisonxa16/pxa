@@ -38,7 +38,9 @@ itself falls back to a slower reduce route rather than serve wrong tokens (bug #
 ```bash
 # no arguments: the launcher does everything (one model under /models)
 docker run -d --name pxa --gpus '"device=0,1"' --shm-size=1g -p 8080:8080 \
-    -v /path/to/your/models:/models:ro ghcr.io/poisonxa16/pxa:latest
+    -v /path/to/your/models:/models:ro \
+    -v pxa-cache:/work/.cache/pxa -e PXA_CACHE_DIR=/work/.cache/pxa \
+    ghcr.io/poisonxa16/pxa:latest
 
 # what would it pick, and why? (starts nothing)
 docker run --rm --gpus '"device=0,1"' -v /path/to/your/models:/models:ro \
@@ -60,10 +62,13 @@ docker run -d --name pxa \
     --gpus '"device=0"' \
     -p 8080:8080 \
     -v /path/to/your/models:/models:ro \
+    -v pxa-cache:/work/.cache/pxa -e PXA_CACHE_DIR=/work/.cache/pxa \
     ghcr.io/poisonxa16/pxa:latest \
     -m /models/your-model.gguf \
     -ngl 99 -c 8192 -b 2048 -ub 512
 ```
+
+`pxa-cache` keeps learned expert counts. Without the volume they are deleted when the container is removed. The server log says so if that directory is not writable or not a mount.
 
 If your Docker install uses the older nvidia-docker2 runtime instead of the `--gpus`
 flag, replace `--gpus '"device=0"'` with `--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0`.

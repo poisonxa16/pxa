@@ -54,6 +54,17 @@ os.environ["PXA_PACKAGE_PUBKEY"] = F.PUB_HEX
 REPOS = {"tiny/Tiny-Qwen3": F.tiny_repo(), "tiny/NoDerivs": F.tiny_repo(license="cc-by-nd-4.0"), "tiny/Gated": dict(F.tiny_repo(), need_token=True, gated=True),
          "tiny/Redirect": dict(F.tiny_repo(), redirect=True, need_token=True), "tiny/Slow": dict(F.tiny_repo(), delay=0.02),
          "tiny/Odd": F.tiny_repo(arch="MadeUpForCausalLM")}
+def moe_repo(experts=256, arch="Qwen3_5MoeForConditionalGeneration"):
+    """A fake HF repo that reports `experts` routed experts per layer, in the shape the real Qwen3.5-MoE config uses
+    (`text_config.num_experts`). Registered rather than returned so a test can name it as a source."""
+    cfg = dict(F.tiny_config(arch=arch), num_experts=experts, num_experts_per_tok=max(1, experts // 32))
+    repo = F.tiny_repo(arch=arch)
+    repo["files"] = dict(repo["files"], **{"config.json": json.dumps({"architectures": [arch], "model_type": "qwen3_5_moe",
+                                                                       "text_config": cfg}).encode()})
+    return repo
+
+
+REPOS["tiny/Tiny-MoE"] = moe_repo()                                    # a mixture-of-experts source, for the counts stage and the PXQN refusal
 HF = F.FakeHF(REPOS)
 CDN = F.FakeCDN(HF)
 HF.cdn = CDN
@@ -197,7 +208,7 @@ class AdapterInfo(unittest.TestCase):
 
     def test_licence_states_map_to_the_few_the_page_knows(self):
         for word, want in (("expired", "expired"), ("Revoked", "revoked"), ("none", "no_key"), ("no-key", "no_key"), ("no-server", "no_server"), ("unreachable", "offline"),
-                           ("suspended", "suspended"), ("refused", "refused"), ("disabled", "revoked"), ("exhausted", "no_quota"), ("???", "unknown")):
+                           ("suspended", "suspended"), ("refused", "refused"), ("disabled", "disabled"), ("exhausted", "no_quota"), ("???", "unknown")):
             o = AD.parse_info(json.dumps({"edition": "pro", "build_id": "b", "tiers": [], "licence": {"state": word}}))
             self.assertEqual(o["licence"]["state"], want, word)
         self.assertIsNone(AD.parse_info(json.dumps({"edition": "pro", "build_id": "b", "tiers": [], "licence": {"state": "valid", "encodes_left": -3}}))["licence"]["encodes_left"])
@@ -277,6 +288,24 @@ class RealOutputs(unittest.TestCase):
         self.assertIn("43.8%", r["message"])
         self.assertIn("PXQ3", r["message"])
         self.assertIn("higher tier", r["hint"])
+
+    def test_the_resident_floor_wording_of_the_quantizer_is_explained_too(self):
+        # since 2026-10-04 (c232f82b3c) the quantizer counts resident weights only and refuses BEFORE encoding; its sentence has a parenthesis
+        # between "PXQ-family bytes" and "(floor N%". The v3.1 quantizer prints this; the Encode tab must still explain it, not quote it.
+        pre = ("llama_model_quantize: failed to quantize: PXQ composition assertion: target PXQ4 - 4.25 bpw, slab layout produced 36.4% PXQ-family bytes of its "
+               "resident weights (0.62 GiB; 1 host-side table(s), 0.29 GiB, not counted) (floor 50%; backbone=v2). The output would misrepresent its contents. "
+               "REFUSED BEFORE ENCODING: nothing was written. Fix the tier map / --custom-q, or set PXA_PXQ_COMPOSITION_OVERRIDE=1 (--pxq-composition-override) "
+               "to encode it anyway.\nmain: failed to quantize model from '/tmp/q05-Q8_0.gguf'")
+        absent = ("llama_model_quantize: failed to quantize: PXQ composition assertion: target PXQ6 - 6.25 bpw produced 51.7% PXQ-family bytes of its resident "
+                  "weights (0.40 GiB; 0 host-side table(s), 0.00 GiB, not counted) and ZERO bytes of the named tier pxq6 (floor 50%; backbone=v2). "
+                  "The output would misrepresent its contents. The output was KEPT, not deleted (/tmp/x.gguf): it is mislabelled for this target - rename it or re-encode.")
+        for text, pct, tier in ((pre, "36.4%", "PXQ4"), (absent, "51.7%", "PXQ6")):
+            r = AD.explain_failure(text, 1)
+            self.assertEqual(r["code"], "composition", text)
+            self.assertIn(pct, r["message"])
+            self.assertIn(tier, r["message"])
+            self.assertIn("50%", r["message"])
+            self.assertNotIn("PXA_PXQ_COMPOSITION_OVERRIDE", r["message"])     # explained in plain words, not quoted
 
     def test_the_most_informative_line_is_shown_not_the_generic_last_one(self):
         r = AD.explain_failure("loading...\nllama_model_quantize: failed to quantize: unsupported tensor shape for blk.3\nmain: failed to quantize model from '/x'", 1)
@@ -402,12 +431,12 @@ class AdapterProgress(unittest.TestCase):
     def test_failures_in_plain_words(self):
         X = AD.explain_failure
         cases = [("pxqe: refused by the licence server (HTTP 402): no encodes left: monthly quota used", "no_quota", "no encodes left"),
-                 ("pxqe: refused by the licence server (HTTP 403): account disabled", "revoked", "revoked, expired or suspended"),
+                 ("pxqe: refused by the licence server (HTTP 403): account disabled", "disabled", "account is disabled"),
                  ("pxqe: refused by the licence server (HTTP 401): invalid key", "bad_key", "does not recognise this key"),
                  ("pxqe: refused by the licence server (HTTP 409): build not supported any more", "old_build", "no longer accepts"),
                  ("pxqe: cannot load the encoder library (libcusolver.so.12: no such file). It needs an NVIDIA driver and the CUDA 12 runtime (cuBLAS, cuSOLVER).", "lib_unloadable", "cannot load on this machine"),
                  ("pxqe: the licence server said 402: monthly quota used", "no_quota", "no encodes left"),
-                 ("pxqe: the licence server said 403: key revoked", "revoked", "revoked, expired or suspended"),
+                 ("pxqe: the licence server said 403: key revoked", "revoked", "it was revoked"),
                  ("pxqe: the licence server said 409: unknown build", "old_build", "no longer accepts"),
                  ("pxqe: the licence server said 429: too many running", "busy", "too many requests"),
                  ("pxqe: cannot reach the licence server (URLError)", "offline", "Cannot reach the licence server"),
@@ -864,6 +893,31 @@ class Checks(unittest.TestCase):
         T.write_gguf(bf, 4, 30, base_type=30, embed_type=30)
         self.assertNotIn("double", [x["id"] for x in r.svc.checks(r.body("pxq3", source=bf))["checks"]])
 
+    def test_a_moe_model_with_a_pxqn_tier_is_refused_at_the_check(self):
+        # Ornith-1.5-35B-A3B (Qwen3.5-MoE, 256 experts) on 2026-10-06: the PXQN skeleton refuses routed experts, so the check says it before the download
+        cfg = dict(F.tiny_config(arch="Qwen3_5MoeForConditionalGeneration"), model_type="qwen3_5_moe")
+        cfg = {"architectures": cfg.pop("architectures"), "model_type": "qwen3_5_moe", "text_config": dict(cfg, num_experts=256, num_experts_per_tok=8)}
+        repo = F.tiny_repo(arch="Qwen3_5MoeForConditionalGeneration")
+        repo["files"] = dict(repo["files"], **{"config.json": json.dumps(cfg).encode()})
+        REPOS["tiny/Tiny-MoE"] = repo
+        r = Rig("pro")
+        self.assertTrue(r.svc.inspect("tiny/Tiny-MoE")["moe"])
+        c = r.svc.checks(r.body("pxqn4", source="tiny/Tiny-MoE"))
+        self.assertFalse(c["can_start"])
+        m = [x for x in c["checks"] if x["id"] == "moe"][0]
+        self.assertEqual(m["status"], "bad")
+        self.assertIn("mixture-of-experts model (256 experts)", m["text"])
+        self.assertIn("classic tier", m["fix"])
+        with self.assertRaises(E.EncodeError):
+            r.svc.start(r.body("pxqn4", source="tiny/Tiny-MoE"))
+        self.assertNotIn("moe", [x["id"] for x in r.svc.checks(r.body("pxq3", source="tiny/Tiny-MoE"))["checks"]])      # classic tiers are fine
+        self.assertNotIn("moe", [x["id"] for x in r.svc.checks(r.body("pxqn4"))["checks"]])                            # a dense model is fine
+        r2 = Rig("pro", features=["classic-quantizer", "make", "skeleton", "dump", "ldlq", "hessian", "watermark", "licence", E.MOE_PXQN_FEATURE])
+        self.assertNotIn("moe", [x["id"] for x in r2.svc.checks(r2.body("pxqn4", source="tiny/Tiny-MoE"))["checks"]])  # an encoder that can, may
+
+    def test_mixtral_style_expert_count_is_read(self):
+        self.assertEqual(E.PL.facts_from_config({"architectures": ["MixtralForCausalLM"], "num_local_experts": 8})["experts"], 8)
+
     def test_free_without_a_key_is_fine(self):
         r = Rig("free", key=False)
         c = r.svc.checks(r.body("pxq3"))
@@ -917,6 +971,9 @@ class Checks(unittest.TestCase):
         self.assertEqual(d["status"], "bad")
         self.assertRegex(d["text"], r"Needs about .* free on")
         self.assertIn("work folder", d["fix"])
+        self.assertIn("step 2", d["fix"])                                  # Advanced is on step 2, not on this page: say where
+        self.assertEqual((d.get("action"), d.get("focus")), ("advanced", "work"))
+        self.assertIn(c["disk"]["need_h"], d["text"])                      # the row and the facts under the list say the same number
 
     def test_disk_on_two_filesystems_names_the_short_one(self):
         r = Rig("pro")
@@ -930,6 +987,11 @@ class Checks(unittest.TestCase):
         d = [x for x in c["checks"] if x["id"] == "disk"][0]
         self.assertEqual(d["status"], "bad")
         self.assertIn("output folder needs", d["text"])
+        self.assertNotIn("work folder needs", d["text"])
+        self.assertIn("output folder needs %s," % c["disk"]["output_h"], d["text"])   # the output folder gets the final file only
+        self.assertEqual((d.get("action"), d.get("focus")), ("advanced", "out"))
+        self.assertIn("step 2", d["fix"])
+        self.assertIn("output folder", d["fix"])
 
     def test_ram_check(self):
         r = Rig("pro")
@@ -957,7 +1019,11 @@ class Checks(unittest.TestCase):
         self.assertEqual(v["status"], "ok")
         busy = Rig("pro", gpus=[(0, "Tesla V100", 70, 16384, 16384, "u0")])
         c = busy.svc.checks(busy.body(cards=[0]))
-        self.assertEqual([x for x in c["checks"] if x["id"] == "vram"][0]["status"], "bad")
+        v = [x for x in c["checks"] if x["id"] == "vram"][0]
+        self.assertEqual(v["status"], "bad")
+        self.assertEqual(v["fix"], E.ADV_FIX["card"])
+        self.assertIn("go back to step 2 and open Advanced to pick another card", v["fix"])
+        self.assertEqual((v.get("action"), v.get("focus")), ("advanced", "card"))
         self.assertFalse(c["can_start"])
         nogpu = Rig("pro", gpus=[])
         c = nogpu.svc.checks(nogpu.body(cards=[0]))
@@ -999,6 +1065,101 @@ class Checks(unittest.TestCase):
 
 
 # =====================================================================================================================
+class StepThreeAdvancedAndDisk(unittest.TestCase):
+    """TucsonJohn's report: the Checks step (3) said "pick another work folder in Advanced" (Advanced is folded on step 2), and its Disk space row
+    said 317.1 GiB while the facts under the list said "Disk at the peak 306.9 GiB" (the row added the 10.2 GiB final file, the facts did not)."""
+
+    def disk(self, c):
+        return [x for x in c["checks"] if x["id"] == "disk"][0]
+
+    def test_no_hint_says_in_advanced_without_saying_where(self):
+        for t in list(E.ADV_FIX.values()) + [AD._MAKE_HINT["disk-full"], AD.explain_failure("write failed: No space left on device")["hint"]]:
+            self.assertNotRegex(t, r"(?i)(another|other) [a-z ]*in Advanced")
+            self.assertIn("step 2", t)
+            self.assertIn("Advanced", t)
+        self.assertEqual(E.ADV_FIX["work"], "Go back to step 2 and open Advanced to pick another work folder, or free some space.")
+        # a started job keeps its work folder: the run-time hint does not pretend Resume can change it
+        self.assertIn("start a new encode", AD._MAKE_HINT["disk-full"])
+        with open(E.__file__) as f:
+            self.assertNotIn("in Advanced.", f.read())
+
+    def test_one_disk_row_and_facts_show_one_number(self):
+        r = Rig("pro")
+        real = E._free_bytes
+        try:
+            E._free_bytes = lambda p: 10 ** 15                                # plenty: the ok text
+            ok = r.svc.checks(r.body())
+            E._free_bytes = lambda p: 50_000                                  # short: the refusal text
+            bad = r.svc.checks(r.body())
+        finally:
+            E._free_bytes = real
+        for c in (ok, bad):
+            dk = c["disk"]
+            self.assertTrue(dk["same_disk"])
+            self.assertEqual(dk["need"], dk["peak"] + dk["output"])           # one disk: the work peak AND the final file
+            self.assertEqual(dk["need_h"], PL.human_bytes(dk["peak"] + dk["output"]))
+            self.assertIn("final file included", dk["need_label"])
+            self.assertIn(dk["need_h"], self.disk(c)["text"])
+            self.assertNotIn(dk["peak_h"], self.disk(c)["text"])                # never the bare work peak next to a total
+        self.assertIn("final file included", self.disk(ok)["text"])
+        self.assertIn("final file", self.disk(bad)["text"])
+        self.assertNotIn("action", self.disk(ok))                               # nothing to fix: no button
+
+    def test_two_disks_split_the_work_peak_and_the_final_file(self):
+        r = Rig("pro")
+        real_free, real_dev = E._free_bytes, E._dev
+        E._dev = lambda p: 2 if p.endswith("models") else 1
+        try:
+            E._free_bytes = lambda p: 10 ** 15
+            ok = r.svc.checks(r.body())
+            E._free_bytes = lambda p: 10 if not p.endswith("models") else 10 ** 15   # the work folder is the short one
+            wk = r.svc.checks(r.body())
+            E._free_bytes = lambda p: 10
+            both = r.svc.checks(r.body())
+        finally:
+            E._free_bytes, E._dev = real_free, real_dev
+        dk = ok["disk"]
+        self.assertFalse(dk["same_disk"])
+        self.assertEqual(dk["need"], dk["peak"])                              # the work folder never holds the final file
+        self.assertEqual(dk["need_label"], "Work folder at the peak")
+        t = self.disk(ok)["text"]
+        self.assertIn("Work folder: about %s needed at the peak" % dk["need_h"], t)
+        self.assertIn("Output folder: %s for the final file" % dk["output_h"], t)
+        d = self.disk(wk)
+        self.assertIn("work folder needs %s," % wk["disk"]["need_h"], d["text"])
+        self.assertNotIn("output folder needs", d["text"])
+        self.assertEqual((d["focus"], d["fix"]), ("work", E.ADV_FIX["work"]))
+        d = self.disk(both)
+        self.assertEqual((d["focus"], d["fix"]), ("work", E.ADV_FIX["both"]))
+
+    def test_disk_need_is_the_one_function(self):
+        src = {"kind": "hf", "params": 27_320_697_856, "download_bytes": 54_657_734_528}
+        tier, stages = 15_720_261_824, ["download", "convert", "reference", "skeleton", "dump", "hessians", "encode", "verify"]
+        sz = PL.stage_sizes(src, tier, stages)
+        one, two = PL.disk_need(src, tier, stages, same_disk=True), PL.disk_need(src, tier, stages, same_disk=False)
+        self.assertEqual((one["work_peak"], one["result"]), (sz["peak"], tier))
+        self.assertEqual(one["need"], sz["peak"] + tier)
+        self.assertEqual((two["work"], two["out"], two["need"]), (sz["peak"], tier, sz["peak"]))
+
+    def test_the_page_has_the_button_and_shows_the_server_number(self):
+        with open(os.path.join(TOOLS, "pxa_control_ui", "encode.js")) as f:
+            js = f.read()
+        self.assertIn('k.action === "advanced"', js)
+        for fid in ("en-adv-work", "en-adv-out", "en-adv-card"):
+            self.assertEqual(js.count('"%s"' % fid), 2, fid)                     # the field in Advanced, and the jump that focuses it
+        self.assertIn("open: EN.advOpen", js)                                    # Advanced stays open across the step-2 re-renders
+        self.assertIn("c.disk.need_h", js)
+        self.assertNotIn('fact("Disk at the peak", c.disk.peak_h)', js)
+        self.assertIn("sent only to the PXA licence server.", js)
+        self.assertNotIn("licence server (", js)
+        self.assertNotIn("st.licence_server", js)
+        node = shutil.which("node")
+        if node:
+            import subprocess
+            p = subprocess.run([node, "--check", os.path.join(TOOLS, "pxa_control_ui", "encode.js")], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+
+
 class Pipeline(unittest.TestCase):
     def test_a_whole_encode_with_ldlq(self):
         r = Rig("pro")
@@ -1277,7 +1438,7 @@ class LicenceRefusalsAtRunTime(unittest.TestCase):
         return r, j
 
     def test_quota_revoked_offline_and_oom_are_plain_sentences(self):
-        for mode, code, frag in (("402", "no_quota", "no encodes left"), ("403", "revoked", "revoked, expired or suspended"), ("offline", "offline", "Cannot reach the licence server"),
+        for mode, code, frag in (("402", "no_quota", "no encodes left"), ("403", "revoked", "it was revoked"), ("offline", "offline", "Cannot reach the licence server"),
                                  ("oom", "oom", "ran out of memory")):
             r, j = self.run_with(fail=mode)
             self.assertEqual(j["status"], "failed", mode)
@@ -1897,6 +2058,52 @@ class LockedFiles(unittest.TestCase):
         ev = AD.parse_make_line('@pxqe {"event":"done","out":"/o.gguf","sha256":"%s","size":9,"tier":"pxqn4"}' % sha)
         self.assertEqual((ev["lock"], ev["lock_file_id"]), ("", ""))
         self.assertEqual(AD.parse_make_line('@pxqe {"event":"done","out":"/o.gguf","sha256":"%s","size":9,"tier":"x","lock":"strange"}' % sha)["lock"], "")
+
+    def test_a_moe_make_asks_for_the_counts_and_the_job_holds_the_run_to_them(self):
+        # v3.1: a model with experts ships <model>.expert-counts.csv beside it. The flag goes to an encoder that lists the stage,
+        # the file is read back with the engine's rules, and the job keeps the numbers for the Done screen.
+        if legacy():                                                                            # the counts stage arrived with CLI 2
+            return
+        REPOS["tiny/Tiny-MoE"] = moe_repo(8)
+        feats = ["classic-quantizer", "make", "skeleton", "dump", "ldlq", "hessian", "watermark", "licence", E.MOE_PXQN_FEATURE]
+        r = self.rig(features=feats, counts_support=True)
+        j = self.run_job(r, source="tiny/Tiny-MoE")
+        self.assertEqual(j["status"], "done", j["error"])
+        self.assertIn("--counts", self.make_argv(r))
+        self.assertIn("counts", [s["id"] for s in j["stages"]])                                  # the encoder's plan is what the page shows
+        csv = j["result"]["path"] + ".expert-counts.csv"
+        self.assertTrue(os.path.isfile(csv), csv)
+        self.assertEqual(j["result"]["counts"]["rows"], 12)                                      # the fake counts 2 tensors x 6 experts
+        self.assertEqual(j["result"]["counts"]["tensors"], 2)
+        self.assertIn("expert counts: 12 rows", "\n".join(r.svc.log_view(j["id"])["lines"]))
+
+    def test_a_run_that_left_no_usable_counts_does_not_pass_as_done(self):
+        if legacy():
+            return
+        REPOS["tiny/Tiny-MoE"] = moe_repo(8)
+        feats = ["classic-quantizer", "make", "skeleton", "dump", "ldlq", "hessian", "watermark", "licence", E.MOE_PXQN_FEATURE]
+        for broken in ("header", "empty", "text"):                                              # a file the engine would silently throw away
+            r = self.rig(features=feats, counts_support=True, counts_broken=broken)
+            j = self.run_job(r, source="tiny/Tiny-MoE")
+            self.assertEqual(j["status"], "failed", (broken, j["status"]))
+            self.assertEqual(j["error"]["code"], "counts-failed", (broken, j["error"]))
+            self.assertIn("expert counts", j["error"]["message"])
+            self.assertIn("Resume", j["error"]["hint"])
+            self.assertTrue(j["error"]["hint"].endswith("."))
+        # a dense model made by the same encoder gets no counts stage, no flag and no file
+        r = self.rig(features=feats, counts_support=True)
+        j = self.run_job(r)
+        self.assertEqual(j["status"], "done", j["error"])
+        self.assertNotIn("--counts", self.make_argv(r))
+        self.assertNotIn("counts", [s["id"] for s in j["stages"]])
+        self.assertFalse(os.path.exists(j["result"]["path"] + ".expert-counts.csv"))
+        self.assertIsNone(j["result"]["counts"])
+        # and an encoder that does not know the stage is never handed the flag, even for a model with experts
+        r2 = self.rig(features=feats)
+        j2 = self.run_job(r2, source="tiny/Tiny-MoE")
+        self.assertEqual(j2["status"], "done", j2["error"])
+        self.assertNotIn("--counts", self.make_argv(r2))
+        self.assertIsNone(j2["result"]["counts"])
 
     def test_probe_of_a_lock_capable_encoder(self):
         d = os.path.join(TMP, "probe-lock")

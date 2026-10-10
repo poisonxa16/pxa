@@ -34,6 +34,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <set>
 #include <string>
@@ -86,6 +87,7 @@ struct result {
     size_t resident_bytes       = 0;   // the denominator of the floor
     size_t resident_family_bytes = 0;  // PXQ-family bytes among the resident tensors
     size_t named_tier_bytes     = 0;   // bytes of the uniform target's own tier (all tensors)
+    size_t resident_table_bytes = 0;   // non-PXQ RESIDENT bytes in token_embd / output (the small-model case, see hint())
     int    n_host               = 0;
     int    n_resident           = 0;
     double share_all            = 0.0; // the OLD measure: family bytes / all bytes (reported, not judged)
@@ -121,6 +123,8 @@ inline result evaluate(const std::vector<tensor> & tensors, const std::set<int> 
         ++r.n_resident;
         if (fam) {
             r.resident_family_bytes += t.bytes;
+        } else if (t.name == "token_embd.weight" || t.name == "output.weight") {
+            r.resident_table_bytes += t.bytes;
         }
     }
     r.share_all = r.total_bytes    ? (double) family_all / (double) r.total_bytes : 0.0;
@@ -129,6 +133,23 @@ inline result evaluate(const std::vector<tensor> & tensors, const std::set<int> 
     r.below_floor = r.resident_bytes > 0 && r.share < floor;
     r.tier_absent = spec_type >= 0 && r.named_tier_bytes == 0;
     return r;
+}
+
+// The next step a refusal names (todo quantizer-composition-hint, e2e-v3 #15263 item 5: a model under ~1.5B parameters
+// aborted with no hint, and guide 04 documents the override the message did not mention). Every failing result gets the
+// flag; when the embedding / output tables are most of the non-PXQ resident bytes it also says why (small model).
+inline std::string hint(const result & r) {
+    const size_t other = r.resident_bytes - r.resident_family_bytes;
+    std::string h;
+    if (r.below_floor && other > 0 && 2 * r.resident_table_bytes >= other) {
+        char buf[200];
+        snprintf(buf, sizeof(buf), "The embedding/output tables are %.0f%% of the non-PXQ bytes: normal for a small model "
+                 "(under about 1.5B parameters). Pick a higher tier, or ", 100.0 * (double) r.resident_table_bytes / (double) other);
+        h = buf;
+    } else {
+        h = "Fix the tier map / --custom-q, or ";
+    }
+    return h + "set PXA_PXQ_COMPOSITION_OVERRIDE=1 (--pxq-composition-override) to write it anyway, and name the file for what it holds.";
 }
 
 } // namespace pxa_comp

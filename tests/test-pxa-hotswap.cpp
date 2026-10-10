@@ -19,11 +19,16 @@
 //   9. under 12 threads x 200 random requests over 3 models: at most one model is ever on the
 //      cards, no lease is ever held on a model that is not, park never runs while the parked model
 //      has a lease, and every request is served by the model it asked for.
+//  10. a resumed context shift trusts the cache only when the kept prefix and the surviving
+//      suffix still match. Qwen keeps nothing at the front (n_keep 0). Gemma keeps the BOS
+//      token there, so a check that starts at cache[0] rejects a good resume.
 // CPU only, no model, no GPU. Exit 0 on pass.
 
 #include "pxa-hotswap.h"
+#include "pxa-shift-keep.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <mutex>
 #include <random>
@@ -367,7 +372,69 @@ static void test_stress() {
     printf("  stress: %d requests, %llu swaps\n", served.load(), (unsigned long long) r.n_swaps());
 }
 
+static void test_sleep() {
+    fake_ops ops(3, 0);
+    ops.park_ms = 5;
+    ops.unpark_ms = 5;
+    router r(names3(), 0, &ops);
+    std::string err;
+    CHECK(r.try_sleep(err), "sleep: %s", err.c_str());
+    CHECK(r.active() == -1, "active %d after sleep", r.active());
+    CHECK(ops.cards_used() == 0, "cards hold %d models", ops.cards_used());
+    CHECK(ops.n_park.load() == 1, "parks %d", ops.n_park.load());
+    CHECK(!r.try_sleep(err), "a second sleep should refuse");
+    CHECK(r.acquire(1, err), "wake by name: %s", err.c_str());
+    CHECK(r.active() == 1, "active %d", r.active());
+    CHECK(ops.cards_used() == 1 && ops.on_card[1] == 1, "model 1 not alone on the cards");
+    r.release(1);
+    CHECK(r.try_sleep(err), "sleep again: %s", err.c_str());
+    CHECK(ops.cards_used() == 0, "cards not free");
+    const int woke = r.acquire_any(err);
+    CHECK(woke == 1, "unnamed request woke %d (%s)", woke, err.c_str());
+    CHECK(!r.try_sleep(err), "sleep while a lease is held");
+    CHECK(r.active() == 1, "lease lost, active %d", r.active());
+    r.release(woke);
+    printf("  sleep: park frees the cards, the next request loads one back\n");
+}
+
+static void test_shift_keep() {
+    using V = std::vector<int32_t>;
+    // Qwen: add_bos false, n_keep 0. The cache is the prompt with a prefix removed.
+    V qwen_prompt = {10, 11, 12, 13, 14, 15, 16};
+    V qwen_cache = {13, 14, 15, 16};
+    CHECK(pxa_shift_keep_matches(qwen_prompt, (int32_t) qwen_prompt.size(),
+                                 qwen_cache, (int32_t) qwen_cache.size(), 3, 0),
+          "qwen keep should match");
+    qwen_cache[0] = 99;
+    CHECK(!pxa_shift_keep_matches(qwen_prompt, (int32_t) qwen_prompt.size(),
+                                  qwen_cache, (int32_t) qwen_cache.size(), 3, 0),
+          "qwen mismatch must not match");
+
+    // Gemma: add_bos, n_keep 1. cache = [BOS] + prompt[n_keep + discarded :].
+    // Comparing prompt[discarded + i] with cache[i] sees 13 against the BOS and fails.
+    const int32_t bos = 2;
+    V gemma_prompt = {bos, 10, 11, 12, 13, 14, 15, 16, 17, 18};
+    V gemma_cache = {bos, 14, 15, 16, 17, 18};
+    CHECK(pxa_shift_keep_matches(gemma_prompt, (int32_t) gemma_prompt.size(),
+                                 gemma_cache, (int32_t) gemma_cache.size(), 4, 1),
+          "gemma keep should match");
+    CHECK(gemma_prompt[4] != gemma_cache[0], "the old index pairs %d with %d",
+          gemma_prompt[4], gemma_cache[0]);
+    V gemma_bad_prefix = gemma_cache;
+    gemma_bad_prefix[0] = 9;
+    CHECK(!pxa_shift_keep_matches(gemma_prompt, (int32_t) gemma_prompt.size(),
+                                  gemma_bad_prefix, (int32_t) gemma_bad_prefix.size(), 4, 1),
+          "gemma wrong prefix must not match");
+    V gemma_bad_suffix = gemma_cache;
+    gemma_bad_suffix[2] = 99;
+    CHECK(!pxa_shift_keep_matches(gemma_prompt, (int32_t) gemma_prompt.size(),
+                                  gemma_bad_suffix, (int32_t) gemma_bad_suffix.size(), 4, 1),
+          "gemma wrong suffix must not match");
+    printf("  shift keep: qwen n_keep 0 and gemma n_keep 1\n");
+}
+
 int main() {
+    test_shift_keep();
     test_parse();
     test_fast_path();
     test_drain_then_swap();
@@ -378,6 +445,7 @@ int main() {
     test_acquire_active();
     test_any();
     test_stress();
+    test_sleep();
     if (g_fail) {
         fprintf(stderr, "test-pxa-hotswap: %d FAILED\n", g_fail.load());
         return 1;
