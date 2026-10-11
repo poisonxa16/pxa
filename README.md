@@ -11,6 +11,12 @@
 <a href="https://ko-fi.com/shatteredrealms1"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-Support%20PXA-FF5E5B?logo=ko-fi&logoColor=white&style=for-the-badge"></a>
 </p>
 
+<p align="center"><img src="docs/img/v3.1/hero-v3.1.png" alt="PXA v3.1: Old GPUs. New tricks. Overdrive +45% on one V100, +56% on one P100, prompt +44% vs Strata" width="900"></p>
+
+<p align="center"><img src="docs/img/v3.1/chart-best.png" alt="PXA v3.1 at its best: generation and prompt speed per model and card setup" width="900"></p>
+
+<p align="center"><b>New in v3.1:</b> PXA Overdrive, a self-learning expert map, a rebuilt PXA Control assistant (auto-compact, memory, sub-agents, web search with approvals) and more. <a href="https://github.com/poisonxa16/pxa/releases/tag/v3.1">Release notes, charts and screenshots</a>.</p>
+
 ```bash
 tar xzf pxa-v3.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v3.1-linux-x86_64-cuda12.8-sm60_61_70    # 1. unpack the release tarball
 ./pxa                                                                  # 2. PXA Control opens in your browser
