@@ -244,6 +244,28 @@ def lazy_checks(binp):
     return fails
 
 
+def turing_checks(binp):
+    checks = [({}, 256), ({"PXA_REFERENCE": "1"}, 64), ({"PXA_ENHANCE": "0"}, 64)]
+    for value, want in [("0", 0), ("128", 128), ("bad", 256), ("-1", 256), ("", 256)]:
+        checks.append(({"PXA_TURING_CUBLAS_NE11": value}, want))
+    fails = []
+    for env, want in checks:
+        rc, text = run(binp, env, ["topo", "750", "get", "turing_cublas_ne11"])
+        values = [line for line in text.splitlines() if line.startswith("turing_cublas_ne11=")]
+        if rc or values != ["turing_cublas_ne11=%d" % want]:
+            fails.append("Turing default/override %r: %s" % (env, text))
+
+    args = ["topo", "750", "get", "turing_cublas_ne11"]
+    for profile in ("dense", "dense_pxq4", "pxq2_only", "pxq3_only", "dense"):
+        args += ["prof"] + PROFS[profile] + ["get", "turing_cublas_ne11"]
+    for env, want in [({}, [256, 256, 64, 64, 64, 256]), ({"PXA_TURING_CUBLAS_NE11": "128"}, [128] * 6)]:
+        rc, text = run(binp, env, args)
+        values = [int(line.split("=")[1]) for line in text.splitlines() if line.startswith("turing_cublas_ne11=")]
+        if rc or values != want:
+            fails.append("Turing model-profile changes %r: %s" % (env, text))
+    return fails
+
+
 # ---------------------------------------------------------------------------------------------- main
 def main():
     args = sys.argv[1:]
@@ -294,8 +316,11 @@ def main():
     lazy = lazy_checks(binp)
     for f in lazy:
         print("FAIL lazy: " + f)
-    ok = not failed and not missing and not lazy
-    print("test-pxa-lever-resolve: %s (%d scenarios against the golden, %d laziness checks)" %
+    turing = turing_checks(binp)
+    for f in turing:
+        print("FAIL Turing: " + f)
+    ok = not failed and not missing and not lazy and not turing
+    print("test-pxa-lever-resolve: %s (%d scenarios against the golden, %d laziness checks, 10 Turing checks)" %
           ("OK" if ok else "FAILED", len(res), 6))
     return 0 if ok else 1
 

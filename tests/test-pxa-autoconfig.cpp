@@ -499,6 +499,64 @@ int main() {
         printf("%-44s %-10s %s\n", "6x P100 Flash-Next ub1024 status RULE", "6x600", ok ? "PASS" : "FAIL");
         g_fail += !ok;
     }
+    // ---- SM75 file-layout cells, including the mixed pair, retain a load-time fit walk ---------
+    {
+        auto f = fn;
+        f.n_layer = 49;
+        f.n_pxq = 681;
+        f.bytes = 83201745728ULL;
+        f.pxa_kv.push_back({"pxa.pxqn.encoder", "PXQN"});
+        struct { const char * topo; int b, ub; const char * status; } cases[] = {
+            {"750:22528", 2048, 2048, "FIT"},
+            {"750:22000", 2048, 2048, "FIT"},
+            {"750:22528,700:32768", 2048, 2048, "FIT"},
+            {"700:32494,750:22000", 2048, 2048, "FIT"},
+            {"750:11264", 1024, 1024, "RULE"},
+            {"750:16384", 1024, 1024, "RULE"},
+            {"750:24576", 1024, 1024, "RULE"},
+            {"750", 1024, 1024, "RULE"},
+            {"750:11264,700:32768", 0, 0, nullptr},
+            {"750:22528,700:16384", 0, 0, nullptr},
+            {"750:22528,600:16384", 0, 0, nullptr},
+            {"750:22528,700:32768,700:32768", 0, 0, nullptr},
+        };
+        bool ok = true;
+        for (const auto & c : cases) {
+            int b = 0, ub = 0;
+            const char * st = nullptr;
+            pxa_registry_batch_cell(pxa_topology_parse(c.topo), f, 2, &b, &ub, nullptr, &st);
+            const bool row_ok = b == c.b && ub == c.ub &&
+                ((st == nullptr && c.status == nullptr) || (st && c.status && strcmp(st, c.status) == 0));
+            ok &= row_ok;
+            if (!row_ok) printf("    SM75 batch %s got %d/%d %s\n", c.topo, b, ub, st ? st : "none");
+        }
+        for (int mismatch = 0; mismatch < 5; ++mismatch) {
+            auto other = f;
+            if (mismatch == 0) other.bytes++;
+            if (mismatch == 1) other.n_pxq--;
+            if (mismatch == 2) other.pxa_kv.clear();
+            if (mismatch == 3) other.n_layer--;
+            if (mismatch == 4) other.n_expert = 256;
+            int b = 0, ub = 0;
+            const int have = pxa_registry_batch_cell(pxa_topology_parse("750:22528,700:32768"), other, 2,
+                                                     &b, &ub, nullptr);
+            ok &= !have && b == 0 && ub == 0;
+        }
+        for (int level : {0, 1, 2}) {
+            pxa_user_set u;
+            const auto ac = pxa_autoconfig_resolve(pxa_topology_parse("750:22528,700:32768"), f, u, level, 0);
+            const auto * ub = pick(ac, "-ub");
+            ok &= ub && (level == 2 ? ub->value == "fit 2048" && ub->status == "FIT" : ac.n_ubatch == 0);
+            u.b = u.ub = true;
+            const auto explicit_ac = pxa_autoconfig_resolve(pxa_topology_parse("750:22528,700:32768"), f, u, level, 0);
+            const auto * explicit_b = pick(explicit_ac, "-b");
+            const auto * explicit_ub = pick(explicit_ac, "-ub");
+            ok &= explicit_b && explicit_ub && !explicit_b->applied && !explicit_ub->applied &&
+                  explicit_b->status == "USER" && explicit_ub->status == "USER";
+        }
+        printf("%-44s %s\n", "SM75/pair file-layout cells and rollback", ok ? "PASS" : "FAIL");
+        g_fail += !ok;
+    }
     // ---- cost lines: an explicit known-worse value is kept and named once -----
     {
         auto has_cost = [](const pxa_autoconfig & ac, const char * what) {

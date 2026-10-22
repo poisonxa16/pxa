@@ -4168,7 +4168,7 @@ static llama_context * pxa_auto_ub_init(llama_model * model, gpt_params & params
         llama_free(lctx);
         lctx = nullptr;
     };
-    const char * who = origin == PXA_UB_RULE ? "a registry rule (PXA_AUTO_UB_VOLTA_Q8)" : "the VRAM ladder";
+    const char * who = origin == PXA_UB_RULE ? "a registry rule" : "the VRAM ladder";
     const int ub = pxa_registry_ub_walk(ub0, origin, reserve, build, discard, &trail);
     if (ub <= 0) {
         if (lctx != nullptr) {   // never expected: the walk keeps no context when it refuses

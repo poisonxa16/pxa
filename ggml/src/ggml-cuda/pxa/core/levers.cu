@@ -171,6 +171,9 @@ static const pxa_lever_row g_pxa_lever_rows[PXA_LEVER_COUNT] = {
     { "PXA_TOPK_MOE_MULTIROW", "TOPK_MOE_MULTIROW", 0,
       "the multi-row fused top-k MoE router processes several rows per block behind one block-wide aliasing barrier; "
       "the per-row arithmetic and its order are unchanged. Default on at ENHANCE, off at DEFAULT and REFERENCE." },
+    { "PXA_TURING_CUBLAS_NE11", "TURING_CUBLAS_NE11", 64,
+      "sm_75 standard quantized matmuls use fp16 cuBLAS at ne11 >= N. 0 keeps MMQ at every batch size. "
+      "Other architectures and the dedicated PXQ/PXQN kernels are unaffected." },
 };
 
 struct pxa_lever_state {
@@ -220,6 +223,10 @@ static int64_t pxa_lever_rule_default(int id) {
     const int level = ggml_pxa_config_level();
     const pxa_topology_t & t = g_pxa_topology;
     switch ((pxa_lever_id) id) {
+        case PXA_LEVER_TURING_CUBLAS_NE11:
+            if (pxa_model_known() && (pxa_model().n_pxq_mmvq_tensors > 0 ||
+                    pxa_model().n_pxq2_tensors > 0 || pxa_model().n_pxq3_tensors > 0)) return 64;
+            return level >= 2 ? 256 : 64;
         case PXA_LEVER_FA_GQA_PACK:
             // PXA_FA_GQA_PACK ENHANCE default (2026-09-03). The packed-GQA vec kernel is reached on ONE shape
             // only: the f32 vec FA kernel at Dk==Dv==256, cols_per_block==1, f16 K and V, no logit softcap --
@@ -324,6 +331,14 @@ static pxa_lever_state pxa_lever_resolve(int i) {
         case PXA_LEVER_FA_D256_VOLTA_TILE_MINKV:
         case PXA_LEVER_FA_D256_VOLTA_TILE_MAXCOLS:
             value = pxa_env_int(g_pxa_lever_rows[i].env, v, g_pxa_lever_rows[i].off);
+            break;
+
+        case PXA_LEVER_TURING_CUBLAS_NE11:
+            value = pxa_env_int(g_pxa_lever_rows[i].env, v, pxa_lever_rule_default(i));
+            if (pxa_model_known()) {
+                fprintf(stderr, "PXA_AUTO: TURING_CUBLAS_NE11=%lld (%s; model profile; override PXA_TURING_CUBLAS_NE11)\n",
+                        (long long) value, set ? "explicit env override" : level_name);
+            }
             break;
 
         case PXA_LEVER_FA_MMA_VOLTA:
@@ -611,6 +626,7 @@ static pxa_lever_cache pxa_lever_cache_of(int id) {
     switch ((pxa_lever_id) id) {
         case PXA_LEVER_ROUTER_FUSE:
         case PXA_LEVER_VOLTA_CUBLAS_NE11:
+        case PXA_LEVER_TURING_CUBLAS_NE11:
         case PXA_LEVER_PXQ_GEMM_2D:
             return PXA_CACHE_PER_PROFILE;
         case PXA_LEVER_PXQ_INT8_PREFILL:

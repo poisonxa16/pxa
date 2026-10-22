@@ -104,7 +104,7 @@ struct pxa_cost {
 struct pxa_pick {
     std::string flag;       // "-sm" | "-b" | "-ub" | "-fa" | "-ngl"
     std::string value;      // "tensor", "8192", "adaptive", "on", ... ("" = left to the user's value)
-    std::string status;     // MEASURED | INFERRED | RULE | USER | ADAPTIVE | OFF
+    std::string status;     // MEASURED | INFERRED | RULE | FIT | USER | ADAPTIVE | OFF
     std::string evidence;   // ledger row id / bug id
     std::string why;
     bool        applied = false;   // the engine will set this flag (it was not given)

@@ -1640,19 +1640,23 @@ static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params
             if (!ub_explicit || !b_explicit) {
                 int         sb = 0, sub = 0;
                 const char * cell = nullptr;
+                const char * cell_status = nullptr;
                 // the 4x P100 cell answers differently for a dense file than for an expert one,
                 // so the resolver is told which this is -- read from the header, before load.
                 // (PXA core step 3: the cell table moved to the registry, which also carries the
                 // launcher's measured rows, so both pick the same -b/-ub on the same cards and file.)
-                if (pxa_registry_batch_cell(pxa_topo, pxa_model, ggml_pxa_config_level(), &sb, &sub, &cell)) {
+                if (pxa_registry_batch_cell(pxa_topo, pxa_model, ggml_pxa_config_level(), &sb, &sub, &cell, &cell_status)) {
                     if (!b_explicit)  { params.n_batch  = sb;  card_b  = true; }
                     if (!ub_explicit) { params.n_ubatch = sub; card_ub = true; }
+                    if (!ub_explicit && cell_status && strcmp(cell_status, "FIT") == 0) {
+                        params.pxa_ub_origin = PXA_UB_RULE;
+                    }
                     fprintf(stderr,
                             "PXA_AUTO: batch defaults for %s -> -b %d%s -ub %d%s "
-                            "(measured cell; pass -b/-ub to override, PXA_ENHANCE=0 for the "
+                            "(%s cell; pass -b/-ub to override, PXA_ENHANCE=0 for the "
                             "stock defaults)\n",
                             cell, params.n_batch, card_b ? "" : " (explicit, kept)",
-                            params.n_ubatch, card_ub ? "" : " (explicit, kept)");
+                            params.n_ubatch, card_ub ? "" : " (explicit, kept)", cell_status ? cell_status : "MEASURED");
                     // (2026-09-25, ws6-server) the 1x sm_61 cell no longer forces --ctx-checkpoints 0.
                     // Context checkpoints live in host RAM (server_prompt_checkpoint::data), not on
                     // the 11 GB card, and PXA_CKPT_PROMPT_POLICY keeps only the two near the end of a

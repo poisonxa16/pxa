@@ -655,6 +655,7 @@
 { "PXA_VLLM_IMAGE", "unset", "launcher", "tool", "", "vLLM image override" },
 { "PXA_VOLTA_CUBLAS_ID_NE11", "0", "any", "lever-off", "", "docs/LEVERS.md: leave unset" },
 { "PXA_VOLTA_CUBLAS_NE11", "64", "any", "site", "", "docs/LEVERS.md: G3-class (prefill numerics class changes; also run-to-run n~" },
+{ "PXA_TURING_CUBLAS_NE11", "256", "sm_75", "site", "", "docs/SM75.md: dense standard-quant crossover; 64 at DEFAULT/REFERENCE; 0 keeps MMQ" },
 { "PXA_VOLTA_CUBLAS_TILE", "0", "any", "site", "", "read at ggml/src/ggml-cuda.cu:3027" },
 { "PXA_VOLTA_F16_GEMM", "1 (on) for cc == 7.0 exactly, off elsew~", "any", "default-on", "", "docs/LEVERS.md: Volta only. Every other arch keeps its exact incumbent beha~" },
 { "PXA_VOLTA_PXQ_GEMM", "off (=1 on)", "any", "lever-off", "", "read at ggml/src/ggml-cuda/pxa/pxq4-v70.cuh:336" },

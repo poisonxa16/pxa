@@ -3690,7 +3690,11 @@ def engine_autoconfig(E, model, sel, a, fa_forced=None):
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"], _ = engine_ld_path(E)
     env["PXA_EXPLAIN"] = "1"
-    env["PXA_TOPOLOGY"] = ",".join(str(int(g[2]) * 10) for g in sel) if sel else "0x0"
+    # SM75 batch cells distinguish a modified 22 GB board from ordinary 11 GB cards.
+    include_vram = any(int(g[2]) == 75 for g in sel)
+    env["PXA_TOPOLOGY"] = ",".join(
+        str(int(g[2]) * 10) + (f":{int(g[3])}" if include_vram else "")
+        for g in sel) if sel else "0x0"
     env.setdefault("PXA_ENHANCE", "1")
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
@@ -4100,7 +4104,10 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
         # cell exists the engine's VRAM ladder decides at load and nothing is passed, so this
         # command and a bare `llama-server -m file` run the same -b/-ub.
         _eb, _eu = engine_pick(plan.engine_ac, "b"), engine_pick(plan.engine_ac, "ub")
-        if str(_eu.get("value", "")).isdigit():
+        if str(_eu.get("value", "")).startswith("fit "):
+            print(f"  -b/-ub: NOT PASSED - the engine verifies {_eu['value']} at load, "
+                  f"including its runtime VRAM reserve [{_eu.get('status')}]: {_eu.get('why')}")
+        elif str(_eu.get("value", "")).isdigit():
             cmd += ["-b", str(_eb.get("value")), "-ub", str(_eu["value"])]
             print(f"  -b {_eb.get('value')} -ub {_eu['value']} [{_eu.get('status')}] from the engine's "
                   f"registry: {_eu.get('why')}")

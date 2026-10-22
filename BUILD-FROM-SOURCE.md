@@ -276,6 +276,8 @@ anything the file does not carry.
 
 ## 4b. PXQN files with a source build
 
+For a native Turing (`sm_75`) source build and its matrix-dispatch tuning controls, see [SM75.md](docs/SM75.md). The architecture coverage of a separately supplied PXQN library must also be checked.
+
 `-DPXA_PXQN_CLOSED_SRC=OFF -DPXA_PXQ_ENCODER=OFF` are required on this public tree: the closed PXQN decoder and the quantizer's private encoder are not in it, and without them the configure step stops with an error.
 
 The PXQN decoder is closed and ships compiled. A build from this repository has open stubs in its place and refuses PXQN files at load with a clear message. To run PXQN files at full speed, download the matching library from the [v3 release page](https://github.com/poisonxa16/pxa/releases/tag/v3):

@@ -309,9 +309,9 @@ if (GGML_CUDA)
             if (GGML_NATIVE AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.6" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
                 set(CMAKE_CUDA_ARCHITECTURES "native")
             elseif (GGML_CUDA_F16 OR GGML_CUDA_DMMV_F16)
-                # canonical PXQ arch list: Pascal (P100 sm_60 / 1080Ti sm_61), Volta (V100 sm_70),
+                # canonical PXQ arch list: Pascal (P100 sm_60 / 1080Ti sm_61), Volta (V100 sm_70), Turing (sm_75),
                 # Ampere (3090-class sm_86), Ada (4090-class sm_89)
-                set(CMAKE_CUDA_ARCHITECTURES "60;61;70;86;89")
+                set(CMAKE_CUDA_ARCHITECTURES "60;61;70;75;86;89")
             else()
                 set(CMAKE_CUDA_ARCHITECTURES "50;61;70;75;80")
                 #set(CMAKE_CUDA_ARCHITECTURES "OFF") # use this to compile much faster, but only F16 models work

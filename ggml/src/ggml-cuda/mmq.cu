@@ -175,3 +175,23 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11) {
 
     return cc < CC_RDNA3 || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
+
+bool ggml_cuda_should_use_mmq_dense(enum ggml_type type, int cc, int64_t ne11) {
+#if !defined(GGML_CUDA_FORCE_CUBLAS) && !defined(GGML_CUDA_FORCE_MMQ)
+    // Keep the existing selector ABI and routed-expert policy for the closed library.
+    if (cc == CC_TURING && ggml_cuda_should_use_mmq(type, cc, 1)) {
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K: {
+                const int64_t threshold = pxa_lever(PXA_LEVER_TURING_CUBLAS_NE11);
+                return threshold == 0 || ne11 < threshold;
+            }
+            default: break;
+        }
+    }
+#endif
+    return ggml_cuda_should_use_mmq(type, cc, ne11);
+}

@@ -188,6 +188,7 @@ static bool get_one(const char * w) {
     if (!strcmp(w, "pxq_mmvq_auto")){ out_i(w, pxa_pxq_mmvq_auto_default()); return true; }
     if (!strcmp(w, "fuse_deltanet_default")) { out_i(w, pxa_fuse_deltanet_default()); return true; }
     if (!strcmp(w, "volta_cublas_ne11")) { out_i(w, pxa_volta_cublas_ne11()); return true; }
+    if (!strcmp(w, "turing_cublas_ne11")) { out_i(w, pxa_lever(PXA_LEVER_TURING_CUBLAS_NE11)); return true; }
     if (!strcmp(w, "int8_prefill")) { out_i(w, pxa_int8_prefill_mode_resolve()); return true; }
     if (!strcmp(w, "router_fuse"))  { out_i(w, pxa_router_fuse_mode_resolve());
                                       out_i("router_fuse_on600", pxa_router_fuse_on(600));

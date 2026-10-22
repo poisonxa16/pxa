@@ -4396,7 +4396,7 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
             ++node_n; continue;
         }
         if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || !ggml_is_quantized(dst->src[0]->type) ||
-                !ggml_cuda_should_use_mmq(dst->src[0]->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) break;
+                !ggml_cuda_should_use_mmq_dense(dst->src[0]->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) break;
         // the GEMV arm below dispatches straight into mmvq; a quantized type with no mmvq kernel
         // for this run (PXQ6 always, PXQ2/PXQ3 whenever PXA_PXQ23_MMVQ leaves them on their own
         // fused decode) would GGML_ABORT there. Stop the chain instead.
@@ -5556,7 +5556,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
 
     bool any_gpus_with_slow_fp16 = false;
-    use_mul_mat_q           = use_mul_mat_q           && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1]);
+    use_mul_mat_q           = use_mul_mat_q           && ggml_cuda_should_use_mmq_dense(src0->type, cc, src1->ne[1]);
     any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_available(cc);
 
     // PXA_PASCAL_DMMV (2026-07-19, env-gated): the PXA_ADAPTIVE_DMMV intent (Pascal keeps the
@@ -9247,7 +9247,7 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         CUDA_CHECK(cudaGetLastError());
     } else {
 
-        if (ggml_cuda_should_use_mmq(src0_1->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) {
+        if (ggml_cuda_should_use_mmq_dense(src0_1->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) {
             quantize_mmq_q8_1_cuda((const float *)src1->data, src1_quantized.get(), src1->ne[0], src1->ne[1], 1,
                     ne10_padded, src0_1->type, stream);
             CUDA_CHECK(cudaGetLastError());
@@ -13351,7 +13351,7 @@ GGML_CALL size_t ggml_backend_cuda_mul_mat_pool_need(int device, const struct gg
     const size_t K = (size_t) w->ne[0], N = (size_t) w->ne[1], T = (size_t) n_tokens;
     size_t need = 0;
     const bool pxq = pxa_is_pxq_type(w->type);
-    if (!pxq && ggml_is_quantized(w->type) && ggml_cuda_should_use_mmq(w->type, cc, n_tokens)) {
+    if (!pxq && ggml_is_quantized(w->type) && ggml_cuda_should_use_mmq_dense(w->type, cc, n_tokens)) {
         need = T*K/32*36 + (size_t(1) << 20);                          // q8_1 copy of src1
     } else if (w->type == GGML_TYPE_F32) {
         need = 0;

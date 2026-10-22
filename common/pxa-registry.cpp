@@ -383,8 +383,35 @@ int pxa_registry_batch_cell(const pxa_topology & topo, const pxa_model_info & mo
                             int * n_batch, int * n_ubatch, const char ** why,
                             const char ** status, int * n_ctx) {
     const char * st = "MEASURED";
-    if (level < 2 || topo.n_dev <= 0 || !topo.same_cc()) {
-        return 0;   // mixed sets have no measured cell (their lever is -ts)
+    if (level < 2 || topo.n_dev <= 0) {
+        return 0;
+    }
+    // Narrow file-layout cells; ordinary 11 GB Turing boards and other files keep their policy.
+    const bool flashnext32 = model.ok && model.arch == "qwen4exp" && model.tier == "PXQ_UNIVERSAL" &&
+        model.n_expert == 512 && model.n_head_kv == 2 && model.n_layer == 49 &&
+        model.n_pxq == 681 && model.bytes == 83201745728ULL &&
+        std::any_of(model.pxa_kv.begin(), model.pxa_kv.end(), [](const auto & kv) {
+            return kv.first == "pxa.pxqn.encoder" && kv.second.compare(0, 4, "PXQN") == 0;
+        });
+    if (flashnext32 && topo.cc.size() == (size_t) topo.n_dev && topo.vram_mib.size() == topo.cc.size()) {
+        int turing = 0, volta = 0;
+        for (size_t i = 0; i < topo.cc.size(); ++i) {
+            turing += topo.cc[i] == 750 && topo.vram_mib[i] >= 21504 && topo.vram_mib[i] < 23552;
+            volta += topo.cc[i] == 700 && topo.vram_mib[i] >= 31744 && topo.vram_mib[i] < 33792;
+        }
+        if ((topo.n_dev == 1 && turing == 1) || (topo.n_dev == 2 && turing == 1 && volta == 1)) {
+            if (n_batch) *n_batch = 2048;
+            if (n_ubatch) *n_ubatch = 2048;
+            if (n_ctx) *n_ctx = 0;
+            if (status) *status = "FIT";
+            if (why) *why = topo.n_dev == 1
+                ? "Flash-Next PXQN 32GB layout, 1x SM75 22GB: prefill candidate -b/-ub 2048, verified at load (docs/SM75.md)"
+                : "Flash-Next PXQN 32GB layout, SM75 22GB + V100 32GB: layer-split prefill candidate -b/-ub 2048, verified at load (docs/SM75.md)";
+            return 1;
+        }
+    }
+    if (!topo.same_cc()) {
+        return 0;   // other mixed sets retain the existing adaptive policy
     }
     const int  n      = topo.n_dev;
     const int  cc     = topo.cc[0];
@@ -857,6 +884,9 @@ static pxa_autoconfig pxa_autoconfig_resolve_picks(const pxa_topology & topo, co
             pb.value = std::to_string(b); pu.value = std::to_string(ub);
             pb.status = pu.status = cst ? cst : "MEASURED"; pb.why = pu.why = cell;
             pb.applied = !user.b; pu.applied = !user.ub;
+            if (cst && strcmp(cst, "FIT") == 0 && !user.ub) {
+                pu.value = "fit " + std::to_string(ub);
+            }
         } else {
             pb.status = "OFF"; pb.why = "no measured cell: the engine default -b is kept";
             pb.evidence = "";

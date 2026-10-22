@@ -798,8 +798,13 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
             if (pxa_router_fuse_on(cc)) fprintf(stderr, " ROUTER_FUSE ON [mode %d]", pxa_router_fuse_mode_resolve());
         } else if (i8 == 2) {
             fprintf(stderr, " INT8_PREFILL ON [TEST all-arch]");
+        } else if (cc == 750) {
+            fprintf(stderr, " dense quant MMQ/fp16-cuBLAS policy");
         } else {
             fprintf(stderr, " defaults [bit-exact set]");
+        }
+        if (cc == 750) {
+            fprintf(stderr, " TURING_CUBLAS_NE11=%lld", (long long) pxa_lever(PXA_LEVER_TURING_CUBLAS_NE11));
         }
     }
     if (pxa_fa_prefill_split_ne11() > 0) {

@@ -2491,6 +2491,15 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     }
 
     // run tests
+    if (getenv("PXA_BO_TURING_MATMUL")) {
+        test_cases.clear();
+        for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            for (int n : {1, 32, 63, 64, 65, 127, 128, 129, 255, 256, 257, 512}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, n, 512, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     if (mode == MODE_TEST) {
         ggml_backend_t backend_cpu = ggml_backend_cpu_init();
 
