@@ -225,16 +225,25 @@ With no arguments the container's launcher picks the cards, the model (the only 
 Model files are published by the team and by community members on Hugging Face ([huggingface.co/poisonxa](https://huggingface.co/poisonxa)). **Who may download a file is set on its model card.** Some files are public. Some are for supporters only. Nothing here promises that a particular file is free or public. A locked file is refused with a plain message that tells you where to put your key.
 
 <!-- models:start -->
+## Models
+
 Models quantized to PXA formats by the team. New posts in the #models channel on the [PXA Network Discord](https://discord.pxanetwork.com) are added here automatically.
 
 | Model | Notes | Published by | Added |
 | --- | --- | --- | --- |
+|[Swift-1.5-Qwen3.8-Flash-Next-PXQN2](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-Flash-Next-PXQN2) |  | PXANetwork | 2026-10-27|
+|[PXA-Supporter-Models](https://huggingface.co/poisonxa/PXA-Supporter-Models) | <https://ko-fi.com/shatteredrealms1> | PXANetwork | 2026-10-24|
+|[Swift-1.5-Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-10-01|
 |[Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-09-30|
 |[Ornith-1.5-35B-A3B-PXQ4-GGUF](https://huggingface.co/poisonxa/Ornith-1.5-35B-A3B-PXQ4-GGUF) | works with tensor split: -sm tensor | poisonxa | 2026-09-22|
 |[PXA-Fusion4-35B-GGUF](https://huggingface.co/poisonxa/PXA-Fusion4-35B-GGUF) | Fusion4 35B | poisonxa | 2026-09-22|
 |[Qwable-27B-GGUF](https://huggingface.co/poisonxa/Qwable-27B-GGUF) | 27B dense | poisonxa | 2026-09-22|
 |[PXA-Coder-35B-PXQ4](https://huggingface.co/poisonxa/PXA-Coder-35B-PXQ4) | coder model in PXQ4 | poisonxa | 2026-09-22|
-Full list: [MODELS.md](MODELS.md)
+|[Qwen3.8-27B-PXQ-GGUF](https://huggingface.co/mistrjirka/Qwen3.8-27B-PXQ-GGUF) |  | mistrjirka | 2026-09-17|
+|[Ornith-1.5-35B-A3B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-35B-A3B-PXQ-GGUF) |  | mistrjirka | 2026-09-11|
+|[Gemma-4-12B-PXQ-GGUF](https://huggingface.co/mistrjirka/Gemma-4-12B-PXQ-GGUF) |  | mistrjirka | 2026-09-09|
+|[Ornith-1.5-9B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-9B-PXQ-GGUF) |  | mistrjirka | 2026-09-08|
+Full list with download counts: [MODELS.md](MODELS.md)
 <!-- models:end -->
 
 ---
