@@ -49,6 +49,7 @@ __attribute__((used)) static pxa_prov_keeper_t pxa_prov_keeper_instance;
 #include "ggml-cuda/qsa-topk.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/pxa-q6k-down2.cuh"
 #include "ggml-cuda/mmvq-args.h"
 #include "ggml-cuda/pxa/pxq-mmvq.cuh"
 #include "ggml-cuda/pxa/pxqn.cuh"
@@ -8350,6 +8351,27 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
             int result = i + 1;
 
             //printf("next: %ld x %ld x %ld x %ld,    %zu x %zu x %zu x %zu\n", next->ne[0], next->ne[1], next->ne[2], next->ne[3], next->nb[0], next->nb[1], next->nb[2], next->nb[3]);
+
+            // Experimental Q6_K down projection: leave up/gate and all unsupported shapes on their incumbent paths.
+            // The enclosing fused branch already verified local CUDA ownership and contiguous outputs.
+            const bool pxa_q6k_down2_has_bias = i+2 < graph->n_nodes &&
+                graph->nodes[i+2]->op == GGML_OP_ADD_ID && graph->nodes[i+2]->src[0] == next &&
+                graph->nodes[i+2]->src[2] == ids;
+            if (Ny == 2 && n_ids == 8 && !pxa_q6k_down2_has_bias) {
+                pxa_mv2_args a{};
+                a.vx_u = next->src[0]->data;
+                a.vy = (const char *)dst_quantized.get(); a.y_st = dst_ddq_size; a.y_sk = dst_row_size;
+                a.dst = (char *)next->data; a.d_st = next->nb[2]; a.d_sk = next->nb[1];
+                a.ids = (const char *)ids->data; a.ids_nb0 = ids->nb[0]; a.ids_nb1 = ids->nb[1];
+                a.nb02 = next->src[0]->nb[2];
+                a.ncols_x = (int)next->src[0]->ne[0]; a.nrows_x = (int)next->src[0]->ne[1];
+                a.nrows_y = (int)dst_padded_col_size; a.ny = Ny; a.n_ids = (int)n_ids;
+                if (pxa_q6k_down2_try(ggml_cuda_info().devices[device_id].cc,
+                        next->src[0], next->src[1], ids, next, a, stream)) {
+                    CUDA_CHECK(cudaGetLastError());
+                    return result;
+                }
+            }
 
             // PXA_MOE_VERIFY2 (default OFF): the routed down projection of the whole verify batch in ONE launch,
             // each expert's rows read once for all the tokens that picked it. Same per-column reduction as below.
