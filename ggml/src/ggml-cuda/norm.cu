@@ -1417,3 +1417,117 @@ bool ggml_cuda_op_fused_rms_norm_q8(ggml_backend_cuda_context & ctx, ggml_tensor
     return fused_rms_norm_q8_f32_cuda((const float *)src0->data, (const float *)src1->data, (float *)dst->data,
             q8, src0->ne[0], (int)ncols_padded, ggml_nrows(src0), eps, ctx.stream());
 }
+
+// ---------------------------------------------------------------------------------------------
+// PXA_NORM_ADD_SCALE (2026-10-17): the Gemma 4 layer end
+//     FUSED_RMS_NORM(x, w) -> ADD(., r) [-> MUL(., s) with a one-element f32 s (layer scalar)]
+// in ONE kernel instead of three (fused_rms_norm + k_add_same + scale_f32_l). The norm value is
+// computed exactly like fused_rms_norm_f32<float> (same block size, same reduction, same
+// (scale*w)*x product); the add and the scalar multiply are explicit round-to-nearest ops
+// (__fadd_rn / __fmul_rn, never contracted into an FMA), so dst is bit-identical to the
+// three-kernel chain (IEEE add/mul are commutative, so the operand order of the ADD/MUL nodes
+// does not matter). Thread t reads x/r at its own columns and writes dst at the same columns
+// after the block-wide reduction, so an EXACT alias of dst with x or r is safe; a shifted
+// overlap is declined by the caller.
+// ---------------------------------------------------------------------------------------------
+template <int block_size, bool regcache, bool has_scale>
+static __global__ void fused_rms_norm_add_scale_f32(const float * x, const float * y, const float * r,
+        const float * s, float * dst, const int ncols, const float eps) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f;
+
+    const bool cached = regcache && ncols > block_size && ncols <= PXA_NORM_MAX_CACHE*block_size;
+    float xv[regcache ? PXA_NORM_MAX_CACHE : 1];
+
+    if (cached) {
+#pragma unroll
+        for (int k = 0; k < (regcache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+            const int   col = tid + k*block_size;
+            const float xi  = col < ncols ? x[row*ncols + col] : 0.0f;
+            xv[k] = xi;
+            tmp  += xi * xi;
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[row*ncols + col];
+            tmp += xi * xi;
+        }
+    }
+
+    tmp = warp_reduce_sum(tmp);
+    if (block_size > WARP_SIZE) {
+        __shared__ float s_sum[32];
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = tmp;
+        }
+        __syncthreads();
+        tmp = lane_id < block_size/WARP_SIZE ? s_sum[lane_id] : 0.0f;
+        tmp = warp_reduce_sum(tmp);
+    }
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    const float sv    = has_scale ? s[0] : 1.0f;
+
+    if (cached) {
+#pragma unroll
+        for (int k = 0; k < (regcache ? PXA_NORM_MAX_CACHE : 1); ++k) {
+            const int col = tid + k*block_size;
+            if (col < ncols) {
+                const float n = scale * y[col] * xv[k];
+                const float o = __fadd_rn(n, r[row*ncols + col]);
+                dst[row*ncols + col] = has_scale ? __fmul_rn(sv, o) : o;
+            }
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float n = scale * y[col] * x[row*ncols + col];
+            const float o = __fadd_rn(n, r[row*ncols + col]);
+            dst[row*ncols + col] = has_scale ? __fmul_rn(sv, o) : o;
+        }
+    }
+}
+
+template <bool has_scale>
+static void fused_rms_norm_add_scale_f32_cuda(const float * x, const float * y, const float * r, const float * s,
+        float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+    if (ncols < 1024) {
+        fused_rms_norm_add_scale_f32<256, false, has_scale><<<nrows, 256, 0, stream>>>(x, y, r, s, dst, ncols, eps);
+    } else if (pxa_norm_regcache_enabled()) {
+        fused_rms_norm_add_scale_f32<1024, true, has_scale><<<nrows, 1024, 0, stream>>>(x, y, r, s, dst, ncols, eps);
+    } else {
+        fused_rms_norm_add_scale_f32<1024, false, has_scale><<<nrows, 1024, 0, stream>>>(x, y, r, s, dst, ncols, eps);
+    }
+}
+
+bool ggml_cuda_op_fused_rms_norm_add_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
+        const ggml_tensor * resid, const ggml_tensor * scale, ggml_tensor * out) {
+    const ggml_tensor * src0 = norm->src[0];
+    const ggml_tensor * src1 = norm->src[1];
+    if (!src1 || !resid || !out) return false;
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
+        resid->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(resid) || !ggml_is_contiguous(out)) return false;
+    if (ggml_nrows(src1) != 1 || src0->ne[0] != src1->ne[0]) return false;
+    if (!ggml_are_same_shape(src0, resid) || !ggml_are_same_shape(src0, out)) return false;
+    if (scale && (scale->type != GGML_TYPE_F32 || ggml_nelements(scale) != 1)) return false;
+    const int64_t ncols = src0->ne[0];
+    // the standalone launcher's block size for these widths is 256 (< 1024) or 1024: same reduction order
+    if (ncols < 256 || ncols % WARP_SIZE != 0) return false;
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const float * x = (const float *) src0->data;
+    const float * y = (const float *) src1->data;
+    const float * r = (const float *) resid->data;
+    float * d = (float *) out->data;
+    if (scale) {
+        fused_rms_norm_add_scale_f32_cuda<true >(x, y, r, (const float *) scale->data, d, ncols, ggml_nrows(src0), eps, ctx.stream());
+    } else {
+        fused_rms_norm_add_scale_f32_cuda<false>(x, y, r, nullptr, d, ncols, ggml_nrows(src0), eps, ctx.stream());
+    }
+    return true;
+}

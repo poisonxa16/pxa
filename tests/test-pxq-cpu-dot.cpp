@@ -57,10 +57,24 @@ int64_t ggml_nrows(const struct ggml_tensor *) { std::abort(); }
 bool ggml_is_contiguous(const struct ggml_tensor *) { std::abort(); }
 bool ggml_are_same_shape(const struct ggml_tensor *, const struct ggml_tensor *) { std::abort(); }
 ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type) { std::abort(); }
+// the closed PXQN library is not linked here: absent (PXQ tiers never reach it)
+const void * ggml_pxqn_lib(void) { return nullptr; }
+bool ggml_pxqn_available(void) { return false; }
+void * ggml_pxqn_cpu_mul_mat_get(void) { return nullptr; }
 }
 
+#if defined(_MSC_VER)
+// MSVC has no _cvtsh_ss / _cvtss_sh. F16C with rounding immediate 0 is the same conversion.
+static inline float f16_to_f32(uint16_t h) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h)));
+}
+static inline uint16_t f32_to_f16(float f) {
+    return (uint16_t) _mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(f), 0));
+}
+#else
 static inline float    f16_to_f32(uint16_t h) { return _cvtsh_ss(h); }
 static inline uint16_t f32_to_f16(float f)    { return _cvtss_sh(f, 0); }
+#endif
 
 #define PXQ_HDR   128
 #define PXQ_SLAB    1088
@@ -210,6 +224,21 @@ static void run_tier(bool hq, int64_t nrows, int64_t k, uint32_t seed) {
         note(e_scalar, sc, ref, mag);
         note(e_avx2,   av, ref, mag);
         note(e_agree,  av, sc,  mag);
+    }
+
+    // the eight-row kernel: every output the same bits as the single-row call, for every row0 (unaligned ones fall back)
+    {
+        int64_t n_bad = 0, n_cmp = 0;
+        for (int64_t r0 = 0; r0 + 8 <= nrows; ++r0) {
+            float o[8];
+            pxa_pxq_dot_q8_x8(type, P.buf.data(), r0, k, xq.data(), o);
+            for (int j = 0; j < 8; ++j) {
+                const float one = pxa_pxq_dot_q8(type, P.buf.data(), r0 + j, k, xq.data());
+                n_bad += std::memcmp(&one, &o[j], sizeof(float)) != 0; ++n_cmp;
+            }
+        }
+        std::printf("   X8       %lld of %lld outputs differ from the single-row kernel (bitwise)\n", (long long)n_bad, (long long)n_cmp);
+        check(n_bad == 0, "eight-row kernel not bit-identical to the single-row kernel");
     }
 
     std::printf("%-14s nrows=%-5lld k=%-5lld  simd=%s\n", name,
@@ -372,6 +401,12 @@ static void bench(int64_t nrows, int64_t k) {
         for (int64_t r = 0; r < nrows; ++r) sink += pxa_pxq_dot_q8(GGML_TYPE_PXQ4, P.buf.data(), r, k, xq.data());
     auto t1 = std::chrono::steady_clock::now();
 
+    auto tx0 = std::chrono::steady_clock::now();
+    for (int it = 0; it < reps; ++it)
+        for (int64_t r = 0; r + 8 <= nrows; r += 8) { float o[8]; pxa_pxq_dot_q8_x8(GGML_TYPE_PXQ4, P.buf.data(), r, k, xq.data(), o); sink += o[0] + o[7]; }
+    auto tx1 = std::chrono::steady_clock::now();
+    const double x8_s = std::chrono::duration<double>(tx1 - tx0).count();
+
     std::vector<float> w(k);
     for (int it = 0; it < reps; ++it)
         for (int64_t r = 0; r < nrows; ++r) {
@@ -386,13 +421,14 @@ static void bench(int64_t nrows, int64_t k) {
     const double weights = (double)reps*nrows*k;
     std::printf("single-thread gemv, %lldx%lld, %d reps\n", (long long)nrows, (long long)k, reps);
     std::printf("   int8 dot        %7.1f Mweight/s   %.3f s\n", weights/dot_s/1e6, dot_s);
+    std::printf("   int8 dot x8     %7.1f Mweight/s   %.3f s   (%.2fx the one-row kernel)\n", weights/x8_s/1e6, x8_s, dot_s/x8_s);
     std::printf("   dequant + f64   %7.1f Mweight/s   %.3f s   (%.1fx slower)\n",
                 weights/deq_s/1e6, deq_s, deq_s/dot_s);
     (void)sink;
 }
 
 int main() {
-    for (int i = 0; i < (1 << 16); ++i) ggml_table_f32_f16[i] = _cvtsh_ss((uint16_t)i);
+    for (int i = 0; i < (1 << 16); ++i) ggml_table_f32_f16[i] = f16_to_f32((uint16_t)i);
     std::printf("PXQ CPU int8 dot self-test\n");
     float bscale = 0.0f;
     const int8_t * bi8 = pxa_pxq_dot_book_i8(&bscale);
@@ -411,6 +447,8 @@ int main() {
     run_wrappers(128, 512, 40, 4, true,  13);    // routed rows, multi-tile, nth > 1
     std::printf("\n");
     bench(2048, 4096);
+    bench(2560, 1024);   // Nemotron 3.5 Bolt latent expert up (1024 -> 2560)
+    bench(1024, 2560);   // and down
 
     std::printf("\n%s\n", g_fail ? "FAILED" : "OK");
     return g_fail;

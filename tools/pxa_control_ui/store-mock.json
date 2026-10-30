@@ -1,0 +1,142 @@
+{
+  "schema": "pxa-store-fixture/1",
+  "note": "PREVIEW FIXTURE for the PXA Control Store and Plugins pages (2026-10-14). Not real data: no account, no balance, no grants. store.js reads GET /api/store/catalog and GET /api/store/entitlements first and falls back to this file while those routes do not exist. Control's backend owns the real shapes; this file is the shape the page renders today (see the comments in store.js).",
+  "catalog": {
+    "version": 1,
+    "updated": "2026-10-14T09:00:00Z",
+    "currency": {
+      "name": "credits",
+      "source": "https://ko-fi.com/shatteredrealms1",
+      "rate_note": "Example only: the store backend sets how many credits a donation earns."
+    },
+    "items": [
+      {
+        "id": "anibal",
+        "kind": "plugin",
+        "hero": true,
+        "name": "Anibal",
+        "tagline": "A voice assistant that runs on your own rig",
+        "description": "Talk to the models you serve, hands-free. Say the wake word or hold a key, ask anything, and Anibal answers out loud, using the server you pick here. Speech recognition and the voice run on this machine.",
+        "highlights": ["Wake word or push-to-talk", "Answers out loud with a local voice", "Uses whichever server you pick in PXA Control", "Nothing leaves your network unless you allow it"],
+        "price": 20,
+        "version": "1.0.0",
+        "size": "1.4 GB with the speech models",
+        "icon": "mic",
+        "provenance": {"source": "discord", "label": "Requested on Discord", "where": "#feature-requests", "votes": 214, "url": "https://discord.pxanetwork.com"},
+        "perm_version": 2,
+        "permissions": [
+          {"id": "does", "group": "What it says it does", "label": "Listens for the wake word, turns your speech into text, asks your model, speaks the answer", "icon": "mic"},
+          {"id": "mic", "group": "What it can reach", "label": "Your microphone", "why": "Only after the wake word, or while you hold the push-to-talk key", "icon": "mic"},
+          {"id": "servers", "group": "What it can reach", "label": "The servers PXA Control runs", "why": "To send your question to the model you picked", "icon": "servers"},
+          {"id": "notify", "group": "What it can reach", "label": "Desktop notifications", "why": "To show what it heard when the sound is off", "icon": "bell", "new": true},
+          {"id": "local", "group": "Where it can send data", "label": "This machine only", "why": "Audio and text stay on this computer", "icon": "shield"}
+        ]
+      },
+      {
+        "id": "doc-chat",
+        "kind": "plugin",
+        "name": "Ask your documents",
+        "tagline": "Point it at a folder and chat with what is inside",
+        "description": "Indexes the PDFs, notes and text files in a folder you choose and lets the Chat tab answer from them, with the passages it used.",
+        "price": 0,
+        "version": "0.9.2",
+        "size": "60 MB",
+        "icon": "file",
+        "provenance": {"source": "discord", "label": "Requested on Discord", "where": "#feature-requests", "votes": 131, "url": "https://discord.pxanetwork.com"},
+        "perm_version": 1,
+        "permissions": [
+          {"id": "does", "group": "What it says it does", "label": "Reads the folder you choose and keeps a search index next to the Control settings", "icon": "file"},
+          {"id": "folder", "group": "What it can reach", "label": "One folder you pick (read only)", "why": "The documents it answers from", "icon": "file"},
+          {"id": "servers", "group": "What it can reach", "label": "The servers PXA Control runs", "why": "To embed and answer", "icon": "servers"},
+          {"id": "local", "group": "Where it can send data", "label": "This machine only", "icon": "shield"}
+        ]
+      },
+      {
+        "id": "discord-relay",
+        "kind": "plugin",
+        "name": "Discord relay",
+        "tagline": "Let your Discord server chat with your models",
+        "description": "A bot you invite to your own Discord server. Members talk to the model you choose; you set who may use it and how much.",
+        "price": 10,
+        "version": "0.6.0",
+        "size": "8 MB",
+        "icon": "chat",
+        "provenance": {"source": "discord", "label": "Requested on Discord", "where": "#feature-requests", "votes": 88, "url": "https://discord.pxanetwork.com"},
+        "perm_version": 1,
+        "permissions": [
+          {"id": "does", "group": "What it says it does", "label": "Relays messages between your Discord server and one model you pick", "icon": "chat"},
+          {"id": "net", "group": "Where it can send data", "label": "discord.com", "why": "Messages to and from your Discord server", "icon": "globe"},
+          {"id": "secret", "group": "What it can reach", "label": "Your Discord bot token (kept in the Control settings)", "icon": "shield"}
+        ]
+      },
+      {
+        "id": "pxqn-tier",
+        "kind": "quant-tier",
+        "name": "PXQN quants",
+        "tagline": "The supporter tier: the same size as PXQ, much lower error",
+        "description": "Every PXQN file on huggingface.co/poisonxa as a one-click download, and the Pro encoder's PXQN tiers in the Encode tab. PXQ files and the Free encoder stay free for everyone.",
+        "highlights": ["All PXQN downloads in Models", "PXQN tiers in Encode (Pro encoder)", "New PXQN releases while it is active"],
+        "price": 30,
+        "duration_days": 30,
+        "grants": ["pxqn"],
+        "icon": "models"
+      },
+      {
+        "id": "preset-overdrive",
+        "kind": "preset",
+        "name": "Overdrive presets",
+        "tagline": "Measured launch settings for V100 and P100 rigs",
+        "description": "The settings behind the board numbers, as Launch presets: card split, context, KV type and the levers that measured faster on each card type.",
+        "price": 5,
+        "icon": "tune",
+        "provenance": {"source": "discord", "label": "Requested on Discord", "where": "#benchmarks", "votes": 57, "url": "https://discord.pxanetwork.com"}
+      },
+      {
+        "id": "preset-longctx",
+        "kind": "preset",
+        "name": "Long-context presets",
+        "tagline": "128k-token setups that still fit",
+        "description": "Launch presets that trade a little speed for a much longer context on 16 and 32 GB cards.",
+        "price": 5,
+        "icon": "tune"
+      },
+      {
+        "id": "feature-history",
+        "kind": "feature",
+        "name": "Long history",
+        "tagline": "Keep 90 days of Live charts instead of 30",
+        "description": "The Live tab keeps minute-level history for 90 days, so a slow week can be compared with a fast one.",
+        "price": 8,
+        "duration_days": 90,
+        "icon": "live"
+      },
+      {
+        "id": "feature-early",
+        "kind": "feature",
+        "name": "Early builds",
+        "tagline": "Try engine builds before they ship",
+        "description": "Opt in to the pre-release engine channel in the update check. You can go back to the stable build at any time.",
+        "price": 12,
+        "icon": "spark"
+      }
+    ]
+  },
+  "entitlements": {
+    "account": {"supporter": true, "name": "PXA supporter", "since": "2026-08-02"},
+    "credits": {"balance": 40, "lifetime": 75, "updated": "2026-10-14T08:40:00Z", "last_topup": {"credits": 25, "at": "2026-10-01T18:12:00Z", "via": "Ko-fi"}},
+    "items": {
+      "anibal": {"state": "owned", "since": "2026-09-20", "consent": {"version": 1, "granted": ["does", "mic", "servers", "local"]}},
+      "preset-overdrive": {"state": "active", "since": "2026-09-02"},
+      "feature-history": {"state": "active", "since": "2026-09-10", "expires": "2026-12-09"}
+    },
+    "grants": [],
+    "receipts": [
+      {"id": "rcpt-0003", "at": "2026-09-20T21:04:00Z", "item": "anibal", "credits": -20, "what": "Anibal"},
+      {"id": "rcpt-0002", "at": "2026-09-10T17:30:00Z", "item": "feature-history", "credits": -8, "what": "Long history, 90 days"},
+      {"id": "rcpt-0001", "at": "2026-09-02T12:00:00Z", "item": "preset-overdrive", "credits": -5, "what": "Overdrive presets"},
+      {"id": "topup-0002", "at": "2026-10-01T18:12:00Z", "item": null, "credits": 25, "what": "Donation on Ko-fi"},
+      {"id": "topup-0001", "at": "2026-08-02T10:00:00Z", "item": null, "credits": 50, "what": "Donation on Ko-fi"}
+    ],
+    "sync": {"online": true, "checked": "2026-10-14T08:40:00Z", "grace_days": 14}
+  }
+}

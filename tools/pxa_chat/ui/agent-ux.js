@@ -64,7 +64,7 @@
 
   G.on("init", function () {
     if (!("serviceWorker" in navigator)) return;
-    const p = navigator.serviceWorker.register("/agent-sw.js");
+    const p = navigator.serviceWorker.register("/sw.js", {scope: "/"});   // one shell worker for the whole Control (pxa_control_ui/sw.js)
     if (p && p.catch) p.catch(function () {});
   });
 })();

@@ -206,7 +206,7 @@ method.")` (FACT, `linear.py:492-495`); `None` is correct only for embeddings
 appends `[num_v_heads, num_v_heads] = [48, 48]` to `output_sizes` (`qwen3_5.py:221-222`) and at
 TP=4 those become **12-row shards — violating rows%64, unshardable**. The production AWQ twin's
 `config.json` lists both per layer (FACT, 07 §5, 311 entries). Ours must too. Effect: `in_proj_qkvz`
-becomes `[2048, 2048, 6144, 6144]` (→ `512/512/1536/1536` at TP=4, all %64 ✓) and `in_proj_ba`
+becomes `[2048, 2048, 6144, 6144]` (→ `512/512/1536/1536` at TP=4, all %64 ok) and `in_proj_ba`
 becomes a separate `MergedColumnParallelLinear([48, 48])` served by `UnquantizedLinearMethod()`.
 
 ### 3.2 `PXQ4LinearMethod`
@@ -516,7 +516,7 @@ one: **dequant `attn_q` to fp16 as well and serve the whole `qkv_proj` unquantiz
 +0.37 GiB/GPU at TP=4 (§9). This only affects the 17 full-attention blocks; the 48 GDN blocks use
 `in_proj_qkvz`, which is uniformly PXQ4 (`attn_qkv` 252 + `attn_gate` 252) and stays quantized.
 Phase 2 removes the cost by re-quantizing `attn_k`/`attn_v` to PXQ4 (both are geometrically
-eligible: 1024 rows %64 ✓, 256/rank at TP=4 %64 ✓) via the quantizer's existing `PXA_PXQ_KV`
+eligible: 1024 rows %64 ok, 256/rank at TP=4 %64 ok) via the quantizer's existing `PXA_PXQ_KV`
 override (`llama-quantize.cpp:1355-1371`), producing a uniform-PXQ4 `qkv_proj`.
 
 ### 5.3 Name mapping and fusion

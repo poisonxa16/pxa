@@ -1,0 +1,21 @@
+/* the share page (todo control-share-report): its own page, the Control palette */
+:root { color-scheme: dark; --bg: #111214; --panel: #1D1F23; --line: #33363C; --fg: #ECEDEF; --dim: #A0A4AC; --acc: #E08A3C; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--acc); }
+.sh-hd { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line); }
+.sh-brand { display: flex; align-items: center; gap: 8px; color: var(--fg); text-decoration: none; }
+.sh-free { margin-left: auto; padding: 2px 10px; border-radius: 999px; background: #1f3a26; color: #7fd18f; font-weight: 700; font-size: 13px; }
+.sh-main { max-width: 1000px; margin: 0 auto; padding: 20px; }
+.sh-sub { color: var(--dim); margin-top: 0; }
+.sh-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 16px 0; }
+.sh-row select { min-width: 320px; padding: 7px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: inherit; }
+.sh-chk { color: var(--dim); }
+.sh-msg { min-height: 1.4em; color: var(--dim); }
+.sh-msg.err { color: #ff8a80; }
+.sh-fig { margin: 0; }
+.sh-fig img { width: 100%; height: auto; border-radius: 14px; border: 1px solid var(--line); display: block; }
+.sh-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+.sh-b { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); font: inherit; cursor: pointer; text-decoration: none; }
+.sh-primary { background: var(--acc); border-color: var(--acc); color: #111214; font-weight: 700; }
+.sh-foot { display: flex; gap: 18px; margin-top: 28px; padding-top: 14px; border-top: 1px solid var(--line); }

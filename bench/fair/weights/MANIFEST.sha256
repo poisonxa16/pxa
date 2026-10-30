@@ -40,9 +40,11 @@ e3de17ac1e3b49fd0f7ed2cb252c13e996b66442fbc44d2a9c481b0426ec7fbb  PXA-Fusion2-35
 # the PXQ4 tier (docs/RENAME-MAP.md); the published filename is deliberately not renamed.
 #   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/PXA-Fusion2-35B-PXQ6.gguf
 4e63c3fd0349ef698ff919d3ef93ad40f6644c6acd87cd7efc969cfc064ddf98  PXA-Fusion2-35B-PXQ6.gguf
-# 4-bit flagship with the MTP head, for --spec-type mtp.
+# 4-bit flagship with the MTP head, for --spec-type mtp. NOTE: re-uploaded 2026-10-24 with cleaned
+# metadata (tensor data identical); a copy downloaded before that date hashes
+# f08dc102b38c4a23ae546d9e007b8dad30e043e848480d29809d2262d0b17531 and is the superseded file.
 #   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/PXA-Fusion2-35B-PXQ6-MTP.gguf
-f08dc102b38c4a23ae546d9e007b8dad30e043e848480d29809d2262d0b17531  PXA-Fusion2-35B-PXQ6-MTP.gguf
+573f6c74424721944a8e40c2cb37de744ef24df59ec021106f4eeeb0dc0c4b44  PXA-Fusion2-35B-PXQ6-MTP.gguf
 # Vision projector for the Fusion2 tiers (--mmproj).
 #   https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/mmproj-fusion2-f16.gguf
 556ff9a8a0ffa3ff924e8c1b8aefb6e16a3551abc8c9b38643233f69592df14d  mmproj-fusion2-f16.gguf

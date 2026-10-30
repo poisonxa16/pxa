@@ -1,6 +1,6 @@
 """Text tool-call reader for models without native tool calls.
 
-Python port of the owner's hive harness reader (PXACLAW tools/local-lane/harness/protocol.mjs, 2026-09-22):
+Python port of an earlier JavaScript tool-call reader (2026-09-22):
 brace counting that understands string literals, one lenient JSON repair (raw newlines inside strings),
 <think> stripping, the Qwen <function=NAME><parameter=K>V</parameter></function> dialect, the
 <tool_call>/<invoke name=..>/<function name=..> tag dialects, and the JSON {"tool": ...} dialect.

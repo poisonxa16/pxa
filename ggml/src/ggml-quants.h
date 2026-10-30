@@ -104,6 +104,11 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
 void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+// PXA: same-order (bit-identical) tile of the above for CPU MUL_MAT_ID: dst[c][r0+r] = dot(row r of vx, vy[c]), nr <= 2, nc <= 4
+void ggml_pxa_vec_dot_q8_0_q8_0_tile(int n, int nr, int nc, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT const * vy, float * GGML_RESTRICT const * dst, int r0);
+int  ggml_pxa_vec_dot_q8_0_q8_0_tile_native(void);
+void ggml_pxa_vec_dot_q4_K_q8_K_tile(int n, int nr, int nc, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT const * vy, float * GGML_RESTRICT const * dst, int r0);
+void ggml_pxa_vec_dot_q6_K_q8_K_tile(int n, int nr, int nc, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT const * vy, float * GGML_RESTRICT const * dst, int r0);
 void ggml_vec_dot_q6_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

@@ -43,6 +43,29 @@ STAY_ON = {
     "PXA_PXQ4_MMQ_ACACHE",          # cache inside the default-OFF PXQ4_MMQ arm, cannot fire alone
     "PXA_PXQ_DENSE_GATEUP_SPLIT",   # sub-switch of PXQ_DENSE_GATEUP, which REFERENCE turns off
     "PXA_P2P_SELFTEST",             # startup correctness check (corrupting peer links), not a lever
+    # Added 2026-10-17 (merge pass 8; classified by reading the code, INFERRED, no run; REFERENCE behaviour is
+    # NOT changed by listing them; PXA_MAMBA2_SCAN_CHUNK and PXA_PXQN_MOE_TC were made level-aware instead):
+    "PXA_PXQN_RHT_OV",              # PXQN family: the RMS+RHT fusion (RHT_FUSE / PXQN_RMS_RHT above) at shifted-overlap sites
+    "PXA_PXQ_MMVQ_PF",              # PXQ codec kernel form: pipelined single-column PXQ4/PXQN4 MMVQ, bit-identical (161a32e3a6)
+    "PXA_PXQN_MOE_GELU",            # PXQN family: lets GELU experts (Gemma 4) reach the PXQN expert kernels; off = the generic
+                                    # dequant/cuBLAS per-expert loop, the different engine the banner keeps out (904fffc2d1)
+    "PXA_CONS_CACHE",               # host-only: caches PXA_CONSUMER_INDEX's table across equal wiring; same table (034578c4f1)
+    "PXA_DN_GDEAD_INDEX",           # host-only planner lookup inside the DeltaNet fusion (REFERENCE turns that fusion off);
+                                    # same predicate, output-identical by construction (3e7bee8ea8)
+    "PXA_MMVQ_NW4",                 # correctness: verify forward bitwise = one-token decode on sm_70 (6798f3ed10), not a speed lever
+    # Added 2026-10-20:
+    "PXA_PXQN_GU_XMAX_LD",          # PXQN family, correctness: the fused up/gate steps PXA_PXQN_XMAX_SC's max sidecar per column
+                                    # (stride 0 gave every verify column column 0's fp16 scale: MTP != plain decode), not a speed lever
+    # Added 2026-10-21 (rc2.2 merge, F1-F4; classified by reading the code and the lane's proof, greedy512
+    # sha on == off on 27B 2x P100; REFERENCE behaviour is NOT changed by listing them):
+    "PXA_PXQN_RR_ONE",              # PXQN family: sm_60 row-block decode GEMV in one launch, bit-identical (371e5a33c3)
+    "PXA_PXQN_OG_RR",               # PXQN family: sm_60 out/gate row-block route, bit-identical (82a37b61e5)
+    "PXA_PXQN_GU_RHT",              # PXQN family: fused up/gate also writes the down_in RHT + max sidecar, bit-identical (1e5ba0f785)
+    "PXA_PXQN_GATE_RHT",            # PXQN family: sm_60 gated attention tail + out_in RHT in one launch, bit-identical (ef6275c3d8)
+    # Added 2026-10-21: correctness guard, not a speed lever; stays on at every level,
+    # REFERENCE included (banner: "CGRAPH_OPPARAMS"); =0 stays the off switch:
+    "PXA_CGRAPH_OPPARAMS",          # bug #343: a CUDA graph is replayed only when every kernel node's op_params match;
+                                    # off = same-shape graphs differing only in op_params replay stale args (65550a577b)
 }
 
 GETENV = re.compile(r'getenv\("(PXA_[A-Z0-9_]+)"\)')

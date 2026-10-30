@@ -1,3 +1,4 @@
+#include "pxa-env-flag.h"
 #include "chat.h"
 
 #include "chat-auto-parser-helpers.h"
@@ -243,7 +244,16 @@ common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::strin
     throw std::invalid_argument("Invalid tool_choice: " + tool_choice);
 }
 
+// a template that failed to load leaves a null templates object (the server keeps running without one):
+// every accessor below is safe on it
+[[noreturn]] static void common_chat_templates_throw_null() {
+    throw std::runtime_error("the model's chat template failed to load (see the startup log); pass --chat-template or --chat-template-file");
+}
+
 bool common_chat_templates_support_enable_thinking(const common_chat_templates * chat_templates) {
+    if (chat_templates == nullptr) {
+        return false;
+    }
     common_chat_templates_inputs inputs;
     inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     common_chat_msg msg;
@@ -484,6 +494,9 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
                                       const common_chat_msg &              new_msg,
                                       bool                                 add_ass,
                                       bool                                 use_jinja) {
+    if (tmpls == nullptr) {
+        common_chat_templates_throw_null();
+    }
     common_chat_templates_inputs inputs;
     inputs.use_jinja = use_jinja;
     inputs.add_bos   = tmpls->add_bos;
@@ -524,6 +537,9 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
 std::string common_chat_format_example(const struct common_chat_templates *       tmpls,
                                        bool                                       use_jinja,
                                        const std::map<std::string, std::string> & chat_template_kwargs) {
+    if (tmpls == nullptr) {
+        return "";
+    }
     common_chat_templates_inputs inputs;
     inputs.use_jinja            = use_jinja;
     inputs.add_bos              = tmpls->add_bos;
@@ -555,10 +571,13 @@ void common_chat_templates_free(struct common_chat_templates * tmpls) {
 }
 
 bool common_chat_templates_was_explicit(const struct common_chat_templates * tmpls) {
-    return tmpls->has_explicit_template;
+    return tmpls != nullptr && tmpls->has_explicit_template;
 }
 
 std::string common_chat_templates_source(const struct common_chat_templates * tmpls, const std::string & variant) {
+    if (tmpls == nullptr || !tmpls->template_default) {
+        return "";
+    }
     if (!variant.empty()) {
         if (variant == "tool_use") {
             if (tmpls->template_tool_use) {
@@ -604,7 +623,7 @@ bool common_chat_auto_jinja(const struct llama_model * model, bool & use_jinja,
         return false;
     }
 
-    if (const char * e = getenv("PXA_AUTO_JINJA"); e && atoi(e) == 0) {
+    if (const char * e = getenv("PXA_AUTO_JINJA"); e && pxa_env_value_off(e)) {
         fprintf(stderr,
                 "PXA_AUTO: JINJA=off (PXA_AUTO_JINJA=0; '%s' ships a chat template the built-in map "
                 "does not know, so chat will be formatted with a template that is not the model's)\n",
@@ -661,7 +680,7 @@ bool common_chat_auto_reasoning(const struct llama_model * model, bool use_jinja
         return false;
     }
 
-    if (const char * e = getenv("PXA_AUTO_REASONING"); e && atoi(e) == 0) {
+    if (const char * e = getenv("PXA_AUTO_REASONING"); e && pxa_env_value_off(e)) {
         fprintf(stderr,
                 "PXA_AUTO: REASONING=on (PXA_AUTO_REASONING=0; '%s' ships its template with thinking "
                 "off, so a short answer budget can be spent entirely on the thought and the content "
@@ -757,6 +776,22 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
         token_eos = get_token(llama_vocab_eos(vocab), "EOS", "eos_token");
         add_bos   = llama_vocab_get_add_bos(vocab);
         add_eos   = llama_vocab_get_add_eos(vocab);
+        // add_bos here means "strip the template's leading BOS text, the tokenizer adds the BOS token". Keep the text
+        // instead when stripping changes how the rest tokenizes and the tokenizer does not double a leading BOS
+        // (Metaspace prepend_scheme "first" vocabs whose BOS is the chat start token, e.g. Nanbeige4.3). For every
+        // other vocab both probes agree and the strip stays as before. Only a tokenizer that really adds the BOS token
+        // is probed further (RWKV and PLaMo-2 never add it whatever add_bos says), and the add_special probe runs only
+        // then, so the other vocabs never log a double-BOS warning from here.
+        if (add_bos && !token_bos.empty()) {
+            const auto kept     = common_tokenize(vocab, token_bos + "x", false, true);
+            const auto stripped = common_tokenize(vocab, "x", true, true);
+            if (kept != stripped && !stripped.empty() && stripped.front() == llama_vocab_bos(vocab)) {
+                const auto kept_add = common_tokenize(vocab, token_bos + "x", true, true);
+                if (kept_add == kept) {
+                    add_bos = false;
+                }
+            }
+        }
     }
     common_chat_templates_ptr tmpls(new common_chat_templates());
     tmpls->has_explicit_template = has_explicit_template;
@@ -912,6 +947,49 @@ std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs) {
     return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
+}
+
+static bool common_chat_template_probe_renders(const common_chat_template & tmpl, const json & roles) {
+    const bool string_content = tmpl.original_caps().supports_string_content;
+    json messages = json::array();
+    for (const auto & r : roles) {
+        const std::string role = r.get<std::string>();
+        const std::string text = role + " probe";
+        json content = string_content ? json(text) : json::array({ { { "type", "text" }, { "text", text } } });
+        messages.push_back({ { "role", role }, { "content", content } });
+    }
+    try {
+        jinja::context ctx(tmpl.source());
+        jinja::global_from_json(ctx, json{
+            { "messages", messages },
+            { "bos_token", tmpl.bos_token() },
+            { "eos_token", tmpl.eos_token() },
+            { "add_generation_prompt", true },
+        }, false);
+        jinja::runtime runtime(ctx);
+        const jinja::value results = runtime.execute(tmpl.prog);
+        (void) jinja::runtime::gather_string_parts(results);
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+bool common_chat_template_probe_system_first_only(const common_chat_template & tmpl) {
+    if (tmpl.source().find("System message must be at the beginning") != std::string::npos) {
+        return true;
+    }
+    // a later system message raises while the same conversation without it renders
+    static const json probes[][2] = {
+        { json::array({ "user", "system", "user" }),              json::array({ "user", "user" }) },
+        { json::array({ "user", "assistant", "system", "user" }), json::array({ "user", "assistant", "user" }) },
+    };
+    for (const auto & p : probes) {
+        if (!common_chat_template_probe_renders(tmpl, p[0]) && common_chat_template_probe_renders(tmpl, p[1])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static common_chat_params common_chat_params_init_ministral_3(const common_chat_template &    tmpl,
@@ -1899,13 +1977,20 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string FC_NAME      = tmpl.source().find("function_calls") != std::string::npos ? "function_calls" : "tool_calls";
-    const std::string FC_START     = "<" + DSML + FC_NAME + ">";
-    const std::string FC_END       = "</" + DSML + FC_NAME + ">";
-    const std::string INVOKE_START = "<" + DSML + "invoke";
-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
-    const std::string PARAM_START  = "<" + DSML + "parameter";
-    const std::string PARAM_END    = "</" + DSML + "parameter>";
+    // DeepSeek-V4.1 puts a space between the DSML token and the tag name:
+    //   <｜DSML｜ calls> / <｜DSML｜ invoke name=".."> / <｜DSML｜ parameter name=".." string="..">
+    // (V3.2/V4 use <｜DSML｜function_calls> or <｜DSML｜tool_calls> with no space).
+    const bool        DSV41        = tmpl.source().find("' calls'") != std::string::npos ||
+                                     tmpl.source().find("｜DSML｜ calls") != std::string::npos;
+    const std::string SP           = DSV41 ? " " : "";
+    const std::string FC_NAME      = DSV41 ? "calls" :
+                                     tmpl.source().find("function_calls") != std::string::npos ? "function_calls" : "tool_calls";
+    const std::string FC_START     = "<" + DSML + SP + FC_NAME + ">";
+    const std::string FC_END       = "</" + DSML + SP + FC_NAME + ">";
+    const std::string INVOKE_START = "<" + DSML + SP + "invoke";
+    const std::string INVOKE_END   = "</" + DSML + SP + "invoke>";
+    const std::string PARAM_START  = "<" + DSML + SP + "parameter";
+    const std::string PARAM_END    = "</" + DSML + SP + "parameter>";
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);
@@ -2182,6 +2267,77 @@ static void map_developer_role_to_system(json & messages) {
     }
 }
 
+
+static std::string message_text_for_merge(const json & content) {
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    std::string text;
+    if (content.is_array()) {
+        for (const auto & part : content) {
+            if (part.is_object() && part.value("type", "") == "text" && part.contains("text") && part.at("text").is_string()) {
+                text += part.at("text").get<std::string>();
+            }
+        }
+    }
+    return text;
+}
+
+// the template takes a system message only at position 0: merge the text of every later system
+// message into messages[0] (a system message is created there when there is none), joined with a
+// blank line, and drop the later ones. Nothing changes when no system message follows position 0.
+static void merge_late_system_messages(json & messages, bool string_content) {
+    if (!messages.is_array() || messages.size() < 2) {
+        return;
+    }
+    std::vector<std::string> late;
+    json kept = json::array();
+    for (size_t i = 0; i < messages.size(); i++) {
+        const auto & m = messages[i];
+        if (i > 0 && m.is_object() && m.value("role", "") == "system") {
+            late.push_back(message_text_for_merge(m.contains("content") ? m.at("content") : json()));
+        } else {
+            kept.push_back(m);
+        }
+    }
+    if (late.empty()) {
+        return;
+    }
+    std::string joined;
+    for (const auto & t : late) {
+        if (t.empty()) {
+            continue;
+        }
+        if (!joined.empty()) {
+            joined += "\n\n";
+        }
+        joined += t;
+    }
+    LOG_DBG("Merging %zu late system message(s) into the first message\n", late.size());
+    if (joined.empty()) {
+        // only empty late system messages: drop them, never create an empty system message
+        messages = std::move(kept);
+        return;
+    }
+    if (kept.empty() || kept[0].value("role", "") != "system") {
+        json sys = { { "role", "system" } };
+        if (string_content) {
+            sys["content"] = joined;
+        } else {
+            sys["content"] = json::array({ { { "type", "text" }, { "text", joined } } });
+        }
+        kept.insert(kept.begin(), sys);
+    } else {
+        auto & first = kept[0];
+        if (first.contains("content") && first.at("content").is_array()) {
+            first["content"].push_back({ { "type", "text" }, { "text", "\n\n" + joined } });
+        } else {
+            std::string head = first.contains("content") ? message_text_for_merge(first.at("content")) : std::string();
+            first["content"] = head.empty() ? joined : head + "\n\n" + joined;
+        }
+    }
+    messages = std::move(kept);
+}
 
 // if first message is system and template does not support it, merge it with next message
 static void system_message_not_supported(json & messages) {
@@ -2639,6 +2795,38 @@ static std::string common_chat_templates_generation_prompt(const common_chat_tem
     return gen_prompt.substr(prefix_len);
 }
 
+// PXA glm-think-off (bug glm-enable-thinking-ignored). GLM chat templates of the [gMASK] family that
+// open the think block in the generation prompt unconditionally ("<|assistant|><think>", GLM-5.3) never
+// read enable_thinking, so a request with thinking off ("chat_template_kwargs": {"enable_thinking":
+// false}, or --reasoning off) still got a reasoning trace and an empty content field. With thinking off,
+// close the block the way the same template writes an assistant turn without reasoning
+// ("<|assistant|><think></think>"); the model then answers as content. Returns the tag to append, or ""
+// for no change: thinking on/default, any other template, a GLM template that already handles
+// enable_thinking itself (GLM-4.6 / GLM-4.7 render their own closed block, so the prompt does not end
+// with the open tag), or PXA_GLM_THINK_OFF=0 (the off switch: the template's own render, as before).
+static std::string pxa_glm_think_off_close(const std::string &                   src,
+                                           const autoparser::generation_params & params,
+                                           const autoparser::autoparser &        ap) {
+    if (params.enable_thinking || !params.add_generation_prompt) {
+        return "";
+    }
+    if (src.find("[gMASK]") == std::string::npos || src.find("<|assistant|>") == std::string::npos) {
+        return "";
+    }
+    if (ap.reasoning.mode == autoparser::reasoning_mode::NONE) {
+        return "";
+    }
+    const std::string start = trim_whitespace(ap.reasoning.start);
+    const std::string end   = trim_whitespace(ap.reasoning.end);
+    if (start != "<think>" || end != "</think>" || !string_ends_with(params.generation_prompt, start)) {
+        return "";
+    }
+    if (const char * e = getenv("PXA_GLM_THINK_OFF"); e && pxa_env_value_off(e)) {
+        return "";
+    }
+    return end;
+}
+
 static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
                                                             const struct common_chat_templates_inputs & inputs) {
     autoparser::generation_params params;
@@ -2660,6 +2848,11 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     if (src.find("<|channel|>") == std::string::npos) {
         // map developer to system for all models except for GPT-OSS
         workaround::map_developer_role_to_system(params.messages);
+    }
+
+    if (tmpl.system_first_only) {
+        // strict template: a system message after position 0 would raise (chat-template-system-msg)
+        workaround::merge_late_system_messages(params.messages, tmpl.original_caps().supports_string_content);
     }
 
     if (!tmpl.original_caps().supports_system_role) {
@@ -2728,7 +2921,24 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         LOG_DBG("%s: using differential autoparser\n", __func__);
         struct autoparser::autoparser autoparser;
         autoparser.analyze_template(tmpl);
+        // PXA glm-think-off: see pxa_glm_think_off_close. The close tag goes into the generation prompt
+        // before the parser is built (the parser reads the prompt's tail) and onto the rendered prompt after.
+        const std::string pxa_think_close = pxa_glm_think_off_close(src, params, autoparser);
+        const std::string pxa_gen_prompt  = params.generation_prompt;
+        if (!pxa_think_close.empty()) {
+            params.generation_prompt += pxa_think_close;
+        }
         auto auto_params = autoparser::peg_generator::generate_parser(tmpl, params, autoparser);
+        if (!pxa_think_close.empty()) {
+            if (string_ends_with(auto_params.prompt, pxa_gen_prompt)) {
+                auto_params.prompt += pxa_think_close;
+            } else {
+                // the rendered prompt does not end with the generation prompt the decision was made on:
+                // leave this request exactly as the template renders it
+                params.generation_prompt = pxa_gen_prompt;
+                auto_params = autoparser::peg_generator::generate_parser(tmpl, params, autoparser);
+            }
+        }
         auto_params.supports_thinking = autoparser.reasoning.mode != autoparser::reasoning_mode::NONE;
         if (auto_params.supports_thinking) {
             auto_params.thinking_start_tag = trim_whitespace(autoparser.reasoning.start);
@@ -2812,7 +3022,11 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
 
 common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                const struct common_chat_templates_inputs & inputs) {
-    GGML_ASSERT(tmpls != nullptr);
+    if (tmpls == nullptr) {
+        // a template that failed to load used to abort the whole server on the first chat request (GGML_ASSERT);
+        // throw instead, so the request gets an error and the server stays up.
+        common_chat_templates_throw_null();
+    }
     return inputs.use_jinja ? common_chat_templates_apply_jinja(tmpls, inputs) :
                               common_chat_templates_apply_legacy(tmpls, inputs);
 }
@@ -2904,8 +3118,9 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
 }
 
 std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates) {
-    GGML_ASSERT(chat_templates != nullptr);
-    GGML_ASSERT(chat_templates->template_default != nullptr);
+    if (chat_templates == nullptr || !chat_templates->template_default) {
+        return {};
+    }
     return chat_templates->template_default->caps.to_map();
 }
 

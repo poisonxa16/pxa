@@ -16,6 +16,7 @@
 #   MTP_DEFAULTS_ENV  optional: name of your vLLM build's "disable the automatic sm_70 MTP
 #                     defaults" environment variable (see the note below).
 set -euo pipefail
+_RH=/home/pxq4          # the container's HOME and TMPDIR (a tmpfs; never a host path)
 
 VLLM_IMAGE=${VLLM_IMAGE:?set VLLM_IMAGE to an sm_70-capable vLLM container image}
 MODEL=${MODEL:?set MODEL to a converted PXQ4 checkpoint directory}
@@ -28,10 +29,10 @@ MTP_DEFAULTS_ENV=${MTP_DEFAULTS_ENV:-}
 docker run -d --rm --name pxq4-serve \
   --gpus "$GPUS" \
   --shm-size 16g \
-  --tmpfs /root/home:exec,size=24g \
+  --tmpfs ${_RH}:exec,size=24g \
   -v "$MODEL":"$MODEL":ro -v "$PXQ4_ROOT":"$PXQ4_ROOT":ro \
   -p ${PORT}:${PORT} \
-  -e HOME=/root/home -e TMPDIR=/root/home \
+  -e HOME=${_RH} -e TMPDIR=${_RH} \
   \
   `# --- the PXQ4 plugin. It needs no pip install into the image: the plugin is` \
   `# registered by PYTHONPATH plus a hand-written entry_points.txt, which also works` \

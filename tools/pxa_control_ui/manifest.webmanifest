@@ -1,0 +1,24 @@
+{
+  "id": "/",
+  "name": "PXA Control",
+  "short_name": "PXA",
+  "description": "PXA Control: run, watch and chat with the PXA engine on this rig or another one on your network.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#111214",
+  "theme_color": "#111214",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ],
+  "shortcuts": [
+    {"name": "Hosts", "short_name": "Hosts", "description": "Pick another PXA Control on the network", "url": "/hosts.html",
+     "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"}]}
+  ]
+}

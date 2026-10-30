@@ -1,41 +1,27 @@
 <p align="center"><img src="docs/assets/pxa-network-banner.png" alt="PXA Network" width="820"></p>
 
-<h1 align="center">PXA v3.1</h1>
+<h1 align="center">PXA 4.0</h1>
 
 <p align="center"><b>Local language models, fast, on the Tesla P100, Tesla V100 and GTX 10-series cards that everyone else stopped tuning for.</b></p>
 
 <p align="center">
 <a href="https://github.com/poisonxa16/pxa/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/poisonxa16/pxa?label=release&color=E69F00&style=for-the-badge"></a>
 <a href="https://benchmarks.pxanetwork.com"><img alt="Live leaderboard" src="https://img.shields.io/badge/Leaderboard-benchmarks.pxanetwork.com-E69F00?style=for-the-badge"></a>
-<a href="https://setup.pxanetwork.com"><img alt="Setup guide" src="https://img.shields.io/badge/Setup%20guide-setup.pxanetwork.com-56B4E9?style=for-the-badge"></a>
 <a href="https://discord.pxanetwork.com"><img alt="Discord" src="https://img.shields.io/badge/Discord-PXA%20Network-5865F2?logo=discord&logoColor=white&style=for-the-badge"></a>
 <a href="https://ko-fi.com/shatteredrealms1"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-Support%20PXA-FF5E5B?logo=ko-fi&logoColor=white&style=for-the-badge"></a>
 </p>
 
-<p align="center"><img src="docs/img/v3.1/hero-v3.1.png" alt="PXA v3.1: Old GPUs. New tricks. Overdrive +45% on one V100, +56% on one P100, prompt +44% vs Strata" width="900"></p>
-
-<p align="center"><img src="docs/img/v3.1/chart-best.png" alt="PXA v3.1 at its best: generation and prompt speed per model and card setup" width="900"></p>
-
-<p align="center"><b>New in v3.1:</b> PXA Overdrive, a self-learning expert map, a rebuilt PXA Control assistant (auto-compact, memory, sub-agents, web search with approvals) and more. <a href="https://github.com/poisonxa16/pxa/releases/tag/v3.1">Release notes, charts and screenshots</a>. New here? Start with the <a href="https://setup.pxanetwork.com">step-by-step setup guide</a> (tarball, Docker, Unraid, reaching PXA Control from your LAN).</p>
-
 ```bash
-tar xzf pxa-v3.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v3.1-linux-x86_64-cuda12.8-sm60_61_70    # 1. unpack the release tarball
+tar xzf pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v4.0    # 1. unpack the release tarball
 ./pxa                                                                  # 2. PXA Control opens in your browser
 # 3. pick your cards, pick a model, press Start.  No browser? Run ./pxa --tui for the same steps in the terminal.
 ```
 
-No build tools, no CUDA toolkit, no account. Prefer a container? See [Quick start](#quick-start).
+No build tools, no CUDA toolkit, no account. Prefer a container, or a Windows or Mac client? See [Quick start](#quick-start).
 
 The speed work targets [PXA quants](#use-pxa-quants) (PXQ and PXQN). A standard GGUF file loads and runs on the same server.
 
-<table align="center"><tr>
-<td align="center"><b>85.8 t/s</b><br><sub>27B code on ONE V100<br>(PXQN2, was 36.7)</sub></td>
-<td align="center"><b>48.1 t/s</b><br><sub>27B code on ONE P100<br>(PXQN2, was 27.2)</sub></td>
-<td align="center"><b>3x</b><br><sub>32 GB Flash-Next on one P100<br>plus RAM (6.5 to 20.4 t/s)</sub></td>
-<td align="center"><b>+35%</b><br><sub>Gemma 4 prompt reading<br>on a V100</sub></td>
-</tr></table>
-
-<p align="center"><sub>PXA v3.0 against v2026.10.2 on the same machine, default settings. v3.1 keeps these. Details in <a href="#speed">Speed</a>.</sub></p>
+The 4.0 numbers, measured against v3.1 on the same machine, are in the [4.0 release notes](RELEASE-NOTES-v4.0.md).
 
 **On this page:** [What PXA is](#what-pxa-is) · [Use PXA quants](#use-pxa-quants) · [Why it is fast](#why-it-is-fast-on-these-cards) · [Features](#features) · [Supported hardware](#supported-hardware) · [Quick start](#quick-start) · [Models](#models) · [Speed](#speed) · [FAQ](#faq) · [Docs](#docs) · [Community](#community-and-support) · [Credits](#credits) · [Licence](#licence)
 
@@ -67,13 +53,13 @@ Get PXA quants from [Hugging Face](https://huggingface.co/poisonxa), or make one
 
 - **Settings picked per card and model.** Split mode, batch sizes, context, flash attention, speculation and KV-cache type come from one table built from measurements. A plain `./run-server.sh -m model.gguf` and the launcher choose the same on the same cards. Every choice is printed at boot as a `PXA_REGISTRY:` line. A flag you type always wins. See [`docs/DEFAULTS.md`](docs/DEFAULTS.md).
 - **Tensor split across cards.** Two identical P100s or V100s, and four identical P100s, split each layer across the cards on files with measured support. If the split cannot start, the engine falls back to the layer split instead of stopping.
-- **MTP and n-gram speculation, chosen per model.** A file with an MTP head (the model's own guesser) uses it where it pays. Other models use n-gram speculation, which reuses text from the prompt. Gemma 4 loads its assistant drafter with `-md`. PXA Control offers that file on the Launch page when it sits next to the model, and `./pxa --draft-model` does the same. On one V100, the Gemma 4 26B-A4B file with that drafter measured 144.9 / 155.6 t/s (prose / code) in the [Speed](#speed) table.
+- **MTP and n-gram speculation, chosen per model.** A file with an MTP head (the model's own guesser) uses it where it pays. Other models use n-gram speculation, which reuses text from the prompt. Gemma 4 loads its assistant drafter with `-md`. PXA Control offers that file on the Launch page when it sits next to the model, and `./pxa --draft-model` does the same.
 - **Expert cache for models bigger than the card.** Mixture-of-experts models that do not fit in VRAM keep their busiest experts on the card and run the rest from system RAM through a fast CPU path made for PXQN weights. It profiles which experts are busy by itself. This is how the 32 GB Flash-Next file runs on one 16 GB card.
 - **PXQN quants with quality-class labels.** Every tier name comes with a measured class, so "PXQN2" tells you it behaves like a classic 3-bit file. See [PXQN tiers](#pxqn-tiers-and-what-they-are-worth).
 - **PXA Control, the browser GUI.** Servers, Live charts, Rig, Models, Launch, Speed, Chat and Encode tabs. See [PXA Control](#pxa-control).
 - **Pro and Free encoders, from PXA Control.** Make your own PXQ or PXQN file from a Hugging Face model in a few clicks. Free makes the classic PXQ tiers and needs no key. Pro makes the PXQN tiers and is a supporter feature. Pro files can be locked: Only me (the default), Any PXA supporter, or Anyone.
 - **Old CPUs work.** If your CPU has no AVX2, the launchers pick a compatibility library on their own. Card speed stays the same. Only the work done on the CPU is slower.
-- **One tarball or a container.** The tarball carries its own CUDA runtime and a launcher. Container images are on ghcr.io, with a Compose file.
+- **One tarball or a container.** The tarball carries its own CUDA runtime and a launcher. Container images are on ghcr.io, with a Compose file. PXA Control also comes as a Windows download (with an engine zip) and a Mac client.
 - **Long context.** A needle-in-a-haystack test at 125,000 tokens passes on one P100 and one V100 with the one-card 27B file.
 - **Hot model swap.** Register several models with `--hot-model 'NAME=PATH [flags]'`. They wait in pinned host RAM, one is on the cards, and the request's `model` field picks which. Supported for Qwen-family models on Volta (V100) and newer cards that report CUDA virtual memory. Sliding-window models, including Gemma 4, are refused. PXA Control's Launch page registers the extras the same way (not on Pascal), and the Servers tab shows which model is on the cards. [Guide 11](docs/tutorials/11-switching-models-from-your-app.md) covers that, and the other way: a separate model switcher in front of the server.
 
@@ -98,36 +84,39 @@ The finer-scale variants PXQN3S8 and PXQN4S8 sit in the 3.5-bit and 6-bit classe
 
 Your rig, one click from serving. PXA Control is the launcher as a local web app: run `./pxa` and it opens. It listens on this machine only unless you pass `--lan` (which adds an access token). It starts nothing until you press Start. Dark and light themes, and it works on a phone.
 
-| Tab | What you get |
+| Page | What you get |
 |---|---|
-| **Servers** | Every server on the machine, one card each: state, port, cards, VRAM, speeds. Start, stop, restart, read the log, chat with it. |
+| **Home** | The first page. A first-run guide, then a model picker with a fit line and **Start**, then what is serving. |
+| **Chat** | Talk to a running server, with the decode and prefill speed of every reply. An assistant with tools, memory across chats and an incognito mode. |
+| **Launch** | Pick cards and a model, press Start. **Show plan** prints the exact command and the reason for each setting. |
+| **Servers** | Every server on the machine, one card each: state, port, cards, memory, speeds. Start, stop, restart, read the log. |
+| **Models** | Point it at your folders. Each file is read from its header and shows what fits on one card, a pair, or neither. Published PXA files download from here. |
+| **Encode** | Turn a Hugging Face model into a PXQ or PXQN file. See [Make your own quant](#make-your-own-quant). |
+| **Benchmarks** | Speed history per model, a one-click benchmark of your rig, and an optional community high-score board. Nothing is sent unless you press the button and read the payload. |
+| **GPU profiles** | Make cards quieter, cooler or faster, with every change shown first and undoable. |
 | **Live** | Decode and prefill speed, speculation acceptance, expert-cache hits, a request timeline and per-card memory, load, temperature and power, as charts with history. |
 | **Rig** | Every card with VRAM, temperature, power, PCIe link, the driver, and a doctor that tells you what would stop a launch. |
-| **Models** | Point it at your folders. Each file is read from its header and shows what fits on one card, a pair, or neither. |
-| **Launch** | Pick cards and a model, press Start. Show plan prints the exact command and the reason for each setting. |
-| **Speed** | Speed history per model, a one-click benchmark of your rig, and an optional community high-score board. Nothing is sent unless you press the button and read the payload. |
-| **Chat** | Talk to the running server, with the decode and prefill speed of every reply. |
-| **Encode** | Turn a Hugging Face model into a PXQ or PXQN file. See [Make your own quant](#make-your-own-quant). |
+| **Plugins** and **Store** | Plugins built by the PXA team, and the coin wallet for supporter rewards. |
 
 <p align="center"><img src="docs/img/pxa-control-live.png" alt="PXA Control Live tab: decode speed, prefill speed and server tiles (sample data)" width="860"><br><sub>The Live tab, with sample data.</sub></p>
 
 <table>
 <tr>
-<td width="62%"><img src="docs/img/pxa-control-speed.png" alt="PXA Control Speed tab (sample data)"><br><sub>The Speed tab, with sample data.</sub></td>
+<td width="62%"><img src="docs/img/pxa-control-speed.png" alt="PXA Control Benchmarks page (sample data)"><br><sub>The Benchmarks page, with sample data.</sub></td>
 <td width="38%"><img src="docs/assets/pxa-control-chat-phone-light.png" alt="PXA Control chat on a phone"><br><sub>Chat on a phone.</sub></td>
 </tr>
 </table>
 
-Full reference: [`docs/LAUNCHER.md`](docs/LAUNCHER.md).
+Every page is described in [PXA Control 4.0](docs/user/CONTROL-GUIDE-4.0.md). The launcher reference is [`docs/LAUNCHER.md`](docs/LAUNCHER.md).
 
 ### Make your own quant
 
 The Encode tab walks you through five steps: Source, Target, Checks, Run, Done. It shows which tiers fit your cards, with their quality class, estimated file size and, where we have a measurement, the decode speed. It resumes after a crash or a reboot.
 
 - **Free.** Classic PXQ tiers. No key and no graphics card needed.
-- **Pro.** The PXQN tiers. Supporters get a key from the PXA Network Discord with `/encoder` (see [Community and support](#community-and-support)). A Pro encode of a 27B model needs an NVIDIA card and about 260 GB of free disk while it runs.
+- **Pro.** The PXQN tiers, a supporter reward: unlock it with Store coins from a Ko-fi donation, or paste the key the PXA Network Discord gives supporters with `/encoder` (see [Community and support](#community-and-support)). A Pro encode of a 27B model needs an NVIDIA card and about 260 GB of free disk while it runs.
 - **Who can load the file.** In Pro, choose **Only me** (tied to your PXA account, the default), **Any PXA supporter**, or **Anyone**. A locked file loads in PXA v3 or newer. Older versions stop at load with an error.
-- **Which models.** Qwen3 and Qwen2, Llama, Mistral, Gemma 3 and Phi convert, load and generate in our tests. Gemma 3 vision towers are skipped (text only).
+- **Which models.** Qwen3 and Qwen2, Llama, Mistral, Gemma 3, Phi and the Nemotron families convert, load and generate in our tests. Gemma 3 vision towers are skipped (text only).
 
 The converter's Python packages are not in the tarball. Install them once:
 `python3 -m venv ~/pxa-convert && ~/pxa-convert/bin/pip install -r tools/requirements-convert.txt`, then start PXA Control with `PXA_CONVERT_PYTHON=~/pxa-convert/bin/python`. The list itself (`tools/requirements-convert.txt`) is in the release tarball; from a source checkout use `requirements/requirements-convert_hf_to_gguf.txt` and `requirements/requirements-convert_legacy_llama.txt`. Guide: [`docs/tutorials/04-quantize-your-own-model.md`](docs/tutorials/04-quantize-your-own-model.md).
@@ -145,7 +134,7 @@ The converter's Python packages are not in the tarball. Install them once:
 | Other GTX 10-series, Titan X, Titan Xp, Quadro P cards | `sm_61` | varies | Same chip family as the 1080 Ti. Expected to work. Not individually tested. |
 | RTX 20-series and newer | `sm_75` and up | | **Not in this build.** It is compiled for `sm_60`, `sm_61` and `sm_70` only. |
 
-**Software.** Linux x86-64. An NVIDIA driver 570 or newer (the package brings its own CUDA 12.8 runtime, so you do not install the toolkit). `python3` for the launcher. Any x86-64 CPU. About 5 GB of disk for the package, plus your models. The main tarball needs glibc 2.38 (Ubuntu 24.04 and newer). A second tarball covers Ubuntu 22.04 (glibc 2.35).
+**Software.** Linux x86-64. An NVIDIA driver 570 or newer (the package brings its own CUDA 12.8 runtime, so you do not install the toolkit). `python3` for the launcher. Any x86-64 CPU. About 5 GB of disk for the package, plus your models. The tarball needs glibc 2.35 or newer (Ubuntu 22.04 and newer). The Windows engine and the Docker image have their own notes in [`docs/install.md`](docs/install.md). macOS has no engine: the Mac download is the PXA Control client for a rig on your network.
 
 **What works on one, two and four cards**
 
@@ -162,18 +151,28 @@ The converter's Python packages are not in the tarball. Install them once:
 
 ## Quick start
 
-**Tarball (recommended).** Download the tarball from the [release page](https://github.com/poisonxa16/pxa/releases/latest). Use `pxa-v3.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz`, or the `-ubuntu22.04` variant on Ubuntu 22.04. Then:
+| Platform | Download | What you get |
+|---|---|---|
+| Linux x86_64 (glibc 2.35+, NVIDIA driver 570+) | the tarball, `pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` | The engine and PXA Control. Steps below. |
+| Docker (Linux, NVIDIA runtime) | `docker pull ghcr.io/poisonxa16/pxa:v4.0` | The same binaries as the tarball. Steps below. |
+| Windows x64 | `pxa-control-win64.exe` and `pxa-engine-win64-cuda12.zip` (unsigned: SmartScreen asks once) | PXA Control and the engine. [Windows steps](docs/install.md#windows). |
+| macOS (Intel and Apple silicon) | the PXA Control zip (unsigned: Gatekeeper asks once) | PXA Control only, for a rig on your network. [Mac steps](docs/install.md#macos). |
+| Android | in testing, not a 4.0 download | A remote window onto a Control on your network. |
+
+Check each download against the sha256 on the release page before you use it. The full install guide, with the Windows and Mac first-start steps, is [`docs/install.md`](docs/install.md).
+
+**Tarball.** Download it from the [release page](https://github.com/poisonxa16/pxa/releases/latest). Then:
 
 ```bash
-tar xzf pxa-v3.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
-cd pxa-v3.1-linux-x86_64-cuda12.8-sm60_61_70
+tar xzf pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+cd pxa-v4.0
 ./pxa --doctor                 # checks your cards, driver and CPU; starts nothing
 ./pxa                          # opens PXA Control in your browser
 ```
 
-Use a PXA quant for the speed this build is tuned for. A standard GGUF quant (Q4_K_M, Q8_0 and the rest) loads and runs on the same command. [Use PXA quants](#use-pxa-quants). Files: [huggingface.co/poisonxa](https://huggingface.co/poisonxa).
+Use a PXA quant for the speed this build is tuned for. A standard GGUF quant (Q4_K_M, Q8_0 and the rest) loads and runs on the same command. [Use PXA quants](#use-pxa-quants). Files: [huggingface.co/poisonxa](https://huggingface.co/poisonxa). Which file to start for each model family: [Model quick start](docs/user/MODEL-QUICKSTART-4.0.md).
 
-**Run `pxa` and PXA Control opens** at http://127.0.0.1:7777 (the next free port if that one is taken). Pick your cards and a model, press Start, then chat with it and watch its speed on the same page. Starting a server from the command line instead (`./pxa --gpus 0 --model your-model.gguf --yes`, or `./run-server.sh -m your-model.gguf`) opens PXA Control next to it, with that server already on the page and a Stop button. It listens on your machine only. `./pxa --tui` asks the same questions in the terminal, and `--no-control` (or `PXA_CONTROL=0`) turns the page off. In Docker it is opt-in: `-e PXA_CONTROL=1 -p 7777:7777`.
+**Run `pxa` and PXA Control opens** at http://127.0.0.1:7777 (the next free port if that one is taken), already signed in. Pick your cards and a model, press Start, then chat with it and watch its speed on the same page. Starting a server from the command line instead (`./pxa --gpus 0 --model your-model.gguf --yes`, or `./run-server.sh -m your-model.gguf`) opens PXA Control next to it, with that server already on the page and a Stop button. It listens on your machine only. `./pxa --tui` asks the same questions in the terminal, and `--no-control` (or `PXA_CONTROL=0`) turns the page off. In Docker it is opt-in: `-e PXA_CONTROL=1 -p 7777:7777`.
 
 Prefer no launcher? One line starts a server, and the engine picks the rest:
 
@@ -190,13 +189,13 @@ Add `--host 0.0.0.0` to reach it from another machine. `START-HERE.md` in the ta
 `curl -fsSL https://raw.githubusercontent.com/poisonxa16/pxa/main/install.sh | bash`
 Add `-s -- --docker` after `bash` to pull the container image instead.
 
-**Container.** `ghcr.io/poisonxa16/pxa:v3.1` carries the same binaries. Models are not in the image. Mount a folder at `/models`.
+**Container.** `ghcr.io/poisonxa16/pxa:v4.0` carries the same binaries. Models are not in the image. Mount a folder at `/models`. The tag `latest` moves only with the public release; `v4.0` stays fixed.
 
 ```bash
 docker run -d --name pxa --gpus '"device=0,1"' --shm-size=1g -p 8080:8080 \
     -v /path/to/models:/models:ro \
     -v pxa-cache:/work/.cache/pxa -e PXA_CACHE_DIR=/work/.cache/pxa \
-    ghcr.io/poisonxa16/pxa:v3.1
+    ghcr.io/poisonxa16/pxa:v4.0
 ```
 
 The `pxa-cache` volume is where a session's learned expert counts are kept. Without that mount they are deleted when the container is removed. If the directory is missing or not writable, the server log says so.
@@ -215,81 +214,36 @@ With no arguments the container's launcher picks the cards, the model (the only 
 |---|---|---|
 | **Qwen3.8-27B** in PXQN2 to PXQN5, and the one-card mix | 1 card and up | The main target. The model has its own MTP head, and PXA uses it where it pays. |
 | **Qwen3.8 Flash-Next** (a very large mixture-of-experts model) | 32 GB file: one P100 plus system RAM. 64 GB file: four P100. | Needs lots of RAM on one card (see the [FAQ](#faq)). |
-| **Gemma 4 26B-A4B** | 1 V100 or 1 P100 | Optional MTP drafter file with `-md`, from `run-server.sh`, `./pxa --draft-model`, or the Launch page when the assistant file sits next to the model. |
+| **Qwen3.6 35B-A3B** (a mixture-of-experts model with its MTP block) | 2 P100, or 1 V100 with system RAM | New in 4.0. Ornith 1.5 35B-A3B runs the same way. |
+| **Gemma 4 26B-A4B** | 1 V100 or 1 P100 | Answers questions about pictures when the vision projector file sits next to the model. Optional MTP drafter file with `-md`, from `run-server.sh`, `./pxa --draft-model`, or the Launch page when the assistant file sits next to the model. |
+| **Nemotron**: Nano 4B, Llama-3.1-Nemotron-Nano 8B, Nano 30B-A3B, Bolt 74B-A9B, Super-VL 120B-A12B | Nano 4B and 8B: 1 card. Nano 30B and Bolt: 1 V100 with system RAM. Super: 2 P100 with system RAM. | New in 4.0. Bolt and Super run as text models (no image input). Super is a PXQN2 file only, a supporter reward. No draft block for Nemotron yet. |
+| **GLM-5.3-Flash** | many cards | The release notes say whether it is supported or still experimental. |
 | **Llama, Mistral, Qwen2 and Qwen3, Gemma 3, Phi** | 1 card and up | Convert them with the Encode tab. |
-| **Ornith 1.5** (35B-A3B and 9B) | 1 card and up | Runs; see the community list below. |
+| **Ornith 1.5** (9B) | 1 card and up | Runs; see the community list below. |
 | **Any other GGUF** the engine can read | any supported card | Standard quants load and run on the same kernels. The speed work targets PXA quants ([Use PXA quants](#use-pxa-quants)). The engine loads more than 80 architectures. |
 
 Model files are published by the team and by community members on Hugging Face ([huggingface.co/poisonxa](https://huggingface.co/poisonxa)). **Who may download a file is set on its model card.** Some files are public. Some are for supporters only. Nothing here promises that a particular file is free or public. A locked file is refused with a plain message that tells you where to put your key.
 
 <!-- models:start -->
-## Models
-
 Models quantized to PXA formats by the team. New posts in the #models channel on the [PXA Network Discord](https://discord.pxanetwork.com) are added here automatically.
 
 | Model | Notes | Published by | Added |
 | --- | --- | --- | --- |
-|[Swift-1.5-Qwen3.8-Flash-Next-PXQN2](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-Flash-Next-PXQN2) |  | PXANetwork | 2026-10-27|
-|[PXA-Supporter-Models](https://huggingface.co/poisonxa/PXA-Supporter-Models) | <https://ko-fi.com/shatteredrealms1> | PXANetwork | 2026-10-24|
-|[Swift-1.5-Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-10-01|
 |[Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-09-30|
 |[Ornith-1.5-35B-A3B-PXQ4-GGUF](https://huggingface.co/poisonxa/Ornith-1.5-35B-A3B-PXQ4-GGUF) | works with tensor split: -sm tensor | poisonxa | 2026-09-22|
 |[PXA-Fusion4-35B-GGUF](https://huggingface.co/poisonxa/PXA-Fusion4-35B-GGUF) | Fusion4 35B | poisonxa | 2026-09-22|
 |[Qwable-27B-GGUF](https://huggingface.co/poisonxa/Qwable-27B-GGUF) | 27B dense | poisonxa | 2026-09-22|
 |[PXA-Coder-35B-PXQ4](https://huggingface.co/poisonxa/PXA-Coder-35B-PXQ4) | coder model in PXQ4 | poisonxa | 2026-09-22|
-|[Qwen3.8-27B-PXQ-GGUF](https://huggingface.co/mistrjirka/Qwen3.8-27B-PXQ-GGUF) |  | mistrjirka | 2026-09-17|
-|[Ornith-1.5-35B-A3B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-35B-A3B-PXQ-GGUF) |  | mistrjirka | 2026-09-11|
-|[Gemma-4-12B-PXQ-GGUF](https://huggingface.co/mistrjirka/Gemma-4-12B-PXQ-GGUF) |  | mistrjirka | 2026-09-09|
-|[Ornith-1.5-9B-PXQ-GGUF](https://huggingface.co/mistrjirka/Ornith-1.5-9B-PXQ-GGUF) |  | mistrjirka | 2026-09-08|
-Full list with download counts: [MODELS.md](MODELS.md)
+Full list: [MODELS.md](MODELS.md)
 <!-- models:end -->
 
 ---
 
 ## Speed
 
-PXA v3.0 against v2026.10.2, the previous release, on the same machine. These are v3.0 numbers on the v3.0 build, and v3.1 keeps every one of them; where v3.1 moves a number, the [v3.1 notes](RELEASE-NOTES-v3.1.md) say so. Both builds ran the same model files with the same flags, one after the other, in the same session. Decode is tokens per second (t/s) while the model writes. Prompt is tokens per second while it reads your prompt. Every number is a mean of three requests per prompt type, first run, greedy output, a different prompt every time, with the settings the engine picks for those cards and no flags typed on the command line; each table names the settings behind it. The test machine has Tesla P100 and V100 cards (16 GB each) on PCIe x4 links. Faster slots would lift the multi-card numbers.
+The 4.0 numbers are in the [4.0 release notes](RELEASE-NOTES-v4.0.md): decode and prompt speed against v3.1 on the same machine, in the same session, on the same model file, plus the Nemotron families and mainline llama.cpp on the same machine. Every number there is a greedy-output measurement on the release build, with the settings the engine picks for those cards and no flags typed.
 
-<p align="center"><img src="docs/img/pxa-v3-onecard.png" alt="One GPU, much faster: decode tokens per second on code, v2026.10.2 against PXA v3" width="900"></p>
-
-<p align="center"><img src="docs/img/pxa-v3-more.png" alt="Faster prompts, faster big MoE: v2026.10.2 against PXA v3" width="900"></p>
-
-**One card, decode with speculation as shipped (prose / code, t/s)**
-
-| Setup | v2026.10.2 | PXA v3.0 |
-|---|---:|---:|
-| Qwen3.8-27B PXQN2, one V100 | 36.8 / 36.7 | **66.9 / 85.8** |
-| Qwen3.8-27B PXQN2, one P100 | 27.3 / 27.2 | **40.3 / 48.1** |
-| Qwen3.8-27B one-card mix, one V100 | 34.6 / 35.0 | **67.2 / 84.2** |
-| Qwen3.8-27B PXQN4, one V100 | 33.7 / 33.8 | 39.9 / 39.8 |
-| Qwen3.8-27B PXQN4, one P100 | 24.2 / 24.2 | 25.4 / 25.5 |
-| Gemma 4 26B-A4B with its drafter, one V100 | 116.1 / 126.6 | **144.9 / 155.6** |
-| Flash-Next 32 GB, one P100 and system RAM | 6.5 / 6.5 | **20.2 / 20.4** |
-
-**Plain decode, no speculation (llama-bench `tg128`, t/s)**
-
-| Qwen3.8-27B tier, one card | One V100, v2026.10.2 to v3 | One P100, v2026.10.2 to v3 |
-|---|---:|---:|
-| PXQN2 | 38.5 to 52.0 (+35%) | 27.4 to 33.3 (+22%) |
-| PXQN3bal | 34.5 to 42.0 (+22%) | 23.9 to 28.1 (+17%) |
-| One-card mix | 33.5 to 42.6 (+27%) | 23.8 to 27.8 (+17%) |
-| PXQN4 | 33.3 to 40.0 (+20%) | 24.0 to 25.2 (+5%) |
-
-**Reading the prompt**
-
-| Setup | v2026.10.2 | PXA v3.0 |
-|---|---:|---:|
-| Gemma 4 26B-A4B, one V100, 4,096-token prompt | 1,994 | **2,683** (+35%) |
-| Flash-Next 32 GB, one P100 and RAM, 4,096-token prompt | 310 | **396** (+28%) |
-| Qwen3.8-27B PXQN2, one P100, 512-token prompt (llama-bench) | 156.1 | **252.3** (+62%) |
-
-Prompt speed on the other V100 and P100 files (llama-bench `pp512` and `pp4096`) is within 2% of v2026.10.2.
-
-**Two and four cards.** Plain decode on the PXQN4 27B file: two P100 go from 37.9 to 38.8, two V100 from 56.3 to 56.1, four P100 from 30.2 to 31.7 (llama-bench `tg128`). A second identical card gives 1.4x to 1.5x of one card's plain decode (P100 25.2 to 38.8, V100 40.0 to 56.1) and lets you run a bigger file. The second chart shows the two-card and four-card rows with speculation.
-
-**Measured on the final build.** Every number above comes from the v3 release gate on the shipping build, with the settings the engine picks for those cards and no flags typed -- on the V100 cards, the four V100 settings listed in [`docs/DEFAULTS.md`](docs/DEFAULTS.md), plus NUMA binding under the container. One exception is worth knowing: the gate runs in containers, where only the thread half of NUMA binding applies. Run natively, Flash-Next 32 GB on one P100 measured 21.9 / 22.7 t/s in our lever test. Flash-Next 64 GB on four P100 decodes code 23% faster (29.4 to 36.3 t/s, speculation as shipped); its prose speed is unchanged.
-
-**What these tables do not cover.** The P40 and the 1080 Ti were not re-measured for v3. Mixed P100 and V100 setups were not measured. Output text differs from v2026.10.2 on many files (see the [FAQ](#faq)).
+The live leaderboard, with every measured card setup and the community scores sent from PXA Control (Benchmarks), is at [benchmarks.pxanetwork.com](https://benchmarks.pxanetwork.com). To measure your own rig, press **Run benchmark** on the Benchmarks page. The numbers from earlier releases are in [`RELEASE-NOTES-v3.md`](RELEASE-NOTES-v3.md) and [`RELEASE-NOTES-v3.1.md`](RELEASE-NOTES-v3.1.md).
 
 ---
 
@@ -307,7 +261,7 @@ pxa-update rollback
 
 It does not touch your models, your settings, or a model's `.expert-counts.csv`. Those stay outside the version folder it switches.
 
-There is no beta channel in v3.1. That comes later.
+Valued Supporters can also opt in to the beta channel from the update window, to get new builds first and go back to stable at any time: [Beta channel](docs/user/BETA-4.0.md). `pxa-update channel stable` followed by `pxa-update apply` returns to stable from a terminal.
 
 ---
 
@@ -324,16 +278,16 @@ There is no beta channel in v3.1. That comes later.
 | One 16 GB card, 27B model | The one-card mix or PXQN3bal. They leave room for context. |
 | One 16 GB card, you want the highest quality that fits | PXQN4 (15.7 GB). It fits with a small context. |
 | Two 16 GB cards | PXQN4, or PXQN5 (18.8 GB) for the best quality. |
-| One 11 GB card | PXQN2 (9.6 GB) or PXQN1 (6.5 GB). Context stays small. Not measured by us on v3. |
+| One 11 GB card | PXQN2 (9.6 GB) or PXQN1 (6.5 GB). Context stays small. Not measured by us. |
 | A model you want in less space than a 4-bit file | PXQN2. It matches a classic 3-bit file's quality at 2-bit size. |
 
 **Does my old CPU work?** Yes. If it has no AVX2, the launchers (`pxa-launch`, `run-server.sh` and the container entrypoint) read `/proc/cpuinfo` and use the compatibility library in `lib-compat/`, then print one line saying so. We proved the picker under emulation of several older CPU types. If `bin/` programs stop with `Illegal instruction`, start through `./run-server.sh`, or set `PXA_CPU_LIB=compat`.
 
-**Why is my output different from the last version?** The v3 kernels add up numbers in a different order. That moves the last digits of the probabilities. When two words are almost tied, the winner can flip, and the text goes another way from there. This is not a quality drop. In our quality test (assistant tokens against Q8_0, the one behind the tier table) the PXQN4 file scored exactly the same on both versions, and a PXQN2 file scored slightly better. If you keep hashes of outputs, make new ones. Speculation can also change near-ties compared with plain decode. The engine keeps the model's own choice, but the arithmetic is not identical.
+**Why is my output different from the last version?** The 4.0 kernels add up numbers in a different order in some places. That moves the last digits of the probabilities. When two words are almost tied, the winner can flip, and the text goes another way from there. This is not a quality drop. If you keep hashes of outputs, make new ones. The release notes list where the 4.0 text is not bit-identical to 3.1. Speculation can also change near-ties compared with plain decode. The engine keeps the model's own choice, but the arithmetic is not identical.
 
-**What did the engine pick for my cards?** Run `./pxa --doctor`. It lists your cards, the driver, the model file and the settings the engine would pick, with the reason for each. Starts nothing. In a container: `docker run --rm --gpus all -v /path/to/models:/models:ro ghcr.io/poisonxa16/pxa:v3.1 doctor -m /models/your-model.gguf`.
+**What did the engine pick for my cards?** Run `./pxa --doctor`. It lists your cards, the driver, the model file and the settings the engine would pick, with the reason for each. Starts nothing. In a container: `docker run --rm --gpus all -v /path/to/models:/models:ro ghcr.io/poisonxa16/pxa:v4.0 doctor -m /models/your-model.gguf`.
 
-**It says a model is locked.** The file was encoded with Pro and locked. Paste your key into the key field on the Encode tab in PXA Control, or set `PXA_LICENCE_KEY`. Supporters get their key from the PXA Network Discord with `/encoder`; a [ko-fi membership](https://ko-fi.com/shatteredrealms1) is what unlocks the Supporter role that comes with it.
+**It says a model is locked.** The file was encoded with Pro and locked. Paste your key into the key field on the Encode tab in PXA Control, or set `PXA_LICENCE_KEY`. Supporters get their key from the PXA Network Discord with `/key` (the same key `/encoder` gives); a [Ko-fi membership](https://ko-fi.com/shatteredrealms1) is what unlocks the Supporter role that comes with it.
 
 **Do I need NVLink?** No. Cards on plain PCIe work. The engine tests peer-to-peer copies at start and falls back to a safe route on boards where they corrupt data.
 
@@ -347,6 +301,9 @@ There is no beta channel in v3.1. That comes later.
 
 | Start here | |
 |---|---|
+| [`docs/install.md`](docs/install.md) | Install on Linux, Docker, Windows and Mac, with the first-start steps for the unsigned downloads. |
+| [`docs/user/CONTROL-GUIDE-4.0.md`](docs/user/CONTROL-GUIDE-4.0.md) | Every PXA Control page. |
+| [`docs/user/MODEL-QUICKSTART-4.0.md`](docs/user/MODEL-QUICKSTART-4.0.md) | Which file to start for each model family. |
 | `START-HERE.md` (in the tarball) | The first fifteen minutes, with what a good start looks like. |
 | [`docs/tutorials/`](docs/tutorials/README.md) | Twelve guides: first chat, settings for your cards, going faster, long chats, measuring your card, fixing problems. |
 | [`docs/LAUNCHER.md`](docs/LAUNCHER.md) | The launcher and PXA Control reference. |
@@ -363,6 +320,7 @@ There is no beta channel in v3.1. That comes later.
 | [`docs/PXA-SM60-SERVING.md`](docs/PXA-SM60-SERVING.md), [`docs/PXA-SM70-SERVING.md`](docs/PXA-SM70-SERVING.md), [`docs/VLLM.md`](docs/VLLM.md) | The optional vLLM sidecar for Pascal and Volta. |
 | [`docker/COMPOSE.md`](docker/COMPOSE.md) | Container images and Compose. |
 | [`BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md) | Building the engine yourself. |
+| [`RELEASE-NOTES-v4.0.md`](RELEASE-NOTES-v4.0.md) | What changed in 4.0. |
 | [`RELEASE-NOTES-v3.md`](RELEASE-NOTES-v3.md) | What changed in v3. |
 | [`RELEASE-NOTES-v3.1.md`](RELEASE-NOTES-v3.1.md) | What changed in v3.1. |
 | [`MODELS.md`](MODELS.md) | The full model list. |
@@ -391,7 +349,7 @@ Supporter models are available to supporters first. Bug reports are welcome on D
 
 ## Credits
 
-Thanks to **mistrjirka**, a developer on the PXA Network Discord and part of the PXA team, for his help on this release. Thanks also to the community members whose testing on real hardware keeps this engine honest:
+Thanks to the PXA team and to the community members whose testing on real hardware keeps this engine honest:
 
 - **Last-Guitar-5924** found a long-context decode cliff on a Tesla P40.
 - **bradrlaw** traced the dual-GPU decode collapse on boards without NVLink and caught a missing library in an earlier package.

@@ -32,3 +32,22 @@ void ggml_cuda_op_delta_net_ex2(ggml_backend_cuda_context & ctx, ggml_tensor * d
 void ggml_cuda_op_delta_net_ex3(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_dst_override,
                                 const int32_t * state_dst_row_idx, int64_t state_dst_row_stride,
                                 const float * state_in_mask);
+
+// PXA_SPEC_CKPT_REPLAY (2026-10-14): one layer of a replay rollback. pack = the layer's replay pack
+// written by the n_verify-token capture verify (ggml_delta_net_set_replay_capture); the recurrence is
+// re-run over its first n_replay tokens from the captured start state and the final state written to
+// state_dst; scratch receives the (unused) attention output, >= head_dim*n_heads*n_replay floats.
+// The layout of this struct is mirrored in src/llama.cpp (static_assert on its size there).
+struct pxa_dn_replay_desc {
+    const float * pack;
+    float       * state_dst;
+    float       * scratch;
+    int64_t       head_dim;
+    int64_t       n_heads;
+    int64_t       n_heads_kq;
+    int32_t       repeat_type;
+    int32_t       n_verify;
+    int32_t       n_replay;
+    int32_t       pad;
+};
+void ggml_cuda_delta_net_replay(ggml_backend_cuda_context & ctx, int n, const pxa_dn_replay_desc * d);

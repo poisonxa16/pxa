@@ -11,6 +11,7 @@ import os
 import signal
 import struct
 import sys
+import threading
 import time
 
 TYPE_OF = {"PXQN4": 259, "PXQN3": 257, "PXQN3S8": 258, "PXQN2": 260, "PXQN1": 261, "PXQN4S8": 262, "PXQN5": 263,
@@ -304,6 +305,8 @@ def tool_pxqe(d, a):
             o["allowed_tiers"] = c["allowed_tiers"]
         if c.get("lock_server") is not None:           # what the licence server says about locks (it sends the block whatever the encoder's age)
             o["lock"] = c["lock_server"]
+        if c.get("coins_server") is not None:          # what a coin-era licence server adds (coins_per_encode, free_coins, ...)
+            o.update(c["coins_server"])
         if c.get("status_fail"):
             print("pxqe: cannot reach the licence server (URLError)", file=sys.stderr)
             return 1
@@ -774,12 +777,14 @@ def tool_server(d, a):
     import socketserver
     port = int(arg(a, "--port", "8080"))
     model = arg(a, "-m") or arg(a, "--model") or "?"
+    last = [time.monotonic()]
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *x):
             pass
 
         def _send(self, obj):
+            last[0] = time.monotonic()
             data = json.dumps(obj).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -805,6 +810,14 @@ def tool_server(d, a):
         daemon_threads = True
         allow_reuse_address = True
     srv = S(("127.0.0.1", port), H)
+    ppid0, idle_max = os.getppid(), float(os.environ.get("PXA_FAKE_SERVER_IDLE_S", "300"))
+
+    def reaper():          # a check that crashes must not leave this stand-in holding a port (a real 808x/809x one) for days
+        while True:
+            time.sleep(2)
+            if os.getppid() != ppid0 or time.monotonic() - last[0] > idle_max:
+                os._exit(0)
+    threading.Thread(target=reaper, daemon=True).start()
     print("main: server is listening on http://127.0.0.1:%d - starting the loop" % port, flush=True)
     srv.serve_forever()
     return 0

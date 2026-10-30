@@ -6,6 +6,7 @@
 
 #include "llama-spec-features.h"
 #include "llama-kv-index.h"
+#include "llama-pxa-reserve-run.h"
 
 struct llama_model;
 
@@ -213,6 +214,15 @@ struct llama_kv_cache {
         // One tensor per recurrent layer, each sized [conv_dim * max_tokens].
         //std::vector<std::vector<ggml_tensor *>> per_step_qkv;
         std::vector<std::vector<ggml_tensor *>> per_step_conv;
+
+        // PXA_SPEC_CKPT_REPLAY (2026-10-14): per-step mode with REPLAY rollback. per_step_ssm[il] is then
+        // ONE replay pack per layer (start state + max_tokens rows of recurrence inputs, ggml.h
+        // ggml_delta_net_set_replay_capture) instead of max_tokens-1 state rows, and a rollback re-runs
+        // the recurrence over the accepted tokens (per_step_restore). per_step_conv is unchanged.
+        // Chosen by llama_spec_ckpt_budget_max_tokens when the per-step rows do not fit (or forced /
+        // forbidden with PXA_SPEC_CKPT_REPLAY=1/0, or asked for with LLAMA_SPEC_CKPT_REPLAY).
+        bool replay = false;
+        ggml_tensor * replay_scratch = nullptr;   // attention output of a replay (dropped)
 
         int32_t per_step_n_tokens = 0;
         int32_t per_step_max_allocated = 0;
@@ -511,6 +521,16 @@ struct llama_context {
     std::vector<int32_t> embd_rows_seq;
     std::vector<int32_t> embd_rows_pos;
     int32_t embd_batch_sole_seq = -2;
+    // PXA_SPEC_LAZY_HIDDEN: see llama_set_embd_lazy(). pxa_embd_pend_t is the last graph's embd node; it and its
+    // device bytes stay valid until the next decode, which clears the pending copy before it builds anything.
+    bool           pxa_embd_lazy       = false;
+    bool           pxa_embd_pend       = false;
+    ggml_tensor *  pxa_embd_pend_t     = nullptr;
+    float *        pxa_embd_pend_dst   = nullptr;
+    size_t         pxa_embd_pend_off   = 0;
+    size_t         pxa_embd_pend_bytes = 0;
+    uint64_t       pxa_embd_n_lazy     = 0;   // one-token decodes that left the row on the device
+    uint64_t       pxa_embd_n_fetch    = 0;   // of those, rows a reader fetched
 
     bool logits_all = false;
 
@@ -575,6 +595,7 @@ struct llama_context {
     std::vector<float>       dspark_cap_out;
     bool                     dspark_cap_out_ok = false;
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
+    int64_t              pxa_band_rows = 0; // PXA_KV_BAND_ANCHOR0: the ubatch rows of the last llama_set_inputs
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_K_shift_swa; // I32 [kv_swa.size]  (PXA_SWA_KV)
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
@@ -593,6 +614,11 @@ struct llama_context {
     // the other 2 -- the value tracked heap layout, so relinking the library changed
     // the outcome. A segfault was equally available.
     struct ggml_tensor * inp_ple_rows = nullptr;
+    // PXA_PLE_DIRECT: [ple_head_dim, ple_n_heads * n_batch] of the table's type. The DISTINCT rows
+    // of this ubatch, read from the file by model.pxa_ple_direct in llama_set_inputs; inp_ple_rows
+    // then indexes this stage instead of the table. nullptr unless the lever engaged at load.
+    struct ggml_tensor * inp_ple_stage = nullptr;
+    std::vector<uint8_t> pxa_ple_stage_host;   // host scratch for the stage bytes
 
     // ---- qwen4exp PLE per-sequence conv history --------------------------------------
     // The PLE conv is dilated and causal: out[c, t] reads the conv input at
@@ -617,6 +643,8 @@ struct llama_context {
     struct ggml_context * ctx_ple_capture   = nullptr;
     ggml_backend_buffer_t buf_ple_capture   = nullptr;
     struct ggml_tensor  * ple_conv_hist_dev = nullptr;
+    // PXA_PLE_PIPELINE (src/llama-pxa-ple-pipe.h): -1 = not decided yet, 0 = keep the per-graph PLE barrier, 1 = skip it
+    int                   pxa_ple_pipe      = -1;
 
     // I32 [conv_kernel * n_tokens]: source column in concat(ple_conv_hist_dev, conv_in) for
     // tap k of token t, at idx[k*n_tokens + t]. Filled host-side in llama_set_inputs, which
@@ -698,6 +726,7 @@ struct llama_context {
     int  pxa_reserved_nodes   = -1;
     int  pxa_reserved_width   =  0;
     int  pxa_reserved_replans = -1;
+    long pxa_reserve_absorbed = 0;   // PXA_RESERVE_ABSORB: allocator re-plans absorbed instead of re-reserving (MTP head context)
     bool pxa_reserve_sizes_logged = false;
 
     // PXA_RESERVE_SHAPE: the reserve used to synthesise a TOKEN batch with n_outputs == n_tokens,
@@ -722,12 +751,16 @@ struct llama_context {
     std::vector<std::string> pxa_reserved_sig;
 
     // thrash guard: shapes (ubatch width, node count) a re-reserve provably cannot cover, plus a
-    // hard cap on how many times this context may re-reserve at all. Without it a context whose
-    // graph shape alternates re-reserves forever, two compute-buffer reallocations per token.
+    // cap on how many CONSECUTIVE unamortized re-reserves (each replacing a plan before
+    // PXA_RESERVE_AMORTIZED_MIN ubatches of this context ran, graph slots included) it may take. Without it a context
+    // whose graph shape alternates re-reserves forever, two compute-buffer reallocations per token.
+    // pxa_reserve_count is the lifetime count, kept for the logs (and PXA_RESERVE_LIFETIME=1).
     std::set<uint64_t> pxa_reserve_dead_shapes;
     int  pxa_reserve_count     = 0;
+    pxa_reserve_run_state pxa_reserve_run;
     bool pxa_reserve_latched_off = false;
-    // PXA_WARMUP_NO_REUSE: the last llama_build_graph built the all-experts warmup shape
+    // PXA_WARMUP_NO_REUSE (default on): the last llama_build_graph built the all-experts warmup shape,
+    // which llama_decode_internal then never records as the reuse graph
     bool pxa_last_build_warmup = false;
 
     // PXA_TSPLIT_LMHEAD_DIRECT: the vocab-parallel head's leading logit slices, handed from
@@ -743,14 +776,34 @@ struct llama_context {
     bool                 pxa_amax_sl    = false;   // the last argmax-only decode read a shortlisted (MTP) head
     bool                 pxa_amax_only  = false;   // request for the next decode (server sets, decode clears)
     bool                 pxa_amax_valid = false;   // the last decode filled pxa_amax_rows instead of logits
+    bool                 pxa_amax_last_sf = false; // the last llama_get_argmax_ith row had no finite maximum (L4)
     int32_t              pxa_amax_nparts = 0;
     std::vector<int64_t> pxa_amax_off;             // [nparts] first vocab column of each slice
     std::vector<float>   pxa_amax_raw;             // [nparts][rows_graph][3] raw D2H
     std::vector<int32_t> pxa_amax_rowmap;          // output row j -> graph row
     int32_t              pxa_amax_rows_graph = 0;
+    int32_t              pxa_amax_w = 3;           // floats per argmax row: 3, or 4 with max2 (PXA_DRAFT_ARGMAX)
+    float                pxa_amax_last_d2 = NAN;   // max2 - max of the last llama_get_argmax_ith row (NAN: no max2)
     ggml_tensor *        pxa_res_t = nullptr;      // the graph's "result_output" (recorded at build)
     ggml_tensor *        pxa_result_norm_t = nullptr; // build-time only: the row an MTP target reads back as its feature
     std::vector<ggml_tensor *> pxa_amax_parts;     // the graph's pxa_amax nodes, column order
+    // PXA_SAMPLED_TOPW (2026-10-19; default off): the head's top-W window node (GGML_OP_ARGMAX mode 3,
+    // [2W, rows]: W values sorted descending then W ids). A decode run with pxa_topw_only set copies it back instead
+    // of the logit rows; the sampler's raw top-k path then reads its window from it (common/sampling.cpp).
+    ggml_tensor *        pxa_topw_t     = nullptr;  // the LAST built graph's window node (nullptr = none)
+    bool                 pxa_topw_only  = false;    // request for the next decode (server sets, decode clears)
+    bool                 pxa_topw_valid = false;    // the last decode filled pxa_topw_raw instead of logits
+    int32_t              pxa_topw_W     = 0;        // the window width of the copied node
+    int32_t              pxa_topw_rows_graph = 0;
+    std::vector<float>   pxa_topw_raw;              // [rows_graph][2W] raw D2H
+    std::vector<int32_t> pxa_topw_rowmap;           // output row j -> graph row
+    ggml_tensor *        pxa_topw_res   = nullptr;  // the window-only decode's logits tensor (lazy fetch, see llama_get_logits)
+    bool                 pxa_topw_logits_ok = true; // false: the logits rows of the last decode are still on the device
+    // PXA_DRAFT_ARGMAX: an argmax-only DRAFT decode (DRAFT_GEN / UPDATE_ACCEPTED) leaves its logit rows on the
+    // device; llama_get_logits / llama_get_logits_ith copy them on first demand (the host's exact fallback draw)
+    bool                 pxa_amax_lazy   = false;
+    std::vector<ggml_tensor *> pxa_amax_res;       // the logit slices in column order (one unless the head is cut)
+    int64_t              pxa_amax_res_w  = 0;      // floats per row they cover (the shortlist width on a shortlisted head)
 
     // PXA_MTP_FOLD (2026-09-28; default off until measured). The MTP head's update
     // pass over every verify row runs INSIDE the verify graph: row j = (trunk hidden j, target argmax j)
@@ -780,6 +833,7 @@ struct llama_context {
     int32_t                  pxa_fold_nkv     = -1;       // companion kv.n the fold graph was built at
     bool                     pxa_fold_built   = false;
     bool                     pxa_fold_dead    = false;    // a fold build was refused once: stay off
+    int                      pxa_cold_epoch_seen = 0;     // model.pxa_cold_epoch the reused graphs were built at
     int32_t                  pxa_fold_head_w  = 0;
     int32_t                  pxa_fold_n_embd  = 0;
     std::vector<float>       pxa_fold_hid_host;           // [w][n_embd]
@@ -792,6 +846,12 @@ struct llama_context {
     };
     std::vector<CacheCopy> cache_copies;
     std::vector<CacheCopy> pxa_fold_cc;   // PXA_MTP_FOLD: the fold's companion K/V writes (graph-bound)
+    // PXA_GLM5NEXT_GRAPH_REUSE: per-layer indexer side-cache (idx_l) writes of the glm5next
+    // MLA/DSA blocks, patched like cache_copies on a reused graph. Bound to the graph that
+    // registered them (pxa_idx_cc_graph); a reuse of any other graph is refused.
+    std::vector<CacheCopy> pxa_idx_cc;
+    ggml_cgraph *          pxa_idx_cc_graph = nullptr;
+    int64_t                pxa_n_graph_reuse = 0;  // times decode reused the previous graph
 
     bool update_cache_copies();
 
@@ -802,4 +862,7 @@ struct llama_context {
     int max_nodes(int n_tokens, int n_kv) const;
 
 };
+
+// PXA_SPEC_LAZY_HIDDEN: copy a one-token decode's deferred hidden row into embd (no-op when none is pending)
+void llama_pxa_embd_resolve(llama_context & lctx);
 

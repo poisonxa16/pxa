@@ -39,6 +39,7 @@
 // why the kernel uses the sign_epi8 trick rather than a +128 bias on the book, whose products
 // would reach 255*127*2 = 64770 and would need a bsum correction to undo.
 
+#include "pxa-env-flag.h"
 #include "pxq-dot.h"
 #include "pxq-cpu.h"
 
@@ -104,7 +105,7 @@ static bool pxa_dot_enabled(void) {
     int v = state;
     if (v < 0) {
         const char * e = getenv("PXA_PXQ_CPU_DOT");
-        v = (e && atoi(e) == 0) ? 0 : 1;
+        v = (e && pxa_env_value_off(e)) ? 0 : 1;
         state = v;
     }
     return v != 0;
@@ -304,6 +305,80 @@ static float pxa_pxq_dot_q8_avx2(enum ggml_type type, const void * base, int64_t
     return pxa_dot_hsum(acc)*pxa_book_i8_scale;
 }
 
+// EIGHT ROWS AT ONCE, core tier (2026-10-19). The CPU cold path of the expert cache (Nemotron 3.5 Bolt PXQ4 on
+// 2x P100: the decode waited ~1 ms per cold layer on this dot) needs more weights per cycle than the one-row kernel's ~2.4,
+// which spends most of its issue slots on port 5 (lane duplication, blendv, four-scalar setr_ps per block). Eight consecutive
+// rows of one 64-row panel (row0 % 8 == 0) share the activation block, the slab, 128 contiguous code bytes, 8 sub bytes and
+// 8 anchors, so per block:
+//   - codes: one 256-bit load = two rows; and / srli / and, then unpacklo / unpackhi put each row's elements 0-15 (ul) and
+//     16-31 (uh) in element order inside each 128-bit lane: ul = [row j 0-15 | row j+1 0-15], uh = [row j 16-31 | row j+1 16-31]
+//   - activation: [a 0-15 | a 0-15] and [a 16-31 | a 16-31], built once per block for all eight rows
+//   - scales: the eight anchors, d and the two subs per row as vectors (anchor*d, then *sub: the very products the one-row kernel
+//     forms one by one), spread per row pair with broadcasts + one blend
+// EXACTNESS. Every int32 lane holds exactly the one-row kernel's integer (the four products of elements 4i..4i+3, exact), every
+// lane gets the same scale value and the same FMA in the same block order; only WHERE a lane sits in a register differs (row j's
+// lanes 0-3 ride accA, its lanes 4-7 accB). At the end each row's eight lanes are put back in the one-row layout and reduced by
+// the same horizontal sum and the same final scale, so out[j] is bit-identical to pxa_pxq_dot_q8(row0 + j)
+// (tests/test-pxq-cpu-dot.cpp checks it bit for bit).
+static void pxa_pxq_dot_q8_x8_core_avx2(const void * base, int64_t row0, int64_t k, const struct pxa_pxq_q8 * y, float out[8]) {
+    struct pxa_dot_row R;
+    pxa_dot_row_setup(GGML_TYPE_PXQ4, base, row0, k, &R);
+    const __m256  anchor = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)((const uint16_t *)R.panel + R.r)));
+
+    const __m256i m0f   = _mm256_set1_epi8(0x0f);
+    const __m256i ones  = _mm256_set1_epi16(1);
+    const __m128i bk128 = _mm_loadu_si128((const __m128i *)pxa_book_i8);
+    const __m256i book  = _mm256_set_m128i(bk128, bk128);
+    const __m256  sub_a = _mm256_loadu_ps(R.sub), sub_b = _mm256_loadu_ps(R.sub + 8);   // the 16-entry sub table
+
+    __m256 accA[4], accB[4];   // pair p = rows 2p, 2p+1: accA lanes 0-3 / 4-7 = row 2p / 2p+1 elems 0-15; accB the same for 16-31
+    for (int p = 0; p < 4; ++p) { accA[p] = _mm256_setzero_ps(); accB[p] = _mm256_setzero_ps(); }
+    for (int64_t kb = 0; kb < R.kb_n; ++kb) {
+        const uint8_t * slab = R.panel + PXQ6_HDR_BYTES + kb*R.slab_bytes;
+        const uint8_t * qrow = slab + R.code_off + R.r*16;
+        const __m256i a32 = _mm256_loadu_si256((const __m256i *)y[kb].qs);
+        const __m256i avA = _mm256_permute2x128_si256(a32, a32, 0x00);     // [a 0-15 | a 0-15]
+        const __m256i avB = _mm256_permute2x128_si256(a32, a32, 0x11);     // [a 16-31 | a 16-31]
+
+        // scales of the eight rows: ad = anchor*d, slo = ad*sub[lo nibble] (elems 0-15), shi = ad*sub[hi nibble] (16-31)
+        const __m256i sb  = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(slab + R.r)));
+        const __m256i ilo = _mm256_and_si256(sb, _mm256_set1_epi32(0xf));
+        const __m256i ihi = _mm256_srli_epi32(sb, 4);
+        // sub[idx] for idx 0..15: entries 0-7 from sub_a, 8-15 from sub_b, picked by bit 3 of idx (moved to the sign bit)
+        const __m256  vlo = _mm256_blendv_ps(_mm256_permutevar8x32_ps(sub_a, ilo), _mm256_permutevar8x32_ps(sub_b, ilo),
+                                             _mm256_castsi256_ps(_mm256_slli_epi32(ilo, 28)));
+        const __m256  vhi = _mm256_blendv_ps(_mm256_permutevar8x32_ps(sub_a, ihi), _mm256_permutevar8x32_ps(sub_b, ihi),
+                                             _mm256_castsi256_ps(_mm256_slli_epi32(ihi, 28)));
+        const __m256  ad  = _mm256_mul_ps(anchor, _mm256_set1_ps(y[kb].d));
+        float slo[8], shi[8];
+        _mm256_storeu_ps(slo, _mm256_mul_ps(ad, vlo));
+        _mm256_storeu_ps(shi, _mm256_mul_ps(ad, vhi));
+
+        for (int p = 0; p < 4; ++p) {
+            const __m256i q  = _mm256_loadu_si256((const __m256i *)(qrow + 32*p));
+            const __m256i lo = _mm256_and_si256(q, m0f);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m0f);
+            const __m256i ul = _mm256_unpacklo_epi8(lo, hi);
+            const __m256i uh = _mm256_unpackhi_epi8(lo, hi);
+
+            const __m256i bvA = _mm256_shuffle_epi8(book, ul);
+            const __m256i bvB = _mm256_shuffle_epi8(book, uh);
+            const __m256i pA  = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(bvA, bvA), _mm256_sign_epi8(avA, bvA)), ones);
+            const __m256i pB  = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(bvB, bvB), _mm256_sign_epi8(avB, bvB)), ones);
+
+            const __m256 svA = _mm256_blend_ps(_mm256_broadcast_ss(&slo[2*p]), _mm256_broadcast_ss(&slo[2*p + 1]), 0xF0);
+            const __m256 svB = _mm256_blend_ps(_mm256_broadcast_ss(&shi[2*p]), _mm256_broadcast_ss(&shi[2*p + 1]), 0xF0);
+            accA[p] = pxa_dot_fma(_mm256_cvtepi32_ps(pA), svA, accA[p]);
+            accB[p] = pxa_dot_fma(_mm256_cvtepi32_ps(pB), svB, accB[p]);
+        }
+    }
+    for (int p = 0; p < 4; ++p) {
+        // the one-row layout: lanes 0-3 = elems 0-15 (accA), lanes 4-7 = elems 16-31 (accB)
+        out[2*p]     = pxa_dot_hsum(_mm256_permute2f128_ps(accA[p], accB[p], 0x20))*pxa_book_i8_scale;
+        out[2*p + 1] = pxa_dot_hsum(_mm256_permute2f128_ps(accA[p], accB[p], 0x31))*pxa_book_i8_scale;
+    }
+}
+
 #endif // __AVX2__
 
 float pxa_pxq_dot_q8(enum ggml_type type, const void * base, int64_t row, int64_t k,
@@ -314,4 +389,34 @@ float pxa_pxq_dot_q8(enum ggml_type type, const void * base, int64_t row, int64_
 #else
     return pxa_pxq_dot_q8_ref(type, base, row, k, y);
 #endif
+}
+
+// PXA_PXQ_DOT_X8=0: the callers keep one row per call (the off switch; the outputs are the same bits either way)
+bool pxa_pxq_dot_x8_on(enum ggml_type type) {
+#if defined(__AVX2__) && defined(__F16C__)
+    if (type != GGML_TYPE_PXQ4 || !pxa_dot_enabled()) return false;
+    static volatile int state = -1;   // benign race: every racer computes the same answer
+    int v = state;
+    if (v < 0) {
+        const char * e = getenv("PXA_PXQ_DOT_X8");
+        v = (e && *e && pxa_env_value_off(e)) ? 0 : 1;
+        state = v;
+    }
+    return v != 0;
+#else
+    (void) type;
+    return false;
+#endif
+}
+
+void pxa_pxq_dot_q8_x8(enum ggml_type type, const void * base, int64_t row0, int64_t k,
+                       const struct pxa_pxq_q8 * y, float out[8]) {
+#if defined(__AVX2__) && defined(__F16C__)
+    if (type == GGML_TYPE_PXQ4 && (row0 & 7) == 0) {
+        pxa_dot_ensure_book();
+        pxa_pxq_dot_q8_x8_core_avx2(base, row0, k, y, out);
+        return;
+    }
+#endif
+    for (int j = 0; j < 8; ++j) out[j] = pxa_pxq_dot_q8(type, base, row0 + j, k, y);
 }

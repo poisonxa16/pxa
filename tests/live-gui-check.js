@@ -12,10 +12,19 @@ async function snap(name) { shot++; await page.screenshot({path: `${OUT}/${THEME
 const count = sel => page.locator(sel).count();
 async function css(sel, prop, idx) { return page.locator(sel).nth(idx || 0).evaluate((e, p) => getComputedStyle(e)[p], prop); }
 async function hoverAt(sel, fx, idx) {          // the pointer over a mark, scrolled into view first (the page re-draws every 2 s: take the box fresh)
-  const loc = page.locator(sel).nth(idx || 0);
-  await loc.scrollIntoViewIfNeeded();
-  const b = await loc.boundingBox();
-  await page.mouse.move(b.x + b.width * fx, b.y + b.height * 0.5);
+  for (let i = 0; ; i++) {                      // a re-draw between finding the mark and scrolling to it detaches it: find it again
+    try {
+      const loc = page.locator(sel).nth(idx || 0);
+      await loc.scrollIntoViewIfNeeded({timeout: 5000});
+      const b = await loc.boundingBox();
+      if (!b) throw new Error('not attached (no box)');
+      await page.mouse.move(b.x + b.width * fx, b.y + b.height * 0.5);
+      break;
+    } catch (e) {
+      if (i >= 4 || !/not attached|no box|Timeout/.test(String(e.message))) throw e;
+      await sleep(250);
+    }
+  }
   await sleep(300);
 }
 (async () => {
@@ -109,7 +118,9 @@ async function hoverAt(sel, fx, idx) {          // the pointer over a mark, scro
   await page.click('#theme'); await sleep(400);
 
   console.log('servers tab');
-  await page.click('nav.tabs button[data-tab=servers]'); await sleep(1500);
+  await page.click('nav.tabs button[data-tab=servers]');
+  await page.waitForFunction(() => document.querySelectorAll('#sv-list .srv').length >= 2, null, {timeout: 30000}).catch(() => {});   // the tab draws after /api/fleet answers
+  await sleep(300);
   const bc = await page.evaluate(() => [...document.querySelectorAll('#sv-list .srv')].map(c => [c.querySelector('h3 span:nth-child(2)').textContent, getComputedStyle(c).borderTopColor]));
   check(bc.length === 2 && bc[0][1] === s1 && bc[1][1] === s2, 'the Servers tab paints each server in the same colour as the Live tab: ' + JSON.stringify(bc));
   await page.click('nav.tabs button[data-tab=live]'); await sleep(1500);

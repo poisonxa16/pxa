@@ -54,6 +54,35 @@ ggml_pxqn_cpu_mul_mat_fn ggml_pxqn_cpu_mul_mat_get(void);
 // true when ggml_pxqn_cpu_mul_mat_get() is non-NULL: the planner then reads PXQN cold experts on the CPU (llama-pxa-place.cpp)
 GGML_API bool ggml_pxqn_cpu_mmv_available(void);
 
+// Optional extra symbols (2026-10-23): the CPU matmul split in its two halves, for the engine's MUL_MAT_ID work
+// queue (ggml.c, PXA_PXQN_CPU_MMID_Q): quantise each activation column once, then (expert x row chunk x column chunk) items.
+//   q8_col_bytes(type, k)            bytes of one quantised column (a multiple of 64); 0 = no fast path for (type, k)
+//   q8_col(type, x, k, q)            quantise x[0..k) into q (32-byte aligned)
+//   mm_q8(type, a, k, r0, r1, q, out, ny)  rows [r0, r1) (multiples of 8) of one expert slice a x ny (1..8) quantised columns
+//                                    q[t]: out[t][r] = row r . column t. Bit-identical to ggml_pxqn_cpu_mul_mat's outputs.
+#define GGML_PXQN_CPU_Q8_COL_BYTES_SYM "ggml_pxqn_cpu_q8_col_bytes"
+#define GGML_PXQN_CPU_Q8_COL_SYM       "ggml_pxqn_cpu_q8_col"
+#define GGML_PXQN_CPU_MM_Q8_SYM        "ggml_pxqn_cpu_mm_q8"
+struct ggml_pxqn_cpu_q8_api {
+    size_t (*q8_col_bytes)(enum ggml_type type, int64_t k);
+    void   (*q8_col)(enum ggml_type type, const float * x, int64_t k, void * q);
+    void   (*mm_q8)(enum ggml_type type, const void * a, int64_t k, int64_t r0, int64_t r1,
+                    const void * const * q, float * const * out, int ny);
+};
+// NULL when the library is absent, lacks any of the three, or the fast matmul is off (PXA_PXQN_CPU_MMV=0)
+GGML_API const struct ggml_pxqn_cpu_q8_api * ggml_pxqn_cpu_q8_api_get(void);
+
+// Optional extra symbols (2026-10-25, R1 RIX): a routed expert's output is the same bits on the card and on the CPU. The library
+// owns the switch: PXA_PXQN_RIX=0/1 (env) overrides the engine's flag (llama-load-tensors.cpp pxa_xc_attach sets it).
+//   ggml_pxqn_rix_get()  1 = on;  ggml_pxqn_rix_set(on)  the engine's flag;  ggml_pxqn_rix_swiglu(n, y, g, u)  the CPU activation
+typedef void (*ggml_pxa_rix_swiglu_fn)(int64_t n, float * y, const float * g, const float * u);
+GGML_API int  ggml_pxa_rix_available(void);    // the library has all three symbols
+GGML_API int  ggml_pxa_rix_on(void);           // the switch reads on (and the library has all three)
+GGML_API void ggml_pxa_rix_set(int on);        // the engine's flag (no-op without the library)
+GGML_API ggml_pxa_rix_swiglu_fn ggml_pxa_rix_swiglu_active(void);   // the CPU epilogue when on, else NULL (ggml.c)
+GGML_API int  ggml_pxa_rix_maxw(void);         // PXA_PXQN_RIX_MAXW: widest graph (tokens) RIX covers (default the async lane's, 8)
+GGML_API void ggml_pxa_rix_tl_off(int off);    // per-op, per-thread: 1 = this MUL_MAT_ID's graph is wider (library symbol optional)
+
 // Optional extra symbol: ggml_pxqn_xcache_get -- the online-adaptation POLICY of PXA_XCACHE (expert-granular hot cache).
 // The engine (open, src/llama-pxa-xcache.cpp) owns the mechanism: per-layer routing counters on the device, the slot table, the
 // copy stream, the map flips between two decodes. The library owns the decisions: how the routing counts are decayed and ranked,
@@ -171,6 +200,11 @@ typedef int (*ggml_pxqn_xcache_cpupool_step_fn)(void * pool, struct ggml_tensor 
                                                 const int32_t * ids, int n_used, int ntok);
 GGML_API ggml_pxqn_xcache_cpupool_step_fn ggml_pxqn_xcache_cpupool_step_get(void);
 
+// present when the step takes gate-less chains (gate == NULL, unary = relu / sqr(relu) node); returns 1
+#define GGML_PXQN_XCACHE_CPUPOOL_GATELESS_SYM "ggml_pxqn_xcache_cpupool_gateless"
+typedef int (*ggml_pxqn_xcache_cpupool_gateless_fn)(void);
+GGML_API ggml_pxqn_xcache_cpupool_gateless_fn ggml_pxqn_xcache_cpupool_gateless_get(void);
+
 struct ggml_pxqn_lib_api {
     uint32_t                         version;   // GGML_PXQN_LIB_VERSION
     uint32_t                         size;      // sizeof(struct ggml_pxqn_lib_api)
@@ -214,6 +248,24 @@ typedef const struct ggml_pxqn_lock_api * (*ggml_pxqn_get_lock_api_fn)(uint32_t 
 
 // NULL when libggml-pxqn is absent, refused, or has no lock entry point
 const struct ggml_pxqn_lock_api * ggml_pxqn_lock(void);
+
+// ---- sealed recipes (PXQN revision 2): an OPTIONAL entry point -------------------------------------------------------------------------------------------
+// A revision-2 file carries no rotation seed or site list, only pxa.pxqn.recipe = an opaque handle the Pro encoder wrote; the seed and the sites live in
+// libggml-pxqn (pxqn-recipe.cpp, closed). A library without this entry point (or no library) cannot open a revision-2 file and says so.
+#define GGML_PXQN_RECIPE_VERSION 1u
+#define GGML_PXQN_RECIPE_OLD_MSG "This model is PXQ-Next revision 2 and this libggml-pxqn is too old to read it - update to the latest PXA release"
+#define GGML_PXQN_RECIPE_NOLIB_MSG "This model is PXQ-Next revision 2: it needs the PXA release build (libggml-pxqn)"
+
+struct ggml_pxqn_recipe_api {
+    uint32_t version;   // GGML_PXQN_RECIPE_VERSION
+    uint32_t size;      // sizeof(struct ggml_pxqn_recipe_api)
+    // handle -> seed + sites (OR of PXQN_SITE_BIT); 0 = ok, otherwise a plain sentence in err
+    int (*resolve)(const char * handle, uint64_t * seed, uint32_t * sites, char * err, int errlen);
+};
+typedef const struct ggml_pxqn_recipe_api * (*ggml_pxqn_get_recipe_api_fn)(uint32_t version);
+
+// NULL when libggml-pxqn is absent, refused, or has no recipe entry point
+const struct ggml_pxqn_recipe_api * ggml_pxqn_recipe(void);
 
 // ---- the speculation selector: an OPTIONAL second table ---------------------------------
 // Looked up by name (ggml_pxqn_get_spec_api) after the main table passed its checks, so a library without the

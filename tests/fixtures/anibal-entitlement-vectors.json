@@ -1,0 +1,281 @@
+{
+ "clock_rollback_hours": 48,
+ "expire_skew_s": 300,
+ "grace_quiet_days": 7,
+ "kid": "ent-VECTORS-DEV",
+ "pubkeys": {
+  "ent-VECTORS-DEV": "658cd44e27e64b11cb963fbf7de26a96d20b385521f456d0e8c3a03448414fbc"
+ },
+ "schema": "pxa-entitlement-vectors/1",
+ "spec": "ANIBAL-ENTITLEMENT-SPEC s6 B4",
+ "statement_fields": [
+  "ent_id",
+  "install_pub",
+  "iss",
+  "issued",
+  "item_id",
+  "kid",
+  "kind",
+  "level",
+  "not_after",
+  "refresh_after",
+  "sub",
+  "v"
+ ],
+ "t0": 1792368000,
+ "vectors": [
+  {
+   "expect": {
+    "extras": true,
+    "gate": "active",
+    "verify": "ok"
+   },
+   "grant": {
+    "signature": "_y-zHTQDbk2Q-QMH8-tJrcusNDll0berNBkGBKoN72f1GXY81XV0tEX6PU0BmgPQYwYY3gARonWQxXSHF8JhCQ",
+    "statement": {
+     "ent_id": "9f7d6924ffc10f1b9069e19dab57359a",
+     "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+     "iss": "licd",
+     "issued": 1792368000,
+     "item_id": "anibal",
+     "kid": "ent-VECTORS-DEV",
+     "kind": "plugin",
+     "level": null,
+     "not_after": 1807920000,
+     "refresh_after": 1792454400,
+     "sub": "4966ac0486db6fc1e222603c9b77e1d2",
+     "v": 1
+    }
+   },
+   "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+   "last_sync": 1792368000,
+   "name": "ok",
+   "note": "fresh grant, 1 h after the sync that brought it",
+   "now": 1792371600,
+   "seen": 1792371600
+  },
+  {
+   "expect": {
+    "extras": true,
+    "gate": "refresh_due",
+    "verify": "refresh_due"
+   },
+   "grant": {
+    "signature": "mvEKdOV6DGbWyzTICygYuhW5c9GABrY9Zjzhz1MRKfYvEub-7pMiztEOoBWyOcrvHUuFZwehIcOSngA64SmLBA",
+    "statement": {
+     "ent_id": "a101fa81ef2784c3a63bbbca549efe76",
+     "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+     "iss": "licd",
+     "issued": 1792368000,
+     "item_id": "anibal",
+     "kid": "ent-VECTORS-DEV",
+     "kind": "plugin",
+     "level": null,
+     "not_after": 1807920000,
+     "refresh_after": 1792454400,
+     "sub": "4966ac0486db6fc1e222603c9b77e1d2",
+     "v": 1
+    }
+   },
+   "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+   "last_sync": 1792368000,
+   "name": "refresh_due",
+   "note": "3 days without a sync: past refresh_after (24 h), inside the quiet first 7 days; extras stay on",
+   "now": 1792627200,
+   "seen": 1792627200
+  },
+  {
+   "expect": {
+    "extras": false,
+    "gate": "expired",
+    "verify": "expired"
+   },
+   "grant": {
+    "signature": "2DhcxTCmHKpowWWMHWsYEyy4lHyeXUr41CPnj0Q6NP9KDDOjg8FjUqmJVXM7K6HAMkiHj2vM3Y7iRhYtsrSaCg",
+    "statement": {
+     "ent_id": "371e7b2ceaae8d023f6c5e0754ad457c",
+     "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+     "iss": "licd",
+     "issued": 1792368000,
+     "item_id": "anibal",
+     "kid": "ent-VECTORS-DEV",
+     "kind": "plugin",
+     "level": null,
+     "not_after": 1807920000,
+     "refresh_after": 1792454400,
+     "sub": "4966ac0486db6fc1e222603c9b77e1d2",
+     "v": 1
+    }
+   },
+   "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+   "last_sync": 1792368000,
+   "name": "expired",
+   "note": "offline past not_after (180 d) + 5 min: extras off until any online sync",
+   "now": 1807920301,
+   "seen": 1807920301
+  },
+  {
+   "expect": {
+    "extras": false,
+    "gate": "wrong_machine",
+    "verify": "wrong_machine"
+   },
+   "grant": {
+    "signature": "GKqZgpE7blA7lIE21-aGKDGy89m40HbUXe-5eHXggK3nx9NYCVUYaFy5UNmrAZYf-bdiqXLDKLdcDLuUw41mCg",
+    "statement": {
+     "ent_id": "8699b8acc64dcde923cf17febe212408",
+     "install_pub": "cfe6a9d31df78c982f44ae6090ee70564776a2b4c7a39b533981862b04be76bf",
+     "iss": "licd",
+     "issued": 1792368000,
+     "item_id": "anibal",
+     "kid": "ent-VECTORS-DEV",
+     "kind": "plugin",
+     "level": null,
+     "not_after": 1807920000,
+     "refresh_after": 1792454400,
+     "sub": "4966ac0486db6fc1e222603c9b77e1d2",
+     "v": 1
+    }
+   },
+   "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+   "last_sync": 1792368000,
+   "name": "wrong_machine",
+   "note": "a grant file copied from another computer (install_pub differs)",
+   "now": 1792371600,
+   "seen": 1792371600
+  },
+  {
+   "expect": {
+    "extras": false,
+    "gate": "invalid",
+    "verify": "bad_signature"
+   },
+   "grant": {
+    "signature": "aRRkxvjT2QeBwlFSzMEwJyXtKr3Z3Y4FolgLVyiy53VQcIjjiKnR_x3ETYviBr27q8sjXrrqWSTeHOZOdQ0JBQ",
+    "statement": {
+     "ent_id": "07fa62c7f5260f4ede79735593a4a867",
+     "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+     "iss": "licd",
+     "issued": 1792368000,
+     "item_id": "anibal",
+     "kid": "ent-VECTORS-DEV",
+     "kind": "plugin",
+     "level": null,
+     "not_after": 1807920000,
+     "refresh_after": 1792454400,
+     "sub": "4966ac0486db6fc1e222603c9b77e1d2",
+     "v": 1
+    }
+   },
+   "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+   "last_sync": 1792368000,
+   "name": "bad_sig",
+   "note": "one signature bit flipped",
+   "now": 1792371600,
+   "seen": 1792371600
+  },
+  {
+   "expect": {
+    "extras": false,
+    "gate": "revoked",
+    "verify": "ok"
+   },
+   "grant": {
+    "signature": "4QgpXbQr497WSQbFLUIyzKB4iCDU7wh-o3OphapNVrGqKC7t7eREdHLtFDdKGXYCpFpJ364qudY4YTfclv8sCA",
+    "statement": {
+     "ent_id": "fe2c95853ae550c7036b391b9c83bbee",
+     "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+     "iss": "licd",
+     "issued": 1792368000,
+     "item_id": "anibal",
+     "kid": "ent-VECTORS-DEV",
+     "kind": "plugin",
+     "level": null,
+     "not_after": 1807920000,
+     "refresh_after": 1792454400,
+     "sub": "4966ac0486db6fc1e222603c9b77e1d2",
+     "v": 1
+    }
+   },
+   "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+   "last_sync": 1792368000,
+   "name": "revoked",
+   "note": "a valid grant whose ent_id is on licd's signed revocation list: off at once, never comes back",
+   "now": 1792371600,
+   "revocations": {
+    "signature": "T7fhaVsSLWiIsqPON4d9LoaHhBBjgxWcgy59hfPVJX_B_a9w7QUTKINWEXQf2mDU0Qjg39vLHsNRZb_oelYiBg",
+    "statement": {
+     "ent_ids": [
+      "fe2c95853ae550c7036b391b9c83bbee"
+     ],
+     "iss": "licd",
+     "issued": 1792369800,
+     "kid": "ent-VECTORS-DEV",
+     "type": "revocations",
+     "v": 1
+    }
+   },
+   "seen": 1792371600
+  },
+  {
+   "expect": {
+    "extras": false,
+    "gate": "update",
+    "verify": "unknown_key"
+   },
+   "grant": {
+    "signature": "sxfexRJXg7ZsFgIMpCIGhZP6U3oAFD13_p-oer8sl65JfWZRLbYuP4_H8fRH9htM2MaPmUZ4rsk8IfEDktNfDA",
+    "statement": {
+     "ent_id": "38dda5afc4dde15f77f3c9b26fc32a4a",
+     "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+     "iss": "licd",
+     "issued": 1792368000,
+     "item_id": "anibal",
+     "kid": "ent-2099-01",
+     "kind": "plugin",
+     "level": null,
+     "not_after": 1807920000,
+     "refresh_after": 1792454400,
+     "sub": "4966ac0486db6fc1e222603c9b77e1d2",
+     "v": 1
+    }
+   },
+   "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+   "last_sync": 1792368000,
+   "name": "unknown_kid",
+   "note": "signed with a key this release does not pin: shown as 'update the app', never as revoked",
+   "now": 1792371600,
+   "seen": 1792371600
+  },
+  {
+   "expect": {
+    "extras": false,
+    "gate": "clock",
+    "verify": "refresh_due"
+   },
+   "grant": {
+    "signature": "v9jy7Tf-rJxsMm0LrqLslJbVoAzqrOOKlW6awk3dKGFFBwE46O4xUZtd7wCPLkxxcEc7gXvH0vRta39UzL46Cw",
+    "statement": {
+     "ent_id": "ffb5b46d9b7fc7483c5dd211968db6cc",
+     "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+     "iss": "licd",
+     "issued": 1792368000,
+     "item_id": "anibal",
+     "kid": "ent-VECTORS-DEV",
+     "kind": "plugin",
+     "level": null,
+     "not_after": 1807920000,
+     "refresh_after": 1792454400,
+     "sub": "4966ac0486db6fc1e222603c9b77e1d2",
+     "v": 1
+    }
+   },
+   "install_pub": "4430faee6bcbe54572f0d27ee95274f40d992df6ba1940169e4126c68fcd0d02",
+   "last_sync": 1792368000,
+   "name": "clock",
+   "note": "the clock is 49 h behind the last time seen (10 d): extras off until an online sync",
+   "now": 1793055600,
+   "seen": 1793232000
+  }
+ ]
+}

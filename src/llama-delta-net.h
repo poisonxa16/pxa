@@ -23,7 +23,9 @@ struct delta_net {
                       int il, const llm_build_cb & cb, int repeat_type,
                       ggml_tensor * per_step_ckpt = nullptr,
                       // PXA_RS_RING: per-step capture strides (elements); 0 = the dense layout
-                      int64_t sv_row_stride = 0, int64_t sv_step_stride = 0);
+                      int64_t sv_row_stride = 0, int64_t sv_step_stride = 0,
+                      // PXA_SPEC_CKPT_REPLAY: per_step_ckpt is a replay pack (ggml_delta_net_set_replay_capture)
+                      bool replay_cap = false);
 
     // PXA_LLAMA_FIX_v4: takes n_seqs + per-request runtime tensors (state_row_idx, conv_seq_map, state_mask) so the
     // mixed (concurrent) path runs ONE batched delta-net (n_seqs=n_tok) instead of a per-token subgraph loop.
@@ -39,6 +41,11 @@ struct delta_net {
             // mixer and will scatter the block output back into the wide residual itself, so the
             // layer norm and the residual add are both skipped, and the output gate is sigmoid.
             bool hc_mode = false) const;
+
+    // PXA Nemotron port: one Mamba-2 mixer (Nemotron-H), state kept in the same s_l rows and routed with the
+    // same per-sequence inputs as the DeltaNet layers. Defined in src/llama-mamba2.cpp.
+    ggml_tensor * build_layer_mamba2(ggml_context * ctx0, ggml_cgraph * gf,
+            ggml_tensor * cur, int il, const llm_build_cb & cb) const;
 
 private:
 
@@ -69,6 +76,14 @@ private:
     mutable ggml_tensor  * shared_state_mask  = nullptr;
     mutable int64_t        shared_view_n_seqs = -1;
     mutable int64_t        shared_view_n_tok  = -1;
+    // PXA_MAMBA2_SHARE_INPUTS: the same per-graph cache for the Mamba-2 layers (build_layer_mamba2,
+    // src/llama-mamba2.cpp). Kept apart from the delta-net views above: the state-mask view differs.
+    mutable ggml_context * m2_view_ctx        = nullptr;
+    mutable ggml_tensor  * m2_state_row       = nullptr;
+    mutable ggml_tensor  * m2_conv_map        = nullptr;
+    mutable ggml_tensor  * m2_state_mask      = nullptr;
+    mutable int64_t        m2_view_n_seqs     = -1;
+    mutable int64_t        m2_view_n_tok      = -1;
 
     static std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * wqkv, ggml_tensor * wqkv_gate, ggml_tensor * input, int il, const llm_build_cb & cb,
@@ -97,7 +112,9 @@ private:
             // PXA_RS_RING: rows per ring plane (0 = ring off) and the WRITE row index (plane 0).
             // With the ring on, state_row_idx is the READ index (it may point at a history plane)
             // and state_row_idx_w is where the new state is scattered.
-            uint32_t rs_plane_rows = 0, ggml_tensor * state_row_idx_w = nullptr);
+            uint32_t rs_plane_rows = 0, ggml_tensor * state_row_idx_w = nullptr,
+            // PXA_SPEC_CKPT_REPLAY: per_step_ssm is a replay pack, not per-step rows
+            bool replay_cap = false);
 
     // il_rot: the REAL layer index for the PXQN out_in rotation (-1 = caller does not rotate; refused
     // when the model rotates out_in); rot_ranges: this device's global K ranges of ssm_out (split path).

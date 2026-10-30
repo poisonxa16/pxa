@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "pxa-test-portable.h"   // setenv / unsetenv on native Windows too
 
 int main() {
     // The hook is on from the start: backend init may already cache the per-pair verdicts (a build

@@ -945,6 +945,43 @@ static llama_token pxa_topk_raw_sample(struct common_sampler * cs, struct llama_
     return llama_sample_token_with_rng(ctx_main, &cur_p, cs->rng);
 }
 
+// PXA_SAMPLED_TOPW: the window of pxa_topk_raw_sample read from the decode's device top-W node instead of a scan
+// of the logits row. Only when nothing else edits the row first (no logit_bias, no server biases, no penalties):
+// then the device window (values descending, lower id first on ties) IS the scan's window, element for element.
+bool common_sampler_topw_ok(const struct common_sampler * cs, struct llama_context * ctx) {
+    if (cs == nullptr || pxa_topk_raw_mode() != 1 || g_pxa_topk_raw_disabled) return false;
+    const auto & p = cs->params;
+    if (!(p.temp > 0.0f) || p.n_probs > 0 || !p.logit_bias.empty() || cs->server_biases != nullptr) return false;
+    if (pxa_topk_raw_penalties_active(cs)) return false;
+    const int W = pxa_topk_raw_window(cs, nullptr, false, llama_n_vocab(llama_get_model(ctx)));
+    return W > 0 && W <= llama_topw_width(ctx);
+}
+static llama_token pxa_topw_sample(struct common_sampler * cs, struct llama_context * ctx_main, const int idx, const int W, bool & ok) {
+    ok = false;
+    const auto & params = cs->params;
+    if (!params.logit_bias.empty() || cs->server_biases != nullptr || pxa_topk_raw_penalties_active(cs)) return 0;
+    llama_token ids[128]; float vals[128];
+    const int n = llama_get_topw_ith(ctx_main, idx, W, ids, vals);
+    if (n < 1) return 0;
+    ok = true;
+    auto & cur = cs->cur;
+    cur.resize(n);
+    for (int i = 0; i < n; ++i) cur[i] = llama_token_data{ids[i], vals[i], 0.0f};
+    cs->cur_p = { cur.data(), (size_t) n, 0, true };
+    llama_token_data_array & cur_p = cs->cur_p;
+    const size_t min_keep = std::max(1, params.min_keep);
+    for (const auto st : params.samplers_sequence) {
+        switch (st) {
+            case llama_sampler_type::TOP_P:       llama_sample_top_p(ctx_main, &cur_p, params.top_p, min_keep); break;
+            case llama_sampler_type::MIN_P:       llama_sample_min_p(ctx_main, &cur_p, params.min_p, min_keep); break;
+            case llama_sampler_type::TEMPERATURE: llama_sample_temp (ctx_main, &cur_p, params.temp); break;
+            case llama_sampler_type::DIST:        llama_sample_dist (ctx_main, &cur_p); break;
+            default: break;   // TOP_K is the window itself; everything else was verified to be a no-op (pxa_topk_raw_window)
+        }
+    }
+    return llama_sample_token_with_rng(ctx_main, &cur_p, cs->rng);
+}
+
 static llama_token llama_sampling_sample_impl_default(struct common_sampler *, struct llama_context *, struct llama_context *, int, bool);
 
 static llama_token pxa_topk_raw_shadow(struct common_sampler * cs, struct llama_context * ctx_main, struct llama_context * ctx_cfg, const int idx, bool grammar_first, const int W, const int mode) {
@@ -1019,6 +1056,7 @@ static llama_token pxa_topk_raw_shadow(struct common_sampler * cs, struct llama_
     return id_old;
 }
 
+static inline bool params_temp_pos(const struct common_sampler * cs) { return cs->params.temp > 0.0f; }
 static llama_token llama_sampling_sample_impl(
                   struct common_sampler * ctx_sampling,
                   struct llama_context * ctx_main,
@@ -1032,6 +1070,11 @@ static llama_token llama_sampling_sample_impl(
         if (W > 0) {
             if (mode == 1) {
                 ++g_pxa_topk_raw_stats[0];
+                if (params_temp_pos(ctx_sampling) && llama_topw_width(ctx_main) >= W) {   // PXA_SAMPLED_TOPW
+                    bool ok = false;
+                    const llama_token id = pxa_topw_sample(ctx_sampling, ctx_main, idx, W, ok);
+                    if (ok) return id;
+                }
                 return pxa_topk_raw_sample(ctx_sampling, ctx_main, idx, W);
             }
             return pxa_topk_raw_shadow(ctx_sampling, ctx_main, ctx_cfg, idx, grammar_first, W, mode);
@@ -1639,7 +1682,17 @@ llama_token common_sampler_draft_sample_dist(struct common_sampler * gsmpl, stru
     std::uniform_real_distribution<float> u01(0.0f, 1.0f);
     const llama_token id = pxa_spec_draw(q_out, u01(gsmpl->rng));
     if (out_prob) {
-        *out_prob = pxa_spec_prob_of(q_out, id);
+        // PXA_SPEC_SAMPLED_GATE_v1 (review 2026-10-16): the probability handed back is the
+        // drafter's confidence AT THIS POSITION (max_y q(y), a function of the head's row only), not
+        // q(x) of the token just drawn. mtp_speculative_gen_draft compares it with p_min and folds it
+        // into the depth cutoff BEFORE it keeps the token, and drops the token when the floor fails;
+        // with q(x) there the kept proposal was q restricted to {q >= p_min} while the verifier
+        // divided by the whole q, so sampled output over-weighted the head's top token (NOT
+        // distribution-exact for n_max >= 2 with p_min > 0 or a cutoff). See pxa_spec_draft_gate_prob
+        // in common/pxa-spec-sampled.h and tests/test-spec-sampled-gate.cpp. Greedy drafts never reach
+        // this function. PXA_SPEC_EXACT=0 restores the old, biased gate, for A/B measurement only.
+        static const bool gate_drawn = !pxa_spec_exact_on();   // PXA_SPEC_EXACT=0: the old gate, A/B only
+        *out_prob = pxa_spec_draft_gate_prob(q_out, id, gate_drawn);
     }
     return id;
 }

@@ -1,3 +1,4 @@
+#include "pxa-env-flag.h"
 #include "llama-delta-net.h"
 #include "ggml-pxqn.h"
 #include "llama-hparams.h"
@@ -63,7 +64,9 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
     const int64_t conv_dim       = key_dim * 2 + value_dim;
     const int64_t conv_state_dim = (hparams.ssm_d_conv - 1) * conv_dim;
     const int64_t state_dim      = conv_state_dim + ssm_state_dim;
-    GGML_ASSERT(hparams.n_embd_v_s() == (uint32_t) state_dim);
+    // PXA Nemotron port: Mamba-2 rows have their own layout (llama_hparams::n_embd_v_s); this object only
+    // supplies the per-sequence routing for them (build_layer_mamba2, src/llama-mamba2.cpp).
+    GGML_ASSERT(hparams.ssm_mamba2 || hparams.n_embd_v_s() == (uint32_t) state_dim);
 
     const bool has_explicit_seq_info = batch.n_seq_id != nullptr && batch.seq_id != nullptr;
     token_seq_ids.resize(batch.n_tokens, 0);
@@ -128,11 +131,17 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
 
 delta_net::~delta_net() = default;
 
+// PXA_SPEC_CKPT_REPLAY (ggml.c; declared here so ggml.h -- and with it every CUDA TU -- is unchanged):
+// turn a DELTA_NET node built without saved_steps into a replay-capture verify. `pack` (one sequence)
+// receives [ start state S_v*S_v*H_v | q S_k*n_tokens*H_k | k (same) | v S_v*H_v*n_tokens | g H_v*n_tokens |
+// beta H_v*n_tokens ]; op_params[4] = 1. CUDA only (the CPU op asserts).
+extern "C" void ggml_delta_net_set_replay_capture(struct ggml_tensor * a, struct ggml_tensor * pack);
+
 std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_context * ctx0,
         ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
         ggml_tensor * g, ggml_tensor * beta, ggml_tensor * state,
         int il, const llm_build_cb & cb, int repeat_type,
-        ggml_tensor * per_step_ckpt, int64_t sv_row_stride, int64_t sv_step_stride) {
+        ggml_tensor * per_step_ckpt, int64_t sv_row_stride, int64_t sv_step_stride, bool replay_cap) {
 
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[2];
@@ -174,9 +183,14 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(beta,      "beta_fused", il);
     cb(state_flat,"state_fused", il);
 
-    ggml_tensor * fused_result = ggml_delta_net(ctx0, q, k, v, g, beta, state_flat, per_step_ckpt);
+    ggml_tensor * fused_result = ggml_delta_net(ctx0, q, k, v, g, beta, state_flat, replay_cap ? nullptr : per_step_ckpt);
     cb(fused_result, "delta_net_fused_raw", il);
     fused_result->op_params[0] = repeat_type;
+    // PXA_SPEC_CKPT_REPLAY: capture the start state + per-token inputs instead of per-step states
+    if (replay_cap && per_step_ckpt) {
+        GGML_ASSERT(sv_row_stride == 0 && sv_step_stride == 0);
+        ggml_delta_net_set_replay_capture(fused_result, per_step_ckpt);
+    }
     // PXA_RS_RING: retarget the per-step capture into the state ring's planes (0,0 = unchanged).
     if (per_step_ckpt && (sv_row_stride > 0 || sv_step_stride > 0)) {
         ggml_op_set_save_strides(fused_result, sv_row_stride, sv_step_stride);
@@ -474,7 +488,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         int64_t n_seqs_in, uint32_t qnext_state_slots, bool reset_state_local,
         float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
         ggml_tensor * per_step_ckpt, ggml_tensor * per_step_conv, int64_t pxa_static_slot,
-        uint32_t rs_plane_rows, ggml_tensor * state_row_idx_w) {
+        uint32_t rs_plane_rows, ggml_tensor * state_row_idx_w, bool replay_cap) {
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t conv_dim       = key_dim * 2 + value_dim;
@@ -516,7 +530,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     // Otherwise leave the dense buffers in place: the rollback then uses the copy path, which is
     // exactly what llama_set_inputs records in rs_capture_ok.
     const int64_t rs_n_seq_tokens = n_seq_tokens;
-    if (rs_plane_rows > 0 && per_step_ckpt != nullptr &&
+    if (rs_plane_rows > 0 && per_step_ckpt != nullptr && !replay_cap &&   // PXA_SPEC_CKPT_REPLAY: never retargeted
         rs_n_seq_tokens > 1 && rs_n_seq_tokens <= (int64_t)(qnext_state_slots / rs_plane_rows)) {
         GGML_ASSERT(qnext_state_slots % rs_plane_rows == 0);
         const int64_t n_planes = qnext_state_slots / rs_plane_rows;   // 1 + n_rs_seq
@@ -692,7 +706,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(k_conv, "k_conv_normed", il);
 
     auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type,
-            per_step_ckpt, rs_sv_row_stride, rs_sv_step_stride);
+            per_step_ckpt, rs_sv_row_stride, rs_sv_step_stride, replay_cap);
 
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
@@ -772,7 +786,7 @@ ggml_tensor * delta_net::build_gated_output(llama_context & lctx, ggml_context *
     // on every device that does not add the residual -- one extra copy kernel per delta layer on that card, and a
     // partial that is not a MUL_MAT output, so the PXA_TSPLIT_EPI producer push declined on it (48 of 64 partials
     // per token on the second P100, 2026-09-28). Returning the product itself is the same bytes.
-    static const bool noview = [] { const char * e = getenv("PXA_DN_OUT_NOVIEW"); return !(e && *e && atoi(e) == 0); }();
+    static const bool noview = [] { const char * e = getenv("PXA_DN_OUT_NOVIEW"); return !(e && *e && pxa_env_value_off(e)); }();
     if (noview && out->ne[0] == (int64_t) lctx.model.hparams.n_embd && out->ne[1] == n_tok && out->ne[2] == 1 && out->ne[3] == 1 &&
         ggml_is_contiguous(out)) {
         return out;
@@ -1052,7 +1066,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         n_seqs, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
         model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv, pxa_static_slot,
-        rs_plane_rows, state_row_idx_w);
+        rs_plane_rows, state_row_idx_w, kv_self.ckpt.replay && per_step_ckpt != nullptr);   // PXA_SPEC_CKPT_REPLAY
 
     auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb, hc_mode, il);
     if (inp_out_ids) {

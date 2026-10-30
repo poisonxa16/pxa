@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -25,6 +26,18 @@ bool llama_pxa_xcache_async_wanted(void) {
 #else
     return false;
 #endif
+}
+
+bool llama_pxa_xcache_async_clamp_wanted(void) {
+    static const bool on = [] {
+        const char * e = getenv("PXA_XCACHE_ASYNC_CLAMP");
+        const bool v = e && *e && atoi(e) != 0;
+        if (v && llama_pxa_xcache_async_wanted()) {
+            fprintf(stderr, "PXA_XCACHE_ASYNC_CLAMP=1: clamped-SwiGLU expert layers (DeepSeek-V4 / GLM-5.x) take the async cold path\n");
+        }
+        return v;
+    }();
+    return on;
 }
 
 int llama_pxa_xcache_async_max_tokens(void) {
@@ -49,7 +62,7 @@ ggml_tensor * llama_pxa_xcache_async_check_node(struct ggml_context * ctx, ggml_
 
 #ifndef GGML_USE_CUDA
 
-void * llama_pxa_xcache_async_slot(const llama_model &, int, int, int, int, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, int, int, bool) { return nullptr; }
+void * llama_pxa_xcache_async_slot(const llama_model &, int, int, int, int, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, int, int, bool, float) { return nullptr; }
 void llama_pxa_xcache_async_free(llama_model &) {}
 
 #else
@@ -71,7 +84,8 @@ std::string g_why_buft;
 }
 
 void * llama_pxa_xcache_async_slot(const llama_model & model, int il, int n_tokens, int n_embd, int n_used,
-        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * up_gate, ggml_tensor * down, int unary_op, int n_threads, bool fused_chain) {
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * up_gate, ggml_tensor * down, int unary_op, int n_threads, bool fused_chain,
+        float clamp_limit) {
     if (n_tokens < 1 || n_tokens > llama_pxa_xcache_async_max_tokens() || !down) return nullptr;
     // the warm-up decode routes every token to ALL experts (n_used = n_expert): that graph is no decode shape and keeps the split path
     if (n_used != (int) model.hparams.n_expert_used) return nullptr;
@@ -110,7 +124,7 @@ void * llama_pxa_xcache_async_slot(const llama_model & model, int il, int n_toke
         if (g_why_buft.empty()) { char b[160]; snprintf(b, sizeof(b), "layer %d width %d: slot %dx%d, asked %dx%d", il, n_tokens, slot->n_embd, slot->n_used, n_embd, n_used); g_why_buft = b; }
         return nullptr;
     }
-    if (!core->add_width(slot, n_tokens, up, gate, up_gate, down, unary_op, n_threads)) { ++g_why[4]; return nullptr; }
+    if (!core->add_width(slot, n_tokens, up, gate, up_gate, down, unary_op, n_threads, clamp_limit)) { ++g_why[4]; return nullptr; }
     static bool said = false;
     if (!said) {
         said = true;

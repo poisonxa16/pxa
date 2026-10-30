@@ -1,6 +1,6 @@
 # PXQ4 CUDA kernel inventory + vLLM reusability verdict
 
-Source tree: `/path/to/engine-repo` (branch fable9-swa-kv, HEAD acf8f245), read-only over ssh.
+Source tree: `/path/to/engine-repo` (branch (internal), HEAD acf8f245), read-only over ssh.
 All line citations are from that tree. Nothing was built, run, or measured for this document.
 
 ---

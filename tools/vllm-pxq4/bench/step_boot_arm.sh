@@ -4,6 +4,7 @@
 # mtp/step container is running.
 # PXA_MODELS_DIR should be an absolute path: it is bind-mounted into the container below.
 set -e
+_RH=/home/pxq4          # the container's HOME and TMPDIR (a tmpfs; never a host path)
 MODELS_DIR="${PXA_MODELS_DIR:-./models}"
 TAG=$1; ARM=$2; shift 2
 if docker ps --format '{{.Names}}' | grep -qE 'pxa-mtp-vllm|pxa-mtp2-vllm|step|vllm-bench|pxa-awq'; then
@@ -26,9 +27,9 @@ mkdir -p $MODELS_DIR/step/logs
 docker run --rm --name step-$TAG \
   --gpus '"device=4,5,6,7"' \
   --shm-size 16g \
-  --tmpfs /root/home:exec,size=24g \
+  --tmpfs ${_RH}:exec,size=24g \
   -v "$MODELS_DIR":"$MODELS_DIR" \
-  -e HOME=/root/home -e TMPDIR=/root/home \
+  -e HOME=${_RH} -e TMPDIR=${_RH} \
   -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
   -e VLLM_SM70_FLASH_ATTN_V100=1 \
   -e VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=0 \

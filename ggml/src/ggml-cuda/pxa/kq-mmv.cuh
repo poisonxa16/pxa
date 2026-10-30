@@ -1,5 +1,5 @@
 // pxa / PXA kernel suite -- authored by PXA Network (https://pxanetwork.com).
-// kq-mmv.cuh -- decode GEMV for the standard k-quants (Q4_K, Q5_K, Q6_K) and Q8_0 at ny 1..8.
+// kq-mmv.cuh -- decode GEMV for the standard k-quants (Q4_K, Q5_K, Q6_K), Q8_0 and Q5_0 at ny 1..8.
 //
 // WHY. The incumbent q8_1 MMVQ gives every output row its own 128-thread block, so every block re-reads
 // the whole q8_1 activation (for Q6_K at K=5120 that is ~1.4x the weight bytes of the row), loads the
@@ -48,7 +48,7 @@
 #define KQMMV_XSINGLE  24576     // staged-activation bytes up to which the whole K is staged once per block
 #define KQMMV_XMULTI   12288     // staged-activation bytes per K chunk when it is not
 
-enum kqmmv_kind { KQ_Q4_K = 0, KQ_Q5_K = 1, KQ_Q6_K = 2, KQ_Q8_0 = 3 };
+enum kqmmv_kind { KQ_Q4_K = 0, KQ_Q5_K = 1, KQ_Q6_K = 2, KQ_Q8_0 = 3, KQ_Q5_0 = 4 };
 enum kqmmv_path { KQMMV_H2 = 0, KQMMV_I8 = 1 };
 
 template <int T> struct kq_traits;
@@ -56,6 +56,8 @@ template <> struct kq_traits<KQ_Q4_K> { static constexpr int QK = 256, BB = 144,
 template <> struct kq_traits<KQ_Q5_K> { static constexpr int QK = 256, BB = 176, BPC = 4,  TPB = 8; static constexpr bool SUM = true;  };
 template <> struct kq_traits<KQ_Q6_K> { static constexpr int QK = 256, BB = 210, BPC = 4,  TPB = 8; static constexpr bool SUM = false; };
 template <> struct kq_traits<KQ_Q8_0> { static constexpr int QK = 32,  BB = 34,  BPC = 32, TPB = 1; static constexpr bool SUM = false; };
+// Q5_0 (2026-10-16): the K % 256 != 0 fallback of the Q4_K_M mixes (Nemotron-H 4B: K = 3136)
+template <> struct kq_traits<KQ_Q5_0> { static constexpr int QK = 32,  BB = 22,  BPC = 32, TPB = 1; static constexpr bool SUM = false; };
 
 // 16-byte units of one chunk copy (the chunk's bytes plus up to 15 bytes of align-down slack), per lane
 template <int T> static constexpr __host__ __device__ int kq_n16() { return (kq_traits<T>::BPC*kq_traits<T>::BB + 15 + 15)/16; }
@@ -91,12 +93,18 @@ static inline double kqmmv_bpe(int T, int path) {
 }
 
 // host: bytes of dynamic shared memory for a launch
+// PXA_KQMMV_XPAD (2026-10-19): the h2 staged x keeps 40 halves (80 B) per 32-block instead of 32, so the
+// lanes' 128-bit x reads of one 8-lane phase (lane l at 32-block l) hit 8 different bank quads instead of two (64 B
+// stride = 4-way conflicts on every x load of the dot). Values and per-lane order are unchanged (bit-identical); the
+// K chunking (kqmmv_xchunk) still counts the unpadded bytes, only the allocation grows by a quarter of the x part.
+// ny <= 5 only: at ny >= 6 the wider block costs occupancy (P100 bench: ny 6 / 8 -4% / +5%), so those keep the dense rows.
+static inline int kqmmv_xcols(int path, int ny, int XC) { return path == KQMMV_H2 && ny <= 5 ? XC + XC/4 : XC; }   // staged x elements per column
 static inline int kqmmv_smem_bytes(int T, int path, int ny, int XC, int nwarps) {
     const int xe  = path == KQMMV_H2 ? 2 : 1;
     const bool sm = T == KQ_Q4_K || T == KQ_Q5_K;
     const int wb  = T == KQ_Q4_K ? kq_wbuf<KQ_Q4_K>() : T == KQ_Q5_K ? kq_wbuf<KQ_Q5_K>()
-                  : T == KQ_Q6_K ? kq_wbuf<KQ_Q6_K>() : kq_wbuf<KQ_Q8_0>();
-    return ny*XC*xe + ny*(XC/32)*4 + (sm ? ny*(XC/16)*4 : 0) + nwarps*wb;
+                  : T == KQ_Q6_K ? kq_wbuf<KQ_Q6_K>() : T == KQ_Q5_0 ? kq_wbuf<KQ_Q5_0>() : kq_wbuf<KQ_Q8_0>();
+    return ny*kqmmv_xcols(path, ny, XC)*xe + ny*(XC/32)*4 + (sm ? ny*(XC/16)*4 : 0) + nwarps*wb;
 }
 
 // host: the activation chunk for (type, path, ny, K). The whole (1024-rounded) K when it fits
@@ -220,12 +228,16 @@ struct kq_part {
 // shared-memory view of one staged activation chunk
 template <int P>
 struct kq_xview {
-    const unsigned char * xq;    // column j at xq + j*XC*XE
+    const unsigned char * xq;    // column j at xq + j*(XC + XC/32*pad)*XE
     const float         * xs;    // column j at xs + j*(XC/32)
     const float         * xsum;  // column j at xsum + j*(XC/16)
     int                   XC;
+    int                   pad;   // PXA_KQMMV_XPAD: elements of padding after every 32-block (8 = h2 ny <= 5, else 0)
     static constexpr int XE = P == KQMMV_H2 ? 2 : 1;
-    __device__ __forceinline__ const unsigned char * elem(int j, int e) const { return xq + ((size_t)j*XC + e)*XE; }
+    // a 16-element run never crosses a 32-block, so the padding never splits a 128-bit x read
+    __device__ __forceinline__ const unsigned char * elem(int j, int e) const {
+        return xq + ((size_t)j*(XC + (XC >> 5)*pad) + e + (e >> 5)*pad)*XE;
+    }
     __device__ __forceinline__ float scale(int j, int e) const { return xs[j*(XC/32) + (e >> 5)]; }
     __device__ __forceinline__ float sum16(int j, int e) const { return xsum[j*(XC/16) + (e >> 4)]; }
 };
@@ -313,6 +325,37 @@ static __device__ __forceinline__ void kq_task(const unsigned char * wb, int o, 
             acc[j] = fmaf(B.dot(X.elem(j, E_hi)), ds_hi*X.scale(j, E_hi), acc[j]);
             acc[j] = fmaf(-dm_hi, X.sum16(j, E_hi), acc[j]);
         }
+    } else if constexpr (T == KQ_Q5_0) {
+        // block: d (fp16) | qh (32 high bits) | qs[16] (element i: low nibble of qs[i], element 16 + i: high nibble);
+        // code = nibble | qh bit << 4 in 0..31, value = (code - 16)*d. Part A = elements 0..15, part B = 16..31.
+        // The 4 high bits of word i go to bit 4 of its 4 bytes with one multiply (4-bit n * 0x02040810: the four
+        // shifted copies of n at bits 4, 11, 18, 25 never overlap, bit k of n lands on bit 8k + 4).
+        const int ob = o + t*22;
+        uint32_t qs[4], lo[4], hi[4];
+        kq_ld16(wb, ob + 6, qs);
+        const uint32_t * hp = reinterpret_cast<const uint32_t *>(wb + (ob & ~3));
+        const uint32_t sh = (uint32_t)(ob & 3)*8;
+        const uint32_t h0 = __funnelshift_r(hp[0], hp[1], sh), h1 = __funnelshift_r(hp[1], hp[2], sh);
+        const uint32_t qh = __funnelshift_r(h0, h1, 16);
+        const float d = __half2float(__ushort_as_half((unsigned short)(h0 & 0xffffu)));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            lo[i] = (qs[i] & 0x0F0F0F0Fu)        | ((((qh >> (4*i))      & 0xFu)*0x02040810u) & 0x10101010u);
+            hi[i] = ((qs[i] >> 4) & 0x0F0F0F0Fu) | ((((qh >> (4*i + 16)) & 0xFu)*0x02040810u) & 0x10101010u);
+            if constexpr (P == KQMMV_I8) {
+                lo[i] = __vsub4(lo[i], 0x10101010u);
+                hi[i] = __vsub4(hi[i], 0x10101010u);
+            }
+        }
+        kq_part<NY, P> A, B;
+        kq_part<NY, P>::make(A, lo, 0x64106410u);    // 1040 = 1024 + 16
+        kq_part<NY, P>::make(B, hi, 0x64106410u);
+        const int E = e0 + t*32;
+#pragma unroll
+        for (int j = 0; j < NY; ++j) {
+            const float f = A.dot(X.elem(j, E)) + B.dot(X.elem(j, E + 16));
+            acc[j] = fmaf(f, d*X.scale(j, E), acc[j]);
+        }
     } else {   // Q8_0
         const int ob = o + t*34;
         uint32_t a[4], b[4];
@@ -340,7 +383,7 @@ static __device__ __forceinline__ void kq_task(const unsigned char * wb, int o, 
 // 32-block, so any 32-aligned chunking stages bit-identical values (the invariance of every mode rests on it).
 template <int NY, int P, bool SUM>
 static __device__ __forceinline__ void kq_stage(const float * x, int64_t sx, int XC, int k0, int Kc,
-                                                unsigned char * xq, float * xs, float * xsum, int lane, int warp, int NW) {
+                                                unsigned char * xq, float * xs, float * xsum, int lane, int warp, int NW, int pad) {
     // 128-element groups: lane l holds elements 4l..4l+3 (a 32-block = 8 lanes, a 16-run = 4 lanes);
     // four groups per warp per step, all loads first
     const int nb32  = Kc/32;
@@ -380,7 +423,7 @@ static __device__ __forceinline__ void kq_stage(const float * x, int64_t sx, int
                     uint2 st;
                     st.x = *reinterpret_cast<const uint32_t *>(&h01);
                     st.y = *reinterpret_cast<const uint32_t *>(&h23);
-                    *reinterpret_cast<uint2 *>(xq + ((size_t)j*XC + e)*2) = st;
+                    *reinterpret_cast<uint2 *>(xq + ((size_t)j*(XC + (XC >> 5)*pad) + e + (e >> 5)*pad)*2) = st;   // PXA_KQMMV_XPAD
                 }
                 // the min term sees the staged x (what the dot sees)
                 s = (__low2float(h01) + __high2float(h01) + __low2float(h23) + __high2float(h23))*sc;
@@ -416,7 +459,9 @@ static __device__ __forceinline__ void kq_stage(const float * x, int64_t sx, int
 // Per warp the weight chunks are a flat item list (vb, matrix, chunk); two items are always in flight in
 // registers while the current one is consumed from the warp's shared buffer.
 // ------------------------------------------------------------------------------------------------
-template <int T, int NY, int P, bool GU>
+// DP = weight chunks in flight per warp (ring of DP register buffers; 2 = the original pA/pB ping-pong). The chunks
+// are still consumed one after another in the warp's item order, so every value is bit-identical at any DP.
+template <int T, int NY, int P, bool GU, int DP = 2>
 static __global__ void __launch_bounds__(256) k_kq_mmv(const kqmmv_args a) {
     using TR = kq_traits<T>;
     constexpr int NMAT = GU ? 2 : 1;
@@ -431,10 +476,11 @@ static __global__ void __launch_bounds__(256) k_kq_mmv(const kqmmv_args a) {
     const int XC = a.XC, K = a.K;
 
     unsigned char * xq   = kq_smem;
-    float         * xs   = reinterpret_cast<float *>(kq_smem + (size_t)NY*XC*XE);
+    constexpr int   XPAD = P == KQMMV_H2 && NY <= 5 ? 8 : 0;   // PXA_KQMMV_XPAD (kqmmv_xcols)
+    float         * xs   = reinterpret_cast<float *>(kq_smem + (size_t)NY*(XC + (XC >> 5)*XPAD)*XE);
     float         * xsum = xs + NY*(XC/32);
     unsigned char * wbuf = reinterpret_cast<unsigned char *>(xsum + (TR::SUM ? NY*(XC/16) : 0)) + (size_t)warp*WBUF;
-    const kq_xview<P> X{xq, xs, xsum, XC};
+    const kq_xview<P> X{xq, xs, xsum, XC, XPAD};
 
     const bool single = XC >= K;
     const int  nxc    = single ? 1 : (K + XC - 1)/XC;
@@ -464,7 +510,7 @@ static __global__ void __launch_bounds__(256) k_kq_mmv(const kqmmv_args a) {
 #pragma unroll
     for (int j = 0; j < NY; ++j) { acc0[j] = 0.0f; acc1[j] = 0.0f; }
 
-    uint4 pA[NLD], pB[NLD];
+    uint4 pp[DP][NLD];
 
     for (int xc = 0; xc < nxc; ++xc) {
         const int k0  = xc*XC;
@@ -548,17 +594,19 @@ static __global__ void __launch_bounds__(256) k_kq_mmv(const kqmmv_args a) {
         };
 
         // the first two weight chunks are in flight while the activation is staged
-        issue(pA, qi); cur_next(qi);
-        issue(pB, qi); cur_next(qi);
+#pragma unroll
+        for (int d = 0; d < DP; ++d) { issue(pp[d], qi); cur_next(qi); }
 
         if (xc > 0) __syncthreads();
-        kq_stage<NY, P, TR::SUM>(a.x, a.sx, XC, k0, Kc, xq, xs, xsum, lane, warp, NW);
+        kq_stage<NY, P, TR::SUM>(a.x, a.sx, XC, k0, Kc, xq, xs, xsum, lane, warp, NW, XPAD);
         __syncthreads();
 
         while (qc.vk < nvk) {
-            consume(pA);
-            if (qc.vk >= nvk) break;
-            consume(pB);
+#pragma unroll
+            for (int d = 0; d < DP; ++d) {
+                consume(pp[d]);
+                if (qc.vk >= nvk) break;
+            }
         }
     }
 }
@@ -624,10 +672,11 @@ static __global__ void __launch_bounds__(256) k_kq_mmv_rw(const kqmmv_args a) {
     const int XC = a.XC, K = a.K;
 
     unsigned char * xq   = kq_smem;
-    float         * xs   = reinterpret_cast<float *>(kq_smem + (size_t)NY*XC*XE);
+    constexpr int   XPAD = P == KQMMV_H2 && NY <= 5 ? 8 : 0;   // PXA_KQMMV_XPAD (kqmmv_xcols)
+    float         * xs   = reinterpret_cast<float *>(kq_smem + (size_t)NY*(XC + (XC >> 5)*XPAD)*XE);
     unsigned char * wb0  = reinterpret_cast<unsigned char *>(xs + NY*(XC/32)) + (size_t)(2*warp)*WBUF;
     unsigned char * wb1  = wb0 + WBUF;
-    const kq_xview<P> X{xq, xs, nullptr, XC};
+    const kq_xview<P> X{xq, xs, nullptr, XC, XPAD};
 
     // this block's matrix (virtual blocks of NW*2*RS rows, concatenated over the launch's matrices)
     const int vb = blockIdx.x;
@@ -692,7 +741,7 @@ static __global__ void __launch_bounds__(256) k_kq_mmv_rw(const kqmmv_args a) {
         const int k0 = xc*XC;
         const int Kc = min(XC, K - k0);
         if (xc > 0) __syncthreads();
-        kq_stage<NY, P, false>(a.x, a.sx, XC, k0, Kc, xq, xs, nullptr, lane, warp, NW);
+        kq_stage<NY, P, false>(a.x, a.sx, XC, k0, Kc, xq, xs, nullptr, lane, warp, NW, XPAD);
         __syncthreads();
         const int g1 = min(nwc, (xc + 1)*gpx);
         for (int g = xc*gpx; g < g1; ++g) {
@@ -743,25 +792,25 @@ static __global__ void k_kq_glu(const float * __restrict__ gate, const float * _
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) dst[i] = kq_glu(gate[i], up[i], limit);
 }
-
+#include "pxa-host-atomic.h" // the cache below: __atomic builtins on GCC/clang, Interlocked on MSVC
 // host: resident blocks per SM of one instance at (nwarps, smem), cached (packed: smem << 12 | nw << 6 | occ)
-template <int T, int NY, int P, bool GU>
+template <int T, int NY, int P, bool GU, int DP = 2>
 static int kqmmv_occupancy(int nwarps, int smem) {
     static uint64_t cache[8] = {0};
     const uint64_t key = ((uint64_t)smem << 12) | ((uint64_t)nwarps << 6);
     for (int i = 0; i < 8; ++i) {
-        const uint64_t c = __atomic_load_n(&cache[i], __ATOMIC_ACQUIRE);
+        const uint64_t c = PXA_ATOMIC_LOAD_ACQ_U64(&cache[i]);
         if (c && (c & ~(uint64_t)63) == key) return (int)(c & 63);
     }
     int occ = 1;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_kq_mmv<T, NY, P, GU>, 32*nwarps, smem) != cudaSuccess || occ < 1) {
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_kq_mmv<T, NY, P, GU, DP>, 32*nwarps, smem) != cudaSuccess || occ < 1) {
         (void) cudaGetLastError();
         occ = 1;
     }
     if (occ > 63) occ = 63;
     for (int i = 0; i < 8; ++i) {
         uint64_t z = 0;
-        if (__atomic_compare_exchange_n(&cache[i], &z, key | (uint64_t)occ, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+        if (PXA_ATOMIC_CAS_U64(&cache[i], &z, key | (uint64_t)occ)) break;
     }
     return occ;
 }
@@ -787,7 +836,7 @@ static inline int kqmmv_rs(int64_t rows, int nsm) {
 
 // host: dynamic shared memory of the wide form (staged x + scales, two chunk buffers per warp)
 static inline int kqmmv_smem_rw(int path, int ny, int XC, int nwarps) {
-    return ny*XC*(path == KQMMV_H2 ? 2 : 1) + ny*(XC/32)*4 + 2*nwarps*kq_wbuf<KQ_Q8_0>();
+    return ny*kqmmv_xcols(path, ny, XC)*(path == KQMMV_H2 ? 2 : 1) + ny*(XC/32)*4 + 2*nwarps*kq_wbuf<KQ_Q8_0>();
 }
 
 template <int P>
@@ -809,16 +858,38 @@ static inline bool kqmmv_rw_fits(int T, int path, int ny, int K) {
     return T == KQ_Q8_0 && kqmmv_xchunk(T, path, ny, K) < K && ny >= 1 && ny <= KQMMV_MAX_NY;
 }
 
-template <int T, int NY, int P, bool GU>
-static cudaError_t kqmmv_launch_t(const kqmmv_args & a, int nwarps, int nsm, cudaStream_t stream) {
+// PXA_KQMMV_DP (2026-10-14; default 0 = off): a one-column launch with at most KQMMV_DP_NVB virtual
+// blocks per SM (the latency-bound small GEMVs: delta-net alpha/beta, attention k/v) keeps DP = kqmmv_dp_on chunks
+// in flight per warp instead of 2 (3..5; 5 = the whole K = 5120 row). Bit-identical (same chunk order per warp).
+static int kqmmv_dp_on = -1;
+static int kqmmv_dp_nvb = -1;   // PXA_KQMMV_DP_NVB: the virtual-block-per-SM limit (default 2)
+static inline int kqmmv_dp() {
+    if (kqmmv_dp_on < 0) { const char * e = getenv("PXA_KQMMV_DP"); const int v = e ? atoi(e) : 0; kqmmv_dp_on = v >= 3 && v <= 5 ? v : 0; }
+    if (kqmmv_dp_nvb < 0) { const char * e = getenv("PXA_KQMMV_DP_NVB"); const int v = e ? atoi(e) : 0; kqmmv_dp_nvb = v > 0 ? v : 2; }
+    return kqmmv_dp_on;
+}
+template <int T, int NY, int P, bool GU, int DP>
+static cudaError_t kqmmv_launch_dp(const kqmmv_args & a, int nwarps, int nsm, cudaStream_t stream) {
     const int smem = kqmmv_smem_bytes(T, P, NY, a.XC, nwarps);   // < 48 KiB by construction
     int grid = a.nvb;
     if (a.XC >= a.K) {
-        const int cap = nsm*kqmmv_occupancy<T, NY, P, GU>(nwarps, smem);
+        const int cap = nsm*kqmmv_occupancy<T, NY, P, GU, DP>(nwarps, smem);
         if (grid > cap) grid = cap;
     }
-    k_kq_mmv<T, NY, P, GU><<<grid, dim3(32, nwarps, 1), smem, stream>>>(a);
+    k_kq_mmv<T, NY, P, GU, DP><<<grid, dim3(32, nwarps, 1), smem, stream>>>(a);
     return cudaGetLastError();
+}
+template <int T, int NY, int P, bool GU>
+static cudaError_t kqmmv_launch_t(const kqmmv_args & a, int nwarps, int nsm, cudaStream_t stream) {
+    if constexpr (NY == 1 && !GU && T == KQ_Q8_0) {
+        const int dp = kqmmv_dp();
+        if (dp && a.XC >= a.K && a.nvb <= kqmmv_dp_nvb*nsm) {
+            if (dp == 3) return kqmmv_launch_dp<T, NY, P, GU, 3>(a, nwarps, nsm, stream);
+            if (dp == 4) return kqmmv_launch_dp<T, NY, P, GU, 4>(a, nwarps, nsm, stream);
+            return kqmmv_launch_dp<T, NY, P, GU, 5>(a, nwarps, nsm, stream);
+        }
+    }
+    return kqmmv_launch_dp<T, NY, P, GU, 2>(a, nwarps, nsm, stream);
 }
 
 template <int T, int P, bool GU>
@@ -844,6 +915,7 @@ static cudaError_t kqmmv_launch(int T, int P, const kqmmv_args & a, int ny, int 
             case KQ_Q5_K: return kqmmv_launch_ny<KQ_Q5_K, KQMMV_H2, GU>(a, ny, nwarps, nsm, stream);
             case KQ_Q6_K: return kqmmv_launch_ny<KQ_Q6_K, KQMMV_H2, GU>(a, ny, nwarps, nsm, stream);
             case KQ_Q8_0: return kqmmv_launch_ny<KQ_Q8_0, KQMMV_H2, GU>(a, ny, nwarps, nsm, stream);
+            case KQ_Q5_0: return kqmmv_launch_ny<KQ_Q5_0, KQMMV_H2, GU>(a, ny, nwarps, nsm, stream);
         }
     } else {
         switch (T) {
@@ -851,6 +923,7 @@ static cudaError_t kqmmv_launch(int T, int P, const kqmmv_args & a, int ny, int 
             case KQ_Q5_K: return kqmmv_launch_ny<KQ_Q5_K, KQMMV_I8, GU>(a, ny, nwarps, nsm, stream);
             case KQ_Q6_K: return kqmmv_launch_ny<KQ_Q6_K, KQMMV_I8, GU>(a, ny, nwarps, nsm, stream);
             case KQ_Q8_0: return kqmmv_launch_ny<KQ_Q8_0, KQMMV_I8, GU>(a, ny, nwarps, nsm, stream);
+            case KQ_Q5_0: return kqmmv_launch_ny<KQ_Q5_0, KQMMV_I8, GU>(a, ny, nwarps, nsm, stream);
         }
     }
     return cudaErrorInvalidValue;

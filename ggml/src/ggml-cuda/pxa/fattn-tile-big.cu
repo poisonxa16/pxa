@@ -583,7 +583,7 @@ bool ggml_cuda_fattn_tile_big_is_supported([[maybe_unused]] ggml_backend_cuda_co
 
     // sm_60 and sm_70 only -- see the SCOPE note at the top of this file.
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !(cc == CC_PASCAL || cc == CC_VOLTA)) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !(cc == PXA_CC_PASCAL || cc == PXA_CC_VOLTA)) {
         return false;
     }
 

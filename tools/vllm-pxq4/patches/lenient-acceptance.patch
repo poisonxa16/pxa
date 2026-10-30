@@ -1,0 +1,122 @@
+PXA Network modification notice (Apache License 2.0, section 4(b)): this patch changes
+vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py from vLLM (Copyright the vLLM contributors, Apache License 2.0).
+Changed by PXA Network, 2026; the change is released under the Apache License 2.0.
+See tools/vllm-pxq4/LICENSE-NOTICE.md. patch(1) skips these lines.
+
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
++
+ import torch
+ 
+ from vllm.triton_utils import tl, tldevice, triton
+@@ -10,6 +12,11 @@
+ )
+ 
+ 
++_PXA_LENIENT_ENV = os.environ.get("PXA_LENIENT_LOGR", "").strip()
++PXA_LENIENT = _PXA_LENIENT_ENV != ""
++PXA_LENIENT_LOGR = float(_PXA_LENIENT_ENV) if PXA_LENIENT else -1.0e30
++
++
+ @triton.jit
+ def _compute_block_max_and_sumexp(logits):
+     block_max = tl.max(logits, axis=0)
+@@ -208,6 +215,8 @@
+     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
+     HAS_DRAFT_LOGITS: tl.constexpr,
+     SYNTHETIC_MODE: tl.constexpr,
++    LENIENT_LOGR=-1.0e30,
++    LENIENT: tl.constexpr = False,
+ ):
+     req_idx = tl.program_id(0)
+     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+@@ -250,6 +259,16 @@
+                     u = tl_rand32(seed, pos, includes_zero=False)
+                     rate = tl.load(synthetic_conditional_rates_ptr + i)
+                     accepted &= u < rate
++                elif LENIENT:
++                    g_max = tl.max(target_local_max, axis=0)
++                    g_logit = tl.load(
++                        target_logits_ptr
++                        + logit_idx * target_logits_stride
++                        + draft_sampled
++                    ).to(tl.float32)
++                    accepted &= (target_argmax == draft_sampled) | (
++                        (g_logit - g_max) >= LENIENT_LOGR
++                    )
+                 else:
+                     accepted &= target_argmax == draft_sampled
+                 tl.store(
+@@ -299,7 +318,23 @@
+                 else:
+                     # Probability ratio test: p(x) > u * q(x)
+                     # Equivalent log form: log_p(x) > log(u) + log_q(x)
+-                    accepted &= target_log_prob > tl.log(u) + draft_log_prob
++                    if LENIENT:
++                        r_blocks = tl.arange(0, PADDED_VOCAB_NUM_BLOCKS)
++                        r_max = tl.max(
++                            tl.load(
++                                target_local_max_ptr
++                                + logit_idx * target_local_max_stride
++                                + r_blocks,
++                                mask=r_blocks < vocab_num_blocks,
++                                other=float("-inf"),
++                            ),
++                            axis=0,
++                        )
++                        accepted &= (
++                            target_log_prob > tl.log(u) + draft_log_prob
++                        ) | ((target_logit - r_max) >= LENIENT_LOGR)
++                    else:
++                        accepted &= target_log_prob > tl.log(u) + draft_log_prob
+                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
+             rejected_step += accepted
+     tl.store(rejected_steps_ptr + req_idx, rejected_step)
+@@ -586,6 +621,8 @@
+     DRAFT_TOP_K: tl.constexpr,
+     DRAFT_BLOCK_K: tl.constexpr,
+     USE_FP64: tl.constexpr,
++    LENIENT_LOGR=-1.0e30,
++    LENIENT: tl.constexpr = False,
+ ):
+     """DFlash2 chain rejection on compact target/draft supports.
+ 
+@@ -667,9 +704,15 @@
+ 
+             pos = tl.load(pos_ptr + row)
+             uniform = tl_rand32(seed, pos, includes_zero=False)
+-            accepted &= (target_proposed_logit - target_lse) > (
++            ok = (target_proposed_logit - target_lse) > (
+                 tl.log(uniform) + draft_proposed_logit - draft_lse
+             )
++            if LENIENT:
++                s_max = tl.max(
++                    tl.where(target_keep, target_logits, float("-inf")), axis=0
++                )
++                ok = ok | ((target_proposed_logit - s_max) >= LENIENT_LOGR)
++            accepted &= ok
+             tl.store(
+                 sampled_ptr + req_idx * sampled_stride + step,
+                 proposed,
+@@ -843,6 +886,8 @@
+         DRAFT_TOP_K=draft_topk_ids.shape[2],
+         DRAFT_BLOCK_K=triton.next_power_of_2(draft_topk_ids.shape[2]),
+         USE_FP64=use_fp64,
++        LENIENT_LOGR=PXA_LENIENT_LOGR,
++        LENIENT=PXA_LENIENT,
+         num_warps=1,
+     )
+     return sampled, num_sampled
+@@ -970,6 +1015,8 @@
+         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
+         HAS_DRAFT_LOGITS=has_draft_logits,
+         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
++        LENIENT_LOGR=PXA_LENIENT_LOGR,
++        LENIENT=PXA_LENIENT,
+         num_warps=1,
+     )
+ 

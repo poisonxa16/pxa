@@ -49,9 +49,12 @@ add_library(llama
             llama-model-loader.cpp
             llama-load-tensors.cpp
             llama-pxa-place.cpp
+            llama-pxa-thread-place.cpp
+            llama-pxa-cold-auto.cpp
             llama-pxa-xcache.cpp
             llama-pxa-xcache-async.cpp
             llama-pxa-xcache-async-core.cpp
+            llama-pxa-xcache-skip.cpp
             llama-build-context.h
             llama-build-context.cpp
             llama-model.h
@@ -72,6 +75,7 @@ add_library(llama
             llama-qsa-prof.cpp
             llama-delta-net.h
             llama-delta-net.cpp
+            llama-mamba2.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
@@ -87,6 +91,8 @@ add_library(llama
             graphs/build_dbrx.cpp
             graphs/build_starcoder.cpp
             graphs/build_starcoder2.cpp
+            graphs/build_nemotron.cpp
+            graphs/build_nemotron_h.cpp
             graphs/build_refact.cpp
             graphs/build_bert.cpp
             graphs/build_bloom.cpp
@@ -94,6 +100,7 @@ add_library(llama
             graphs/build_stablelm.cpp
             graphs/build_seedoss.cpp
             graphs/build_step35.cpp
+            graphs/build_flint.cpp
             graphs/build_laguna.cpp
             graphs/build_hy3.cpp
             graphs/build_qwen.cpp
@@ -152,7 +159,7 @@ endif()
 if (PXA_PXQN_ENCODER)
     target_compile_definitions(llama PRIVATE PXA_PXQN_ENCODER)
     if (PXA_QUANTIZER_EDITION STREQUAL "pro")
-        # the Pro build: license-gated PXQN, and no LDLQ code in the binary (PXQN_NO_LDLQ).
+        # the Pro build: license-gated PXQN, and no supporter-only encoder stage in the binary (PXQN_NO_LDLQ).
         # The key list goes in comma-separated (a ; would split the definition into several).
         string(REPLACE ";" "," _pxa_pubkeys_def "${PXA_LICENSE_PUBKEYS}")
         target_compile_definitions(llama PRIVATE PXA_PRO_LICENSE PXQN_NO_LDLQ

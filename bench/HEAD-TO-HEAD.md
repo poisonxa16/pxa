@@ -16,7 +16,7 @@
 (`pxa-35b-ornith-siq-bf16.gguf`, the exact source of the released PXQ tiers) to the parent engine's IQ_K
 incumbents with the fork's `llama-quantize`, using the **same imatrix** the PXQ tiers used
 (`ornith-forquant.imatrix`, 2530 chunks). Same weights + same imatrix + same wikitext-2 corpus +
-the **same bf16 KL-divergence reference** ⇒ KLD is directly comparable, not just perplexity. This is
+the **same bf16 KL-divergence reference** => KLD is directly comparable, not just perplexity. This is
 a fairer, harder test than any downloaded incumbent (which would be different base weights).
 
 ## The table

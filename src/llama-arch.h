@@ -77,6 +77,7 @@ enum llm_arch {
     LLM_ARCH_MIMO2,
     LLM_ARCH_SEED_OSS,
     LLM_ARCH_STEP35,
+    LLM_ARCH_FLINT,
     LLM_ARCH_LAGUNA,
     LLM_ARCH_GLM_DSA,
     LLM_ARCH_MISTRAL4,
@@ -85,8 +86,12 @@ enum llm_arch {
     LLM_ARCH_HY_V3,
     LLM_ARCH_MUSE_GLIMMER,
     LLM_ARCH_DEEPSEEK4,
+    LLM_ARCH_NEMOTRON,       // PXA Nemotron port: Nemotron-4 / Minitron dense (LayerNorm1p, partial NeoX rope, relu^2)
+    LLM_ARCH_NEMOTRON_H,     // PXA Nemotron port: Nemotron-H hybrid (Mamba-2 + attention + relu^2 MLP)
+    LLM_ARCH_NEMOTRON_H_MOE, // PXA Nemotron port: Nemotron 3 hybrid MoE (Mamba-2 + attention + sigmoid-routed relu^2 experts)
     LLM_ARCH_DEEPSEEK4_DSPARK,
     LLM_ARCH_GLM5NEXT,
+    LLM_ARCH_DEEPSEEK41,     // DeepSeek-V4.1-Flash (CSA2/CED/Engram); names follow the ISTA GGUF header
     LLM_ARCH_UNKNOWN,
 };
 
@@ -112,6 +117,7 @@ enum llm_kv {
     LLM_KV_FEED_FORWARD_LENGTH,
     LLM_KV_EXPERT_FEED_FORWARD_LENGTH,
     LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH,
+    LLM_KV_MOE_LATENT_SIZE,                 // PXA: Nemotron latent MoE (experts run at this width)
     LLM_KV_USE_PARALLEL_RESIDUAL,
     LLM_KV_TENSOR_DATA_LAYOUT,
     LLM_KV_EXPERT_COUNT,
@@ -167,6 +173,27 @@ enum llm_kv {
     LLM_KV_DSPARK_NOISE_TOKEN_ID,
     LLM_KV_DSPARK_TARGET_LAYER_IDS,
 
+    // DeepSeek-V4.1 ("deepseek41"). Spelled exactly as the ISTA GGUF writes them, which
+    // mixes "engram.x" and "engram_x" forms; do not normalise.
+    LLM_KV_ATTENTION_CANDIDATE_BLOCK_SIZE,
+    LLM_KV_ATTENTION_CANDIDATE_TOPK_BLOCKS,
+    LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER_ID,
+    LLM_KV_KV_SOURCE_LAYER_IDS,
+    LLM_KV_INDEX_SOURCE_LAYER_IDS,
+    LLM_KV_DSV41_DSPARK_TARGET_LAYER_IDS,
+    LLM_KV_EXPERT_SCORING_FUNC,
+    LLM_KV_ENGRAM_PRESENT,
+    LLM_KV_ENGRAM_LAYER_IDS,
+    LLM_KV_ENGRAM_NUM_EMBEDDINGS,
+    LLM_KV_ENGRAM_HEAD_DIM,
+    LLM_KV_ENGRAM_N_HEADS,
+    LLM_KV_ENGRAM_MAX_NGRAM_SIZE,
+    LLM_KV_ENGRAM_VOCAB_SIZE,
+    LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE,
+    LLM_KV_ENGRAM_PAD_TOKEN_ID,
+    LLM_KV_ENGRAM_SOURCE,
+    LLM_KV_ENGRAM_FILE,
+
     LLM_KV_ATTENTION_HEAD_COUNT,
     LLM_KV_ATTENTION_HEAD_COUNT_KV,
     LLM_KV_ATTENTION_MAX_ALIBI_BIAS,
@@ -181,6 +208,7 @@ enum llm_kv {
     LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,
     LLM_KV_ATTENTION_SLIDING_WINDOW,
     LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
+    LLM_KV_ATTENTION_ROPE_PATTERN,
     LLM_KV_ATTENTION_SCALE,
     LLM_KV_ATTENTION_OUTPUT_SCALE,
     LLM_KV_ATTENTION_TEMPERATURE_LENGTH,
@@ -256,6 +284,7 @@ enum llm_kv {
     LLM_KV_TOKENIZER_ADD_SEP,
     LLM_KV_TOKENIZER_ADD_PREFIX,
     LLM_KV_TOKENIZER_REMOVE_EXTRA_WS,
+    LLM_KV_TOKENIZER_METASPACE_PREPEND,
     LLM_KV_TOKENIZER_PRECOMPILED_CHARSMAP,
     LLM_KV_TOKENIZER_HF_JSON,
     LLM_KV_TOKENIZER_RWKV,
@@ -462,6 +491,17 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_MARKOV_W2,
     LLM_TENSOR_DSPARK_CONF_PROJ,
 
+    // DeepSeek-V4.1 Engram (layers 1 and 14 + model-level hash tables; the row table
+    // blk.N.engram_embd lives in the sidecar GGUF "deepseek41-engram")
+    LLM_TENSOR_ENGRAM_Q,
+    LLM_TENSOR_ENGRAM_K,
+    LLM_TENSOR_ENGRAM_WKV,
+    LLM_TENSOR_ENGRAM_EMBD,
+    LLM_TENSOR_ENGRAM_TOKEN_MAP,
+    LLM_TENSOR_ENGRAM_PRIMES,
+    LLM_TENSOR_ENGRAM_OFFSETS,
+    LLM_TENSOR_ENGRAM_MULTIPLIERS,
+
     // ---- qwen4exp ----
     // Low-rank hyper-connection mixers. Distinct from DeepSeek-V4's
     // LLM_TENSOR_HC_{ATTN,FFN,HEAD}_{FN,BASE,SCALE} above, which are full-rank.
@@ -495,6 +535,8 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HC_NORM,
     LLM_TENSOR_NEXTN_HC_DOWN,
     LLM_TENSOR_NEXTN_HC_UP,
+    LLM_TENSOR_FFN_LATENT_DOWN,             // PXA: Nemotron latent MoE n_embd -> moe_latent_size
+    LLM_TENSOR_FFN_LATENT_UP,               // PXA: Nemotron latent MoE moe_latent_size -> n_embd
 
     LLM_TENSOR_UNKNOWN,
 };

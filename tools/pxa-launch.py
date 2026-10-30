@@ -174,7 +174,12 @@ sm_70 ONLY WAS A LIE, AND IT MADE THE MoE BRANCH UNREACHABLE
   where the crossover was measured. Eligibility is a property of the resolved
   IMAGE, probed. See vllm_eligibility().
 """
-import argparse, collections, json, os, re, shutil, struct, subprocess, sys
+import argparse, collections, glob, json, os, re, shutil, struct, subprocess, sys
+
+# No __pycache__ next to the install's own sources (review N3): PXA Control runs inside this process, so the launcher and
+# everything it imports from tools/ load with bytecode writing off, and every python child it starts inherits the switch.
+sys.dont_write_bytecode = True
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
 # Host directory bind-mounted at /c inside the serving containers.
 # Override with PXA_HOST_ROOT; defaults to the current working directory.
@@ -524,6 +529,65 @@ PIPELINE_PP_NOTE = (
     "This launcher does not set it either way.")
 
 
+# ---------------------------------------------------------------------------
+# OVERDRIVE - the measured switch set for the qwen4exp PXQN Flash-Next class
+# ---------------------------------------------------------------------------
+# WHY THE LAUNCHER CARES. The engine declines its expert cache whenever MTP is
+# loaded ("PXA_XCACHE: declined with MTP loaded (cache + MTP is not validated yet)")
+# and the exact set of switches that makes cache+MTP both safe and fast is a
+# MEASURED ARM: 2026-10-12 a Flash-Next PXQN seat on 2x P100 measured 23.0 t/s
+# prose decode without it against 35.6 t/s with it, same argv, same cards, same
+# box (REPS 3, warmed, box load ~21 both arms). That is the +55% an operator lost
+# because nothing on the screen named the switch.
+#
+# WHAT THE MODEL CLASS IS, and it is read out of the file, not out of its name:
+# arch qwen4exp + MoE + linear-attention (DeltaNet) layers + a PXQ tier + MTP
+# tensors present. All five come from the GGUF header (model_profile).
+#
+# WHERE THE SWITCHES ARE (2026-10-19, todo overdrive-levers-into-closed-lib). The
+# recipe - which switches, which values, in which order - and the decision that
+# applies it live in the PXQN library, and the ENGINE applies it at startup through
+# its registry (PXA_AUTO_OVERDRIVE, on by default) whenever it reads this class out
+# of the header and the file is larger than the cards. This launcher exports none
+# of the recipe's rows: a bare run, this launcher and a --serve-name script are the
+# SAME seat (the frozen-residency recipe E, the measured-best arm; 2026-10-19).
+# What it exports for the class is the public switch PXA_OVERDRIVE=1 (setdefault), so
+# the set applies even on cards the file would fit - as this launcher always applied it
+# for the class - while the engine's own rule alone waits for a file larger than the
+# cards. The plan prints the rows the engine's own plan (PXA_EXPLAIN) answered with, so
+# the operator still sees every one; the library-only rows show as their alias
+# PXA_OVERDRIVE_LIB=1. PXA_NO_OVERDRIVE=1 turns the block off for anyone who wants
+# the bare seat (it wins over the switch); a PXA_OVERDRIVE the user exported is kept.
+#
+# WHAT IS EXPORTED FROM HERE is the box, not the recipe: PXA_XCACHE_CPUPOOL_CPUS (the
+# preset's 0-15 is one machine's socket; the pool belongs to the cards' own NUMA
+# node, see overdrive_pool_cpus()) and the expert map (overdrive_expert_map()).
+OVERDRIVE_SWITCH = "PXA_AUTO_OVERDRIVE"     # the engine registry pick the plan reports on
+OVERDRIVE_SRC = ("presets/pxa-overdrive-flashnext-pxqn2-1xp100.env (published for the "
+                 "Flash-Next PXQN2 file, measured on 1x P100 2026-10-09: off 26.91 prose / "
+                 "32.28 code -> on 30.70 / 37.96, +14% / +18%, three runs per cell)")
+OVERDRIVE_MEASURED_HERE = ("measured again on this launcher's own box 2026-10-12, 2x P100, "
+                           "the SAME argv with and without this block: prose 23.02 -> 35.58 "
+                           "median (close bracket), code 23.85 -> 36.44, MTP draft acceptance "
+                           "0.43 -> 0.87, REPS 3 after a warm-up, box load ~21 on both arms")
+# Depth caps 4 and 5 and the wide-verify/SC-5 pair were each measured and are LOSSES on
+# this class; the cache-admission pair is lossy; PXA_CUDA_GRAPH_SLOTS costs -9.5% prose.
+OVERDRIVE_LEFT_OFF = ("depth caps 4/5, the wide-verify + speculative-guard pair, the "
+                      "cache-admission pair and PXA_CUDA_GRAPH_SLOTS were all measured on this "
+                      "class and left OFF - each is a loss, not an omission")
+OVERDRIVE_SERVER_ARGS = ("-ot 'per_layer_token_embd\\.weight=CPU' -ngl 99 -fa on -np 1 -t 16 "
+                         "--jinja --no-context-shift --cache-ram 0 -c 16384 -ctk q8_0 -ctv q8_0 "
+                         "--spec-type mtp:n_max=3,p_min=0.75")
+# The released sibling file's tier; PXQ_UNIVERSAL is what the 2x P100 arm above ran.
+OVERDRIVE_TIERS = {"PXQN2", "PXQN4", "PXQ_UNIVERSAL"}
+# MEASURED on this box: the two-card split with this block was 35.6 prose, i.e. NOT
+# slower than the preset's own one-card 30.70. What the one-card advice below says is
+# therefore about the MODEL NOT FITTING without the expert cache, not about a split
+# penalty - see the arm-C line in overdrive_notes().
+OVERDRIVE_HEAT_WARN_C = 80
+
+
+
 class Recipe(object):
     """One row of the table. `numbers` is quoted ONLY when the row matched
     exactly; an adjacent match prints the flags and suppresses the numbers,
@@ -613,6 +677,1083 @@ def model_family(prof):
     if prof.get("is_moe"):
         return "hybrid-moe" if prof.get("deltanet") else "moe"
     return "hybrid" if prof.get("deltanet") else "dense"
+
+
+# ---------------------------------------------------------------------------
+# OVERDRIVE DETECTION - what the box, the CPU and the card are, so the model
+# class above can be served the way it was measured
+# ---------------------------------------------------------------------------
+def _cpuset_to_list(cpus):
+    """{0,1,2,36} -> '0-2,36'. Contiguous runs collapse; a scattered set stays
+    scattered, which is the point: an interleaved CPU numbering (this box, and
+    every dual-socket Xeon) must not be flattened into one range, because
+    '0-71' on a machine whose real pool is 0-17,36-53 hands the cold-expert
+    threads to a socket the cards are not on."""
+    out, run = [], []
+    for c in sorted(cpus):
+        if run and c == run[-1] + 1:
+            run.append(c)
+            continue
+        if run:
+            out.append(f"{run[0]}-{run[-1]}" if len(run) > 1 else str(run[0]))
+        run = [c]
+    if run:
+        out.append(f"{run[0]}-{run[-1]}" if len(run) > 1 else str(run[0]))
+    return ",".join(out)
+
+
+def _parse_cpulist(s):
+    """'0-2,36' -> {0,1,2,36}. Also the strided forms a NUMA list is written in on an
+    interleaved dual-socket box: the kernel's '0-30:2' (and the '0-30/2' people type),
+    i.e. every second CPU from 0 to 30. Unparseable parts are skipped, never guessed."""
+    cpus = set()
+    for part in re.split(r"[,\s]+", (s or "").strip()):
+        if not part:
+            continue
+        m = re.match(r"^(\d+)-(\d+)(?:[:/](\d+))?$", part)
+        if m:
+            lo, hi, step = int(m.group(1)), int(m.group(2)), int(m.group(3) or 1)
+            if hi >= lo and step > 0 and hi - lo < 65536:
+                cpus.update(range(lo, hi + 1, step))
+        elif part.isdigit():
+            cpus.add(int(part))
+    return cpus
+
+
+# ---------------------------------------------------------------------------
+# BOX TOPOLOGY - sockets, NUMA nodes, which node each card hangs off, which CPUs
+# this process may use. Read once (nvidia-smi topo -m, lscpu, /sys), decided by
+# pure functions so the decisions are unit-tested against REAL outputs:
+#   * CriticalTechGuy 2026-10-12: dual Xeon E5-2640 v2 (no AVX2), node0 = 0-30:2,
+#     node1 = 1-31:2 (INTERLEAVED numbering), GPU0 on node 0, GPU1 on node 1, the
+#     two cards joined by SYS (across QPI). The preset's PXA_XCACHE_CPUPOOL_CPUS=0-15
+#     names CPUs of BOTH sockets there.
+#   * this box: 2x E5-2699 v3, node0 = 0-17,36-53, every card on node 0 (PHB).
+# ---------------------------------------------------------------------------
+TOPO_LINK_RANK = {"SYS": 6, "NODE": 5, "PHB": 4, "PXB": 3, "PIX": 2}   # higher = farther apart
+CPUPOOL_WIDTH = 16        # the measured pool: 16 CPUs (one socket's 0-15 on the preset's box)
+_TOPO_MEMO = {"t": 0.0, "v": None}
+
+
+def _strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s or "")
+
+
+def _sysfs_bus_id(bus):
+    """nvidia-smi says '00000000:02:00.0' (8-digit domain); sysfs names it '0000:02:00.0'.
+    The 8-digit form never resolves under /sys/bus/pci/devices, so the card's numa_node
+    was silently unreadable and the CPU pool fell back to whatever this process was
+    allowed (2026-10-12: a launcher run under taskset 54-71 handed the pool node 1 on a
+    box whose cards are all on node 0)."""
+    b = (bus or "").strip().lower()
+    m = re.match(r"^([0-9a-f]+):([0-9a-f]{2}):([0-9a-f]{2})\.([0-7])$", b)
+    if not m:
+        return b
+    return f"{int(m.group(1), 16):04x}:{m.group(2)}:{m.group(3)}.{m.group(4)}"
+
+
+def parse_nvidia_topo(text):
+    """`nvidia-smi topo -m` -> {"gpus": {idx: {"cpus": set|None, "numa": int|None}},
+    "links": {(i, j): "SYS"|"NODE"|"PHB"|"PXB"|"PIX"|"NV#"}}. Whitespace-tokenised (the
+    tool pads with tabs AND spaces, and NIC rows/columns may be present)."""
+    out = {"gpus": {}, "links": {}}
+    lines = [_strip_ansi(ln) for ln in (text or "").splitlines()]
+    cols = None
+    for ln in lines:
+        toks = ln.split()
+        if not toks:
+            continue
+        if cols is None and "Affinity" in ln:
+            cols = [t for t in toks if re.match(r"^(GPU|NIC)\d+$", t)]
+            continue
+        m = re.match(r"^GPU(\d+)$", toks[0])
+        if cols is None or not m:
+            continue
+        i = int(m.group(1))
+        links = toks[1:1 + len(cols)]
+        rest = toks[1 + len(cols):]
+        for c, l in zip(cols, links):
+            mm = re.match(r"^GPU(\d+)$", c)
+            if mm and int(mm.group(1)) != i and l != "X":
+                out["links"][(i, int(mm.group(1)))] = l
+        cpus, numa = None, None
+        if rest and re.match(r"^[\d,\-:/]+$", rest[0]):
+            cpus = _parse_cpulist(rest[0]) or None
+            if len(rest) > 1 and rest[1].isdigit():
+                numa = int(rest[1])
+        out["gpus"][i] = {"cpus": cpus, "numa": numa}
+    return out
+
+
+def parse_lscpu(text):
+    """`lscpu` -> {"nodes": {n: set}, "sockets": int|None, "threads_per_core": int|None,
+    "flags": set, "model": str}."""
+    out = {"nodes": {}, "sockets": None, "threads_per_core": None, "flags": set(), "model": ""}
+    for ln in (text or "").splitlines():
+        if ":" not in ln:
+            continue
+        k, v = [x.strip() for x in ln.split(":", 1)]
+        m = re.match(r"^NUMA node(\d+) CPU\(s\)$", k)
+        if m:
+            out["nodes"][int(m.group(1))] = _parse_cpulist(v)
+        elif k == "Socket(s)" and v.isdigit():
+            out["sockets"] = int(v)
+        elif k == "Thread(s) per core" and v.isdigit():
+            out["threads_per_core"] = int(v)
+        elif k == "Flags":
+            out["flags"] = set(v.split())
+        elif k == "Model name" and not out["model"]:
+            out["model"] = v
+    return out
+
+
+def _in_container():
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup") as f:
+            c = f.read()
+        return any(w in c for w in ("docker", "containerd", "kubepods", "libpod"))
+    except OSError:
+        return False
+
+
+def _mount_point_of(path, mountinfo=None):
+    """The mount point that holds `path` (longest prefix in /proc/self/mountinfo)."""
+    if mountinfo is None:
+        try:
+            with open("/proc/self/mountinfo") as f:
+                mountinfo = f.read()
+        except OSError:
+            return None
+    path = os.path.abspath(path)
+    best = None
+    for ln in mountinfo.splitlines():
+        p = ln.split()
+        if len(p) < 5:
+            continue
+        mp = p[4].replace("\\040", " ")
+        if path == mp or path.startswith(mp.rstrip("/") + "/") or mp == "/":
+            if best is None or len(mp) > len(best):
+                best = mp
+    return best
+
+
+def pxa_cache_dir():
+    """Where the engine keeps what it learns (the expert map it writes when it profiles a
+    model): $PXA_CACHE_DIR, else $XDG_CACHE_HOME/pxa, else ~/.cache/pxa - the engine's own
+    order (src/llama.cpp pxa_xcache_counts_candidates). In the image HOME=/work."""
+    d = os.environ.get("PXA_CACHE_DIR")
+    if d:
+        return d
+    x = os.environ.get("XDG_CACHE_HOME")
+    return os.path.join(x, "pxa") if x else os.path.join(os.path.expanduser("~"), ".cache", "pxa")
+
+
+def read_box_topology(max_age=60.0):
+    """The box as this process sees it. Cached for a minute (Control asks on every plan).
+    PXA_LAUNCH_FAKE_TOPO=<dir> reads topo.txt / lscpu.txt / allowed.txt / env.txt from a
+    fixture directory instead (tests); PXA_LAUNCH_FAKE_GPUS alone reads nothing, so a
+    dry-run plan never depends on the machine it runs on."""
+    import time as _t
+    fake = os.environ.get("PXA_LAUNCH_FAKE_TOPO", "").strip()
+    if not fake and os.environ.get("PXA_LAUNCH_FAKE_GPUS"):
+        return {"source": "not read (PXA_LAUNCH_FAKE_GPUS)", "gpus": {}, "links": {}, "nodes": {},
+                "sockets": None, "flags": set(), "model": "", "siblings": {}, "allowed": None,
+                "container": False, "cap_sys_nice": None, "cache_mount": None, "cache_dir": None}
+    if not fake and _TOPO_MEMO["v"] is not None and _t.time() - _TOPO_MEMO["t"] < max_age:
+        return _TOPO_MEMO["v"]
+    if fake:
+        def _rd(n):
+            try:
+                with open(os.path.join(fake, n)) as f:
+                    return f.read()
+            except OSError:
+                return ""
+        tt, lt = parse_nvidia_topo(_rd("topo.txt")), parse_lscpu(_rd("lscpu.txt"))
+        kv = dict(ln.split("=", 1) for ln in _rd("env.txt").splitlines() if "=" in ln)
+        allowed = _parse_cpulist(_rd("allowed.txt")) or None
+        sib = {}
+        for grp in _rd("siblings.txt").split():
+            s = frozenset(_parse_cpulist(grp))
+            for c in s:
+                sib[c] = s
+        topo = {"source": f"fixture {fake}", "gpus": tt["gpus"], "links": tt["links"],
+                "nodes": lt["nodes"], "sockets": lt["sockets"], "flags": lt["flags"],
+                "model": lt["model"], "siblings": sib, "allowed": allowed,
+                "container": kv.get("container") == "1",
+                "cap_sys_nice": {"1": True, "0": False}.get(kv.get("cap_sys_nice")),
+                "cache_dir": kv.get("cache_dir"), "cache_mount": kv.get("cache_mount")}
+        return topo
+    tt = parse_nvidia_topo(_run(["nvidia-smi", "topo", "-m"], timeout=10) or "")
+    lt = parse_lscpu(_run(["lscpu"], timeout=10) or "")
+    # the card's own numa_node beats the topo table's column (some drivers print N/A there)
+    for line in (_run(["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader"]) or "").splitlines():
+        try:
+            i, bus = [x.strip() for x in line.split(",")[:2]]
+            with open(f"/sys/bus/pci/devices/{_sysfs_bus_id(bus)}/numa_node") as f:
+                n = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+        g = tt["gpus"].setdefault(int(i), {"cpus": None, "numa": None})
+        if n >= 0:
+            g["numa"] = n
+    nodes = {}
+    try:
+        for d in os.listdir("/sys/devices/system/node"):
+            m = re.match(r"^node(\d+)$", d)
+            if m:
+                with open(f"/sys/devices/system/node/{d}/cpulist") as f:
+                    nodes[int(m.group(1))] = _parse_cpulist(f.read())
+    except OSError:
+        pass
+    sib = {}
+    for c in range(os.cpu_count() or 0):
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list") as f:
+                sib[c] = frozenset(_parse_cpulist(f.read()))
+        except OSError:
+            break
+    try:
+        allowed = set(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        allowed = None
+    cdir = pxa_cache_dir()
+    topo = {"source": "nvidia-smi topo -m + lscpu + /sys", "gpus": tt["gpus"], "links": tt["links"],
+            "nodes": nodes or lt["nodes"], "sockets": lt["sockets"], "flags": lt["flags"],
+            "model": lt["model"], "siblings": sib, "allowed": allowed,
+            "container": _in_container(), "cap_sys_nice": overdrive_cap_sys_nice(),
+            "cache_dir": cdir, "cache_mount": _mount_point_of(cdir)}
+    _TOPO_MEMO["t"], _TOPO_MEMO["v"] = _t.time(), topo
+    return topo
+
+
+def _gpu_node(topo, i):
+    """The NUMA node card i hangs off: its numa_node / NUMA Affinity, else the node whose CPU
+    list equals the card's CPU affinity. None when nothing says."""
+    g = (topo.get("gpus") or {}).get(i) or {}
+    if g.get("numa") is not None:
+        return g["numa"]
+    cpus = g.get("cpus")
+    if cpus:
+        for n, nc in (topo.get("nodes") or {}).items():
+            if nc and cpus == nc:
+                return n
+    return None
+
+
+def _physical_first(cpus, siblings):
+    """Order a CPU set one hardware thread per core first (lowest sibling), then the rest:
+    the measured pool was 16 physical cores, not 8 cores and their hyperthreads."""
+    first, rest, seen = [], [], set()
+    for c in sorted(cpus):
+        grp = (siblings or {}).get(c)
+        key = min(grp) if grp else c
+        if key in seen:
+            rest.append(c)
+        else:
+            seen.add(key)
+            first.append(c)
+    return first + rest
+
+
+def numa_decide(topo, sel_idx, width=CPUPOOL_WIDTH):
+    """Pure: the NUMA facts and the CPU pool for cards `sel_idx` on box `topo`.
+    -> {"nodes", "node", "link", "spans", "multi_node", "node_cpus", "pool", "pool_why",
+        "cpuset", "warnings"}"""
+    sel_idx = [int(i) for i in sel_idx]
+    host_nodes = topo.get("nodes") or {}
+    multi = len(host_nodes) > 1 or (topo.get("sockets") or 1) > 1
+    per = {i: _gpu_node(topo, i) for i in sel_idx}
+    nodes = sorted({n for n in per.values() if n is not None})
+    link = None
+    for a_ in sel_idx:
+        for b_ in sel_idx:
+            l_ = (topo.get("links") or {}).get((a_, b_))
+            if l_ and (link is None or TOPO_LINK_RANK.get(l_, 0) > TOPO_LINK_RANK.get(link, 0)):
+                link = l_
+    spans = len(nodes) > 1 or link == "SYS"
+    allowed = topo.get("allowed")
+    warnings = []
+    node = nodes[0] if len(nodes) == 1 and None not in per.values() else None
+    node_cpus = None
+    if node is not None:
+        node_cpus = set(host_nodes.get(node) or ((topo.get("gpus") or {}).get(sel_idx[0]) or {}).get("cpus") or set())
+    elif nodes:
+        node_cpus = set()
+        for n in nodes:
+            node_cpus |= set(host_nodes.get(n) or set())
+    if node_cpus:
+        base = (node_cpus & allowed) if allowed else set(node_cpus)
+        if not base:
+            base = set(allowed or node_cpus)
+            warnings.append("cpuset: " +
+                f"this process may only use CPUs {_cpuset_to_list(allowed)}, none of which sit on "
+                f"node {node if node is not None else nodes} where the card(s) hang off "
+                f"({_cpuset_to_list(node_cpus)}): the cold-expert threads will read host RAM across "
+                f"the socket link. Give the container --cpuset-cpus={_cpuset_to_list(node_cpus)}"
+                + (f" --cpuset-mems={node}" if node is not None else ""))
+        if any(w.startswith("cpuset: ") for w in warnings):
+            why = (f"this process's allowed CPU set: the cards' node "
+                   f"{node if node is not None else nodes} has no CPU this process may use")
+        elif node is not None:
+            why = f"node {node}, the node card(s) {','.join(map(str, sel_idx))} hang off"
+        else:
+            why = (f"nodes {','.join(map(str, nodes))} - the cards sit on DIFFERENT sockets, so no "
+                   f"pool is local to both; this one spans every socket they reach")
+    elif allowed:
+        base = set(allowed)
+        why = ("this process's allowed CPU set - the card(s) report no NUMA node, so the container's "
+               "cpuset is the honest boundary")
+    else:
+        base = set(range(os.cpu_count() or width))
+        why = "every CPU (neither the cards' NUMA node nor this process's CPU set could be read)"
+    ordered = _physical_first(base, topo.get("siblings"))
+    pool_set = set(ordered[:width]) if width and len(ordered) > width else set(ordered)
+    pool = _cpuset_to_list(pool_set)
+    if width and len(ordered) > width:
+        why += (f"; first {width} of its {len(ordered)} usable CPUs, one thread per core first "
+                f"(the measured pool was 16 physical cores)")
+    if spans and len(sel_idx) > 1:
+        desc = ", ".join(f"card {i} node {per[i] if per[i] is not None else '?'}" for i in sel_idx)
+        warnings.append("spans: " +
+            f"the selected cards sit on DIFFERENT CPU sockets ({desc}; link {link or 'unknown'}: every "
+            f"byte between them crosses the CPU interconnect). The engine's NUMA binding cannot bind a "
+            f"process whose cards span nodes, so one card's cold experts and the PLE gather are read "
+            f"across the socket link. Two cards on ONE node measured faster than one here (Flash-Next "
+            f"2x P100 39.22 vs 1x 25.18 prose, PHB link); across a SYS link the split is UNMEASURED. "
+            f"Compare against one card: --gpus {sel_idx[0]}")
+    if multi and topo.get("container") and topo.get("cap_sys_nice") is False:
+        warnings.append("sysnice: CAP_SYS_NICE is missing in this container on a multi-socket host: the engine's "
+                        "NUMA memory policy (PXA_NUMA_BIND, on by default) cannot place pages on the "
+                        "cards' node. Start the container with --cap-add SYS_NICE")
+    cpuset = _cpuset_to_list(node_cpus & allowed if (node_cpus and allowed and node_cpus & allowed)
+                             else node_cpus) if node_cpus else None
+    return {"per_card": per, "nodes": nodes, "node": node, "link": link, "spans": spans,
+            "multi_node": multi, "node_cpus": node_cpus, "pool": pool, "pool_why": why,
+            "cpuset": cpuset, "warnings": warnings}
+
+
+def overdrive_pool_cpus(cv):
+    """-> (cpulist, why) for PXA_XCACHE_CPUPOOL_CPUS, derived from the box topology
+    (numa_decide): the selected cards' node, intersected with the CPUs this process may
+    use, one thread per core first, 16 wide (the measured width)."""
+    sel = [int(x) for x in str(cv or "").split(",") if x.strip().isdigit()]
+    d = numa_decide(read_box_topology(), sel)
+    return d["pool"], d["pool_why"]
+
+
+def overdrive_cap_sys_nice():
+    """True when CAP_SYS_NICE is in this process's EFFECTIVE set (bit 38).
+
+    The preset's memory policy (PXA_NUMA_BIND) needs it, and a container drops it
+    unless it was given --cap-add SYS_NICE - so a seat can be measurably slower for
+    a reason that appears on no line of the command. Reports the fact; never sets
+    the policy itself."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("CapEff:"):
+                    return bool(int(line.split()[1], 16) & (1 << 38))
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _model_names(model):
+    """Every name this model file answers to: the path given, the file it resolves to, and
+    any sibling symlink (in either directory) that resolves to the same file. The shipped
+    release dir names the expert map after the SYMLINK (<link>.gguf.expert-counts.csv) while
+    the engine looked only for <path it was given>.expert-counts.csv, so a model opened by
+    its real name (or the other way round) missed a map that was sitting right there."""
+    names, dirs = [], []
+    real = os.path.realpath(model)
+    for p in (model, real):
+        if os.path.basename(p) not in names:
+            names.append(os.path.basename(p))
+        if os.path.dirname(os.path.abspath(p)) not in dirs:
+            dirs.append(os.path.dirname(os.path.abspath(p)))
+    for d in list(dirs):
+        try:
+            ents = os.listdir(d)
+        except OSError:
+            continue
+        for e in ents:
+            if e.lower().endswith(".gguf") and e not in names:
+                fp = os.path.join(d, e)
+                if os.path.islink(fp) and os.path.realpath(fp) == real:
+                    names.append(e)
+    return names, dirs
+
+
+def overdrive_expert_map(model):
+    """-> (path or None, how). Where the engine will find this model's expert map.
+
+    Looked for under every name the file answers to (_model_names), beside the model (both
+    its own directory and the directory it resolves into), then in the cache dir
+    ($PXA_CACHE_DIR, $XDG_CACHE_HOME/pxa, ~/.cache/pxa) - the engine's order. Only a map
+    named after THIS model counts: the first *.expert-counts.csv in the cache dir may belong
+    to another model (the engine would refuse it by shape, after the plan claimed it).
+    WITHOUT a map the engine profiles the model on first start and restarts once."""
+    names, dirs = _model_names(model)
+    cands = []
+    for d in dirs:
+        for n in names:
+            cands.append((os.path.join(d, n + ".expert-counts.csv"), "beside the model file"))
+            base = os.path.splitext(n)[0]
+            if base != n:
+                cands.append((os.path.join(d, base + ".expert-counts.csv"), "beside the model file"))
+    for d in (os.environ.get("PXA_CACHE_DIR"),
+              os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "pxa")):
+        if d:
+            for n in names:
+                cands.append((os.path.join(d, n + ".expert-counts.csv"), f"in the cache dir {d}"))
+    first = model + ".expert-counts.csv"
+    for c, how in cands:
+        if os.path.isfile(c) and os.access(c, os.R_OK):
+            if os.path.basename(c) != os.path.basename(first) and how == "beside the model file":
+                how += f" (named after {os.path.basename(c)[:-len('.expert-counts.csv')]}, another name of this file)"
+            return c, how
+    return None, "not found: the engine will profile the model on first start and restart once"
+
+
+def counts_env_state(path):
+    """A PXA_XCACHE_COUNTS value -> ("ok"|"write"|"bad", why). The engine READS it when it
+    exists and WRITES it (after profiling) when it does not; a value that can do neither -
+    a dangling symlink, a file it may not read, a missing file in a directory it may not
+    write - used to mean whole-layer expert streaming behind one log line (2026-10-12, arm C:
+    a symlink into a read-only bind mount)."""
+    if path is None:
+        return None, "unset"
+    if not path.strip():
+        return "bad", "set but empty"
+    if os.path.isfile(path):
+        if os.access(path, os.R_OK):
+            return "ok", "readable"
+        return "bad", "exists but this process may not read it"
+    if os.path.islink(path):
+        return "bad", f"a symlink to {os.readlink(path)!r}, which does not resolve here (dangling)"
+    if os.path.exists(path):
+        return "bad", "exists but is not a regular file"
+    d = os.path.dirname(os.path.abspath(path))
+    if os.path.isdir(d) and os.access(d, os.W_OK):
+        return "write", "does not exist yet; the engine will profile the model and write it there"
+    return "bad", f"does not exist and its directory {d} is not writable"
+
+
+def scrub_counts_env(e, note=None):
+    """Make a SET-but-unusable PXA_XCACHE_COUNTS act like an unset one in the child's
+    environment `e` (in place): the engine then looks beside the model and in the cache dir.
+    -> the line to print, or None when nothing was wrong."""
+    st, why = counts_env_state(e.get("PXA_XCACHE_COUNTS"))
+    if st != "bad":
+        return None
+    bad = e.pop("PXA_XCACHE_COUNTS")
+    return (f"PXA_XCACHE_COUNTS={bad!r} is {why}: DROPPED from the server's environment so the "
+            f"engine looks for the map beside the model and in its cache dir, as if it were unset"
+            + (f" ({note})" if note else ""))
+
+
+def hot_cards(sel_idx=None, min_c=OVERDRIVE_HEAT_WARN_C):
+    """[(index, C)] for the selected cards (all when None) at or above the warning temperature.
+    PXA_LAUNCH_FAKE_TEMPS="5:83,6:40" for tests; nothing is read under PXA_LAUNCH_FAKE_GPUS."""
+    fake = os.environ.get("PXA_LAUNCH_FAKE_TEMPS")
+    if fake is not None:
+        t = "\n".join(x.replace(":", ",") for x in fake.split(",") if x)
+    elif os.environ.get("PXA_LAUNCH_FAKE_GPUS"):
+        return []
+    else:
+        t = _run(["nvidia-smi", "--query-gpu=index,temperature.gpu", "--format=csv,noheader"], timeout=10)
+    out = []
+    for line in (t or "").splitlines():
+        try:
+            i, v = [x.strip() for x in line.split(",")[:2]]
+            if (sel_idx is None or int(i) in sel_idx) and int(v) >= min_c:
+                out.append((int(i), int(v)))
+        except ValueError:
+            continue
+    return out
+
+
+def overdrive_hot_cards(min_c=OVERDRIVE_HEAT_WARN_C):
+    """[(index, C)] for cards at or above the warning temperature."""
+    return hot_cards(None, min_c)
+
+
+# ---------------------------------------------------------------------------
+# STORAGE - which disk holds the model, and is it a spinning one? (2026-10-13)
+# The per-layer-embedding table of the Flash-Next class (per_layer_token_embd: 51 GiB at Q8_0, 33 GiB at Q5_0) is a host-side
+# gather table: every token reads ~16 hashed rows from it, and a row that is not in the page cache is one random read - about
+# 0.1 ms on an SSD, 8-15 ms on a spinning disk. An early comparison collapsed (about 5x) because that table sat on a
+# rotational disk. The kernel says which disks spin: /sys/dev/block/<maj:min> -> the device, queue/rotational on it (a partition
+# has none: its disk does), and for md / LVM / dm-crypt / bcache the disks under it (slaves/) decide, not the flag of the stack.
+# Docker: the bind mount's mountinfo line carries the host device (major:minor, source /dev/...); an overlay root does not, and is
+# reported as "cannot tell" rather than guessed. An Unraid user share (fuse.shfs) is resolved to the disk or pool directory that holds the file.
+# Pure functions: the sysfs root, the mountinfo text and the file-system root are parameters (tests build fake trees).
+# ---------------------------------------------------------------------------
+STORAGE_PLE_MIN_GIB = 4.0            # a smaller table is read once and then lives in the page cache
+_UNRAID = "/mnt"                   # Unraid: the disk and pool mount points sit directly under it
+STORAGE_KIND_ENV = "PXA_STORAGE_KIND"            # ssd | nvme | hdd: when the kernel's flag is wrong (virtual disks often say rotational)
+STORAGE_FAKE_ENV = "PXA_LAUNCH_FAKE_STORAGE"     # hdd | ssd | nvme | unknown: tests / dry runs (never reads the machine)
+_NET_FS = ("nfs", "nfs3", "nfs4", "cifs", "smb3", "smbfs", "9p", "virtiofs", "ceph", "glusterfs", "lustre", "afs", "ncpfs")
+_RAM_FS = ("tmpfs", "ramfs", "hugetlbfs", "devtmpfs")
+
+
+def _sys_read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _unescape_mnt(s):
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+
+
+def _mountinfo_entry(path, mountinfo=None):
+    """The /proc/self/mountinfo line that holds `path` -> {mount, majmin, root, fstype, source} or None.
+    Longest mount point wins; at an equal mount point the LATER line wins (it shadows the earlier one)."""
+    if mountinfo is None:
+        try:
+            with open("/proc/self/mountinfo") as f:
+                mountinfo = f.read()
+        except OSError:
+            return None
+    path = os.path.abspath(path)
+    best = None
+    for ln in mountinfo.splitlines():
+        p = ln.split()
+        if "-" not in p[6:]:
+            continue
+        dash = p.index("-", 6)
+        if len(p) < dash + 3:
+            continue
+        mp = _unescape_mnt(p[4])
+        if path == mp or path.startswith(mp.rstrip("/") + "/") or mp == "/":
+            if best is None or len(mp) >= len(best["mount"]):
+                best = {"mount": mp, "majmin": p[2], "root": _unescape_mnt(p[3]), "fstype": p[dash + 1],
+                        "source": _unescape_mnt(p[dash + 2])}
+    return best
+
+
+def _sysfs_dev_dir(ent, sysroot="/sys"):
+    """The sysfs directory of the block device behind a mountinfo entry, or None. The major:minor is
+    the truth when it is a real one; btrfs / zfs-like mounts carry an anonymous 0:N and name the device
+    in the source instead (/dev/nvme0n1p2, or /dev/mapper/<name> for LVM / LUKS)."""
+    maj = ent["majmin"].partition(":")[0]
+    if maj.isdigit() and int(maj) != 0:
+        d = os.path.join(sysroot, "dev", "block", ent["majmin"])
+        if os.path.exists(d):
+            return os.path.realpath(d)
+    src = ent["source"]
+    if src.startswith("/dev/"):
+        cb = os.path.join(sysroot, "class", "block")
+        name = os.path.basename(os.path.realpath(src) if os.path.exists(src) else src)
+        if os.path.exists(os.path.join(cb, name)):
+            return os.path.realpath(os.path.join(cb, name))
+        if src.startswith("/dev/mapper/") and os.path.isdir(cb):
+            want = src[len("/dev/mapper/"):]
+            for n in sorted(os.listdir(cb)):
+                if _sys_read(os.path.join(cb, n, "dm", "name")) == want:
+                    return os.path.realpath(os.path.join(cb, n))
+    return None
+
+
+def _dev_rot(devdir, depth=0, seen=frozenset(), via_path=None):
+    """Walk one block device in sysfs -> {name, rot: hdd|ssd|mixed|unknown, leaves: [{name, rot, nvme}], how}.
+    A stack (md, dm, bcache) is judged by the disks under slaves/; a partition by the disk it sits on; a loop
+    device by the file behind it (`via_path`); anything else by its own queue/rotational."""
+    real = os.path.realpath(devdir)
+    name = os.path.basename(real)
+    if real in seen or depth > 8:
+        return {"name": name, "rot": "unknown", "leaves": [], "how": "loop in the device stack"}
+    seen = seen | {real}
+    sl = os.path.join(real, "slaves")
+    members = [_dev_rot(os.path.join(sl, x), depth + 1, seen, via_path)
+               for x in (sorted(os.listdir(sl)) if os.path.isdir(sl) else [])]
+    if members:
+        kinds = [m["rot"] for m in members]
+        n_hdd, n_ssd, n_mix = kinds.count("hdd"), kinds.count("ssd"), kinds.count("mixed")
+        rot = ("mixed" if n_mix or (n_hdd and n_ssd) or (n_hdd and "unknown" in kinds)
+               else "hdd" if n_hdd else "ssd" if n_ssd else "unknown")
+        if rot != "unknown":
+            leaves = [x for m in members for x in m["leaves"]]
+            return {"name": name, "rot": rot, "leaves": leaves,
+                    "how": "%d member(s) under %s: %s" % (len(members), name, ", ".join(m["name"] for m in members))}
+    bf = _sys_read(os.path.join(real, "loop", "backing_file"))
+    if bf and via_path is not None:
+        r = via_path(bf)
+        if r is not None:
+            leaves = [{"name": d, "rot": "hdd" if r["kind"] in ("hdd", "mixed") else "ssd", "nvme": r["kind"] == "nvme"}
+                      for d in (r.get("devices") or [])]
+            return {"name": name, "rot": {"hdd": "hdd", "mixed": "mixed", "ssd": "ssd", "nvme": "ssd"}.get(r["kind"], "unknown"),
+                    "leaves": leaves, "how": "loop device over a file on %s" % (r.get("chain") or "?")}
+    if os.path.exists(os.path.join(real, "partition")) and not os.path.isdir(os.path.join(real, "queue")):
+        return _dev_rot(os.path.dirname(real), depth + 1, seen, via_path)
+    r = _sys_read(os.path.join(real, "queue", "rotational"))
+    if r in ("0", "1"):
+        rot = "hdd" if r == "1" else "ssd"
+        return {"name": name, "rot": rot, "leaves": [{"name": name, "rot": rot, "nvme": name.startswith("nvme")}],
+                "how": "queue/rotational=%s" % r}
+    return {"name": name, "rot": "unknown", "leaves": [], "how": "no queue/rotational under %s" % name}
+
+
+def storage_of_path(path, sysroot="/sys", mountinfo=None, fsroot="", _depth=0):
+    """Which disk(s) hold `path` -> {kind: nvme|ssd|hdd|mixed|ram|network|unknown, rotational: True|False|None,
+    fs, source, devices: [leaf disks], chain, why}. Never raises. `fsroot` prefixes the Unraid share lookup only."""
+    out = {"kind": "unknown", "rotational": None, "fs": None, "source": None, "devices": [], "chain": "", "why": ""}
+    try:
+        real = os.path.realpath(path)
+        ent = _mountinfo_entry(real, mountinfo)
+        if ent is None:
+            out["why"] = "no mount entry for the path"
+            return out
+        fs, src = ent["fstype"], ent["source"]
+        out.update(fs=fs, source=src)
+        if fs in _RAM_FS:
+            out.update(kind="ram", rotational=False, chain=fs, why="memory-backed file system")
+            return out
+        if fs in _NET_FS or fs.startswith("nfs") or (fs.startswith("fuse.") and fs != "fuse.shfs"):
+            out.update(chain=fs, why="%s is a network / FUSE file system: the read rate is the link's or the daemon's, "
+                       "there is no disk flag to read here" % fs)
+            return out
+        if fs == "fuse.shfs" or src == "shfs":
+            # Unraid user share: the file physically lives on one disk or pool directory; find it there
+            rel = os.path.relpath(real, ent["mount"])
+            found = []
+            if _depth < 1:
+                base = fsroot.rstrip("/")
+                for d in sorted(glob.glob(base + _UNRAID + "/*")):
+                    vd = d[len(base):]
+                    if os.path.basename(vd) in ("user", "user0", "remotes", "rootshare", "disks") or not os.path.isdir(d):
+                        continue
+                    if os.path.exists(os.path.join(d, rel)):
+                        found.append((vd, storage_of_path(os.path.join(vd, rel), sysroot, mountinfo, fsroot, _depth + 1)))
+            if not found:
+                out.update(chain="shfs", why="Unraid user share (fuse.shfs): the disk under it is not visible from here "
+                           "(mount the disk or the pool path instead of the user share)")
+                return out
+            order = {"hdd": 0, "mixed": 1, "unknown": 2, "network": 3, "ssd": 4, "nvme": 5, "ram": 6}
+            vd, st = min(found, key=lambda x: order.get(x[1]["kind"], 9))
+            st = dict(st)
+            st["chain"] = "shfs -> " + (st["chain"] or vd)
+            st["why"] = "Unraid user share resolved to %s: %s" % (vd, st["why"])
+            return st
+        if fs == "overlay" or src == "overlay":
+            out.update(chain="overlay", why="container overlay file system: which disk is under it is not visible from inside "
+                       "(bind-mount the model directory from the disk you want, -v /path/on/ssd:/models)")
+            return out
+        dev = _sysfs_dev_dir(ent, sysroot)
+        if dev is None:
+            out["why"] = "no block device found for %s (%s %s)" % (ent["majmin"], fs, src)
+            return out
+        via = (lambda p: storage_of_path(p, sysroot, mountinfo, fsroot, _depth + 1)) if _depth < 3 else None
+        r = _dev_rot(dev, via_path=via)
+        leaves = r["leaves"]
+        names = sorted({l["name"] for l in leaves}) or [r["name"]]
+        kind = {"hdd": "hdd", "mixed": "mixed", "unknown": "unknown"}.get(r["rot"])
+        if r["rot"] == "ssd":
+            kind = "nvme" if leaves and all(l["nvme"] for l in leaves) else "ssd"
+        out.update(kind=kind, rotational={"hdd": True, "mixed": True, "ssd": False}.get(r["rot"]), devices=names,
+                   chain=(r["name"] if names == [r["name"]] else "%s -> %s" % (r["name"], ", ".join(names))),
+                   why=r["how"])
+        return out
+    except Exception as e:             # a launcher must never die describing a disk
+        out["why"] = "storage probe failed (%s: %s)" % (e.__class__.__name__, e)
+        return out
+
+
+def storage_kind_override():
+    """PXA_STORAGE_KIND -> 'hdd' | 'ssd' | None (the user's word beats the kernel's flag)."""
+    v = os.environ.get(STORAGE_KIND_ENV, "").strip().lower()
+    return {"hdd": "hdd", "rotational": "hdd", "spinning": "hdd", "disk": "hdd",
+            "ssd": "ssd", "nvme": "ssd", "flash": "ssd"}.get(v)
+
+
+def storage_of_model(model, probe=None):
+    """The worst storage over every shard of `model` (the table lives in one shard and nothing says
+    which) -> {kind, ..., shards, worst}. `probe(path)` defaults to storage_of_path; the dry-run fixtures
+    (PXA_LAUNCH_FAKE_GPUS without PXA_LAUNCH_FAKE_STORAGE) read nothing."""
+    fake = os.environ.get(STORAGE_FAKE_ENV, "").strip().lower()
+    if fake:
+        k = {"hdd": "hdd", "ssd": "ssd", "nvme": "nvme"}.get(fake, "unknown")
+        return {"kind": k, "rotational": {"hdd": True, "ssd": False, "nvme": False}.get(k), "fs": None, "source": None,
+                "devices": ["fake0"], "chain": "fake0", "why": "%s=%s" % (STORAGE_FAKE_ENV, fake), "shards": 1, "worst": model}
+    if probe is None and os.environ.get("PXA_LAUNCH_FAKE_GPUS"):
+        return None
+    probe = probe or storage_of_path
+    paths = [model]
+    try:
+        if model.lower().endswith(".gguf"):
+            paths = [sp for sp in gguf_shards(model) if os.path.exists(sp)] or [model]
+    except Exception:
+        pass
+    order = {"hdd": 0, "mixed": 1, "unknown": 2, "network": 3, "ssd": 4, "nvme": 5, "ram": 6}
+    best = None
+    for sp in paths:
+        st = probe(sp)
+        if best is None or order.get(st["kind"], 9) < order.get(best[1]["kind"], 9):
+            best = (sp, st)
+    st = dict(best[1])
+    st["shards"], st["worst"] = len(paths), best[0]
+    ov = storage_kind_override()
+    if ov:
+        st.update(kind=ov, rotational=(ov == "hdd"), why="forced by %s=%s (the kernel said: %s, %s)"
+                  % (STORAGE_KIND_ENV, os.environ.get(STORAGE_KIND_ENV), st["kind"], st["why"] or "no reason given"))
+    return st
+
+
+def storage_row(model, probe=None):
+    """The --doctor line: where the model file is and what the kernel says about that disk. None when unknown."""
+    st = storage_of_model(model, probe) if model else None
+    if st is None:
+        return None
+    tail = {"hdd": "ROTATIONAL (spinning disk)", "mixed": "ROTATIONAL members (mixed stack)", "nvme": "NVMe", "ssd": "SSD",
+            "ram": "memory", "network": "network", "unknown": "cannot tell"}.get(st["kind"], st["kind"])
+    return ("model on %s, %s%s [%s]" % (st["chain"] or st["fs"] or "?", tail,
+                                        (" x%d shards" % st["shards"]) if st.get("shards", 1) > 1 else "",
+                                        st["why"] or "-"))
+
+
+def storage_summary(path, probe=None):
+    """The bug report's storage field: device kind and chain, never a path. None when not readable."""
+    try:
+        st = storage_of_model(path, probe) if path else None
+    except Exception:
+        return None
+    if not st:
+        return None
+    return {"kind": st["kind"], "rotational": st["rotational"], "chain": st["chain"], "devices": st["devices"],
+            "fs": st["fs"], "source": st["source"], "why": st["why"], "shards": st.get("shards", 1),
+            "forced": bool(storage_kind_override()), "ple_min_gib": STORAGE_PLE_MIN_GIB}
+
+
+PLE_DIRECT_ENV = "PXA_PLE_DIRECT"                  # engine lever: O_DIRECT row reads of the PLE table, default off
+PLE_DIRECT_CACHE_ENV = "PXA_PLE_DIRECT_CACHE_MIB"  # its RAM row cache (engine default 256)
+PLE_DIRECT_CACHE_MIB = 256
+
+
+def ple_direct_mode(env=None):
+    """PXA_PLE_DIRECT as the engine reads it (atoi): 0 / unset / junk = off, 1 = on with the device + speed refusals, 2 = lab (no refusals)."""
+    e = os.environ if env is None else env
+    m = re.match(r"\s*[+-]?\d+", e.get(PLE_DIRECT_ENV) or "")
+    return max(0, int(m.group(0))) if m else 0
+
+
+def ple_host_ram_bytes(prof, kind=None, env=None):
+    """Host RAM the per-layer table is expected to hold RESIDENT, for memory planning / fit checks (the file bytes when the table is a plain
+    host mapping). With PXA_PLE_DIRECT on, the engine reads rows from the file with O_DIRECT and keeps only a row cache, so the table is
+    NOT resident: this returns the cache (PXA_PLE_DIRECT_CACHE_MIB, default 256). It does so only when the lever will really engage: `kind`
+    (storage_of_model's kind) must be ssd / nvme / ram, or the lab mode 2; on a rotational, mixed, network or unidentified device (or
+    kind None = not known) the engine refuses and keeps the RAM path, so the whole table is counted."""
+    e = os.environ if env is None else env
+    full = int((prof or {}).get("ple_bytes") or 0) or int(((prof or {}).get("ple_elems") or 0) * 0.5625)
+    if not (prof or {}).get("ple_tensor") or full <= 0:
+        return 0
+    mode = ple_direct_mode(e)
+    if mode == 0:
+        return full
+    if mode != 2 and kind not in ("ssd", "nvme", "ram"):
+        return full
+    try:
+        cache = float(e.get(PLE_DIRECT_CACHE_ENV) or PLE_DIRECT_CACHE_MIB)
+    except ValueError:
+        cache = PLE_DIRECT_CACHE_MIB
+    return min(full, int(max(cache, 0) * 1048576))
+
+
+def ple_ram_decision(prof, st, env=None):
+    """The one DECISION line saying how the per-layer table is counted in RAM while PXA_PLE_DIRECT is set -> [line] ([] with the lever off)."""
+    if ple_direct_mode(env) == 0 or not st:
+        return []
+    full = int((prof or {}).get("ple_bytes") or 0) or int(((prof or {}).get("ple_elems") or 0) * 0.5625)
+    kept = ple_host_ram_bytes(prof, st["kind"], env)
+    g = lambda b: "%.1f GiB" % (b / BYTES_PER_GIB)
+    if kept < full:
+        return [decision_line(
+            "ple-ram", "the %s per-layer table is NOT counted as resident RAM (%s row cache only)" % (g(full), g(kept)),
+            "%s is on and the table sits on %s: the engine reads rows with O_DIRECT instead of holding the table in memory, so the "
+            "memory plan keeps the row cache only. The engine still refuses (and then holds the table in RAM) if the O_DIRECT open or its "
+            "rows/s probe fails" % (PLE_DIRECT_ENV, st["chain"] or st["fs"] or st["kind"]),
+            "unset %s to count the whole table" % PLE_DIRECT_ENV)]
+    return [decision_line(
+        "ple-ram", "the %s per-layer table is still counted as resident RAM" % g(full),
+        "%s is set, but the table is on a %s device: the engine refuses the O_DIRECT tier there and keeps the RAM path" % (PLE_DIRECT_ENV, st["kind"]),
+        "%s=2 (lab) skips the refusal; the better fix is an SSD / NVMe" % PLE_DIRECT_ENV, warn=True)]
+
+
+def _storage_decisions_base(model, prof, overdrive, probe=None):
+    """DECISION lines about where the per-layer table is read from. Only a model that HAS one (a host-side
+    gather table, GET_ROWS only) is concerned: a model whose weights sit on the cards pays for a slow disk
+    once, at load. -> [line]."""
+    if not model or not (prof or {}).get("ple_tensor"):
+        return []
+    ple = int((prof or {}).get("ple_bytes") or 0) or int(((prof or {}).get("ple_elems") or 0) * 0.5625)
+    gib = ple / BYTES_PER_GIB
+    st = storage_of_model(model, probe)
+    if st is None or gib < STORAGE_PLE_MIN_GIB:
+        return []
+    k, where = st["kind"], st["chain"] or st["fs"] or "?"
+    if k in ("hdd", "mixed"):
+        return [decision_line(
+            "ple-storage",
+            "the %.1f GiB per-layer table is read from %s (%s)" % (gib, where, "rotational" if k == "hdd" else "some members rotational"),
+            "every token gathers ~16 hashed rows from it and each row outside the page cache is a seek (~10 ms on a spinning "
+            "disk, ~0.1 ms on an SSD): an early comparison ran about 5x slower for exactly this. Move the model file "
+            "to an SSD / NVMe and launch from the copy. If you cannot: keep free RAM for the whole table (PXA_PLE_MMAP=2 "
+            "prefetches it) and expect slow first minutes; the O_DIRECT row tier (PXA_PLE_IO, in development) is the fix that "
+            "needs no move. A Q5_0 table (file revision 2) is 35 GB instead of 54 GB at Q8_0, so it fits the cache sooner",
+            "%s=ssd if this disk is not really rotational (virtual disks often report 1)" % STORAGE_KIND_ENV, warn=True)]
+    if k == "unknown" or k == "network":
+        return [decision_line(
+            "ple-storage", "cannot tell which disk the %.1f GiB per-layer table is read from" % gib,
+            "%s. If it is a spinning disk, every row outside the page cache is a seek and an early comparison "
+            "ran about 5x slower for exactly that; put the file on an SSD / NVMe" % (st["why"] or "the kernel does not say"),
+            "%s=ssd|hdd to say which" % STORAGE_KIND_ENV)]
+    if overdrive:
+        return [decision_line("ple-storage", "the %.1f GiB per-layer table is read from %s (%s)"
+                              % (gib, where, {"nvme": "NVMe", "ssd": "SSD", "ram": "memory"}.get(k, k)),
+                              "not rotational: a row outside the page cache costs ~0.1 ms" +
+                              (" [forced by %s]" % STORAGE_KIND_ENV if storage_kind_override() else ""), None)]
+    return []
+
+
+def storage_decisions(model, prof, overdrive, probe=None):
+    """_storage_decisions_base() plus, with PXA_PLE_DIRECT set, the line saying whether the per-layer table still counts as resident RAM
+    (ple_host_ram_bytes). Lever off (the default): exactly the base lines."""
+    out = _storage_decisions_base(model, prof, overdrive, probe)
+    if model and (prof or {}).get("ple_tensor") and ple_direct_mode():
+        full = int(prof.get("ple_bytes") or 0) or int((prof.get("ple_elems") or 0) * 0.5625)
+        if full / BYTES_PER_GIB >= STORAGE_PLE_MIN_GIB:
+            out = out + ple_ram_decision(prof, storage_of_model(model, probe))
+    return out
+
+# ---------------------------------------------------------------------------
+# DECISIONS - one line per thing the plan decided about THIS box: what, why, the
+# measured number behind it, how to override. Printed as "  DECISION <key>: ..." so
+# the same lines reach the plan, `--doctor` and (through PXA Control) the bug report.
+# ---------------------------------------------------------------------------
+def decision_line(key, value, why, override=None, warn=False):
+    return (f"DECISION {'!! ' if warn else ''}{key}: {value} -- {why}"
+            + (f" [override: {override}]" if override else ""))
+
+
+def box_decisions(model, sel_idx, prof, overdrive):
+    """The box-side decisions for this model on cards `sel_idx` -> [line]. On the Overdrive
+    class every decision is named (the CPU pool, the node, the map, the cache volume, the CPU
+    library); for any other model only what is WRONG is (cards across sockets, a missing
+    SYS_NICE where it matters, a hot card), so a plan that had nothing to say still says
+    nothing."""
+    topo = read_box_topology()
+    out = []
+    d = numa_decide(topo, sel_idx) if (topo.get("gpus") or topo.get("nodes")) else None
+    if overdrive:
+        if d is not None:
+            if d["node"] is not None:
+                out.append(decision_line(
+                    "numa", f"card(s) {','.join(map(str, sel_idx))} on node {d['node']}"
+                    + (f" of {len(topo.get('nodes') or {})}" if d["multi_node"] else " (one node)"),
+                    ("the engine pins its threads to that node and prefers its memory at load "
+                     "(PXA_NUMA_BIND, on by default: +7/+9% on 1x P100 + RAM)" if d["multi_node"] else
+                     "single-node host: nothing to bind"),
+                    "PXA_NUMA_BIND=0" if d["multi_node"] else None))
+            out.append(decision_line("cpu-pool", f"PXA_XCACHE_CPUPOOL_CPUS={d['pool']}", d["pool_why"]
+                                     + " (the preset's 0-15 is one machine's socket)",
+                                     "set PXA_XCACHE_CPUPOOL_CPUS yourself"))
+            if d["multi_node"] and d["cpuset"] and topo.get("container"):
+                out.append(decision_line("cpuset", d["cpuset"],
+                                         f"the cards' node; docker: --cpuset-cpus={d['cpuset']}"
+                                         + (f" --cpuset-mems={d['node']}" if d["node"] is not None else ""),
+                                         None))
+        fl = topo.get("flags") or set()
+        if fl and "avx2" not in fl:
+            out.append(decision_line(
+                "cpu-lib", "compat (this CPU has no AVX2)",
+                f"{topo.get('model') or 'this CPU'}: the CPU side runs the compat library, so the "
+                "expert cache's cold experts are read by the GPU in place (zero-copy) rather than "
+                "multiplied on the CPU; keep the resident set as large as the card allows. The "
+                "no-AVX2 path is UNMEASURED for this model", None))
+        mp, how = overdrive_expert_map(model)
+        out.append(decision_line("expert-map", mp or "NOT FOUND", how,
+                                 "PXA_XCACHE_COUNTS=<csv>", warn=not mp))
+        if topo.get("container") and topo.get("cache_mount") in ("/", None) and topo.get("cache_dir"):
+            out.append(decision_line(
+                "cache-volume", f"{topo['cache_dir']} is NOT a mounted volume",
+                "the expert map the engine learns (and writes there when it profiles the model) is "
+                "lost every time the container is recreated, so each restart profiles again. Mount "
+                f"one: -v pxa-cache:{topo['cache_dir']}", None, warn=True))
+    out.extend(storage_decisions(model, prof, overdrive))
+    st, why = counts_env_state(os.environ.get("PXA_XCACHE_COUNTS"))
+    if st == "bad":
+        out.append(decision_line("counts-env", f"PXA_XCACHE_COUNTS={os.environ.get('PXA_XCACHE_COUNTS')!r} IGNORED",
+                                 why + "; a set-but-unusable path used to mean whole-layer expert streaming, "
+                                 "so it is dropped and the engine looks beside the model instead",
+                                 "point it at a readable CSV", warn=True))
+    if d is not None:
+        for w in d["warnings"]:
+            kind, _, text = w.partition(": ")
+            # a model that is not the Overdrive class does its work on the cards: where its CPU
+            # threads run is not worth a line, cards on two sockets still are
+            if overdrive or kind == "spans":
+                out.append(decision_line({"spans": "cards-span-sockets", "cpuset": "cpuset",
+                                          "sysnice": "sys-nice"}.get(kind, kind), "check", text,
+                                         None, warn=True))
+    hot = hot_cards(set(sel_idx))
+    if hot:
+        out.append(decision_line(
+            "heat", ", ".join(f"card {i} {t} C" for i, t in hot),
+            f"at or above {OVERDRIVE_HEAT_WARN_C} C: a throttling card decodes slower and falsifies any "
+            "number taken on it (a hot card was TucsonJohn's 9-30 slowdown); cool it or pick another card",
+            None, warn=True))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# FLASH-NEXT ON 16 GB CARDS: KV type, -b, and -c for MTP
+# ---------------------------------------------------------------------------
+FN_KV_CC = {60, 70}                  # P100 / V100: where the q8_0 Overdrive numbers were taken
+FN_BATCH_MAX_16G = 2048              # never -b 8192 on a 16 GB card for this class
+CARD_16G_MIB = 16896                 # "a 16 GB card": 16 GiB boards report 16280-16384 MiB
+MTP_DRAFT_FLOOR_MIB = 2048           # the engine's spec gate: under 2048 MiB of post-weights headroom
+                                     # the draft context is declined (examples/server/server.cpp)
+
+
+def _is_flashnext(prof):
+    return (prof or {}).get("arch") == "qwen4exp"
+
+
+def flashnext_kv_pick(prof, sel):
+    """q8_0 for the Flash-Next class on P100/V100 when the KV type was left on auto, else None.
+    The engine's registry has a measured KV pick for qwen35 only; for this arch it kept f16,
+    while every Overdrive number (preset, 2x P100 repro, the click path) ran q8_0."""
+    if not _is_flashnext(prof) or not sel:
+        return None
+    if all(int(g[2]) in FN_KV_CC for g in sel):
+        return "q8_0"
+    return None
+
+
+def flashnext_batch_cap(cmd, prof, sel, forced):
+    """Cap -b on the Flash-Next class when the smallest selected card is a 16 GB one. Edits
+    `cmd` in place -> the DECISION line, or None. The engine's 2x P100 cell (a DENSE 27B
+    measurement: 340 t/s prefill at -b 8192 -ub 256) was handed to this file on that pair -
+    CriticalTechGuy's seat ran -b 8192 - while the measured click path ran -b 2048 (36.86
+    prose, needle pass) and the 8192 arm measured no better (35.58)."""
+    if forced or not _is_flashnext(prof) or not sel or "-b" not in cmd:
+        return None
+    if min(int(g[3]) for g in sel) > CARD_16G_MIB:
+        return None
+    i = cmd.index("-b")
+    try:
+        b = int(cmd[i + 1])
+        ub = int(cmd[cmd.index("-ub") + 1]) if "-ub" in cmd else 0
+    except (ValueError, IndexError):
+        return None
+    if b <= FN_BATCH_MAX_16G:
+        return None
+    nb = max(FN_BATCH_MAX_16G, ub)
+    cmd[i + 1] = str(nb)
+    return decision_line(
+        "batch", f"-b {nb} (not {b})",
+        f"a 16 GB card serving the Flash-Next class: -b {b} came from a dense-model cell; the measured "
+        f"Flash-Next seats ran -b 2048 (click path 36.86 prose) and -b 8192 measured no better (35.58), "
+        f"while a larger -b raises -c's floor and the batch buffers on a card the model already fills",
+        "--b N --ub N")
+
+
+def mtp_ctx_fit(model, prof, sel, ctx, kv_type, forced, overdrive):
+    """-> (ctx, line|None). With MTP on and a file that sits fully on the cards, the post-load
+    headroom must keep the engine's 2048 MiB draft floor, or the draft context is declined
+    ('spec DECLINED at 1.9 GB headroom'). Lowers an AUTO -c in halves (never below 4096) and
+    says so; a -c the user set is kept and warned about. A file that does not fit is the
+    expert cache's job: with PXA_XCACHE_MTP it plans the chain's VRAM itself."""
+    try:
+        mb = model_bytes(model, model_kind(model)) or 0
+    except Exception:
+        mb = 0
+    if not mb or not sel:
+        return ctx, None
+    ple = (prof or {}).get("ple_bytes") or 0
+    resident = (mb - ple) / 1048576.0
+    free = sum(max(0, int(g[3]) - int(g[4] if len(g) > 4 and g[4] is not None else 0)) for g in sel)
+    kvt = (prof or {}).get("kv_bytes_tok") or 0
+    scale = {"f16": 1.0, "bf16": 1.0, "f32": 2.0, "q8_0": 34.0 / 64, "q6_0": 26.0 / 64,
+             "q5_0": 22.0 / 64, "q5_1": 24.0 / 64, "q4_0": 18.0 / 64, "q4_1": 20.0 / 64}.get(kv_type, 1.0)
+    per_card = 250.0                     # CUDA context per device (TS_CUDA_CTX_MIB)
+
+    def need(c):
+        return resident + kvt * scale * c / 1048576.0 + MTP_DRAFT_FLOOR_MIB + per_card * len(sel)
+    if resident + per_card * len(sel) > free:
+        if overdrive:
+            return ctx, decision_line(
+                "ctx", f"-c {ctx} kept",
+                f"the file's {resident / 1024:.1f} GiB on-card share does not fit {free / 1024:.1f} GiB, so "
+                f"the expert cache plans the load and keeps the MTP chain's VRAM (checkpoints + companion) "
+                f"out of the experts' share itself (PXA_XCACHE_MTP)", "--ctx N")
+        return ctx, None
+    if not kvt or need(ctx) <= free:
+        return ctx, None
+    if forced:
+        return ctx, decision_line(
+            "ctx", f"-c {ctx} kept (yours)",
+            f"weights {resident / 1024:.1f} GiB + {kv_type} KV at -c {ctx} + MTP's {MTP_DRAFT_FLOOR_MIB} MiB "
+            f"draft floor = {need(ctx) / 1024:.1f} GiB > {free / 1024:.1f} GiB free: the engine may decline "
+            f"the draft context", "a smaller --ctx", warn=True)
+    c = ctx
+    while c > 4096 and need(c) > free:
+        c //= 2
+    c = max(c, 4096)
+    if c == ctx:
+        return ctx, None
+    return c, decision_line(
+        "ctx", f"-c {c} (lowered from {ctx}) so MTP fits",
+        f"weights {resident / 1024:.1f} GiB + {kv_type} KV + MTP's {MTP_DRAFT_FLOOR_MIB} MiB draft floor: "
+        f"{need(ctx) / 1024:.1f} GiB at -c {ctx}, {need(c) / 1024:.1f} GiB at -c {c}, against "
+        f"{free / 1024:.1f} GiB free on these cards", "--ctx N")
+
+
+def overdrive_class(prof):
+    """Is this file the class the Overdrive set was measured on?
+
+    Read out of the GGUF header, never out of the file name: qwen4exp + MoE +
+    DeltaNet (hybrid linear attention) + a PXQ tier + MTP tensors. Anything else
+    returns False and the block is not applied - an env set measured on one
+    architecture is not a default for another."""
+    if os.environ.get("PXA_NO_OVERDRIVE", "").strip() in ("1", "true", "yes"):
+        return False
+    if not prof or prof.get("hdr_err"):
+        return False
+    return bool(prof.get("arch") == "qwen4exp"
+                and prof.get("is_moe")
+                and prof.get("deltanet")
+                and (prof.get("tier") or "") in OVERDRIVE_TIERS
+                and (prof.get("mtp_tensors") or 0) > 0)
+
+
+def overdrive_notes(sel, prof, cv):
+    """The lines that go on the plan: what the block is, why, and what else on this
+    box would change the number. -> notes[]."""
+    note = [f"Model class = the measured Overdrive class: arch {prof.get('arch')}, "
+            f"{prof.get('n_expert')} experts, DeltaNet layers, tier {prof.get('tier')}, "
+            f"{prof.get('mtp_tensors')} MTP tensors. [{OVERDRIVE_SRC}]",
+            f"{OVERDRIVE_MEASURED_HERE}.",
+            f"The engine applies its measured switch set for this class at startup ({OVERDRIVE_SWITCH}; the plan "
+            f"lists the rows it answered with), plus PXA_XCACHE_CPUPOOL_CPUS derived from this box. {OVERDRIVE_LEFT_OFF}.",
+            "Off switch: PXA_NO_OVERDRIVE=1 boots the bare seat with none of this."]
+    if len(sel or []) > 1:
+        note.append(
+            "The preset this set comes from is a SINGLE-CARD preset: 'Overdrive is single-card "
+            "only; splitting this model across cards did not go faster, and tensor split is "
+            "impossible for it'. Measured here 2026-10-12 on the same argv: 2x P100 with this "
+            "set = 35.58 prose / 36.44 code (median of 3, warmed, load ~21) against 23.02 / "
+            "23.85 without it - so the set, not the second card, is what was missing. A second "
+            "card only helps if the model does not fit without the expert cache; check the "
+            "cache line below before adding one.")
+    return note
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +1969,24 @@ TSPLIT_AUTO_TIERS = {"PXQ4"}
 TSPLIT_AUTO_TIERS_PXQN = {"PXQN4", "PXQN4S8", "PXQN5"}
 
 
+# 2026-10-24: the OneCard 27B mix (PXQN4 + PXQN3 + PXQN5 tensors, tier PXQ_UNIVERSAL) on a P100 PAIR, public
+# Qwen3.8-27B-PXQN-OneCard, same build, boots layer/tensor/tensor/layer, REPS 3 greedy512: tensor 40.10/40.26 against layer(+P2L)
+# 30.54/30.56 t/s (+31.3/+31.7%), greedy shas identical. P100 pairs only (no V100 pair number). Mirrors the engine's
+# pxa_tsplit_onecard_pair(); PXA_AUTO_SM_PXQN=0 is the switch back.
+TSPLIT_ONECARD_TYPES = {257, 259, 263}
+
+
+def tsplit_onecard_pair(sel, prof, environ=None):
+    """True for the OneCard mix on exactly two P100s. PURE given `environ`."""
+    env = os.environ if environ is None else environ
+    if str(env.get("PXA_AUTO_SM_PXQN") or "").startswith("0"):
+        return False
+    if prof.get("tier") != "PXQ_UNIVERSAL" or len(sel or []) != 2 or any(g[2] != TSPLIT_AUTO_QUAD_CC for g in sel):
+        return False
+    pxq = {t for t in (prof.get("hist") or {}) if t in PXQ_GGML_TYPE}
+    return pxq == TSPLIT_ONECARD_TYPES
+
+
 def tsplit_auto_tiers(environ=None):
     """The tiers '--sm auto' may put on the tensor split. PURE given `environ`."""
     env = os.environ if environ is None else environ
@@ -923,7 +2082,7 @@ def resolve_auto_split(engine, sel, prof, forced_ts, recipe, fa="on"):
                          f"does not spend a load to find that out")
     tier = prof.get("tier")
     _tiers = tsplit_auto_tiers()
-    if tier not in _tiers:
+    if tier not in _tiers and not tsplit_onecard_pair(sel, prof):
         return "layer", (f"tier {tier or 'none'} - the split is a default only on the tiers it "
                          f"was measured faster on ({'/'.join(sorted(_tiers))})")
     nkv = prof.get("n_head_kv")
@@ -1300,7 +2459,7 @@ def gemma4_assistant_siblings(model_path):
     cands, n = [], 0
     target = os.path.abspath(model_path)
     for name in names:
-        if n >= 256 or not name.endswith(".gguf"):
+        if n >= 256 or not name.lower().endswith(".gguf"):
             continue
         path = os.path.join(directory, name)
         if os.path.abspath(path) == target:
@@ -1399,13 +2558,81 @@ def gpu_table():
             ccs += [int(cc)] * int(n) if cc else [int(n)]
         return [(i, names.get(c, f"card sm_{c // 10}"), c // 10, mem.get(c, 16384), 0,
                  f"GPU-fake-{i}") for i, c in enumerate(ccs)], None
+    # Detection chain (public pxa #4: LXC / containers often have the driver and the device
+    # nodes but no nvidia-smi binary): nvidia-smi -> NVML through libnvidia-ml (the library
+    # nvidia-smi itself reads; same PCI-bus index order) -> /proc/driver/nvidia/gpus (names and
+    # bus ids, sorted by bus id = the same order). GPU_SOURCE says which one answered.
+    global GPU_SOURCE
+    errs = []
+    for name, fn, off in (("nvidia-smi", _gpus_nvidia_smi, "PXA_LAUNCH_NO_NVIDIA_SMI"),
+                          ("NVML (libnvidia-ml)", _gpus_nvml, "PXA_LAUNCH_NO_NVML"),
+                          ("/proc/driver/nvidia/gpus", _gpus_procfs, "PXA_LAUNCH_NO_PROC")):
+        if os.environ.get(off) == "1":
+            continue                      # test hook: skip one source
+        rows, err = fn()
+        if rows:
+            GPU_SOURCE = name
+            return rows, None
+        errs.append(f"{name}: {err}")
+    return None, ("cannot detect GPUs (" + "; ".join(errs) + "). Pass --gpus <indexes> to name "
+                  "the cards yourself, or --engine to force.")
+
+
+GPU_SOURCE = None
+# name -> compute capability (x10) for the /proc fallback, which has names but no capability.
+# First match wins; only used when nvidia-smi and NVML are both unavailable.
+_CC_BY_NAME = [
+    (r"P100", 60), (r"P40|P4\b|P6\b|1080|1070|1060|1050|TITAN Xp|TITAN X \(Pascal\)|Quadro P", 61),
+    (r"V100|TITAN V\b|Quadro GV100", 70), (r"T4\b|RTX 20|GTX 16|TITAN RTX|Quadro RTX|RTX [4-8]000\b", 75),
+    (r"A100|A30\b|A800", 80), (r"RTX 30|A[1-6]0\b|A40\b|A[2-6]000\b|A2\b|A16\b", 86),
+    (r"RTX 40|L4\b|L40|Ada", 89), (r"H100|H200|H800|GH200", 90), (r"B100|B200|GB200", 100),
+    (r"RTX 50|RTX PRO", 120),
+]
+
+
+# memory (MiB) for the /proc fallback when the name carries no "NNGB"; first match wins
+_MEM_BY_NAME = [
+    (r"RTX (?:3090|4090)|TITAN RTX|A5000\b|L4\b", 24576), (r"RTX 5090", 32768),
+    (r"RTX (?:4080|5080|4070 Ti SUPER|5070 Ti|4060 Ti 16)|T4\b|A4000\b|A16\b", 16384),
+    (r"RTX (?:3080 Ti|3060|4070|5070)|TITAN V\b|TITAN Xp|1080 Ti|2080 Ti", 11264),
+    (r"RTX 3080", 10240), (r"RTX (?:2080|2070|3070|3060 Ti|4060)|1080|1070", 8192),
+    (r"A40\b|A6000\b|L40", 46080), (r"A10\b", 23028), (r"A30\b", 24576),
+]
+
+
+def _assumed_mem_mib():
+    """Card memory when nothing reports it: PXA_LAUNCH_GPU_MEM_MIB, else a deliberately small
+    8 GiB (the plan then keeps more on the CPU: slower but it boots; never an OOM)."""
+    try:
+        return max(1024, int(os.environ.get("PXA_LAUNCH_GPU_MEM_MIB", "") or 8192))
+    except ValueError:
+        return 8192
+
+
+def gpus_from_flag(spec):
+    """Rows for --gpus when no detector answered: the user named the cards, so trust the
+    indexes; capability unknown (0 = the conservative paths; PXA_LAUNCH_GPU_CC=70 sets it),
+    memory from _assumed_mem_mib()."""
+    try:
+        cc = int(os.environ.get("PXA_LAUNCH_GPU_CC", "") or 0)
+    except ValueError:
+        cc = 0
+    out = []
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if tok.isdigit() and int(tok) not in [r[0] for r in out]:
+            out.append((int(tok), f"GPU {tok} (not detected)", cc, _assumed_mem_mib(), 0, f"GPU-undetected-{tok}"))
+    return out
+
+
+def _gpus_nvidia_smi():
     if not shutil.which("nvidia-smi"):
-        return None, "nvidia-smi not found - cannot detect GPUs. Use --engine to force."
+        return None, "not found"
     out = _run(["nvidia-smi",
                 "--query-gpu=index,name,compute_cap,memory.total,memory.used,uuid",
                 "--format=csv,noheader,nounits"])
     if out is None:
-        return None, "nvidia-smi failed (driver not loaded?). Use --engine to force."
+        return None, "failed (driver not loaded?)"
     rows = []
     for line in out.splitlines():
         p = [x.strip() for x in line.split(",")]
@@ -1416,9 +2643,92 @@ def gpu_table():
                          int(p[3]), int(p[4]), p[5]))
         except ValueError:
             continue
-    if not rows:
-        return None, "nvidia-smi returned no usable rows"
-    return rows, None
+    return (rows, None) if rows else (None, "returned no usable rows")
+
+
+def _gpus_nvml():
+    """The same table through libnvidia-ml (ctypes, no extra package). NVML numbers the cards
+    in PCI bus order, exactly like nvidia-smi."""
+    import ctypes
+    lib = None
+    for so in ("libnvidia-ml.so.1", "libnvidia-ml.so"):
+        try:
+            lib = ctypes.CDLL(so)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        return None, "libnvidia-ml not found"
+
+    class _Mem(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+    try:
+        init = getattr(lib, "nvmlInit_v2", None) or lib.nvmlInit
+        if init() != 0:
+            return None, "nvmlInit failed (driver not loaded?)"
+        try:
+            n = ctypes.c_uint(0)
+            cnt = getattr(lib, "nvmlDeviceGetCount_v2", None) or lib.nvmlDeviceGetCount
+            if cnt(ctypes.byref(n)) != 0:
+                return None, "nvmlDeviceGetCount failed"
+            byidx = getattr(lib, "nvmlDeviceGetHandleByIndex_v2", None) or lib.nvmlDeviceGetHandleByIndex
+            rows = []
+            for i in range(n.value):
+                h = ctypes.c_void_p()
+                if byidx(ctypes.c_uint(i), ctypes.byref(h)) != 0:
+                    continue
+                nm = ctypes.create_string_buffer(96)
+                lib.nvmlDeviceGetName(h, nm, ctypes.c_uint(96))
+                uu = ctypes.create_string_buffer(96)
+                lib.nvmlDeviceGetUUID(h, uu, ctypes.c_uint(96))
+                ma, mi = ctypes.c_int(0), ctypes.c_int(0)
+                cc = 0
+                if lib.nvmlDeviceGetCudaComputeCapability(h, ctypes.byref(ma), ctypes.byref(mi)) == 0:
+                    cc = ma.value * 10 + mi.value
+                m = _Mem()
+                tot = used = 0
+                if lib.nvmlDeviceGetMemoryInfo(h, ctypes.byref(m)) == 0:
+                    tot, used = m.total // (1 << 20), m.used // (1 << 20)
+                rows.append((i, nm.value.decode(errors="replace"), cc, int(tot), int(used),
+                             uu.value.decode(errors="replace")))
+            return (rows, None) if rows else (None, "no devices")
+        finally:
+            try:
+                lib.nvmlShutdown()
+            except Exception:
+                pass
+    except Exception as e:                    # a broken or partial library must not kill the launcher
+        return None, f"{e.__class__.__name__}: {e}"
+
+
+def _gpus_procfs(root=None):
+    """Names, UUIDs and bus ids from the kernel driver; index = rank by PCI bus id (the order
+    nvidia-smi and NVML use). No capability (from the name table) and no memory figures here:
+    memory comes from an 'NNGB' in the name when there is one, else 0 = unknown."""
+    root = root or os.environ.get("PXA_LAUNCH_PROC_GPUS", "/proc/driver/nvidia/gpus")
+    try:
+        ents = sorted(os.listdir(root))
+    except OSError:
+        return None, "not present"
+    rows = []
+    for d in ents:
+        try:
+            info = open(os.path.join(root, d, "information"), encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        kv = {}
+        for line in info.splitlines():
+            k, _, v = line.partition(":")
+            kv[k.strip().lower()] = v.strip()
+        name = kv.get("model", "NVIDIA GPU")
+        bus = kv.get("bus location", d).lower()
+        cc = next((c for pat, c in _CC_BY_NAME if re.search(pat, name)), 0)
+        mg = re.search(r"(\d+)\s*GB", name)
+        mem = int(mg.group(1)) * 1024 if mg else next((m for pat, m in _MEM_BY_NAME if re.search(pat, name)), 0)
+        rows.append((bus, name, cc, mem or _assumed_mem_mib(), 0, kv.get("gpu uuid", f"GPU-bus-{bus}")))
+    rows.sort(key=lambda r: r[0])
+    rows = [(i,) + r[1:] for i, r in enumerate(rows)]
+    return (rows, None) if rows else (None, "no readable entries")
 
 
 # ---------------------------------------------------------------------------
@@ -1456,6 +2766,43 @@ def resolve_device_order():
                   f"get.")
 
 
+def mark_launcher_env(e):
+    """Bug #324: name, in PXA_ENV_BY_PXA, every PXA_*/PXQ* variable this launcher puts in a child's
+    environment that the USER did not have in theirs (recipe levers, the tensor-split reduce default, the
+    expert-map path ...). The engine's startup 'lab knobs set' warning lists only what the user set; without
+    this list it cannot tell the launcher's own picks from a switch left in a shell profile. A name the user
+    already had in os.environ is never listed, so a switch they set themselves is still reported."""
+    mine = [k for k in e if (k.startswith("PXA_") or k.startswith("PXQ")) and k != "PXA_ENV_BY_PXA"
+            and k not in os.environ]
+    prior = [x for x in os.environ.get("PXA_ENV_BY_PXA", "").split(",") if x]
+    names = prior + [k for k in sorted(mine) if k not in prior]
+    if names:
+        e["PXA_ENV_BY_PXA"] = ",".join(names)
+    return e
+
+
+def merge_env_user_wins(base, env):
+    """Merge the launcher's env into `base` (a copy of the user's os.environ) with the USER's shell winning
+    on every PXA_*/PXQ* name they already set (review item 8): a switch typed in a shell, a systemd unit
+    or a profile is an instruction, and a plain dict.update used to overwrite it with the launcher's pick
+    (PXA_ENHANCE, an Overdrive switch, a recipe lever) without a word. Everything else (LD_LIBRARY_PATH,
+    CUDA_*) is the launcher's. -> [(name, user's value, launcher's value)] for the names that were kept,
+    so the caller can say so out loud."""
+    kept = []
+    for k, v in env.items():
+        v = str(v)
+        if (k.startswith("PXA_") or k.startswith("PXQ")) and k in base:
+            if base[k] != v:
+                kept.append((k, base[k], v))
+            continue
+        base[k] = v
+    return kept
+
+
+def kept_env_lines(kept):
+    return [f"your shell's {k}={u} is kept (the launcher would have set {k}={v})" for k, u, v in kept]
+
+
 def device_env(cv):
     """({env}, note) - THE device scoping handed to every child, built in one place.
 
@@ -1475,7 +2822,24 @@ def device_env(cv):
         note = None            # a UUID selection is immune; do not editorialise
     env["CUDA_VISIBLE_DEVICES"] = str(cv)
     env["NVIDIA_VISIBLE_DEVICES"] = str(cv)
+    env.update(jit_cache_env())
     return env, note
+
+
+# PXA_JIT_FIRST_START_v1: a GPU newer than every SASS arch in the build (H100 sm_90, B200, RTX 50)
+# runs kernels the driver JIT-compiles from PTX on first start (minutes), then caches. The driver's
+# default cache (CUDA_CACHE_MAXSIZE, 256 MiB on current drivers, less on older ones) can be smaller
+# than our compiled kernels, and an overflowing cache evicts entries, so every start would compile
+# again. 4 GiB is the driver's maximum. A value the user exported is kept as set.
+JIT_CACHE_MAXSIZE = "4294967296"
+
+
+def jit_cache_env(environ=None):
+    """{CUDA_CACHE_MAXSIZE: 4 GiB} for a child server, or {} when the user already set it."""
+    environ = os.environ if environ is None else environ
+    if str(environ.get("CUDA_CACHE_MAXSIZE", "")).strip():
+        return {}
+    return {"CUDA_CACHE_MAXSIZE": JIT_CACHE_MAXSIZE}
 
 
 def resident_procs(gpus):
@@ -1502,6 +2866,155 @@ def resident_procs(gpus):
         except ValueError:
             continue
     return res, True
+
+
+# ---------------------------------------------------------------------------
+# R-20 BUSY FLOOR, DESKTOP-AWARE (RC2.3, todo rc23-busy-floor-display)
+# ---------------------------------------------------------------------------
+# Since c68d85fe9d (2026-08-24) a card with a listed compute process, or more than 512 MiB resident
+# and nothing listed, is refused. On a headless card that is right and stays exactly as it was: in a
+# container the PIDs are hidden and the memory in use is the only signal. On a card that drives a
+# display it refused every single-GPU desktop (the Windows desktop alone held 550 MiB on the rig's
+# RTX 3080 Ti). A card counts as a DISPLAY card when its driver model is WDDM (every Windows
+# desktop card, and WSL, which reports the Windows driver model) or nvidia-smi says display_active
+# Enabled. On a display card:
+#   - compute use is refused and named: a compute-only process (type C), any MPS type (M, M+C, ...),
+#     any other type with a C in it except C+G, and a C+G program holding more than 512 MiB on its own
+#     (Blender, Resolve, a game: compute AND graphics, the old rule refused them too);
+#   - graphics processes (type G, and C+G at or under 512 MiB = dwm.exe, explorer.exe, Xorg, a
+#     browser ...) are the desktop's share, capped at DESKTOP_SHARE_MIB (1536 MiB) whether measured
+#     (Linux hosts report per-process memory) or assumed (WDDM never reports it, a container or WSL
+#     sees no processes): share = min(used, graphics memory or everything resident, 1536);
+#   - the floor applies to what is left over:  used - desktop share > 512 -> refused. So a display
+#     card is refused above 2048 MiB in use whatever is (not) listed (review of 4de1cebf8d).
+# The plan then sizes the model from the memory actually free (vram_check / auto_tensor_split /
+# the context sizer all use total - used), so the desktop's share is never planned over.
+BUSY_FLOOR_MIB = 512
+DESKTOP_SHARE_MIB = 1536        # fixed cap, any card size (the measured Windows desktop is 550 MiB)
+GRAPHICS_PTYPES = ("G", "C+G")
+
+
+def _compute_ptype(t, mib):
+    """Is a process of nvidia-smi type t (holding mib MiB, None = not reported) compute use?"""
+    t = (t or "").strip().upper()
+    if "M" in t:                                   # MPS server / client: M, M+C
+        return True
+    if t == "C+G":
+        return mib is not None and mib > BUSY_FLOOR_MIB
+    return "C" in t
+
+
+def _exe_name(p):
+    """Program name from a Linux or Windows path, on either OS."""
+    p = (p or "").strip()
+    return re.split(r"[\\/]", p)[-1] if p else "?"
+
+
+def _parse_smi_processes_xml(xml_text, by_uuid):
+    """nvidia-smi -q -x -> {gpu_index: [(pid, name, mib | None, type), ...]}. mib None = the driver
+    does not say (WDDM always reports N/A per process)."""
+    import xml.etree.ElementTree as ET
+    out = {}
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    for gpu in root.findall("gpu"):
+        idx = by_uuid.get((gpu.findtext("uuid") or "").strip())
+        if idx is None:
+            continue
+        rows = []
+        for pi in gpu.findall("processes/process_info"):
+            mem = (pi.findtext("used_memory") or "").strip()
+            m = re.match(r"(\d+)", mem)
+            rows.append(((pi.findtext("pid") or "?").strip(), _exe_name(pi.findtext("process_name")),
+                         int(m.group(1)) if m else None, (pi.findtext("type") or "").strip()))
+        out[idx] = rows
+    return out
+
+
+def display_info(gpus):
+    """{gpu_index: {"display": bool, "wddm": bool, "active": bool, "procs": [(pid, name, mib|None, type)] | None}}
+    for every card nvidia-smi answers for. "procs" is read (one nvidia-smi -q -x) only when some card
+    drives a display, so a headless box pays one small query. {} = unknown -> every card is treated
+    as headless, which is the old rule."""
+    if os.environ.get("PXA_LAUNCH_FAKE_GPUS", "").strip() or not gpus:
+        return {}
+    by_uuid = {g[5]: g[0] for g in gpus}
+    out = _run(["nvidia-smi", "--query-gpu=uuid,display_active,driver_model.current",
+                "--format=csv,noheader"], timeout=15)
+    if out is None:   # an older driver without the driver_model field
+        out = _run(["nvidia-smi", "--query-gpu=uuid,display_active", "--format=csv,noheader"], timeout=15)
+    if not out:
+        return {}
+    res = {}
+    for line in out.splitlines():
+        p = [x.strip() for x in line.split(",")]
+        idx = by_uuid.get(p[0]) if p else None
+        if idx is None:
+            continue
+        active = len(p) > 1 and p[1].lower() == "enabled"
+        wddm = len(p) > 2 and p[2].upper() == "WDDM"
+        res[idx] = {"display": bool(active or wddm), "wddm": wddm, "active": active, "procs": None}
+    if any(v["display"] for v in res.values()):
+        x = _run(["nvidia-smi", "-q", "-x"], timeout=25)
+        per = _parse_smi_processes_xml(x, by_uuid) if x else None
+        if per is not None:
+            for idx, v in res.items():
+                if v["display"]:
+                    v["procs"] = per.get(idx, [])
+    return res
+
+
+def _prog(n):
+    """A program name for the user: nvidia-smi says '[Not Found]' / '[Insufficient Permissions]' for a
+    program in another container or session."""
+    return "a program it cannot name" if (not n or n == "?" or n.startswith("[")) else n
+
+
+def card_busy(g, procs, disp=None):
+    """R-20 for ONE card -> (busy, detail, desktop_mib). g = a GPU row (index, name, cc, total, used,
+    uuid); procs = resident_procs()[index] (compute apps with a memory number); disp = display_info()
+    [index] or None. detail is the plain-words reason (for the refusal and the card lists), "" when
+    the card is free; desktop_mib is the share counted as the desktop's (0 on a headless card)."""
+    used = int(g[4] or 0)
+    if not disp or not disp.get("display"):
+        # headless: the rule of c68d85fe9d, unchanged
+        if procs:
+            return True, ("programs using it: "
+                          + ", ".join(f"{_prog(n)} (pid {p}, {m} MiB)" for p, n, m in procs)), 0
+        if used > BUSY_FLOOR_MIB:
+            return True, ("no program is listed for it; a program in a container or another session "
+                          "can hold memory without being listed"), 0
+        return False, "", 0
+    seen = disp.get("procs")
+    if seen is None:   # the type of each process is unknown: what has a memory number is compute
+        compute = [(p, n, m) for p, n, m in (procs or [])]
+        graphics = []
+    else:
+        compute = [(p, n, m) for p, n, m, t in seen if _compute_ptype(t, m)]
+        graphics = [(p, n, m) for p, n, m, t in seen if t in GRAPHICS_PTYPES and not _compute_ptype(t, m)]
+    if compute:
+        return True, ("programs computing on it: "
+                      + ", ".join(f"{_prog(n)} (pid {p}{'' if m is None else f', {m} MiB'})"
+                                  for p, n, m in compute)), 0
+    if graphics and all(m is not None for _p, _n, m in graphics):
+        desktop = min(used, sum(m for _p, _n, m in graphics), DESKTOP_SHARE_MIB)
+    else:
+        desktop = min(used, DESKTOP_SHARE_MIB)
+    other = used - desktop
+    if other > BUSY_FLOOR_MIB:
+        return True, (f"about {desktop} MiB of it is counted as your desktop's share (this card drives a "
+                      f"display), the other {other} MiB is held by other programs"), desktop
+    return False, "", desktop
+
+
+def busy_cards(gpus, sel=None):
+    """{gpu_index: (busy, detail, desktop_mib)} for the cards in sel (default all), from one
+    resident_procs() and one display_info() read."""
+    procs, _ok = resident_procs(gpus or [])
+    disp = display_info(gpus or [])
+    return {g[0]: card_busy(g, procs.get(g[0]), disp.get(g[0])) for g in (sel if sel is not None else (gpus or []))}
 
 
 # ---------------------------------------------------------------------------
@@ -1571,7 +3084,7 @@ def shm_bytes(path="/dev/shm"):
     try:
         st = os.statvfs(path)
         return st.f_blocks * st.f_frsize
-    except OSError:
+    except (OSError, AttributeError):     # AttributeError: no os.statvfs on Windows (Control /api/rig gave 500 there)
         return 0
 
 
@@ -1673,8 +3186,8 @@ def gguf_header(path, max_tensors=200000):
     {kv, tensors:[(name,type)], n_tensors, ok, err}. Never raises: a launcher must
     not die on a file it was merely trying to describe. `ok` False means the file
     is not a usable GGUF - which is a REFUSAL (R-23), not a shrug: a 5.3 GB file
-    with a zeroed header exists on this box (/tmp/TRUNCATED-pxq4.gguf, first 4
-    bytes 00 00 00 00) and the old launcher built a full command for it."""
+    with a zeroed header (a truncated download, first 4 bytes 00 00 00 00) once
+    got a full launch command from the old launcher."""
     out = {"kv": {}, "tensors": [], "n_tensors": 0, "ok": False, "err": None}
     try:
         with open(path, "rb") as f:
@@ -1891,7 +3404,7 @@ def model_kind(path):
     if not os.path.exists(path):
         return "missing"
     if os.path.isfile(path):
-        if path.endswith(".gguf"):
+        if path.lower().endswith(".gguf"):
             return "gguf"
         return "not_a_model_file"
     if not os.path.isdir(path):
@@ -1899,7 +3412,7 @@ def model_kind(path):
     cfgp = os.path.join(path, "config.json")
     has_weights = False
     for root, _, files in os.walk(path):
-        if any(f.endswith((".safetensors", ".bin", ".gguf")) for f in files):
+        if any(f.lower().endswith((".safetensors", ".bin", ".gguf")) for f in files):
             has_weights = True
             break
     if os.path.exists(os.path.join(path, "adapter_config.json")):
@@ -1944,7 +3457,8 @@ def gguf_shards(path):
         return [path]
     n = int(m.group(2))
     stem = path[:m.start()]
-    return [f"{stem}-{i:05d}-of-{n:05d}.gguf" for i in range(1, n + 1)]
+    ext = path[m.end() - 5:]          # keep the file's own case: a split 'X-00001-of-00002.GGUF' has '.GGUF' siblings
+    return [f"{stem}-{i:05d}-of-{n:05d}{ext}" for i in range(1, n + 1)]
 
 
 def model_profile(path, kind):
@@ -2045,6 +3559,8 @@ def model_profile(path, kind):
                     # caller then declines to subtract rather than guessing.
                     _BPE = {0: 4.0, 1: 2.0, 30: 2.0,      # f32, f16, bf16
                             8: 34.0 / 32.0,               # q8_0
+                            6: 22.0 / 32.0,               # q5_0 (the Flash-Next 32GB file's table since revision 2: 35.2 GB)
+                            2: 18.0 / 32.0,               # q4_0 (28.8 GB)
                             14: 210.0 / 256.0,            # q6_K
                             12: 144.0 / 256.0,            # q4_K
                             20: 18.0 / 32.0}              # iq4_nl
@@ -2271,7 +3787,7 @@ def model_bytes(path, kind):
         t = 0
         for root, _, files in os.walk(path):
             for f in files:
-                if f.endswith((".safetensors", ".bin", ".gguf")):
+                if f.lower().endswith((".safetensors", ".bin", ".gguf")):
                     try:
                         t += os.path.getsize(os.path.join(root, f))
                     except OSError:
@@ -2293,10 +3809,66 @@ def find_mmproj(model_path, kind):
     d = os.path.dirname(os.path.abspath(model_path))
     try:
         cands = sorted(os.path.join(d, f) for f in os.listdir(d)
-                       if f.startswith("mmproj") and f.endswith(".gguf"))
+                       if f.startswith("mmproj") and f.lower().endswith(".gguf"))
     except OSError:
         return [], "model directory unreadable"
     return cands, f"{len(cands)} mmproj*.gguf sibling(s) in {d}"
+
+
+_MMPROJ_PREC = re.compile(r"[-_.](f16|bf16|f32|q8_0|q4_0|q4_k_m|fp16|fp32)$", re.I)
+
+
+def mmproj_name_stem(path):
+    """The model name inside an mmproj file name: 'mmproj-gemma-4-26B-A4B-it-f16.gguf' -> 'gemma-4-26b-a4b-it'
+    (lower-cased; the 'mmproj' marker and the precision suffix removed)."""
+    b = os.path.basename(path)
+    b = b[:-5] if b.lower().endswith(".gguf") else b
+    b = re.sub(r"^mmproj[-_.]?", "", b, flags=re.I)
+    b = re.sub(r"[-_.]?mmproj$", "", b, flags=re.I)
+    while True:
+        n = _MMPROJ_PREC.sub("", b)
+        if n == b:
+            break
+        b = n
+    return b.lower()
+
+
+def mmproj_matches_model(model_path, cand):
+    """Auto-find (todo gemma-mmproj-support): a projector belongs to the model when the model's file name starts
+    with the model name written in the projector's file name, at a name boundary. The model file carries a
+    quant tag after the name ('gemma-4-26B-A4B-it-PXQN4-embq8.gguf'), the projector a precision tag."""
+    m = os.path.basename(model_path).lower()
+    stem = mmproj_name_stem(cand)
+    if not stem:
+        return False
+    if not m.startswith(stem):
+        return False
+    rest = m[len(stem):]
+    # what follows the name must be a quant / format tag (or the end), not more model name: a projector
+    # for 'gemma-4-26b' must not attach to 'gemma-4-26b-a4b-it-...'.
+    return rest in ("", ".gguf") or re.match(r"[-_.](px|q\d|iq\d|mxfp|ud[-_]|f16|bf16|f32|fp\d|i\d|\d+bit)", rest) is not None
+
+
+def pick_mmproj_auto(model_path, cands):
+    """-> (path or None, reason). Rule for a model file that carries no vision tensors of its own (a text GGUF):
+    exactly one projector whose name matches the model; or exactly one projector in the folder when the model
+    is also the only model file there. Several matches (an F16 and a Q8_0), or one projector beside several
+    models with no name match, are NOT guessed (nothing ranks them): the caller prints the list."""
+    if not cands:
+        return None, "no projector"
+    match = [c for c in cands if mmproj_matches_model(model_path, c)]
+    if len(match) == 1:
+        return match[0], "name matches the model"
+    if len(match) > 1:
+        return None, f"{len(match)} projectors match this model's name and nothing ranks them"
+    d = os.path.dirname(os.path.abspath(model_path))
+    try:
+        ggufs = [f for f in os.listdir(d) if f.lower().endswith(".gguf") and not f.startswith("mmproj")]
+    except OSError:
+        ggufs = []
+    if len(cands) == 1 and len(ggufs) <= 1:
+        return cands[0], "the only projector beside the only model file"
+    return None, "no projector name matches this model"
 
 
 def docker_has_image(tag):
@@ -2411,6 +3983,15 @@ class Refusal(Exception):
         self.rid, self.text, self.code = rid, text, code
 
 
+# public pxa #7: one-line notes for --spec mtp on a file with no draft head. The launch
+# goes on without the flag; these replace the old R-15B/R-15C refusals (kept in R below for the text index).
+NOTES_MTP_OFF = {
+    "R-15B": "MTP off: this file has no draft (MTP) head (no nextn/mtp tensors, none declared), so --spec mtp "
+             "was dropped and it runs without speculation. A file that carries the head is needed for MTP.",
+    "R-15C": "MTP off: this file declares a draft head (nextn_predict_layers {kvn}) but carries no nextn/mtp "
+             "tensors, so --spec mtp was dropped and it runs without speculation. Get the current file for MTP.",
+}
+
 R = {
  "R-01": ("REFUSING: PXQ1 content. A PXQ1 MoE file loads, clears the composition gate at 80.9% "
           "PXQ-family bytes, and generates INCOHERENT text - nothing downstream catches it "
@@ -2467,10 +4048,16 @@ R = {
            "(dense qwen35 is a measured win; the MoE family has not been re-measured since -- "
            "see docs/LEVERS.md's MTP rows for the last numbers on record, which move as the "
            "engine does). Use n_max=1, or --accept-unmeasured to run it anyway."),
- "R-15B": ("REFUSING: --spec mtp but this file has NO nextn/mtp tensors. Its "
-           "nextn_predict_layers KV says {kvn}; the tensor directory says 0. Two shipped f16 "
-           "files carry exactly this lie (PXA-Agent-9B-f16.gguf, PXA-Coder-35B-v2-f16.gguf) - "
-           "the head was dropped in the recovery pipeline and the flag survived."),
+ # public pxa #7: R-15B used to tell everyone their file "carries this lie" and named two old f16
+ # files, even for a file that simply has no head and says so. Two cases now, worded for the user.
+ "R-15B": ("REFUSING: --spec mtp but this file has no draft (MTP) head: no nextn/mtp tensors, and "
+           "its header does not declare one either. It was made without the head, so it cannot "
+           "draft for itself. Run it without --spec mtp, or use a file that carries the head (the "
+           "model card says when a file has MTP; the launcher's 'mtp:' line shows the tensor count)."),
+ "R-15C": ("REFUSING: --spec mtp but this file declares a draft head it does not carry: its "
+           "nextn_predict_layers says {kvn}, the tensor directory has 0 nextn/mtp tensors. The head "
+           "was dropped when the file was made and the flag survived (seen on some older PXA "
+           "releases). Run it without --spec mtp, or download the current version of the file."),
  "R-16": ("REFUSING: {tier} has no CPU codec (GPU-only, open task #62; PXQ-TYPE-MATRIX.md:67, "
           "RELEASE-GATE.md:177). A CPU-only or partially-offloaded run ABORTS. You asked for "
           "-ngl {ngl}: offload every layer or pick another tier."),
@@ -2499,8 +4086,10 @@ R = {
           "fp16 weights."),
  "R-19": ("REFUSING: {dir} contains no .safetensors/.gguf weights (config.json only, {n} bytes "
           "of weight files). A config-only stub is not a model."),
- "R-20": ("REFUSING: card {i} has {mib} MiB resident ({procs}). This is a SHARED, LIVE box. Pass "
-          "--gpus explicitly for free cards, or --allow-busy if you own that process."),
+ "R-20": ("REFUSING: card {i} is already in use: {mib} MiB of its memory is taken ({procs}). A model "
+          "started on top of another program can run both out of memory. Close that program or choose "
+          "another card; to start anyway, tick 'Allow busy cards' in PXA Control, or add --allow-busy "
+          "to the pxa-launch command."),
  "R-21": ("REFUSING: np={n} needs a cudagraph capture ladder above the measured [1,2,4,8]. I can "
           "widen it, but nothing above np=8 has been measured on either engine and a too-short "
           "ladder has cliffed before (task #78: a hardcoded [1,2] cliffed at 3+ concurrent). "
@@ -2509,9 +4098,9 @@ R = {
  "R-22": ("REFUSING: {path} exists but is not a servable artifact ({kind}). {detail} The "
           "taxonomy this replaces had no slot for it and reported 'path does not exist' for a "
           "path that plainly does."),
- "R-23": ("REFUSING: {path} is not a usable GGUF - {detail}. A 5.3 GB file with a zeroed header "
-          "sits on this box today (/tmp/TRUNCATED-pxq4.gguf) and the previous version of this "
-          "file built a full launch command for it."),
+ "R-23": ("REFUSING: {path} is not a usable GGUF - {detail}. A truncated or damaged download "
+          "looks like this (a zeroed header); download the file again and compare its size "
+          "and sha256 with the source."),
  "R-24": ("REFUSING to guess an mmproj. {n} candidates sit next to this model at different "
           "precisions and no measurement ranks them:\n      {list}\n    Pass --mmproj <path>, or "
           "--no-mmproj to serve text-only."),
@@ -2543,6 +4132,11 @@ R = {
           "seat is llama.cpp - which cannot read safetensors. Why llama.cpp: {why} "
           "Serve the GGUF this directory was converted FROM, or change the inputs so vLLM wins "
           "(a vLLM-eligible image + card selection, and np>=6 for a MoE)."),
+ "R-34": ("REFUSING: card{s} {cards} below compute capability 6.0. The engine is built for Pascal "
+          "(sm_60) and newer: Maxwell and older cards (GTX 9xx, Titan X Maxwell, Quadro M-series, "
+          "Tesla M-series) have no kernels in it, so the seat would not start or would fail at the "
+          "first token. Tick only cards that are sm_60 or newer (P100, GTX 10xx, V100, RTX 20xx and "
+          "up), or serve this model on the CPU."),
  "R-30": ("REFUSING: -sm {sm} on arch '{arch}'. The engine has a {sm}-split builder for this "
           "architecture and it has never been run on a real file, so the engine refuses it "
           "after the model load rather than produce output nobody has checked - it says "
@@ -2700,6 +4294,16 @@ def decide(sel, kind, model, forced, prof, np_, workload, elig_caps, image, prob
     names = ", ".join(f"{g[0]}:{g[1].replace('NVIDIA ', '')} sm_{g[2]}" for g in sel)
     tier = prof.get("tier")
     p.elig = [g for g in sel if g[2] in elig_caps]
+
+    # ---- 0. cards the engine has no kernels for (review item 7) -------------------
+    # A pre-Pascal card used to be planned as 'card set not measured ... Expect it to work'. It will not:
+    # the engine's smallest target is sm_60. Refuse before anything else is decided.
+    _old = [g for g in sel if g[2] < 60]
+    if _old:
+        p.refuse("R-34", s="s" if len(_old) > 1 else "", cards=", ".join(
+            f"{g[0]} ({g[1].replace('NVIDIA ', '')}, compute capability {g[2] // 10}.{g[2] % 10}, sm_{g[2]})"
+            for g in _old) + (" is" if len(_old) == 1 else " are"))
+        return p
 
     # ---- 1. artifact resolvable? -------------------------------------------
     if kind == "missing":
@@ -3462,9 +5066,11 @@ ENGINE_DIR_CANDIDATES = [
 ]
 # The same names next to THIS file's checkout (tools/..): `./build` above is relative to the
 # current directory, so a launcher (or PXA Control) started from anywhere but the source root
-# never saw the user's own source build (shibi 2026-09-30: "no llama-server was found" with a
+# never saw the user's own source build (a user report 2026-09-30: "no llama-server was found" with a
 # fine build/bin/llama-server in the tree).
 _SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# the engine binary's file name: bin/llama-server, bin/llama-server.exe on Windows (the Windows one-download)
+ENGINE_EXE = "llama-server.exe" if os.name == "nt" else "llama-server"
 for _n in ("build-unified", "build", "build-cuda"):
     _p = os.path.join(_SRC_ROOT, _n)
     if _p not in ENGINE_DIR_CANDIDATES and os.path.abspath(_n) != _p:
@@ -3475,9 +5081,9 @@ def normalize_engine_dir(d):
     """PXA_ENGINE_DIR may name the build dir (holding bin/llama-server), the bin dir itself, or
     the llama-server binary: all three mean the same build. Returns the build dir."""
     d = os.path.abspath(os.path.expanduser(str(d or "").strip()))
-    if os.path.isfile(d) and os.path.basename(d) == "llama-server":
+    if os.path.isfile(d) and os.path.basename(d) == ENGINE_EXE:
         d = os.path.dirname(d)
-    if os.path.isfile(os.path.join(d, "llama-server")) and not os.path.isfile(os.path.join(d, "bin", "llama-server")):
+    if os.path.isfile(os.path.join(d, ENGINE_EXE)) and not os.path.isfile(os.path.join(d, "bin", ENGINE_EXE)):
         d = os.path.dirname(d)
     return d
 
@@ -3488,11 +5094,11 @@ def find_source_builds(roots=None, limit=12):
     import glob
     out = []
     for r in (roots or [os.getcwd(), _SRC_ROOT]):
-        for exe in glob.glob(os.path.join(r, "build*", "bin", "llama-server")):
+        for exe in glob.glob(os.path.join(r, "build*", "bin", ENGINE_EXE)):
             d = os.path.dirname(os.path.dirname(os.path.abspath(exe)))
             if d not in out:
                 out.append(d)
-    out.sort(key=lambda d: os.path.getmtime(os.path.join(d, "bin", "llama-server")), reverse=True)
+    out.sort(key=lambda d: os.path.getmtime(os.path.join(d, "bin", ENGINE_EXE)), reverse=True)
     return out[:limit]
 
 
@@ -3576,7 +5182,7 @@ def engine_ld_path(E):
 
 
 def engine_runs(E):
-    exe = f"{E}/bin/llama-server"
+    exe = f"{E}/bin/{ENGINE_EXE}"
     if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
         return False, "no executable bin/llama-server"
     env = dict(os.environ)
@@ -3607,7 +5213,7 @@ def resolve_engine_dir():
         return env, ("PXA_ENGINE_DIR" if ok else f"PXA_ENGINE_DIR -- WILL NOT START: {why}")
     seen = set()
     for d in list(ENGINE_DIR_CANDIDATES) + find_source_builds():
-        if not d or os.path.abspath(d) in seen or not os.path.isfile(f"{d}/bin/llama-server"):
+        if not d or os.path.abspath(d) in seen or not os.path.isfile(f"{d}/bin/{ENGINE_EXE}"):
             continue
         seen.add(os.path.abspath(d))
         ok, why = engine_runs(d)
@@ -3645,7 +5251,7 @@ EXPLAIN_MARK = b"PXA_EXPLAIN_JSON"
 
 
 def engine_can_explain(E):
-    exe = f"{E}/bin/llama-server"
+    exe = f"{E}/bin/{ENGINE_EXE}"
     try:
         # a binary without the registry would ignore PXA_EXPLAIN and start LOADING the model, so
         # the capability is read off the file, not tried
@@ -3671,7 +5277,7 @@ def engine_autoconfig(E, model, sel, a, fa_forced=None):
         return None, "no engine binary to ask"
     if not engine_can_explain(E):
         return None, "this engine build predates the registry (no PXA_EXPLAIN); launcher tables used"
-    exe = f"{E}/bin/llama-server"
+    exe = f"{E}/bin/{ENGINE_EXE}"
     args = [exe, "-m", model]
     if getattr(a, "sm", "auto") not in ("auto", "", None):
         args += ["-sm", a.sm]
@@ -3690,7 +5296,10 @@ def engine_autoconfig(E, model, sel, a, fa_forced=None):
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"], _ = engine_ld_path(E)
     env["PXA_EXPLAIN"] = "1"
-    env["PXA_TOPOLOGY"] = ",".join(str(int(g[2]) * 10) for g in sel) if sel else "0x0"
+    # cc:MiB per card (pxa_topology_parse): the registry's fit tests (a file larger than the cards) need the memory;
+    # the SM75 batch cells (PR #13) use it too, to tell a modified 22 GB board from ordinary 11 GB cards
+    env["PXA_TOPOLOGY"] = ",".join(f"{int(g[2]) * 10}:{int(g[3])}" if len(g) > 3 and g[3] else str(int(g[2]) * 10)
+                                   for g in sel) if sel else "0x0"
     env.setdefault("PXA_ENHANCE", "1")
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
@@ -3760,7 +5369,7 @@ def doctor(a, gpus, gpu_err):
         try:
             env = dict(os.environ)
             env["LD_LIBRARY_PATH"], _ = engine_ld_path(E)
-            r = subprocess.run([f"{E}/bin/llama-server", "--version"], capture_output=True, text=True,
+            r = subprocess.run([f"{E}/bin/{ENGINE_EXE}", "--version"], capture_output=True, text=True,
                                timeout=25, env=env)
             ver = next((l.strip() for l in ((r.stdout or "") + (r.stderr or "")).splitlines()
                         if l.strip().startswith("version")), "")
@@ -3782,16 +5391,17 @@ def doctor(a, gpus, gpu_err):
     print(f"driver       {drv}" + (f"  (CUDA {cuda})" if cuda else ""))
     if gpu_err:
         probs.append(gpu_err)
-    procs, _ok = resident_procs(gpus or [])
+    _bz = busy_cards(gpus or [])
     cards = {int(x) for x in re.split(r"[,\s]+", a.gpus) if x.strip()} if a.gpus else set()
     sel = [g for g in (gpus or []) if g[0] in cards] if cards else (gpus or [])
     for g in (gpus or []):
-        busy = procs.get(g[0]) or g[4] > 512
+        busy, why, desk = _bz.get(g[0], (False, "", 0))
         mark = "*" if g in sel else " "
         print(f" {mark}card {g[0]}     {g[1].replace('NVIDIA ', ''):<24} sm_{g[2]}  {g[3] / 1024:.0f} GiB"
-              f"  used {g[4]} MiB{'  BUSY' if busy else ''}")
+              f"  used {g[4]} MiB{'  BUSY' if busy else (f'  (desktop ~{desk} MiB)' if desk else '')}")
         if busy and g in sel:
-            probs.append(f"card {g[0]} is in use ({g[4]} MiB resident) - the launcher refuses it without --allow-busy")
+            probs.append(f"card {g[0]} is in use ({g[4]} MiB taken; {why}) - the launcher refuses it unless "
+                         f"you tick 'Allow busy cards' in PXA Control or pass --allow-busy")
     if sel and len({g[2] for g in sel}) > 1:
         print("             mixed card classes: layer split only; -ts is weighted for you on V100+P100")
     # ---- PCIe links (bug #280) ---------------------------------------------------------------
@@ -3890,6 +5500,54 @@ def doctor(a, gpus, gpu_err):
                 probs.append(f"launcher table says -sm {want}, engine registry says -sm {got}")
         else:
             print(f"defaults     not shown: {note}")
+    # ---- Overdrive (the measured env set for the qwen4exp Flash-Next class) ---------------
+    # Reported as a FACT about this box, three lines: does the class apply, which CPU pool
+    # was derived, and is the expert map where the engine will look. The map line is the one
+    # that matters most - a card that cannot hold the model without the map streams whole
+    # layers, and the only trace of it is one line inside the engine's log.
+    if a.model:
+        _op = model_profile(a.model, model_kind(a.model))
+        _osel = sel if sel is not None else []
+        if overdrive_class(_op):
+            _map, _mhow = overdrive_expert_map(a.model)
+            print(f"Overdrive    APPLIES: arch {_op.get('arch')}, {_op.get('n_expert')} experts, "
+                  f"DeltaNet, tier {_op.get('tier')}, {_op.get('mtp_tensors')} MTP tensors")
+            print(f"             the engine applies its measured switch set at startup ({OVERDRIVE_SWITCH}; "
+                  f"the expert cache with the MTP chain among them - without it the engine declines the "
+                  f"expert cache whenever MTP is loaded). PXA_NO_OVERDRIVE=1 turns them off.")
+            _mb = model_bytes(a.model, model_kind(a.model))
+            if not _map and _mb and _osel and _mb > min(g[3] for g in _osel) * 1024 * 1024:
+                probs.append("no expert map for a model larger than the smallest selected card: "
+                             "without it the engine streams whole layers and runs several times "
+                             "slower. Put <model>.expert-counts.csv beside the model file or in "
+                             "$PXA_CACHE_DIR.")
+        # the same DECISION lines the plan prints (and PXA Control's bug report carries)
+        if _is_flashnext(_op) and _osel:
+            _kp = flashnext_kv_pick(_op, _osel)
+            if _kp:
+                print("decision     kv: -ctk %s -ctv %s on auto (the Flash-Next class on P100/V100 was measured at "
+                      "q8_0; never a silent f16 with MTP) [override: --ctk/--ctv]" % (_kp, _kp))
+            if min(int(g[3]) for g in _osel) <= CARD_16G_MIB:
+                print("decision     batch: -b capped at %d on these 16 GB cards (a -b 8192 cell is a dense-model "
+                      "measurement) [override: --b N --ub N]" % FN_BATCH_MAX_16G)
+            print("decision     ctx: an AUTO -c is halved until weights + KV + MTP's %d MiB draft floor fit the "
+                  "cards; a -c you set is kept and warned about [override: --ctx N]" % MTP_DRAFT_FLOOR_MIB)
+        _sr = storage_row(a.model)
+        if _sr:
+            print("storage      " + _sr)
+        _dsel = [g[0] for g in _osel] or sorted((read_box_topology().get("gpus") or {}).keys())
+        for _ln in box_decisions(a.model, _dsel, _op, overdrive_class(_op)) if _dsel else []:
+            print("decision     " + _ln[len("DECISION "):])
+            if _ln.startswith("DECISION !!"):
+                probs.append(_ln[len("DECISION !! "):])
+        if overdrive_class(_op):
+            pass
+        elif (_op.get("arch") or "") == "qwen4exp":
+            print(f"Overdrive    not applied: arch qwen4exp but "
+                  + ("tier %s / %s MTP tensor(s) / moe=%s / deltanet=%s does not match the "
+                     "measured class (tier in %s, MTP tensors > 0, MoE, DeltaNet)"
+                     % (_op.get("tier"), _op.get("mtp_tensors"), _op.get("is_moe"),
+                        _op.get("deltanet"), "/".join(sorted(OVERDRIVE_TIERS)))))
     print("-" * W)
     if probs:
         for p_ in probs:
@@ -3960,12 +5618,14 @@ def _compute_buf_mib(ctx):
     return lo_v + (hi_v - lo_v) * (ctx - lo_c) / (hi_c - lo_c)
 
 
-def auto_tensor_split(sel, ctx):
+def auto_tensor_split(sel, ctx, mmproj_mib=0):
     """Capacity-proportional -ts over the SELECTED cards, using free VRAM.
 
     Returns (ts_string, notes). The LAST device in the selection is treated as the
     head (llama.cpp places the output head on the last device in PCI order), so it
-    is charged the larger head compute buffer.
+    is charged the larger head compute buffer. `mmproj_mib` (bug #368) is a vision
+    projector the server loads on the FIRST device after the model's placement was
+    judged: it is charged to that card here, because nothing later accounts for it.
     Returns (None, notes) if any card has no room at all - better to refuse loudly
     than to emit a split that cannot work."""
     notes, caps = [], []
@@ -3975,6 +5635,8 @@ def auto_tensor_split(sel, ctx):
         free_mib = total_mib - used_mib
         is_head = (i == len(sel) - 1)
         overhead = (TS_HEAD_COMPUTE_MIB if is_head else comp) + TS_CUDA_CTX_MIB + TS_HEADROOM_MIB
+        if i == 0 and mmproj_mib:
+            overhead += mmproj_mib
         caps.append(max(0.0, free_mib - overhead))
     if min(caps) <= 0:
         bad = [g[0] for g, c in zip(sel, caps) if c <= 0]
@@ -3989,9 +5651,83 @@ def auto_tensor_split(sel, ctx):
     notes.append(f"AUTO -ts {ts} [MEASURED method]: capacity-proportional over FREE VRAM after "
                  f"reserving {TS_HEADROOM_MIB} MiB decode headroom + {comp:.0f} MiB compute "
                  f"({TS_HEAD_COMPUTE_MIB} on the head card) + {TS_CUDA_CTX_MIB} MiB context "
-                 f"per device. Capacities: {detail}. -ts partitions BYTES, not layers, and "
+                 f"per device"
+                 + (f" + {mmproj_mib:.0f} MiB vision projector on the first card" if mmproj_mib else "")
+                 + f". Capacities: {detail}. -ts partitions BYTES, not layers, and "
                  f"llama.cpp repacks when -ub changes - re-derive if you force a different -ub.")
     return ts, notes
+
+
+# bug #368: the vision projector's own compute buffer. MEASURED in the report's load log: the Qwen3-VL
+# projector of PXA-Coder-35B (857.6 MiB F16) asked for a 558.6 MiB warm-up buffer at 1472x1472 on card 0.
+TS_MMPROJ_COMPUTE_MIB = 600
+# The floor of the -b cap below: the engine's default -b. Never cap under it: a non-causal projector
+# (Gemma) needs a whole image in one batch, and every projector is served at this width by default.
+MMPROJ_BATCH_FLOOR = 2048
+
+
+def mmproj_on_gpu(mmproj, cmd, extra=()):
+    """True when the server will put the projector on a GPU (its default; --no-mmproj-offload keeps
+    it on the CPU)."""
+    return bool(mmproj) and "--no-mmproj-offload" not in list(cmd) + list(extra or ())
+
+
+def mmproj_vram_mib(mmproj):
+    """The projector's footprint on the first card: its file plus its compute buffer."""
+    try:
+        sz = os.path.getsize(mmproj) / 1048576.0
+    except OSError:
+        sz = 0.0
+    return sz + TS_MMPROJ_COMPUTE_MIB
+
+
+def even_ts(ts):
+    """'1,1' / '1,1,1,1' / '5,5': every share equal."""
+    try:
+        parts = [float(x) for x in str(ts).split(",") if x.strip() != ""]
+    except ValueError:
+        return False
+    return len(parts) > 1 and len(set(parts)) == 1
+
+
+def cards_unequal(sel, tol=0.05):
+    """The selected cards differ in total VRAM by more than `tol` (a 16 GB + 12 GB P100 pair)."""
+    tot = [int(g[3]) for g in sel or ()]
+    return len(tot) > 1 and min(tot) < (1.0 - tol) * max(tot)
+
+
+def mmproj_batch_cap(cmd, mmproj, forced, extra=()):
+    """bug #368. With a projector on the GPU the engine raises -ub to -b (the multimodal batch rule in
+    common.cpp), so a cell's '-b 8192 -ub 2048' runs a 8192-token ubatch: four times the compute buffer
+    and GEMM temporaries the cell was measured with, which crashed a 16 + 12 GB P100 pair at the first
+    prompt. Emitting -b = -ub keeps the measured ubatch (the projector's image tokens are fed in -b
+    chunks either way), never under the engine's default -b 2048 (MMPROJ_BATCH_FLOOR). Edits `cmd` in
+    place -> the line to print, or None.
+    PXA_LAUNCH_MMPROJ_BATCH=0 keeps the old -b."""
+    if os.environ.get("PXA_LAUNCH_MMPROJ_BATCH", "1") == "0":
+        return None
+    if not mmproj_on_gpu(mmproj, cmd, extra) or "-b" not in cmd or "-ub" not in cmd:
+        return None
+    i = cmd.index("-b")
+    try:
+        b, ub = int(cmd[i + 1]), int(cmd[cmd.index("-ub") + 1])
+    except (ValueError, IndexError):
+        return None
+    nb = max(ub, MMPROJ_BATCH_FLOOR)
+    if b <= nb:
+        return None
+    if forced:
+        return (f"!! -b {b} -ub {ub} with a vision projector on the GPU: the engine runs the ubatch at "
+                f"-b ({b} tokens), not {ub}, so the compute buffer is sized for {b}. Kept because --b/--ub "
+                f"were given; pass --b {nb} to keep the ubatch at {nb}.")
+    cmd[i + 1] = str(nb)
+    return decision_line(
+        "batch", f"-b {nb} (not {b})",
+        f"a vision projector rides on the GPU, and then the engine runs every ubatch at -b; -b {b} would "
+        f"run a {b}-token ubatch (the cell measured -ub {ub}) and size the compute buffer for it. {nb} is the "
+        f"engine's default batch, the width every projector is served with by default (a whole Gemma image "
+        f"stays in one batch)",
+        "--b N --ub N")
 
 
 def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
@@ -4051,14 +5787,47 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
                   f"{ctx} from the np*4096 anchor): {_ec.get('why')}")
             ctx = int(_ec["value"])
 
-    cmd = [f"{E}/bin/llama-server", "-m", a.model, "--host", a.host, "--port", str(a.port),
+    # ---- KV type for the Flash-Next class, and -c sized so MTP's draft floor fits --------
+    _kv_auto = a.ctk == "auto" and a.ctv == "auto"
+    _kv_pick = flashnext_kv_pick(prof, sel) if _kv_auto else None
+    _mtp_on = bool((a.spec or "").startswith("mtp")) or overdrive_class(prof)
+    if _mtp_on and sel:
+        _kvt = (a.ctk if not _kv_auto else
+                (_kv_pick or (engine_pick(getattr(plan, "engine_ac", None), "ctk") or {}).get("value") or "f16"))
+        _forced = bool(a.ctx) or bool(R is not None and R.ctx)
+        _new, _line = mtp_ctx_fit(a.model, prof, sel, ctx, _kvt, _forced, overdrive_class(prof))
+        if _line:
+            print("  " + _line)
+        if _new != ctx:
+            ctx = _new
+    cmd = [f"{E}/bin/{ENGINE_EXE}", "-m", a.model, "--host", a.host, "--port", str(a.port),
            "-ngl", str(a.ngl), "-sm", a.sm, "-c", str(ctx),
            "-np", str(a.np),
            "-fa", plan.fa, "--cont-batching"]
-    if a.ctk == "auto" and a.ctv == "auto":
+    if _kv_pick:
+        cmd += ["-ctk", _kv_pick, "-ctv", _kv_pick]
+        print("  " + decision_line(
+            "kv", f"-ctk {_kv_pick} -ctv {_kv_pick}",
+            "the Flash-Next class on P100/V100: every Overdrive number was measured at q8_0 (1x P100 "
+            "30.70 prose / 37.96 code; 2x P100 35.58 / 36.44; the click path 36.86) and the engine's "
+            "registry has no KV pick for this arch, so leaving it unset meant f16 KV with MTP on - "
+            "TucsonJohn's 9-30 slowdown shape", "--ctk/--ctv (Control: KV cache)"))
+    elif a.ctk == "auto" and a.ctv == "auto":
         print("  -ctk/-ctv: NOT PASSED (auto). The engine's registry picks the measured KV cache type for this "
               "card and model (q4_0 for the Qwen3.8 family on Pascal/Volta, what every published number uses; f16 "
               "elsewhere). --ctk/--ctv force one.")
+        _eac = getattr(plan, "engine_ac", None)
+        _ek = engine_pick(_eac, "ctk") or {}
+        # f16 is certain when the engine answered "no pick" (status OFF), or when no engine was
+        # asked and the arch is not the one family the registry carries a KV pick for (qwen35)
+        _f16 = (_ek.get("status") == "OFF" or not _ek.get("value")) if _eac else prof.get("arch") != "qwen35"
+        if _mtp_on and _f16:
+            print("  " + decision_line(
+                "kv", "f16 (the engine default) with MTP on",
+                "no measured KV pick exists for this model on these cards, so the engine keeps f16; f16 KV "
+                "with MTP was the 9-30 slowdown shape (TucsonJohn). Not changed here because no other type "
+                "was measured on this model - pick one if the seat is slow",
+                "--ctk q8_0 --ctv q8_0 (Control: KV cache)", warn=True))
     else:
         cmd += ["-ctk", "f16" if a.ctk == "auto" else a.ctk, "-ctv", "f16" if a.ctv == "auto" else a.ctv]
     if getattr(a, "emit_threads", True):
@@ -4100,13 +5869,23 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
         # cell exists the engine's VRAM ladder decides at load and nothing is passed, so this
         # command and a bare `llama-server -m file` run the same -b/-ub.
         _eb, _eu = engine_pick(plan.engine_ac, "b"), engine_pick(plan.engine_ac, "ub")
-        if str(_eu.get("value", "")).isdigit():
+        if str(_eu.get("value", "")).startswith("fit ") and _eu.get("status") == "FIT":
+            # a FIT batch cell (SM75 Flash-Next, docs/SM75.md); a fit RULE (Gemma 4) takes the branch below
+            print(f"  -b/-ub: NOT PASSED - the engine verifies {_eu['value']} at load, "
+                  f"including its runtime VRAM reserve [{_eu.get('status')}]: {_eu.get('why')}")
+        elif str(_eu.get("value", "")).isdigit():
             cmd += ["-b", str(_eb.get("value")), "-ub", str(_eu["value"])]
             print(f"  -b {_eb.get('value')} -ub {_eu['value']} [{_eu.get('status')}] from the engine's "
                   f"registry: {_eu.get('why')}")
             if R is not None and (str(R.b), str(R.ub)) != (str(_eb.get("value")), str(_eu["value"])):
                 print(f"  !! DISAGREEMENT: recipe row '{R.key}' ({R.status}) says -b {R.b} -ub {R.ub}; "
                       f"the engine's registry is used, because it is what a bare llama-server runs.")
+        elif str(_eu.get("value", "")).startswith("fit "):
+            # a FIT rule (Gemma 4 on one 16 GB card, 2026-10-16): the cell's -ub is the floor of a walk the
+            # engine runs at load, so a number passed here would pin it and skip the walk
+            print(f"  -b/-ub: NOT PASSED - the engine walks -ub at load ({_eu['value']}: from the ceiling down to "
+                  f"the measured cell, the largest that loads resident and leaves its VRAM reserve) [{_eu.get('status')}]: "
+                  f"{_eu.get('why')}")
         else:
             print(f"  -b/-ub: NOT PASSED - the engine's registry has no measured cell for these cards "
                   f"and this file, so its VRAM ladder picks -ub at load (expect <= {ub_expect}); the "
@@ -4143,6 +5922,14 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
               f"expects {ub_expect} on this selection. Verify against the server's own "
               f"'PXA posture: mode=... fa=... ub=...' line.")
 
+    # ---- never -b 8192 on a 16 GB card for the Flash-Next class --------------------------
+    _bline = flashnext_batch_cap(cmd, prof, sel, bool(a.ub))
+    if _bline:
+        print("  " + _bline)
+    _mline = mmproj_batch_cap(cmd, mmproj, bool(a.ub), R.extra if R is not None else ())
+    if _mline:
+        print("  " + _mline)
+
     # ---- -ot (per-layer embedding to host RAM) ----------------------------
     # Not an optimisation: without it the gather table is offloaded with everything
     # else and the load dies with a cudaMalloc of the whole tensor on one card
@@ -4163,11 +5950,13 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
               "a large fraction of the file from VRAM. Without this the load OOMs.")
 
     # ---- -ts --------------------------------------------------------------
+    _mm_mib = mmproj_vram_mib(mmproj) if mmproj_on_gpu(mmproj, cmd, R.extra if R is not None else ()) else 0
     if a.ts:
         cmd += ["-ts", a.ts]
         print(f"  -ts {a.ts} FORCED by --ts; neither the recipe split nor the automatic "
               f"capacity split was used.")
-    elif R is not None and R.ts:
+    elif R is not None and R.ts and not (a.sm == "layer" and even_ts(R.ts) and cards_unequal(sel)
+                                         and auto_tensor_split(sel, ctx, _mm_mib)[0]):
         cmd += ["-ts", R.ts]
         print(f"  -ts {R.ts} from recipe row '{R.key}'. This is the split the row was MEASURED "
               f"with, so the automatic capacity split is NOT used - on the Flash-Next seat the "
@@ -4185,7 +5974,14 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
               f"split the layer mode uses is deliberately NOT reused here: both devices run "
               f"the same step at the same time, so an uneven ratio only adds wait.")
     elif sel and len(sel) > 1:
-        _ts, _tsnotes = auto_tensor_split(sel, ctx)
+        if R is not None and R.ts:
+            # bug #368: the row's even split was measured on cards of ONE size. Under -sm layer -ts
+            # partitions BYTES, so on a 16 GB + 12 GB pair an even split leaves the small card's room
+            # unused and packs the big one to its last MiB; the capacity split below replaces it.
+            print(f"  -ts {R.ts} from recipe row '{R.key}' NOT used: the row was measured on cards of one "
+                  f"size and these differ ({', '.join(str(int(g[3])) + ' MiB' for g in sel)}); an even "
+                  f"byte split would fill the larger card. The capacity split is used instead.")
+        _ts, _tsnotes = auto_tensor_split(sel, ctx, _mm_mib)
         for _n in _tsnotes:
             print("  " + _n)
         if _ts:
@@ -4250,11 +6046,95 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
               f"{R.source.split(';')[0]}:")
         for k, v in R.env.items():
             print(f"      {k}={v}")
+    # ---- OVERDRIVE: the engine applies the measured switch set for this model class ----
+    # Since 2026-10-19 the recipe is the PXQN library's and the ENGINE applies it at startup
+    # (its registry, PXA_AUTO_OVERDRIVE on by default) whenever it reads the class out of
+    # the header and the file is larger than the cards. Nothing of the recipe is exported
+    # from here: a bare run, this launcher and a --serve-name script are the same seat.
+    # What IS exported: the public switch PXA_OVERDRIVE=1 (the set applies for the class even
+    # on cards the file would fit, as this launcher always applied it; a user's own value
+    # wins, PXA_NO_OVERDRIVE=1 wins over it), and the box: the cold-expert CPU pool of the
+    # cards' own NUMA node (setdefault: a user's own pool wins) and the expert map. The rows
+    # the plan prints are the engine's own answer (PXA_EXPLAIN), so the plan names every row
+    # the seat will get. Not one flag on the command line changes.
+    if overdrive_class(prof):
+        _cv = ",".join(str(g[0]) for g in sel)
+        _pool, _poolwhy = overdrive_pool_cpus(_cv)
+        env.setdefault("PXA_OVERDRIVE", "1")
+        env.setdefault("PXA_XCACHE_CPUPOOL_CPUS", _pool)
+        # The map the plan is about to claim it found must be the map the ENGINE uses.
+        # We export it only after os.path.isfile() has succeeded, so this can never be a
+        # stale path - and a SET-but-unreadable PXA_XCACHE_COUNTS is worse than an unset
+        # one: unset makes the engine profile the model and restart once, while a path
+        # that does not resolve silently degrades to whole-layer expert streaming behind
+        # a single log line (measured 2026-10-12 on the Flash-Next file, arm C).
+        _map_path, _map_how = overdrive_expert_map(a.model)
+        if _map_path and "PXA_XCACHE_COUNTS" not in env and \
+                counts_env_state(os.environ.get("PXA_XCACHE_COUNTS"))[0] not in ("ok", "write"):
+            env["PXA_XCACHE_COUNTS"] = os.path.abspath(_map_path)   # a user's own usable value wins
+        _eac = getattr(plan, "engine_ac", None)
+        _od_pick = engine_pick(_eac, OVERDRIVE_SWITCH) or {}
+        _od_env = ((_eac or {}).get("env") or {}) if _od_pick.get("applied") else {}
+        print(f"  OVERDRIVE: ON for the measured Flash-Next class (arch {prof.get('arch')}, tier "
+              f"{prof.get('tier')}, {prof.get('mtp_tensors')} MTP tensors): the engine applies its "
+              f"measured switch set at startup ({OVERDRIVE_SWITCH}, recipe E). [{OVERDRIVE_SRC}]")
+        if _od_env:
+            print(f"      the engine's plan for this seat ({len(_od_env)} row(s); a value already in "
+                  f"your environment wins):")
+            for k, v in sorted(_od_env.items()):
+                print(f"      {k}={v}")
+        elif _eac is None:
+            print("      (no engine was asked for its plan; the rows are applied at startup all the "
+                  "same - run --explain against the engine to list them)")
+        else:
+            print(f"      the engine's own rule would not pick {OVERDRIVE_SWITCH} for this seat by itself "
+                  f"(the file fits the cards, or a tensor split); PXA_OVERDRIVE={env['PXA_OVERDRIVE']} is "
+                  f"exported, so the set applies at startup for the class all the same (a tensor split "
+                  f"keeps its own env; PXA_NO_OVERDRIVE=1 turns it off).")
+        print(f"  Overdrive is on because this class is what it was measured on: "
+              f"{OVERDRIVE_MEASURED_HERE}. {OVERDRIVE_LEFT_OFF}; PXA_NO_OVERDRIVE=1 turns "
+              f"the block off.")
+        print(f"  PXA_XCACHE_CPUPOOL_CPUS={_pool} - the cold-expert CPU pool, taken from "
+              f"{_poolwhy}. It is NOT the preset's hardcoded 0-15: that is one machine's "
+              f"socket, and on an interleaved CPU numbering a wrong pool puts the expert "
+              f"threads on a socket the cards are not on.")
+        _map, _how = _map_path, _map_how
+        if _map:
+            print(f"  expert map: {_map} ({_how}) - exported as PXA_XCACHE_COUNTS="
+                  f"{os.path.abspath(_map)}. The cache reads which experts this model routes "
+                  f"to; without it the engine profiles the file and restarts once.")
+        else:
+            print(f"  !! expert map: {_how}. On a card that cannot hold the model this is the "
+                  f"difference between the expert cache and whole-layer streaming (the preset's "
+                  f"own note). The download ships <model>.expert-counts.csv beside the shards; "
+                  f"put it there or in $PXA_CACHE_DIR.")
+        # CAP_SYS_NICE, the cards' node, heat and the cache volume are on the report's DECISION
+        # lines (box_decisions), once, and only where they matter.
+    elif prof.get("arch") == "qwen4exp" and os.environ.get("PXA_NO_OVERDRIVE", "").strip() in \
+            ("1", "true", "yes"):
+        print("  OVERDRIVE: OFF (PXA_NO_OVERDRIVE=1). This file IS the measured class, so the "
+              f"seat will boot without the switch set that was measured on it. "
+              f"{OVERDRIVE_MEASURED_HERE}.")
     # ---- the tensor split's own environment -------------------------------
     # Emitted whenever '-sm tensor' is what goes on the command line, however it got there,
     # so that the line printed here, the line in --serve-name's script and the line in the
     # tutorials are the same line and mean the same thing. setdefault, not assignment: a
     # recipe row that names one of these was measured with its own value and keeps it.
+    # The engine's own env for the split it picked (review item 1, 2026-10-16): the registry
+    # returns the levers its pick was MEASURED with (Flash-Next on a P100 pair: the six qwen4exp
+    # tsplit switches, +7-10%) in eac["env"], but only a bare run reaches them - this launcher
+    # types '-sm tensor' on the argv, and the engine then sees an explicit request, emits nothing,
+    # and the auto-fallback demotes the seat to layer silently. So when the FINAL -sm is the
+    # engine's own pick, its env rides with it. setdefault: a recipe row or Overdrive keeps its value.
+    _eac_sm = engine_pick(getattr(plan, "engine_ac", None), "sm")
+    _eac_env = (getattr(plan, "engine_ac", None) or {}).get("env") or {}
+    if _eac_env and _eac_sm and _eac_sm.get("value") == a.sm:
+        _took = [k for k in _eac_env if k not in env]
+        for k, v in _eac_env.items():
+            env.setdefault(k, str(v))
+        if _took:
+            print(f"  engine registry env for -sm {a.sm} ({len(_took)} switch(es) the engine measured "
+                  f"this pick with, exported with the argv): " + ", ".join(f"{k}={env[k]}" for k in _took))
     if a.sm == "tensor":
         for k, v in TSPLIT_AUTO_ENV.items():
             env.setdefault(k, v)
@@ -4672,7 +6552,7 @@ def _scan_cache_save(c):
         pass
 
 
-SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.I)
 
 
 def describe_gguf(path, cache):
@@ -4726,7 +6606,7 @@ def scan_models(roots):
                 dirnames[:] = []
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for fn in sorted(filenames):
-                if not fn.endswith(".gguf"):
+                if not fn.lower().endswith(".gguf"):
                     continue
                 m = SHARD_RE.search(fn)
                 if m and m.group(1) != "00001":
@@ -4790,14 +6670,14 @@ def print_card_menu(gpus, procs):
     print("STEP 1 of 4 - which card(s) do you want to use?")
     print()
     print("   #   gpu  name                            VRAM        in use by another process?")
+    disp = display_info(gpus or [])
     for n, g in enumerate(gpus, 1):
         idx, name, cc, tot, used, _uuid = g
-        busy = procs.get(idx) or []
-        if busy:
-            who = ", ".join(f"pid {p} {nm} ({mb} MiB)" for p, nm, mb in busy)
-            st = f"YES - {who}"
-        elif used > 512:
-            st = f"YES - {used} MiB resident, no compute app listed"
+        bz, why, desk = card_busy(g, procs.get(idx), disp.get(idx))
+        if bz:
+            st = f"YES - {used} MiB taken; {why}"
+        elif desk:
+            st = f"free (desktop ~{desk} MiB)"
         else:
             st = "free"
         print(f"  {n:>2}   {idx:>3}  {name.replace('NVIDIA ', ''):<30}  "
@@ -5030,8 +6910,23 @@ def write_serve_script(name, cmd, env, cv, serve_dir):
              '  for i in $(echo "$CARDS" | tr "," " "); do',
              '    used=$(nvidia-smi -i "$i" --query-gpu=memory.used --format=csv,noheader,nounits '
              '2>/dev/null || echo 0)',
-             '    if [ "${used:-0}" -gt 512 ]; then',
-             '      echo "pxa-serve: card $i already has ${used} MiB resident. Free it, or edit '
+             "    # a card that drives a display may also carry the desktop's share (at most 1536 MiB) on top",
+             "    # of the 512 MiB floor, as in the launcher; a compute program with a memory number refuses it",
+             '    limit=512',
+             '    case "$(nvidia-smi -i "$i" --query-gpu=display_active,driver_model.current --format=csv,noheader '
+             '2>/dev/null || true)" in',
+             '      *Enabled*|*WDDM*)',
+             '        limit=2048',
+             "        # stricter than the launcher on purpose: --query-compute-apps gives no process type, so",
+             "        # a listed C+G program of <= 512 MiB (desktop to the launcher) refuses the restart here too",
+             '        if nvidia-smi -i "$i" --query-compute-apps=pid,used_memory --format=csv,noheader,nounits '
+             '2>/dev/null | grep -Eq "^ *[0-9]+, *[0-9]+ *$"; then',
+             '          echo "pxa-serve: card $i is in use by a compute program. Close it, or edit this script." >&2',
+             '          exit 2',
+             '        fi ;;',
+             '    esac',
+             '    if [ "${used:-0}" -gt "$limit" ]; then',
+             '      echo "pxa-serve: card $i already has ${used} MiB in use by other programs. Close them, or edit '
              'this script." >&2',
              '      exit 2',
              '    fi',
@@ -5047,6 +6942,9 @@ def write_serve_script(name, cmd, env, cv, serve_dir):
         lines.append(f"export {k}={q(str(v))}")
     for k, v in env.items():
         lines.append(f"export {k}={q(str(v))}")
+    _by = mark_launcher_env(dict(env)).get("PXA_ENV_BY_PXA")
+    if _by:    # bug #324: these exports are the launcher's picks, not switches the user typed
+        lines.append(f"export PXA_ENV_BY_PXA={q(_by)}")
     # The API key is NEVER written into the script. A restart script is the file
     # most likely to be pasted into a chat, committed, or copied to another box.
     out = list(cmd)
@@ -5114,7 +7012,7 @@ def builtin_chat_templates(engine_dir=None):
     """-> (names[], provenance). Never guesses silently: the returned provenance
     string says which of the three probes answered."""
     if engine_dir:
-        exe = os.path.join(engine_dir, "bin", "llama-server")
+        exe = os.path.join(engine_dir, "bin", ENGINE_EXE)
         if os.path.isfile(exe):
             env = dict(os.environ)
             env["LD_LIBRARY_PATH"], _ = engine_ld_path(engine_dir)
@@ -5481,6 +7379,7 @@ class _Capture(object):
 class LaunchTUI(object):
     def __init__(self, a, gpus, procs):
         self.a, self.gpus, self.procs = a, gpus, procs
+        self.disp = display_info(gpus or [])   # R-20 desktop share, read once per TUI session
         self.sel_idx = []            # GPU indexes ticked
         self.model = a.model or ""
         self.entries, self.mtrail, self.mnotes = [], [], []
@@ -5557,12 +7456,11 @@ class LaunchTUI(object):
                                "in use by another process?", curses.A_BOLD)
             for i, g in enumerate(self.gpus):
                 idx, name, cc, tot, used, _u = g
-                busy = self.procs.get(idx) or []
-                if busy:
-                    st = "busy: " + ", ".join(f"{n} (pid {p}, {mb} MiB)" for p, n, mb in busy)
-                    at = curses.A_DIM
-                elif used > 512:
-                    st, at = f"busy: {used} MiB resident, no process named", curses.A_DIM
+                bz, why, desk = card_busy(g, self.procs.get(idx), self.disp.get(idx))
+                if bz:
+                    st, at = "busy: " + why, curses.A_DIM
+                elif desk:
+                    st, at = f"free (desktop ~{desk} MiB)", 0
                 else:
                     st, at = "free", 0
                 mark = "x" if idx in self.sel_idx else " "
@@ -6003,8 +7901,9 @@ class LaunchTUI(object):
         import collections as _c
         plan, cmd, env, cv, _prof, _ctx = self.built
         e = dict(os.environ)
-        e.update(env)
+        merge_env_user_wins(e, env)
         e.update(device_env(cv)[0])       # I-13: the order goes with the index
+        mark_launcher_env(e)              # bug #324
         log = _c.deque(maxlen=4000)
         state = {"phase": "starting the server process", "first_token": None}
         try:
@@ -6088,29 +7987,64 @@ class LaunchTUI(object):
                 _sleep(0.2)
         finally:
             w.nodelay(False)
-            self._stop(proc, cmd)
-        self.status = "server stopped"
+            stop_err = self._stop(proc, cmd)
+        if stop_err:
+            print(f"pxa-launch: stop failed: {stop_err}", file=sys.stderr)
+            self.status = f"stop failed: {stop_err}"
+        else:
+            self.status = "server stopped"
         return "review"
 
     @staticmethod
     def _stop(proc, cmd):
-        """SIGTERM, then a hard kill. If the seat is a container (the command IS a
-        docker run), stop it BY NAME - never by image, which would take down every
-        container built from it."""
+        """Stop the seat's process: SIGTERM, then SIGKILL after 10 s. If the seat is a container
+        (the command IS a docker run), stop it BY NAME first - never by image, which would take
+        down every container built from it. A seat with no command (cmd None) is stopped by its
+        pid alone, the same way. Returns None when the process is gone; otherwise one line saying
+        what failed, which the caller shows and prints (nothing is swallowed)."""
         import signal
+        pid = getattr(proc, "pid", proc)
+        errs = []
         try:
-            if os.path.basename(cmd[0]) == "docker" and "--name" in cmd:
+            if cmd is not None and os.path.basename(cmd[0]) == "docker" and "--name" in cmd:
                 name = cmd[cmd.index("--name") + 1]
-                subprocess.run(["docker", "stop", name], capture_output=True, timeout=60)
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
+                r = subprocess.run(["docker", "stop", name], capture_output=True, timeout=60)
+                if r.returncode != 0:
+                    errs.append(f"docker stop {name} exited {r.returncode}")
+        except Exception as ex:
+            errs.append(f"docker stop failed: {ex}")
+
+        def alive():
+            if hasattr(proc, "poll"):          # our Popen: poll() also reaps it
+                return proc.poll() is None
+            return _pid_alive(pid)
+
+        def send(sig):
+            if hasattr(proc, "send_signal"):
+                proc.send_signal(sig)
+            else:
+                os.kill(pid, sig)
+
+        try:
+            if alive():
+                send(signal.SIGTERM)
                 for _ in range(100):
-                    if proc.poll() is not None:
-                        return
+                    if not alive():
+                        break
                     _sleep(0.1)
-                proc.kill()
-        except Exception:
-            pass
+                if alive():
+                    send(getattr(signal, "SIGKILL", signal.SIGTERM))
+                    for _ in range(50):
+                        if not alive():
+                            break
+                        _sleep(0.1)
+                if alive():
+                    errs.append(f"pid {pid} still running after SIGKILL")
+        except ProcessLookupError:
+            pass                                # it exited between the check and the signal
+        except Exception as ex:
+            errs.append(f"could not stop pid {pid}: {ex}")
+        return "; ".join(errs) or None
 
     # ---- driver ----------------------------------------------------------
     def run(self):
@@ -6156,6 +8090,30 @@ def _wrap(text, width):
 def _sleep(t):
     import time
     time.sleep(t)
+
+
+_WINDOWS = os.name == "nt"
+
+
+def _pid_alive(pid):
+    """True while pid exists and is not a zombie (a process this launcher did not start cannot be polled)."""
+    if _WINDOWS:                # os.kill(pid, 0) there sends CTRL_C_EVENT: Control's kernel32 check instead
+        try:
+            from pxa_control import core
+            return bool(core.pid_alive(int(pid)))
+        except Exception:       # noqa: BLE001 - cannot tell
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
 
 
 
@@ -6626,6 +8584,15 @@ def selftest(gpus):
     ok_all &= a17
     print(f"  A17 '-sm tensor' by hand on >2 cards warns with the auto path's own bug #206 text "
           f"(#8382 problem 4): {'PASS' if a17 else 'FAIL'}")
+    # A17b (2026-10-24): the OneCard mix takes the auto tensor split on a P100 pair only; other mixes and V100 pairs stay layer.
+    _oc = dict(qwen, tier="PXQ_UNIVERSAL", hist={257: 49, 259: 100, 263: 1, 8: 60})
+    a17b = (resolve_auto_split("llama", _c(60, P100, 2), _oc, "", None, "on")[0] == "tensor"
+            and resolve_auto_split("llama", _c(70, V100, 2), _oc, "", None, "on")[0] == "layer"
+            and resolve_auto_split("llama", _c(60, P100, 2), dict(_oc, hist={257: 49, 259: 100, 260: 3}), "", None, "on")[0] == "layer"
+            and resolve_auto_split("llama", _c(60, P100, 2), dict(_oc, hist={257: 49, 263: 1}), "", None, "on")[0] == "layer"
+            and not tsplit_onecard_pair(_c(60, P100, 2), _oc, {"PXA_AUTO_SM_PXQN": "0"}))
+    ok_all &= a17b
+    print(f"  A17b the OneCard N4+N3+N5 mix takes the auto tensor split on a P100 pair only: {'PASS' if a17b else 'FAIL'}")
     # A18 (2026-09-27): the container /dev/shm preflight speaks only when it should - a container,
     #     2+ cards, under 1 GiB - and names the container's own fix.
     a18 = (shm_warning(None, 4, 64 << 20) is None
@@ -6697,6 +8664,62 @@ def selftest(gpus):
     ok_all &= a22
     print(f"  A22 GGUF plans on 4 cards / mixed cards / 3 cards need no --accept-unmeasured: "
           f"{'PASS' if a22 else 'FAIL'}")
+
+    # A23: the Overdrive class gate and the CPU-pool compressor. The gate decides whether
+    # 23 switches are exported onto a seat, so each of its five conditions is mutated here
+    # INDEPENDENTLY - a gate that only ever runs on one header is a gate nobody has read.
+    _base = {"arch": "qwen4exp", "is_moe": True, "deltanet": True, "n_expert": 512,
+             "tier": "PXQ_UNIVERSAL", "mtp_tensors": 6}
+    a23 = overdrive_class(_base) is True
+    for k, v in (("arch", "qwen35moe"), ("is_moe", False), ("deltanet", False),
+                 ("tier", "PXQ4"), ("mtp_tensors", 0)):
+        h = dict(_base)
+        h[k] = v
+        if overdrive_class(h) is not False:
+            a23 = False
+    os.environ["PXA_NO_OVERDRIVE"] = "1"
+    if overdrive_class(_base) is not False:
+        a23 = False
+    os.environ.pop("PXA_NO_OVERDRIVE", None)
+    # interleaved CPU numbering must survive as two runs, not be flattened into one range
+    _flat = _cpuset_to_list({0, 1, 2, 36, 37, 53}) == "0-2,36-37,53"
+    _round = _parse_cpulist("0-2,36-37,53") == {0, 1, 2, 36, 37, 53}
+    _pool, _pwhy = overdrive_pool_cpus("999999")   # no such card -> affinity, and it says so
+    _poolok = bool(_pool and _pwhy)
+    a23 &= _flat and _round and _poolok
+    ok_all &= a23
+    print(f"  A23 Overdrive class gate + interleaved CPU pool (5 conditions mutated, "
+          f"PXA_NO_OVERDRIVE honoured, '0-2,36-37,53' stays two runs): "
+          f"{'PASS' if a23 else 'FAIL'}")
+
+    # A24: the expert map the plan CLAIMS it found must be the map the engine is handed.
+    # A set-but-unreadable PXA_XCACHE_COUNTS silently degrades to whole-layer streaming
+    # (measured 2026-10-12, arm C), so the export is gated on an isfile() that succeeded -
+    # and a recipe row's own value still wins.
+    import tempfile as _tf
+    a24 = True
+    with _tf.TemporaryDirectory() as _d:
+        _m = os.path.join(_d, "some-model-PXQN4.gguf")
+        open(_m, "w").close()
+        _p, _howm = overdrive_expert_map(_m)
+        if _p is not None or "not found" not in _howm:
+            a24 = False                      # no CSV -> must report not-found, never a path
+        _csv = _m + ".expert-counts.csv"
+        open(_csv, "w").close()
+        _p, _howm = overdrive_expert_map(_m)
+        if _p != _csv or _howm != "beside the model file":
+            a24 = False                      # a CSV beside the model -> that exact path
+        if not os.path.isfile(_p):
+            a24 = False                      # the guard the export rests on
+        # and the same file is found when the extension differs from the shard name
+        _b = os.path.splitext(_m)[0] + ".expert-counts.csv"
+        if overdrive_expert_map(_m)[0] != _csv:
+            a24 = False
+        del _b
+    ok_all &= a24
+    print(f"  A24 the expert map is exported only when isfile() proves it resolves "
+          f"(no CSV -> not-found, CSV beside the model -> that path): "
+          f"{'PASS' if a24 else 'FAIL'}")
     print(f"  standing assertions: {'ALL PASS' if ok_all else 'FAILURES ABOVE'}")
     return ok_all
 
@@ -6832,8 +8855,32 @@ def plan_and_build(a, gpus):
         print(f"  deltanet: {prof['deltanet']}  [{prof['deltanet_src']}]")
     else:
         print(f"  class:  UNKNOWN  [{prof['why']}]")
-    print(f"  serve:  np={a.np}, workload={workload}, ctx={ctx} (={per_slot}/slot), "
-          f"threads={threads}")
+    # The serve line is printed with the command, after -c is resolved. Printing it
+    # here used the np*4096 anchor while the command later took the engine cell.
+    # ---- OVERDRIVE, on the report itself -----------------------------------
+    # Printed HERE as well as in the command builder, because a REFUSED launch (a busy
+    # card, an UNMEASURED branch, R-17A) exits before the command builder ever runs --
+    # and the seat's env set is exactly the thing an operator wants to see when the
+    # launch they wanted is blocked. The builder prints the per-switch list; this is
+    # the one-line answer plus the two box facts the class needs (CPU pool, expert map).
+    if overdrive_class(prof):
+        _pcv = ",".join(str(g[0]) for g in (sel or []))
+        _pool, _pwhy = overdrive_pool_cpus(_pcv)
+        _map, _mhow = overdrive_expert_map(a.model)
+        print(f"  OVERDRIVE: this file is the measured Flash-Next class - "
+              f"the engine applies its measured switch set at startup ({OVERDRIVE_SWITCH}; the "
+              f"expert cache with the MTP chain among them, without which the engine declines "
+              f"the expert cache whenever MTP is loaded). [{OVERDRIVE_SRC}]")
+        print(f"             {OVERDRIVE_MEASURED_HERE}.")
+        print(f"             CPU pool PXA_XCACHE_CPUPOOL_CPUS={_pool} [{_pwhy}]"
+              f"  |  expert map: {_map or 'NOT FOUND'} [{_mhow}]")
+        print(f"             {OVERDRIVE_LEFT_OFF}. PXA_NO_OVERDRIVE=1 turns the block off.")
+    # ---- what this BOX decided (topology, pool, map, cache volume, heat) ------------------
+    # Printed on the report so a refused launch shows them too. Silent for a model that is not
+    # the Overdrive class unless something is wrong (cards across sockets, a hot card).
+    if plan.engine == "llama" and sel:
+        for _ln in box_decisions(a.model, [g[0] for g in sel], prof, overdrive_class(prof)):
+            print("  " + _ln)
     print(f"  cards:  " + (", ".join(f"{g[0]}:{g[1].replace('NVIDIA ', '')} sm_{g[2]} "
                                      f"{g[3]/1024:.0f}GiB" for g in sel) or "none"))
     print(f"  recipe: {plan.recipe.key if plan.recipe else 'none'}"
@@ -6850,17 +8897,15 @@ def plan_and_build(a, gpus):
         print(f"  ev:     {e}")
 
     # ---- refusals gathered during the decision ------------------------------
-    # H4 / R-20: a shared, live box. Do this AFTER the decision so the operator
-    # still sees what the launcher would have chosen.
+    # H4 / R-20: never hand a card to a second program by accident. Do this AFTER the decision so the
+    # operator still sees what the launcher would have chosen. card_busy(): 512 MiB on a headless
+    # card (unchanged), the desktop's share allowed on a card that drives a display (RC2.3).
     if sel and not a.allow_busy:
-        procs, ok = resident_procs(gpus or [])
+        _bz = busy_cards(gpus or [], sel)
         for g in sel:
-            if procs.get(g[0]):
-                plist = ", ".join(f"pid {p} {n} {m} MiB" for p, n, m in procs[g[0]])
-                plan.refuse("R-20", i=g[0], mib=g[4], procs=plist)
-            elif g[4] > 512:
-                plan.refuse("R-20", i=g[0], mib=g[4],
-                            procs="no compute app listed, but >512 MiB is resident")
+            busy, why, _desk = _bz[g[0]]
+            if busy:
+                plan.refuse("R-20", i=g[0], mib=g[4], procs=why)
 
     if plan.engine is None and not plan.refusals:
         print("=" * 78)
@@ -6952,7 +8997,17 @@ def plan_and_build(a, gpus):
             else:
                 plan.notes.append("--sm tensor was asked for on a model bigger than these cards. The expert "
                                   "cache was only ever measured on the layer split; the engine decides at load.")
-        if not a.spec and (prof.get("mtp_tensors") or 0) > 0:
+        if not a.spec and (prof.get("mtp_tensors") or 0) > 0 and overdrive_class(prof):
+            # review item 9 (dry run 2026-10-18): the Overdrive block exports PXA_XCACHE_MTP=1, the switch
+            # that lets the expert cache run WITH the MTP head loaded (and two of the library switches are MTP
+            # switches too). Forcing --spec-type none here threw the head away and left those switches inert,
+            # and the 1x P100 Overdrive cell (30.70 prose, preset 1xp100) was measured with MTP on. So the
+            # engine keeps its own MTP default; PXA_NO_OVERDRIVE=1 brings the old 'none' back.
+            plan.notes.append("--spec-type is NOT forced to none here: this file is the Overdrive class and the "
+                              "block exports PXA_XCACHE_MTP=1, which lets the expert cache run with the MTP head "
+                              "loaded (the measured Overdrive cells ran with MTP). PXA_NO_OVERDRIVE=1 restores "
+                              "--spec-type none for this route.")
+        elif not a.spec and (prof.get("mtp_tensors") or 0) > 0:
             a.spec = "none"
             plan.notes.append("--spec-type none: this file carries an MTP head, and the expert cache does not "
                               "run with it loaded (the engine would stream whole layers instead). The measured "
@@ -7032,7 +9087,14 @@ def plan_and_build(a, gpus):
                                       "memory. The engine still refuses the flag when a card has none.")
     # spec / MTP gates apply on both engines
     m, params = parse_spec(a.spec)
-    if m == "mtp":
+    if m == "mtp" and prof.get("mtp_tensors") == 0:
+        # public pxa #7: a file with no nextn/mtp tensors never gets an MTP flag.
+        # It used to REFUSE (exit 3, R-15B/R-15C); now the flag is dropped, one note says why, and
+        # the launch goes ahead exactly as if --spec had not been given (spec = None, not "none").
+        kvn = prof.get("mtp_kv")
+        print("  ** " + NOTES_MTP_OFF["R-15C" if kvn not in (None, 0, "0") else "R-15B"].format(kvn=kvn))
+        a.spec = None
+    elif m == "mtp":
         nmax = int(params.get("n_max", 0) or 0)
         if nmax == 0:
             # I-8 (2026-09-09): a bare 'mtp' now passes through to the engine UNCHANGED. It
@@ -7047,9 +9109,7 @@ def plan_and_build(a, gpus):
             # The sparse MoE family has not been re-measured since the dense fixes landed, so
             # it keeps a refusal -- with the escape hatch every other UNMEASURED gate uses.
             plan.refuse("R-15A", code=3, n=nmax)
-        if prof.get("mtp_tensors") == 0:
-            plan.refuse("R-15B", code=3, kvn=prof.get("mtp_kv"))
-        elif prof.get("mtp_tensors", 0) > 0:
+        if prof.get("mtp_tensors", 0) > 0:
             print("  MTP: PXA_MTP_LAZY_WARMUP is armed by PXA_ENHANCE and is MANDATORY whenever "
                   "MTP is active - without it MTP costs -33% prefill (LEVERS.md:152, :402). "
                   "PXA_MOE_FASTTG_MAX_NY is left at its shipped 8; =1 with MTP verify measured "
@@ -7114,6 +9174,9 @@ def plan_and_build(a, gpus):
             else:
                 print("  mmproj: NONE found next to this model although it carries vision "
                       "tensors. Serving TEXT-ONLY. Pass --mmproj to enable vision.")
+        elif cands and pick_mmproj_auto(a.model, cands)[0]:
+            mmproj, why2 = pick_mmproj_auto(a.model, cands)
+            print(f"  mmproj: {mmproj}  [auto-found: {why2}; --no-mmproj turns this off, --mmproj <path> overrides]")
         elif cands:
             # No vision tensors in the model file, but projectors sit beside it (the
             # muse-glimmer case: two F16 projectors in one dir, an F16 and a Q8_0 in
@@ -7240,6 +9303,10 @@ def plan_and_build(a, gpus):
         else:
             print("  CONTAINER CONTRACT: no image was named, so eligibility came from the "
                   "importable vllm_pxq4 in THIS interpreter. `vllm serve` execs here.")
+    # Headline context is the -c the command carries, not the anchor chosen above.
+    per_slot = max(1, int(ctx) // max(1, a.np))
+    print(f"  serve:  np={a.np}, workload={workload}, ctx={ctx} (={per_slot}/slot), "
+          f"threads={threads}")
     print(f"  command: {' '.join(redact_cmd(cmd))}")
     print_post_boot_contract(plan.engine, cv)
     return plan, cmd, env, cv, prof, ctx
@@ -7394,7 +9461,9 @@ def build_parser():
                          "spelled the way llama-server spells it. Omit to pick from a numbered "
                          "list of the models found under the search roots.")
     ap.add_argument("--gpus", "--cards", dest="gpus", default="", metavar="N,N",
-                    help="GPU INDEXES as nvidia-smi reports them, e.g. --gpus 2,4. Omit to pick "
+                    help="GPU INDEXES as nvidia-smi reports them (PCI bus order), e.g. --gpus 2,4. Works without "
+                         "nvidia-smi: NVML or /proc/driver/nvidia is read instead, and when nothing "
+                         "detects, the indexes given here are used as-is. Omit to pick "
                          "from a numbered list. (--cards is the old name and still works.)")
     ap.add_argument("--models-dir", dest="models_dir", action="append", default=[],
                     metavar="DIR",
@@ -7717,6 +9786,16 @@ def main():
         return
 
     gpus, err = gpu_table()
+    if err and a.gpus and gpus_from_flag(a.gpus):
+        # public pxa #4: no nvidia-smi / NVML / procfs in this container, but the user named the
+        # cards. Run with them instead of refusing; say what was assumed.
+        gpus = gpus_from_flag(a.gpus)
+        print(f"pxa-launch: {err}\npxa-launch: using --gpus {a.gpus} as given: capability "
+              f"{'unknown' if not gpus[0][2] else 'sm_' + str(gpus[0][2])}, {gpus[0][3]} MiB per card assumed "
+              "(set PXA_LAUNCH_GPU_MEM_MIB / PXA_LAUNCH_GPU_CC to the real values)", file=sys.stderr)
+        err = None
+    elif not err and GPU_SOURCE and GPU_SOURCE != "nvidia-smi":
+        print(f"pxa-launch: nvidia-smi unavailable; GPUs read from {GPU_SOURCE}", file=sys.stderr)
     if err:
         print(f"pxa-launch: {err}", file=sys.stderr)
         if not a.engine and not a.selftest and not a.doctor:
@@ -7864,8 +9943,13 @@ def main():
     # PXA Control next to this server (a person at a terminal; --no-control / PXA_CONTROL=0 to skip)
     control_alongside(a, cv)
     e = dict(os.environ)
-    e.update(env)
+    for _l in kept_env_lines(merge_env_user_wins(e, env)):
+        print("  " + _l)
     e.update(device_env(cv)[0])           # I-13: the order goes with the index
+    _sc = scrub_counts_env(e)             # a set-but-unusable PXA_XCACHE_COUNTS acts like unset
+    if _sc:
+        print("  " + _sc)
+    mark_launcher_env(e)                  # bug #324: the engine's lab-knob warning lists only the user's own switches
     # FLUSH BEFORE EXEC, OR THE WHOLE POINT OF THIS FILE IS LOST.
     # execve replaces the process image and DISCARDS whatever is still sitting in
     # Python's stdout buffer. On a terminal that is invisible (line-buffered, so it

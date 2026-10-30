@@ -121,7 +121,7 @@ of what we need, minus the config wrapper:
   `torch.empty(0)` Parameters) so the fp16-unpacked staging tensor is freed. Copy this — it is
   what keeps the 4.64 GiB/GPU resident figure honest.
 
-Python↔C++ shim: `vllm/_sm70_ops.py` (2123 lines) wraps every op with a `_op(name)` presence
+Python<->C++ shim: `vllm/_sm70_ops.py` (2123 lines) wraps every op with a `_op(name)` presence
 check (`:23-29`) plus a `register_fake` meta implementation (e.g. `:56-75`) so `torch.compile`
 and `FULL_AND_PIECEWISE` CUDA graph capture can trace it. We must supply fakes too.
 

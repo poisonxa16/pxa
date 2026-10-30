@@ -134,7 +134,7 @@ cmake --build build \
 resulting executables load the real driver normally on a machine that has one — a binary built
 this way was verified to load a PXQ4 model with `offloaded 33/33 layers to GPU`.
 
-> ### ⚠ The other half of the stub trap — at runtime
+> ### Warning: the other half of the stub trap — at runtime
 >
 > If you put `/usr/local/cuda/lib64/stubs` on `LD_LIBRARY_PATH` (or created that
 > `libcuda.so.1` symlink somewhere the loader searches), **take it back off before you run
@@ -275,6 +275,8 @@ weight, and the backbone revision and codec tier the quantizer recorded, with `n
 anything the file does not carry.
 
 ## 4b. PXQN files with a source build
+
+For a native Turing (`sm_75`) source build and its matrix-dispatch tuning controls, see [SM75.md](docs/SM75.md). The architecture coverage of a separately supplied PXQN library must also be checked.
 
 `-DPXA_PXQN_CLOSED_SRC=OFF -DPXA_PXQ_ENCODER=OFF` are required on this public tree: the closed PXQN decoder and the quantizer's private encoder are not in it, and without them the configure step stops with an error.
 

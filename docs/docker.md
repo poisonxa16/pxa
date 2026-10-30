@@ -1,89 +1,23 @@
 # Docker
 
->[!IMPORTANT]
->The recipes on this page are not the supported way to run pxa (see `docker/README.md` for the supported image). All of the following was inherited from `llama.cpp` when this project was forked, and has never been updated. As such, it is outdated and likely inaccurate. I have still left it behind in case it is useful for someone interested in preparing theor own docker images.
+PXA 4.0 ships one engine image, `ghcr.io/poisonxa16/pxa:v4.0`. It carries the same binaries as the Linux
+tarball (and no models: mount a folder at `/models`). It runs as a normal user and answers a health check
+on port 8080. The tag `latest` moves only with the public release; `v4.0` stays fixed.
 
-## Prerequisites
-* Docker must be installed and running on your system.
-* Create a folder to store big models & intermediate files (ex. /llama/models)
-
-## Images
-We have three Docker images available for this project:
-
-1. `ghcr.io/ggerganov/llama.cpp:full`: This image includes both the main executable file and the tools to convert LLaMA models into ggml and convert into 4-bit quantization. (platforms: `linux/amd64`, `linux/arm64`)
-2. `ghcr.io/ggerganov/llama.cpp:light`: This image only includes the main executable file. (platforms: `linux/amd64`, `linux/arm64`)
-3. `ghcr.io/ggerganov/llama.cpp:server`: This image only includes the server executable file. (platforms: `linux/amd64`, `linux/arm64`)
-
-Additionally, there the following images, similar to the above:
-
-- `ghcr.io/ggerganov/llama.cpp:full-cuda`: Same as `full` but compiled with CUDA support. (platforms: `linux/amd64`)
-- `ghcr.io/ggerganov/llama.cpp:light-cuda`: Same as `light` but compiled with CUDA support. (platforms: `linux/amd64`)
-- `ghcr.io/ggerganov/llama.cpp:server-cuda`: Same as `server` but compiled with CUDA support. (platforms: `linux/amd64`)
-- `ghcr.io/ggerganov/llama.cpp:full-rocm`: Same as `full` but compiled with ROCm support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggerganov/llama.cpp:light-rocm`: Same as `light` but compiled with ROCm support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggerganov/llama.cpp:server-rocm`: Same as `server` but compiled with ROCm support. (platforms: `linux/amd64`, `linux/arm64`)
-
-The GPU enabled images are not currently tested by CI beyond being built. They are not built with any variation from the ones in the Dockerfiles defined in [.devops/](../.devops/) and the GitHub Action defined in [.github/workflows/ghcr.yml](../.github/workflows/ghcr.yml). If you need different settings (for example, a different CUDA or ROCm library, you'll need to build the images locally for now).
-
-## Usage
-
-The easiest way to download the models, convert them to ggml and optimize them is with the --all-in-one command which includes the full docker image.
-
-Replace `/path/to/models` below with the actual path where you downloaded the models.
+You need Docker and the NVIDIA Container Toolkit, and an NVIDIA driver 570 or newer on the host. The cards
+are Tesla P100, Tesla V100 and the GTX 10-series (sm_60, sm_61 and sm_70).
 
 ```bash
-docker run -v /path/to/models:/models ghcr.io/ggerganov/llama.cpp:full --all-in-one "/models/" 7B
+docker run -d --name pxa --gpus '"device=0,1"' --shm-size=1g -p 8080:8080 \
+    -v /path/to/models:/models:ro \
+    -v pxa-cache:/work/.cache/pxa -e PXA_CACHE_DIR=/work/.cache/pxa \
+    ghcr.io/poisonxa16/pxa:v4.0
 ```
 
-On completion, you are ready to play!
+- [Install PXA](install.md#container): the same command, with the notes for `--gpus` and `--runtime=nvidia`.
+- [`docker/COMPOSE.md`](../docker/COMPOSE.md): the Compose file, four commands from nothing to an endpoint.
+- [Guide 07](tutorials/07-docker-compose.md): the Compose file explained line by line.
+- PXA Control in the container is opt-in: add `-e PXA_CONTROL=1 -p 7777:7777`.
 
-```bash
-docker run -v /path/to/models:/models ghcr.io/ggerganov/llama.cpp:full --run -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512
-```
-
-or with a light image:
-
-```bash
-docker run -v /path/to/models:/models ghcr.io/ggerganov/llama.cpp:light -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512
-```
-
-or with a server image:
-
-```bash
-docker run -v /path/to/models:/models -p 8000:8000 ghcr.io/ggerganov/llama.cpp:server -m /models/7B/ggml-model-q4_0.gguf --port 8000 --host 0.0.0.0 -n 512
-```
-
-## Docker With CUDA
-
-Assuming one has the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) properly installed on Linux, or is using a GPU enabled cloud, `cuBLAS` should be accessible inside the container.
-
-## Building Docker locally
-
-```bash
-docker build -t local/llama.cpp:full-cuda -f .devops/full-cuda.Dockerfile .
-docker build -t local/llama.cpp:light-cuda -f .devops/llama-cli-cuda.Dockerfile .
-docker build -t local/llama.cpp:server-cuda -f .devops/llama-server-cuda.Dockerfile .
-```
-
-You may want to pass in some different `ARGS`, depending on the CUDA environment supported by your container host, as well as the GPU architecture.
-
-The defaults are:
-
-- `CUDA_VERSION` set to `11.7.1`
-- `CUDA_DOCKER_ARCH` set to `all`
-
-The resulting images, are essentially the same as the non-CUDA images:
-
-1. `local/llama.cpp:full-cuda`: This image includes both the main executable file and the tools to convert LLaMA models into ggml and convert into 4-bit quantization.
-2. `local/llama.cpp:light-cuda`: This image only includes the main executable file.
-3. `local/llama.cpp:server-cuda`: This image only includes the server executable file.
-
-## Usage
-
-After building locally, Usage is similar to the non-CUDA examples, but you'll need to add the `--gpus` flag. You will also want to use the `--n-gpu-layers` flag.
-
-```bash
-docker run --gpus all -v /path/to/models:/models local/llama.cpp:full-cuda --run -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
-docker run --gpus all -v /path/to/models:/models local/llama.cpp:light-cuda -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
-docker run --gpus all -v /path/to/models:/models local/llama.cpp:server-cuda -m /models/7B/ggml-model-q4_0.gguf --port 8000 --host 0.0.0.0 -n 512 --n-gpu-layers 1
-```
+The image is built from the release tarball; this repository's other Dockerfiles are for building the
+engine yourself ([`BUILD-FROM-SOURCE.md`](../BUILD-FROM-SOURCE.md)) and are not the supported way to run PXA.

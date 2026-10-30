@@ -18,6 +18,7 @@
 #                     the boot fail on its own assertion. If your build has such a knob, set
 #                     MTP_DEFAULTS_ENV to its name and it is passed as <NAME>=0.
 set -eu
+_RH=/home/pxq4          # the container's HOME and TMPDIR (a tmpfs; never a host path)
 NAME=$1; PORT=$2; shift 2
 
 VLLM_IMAGE=${VLLM_IMAGE:?set VLLM_IMAGE to an sm_70-capable vLLM container image}
@@ -30,8 +31,8 @@ MTP_DEFAULTS_ENV=${MTP_DEFAULTS_ENV:-}
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" \
   --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$GPUS" \
-  --shm-size 16g --tmpfs /root/home:exec,size=24g \
-  -e HOME=/root/home -e TMPDIR=/root/home \
+  --shm-size 16g --tmpfs ${_RH}:exec,size=24g \
+  -e HOME=${_RH} -e TMPDIR=${_RH} \
   -e PYTHONPATH=/plugin/site -e PYTHONUNBUFFERED=1 \
   -e VLLM_SM70_FLASH_ATTN_V100=1 -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
   ${MTP_DEFAULTS_ENV:+-e ${MTP_DEFAULTS_ENV}=0} \

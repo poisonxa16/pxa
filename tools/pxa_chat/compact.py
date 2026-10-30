@@ -30,16 +30,33 @@ FILE_RE = re.compile(r"\b[\w./+-]+\.(?:py|js|mjs|c|cc|cpp|h|hpp|md|txt|json|css|
 NUM_RE = re.compile(r"\b\d[\d,]{2,}(?:\.\d+)?\b")
 
 
+def _pos_int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
 def n_ctx_of(props):
-    """context length from a llama-server /props body, or None."""
+    """the window ONE request may use, from a llama-server /props body, or None.
+
+    PXA's server publishes the top-level n_ctx as the TOTAL KV ring and the per-request ceiling as n_ctx_slot
+    (PXA_KV_UNIFIED_v1); upstream servers publish the slot's n_ctx under default_generation_settings. With -np 2
+    the top-level number is twice what a request can use, so it is the last resort, divided by the slots unless
+    the ring is unified. n_ctx_train is the model's training length, not the server's window: never used."""
     if not isinstance(props, dict):
         return None
-    for src in (props, props.get("default_generation_settings") or {}):
-        if isinstance(src, dict):
-            for k in ("n_ctx", "n_ctx_train"):
-                v = src.get(k)
-                if isinstance(v, int) and v > 0:
-                    return v
+    v = _pos_int(props.get("n_ctx_slot"))
+    if v:
+        return v
+    dg = props.get("default_generation_settings")
+    if isinstance(dg, dict):
+        v = _pos_int(dg.get("n_ctx"))
+        if v:
+            return v
+    v = _pos_int(props.get("n_ctx"))
+    if v:
+        slots = _pos_int(props.get("total_slots"))
+        if slots and slots > 1 and props.get("kv_unified") is not True:
+            return max(1, v // slots)
+        return v
     return None
 
 
@@ -61,11 +78,19 @@ def message_text(m):
     return text
 
 
+def text_tokens(text):
+    """chars/4 for ASCII; one token per other character (CJK, emoji and most non-Latin scripts cost about one
+    token or more per character, so chars/4 under-counted them 3-4x and compaction started too late)."""
+    text = str(text or "")
+    wide = sum(1 for ch in text if ord(ch) > 0x7F) if not text.isascii() else 0
+    return (len(text) - wide + 3) // 4 + wide
+
+
 def estimate(msgs):
-    """chars/4 plus a few tokens per message. The fallback counter, also the planner."""
+    """chars/4 (one per non-ASCII character) plus a few tokens per message. The fallback counter, also the planner."""
     n = 0
     for m in msgs or []:
-        n += (len(message_text(m)) + 3) // 4 + 4
+        n += text_tokens(message_text(m)) + 4
     return n
 
 
@@ -218,6 +243,14 @@ def is_overflow(err):
                               "prompt is too long", "context overflow")):
         return True
     return "context" in msg and any(k in msg for k in ("exceed", "overflow", "too long", "too large"))
+
+
+def usable(n_ctx, max_tokens=None):
+    """tokens a prompt may take in one request: the window minus the room kept for the reply (as limits() keeps)."""
+    n_ctx = max(1, int(n_ctx or 8192))
+    reserve = int(max_tokens) if max_tokens else min(1024, max(128, n_ctx // 8))
+    reserve = min(reserve, max(1, n_ctx // 2))
+    return max(1, n_ctx - reserve)
 
 
 def limits(n_ctx, max_tokens, threshold, harder=False):

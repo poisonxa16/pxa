@@ -49,7 +49,7 @@ clause rather than to a hash: mean KL divergence against the file's own exact pa
 PXQ4 fused kernel's `0.000951`, and same-top-p not below `98.710%`. Measured mean KLD
 **0.000026 – 0.000032** (30–37× under the bar) and same-top-p **99.64 – 99.75%**.
 
-⚠⚠ **Gate this lever with `-b 8 -ub 8`, never the default batch, and read the statistic the bar
+Warning: **Gate this lever with `-b 8 -ub 8`, never the default batch, and read the statistic the bar
 names.** `llama-perplexity` is pure prefill and the dense 2D decode driver only accepts `ny <= 8`, so
 at `-b 512` both arms take the prefill GEMM and return bit-identical logits — a false PASS on a run
 in which the kernel never executed. In the other direction, a greedy hash is not a pass condition

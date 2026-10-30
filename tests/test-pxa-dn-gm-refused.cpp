@@ -31,28 +31,51 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <unistd.h>
 #include <vector>
+#include "pxa-test-portable.h"   // native Windows: no unistd.h / mkstemp
+#ifdef _WIN32
+#  include <fcntl.h>
+#  include <io.h>
+#  include <sys/stat.h>
+#endif
 
 // The engine reports on stderr; capture it around the compute so the test can read its evidence.
 struct stderr_capture {
     int saved = -1;
     std::string path;
     bool begin() {
-        char tmpl[] = "/tmp/pxa-dn-gm-XXXXXX";
-        const int fd = mkstemp(tmpl);
+#ifdef _WIN32
+        char name[64];
+        snprintf(name, sizeof name, "pxa-dn-gm-%d.txt", pxa_getpid());
+        path = pxa_tmp_path(name);
+        const int fd = _open(path.c_str(), _O_CREAT | _O_TRUNC | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
         if (fd < 0) return false;
-        path = tmpl;
+        fflush(stderr);
+        saved = _dup(2);
+        _dup2(fd, 2);
+        _close(fd);
+#else
+        std::string tmpl_s = pxa_tmp_path("pxa-dn-gm-XXXXXX");
+        std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end()); tmpl.push_back(0);
+        const int fd = mkstemp(tmpl.data());
+        if (fd < 0) return false;
+        path = tmpl.data();
         fflush(stderr);
         saved = dup(2);
         dup2(fd, 2);
         close(fd);
+#endif
         return true;
     }
     std::string end() {
         fflush(stderr);
+#ifdef _WIN32
+        _dup2(saved, 2);
+        _close(saved);
+#else
         dup2(saved, 2);
         close(saved);
+#endif
         std::string out;
         if (FILE * f = fopen(path.c_str(), "rb")) {
             char buf[4096];
@@ -60,7 +83,7 @@ struct stderr_capture {
             while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
             fclose(f);
         }
-        unlink(path.c_str());
+        remove(path.c_str());
         return out;
     }
 };

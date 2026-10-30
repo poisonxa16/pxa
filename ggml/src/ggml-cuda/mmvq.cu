@@ -302,6 +302,12 @@ bool ggml_cuda_mmvq_group(ggml_type type, mmvq_group_args & g, cudaStream_t stre
     }
 }
 
+// PXA_MMVQ_MIXGRP: a PXQN4 group + a stock-type group on the same q8_1 activation in one launch (false = not served)
+bool ggml_cuda_mmvq_group_mix(ggml_type ta, ggml_type tb, mmvq_group_args & ga, mmvq_group_args & gb, cudaStream_t stream) {
+    if (ta == GGML_TYPE_PXQN4) return mul_mat_vec_pxqn4_q8_1_group_mix_cuda(ga, gb, tb, stream);
+    return false;
+}
+
 bool ggml_cuda_mmvq_type_supported(ggml_type src0_type) {
     switch (src0_type) {
         case GGML_TYPE_Q4_0:

@@ -22,7 +22,7 @@ function pfInfo(text) {                      // the (i) with a plain-language to
 }
 function pfCurl(method, path, body) {
   let c = `curl -s${method !== "GET" ? " -X " + method : ""} '${location.origin}${path}'`;
-  if (PF.info && PF.info.lan) c += ` -H "X-PXA-Token: $PXA_CONTROL_TOKEN"`;
+  c += ` -H "X-PXA-Token: $PXA_CONTROL_TOKEN"`;           // every route but /metrics and /api/health needs the session token (H1/H10)
   if (body !== undefined) c += ` -H 'Content-Type: application/json' -d '${JSON.stringify(body).replace(/'/g, "'\\''")}'`;
   return c;
 }
@@ -95,21 +95,25 @@ function pfBuild() {
 function pfRender() {
   const s = PF.state; if (!s) return;
   const adv = pfAdv();
-  const m = $("#pf-mode"); if (m && m.setv) m.setv(PF.mode);
-  $("#pf-quiet").hidden = !adv; $("#pf-export").hidden = !adv; $("#pf-import").hidden = !adv;
-  $("#pf-quiet").textContent = s.quiet && s.quiet.on ? "End benchmark mode" : "Benchmark mode";
-  pfRenderBanner();
-  pfRenderCards();
-  pfRenderProfiles();
-  const two = $("#p-profiles .pf-two"), aud = $("#pf-audit").closest(".card");
-  two.hidden = !adv; aud.hidden = !adv;
-  if (adv) { pfRenderSched(); pfRenderSup(); pfLoadAudit(false); }
+  // this runs again every 3 s while the tab is open, so redraw inside uiKeep: an expander the reader opened
+  // stays open, the scroll stays put and a half-typed field keeps the caret instead of being thrown away.
+  uiKeep($("#p-profiles"), () => {
+    const m = $("#pf-mode"); if (m && m.setv) m.setv(PF.mode);
+    $("#pf-quiet").hidden = !adv; $("#pf-export").hidden = !adv; $("#pf-import").hidden = !adv;
+    $("#pf-quiet").textContent = s.quiet && s.quiet.on ? "End benchmark mode" : "Benchmark mode";
+    pfRenderBanner();
+    pfRenderCards();
+    pfRenderProfiles();
+    const two = $("#p-profiles .pf-two"), aud = $("#pf-audit").closest(".card");
+    two.hidden = !adv; aud.hidden = !adv;
+    if (adv) { pfRenderSched(); pfRenderSup(); pfLoadAudit(false); }
+  });
 }
 
 function pfHowToEnable() {
   const path = (PF.info && PF.info.config) || "~/.config/pxa/control.json";
   const line = '"allow_gpu_control": true';
-  return el("details", {style: "margin-top:6px"}, el("summary", {text: "How to switch it on"}),
+  return el("details", {style: "margin-top:6px", "data-ui": "how-to-enable"}, el("summary", {text: "How to switch it on"}),
     el("ol", {class: "tiny", style: "margin:4px 0 0;padding-left:1.3em;line-height:1.7"},
       el("li", {}, "Open PXA Control's settings file: ", el("span", {class: "mono", text: path})),
       el("li", {}, "Add this line inside the { }: ", el("span", {class: "mono", text: line}), " ",
@@ -320,10 +324,13 @@ function pfRenderEditor() {
     ...Object.entries(s.cards.reduce((a, c) => { (a[pfShort(c.name)] = a[pfShort(c.name)] || []).push(c.uuid); return a; }, {})).map(([n, us]) =>
       el("button", {class: "b", style: "height:30px", onclick: () => { d.targets = us; pfRenderEditor(); }, text: `all ${n} (${us.length})`})),
     el("button", {class: "b", style: "height:30px", onclick: () => { d.targets = s.cards.map(c => c.uuid); pfRenderEditor(); }, text: "every card"})) : null;
-  const uuidBox = adv ? el("details", {style: "margin-top:6px"}, el("summary", {text: "Cards by UUID (also cards not plugged in now)"}), (() => {
+  const uuidBox = adv ? el("details", {style: "margin-top:6px", "data-ui": "ed-uuid"}, el("summary", {text: "Cards by UUID (also cards not plugged in now)"}), (() => {
     const ta = el("textarea", {rows: "3", class: "mono", spellcheck: "false"}); ta.value = d.targets.join("\n");
     ta.addEventListener("change", () => { d.targets = ta.value.split(/[\s,]+/).filter(Boolean); pfRenderEditor(); }); return ta; })()) : null;
-  pfFill(body, 
+  // the editor redraws itself whenever a tile is ticked, a server row is added, and so on: keep the open
+  // sections and the caret so editing a profile does not shut the "Advanced" or "Cards by UUID" expander.
+  const ui = uiSnap(body);
+  pfFill(body,
     el("div", {class: "pf-sec", style: "border-top:0;margin-top:0;padding-top:0"}, el("h4", {}, "Start from"), presets),
     sec("Name", null, name),
     sec("Which cards", "The profile changes only the cards ticked here.", cards, groups, uuidBox),
@@ -409,7 +416,7 @@ function pfAdvancedEditor() {
       el("tr", {}, el("td", {colspan: "9", style: "border-bottom:1px solid var(--line-2)"}, el("div", {class: "pf-row"}, el("span", {class: "tiny", text: "extra engine args"}), el("div", {style: "flex:1;min-width:160px"}, xa), el("span", {class: "tiny", text: "env"}), el("div", {style: "flex:1;min-width:160px"}, ev))))];
   });
   const notes = el("textarea", {rows: "2", maxlength: "500"}); notes.value = d.notes || ""; notes.addEventListener("input", () => d.notes = notes.value);
-  return el("details", {class: "pf-sec", open: true}, el("summary", {text: "Advanced"}),
+  return el("details", {class: "pf-sec", open: true, "data-ui": "ed-advanced"}, el("summary", {text: "Advanced"}),
     el("div", {class: "form", style: "grid-template-columns:repeat(auto-fill,minmax(260px,1fr));margin-top:8px"},
       anyCap("persistence") ? el("div", {}, el("div", {class: "tiny", style: "margin-bottom:4px"}, "Persistence mode ", pfInfo("keeps the driver loaded between runs: faster starts, a few watts at idle")),
         segOf([["leave", "Leave"], ["on", "On"], ["off", "Off"]], pmCur, k => g.persistence = k === "leave" ? null : k === "on")) : null,
@@ -429,6 +436,7 @@ function pfAdvancedEditor() {
     el("div", {class: "pf-sec"}, el("h4", {}, "Notes"), notes,
       el("div", {class: "row", style: "margin-top:8px"}, el("button", {class: "b", onclick: () => copyText(JSON.stringify(PF.draft, null, 1)), text: "Copy as JSON"}),
         el("button", {class: "b", onclick: () => copyText(pfCurl("POST", "/api/gpu/profiles", PF.draft)), text: "Copy as curl"}))));
+  uiRestore(body, ui);
 }
 async function pfSave(previewOnly) {
   const d = PF.draft;
@@ -472,7 +480,7 @@ async function pfPreview(req, p) {
   if (notes.length) box.push(el("div", {class: "pf-clamp"}, ...notes.map(n => el("div", {text: n}))));
   if (locked.length) box.push(el("div", {class: "alert warn"}, badge("warn", "kept free"), el("span", {text: locked.join(" · ") + ". These cards cannot be changed right now."})));
   if (lines.length && !canWrite) box.push(el("div", {class: "alert warn"}, badge("warn", "look only"), el("div", {}, el("div", {text: "Changing cards is switched off on this machine, so this is a preview only."}), pfHowToEnable())));
-  if (adv) box.push(el("details", {class: "pf-sec"}, el("summary", {text: "Exact changes (raw)"}),
+  if (adv) box.push(el("details", {class: "pf-sec", "data-ui": "plan-raw"}, el("summary", {text: "Exact changes (raw)"}),
     !lines.length ? el("div", {class: "tiny", text: "No differences: every field already has the value this profile asks for."}) :
     el("div", {class: "tw"}, el("table", {class: "pf-diff"}, el("thead", {}, el("tr", {}, ...["Card", "UUID", "Field", "Now", "After"].map(h => el("th", {text: h})))),
       el("tbody", {}, ...plan.cards.flatMap(c => c.steps.map(st => el("tr", {}, el("td", {class: "mono", text: c.index == null ? "-" : "#" + c.index}), el("td", {class: "mono", text: c.uuid}),

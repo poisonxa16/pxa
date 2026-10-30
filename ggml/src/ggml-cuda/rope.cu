@@ -1,4 +1,5 @@
 #include "rope.cuh"
+#include "graph.cuh"   // PXA_ROPE_KV_FUSE: the copy-indirection guard
 
 struct rope_corr_dims {
     float v[2];
@@ -1660,4 +1661,137 @@ bool ggml_cuda_op_rope_rope_impl(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 bool ggml_cuda_op_rope_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst1, ggml_tensor * dst2) {
     return ggml_cuda_op_rope_rope_impl<true>(ctx, dst1, dst2);
+}
+
+// PXA_ROPE_KV_FUSE=2 (2026-10-19): one decode token's Q rope, K rope AND the two KV-cache stores
+// (CPY Kcur_roped -> cache_k view, CPY Vcur -> cache_v view, f32 -> f16) in ONE launch. The rope arithmetic is
+// rope_rope_norm's line for line (the K rows still write Kcur_roped), the stores are the copy kernels'
+// (half) conversion of the same f32 values: bit-identical to the rope pair + the paired copy. Norm-mode rope,
+// f32, one token, contiguous f16 cache views of the K shape; anything else returns false (the caller runs the
+// unfused nodes). The CUDA-graph copy indirection is not handled: the caller declines while it is armed.
+template<bool has_ff>
+static __global__ void rope_rope_kv_norm(
+        const float * x1, const float * x2, float * dst1, float * dst2, half * kc, const float * vx, half * vc,
+        const int ne0, const int ne1_1, const int ne1_2, const int s1_1, const int s1_2, const int n_dims,
+        const int32_t * pos, const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors) {
+    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
+    if (i0 >= ne0) {
+        return;
+    }
+    int row_x = blockIdx.z;
+    if (row_x >= ne1_1 + ne1_2) {                     // the V store: row r of the [ne0, ne1_2] value block
+        const int iv = (row_x - ne1_1 - ne1_2)*ne0 + i0;
+        vc[iv + 0] = (half) vx[iv + 0];
+        vc[iv + 1] = (half) vx[iv + 1];
+        return;
+    }
+    const float * x;
+    float * dst;
+    int s1;
+    const bool is_k = row_x >= ne1_1;
+    if (!is_k) { x = x1; dst = dst1; s1 = s1_1; }
+    else       { x = x2; dst = dst2; s1 = s1_2; row_x -= ne1_1; }
+    const int idst = row_x*ne0 + i0;                  // one token: channel_x = 0
+    const int ix   = row_x*s1 + i0;
+    if (i0 >= n_dims) {
+        dst[idst + 0] = x[ix + 0];
+        dst[idst + 1] = x[ix + 1];
+        if (is_k) { kc[idst + 0] = (half) dst[idst + 0]; kc[idst + 1] = (half) dst[idst + 1]; }
+        return;
+    }
+    const float theta_base = pos[0]*powf(theta_scale, i0/2.0f);
+    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+    float cos_theta;
+    float sin_theta;
+    rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+    const float t0 = x[ix + 0];
+    const float t1 = x[ix + 1];
+    const float r0 = t0*cos_theta - t1*sin_theta;
+    const float r1 = t0*sin_theta + t1*cos_theta;
+    dst[idst + 0] = r0;
+    dst[idst + 1] = r1;
+    if (is_k) { kc[idst + 0] = (half) r0; kc[idst + 1] = (half) r1; }
+}
+
+// PXA_ROPE_KV_FUSE: no output of the fused launch may share bytes with an input it reads, other than an exact in-place
+// output on its own input (each thread reads its two elements before it writes them)
+static bool pxa_bytes_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+    const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+bool pxa_rope_fuse_disjoint(const ggml_tensor * dst1, const ggml_tensor * dst2, const ggml_tensor * vs) {
+    const ggml_tensor * x1 = dst1->src[0], * x2 = dst2->src[0];
+    if (pxa_bytes_overlap(dst1, x2) || pxa_bytes_overlap(dst2, x1) || pxa_bytes_overlap(dst1, dst2)) return false;
+    if (pxa_bytes_overlap(dst1, x1) && dst1->data != x1->data) return false;
+    if (pxa_bytes_overlap(dst2, x2) && dst2->data != x2->data) return false;
+    if (vs && (pxa_bytes_overlap(dst1, vs) || pxa_bytes_overlap(dst2, vs))) return false;
+    return true;
+}
+
+bool ggml_cuda_op_rope_rope_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst1, ggml_tensor * dst2,
+                               const ggml_tensor * cpy_k, const ggml_tensor * cpy_v) {
+    // the pair checks of ggml_cuda_op_rope_rope_impl, narrowed to one f32 norm-mode token
+    if (dst1->src[1] != dst2->src[1] || dst1->src[2] != dst2->src[2]) return false;
+    if (dst1->ne[3] > 1 || dst1->ne[0] != dst2->ne[0] || dst1->ne[2] != 1 || dst2->ne[2] != 1) return false;
+    if (memcmp(dst1->op_params, dst2->op_params, 15*sizeof(int))) return false;
+    if (dst1->op_params[15] != 0 || dst2->op_params[15] != 0) return false;
+    if (dst1->type != GGML_TYPE_F32 || dst2->type != GGML_TYPE_F32 ||
+        dst1->src[0]->type != GGML_TYPE_F32 || dst2->src[0]->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(dst1) || !ggml_is_contiguous(dst2)) return false;
+    const int mode = ((const int32_t *) dst1->op_params)[2];
+    if (mode != 0) return false;                      // norm rope only (not neox / mrope / vision)
+    // the stores: K = this pair's second rope, both f16 contiguous views of the K shape
+    if (cpy_k->src[0] != dst2 || cpy_v->src[0] == nullptr) return false;
+    const ggml_tensor * kd = cpy_k->src[1], * vs = cpy_v->src[0], * vd = cpy_v->src[1];
+    if (kd->type != GGML_TYPE_F16 || vd->type != GGML_TYPE_F16 || vs->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(kd) || !ggml_is_contiguous(vd) || !ggml_is_contiguous(vs)) return false;
+    const int64_t nk = ggml_nelements(dst2);
+    if (ggml_nelements(kd) != nk || ggml_nelements(vs) != nk || ggml_nelements(vd) != nk) return false;
+#if defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS) || defined(GGML_MUSA_GRAPHS)
+    if (ctx.cur_graph && ctx.cur_graph->use_cpy_indirection) return false;   // the copy kernels' graph indirection is not replicated
+#endif
+
+    const int64_t ne00   = dst1->src[0]->ne[0];
+    const int64_t ne01_1 = dst1->src[0]->ne[1];
+    const int64_t ne01_2 = dst2->src[0]->ne[1];
+    if (ne00 % 2 != 0 || dst1->src[0]->ne[2] != 1 || dst2->src[0]->ne[2] != 1) return false;
+    // one launch reads Q, K, V and writes Q', K' and the two cache views: the allocator may have put an output of a LATER node
+    // of the unfused order on top of an input of an earlier one (K' on the memory of Q, freed after the Q rope): decline then
+    if (!pxa_rope_fuse_disjoint(dst1, dst2, vs)) return false;
+    const size_t s01_1 = dst1->src[0]->nb[1] / sizeof(float);
+    const size_t s01_2 = dst2->src[0]->nb[1] / sizeof(float);
+    if (dst1->src[0]->nb[0] != sizeof(float) || dst2->src[0]->nb[0] != sizeof(float)) return false;
+
+    const int n_dims     = ((const int32_t *) dst1->op_params)[1];
+    const int n_ctx_orig = ((const int32_t *) dst1->op_params)[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   (const int32_t *) dst1->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) dst1->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) dst1->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) dst1->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) dst1->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) dst1->op_params + 10, sizeof(float));
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+    const float theta_scale = powf(freq_base, -2.0f/n_dims);
+    const int32_t * pos = (const int32_t *) dst1->src[1]->data;
+    const float * freq_factors = dst1->src[2] ? (const float *) dst1->src[2]->data : nullptr;
+
+    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
+    const int n_blocks_x = (ne00 + 2*CUDA_ROPE_BLOCK_SIZE - 1) / (2*CUDA_ROPE_BLOCK_SIZE);
+    const dim3 block_nums(1, n_blocks_x, ne01_1 + 2*ne01_2);
+    if (freq_factors) {
+        rope_rope_kv_norm<true><<<block_nums, block_dims, 0, ctx.stream()>>>(
+            (const float *) dst1->src[0]->data, (const float *) dst2->src[0]->data, (float *) dst1->data, (float *) dst2->data,
+            (half *) kd->data, (const float *) vs->data, (half *) vd->data, ne00, ne01_1, ne01_2, s01_1, s01_2, n_dims, pos,
+            freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors);
+    } else {
+        rope_rope_kv_norm<false><<<block_nums, block_dims, 0, ctx.stream()>>>(
+            (const float *) dst1->src[0]->data, (const float *) dst2->src[0]->data, (float *) dst1->data, (float *) dst2->data,
+            (half *) kd->data, (const float *) vs->data, (half *) vd->data, ne00, ne01_1, ne01_2, s01_1, s01_2, n_dims, pos,
+            freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors);
+    }
+    return true;
 }

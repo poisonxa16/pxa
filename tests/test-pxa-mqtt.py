@@ -10,8 +10,10 @@ breaks every reply), the discovery payload (unique_id, device block, unit, devic
 state_class, the availability wiring), the topic shapes and retain flags, and the availability
 behaviour on both shutdown paths.
 
-No broker and no network: a fake socket for the wire, a fake snapshot for the entities. The live
-end-to-end run against a real mosquitto is a separate harness (the release notes' evidence).
+No broker and no network: a fake socket for the wire, a fake snapshot for the entities. The other
+half -- the same payloads published by a real Control, decoded off the wire against a broker socket
+on loopback -- is tests/mqtt-e2e-live.py; that is the one that catches a wrong UNIT, which a
+snapshot-shaped test cannot see.
 
     python3 tests/test-pxa-mqtt.py          (wired into CTest as test-pxa-mqtt)
 """
@@ -41,7 +43,11 @@ def snapshot(cards=True, host=True, expert=True, servers=True, card_power=True):
                          "model": "qwen3-0.6b-q8", "phase": "idle", "kind": "docker",
                          "n_ctx": 4096, "model_file": "/models/qwen3-0.6b-q8.gguf"}]
     if host:
-        s["host"] = {"ram": 31.5, "cpu": 8.2, "swap": 0.0}
+        # The numbers Home Assistant showed on 2026-10-11, in the units the sampler really keeps: a
+        # host row is MiB used and a CPU percent, and ram_total_mib/swap_total_mib are what turn the
+        # first two into shares.
+        s["host"] = {"ram": 8386.1640625, "ram_total_mib": 32768, "cpu": 2.7023645689978726,
+                     "swap": 1026.76171875, "swap_total_mib": 4096}
     if expert:
         s["expert"] = {"sessions": 12, "learning": False}
     return s
@@ -236,11 +242,24 @@ class EntityTests(unittest.TestCase):
         self.assertEqual(u(("gpu_0", "temperature"))["state_class"], "measurement")
         self.assertEqual(u(("gpu_1", "power"))["device_class"], "power")
         self.assertEqual(u(("gpu_1", "memory_used"))["unit_of_measurement"], "MiB")
+        self.assertEqual(u(("gpu_1", "memory_used"))["device_class"], "data_size",
+                         "a VRAM count in MiB is a data size, and HA has to know which unit it is")
         self.assertEqual(u(("gpu_1", "utilization"))["unit_of_measurement"], "%")
         self.assertEqual(u(("host", "ram_used"))["unit_of_measurement"], "%")
+        self.assertEqual(u(("host", "ram_used_mib"))["unit_of_measurement"], "MiB")
+        self.assertEqual(u(("host", "ram_used_mib"))["device_class"], "data_size")
         self.assertEqual(u(("server_d_8080", "tokens_per_second"))["unit_of_measurement"], "tok/s")
         self.assertEqual(u(("server_d_8080", "kv_cache_used"))["unit_of_measurement"], "%")
         self.assertEqual(u(("server_d_8080", "tokens_per_second"))["state_class"], "measurement")
+
+    def test_a_percent_entity_carries_no_device_class(self):
+        """Home Assistant has no device class for a percentage; naming one (or naming a unit that
+        class does not allow) is how a discovery payload gets rejected and the entity never appears."""
+        for key in (("host", "ram_used"), ("host", "cpu_used"), ("host", "swap_used"),
+                    ("gpu_1", "utilization"), ("server_d_8080", "kv_cache_used")):
+            cfg = self.by[key][1]
+            self.assertEqual(cfg["unit_of_measurement"], "%", key)
+            self.assertNotIn("device_class", cfg, key)
 
     def test_a_fixed_capacity_is_not_a_measurement(self):
         """VRAM total never moves; a state_class there would have Home Assistant build long-term
@@ -257,7 +276,61 @@ class EntityTests(unittest.TestCase):
     def test_the_percentages_are_percentages(self):
         self.assertEqual(self.by[("server_d_8080", "kv_cache_used")][0], 25.0,
                          "ctx 0.25 is 25 percent, not 0.25")
-        self.assertEqual(self.by[("host", "ram_used")][0], 31.5)
+        self.assertEqual(self.by[("host", "ram_used")][0], 25.6,
+                         "8386 MiB of 32768 MiB is 25.6 percent, not 8386 percent")
+        self.assertEqual(self.by[("host", "swap_used")][0], 25.1,
+                         "1026.76 MiB of 4096 MiB is 25.1 percent, not 1026 percent")
+
+    def test_the_host_amounts_are_in_the_units_they_really_are(self):
+        """THE regression of 2026-10-11: the sampler keeps a host row as MiB used, and it was
+        published under a "%" unit, so a healthy box read 'RAM used 8386.1640625 %'."""
+        st = dict((t, v) for t, v, _r in M.state_topics(self.ents, "pxa"))
+        self.assertEqual(st["pxa/host/ram_used_mib"], 8386.2, "the MiB reading, rounded, under MiB")
+        self.assertEqual(st["pxa/host/ram_total_mib"], 32768)
+        self.assertEqual(st["pxa/host/swap_used_mib"], 1026.8)
+        self.assertEqual(st["pxa/host/swap_total_mib"], 4096)
+        self.assertEqual(st["pxa/host/ram_used"], 25.6, "the share is a different topic from the amount")
+        self.assertNotEqual(st["pxa/host/ram_used"], st["pxa/host/ram_used_mib"])
+
+    def test_a_share_without_its_total_makes_no_entity(self):
+        """A numerator with no denominator is not a percentage: better no entity than a wrong one.
+        The amount sensors still stand, because the amount is a real reading either way."""
+        s = snapshot()
+        s["host"] = {"ram": 8386.16, "ram_total_mib": None, "cpu": 12.5, "swap": None,
+                     "swap_total_mib": None}
+        got = {(e, m) for e, m, _v, _c in M.entities(s, "pxa", "PXANET")}
+        self.assertNotIn(("host", "ram_used"), got)
+        self.assertNotIn(("host", "swap_used"), got)
+        self.assertNotIn(("host", "swap_used_mib"), got, "no swap reading, so no swap sensor at all")
+        self.assertIn(("host", "ram_used_mib"), got)
+        self.assertNotIn(("host", "ram_total_mib"), got, "no total reading, no total sensor")
+        self.assertIn(("host", "cpu_used"), got, "a real percent is unaffected by either total")
+
+    def test_every_number_is_rounded_the_same_way(self):
+        """One float reached Home Assistant as 2.7023645689978726 %: a reading is not a display."""
+        for (_eid, _m), (value, _cfg) in self.by.items():
+            if isinstance(value, float):
+                self.assertEqual(value, round(value, 1), "%.12f is not rounded" % value)
+        st = dict((t, v) for t, v, _r in M.state_topics(self.ents, "pxa"))
+        self.assertEqual(st["pxa/host/cpu_used"], 2.7)
+
+    def test_precision_is_a_property_of_the_metric_not_the_reading(self):
+        """suggested_display_precision must not follow the value: a config that changed whenever a
+        reading happened to land on a whole number would be rewritten on the broker every cycle."""
+        whole = snapshot()
+        whole["host"]["cpu"] = 12.0
+        whole["servers"][0]["dec"] = 41.0
+        a = {(e, m): c for e, m, _v, c in M.entities(snapshot(), "pxa", "PXANET")}
+        b = {(e, m): c for e, m, _v, c in M.entities(whole, "pxa", "PXANET")}
+        for key in a:
+            self.assertEqual(a[key].get("suggested_display_precision"),
+                             b[key].get("suggested_display_precision"), key)
+        self.assertEqual(a[("host", "cpu_used")]["suggested_display_precision"], 1)
+        self.assertEqual(a[("host", "ram_used")]["suggested_display_precision"], 1)
+        self.assertEqual(a[("server_d_8080", "slots_total")]["suggested_display_precision"], 0,
+                         "a slot count is a whole thing")
+        self.assertNotIn("suggested_display_precision", a[("server_d_8080", "model")],
+                         "a text sensor has no number to round")
 
     def test_a_metric_the_build_does_not_report_makes_no_entity(self):
         """The documented rule: a reading that is not there produces no sensor, rather than one frozen
@@ -286,6 +359,74 @@ class EntityTests(unittest.TestCase):
         st = dict((t, (v, r)) for t, v, r in M.state_topics(self.ents, "pxa"))
         self.assertEqual(st["pxa/gpu_1/memory_used"][0], 120, "120.0 -> 120")
         self.assertIsInstance(st["pxa/gpu_0/temperature"][0], int)
+
+
+class DiscoveryContractTests(unittest.TestCase):
+    """The whole set of published payloads, checked the way Home Assistant's schema checks them: a
+    unit that matches its device_class, a state_class that is one HA knows, an origin block, and a
+    precision that is a number wherever there is a number.  The stricter schema is the point of the
+    2026-10-11 fix -- an unknown key or a bad unit/class pair is a REJECTED entity, which shows up as
+    a sensor that simply never appears rather than as an error anyone can see."""
+
+    # every device_class we publish, with the units Home Assistant allows for it
+    ALLOWED = {"temperature": ("°C", "°F", "K"),
+               "power": ("W", "kW", "MW", "GW", "mW"),
+               "data_size": ("B", "kB", "MB", "GB", "TB", "PB",
+                             "KiB", "MiB", "GiB", "TiB", "PiB")}
+
+    def setUp(self):
+        self.ents = M.entities(snapshot(), "pxa", "PXANET", "v9.9-test")
+        self.by = {(e, m): (v, c) for e, m, v, c in self.ents}
+
+    def test_every_unit_is_allowed_for_its_device_class(self):
+        for (eid, metric), (_v, cfg) in self.by.items():
+            dc = cfg.get("device_class")
+            if not dc:
+                continue
+            self.assertIn(dc, self.ALLOWED, "%s/%s" % (eid, metric))
+            self.assertIn(cfg.get("unit_of_measurement"), self.ALLOWED[dc],
+                          "%s/%s: %s is not a %s unit" % (eid, metric, cfg.get("unit_of_measurement"), dc))
+
+    def test_every_class_in_use_is_one_of_ours(self):
+        got = {cfg.get("device_class") for _e, _m, _v, cfg in self.ents if cfg.get("device_class")}
+        self.assertEqual(got, set(self.ALLOWED), "a new class needs its units listed here")
+
+    def test_every_state_class_is_a_measurement(self):
+        for (eid, metric), (_v, cfg) in self.by.items():
+            sc = cfg.get("state_class")
+            if sc is not None:
+                self.assertEqual(sc, "measurement", "%s/%s" % (eid, metric))
+
+    def test_the_origin_block_names_the_software_and_its_version(self):
+        v, cfg = self.by[("host", "cpu_used")]
+        self.assertEqual(cfg["origin"], {"name": "PXA Control", "sw_version": "v9.9-test"})
+        self.assertEqual(cfg["device"]["sw_version"], "v9.9-test")
+
+    def test_the_version_is_read_from_the_package_when_it_is_not_given(self):
+        """The publisher passes the package version; a direct caller gets the same token rather than a
+        string someone has to remember to bump at each release."""
+        import pxa_control as C
+        cfg = M.entities(snapshot(), "pxa", "H")[0][3]
+        self.assertEqual(cfg["origin"]["sw_version"], C.CONTROL_VERSION)
+        self.assertTrue(cfg["origin"]["sw_version"], "the package tree here has a VERSION file")
+
+    def test_the_schema_is_bumped_past_the_broken_units(self):
+        """The published shape changed on 2026-10-11 (host memory: MiB counts under a '%' unit -> real
+        percentages with the amounts beside them), so the schema says so; Home Assistant re-reads a
+        config whenever its payload arrives, which is how a running HA picks the new units up."""
+        self.assertGreaterEqual(M.SCHEMA_VERSION, 2)
+        _, cfg = self.by[("host", "ram_used")]
+        self.assertEqual(cfg["unit_of_measurement"], "%")
+        _, amount = self.by[("host", "ram_used_mib")]
+        self.assertEqual(amount["unit_of_measurement"], "MiB")
+
+    def test_every_payload_is_json_a_broker_can_carry(self):
+        for topic, payload in M.discovery_topics(self.ents, "homeassistant"):
+            cfg = json.loads(payload)
+            self.assertIsInstance(cfg, dict, topic)
+            self.assertTrue(cfg["name"] and cfg["unique_id"] and cfg["state_topic"])
+            self.assertEqual(json.loads(json.dumps(cfg, sort_keys=True)), cfg,
+                             "%s: the payload we publish must be the one we measured" % topic)
 
 
 class TopicPublishTests(unittest.TestCase):

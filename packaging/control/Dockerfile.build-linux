@@ -1,0 +1,12 @@
+# PXA Control - the Linux x86_64 build environment for the compiled pxa-control binary (BUILD-CONTROL.md).
+# Ubuntu 22.04 on purpose: glibc 2.35 is the floor the engine release already has (the release image builds on 22.04),
+# so the binary runs wherever the engine runs. Python 3.10 (all of tools/ parses and runs on 3.10).
+# Pinned build tools, each released at least two weeks before 2026-10-14.
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev python3-pip python3-venv gcc g++ patchelf ccache binutils file curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install nuitka==4.2.2 zstandard==0.25.0 ordered-set==4.1.0 pyinstaller==6.22.3 cython==3.3.0 \
+        pystray==0.19.5 pillow==12.3.0 python-xlib==0.33
+WORKDIR /work

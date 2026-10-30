@@ -1,3 +1,4 @@
+#include "pxa-env-flag.h"
 #include "levers.cuh"
 
 #include "../../common.cuh"
@@ -171,6 +172,10 @@ static const pxa_lever_row g_pxa_lever_rows[PXA_LEVER_COUNT] = {
     { "PXA_TOPK_MOE_MULTIROW", "TOPK_MOE_MULTIROW", 0,
       "the multi-row fused top-k MoE router processes several rows per block behind one block-wide aliasing barrier; "
       "the per-row arithmetic and its order are unchanged. Default on at ENHANCE, off at DEFAULT and REFERENCE." },
+    { "PXA_TURING_CUBLAS_NE11", "TURING_CUBLAS_NE11", 64,
+      "sm_75 standard quantized matmuls (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K) use fp16 cuBLAS at ne11 >= N. Default 64 (the "
+      "previous crossover) at every level; 256 is opt-in (mainline-Q-only lever). 0 keeps MMQ at every batch size. "
+      "Other architectures and the dedicated PXQ/PXQN kernels are unaffected." },
 };
 
 struct pxa_lever_state {
@@ -220,6 +225,12 @@ static int64_t pxa_lever_rule_default(int id) {
     const int level = ggml_pxa_config_level();
     const pxa_topology_t & t = g_pxa_topology;
     switch ((pxa_lever_id) id) {
+        case PXA_LEVER_TURING_CUBLAS_NE11:
+            // Port of public PR #13 (2026-10-20): 256 measured faster on one 22 GB RTX 2080 Ti, but the lever only
+            // moves mainline Q types (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K), and mainline-Q-only switches stay OPT-IN (owner
+            // rule). So 64 -- MMQ_DP4A_MAX_BATCH_SIZE, the previous crossover, bit-identical to the old selector --
+            // is the default at every level and for every model; PXA_TURING_CUBLAS_NE11=256 opts in.
+            return 64;
         case PXA_LEVER_FA_GQA_PACK:
             // PXA_FA_GQA_PACK ENHANCE default (2026-09-03). The packed-GQA vec kernel is reached on ONE shape
             // only: the f32 vec FA kernel at Dk==Dv==256, cols_per_block==1, f16 K and V, no logit softcap --
@@ -324,6 +335,14 @@ static pxa_lever_state pxa_lever_resolve(int i) {
         case PXA_LEVER_FA_D256_VOLTA_TILE_MINKV:
         case PXA_LEVER_FA_D256_VOLTA_TILE_MAXCOLS:
             value = pxa_env_int(g_pxa_lever_rows[i].env, v, g_pxa_lever_rows[i].off);
+            break;
+
+        case PXA_LEVER_TURING_CUBLAS_NE11:
+            value = pxa_env_int(g_pxa_lever_rows[i].env, v, pxa_lever_rule_default(i));
+            if (pxa_model_known() && set) {   // the default 64 is the old selector: nothing to say unless opted in
+                fprintf(stderr, "PXA_AUTO: TURING_CUBLAS_NE11=%lld (explicit env override, %s; sm_75 only; default 64)\n",
+                        (long long) value, level_name);
+            }
             break;
 
         case PXA_LEVER_FA_MMA_VOLTA:
@@ -480,6 +499,13 @@ static pxa_lever_state pxa_lever_resolve(int i) {
                        && g_pxa_topology.has_sm70 && !g_pxa_topology.mixed
                        && (!pxa_model_known() || pxa_model_is_moe())) {
                 mode = 1;
+            } else if (level == 2 && pxa_router_fuse_gemma4_p60()) {
+                // ONE P100 x Gemma 4 MoE (2026-10-17, ledger gemma-router-fuse-p60): mode 3, the
+                // sm_60-shaped 128-thread float4 router GEMV, replaces cuBLAS gemv2T (0.69 ms/token, 23 us x 30 layers
+                // at 63 GB/s). 1x P100 card 6, Gemma 4 26B-A4B PXQN4, server greedy512 on top of PXA_PXQN_MOE_GELU:
+                // 77.22 -> 79.83 tok/s (+3.4%), greedy sha unchanged. The +1.6% KILL above was mode 1 (one warp per
+                // row) on a Qwen file; scoped to where mode 3 was measured. PXA_ROUTER_FUSE=0 puts cuBLAS back.
+                mode = 3;
             }
             value = mode;
             break;
@@ -611,6 +637,7 @@ static pxa_lever_cache pxa_lever_cache_of(int id) {
     switch ((pxa_lever_id) id) {
         case PXA_LEVER_ROUTER_FUSE:
         case PXA_LEVER_VOLTA_CUBLAS_NE11:
+        case PXA_LEVER_TURING_CUBLAS_NE11:
         case PXA_LEVER_PXQ_GEMM_2D:
             return PXA_CACHE_PER_PROFILE;
         case PXA_LEVER_PXQ_INT8_PREFILL:
@@ -727,7 +754,7 @@ const char * pxa_core_level_why(void) {
     }
     const char * e = getenv("PXA_ENHANCE");
     if (e) {
-        return atoi(e) == 0 ? "PXA_ENHANCE=0" : "PXA_ENHANCE=1";
+        return pxa_env_value_off(e) ? "PXA_ENHANCE=0" : "PXA_ENHANCE=1";
     }
     return "default";
 }

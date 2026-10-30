@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <unordered_set>
 
 #include "../llama-build-context.h"
@@ -46,14 +47,16 @@ static std::vector<int> pxa_split_devs(const ggml_tensor * t) {
     return g;
 }
 
-// PXA_QWEN4EXP_HC_FUSED (lever, default OFF; 2026-09-25): the hc mixer's stream
+// PXA_QWEN4EXP_HC_FUSED (default ON at ENHANCE since 2026-10-16, order #22214: bit-identical, greedy sha
+// unchanged on -sm layer and -sm tensor, 2x V100 MTP n3 layer +7%/+6%, tensor +13%/+18%, every Flash-Next preset set it;
+// =0 = the stock chain; off at PXA_REFERENCE=1 / PXA_ENHANCE=0; lever since 2026-09-25): the hc mixer's stream
 // mean and the combine + next norm run as two fused ops (ggml_hc_gate_mix, ggml_hc_combine_norm)
 // instead of ~13 elementwise kernels per sublayer. Rows <= PXA_QWEN4EXP_HC_FUSED_MAXNT (default 8,
 // i.e. decode and short verify) only; prefill keeps the stock chain.
 bool llm_build_context::qwen4exp_hc_fused(int64_t n_tokens) {
     static const bool on = [] {
         const char * e = getenv("PXA_QWEN4EXP_HC_FUSED");
-        return e && atoi(e) != 0;
+        return e && *e ? atoi(e) != 0 : ggml_pxa_config_level() >= 2;
     }();
     static const int64_t maxnt = [] {
         const char * e = getenv("PXA_QWEN4EXP_HC_FUSED_MAXNT");
@@ -194,7 +197,15 @@ ggml_tensor * llm_build_context::build_qwen4exp_ple(ggml_cgraph * gf, ggml_tenso
     GGML_ASSERT(model.tok_embd_per_layer != nullptr);
 
     // gather, then flatten the heads: get_rows lays the head dimension out slowest
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.tok_embd_per_layer, lctx.inp_ple_rows);
+    //
+    // PXA_PLE_DIRECT: the ubatch's distinct rows were read from the file into inp_ple_stage
+    // (same type, same bytes) and inp_ple_rows indexes that stage, so this GET_ROWS yields
+    // exactly what the table gather yields. It stays on the CPU, where it ran on the host table.
+    ggml_tensor * ple_src = lctx.inp_ple_stage ? lctx.inp_ple_stage : model.tok_embd_per_layer;
+    ggml_tensor * emb = ggml_get_rows(ctx0, ple_src, lctx.inp_ple_rows);
+    if (lctx.inp_ple_stage && lctx.backend_cpu) {
+        ggml_backend_sched_set_tensor_backend(lctx.sched, emb, lctx.backend_cpu);
+    }
 
     // PXA_PLE_F16=1 (lever, default off): when the table lives in host RAM (the
     // `-ot per_layer_token_embd=CPU` recipe) the gather runs in a CPU split and its f32
@@ -808,12 +819,30 @@ ggml_tensor * llm_build_context::build_qwen4exp_qsa_attention(
 
         ggml_tensor * idx = ggml_reshape_1d(ctx0, sel, n_sel*n_tokens);
 
-        // ggml_get_rows returns F32 in this tree, so the compact K/V is staged through F32 --
-        // twice the bytes a type-preserving gather would write, and the two conts below cost
-        // more again. It is still ~7.5x less than the dense path reads at 140k; a typed gather
-        // is the first thing milestone 2 removes.
-        ggml_tensor * k_g = ggml_get_rows(ctx0, rows_k, idx);   // [hk*n_hkv, n_sel*n_tokens]
-        ggml_tensor * v_g = ggml_get_rows(ctx0, rows_v, idx);
+        // PXA_QSA_TYPED_GATHER (default off). ggml_get_rows widens to F32. The typed gather
+        // keeps the stored type. F16 only: a q8_0 cont through this permute is the MLA transpose
+        // in cpy.cu, not a strided row copy, and it would return the wrong bytes.
+        const ggml_type kvt_k = kv_self.k_l[il]->type;
+        const ggml_type kvt_v = kv_self.v_l[il]->type;
+        static const bool pxa_qsa_typed_gather = [] {
+            const char * e = getenv("PXA_QSA_TYPED_GATHER");
+            return e && atoi(e) != 0;
+        }();
+        const bool typed_k = pxa_qsa_typed_gather && kvt_k == GGML_TYPE_F16;
+        const bool typed_v = pxa_qsa_typed_gather && kvt_v == GGML_TYPE_F16;
+        if (pxa_qsa_typed_gather && il == 0) {
+            static std::atomic<bool> fired{false};
+            if (!fired.exchange(true)) {
+                fprintf(stderr, "PXA_QSA_TYPED_GATHER: k=%s(%s) v=%s(%s)\n",
+                        ggml_type_name(kvt_k), typed_k ? "typed" : "widened",
+                        ggml_type_name(kvt_v), typed_v ? "typed" : "widened");
+            }
+        }
+
+        ggml_tensor * k_g = typed_k ? ggml_get_rows_typed(ctx0, rows_k, idx)
+                                    : ggml_get_rows(ctx0, rows_k, idx);   // [hk*n_hkv, n_sel*n_tokens]
+        ggml_tensor * v_g = typed_v ? ggml_get_rows_typed(ctx0, rows_v, idx)
+                                    : ggml_get_rows(ctx0, rows_v, idx);
         cb(k_g, "qsa_k_gathered", il);
         pxa_qsa_prof_tag(k_g, PXA_QSA_ST_GATHER, il);
         pxa_qsa_prof_tag(v_g, PXA_QSA_ST_GATHER, il);
@@ -966,6 +995,14 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         lctx.inp_ple_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hparams.ple_n_heads*n_tokens);
         cb(lctx.inp_ple_rows, "inp_ple_rows", -1);
         ggml_set_input(lctx.inp_ple_rows);
+
+        // PXA_PLE_DIRECT: one stage row per gather row is the worst case (no repeats in the ubatch)
+        if (model.pxa_ple_direct) {
+            lctx.inp_ple_stage = ggml_new_tensor_2d(ctx0, model.tok_embd_per_layer->type,
+                    model.tok_embd_per_layer->ne[0], hparams.ple_n_heads*n_tokens);
+            cb(lctx.inp_ple_stage, "inp_ple_stage", -1);
+            ggml_set_input(lctx.inp_ple_stage);
+        }
 
         // One PLE layer is what this build supports: hparams holds a single set of hash
         // constants, and one window is carried. (Mainline has the same limit.)
@@ -1529,6 +1566,154 @@ struct ggml_tensor * llm_build_context::build_qwen4exp_mtp(
     const float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head))
                                                              : hparams.f_attention_scale;
 
+    // ---- tensor split (PXA_TSPLIT_QWEN4EXP_HC=1; 2026-10-14) -------------------------
+    // split_qwen4exp_tensors() MIRRORS this block's hc_attn_* / hc_ffn_* exactly like the trunk's: one
+    // full copy per card, and the BASE tensor becomes a split-buffer placeholder (dummy data pointer)
+    // that must never be read. The tail below used the bases, so the first draft under '-sm tensor'
+    // read 0x1000 on card 0 and died in the next cuBLAS call ("the function failed to launch on the
+    // GPU", 2x P100). Under the split the tail now runs the trunk's per-card pattern for its one layer
+    // (trunk_split in build_qwen4exp): the fused input (enorm/hnorm/eh_proj live un-split on one card)
+    // is handed to every card of the block's group, each card mixes with its OWN mirror copies, the
+    // split attention / MoE builders take the per-card inputs through a reduce-OFF container, and each
+    // card combines with its copy of the all-reduced block output. The draft head (nextn.hc_*, the
+    // shared lm_head) then reads the first card's residual. Without the split nothing below changes.
+    if (mtp_layer.hc_attn_norm && mtp_layer.hc_attn_norm->extra) {
+        auto sp0 = (ggml_split_tensor_t *) mtp_layer.hc_attn_norm->extra;
+        const int n_dev = sp0->n_device;
+        auto WS = [&](ggml_tensor * t, int id) -> ggml_tensor * {
+            if (t && t->extra) {
+                ggml_tensor * r = ((ggml_split_tensor_t *) t->extra)->splits[id];
+                GGML_ASSERT(r);
+                return r;
+            }
+            return t;
+        };
+        std::vector<ggml_backend_t> be(n_dev, nullptr);
+        std::vector<int> devs;
+        for (int id = 0; id < n_dev; ++id) {
+            ggml_tensor * w = sp0->splits[id];
+            if (!w) continue;
+            GGML_ASSERT(w->buffer);
+            auto buft = ggml_backend_buffer_get_type(w->buffer);
+            for (auto * b : lctx.backends) {
+                if (b != lctx.backend_cpu && ggml_backend_supports_buft(b, buft)) { be[id] = b; break; }
+            }
+            GGML_ASSERT(be[id] && "no backend for an MTP hyper-connection mirror");
+            devs.push_back(id);
+        }
+        GGML_ASSERT(devs.size() > 1);
+        // the cards of a sublayer: every mirror holder, or (pair-local) the block's own split group
+        auto group_for = [&](bool ffn) -> std::vector<int> {
+            if (!pxa_qwen4exp_pairlocal()) return devs;
+            std::vector<int> g;
+            for (int d : pxa_split_devs(ffn ? mtp_layer.ffn_down_exps : mtp_layer.wq)) {
+                if (std::find(devs.begin(), devs.end(), d) != devs.end()) g.push_back(d);
+            }
+            return g.empty() ? devs : g;
+        };
+        auto pin = [&](ggml_tensor * out, int id, std::initializer_list<ggml_tensor *> inputs) {
+            std::unordered_set<ggml_tensor *> seen(inputs.begin(), inputs.end());
+            std::vector<ggml_tensor *> st{out};
+            while (!st.empty()) {
+                ggml_tensor * t = st.back(); st.pop_back();
+                if (!t || seen.count(t)) continue;
+                seen.insert(t);
+                if (t->buffer || t->op == GGML_OP_NONE || t->op == GGML_OP_REDUCE) continue;
+                if (ggml_backend_sched_get_tensor_backend(lctx.sched, t) != nullptr) continue;
+                if (!t->view_src) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, t, be[id]);
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) if (t->src[j]) st.push_back(t->src[j]);
+            }
+        };
+        auto mark_boundary = [&](ggml_tensor * t) {
+            t->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
+        };
+        std::vector<ggml_tensor *> res(n_dev, nullptr), mixed(n_dev, nullptr), inj(n_dev, nullptr);
+        std::vector<int> hold = group_for(false);
+        for (int id : hold) {
+            ggml_tensor * r = ggml_cont(ctx0, inpL);
+            ggml_backend_sched_set_tensor_backend(lctx.sched, r, be[id]);
+            mark_boundary(r);
+            cb(r, "mtp_hc_handoff", il);
+            res[id] = r;
+        }
+        auto ensure = [&](const std::vector<int> & S) {
+            if (S == hold) return;
+            const int src = hold[0];
+            for (int id : S) {
+                if (res[id]) continue;
+                ggml_tensor * r = ggml_cont(ctx0, res[src]);
+                ggml_backend_sched_set_tensor_backend(lctx.sched, r, be[id]);
+                mark_boundary(r);
+                cb(r, "mtp_hc_handoff", il);
+                res[id] = r;
+            }
+            for (int id : hold) {
+                if (std::find(S.begin(), S.end(), id) == S.end()) { res[id] = nullptr; inj[id] = nullptr; }
+            }
+            hold = S;
+        };
+        auto mix_all = [&](ggml_tensor * nrm, ggml_tensor * dn, ggml_tensor * up, ggml_tensor * ij, bool ffn) {
+            ensure(group_for(ffn));
+            std::fill(mixed.begin(), mixed.end(), nullptr);
+            for (int id : hold) {
+                mixed[id] = build_qwen4exp_hc_mix(res[id], WS(nrm, id), WS(dn, id), WS(up, id), WS(ij, id), &inj[id], il);
+                pin(mixed[id], id, {res[id]});
+                pin(inj[id], id, {res[id]});
+            }
+            ggml_tensor * c = ggml_reduce(ctx0, mixed.data(), n_dev, GGML_OP_ADD);
+            c->op_params[3] = 1;   // reduce OFF: a container, the split builders read src[id]
+            ggml_build_forward_expand(gf, c);
+            return c;
+        };
+        auto combine_all = [&](ggml_tensor * block) {
+            for (int id : hold) {
+                ggml_tensor * b = get_input_tensor_sm_graph(ctx0, block, id);
+                ggml_tensor * b_in = b;
+                if (b->type != GGML_TYPE_F32) {
+                    b = ggml_cast(ctx0, b, GGML_TYPE_F32);
+                }
+                ggml_tensor * prev = res[id];
+                res[id] = build_qwen4exp_hc_combine(prev, b, inj[id], il);
+                pin(res[id], id, {prev, b_in, inj[id]});
+            }
+        };
+
+        ggml_tensor * cin = mix_all(mtp_layer.hc_attn_norm, mtp_layer.hc_attn_down, mtp_layer.hc_attn_up,
+                mtp_layer.hc_attn_inject, false);
+        cb(cin, "mtp_hc_attn_pre", il);
+        ggml_tensor * blk = build_std_attention(gf, /*attn_norm*/ nullptr, cin, inp_pos, /*inp_out_ids*/ nullptr,
+                /*rope_factors*/ nullptr, KQ_mask, /*sinks*/ nullptr, /*inp_attn_scale*/ nullptr,
+                KQ_scale, 0.0f, /*n_swa*/ 0, il,
+                /*do_rope*/ true, /*add_graph_split*/ false, /*add_input*/ false,
+                /*is_norm*/ false, /*is_multi*/ true);
+        cb(blk, "mtp_attn_block_out", il);
+        combine_all(blk);
+
+        cin = mix_all(mtp_layer.hc_ffn_norm, mtp_layer.hc_ffn_down, mtp_layer.hc_ffn_up,
+                mtp_layer.hc_ffn_inject, true);
+        cb(cin, "mtp_hc_ffn_pre", il);
+        blk = llm_build_std_moe_ffn(ctx0, lctx, /*ffn_norm*/ nullptr, cin,
+                mtp_layer.ffn_gate_inp,   nullptr,
+                mtp_layer.ffn_up_exps,    nullptr,
+                mtp_layer.ffn_gate_exps,  nullptr,
+                mtp_layer.ffn_down_exps,  nullptr,
+                nullptr,
+                mtp_layer.ffn_up_shexp,   nullptr,
+                mtp_layer.ffn_gate_shexp, nullptr,
+                mtp_layer.ffn_down_shexp, nullptr,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, true, false, 0.0f,
+                LLM_EXPERT_GATING_FUNC_SOFTMAX,
+                LLM_FFN_SILU, cb, il, gf, /*add_input*/ false,
+                mtp_layer.ffn_up_gate_exps, nullptr, mtp_layer.ffn_gate_inp_shexp);
+        cb(blk, "mtp_ffn_out", il);
+        combine_all(blk);
+        inpL = res[hold[0]];
+        cb(inpL, "mtp_l_out", il);
+    } else {
+
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur    = build_qwen4exp_hc_mix(inpL,
             mtp_layer.hc_attn_norm, mtp_layer.hc_attn_down, mtp_layer.hc_attn_up,
@@ -1572,6 +1757,9 @@ struct ggml_tensor * llm_build_context::build_qwen4exp_mtp(
 
     inpL = build_qwen4exp_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_l_out", il);
+    }   // not a tensor split
+
+    ggml_tensor * cur = nullptr;
 
     // Chained-draft hand-over: the next draft step is conditioned on the WIDE streams the
     // block just produced, exactly as the target's trunk hands its res_hc over. Row-select

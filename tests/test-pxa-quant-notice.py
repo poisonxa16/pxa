@@ -98,8 +98,8 @@ class NoticeTests(unittest.TestCase):
             agent = f.read()
         self.assertIn('id: "ag-qnote"', agent)
         self.assertIn("chatQuantNote()", agent)
-        with open(os.path.join(TOOLS, "pxa_control.py"), encoding="utf-8") as f:
-            ctl = f.read()
+        ctl = "".join(open(os.path.join(TOOLS, "pxa_control", _f), encoding="utf-8").read()
+                          for _f in sorted(os.listdir(os.path.join(TOOLS, "pxa_control"))) if _f.endswith(".py"))          # the package (the Control hardening pass)
         self.assertIn("standard_gguf_notice", ctl)
         self.assertIn('"notice": notice', ctl)
         self.assertIn("quant_notice", ctl)

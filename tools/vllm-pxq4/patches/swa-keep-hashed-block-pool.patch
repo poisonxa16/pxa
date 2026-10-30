@@ -1,0 +1,107 @@
+PXA Network modification notice (Apache License 2.0, section 4(b)): this patch changes
+vllm/v1/core/block_pool.py from vLLM (Copyright the vLLM contributors, Apache License 2.0).
+Changed by PXA Network, 2026; the change is released under the Apache License 2.0.
+See tools/vllm-pxq4/LICENSE-NOTICE.md. patch(1) skips these lines.
+
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections.abc import Iterable, Sequence
+ from typing import Any
+ 
+@@ -30,6 +31,25 @@
+ 
+ logger = init_logger(__name__)
+ 
++# PXA_SWA_KEEP_HASHED=1 puts hashed blocks on the LRU end of the free queue
++# (evicted last), including blocks a sliding window released for immediate
++# reuse. Unset or 0 keeps this build's free order. Default off.
++_PXA_SWA_KEEP_HASHED = os.environ.get("PXA_SWA_KEEP_HASHED", "0") == "1"
++
++
++def _pxa_swa_split(freed, reuse_first, keep, caching):
++    """Return (prepend, append) for one free_blocks call.
++
++    keep off, or caching off: one append, caller order (this build's stock path).
++    keep on: unhashed blocks are recycled first; hashed blocks go to the LRU end
++    even when reuse_first is set.
++    """
++    if not keep or not caching:
++        return [], list(freed)
++    pre = [b for b in freed if b.block_hash is None]
++    post = [b for b in freed if b.block_hash is not None]
++    return pre, post
++
+ 
+ class BlockHashToBlockMap:
+     """
+@@ -416,21 +436,33 @@
+             if self.metrics_collector:
+                 self.metrics_collector.on_block_accessed(block)
+ 
+-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
++    def free_blocks(
++        self, ordered_blocks: Iterable[KVCacheBlock], reuse_first: bool = False
++    ) -> None:
+         """Free a list of blocks. The blocks should be ordered by their
+         eviction priority, where the first block will be evicted first.
+ 
+         Args:
+             ordered_blocks: A list of blocks to free ordered by their eviction
+                 priority.
++            reuse_first: Accepted so a sliding-window caller can ask for
++                immediate recycle. With PXA_SWA_KEEP_HASHED unset this build
++                ignores it and appends in caller order. With the flag set,
++                hashed blocks still go to the LRU end.
+         """
+         # Materialize the iterable to allow multiple passes.
+         blocks_list = list(ordered_blocks)
+         for block in blocks_list:
+             block.ref_cnt -= 1
+-        self.free_block_queue.append_n(
+-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
++        freed = [
++            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
++        ]
++        pre, post = _pxa_swa_split(
++            freed, reuse_first, _PXA_SWA_KEEP_HASHED, self.enable_caching
+         )
++        if pre:
++            self.free_block_queue.prepend_n(pre)
++        self.free_block_queue.append_n(post)
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -328,6 +328,27 @@
+ 
+         self.num_free_blocks += 1
+ 
++    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
++        """Put a list of blocks at the front of the free list."""
++        if len(blocks) == 0:
++            return
++
++        first_block = self.fake_free_list_head.next_free_block
++        assert first_block is not None, (
++            "next_free_block of fake_free_list_head should always exist"
++        )
++
++        prev_block = self.fake_free_list_head
++        for block in blocks:
++            block.prev_free_block = prev_block
++            prev_block.next_free_block = block
++            prev_block = block
++
++        prev_block.next_free_block = first_block
++        first_block.prev_free_block = prev_block
++
++        self.num_free_blocks += len(blocks)
++
+     def append_n(self, blocks: list[KVCacheBlock]) -> None:
+         """Put a list of blocks back into the free list
+ 

@@ -12,6 +12,8 @@
 //      the KV/state bytes);
 //   3. the KV/state class comes back with the contents it had at the LAST park, not the first;
 //   4. compute buffers and pools are dropped and re-mapped without a copy;
+//      a compute buffer comes back zeroed (fresh VRAM is not the cleared
+//      buffer the first allocation was);
 //   5. split slices taken during the load window are weights, slices taken later are state (the KV
 //      cache under -sm tensor) -- the buffer usage flag alone would call both weights;
 //   6. an unpark that cannot get its memory (a failing device) rolls back completely: nothing stays
@@ -30,6 +32,9 @@
 // CPU only, no model, no GPU. Exit 0 on pass.
 
 #include "pxa-residency.h"
+#ifdef _WIN32
+#include "pxa-win-compat.h"   // setenv, unsetenv
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -145,6 +150,12 @@ struct fake_dev : public pxa_res::dev_ops {
         for (auto & op : ops) if (!xfer(dev, op.va, op.host, op.size, false)) { err = "h2d to unmapped memory"; return false; }
         return true;
     }
+    bool memset_zero(int dev, uint64_t va, size_t size, std::string & err) override {
+        std::lock_guard<std::recursive_mutex> lk(mu);
+        std::vector<unsigned char> z(size, 0);
+        if (!xfer(dev, va, z.data(), size, false)) { err = "memset of unmapped memory"; return false; }
+        return true;
+    }
     bool sync(int, std::string &) override { return true; }
     int owner_class(const void * owner) override {
         const fake_buffer * b = (const fake_buffer *) owner;
@@ -162,6 +173,13 @@ struct fake_dev : public pxa_res::dev_ops {
         std::vector<unsigned char> buf(size);
         for (size_t i = 0; i < size; ++i) buf[i] = pat(seed, i);
         if (!xfer(dev, (uint64_t) (uintptr_t) ptr, buf.data(), size, false)) { fprintf(stderr, "fake: fill of unmapped memory\n"); ++g_fail; }
+    }
+    bool is_zero(int dev, void * ptr, size_t size) {
+        std::lock_guard<std::recursive_mutex> lk(mu);
+        std::vector<unsigned char> buf(size);
+        if (!xfer(dev, (uint64_t) (uintptr_t) ptr, buf.data(), size, true)) return false;
+        for (unsigned char c : buf) if (c != 0) return false;
+        return true;
     }
     bool same(int dev, void * ptr, size_t size, unsigned seed) {
         std::lock_guard<std::recursive_mutex> lk(mu);
@@ -345,6 +363,10 @@ static void test_single_model() {
     CHECK(!r.parked(), "still parked");
     CHECK(all_mapped(fd, mb), "a range is missing after unpark");
     CHECK(all_intact(fd, mb), "content not restored");
+    for (auto & it : mb.items) {
+        if (it.cls != pxa_res::CLS_SCRATCH) continue;
+        CHECK(fd.is_zero(it.dev, it.p, it.size), "compute buffer not cleared on unpark");
+    }
     CHECK(!pool.parked, "pool not unparked");
     CHECK(fd.used[0] + fd.used[1] == used0, "VRAM after unpark %zu != before %zu", fd.used[0] + fd.used[1], used0);
     CHECK(st.bytes_copied == bytes_of(mb, pxa_res::CLS_WEIGHTS) + bytes_of(mb, pxa_res::CLS_STATE), "unpark copy bytes");

@@ -28,6 +28,7 @@
 //                   | 2 (any arch with real DP4A, i.e. cc >= 610; TEST)
 #pragma once
 
+#include "pxa-env-flag.h"
 #include "../common.cuh"
 #include <atomic>
 #include <cstdlib>
@@ -253,16 +254,14 @@ static inline bool pxa_spec_fast_verify(int cc) { (void) cc; return pxa_spec_fas
 // form below (pxq_mmvq_wfrag + pxq_mmvq_dot_frag), which is this function with its weight-only
 // prologue lifted out of the column loop and is bit-identical to it; this one then doubles as the
 // reference arm of tests/test-pxq-mmvq-cols.cu, so KEEP THE TWO ARITHMETICALLY IN STEP.
+// The arithmetic half on code words the caller already holds (vec_dot_pxq_q8_1 below = load + this; the PF
+// single-column loop in mmvq-templates.cuh loads one k-block ahead and calls this directly): one body, so the
+// two can never drift apart arithmetically.
 template <class POL, int VDR, int ROWS>
-static __device__ __forceinline__ float vec_dot_pxq_q8_1(
-        const uint8_t * __restrict__ slab, const int r, const int i, const float anch,
+static __device__ __forceinline__ float vec_dot_pxq_q8_1_qw(
+        const uint32_t * qw, const int i, const float anch,
         const float * __restrict__ sub, const pxq_mmvq_scales<POL, ROWS> & sc,
         const block_q8_1 * __restrict__ bq8_1, const int iqs) {
-
-    // this thread's code words, however many the tier packs its VDR groups into
-    uint32_t qw[POL::template NWORDS<VDR>];
-    POL::template load_words<VDR>(slab, r, iqs, qw);
-
     const int * q8 = (const int *) bq8_1->qs;
 
     float sum = 0.0f;
@@ -276,6 +275,25 @@ static __device__ __forceinline__ float vec_dot_pxq_q8_1(
     }
 
     return anch * __low2float(bq8_1->ds) * sum;
+}
+template <class POL, int ROWS>
+static __device__ __forceinline__ float vec_dot_pxq_q8_1_w(
+        const uint32_t * qw, const int i, const float anch,
+        const float * __restrict__ sub, const pxq_mmvq_scales<POL, ROWS> & sc,
+        const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+    return vec_dot_pxq_q8_1_qw<POL, 2, ROWS>(qw, i, anch, sub, sc, bq8_1, iqs);
+}
+
+template <class POL, int VDR, int ROWS>
+static __device__ __forceinline__ float vec_dot_pxq_q8_1(
+        const uint8_t * __restrict__ slab, const int r, const int i, const float anch,
+        const float * __restrict__ sub, const pxq_mmvq_scales<POL, ROWS> & sc,
+        const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+
+    // this thread's code words, however many the tier packs its VDR groups into
+    uint32_t qw[POL::template NWORDS<VDR>];
+    POL::template load_words<VDR>(slab, r, iqs, qw);
+    return vec_dot_pxq_q8_1_qw<POL, VDR, ROWS>(qw, i, anch, sub, sc, bq8_1, iqs);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -379,7 +397,7 @@ static __device__ __forceinline__ float pxq_mmvq_dot_frag_fast(
 // the same w; x is q8_1-quantized (not the PXQN GEMV's staging), so numerics are the PXQ4 MMVQ class. Measured cause
 // (V100 tg64 nvprof): PXQN GEMVs 1250 ms vs PXQ4 MMVQ 1152 ms for the same bytes; 0 = the PXQN GEMV.
 static inline bool pxqn_mmvq_route_on() {
-    static const bool v = [](){ const char * e = getenv("PXA_PXQN_MMVQ"); return !(e && atoi(e) == 0); }();
+    static const bool v = [](){ const char * e = getenv("PXA_PXQN_MMVQ"); return !(e && pxa_env_value_off(e)); }();
     return v;
 }
 static inline bool pxa_pxq_mmvq_type(ggml_type t) {
@@ -473,7 +491,7 @@ static inline int pxa_pxq_mmvq_rows() {
 // DEFAULT (2026-09-27, , plan item S7a): unset = ON on sm_70 and newer at ENHANCE, OFF below
 // (sm_61 fleets, the only other arch this kernel runs on, never measured it). Measured +4.4% greedy
 // decode on the V100 pair under MTP verify (58.64 -> 61.21 t/s, same acceptance; RESEARCH-NEW-LEVERS
-// row 2); re-probed 2026-09-27 on the release build (impl s7a-mmvq-cols-sm70), 2x V100, 27B PXQ4, MTP,
+// row 2); re-probed 2026-09-27 on the release build, 2x V100, 27B PXQ4, MTP,
 // REPS 3: -sm layer off/on/off 44.39/49.14/44.60 control, 64.81/77.12/67.12 repetition (+10.2%/+14.9%
 // on the close bracket), under the pair's default -sm tensor a wash inside a drifting bracket, inert at
 // width 1 (plain decode), greedy shas identical in every arm. =0 turns it off everywhere (the old
@@ -489,7 +507,7 @@ static inline int pxa_pxq_mmvq_cols_env() {
 static inline bool pxa_pxq_mmvq_cols(int cc) {
     const int  e = pxa_pxq_mmvq_cols_env();
     // the default follows the config level like every ENHANCE lever: PXA_ENHANCE=0 / PXA_REFERENCE=1 keep the clamp
-    const bool v = e >= 0 ? e == 1 : (cc >= CC_VOLTA && ggml_pxa_config_level() >= 2);
+    const bool v = e >= 0 ? e == 1 : (cc >= PXA_CC_VOLTA && ggml_pxa_config_level() >= 2);
     if (v) {
         static const bool said = [e](){
             fprintf(stderr, "PXA_PXQ_MMVQ_COLS: multi-column PXQ MMVQ tile = 8 rows at 3-4 columns, 4 at 5-8 "
@@ -567,6 +585,16 @@ static inline int pxa_pxq_mmvq_tile(int ncols_y, bool fused, int cc) {
     return clamped;
 }
 
+// PXA_PXQ_MMVQ_PF (K1, 2026-10-14): 1 (default) = the single-column PXQ4 / PXQN4 MMVQ at the
+// default tile (ROWS 4, VDR 2, 4 warps), plain and grouped, issues the next k-block's code + scale words before
+// this k-block's math and is launch-bounded to 8 blocks/SM (64 regs, no spill). Bit-identical (same lane mapping,
+// same per-thread k order, one shared arithmetic body). Standalone V100 us/launch old -> new: 5120x17408 62.9 ->
+// 61.6, 5120x6144 25.6 -> 24.8, 12288x5120 46.7 -> 45.9, 6144x5120 26.9 -> 25.9. 0 = the previous loop.
+static inline bool pxa_pxq_mmvq_pf() {
+    static const bool v = [](){ const char * e = getenv("PXA_PXQ_MMVQ_PF"); return !(e && pxa_env_value_off(e)); }();
+    return v;
+}
+
 // code words per thread: 2 (LDG.64, a thread pair per code row) or 4 (LDG.128, one thread).
 static inline int pxa_pxq_mmvq_vdr() {
     static const int v = [](){
@@ -582,7 +610,7 @@ static inline int pxa_pxq_mmvq_vdr() {
 static inline bool pxa_pxq_mmvq_on(int cc) {
     const int m = pxa_pxq_mmvq_mode();
     if (m == 0) return false;
-    if (m == 1) return cc >= CC_VOLTA;
+    if (m == 1) return cc >= PXA_CC_VOLTA;
     return cc >= 610;                 // real DP4A only; sm_60 would run the emulation
 }
 
@@ -592,6 +620,6 @@ static inline bool pxa_pxq_mmvq_on(int cc) {
 // PXQ2/PXQ3 until somebody measures it there — a lever should arm on the arch its gate passed on.
 static inline bool pxa_pxq_mmvq_on_type(int cc, ggml_type t) {
     if (!pxa_pxq_mmvq_on(cc)) return false;
-    if (t == GGML_TYPE_PXQ2 || t == GGML_TYPE_PXQ3) return cc >= CC_VOLTA;
+    if (t == GGML_TYPE_PXQ2 || t == GGML_TYPE_PXQ3) return cc >= PXA_CC_VOLTA;
     return true;
 }

@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <type_traits>
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
@@ -50,6 +51,7 @@ struct slot_params {
     bool stream = true;
     bool include_usage = false;
     bool cache_prompt = true; // remember the prompt to avoid reprocessing all prompt
+    std::string dump_tag; // PXA_DUMP_MTP_EMBD_v1: file stem of this request's --dump-mtp-embd rows
 
     int32_t  n_keep = 0; // number of tokens to keep from initial prompt
     int32_t  n_discard = 0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
@@ -183,6 +185,12 @@ struct server_task_result {
 
     bool                  verbose = false;
 
+    // Results are owned and deleted through std::unique_ptr<server_task_result>: without a virtual
+    // destructor that delete is undefined behaviour and the derived members (generated text, token
+    // probabilities, json payloads) were never destroyed, so every finished request leaked them
+    // (ASan: new-delete-type-mismatch, 768 vs 664 bytes for server_task_result_cmpl_final).
+    virtual ~server_task_result() = default;
+
     virtual bool is_error() {
         // only used by server_task_result_error
         return false;
@@ -203,6 +211,10 @@ struct server_task_result {
     }
 
 };
+
+// regression guard (ASan new-delete-type-mismatch): results are deleted through the base pointer
+static_assert(std::has_virtual_destructor<server_task_result>::value,
+              "server_task_result is deleted through std::unique_ptr<server_task_result>: keep its destructor virtual");
 
 struct server_task_result_cmpl_partial : server_task_result {
     bool anthropic_has_reasoning = false;

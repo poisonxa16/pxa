@@ -7,7 +7,10 @@
   if (typeof el !== "function" || !document.getElementById("p-chat")) return;
 
   // ---------------- markdown (the default renderer; a plugin may replace it with setRenderer) ----------------
-  function esc(s) { return s.replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c])); }
+  // u06: bidi override/embedding/isolate controls would let "evil\u202Etxt.exe" read as "evilexe.txt": shown as visible [U+202E] markers
+  const BIDI = /[\u202A-\u202E\u2066-\u2069]/g;
+  const bidi = s => typeof s === "string" ? s.replace(BIDI, c => "[U+" + c.charCodeAt(0).toString(16).toUpperCase() + "]") : s;
+  function esc(s) { return bidi(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c])); }
   function inline(s) {
     // s is already escaped
     return s.replace(/`([^`\n]+)`/g, "<code>$1</code>")
@@ -102,12 +105,31 @@
              tools: $("#chat-composer-tools"), sections: $("#chat-settings-sections")};
   const views = new Map();   // msg id -> {m, body, think, meta, actions}
   const scrollEnd = () => { D.msgs.scrollTop = D.msgs.scrollHeight; };
-  function renderBody(msg, v, live) {
-    if (msg.role === "user") v.body.textContent = msg.content;
+  function renderBodyNow(msg, v, live) {
+    if (msg.role === "user") v.body.textContent = bidi(msg.content);
     else {
       let h = ""; try { h = R.renderer(msg.content || "", msg); } catch (e) { console.error("PXAChat renderer failed:", e); h = md(msg.content || ""); }
       v.body.innerHTML = h; window.PXAMarkdown.process(v.body, {view: "classic", live: !!live, msg});
     }
+  }
+  // s21: a streamed reply used to be re-rendered from its first character on EVERY delta. Live renders now wait for the next frame,
+  // coalesce (many deltas, one render) and back off so rendering takes at most about a fifth of the main thread however long the
+  // reply gets; the final, non-live render is immediate and cancels any pending one.
+  function renderBody(msg, v, live) {
+    if (!live || msg.role === "user") {
+      if (v._rt) { clearTimeout(v._rt); cancelAnimationFrame(v._raf); v._rt = 0; v._raf = 0; v._pend = null; }
+      renderBodyNow(msg, v, false); return;
+    }
+    v._pend = msg;
+    if (v._rt) return;
+    const wait = Math.max(0, (v._cost || 0) * 4 - (performance.now() - (v._at || 0)));
+    v._rt = setTimeout(() => {
+      v._raf = requestAnimationFrame(() => {
+        v._rt = 0; v._raf = 0;
+        const m = v._pend; if (!m) return; v._pend = null;
+        const t0 = performance.now(); renderBodyNow(m, v, true); v._at = performance.now(); v._cost = v._at - t0;
+      });
+    }, wait);
   }
   function addMsgView(msg) {
     $("#msgs-empty") && $("#msgs-empty").remove();
@@ -116,7 +138,7 @@
     const m = el("div", {class: "msg " + msg.role, "data-id": msg.id}, think, body, meta, actions);
     const v = {m, body, think, meta, actions}; views.set(msg.id, v);
     renderBody(msg, v);
-    if (msg.reasoning) { think.hidden = false; think.textContent = msg.reasoning; }
+    if (msg.reasoning) { think.hidden = false; think.textContent = bidi(msg.reasoning); }
     if (msg.meta && msg.meta.text) meta.textContent = msg.meta.text;
     if (msg.meta && msg.meta.error) m.style.borderColor = "var(--bad)";
     D.msgs.append(m); scrollEnd();
@@ -209,7 +231,7 @@
       res = await streamCompletion(body, j => {
         const d = j.choices && j.choices[0] && j.choices[0].delta;
         if (d) {
-          if (d.reasoning_content) { msg.reasoning += d.reasoning_content; ui.think.hidden = false; ui.think.textContent = msg.reasoning; n++; }
+          if (d.reasoning_content) { msg.reasoning += d.reasoning_content; ui.think.hidden = false; ui.think.textContent = bidi(msg.reasoning); n++; }
           if (d.content) { msg.content += d.content; n++; renderBody(msg, ui, true); }
           if (tFirst == null && (d.content || d.reasoning_content)) tFirst = performance.now();
           if (j.choices[0].finish_reason) msg.meta.finish_reason = j.choices[0].finish_reason;
@@ -236,7 +258,7 @@
       }
       msg.meta.model = targetLabel(S.target); msg.meta.ts = Date.now();
       conv.updated = Date.now(); save(conv);
-      if (msg.content && window.PXAMarkdown.count) renderBody(msg, ui, false);
+      if (msg.content) renderBody(msg, ui, false);      // the last live render may still be waiting for its frame: always paint the final text
       finishView(msg); emit("messageDone", msg, conv);
     }
     return msg;

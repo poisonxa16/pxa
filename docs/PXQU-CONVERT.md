@@ -21,7 +21,7 @@ llama-quantize --allow-requantize \
   upstream of the quantizer: it is evidence for **you** when you write the tier map below.
 - Source should be a near-lossless **Q8_0** gguf.
 
-> ⚠ **Do not pass `--override-kv <arch>.expert_used_count=int:N` at quantize time.** Earlier
+> Warning: **Do not pass `--override-kv <arch>.expert_used_count=int:N` at quantize time.** Earlier
 > revisions of this page suggested it, to pin routing to the model's real top-k. It bakes the key
 > into the output GGUF as **INT32**, while the loader reads that key as **UINT32** — so the file
 > quantizes without complaint and then fails at load with

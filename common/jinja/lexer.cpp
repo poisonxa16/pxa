@@ -2,10 +2,54 @@
 #include "runtime.h"
 
 #include <cctype>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
 #include <vector>
+
+// PXA: helpers for the Python string escapes in the lexer (\xHH, \uXXXX, \UXXXXXXXX, octal)
+static bool read_hex(const std::string & s, size_t & pos, int n, uint32_t & out) {
+    if (pos + (size_t) n > s.size()) {
+        return false;
+    }
+    uint32_t v = 0;
+    for (int k = 0; k < n; ++k) {
+        const char c = s[pos + k];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = v * 16 + (uint32_t) d;
+    }
+    pos += n;
+    out = v;
+    return true;
+}
+
+// Code points UTF-8 cannot carry (above U+10FFFF, or a lone UTF-16 surrogate U+D800-U+DFFF from a \u escape
+// without its pair) are written as U+FFFD, so the template output always stays valid UTF-8.
+static void append_utf8(std::string & out, uint32_t cp) {
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        cp = 0xFFFD;
+    }
+    if (cp < 0x80) {
+        out += (char) cp;
+    } else if (cp < 0x800) {
+        out += (char) (0xC0 | (cp >> 6));
+        out += (char) (0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char) (0xE0 | (cp >> 12));
+        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+        out += (char) (0x80 | (cp & 0x3F));
+    } else {
+        out += (char) (0xF0 | (cp >> 18));
+        out += (char) (0x80 | ((cp >> 12) & 0x3F));
+        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+        out += (char) (0x80 | (cp & 0x3F));
+    }
+}
 
 #define FILENAME "jinja-lexer"
 
@@ -75,11 +119,48 @@ lexer_result lexer::tokenize(const std::string & source) {
                 }
                 // add escaped char
                 char escaped_char = src[pos++];
-                if (escape_chars.find(escaped_char) == escape_chars.end()) {
-                    throw lexer_exception(std::string("unknown escape character \\") + escaped_char, source, pos);
+                auto esc = escape_chars.find(escaped_char);
+                if (esc != escape_chars.end()) {
+                    str += esc->second;
+                    continue;
                 }
-                char unescaped_char = escape_chars.at(escaped_char);
-                str += unescaped_char;
+                // PXA (2026-10-23): the rest of Python's string-literal escapes, which jinja2 templates
+                // inherit. Flint's template strips NULs with replace("\x00", ""), and the old lexer threw on \x, so
+                // the template failed to load and every chat request aborted the server. A template that parsed
+                // before takes none of these branches, so its output is unchanged.
+                const int n_hex = escaped_char == 'x' ? 2 : escaped_char == 'u' ? 4 : escaped_char == 'U' ? 8 : 0;
+                if (n_hex > 0) {
+                    uint32_t cp = 0;
+                    if (!read_hex(src, pos, n_hex, cp)) {
+                        throw lexer_exception(std::string("truncated \\") + escaped_char + " escape", source, pos);
+                    }
+                    // a \uD800-\uDBFF high surrogate followed by a \uDC00-\uDFFF low one is one code point
+                    if (escaped_char == 'u' && cp >= 0xD800 && cp <= 0xDBFF && pos + 6 <= src.size() && src[pos] == '\\' && src[pos + 1] == 'u') {
+                        size_t p2 = pos + 2;
+                        uint32_t lo = 0;
+                        if (read_hex(src, p2, 4, lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp  = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            pos = p2;
+                        }
+                    }
+                    append_utf8(str, cp);
+                    continue;
+                }
+                if (escaped_char >= '0' && escaped_char <= '7') {   // octal, up to 3 digits (\0 = NUL)
+                    uint32_t cp = (uint32_t) (escaped_char - '0');
+                    for (int k = 0; k < 2 && pos < src.size() && src[pos] >= '0' && src[pos] <= '7'; ++k) {
+                        cp = cp * 8 + (uint32_t) (src[pos++] - '0');
+                    }
+                    append_utf8(str, cp);
+                    continue;
+                }
+                if (escaped_char == 'a') {
+                    str += '\a';
+                    continue;
+                }
+                // Python keeps an unknown escape as written (backslash + char)
+                str += '\\';
+                str += escaped_char;
                 continue;
             }
 

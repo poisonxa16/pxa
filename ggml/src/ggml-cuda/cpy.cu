@@ -1144,8 +1144,45 @@ bool ggml_cuda_cpy_n(ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int 
     return true;
 }
 
+// PXA_KV_Q4_CPY2 (2026-10-19; default 0, the one-V100 qwen35 rule sets 1): the decode K and V stores into a
+// q4_0 cache (CPY f32 -> q4_0, adjacent, the G2-F5c CPY + VIEW + CPY pattern) in ONE launch. Each thread quantizes one 32-
+// element block with the same cpy_blck_f32_q4_0 (quantize_f32_q4_0_block) the two cpy_f32_q launches run, on the same
+// contiguous source floats into the same destination block: bit-identical. Saves a launch + a boundary per attention layer.
+static bool pxa_kv_q4_cpy2_on() {
+    static const bool v = [](){ const char * e = getenv("PXA_KV_Q4_CPY2"); return e && atoi(e) != 0; }();
+    return v;
+}
+static __global__ void cpy_f32_q4_0_2(const float * __restrict__ x1, const float * __restrict__ x2,
+                                      char * __restrict__ y1, char * __restrict__ y2, const int nb1, const int nb2) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i < nb1) {
+        cpy_blck_f32_q4_0((const char *)(x1 + (int64_t)QK4_0*i), y1 + (int64_t)i*sizeof(block_q4_0));
+    } else if (i < nb1 + nb2) {
+        const int j = i - nb1;
+        cpy_blck_f32_q4_0((const char *)(x2 + (int64_t)QK4_0*j), y2 + (int64_t)j*sizeof(block_q4_0));
+    }
+}
+
 bool ggml_cuda_cpy_2(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const ggml_tensor * src2,
         ggml_tensor * dst1, ggml_tensor * dst2, bool disable_indirection) {
+    if (src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst1->type == GGML_TYPE_Q4_0 && dst2->type == GGML_TYPE_Q4_0) {
+        if (!pxa_kv_q4_cpy2_on()) return false;
+        if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(src2) || !ggml_is_contiguous(dst1) || !ggml_is_contiguous(dst2)) return false;
+        const int64_t n1 = ggml_nelements(src1), n2 = ggml_nelements(src2);
+        if (n1 != ggml_nelements(dst1) || n2 != ggml_nelements(dst2) || n1 % QK4_0 || n2 % QK4_0) return false;
+        if (n1/QK4_0 + n2/QK4_0 > 0x3fffffff) return false;
+#if defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS) || defined(GGML_MUSA_GRAPHS)
+        if (ctx.cur_graph && ctx.cur_graph->use_cpy_indirection && !disable_indirection) return false;   // the indirect copies keep their own launches
+#else
+        GGML_UNUSED(disable_indirection);
+#endif
+        const int nb1 = (int)(n1/QK4_0), nb2 = (int)(n2/QK4_0);
+        const int nblk = (nb1 + nb2 + CUDA_CPY_BLOCK_SIZE - 1)/CUDA_CPY_BLOCK_SIZE;
+        cpy_f32_q4_0_2<<<nblk, CUDA_CPY_BLOCK_SIZE, 0, ctx.stream()>>>((const float *)src1->data, (const float *)src2->data,
+                (char *)dst1->data, (char *)dst2->data, nb1, nb2);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     if (src1->type != GGML_TYPE_F32 || src2->type != GGML_TYPE_F32) return false;
     if (dst1->type != GGML_TYPE_F16 && dst1->type != GGML_TYPE_BF16) return false;
     if (dst2->type != GGML_TYPE_F16 && dst2->type != GGML_TYPE_BF16) return false;

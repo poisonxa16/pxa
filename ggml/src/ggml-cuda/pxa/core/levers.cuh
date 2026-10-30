@@ -87,6 +87,7 @@ enum pxa_lever_id {
     PXA_LEVER_CPY_FASTDIV,       // fastdiv index math in the float cpy kernel
     PXA_LEVER_GETROWS_NARROW,    // flattened narrow-row get_rows launch
     PXA_LEVER_TOPK_MOE_MULTIROW, // block-wide aliasing barrier for the multi-row fused top-k MoE router
+    PXA_LEVER_TURING_CUBLAS_NE11, // sm_75 standard-quant MMQ/cuBLAS crossover (0 = MMQ always)
     PXA_LEVER_COUNT
 };
 

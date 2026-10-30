@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "pxa/fattn-longpf.cuh"
 #include "fattn-tile-f16.cuh"
 #include "fattn-tile-f32.cuh"
 #include "fattn-vec-f16-interface.cuh"
@@ -36,6 +37,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // The window as the router sees it, taken before any rewrite: the SWA slice zeroes
     // op_params[4] on the node it hands the kernel, and routing has always used the original.
     const int32_t n_swa = ((const int32_t *) dst->op_params)[4];
+    if (n_swa == 0 && ggml_cuda_pxa_fa_longpf_try(ctx, dst)) {   // PXA_FA_LONGPREFILL (opt-in): sm_60 head-256 prompt attention
+        return;
+    }
 
     pxa_fa_scratch_t scratch;
     ggml_tensor * node = pxa_fa_prepare_node(dst, scratch);

@@ -79,6 +79,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MIMO2,           "mimo2"        },
     { LLM_ARCH_SEED_OSS,        "seed_oss"     },
     { LLM_ARCH_STEP35,          "step35"       },
+    { LLM_ARCH_FLINT,           "flint"        },
     { LLM_ARCH_LAGUNA,          "laguna"       },
     { LLM_ARCH_GLM_DSA,         "glm-dsa"      },
     { LLM_ARCH_MISTRAL4,        "mistral4"     },
@@ -88,12 +89,16 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MUSE_GLIMMER,    "muse-glimmer" },
     { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
     { LLM_ARCH_DEEPSEEK4_DSPARK, "deepseek4-dspark" },
+    { LLM_ARCH_DEEPSEEK41,      "deepseek41"   },
     // PXA_GLM5NEXT: GLM-5.3-Flash. Upstream PR #27773 registers the string "glm5-next", but
     // the GGUFs people actually have (unsloth/GLM-5.3-Flash-GGUF, and Unsloth's own branch)
     // write "glm5next" with no hyphen, and the KV prefix follows the arch string, so the two
     // spellings are two different key namespaces. Ours is the unhyphenated one because that is
     // what the weights on disk say; llama_model_loader maps the hyphenated alias onto it.
     { LLM_ARCH_GLM5NEXT,        "glm5next"     },
+    { LLM_ARCH_NEMOTRON,        "nemotron"       },
+    { LLM_ARCH_NEMOTRON_H,      "nemotron_h"     },
+    { LLM_ARCH_NEMOTRON_H_MOE,  "nemotron_h_moe" },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -144,6 +149,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_FEED_FORWARD_LENGTH,               "%s.feed_forward_length"               },
     { LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        "%s.expert_feed_forward_length"        },
     { LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, "%s.expert_shared_feed_forward_length" },
+    { LLM_KV_MOE_LATENT_SIZE,                   "%s.moe_latent_size"                   },
     { LLM_KV_USE_PARALLEL_RESIDUAL,             "%s.use_parallel_residual"             },
     { LLM_KV_TENSOR_DATA_LAYOUT,                "%s.tensor_data_layout"                },
     { LLM_KV_EXPERT_COUNT,                      "%s.expert_count"                      },
@@ -199,6 +205,26 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DSPARK_NOISE_TOKEN_ID,                "dspark.noise_token_id"                   },
     { LLM_KV_DSPARK_TARGET_LAYER_IDS,              "dspark.target_layer_ids"                 },
 
+    // DeepSeek-V4.1: verbatim from the ISTA GGUF header (mixed "." and "_" forms are real)
+    { LLM_KV_ATTENTION_CANDIDATE_BLOCK_SIZE,       "%s.attention.candidate_block_size"       },
+    { LLM_KV_ATTENTION_CANDIDATE_TOPK_BLOCKS,      "%s.attention.candidate_topk_blocks"      },
+    { LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER_ID,  "%s.attention.candidate_source_layer_id"  },
+    { LLM_KV_KV_SOURCE_LAYER_IDS,                  "%s.kv_source_layer_ids"                  },
+    { LLM_KV_INDEX_SOURCE_LAYER_IDS,               "%s.index_source_layer_ids"               },
+    { LLM_KV_DSV41_DSPARK_TARGET_LAYER_IDS,        "%s.dspark_target_layer_ids"              },
+    { LLM_KV_EXPERT_SCORING_FUNC,                  "%s.expert_scoring_func"                  },
+    { LLM_KV_ENGRAM_PRESENT,                       "%s.engram.present"                       },
+    { LLM_KV_ENGRAM_LAYER_IDS,                     "%s.engram.layer_ids"                     },
+    { LLM_KV_ENGRAM_NUM_EMBEDDINGS,                "%s.engram.num_embeddings"                },
+    { LLM_KV_ENGRAM_HEAD_DIM,                      "%s.engram_head_dim"                      },
+    { LLM_KV_ENGRAM_N_HEADS,                       "%s.engram_n_heads"                       },
+    { LLM_KV_ENGRAM_MAX_NGRAM_SIZE,                "%s.engram_max_ngram_size"                },
+    { LLM_KV_ENGRAM_VOCAB_SIZE,                    "%s.engram_vocab_size"                    },
+    { LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE,         "%s.engram_compressed_vocab_size"         },
+    { LLM_KV_ENGRAM_PAD_TOKEN_ID,                  "%s.engram_pad_token_id"                  },
+    { LLM_KV_ENGRAM_SOURCE,                        "%s.engram.source"                        },
+    { LLM_KV_ENGRAM_FILE,                          "%s.engram.file"                          },
+
     { LLM_KV_ATTENTION_HEAD_COUNT,             "%s.attention.head_count"             },
     { LLM_KV_ATTENTION_HEAD_COUNT_KV,          "%s.attention.head_count_kv"          },
     { LLM_KV_ATTENTION_MAX_ALIBI_BIAS,         "%s.attention.max_alibi_bias"         },
@@ -213,6 +239,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, "%s.attention.relative_buckets_count" },
     { LLM_KV_ATTENTION_SLIDING_WINDOW,         "%s.attention.sliding_window"         },
     { LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, "%s.attention.sliding_window_pattern" },
+    { LLM_KV_ATTENTION_ROPE_PATTERN,           "%s.attention.rope_pattern"           },
     { LLM_KV_ATTENTION_SCALE,                  "%s.attention.scale"                  },
     { LLM_KV_ATTENTION_OUTPUT_SCALE,           "%s.attention.output_scale"           },
     { LLM_KV_ATTENTION_TEMPERATURE_LENGTH,     "%s.attention.temperature_length"     },
@@ -284,6 +311,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_TOKENIZER_ADD_SEP,              "tokenizer.ggml.add_sep_token"            },
     { LLM_KV_TOKENIZER_ADD_PREFIX,           "tokenizer.ggml.add_space_prefix"         },
     { LLM_KV_TOKENIZER_REMOVE_EXTRA_WS,      "tokenizer.ggml.remove_extra_whitespaces" },
+    { LLM_KV_TOKENIZER_METASPACE_PREPEND,    "tokenizer.ggml.metaspace.prepend_scheme" },
     { LLM_KV_TOKENIZER_PRECOMPILED_CHARSMAP, "tokenizer.ggml.precompiled_charsmap"     },
     { LLM_KV_TOKENIZER_HF_JSON,              "tokenizer.huggingface.json"              },
     { LLM_KV_TOKENIZER_RWKV,                 "tokenizer.rwkv.world"                    },
@@ -337,6 +365,9 @@ bool llm_arch_is_recurrent(const llm_arch & arch) {
 
 bool llm_arch_is_hybrid(const llm_arch & arch) {
     switch (arch) {
+    // PXA Nemotron port: Mamba-2 layers keep their conv + scan state in the s_l rows (same storage as DeltaNet)
+    case LLM_ARCH_NEMOTRON_H:
+    case LLM_ARCH_NEMOTRON_H_MOE:
     case LLM_ARCH_QWEN3NEXT:
     case LLM_ARCH_QWEN35MOE:
     case LLM_ARCH_QWEN35:

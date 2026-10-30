@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -41,3 +42,21 @@ struct common_reasoning_budget_ctx * common_reasoning_budget_init(
     common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const common_reasoning_budget_ctx * smpl);
+
+// PXA 2026-10-26 (#361/#362): the thinking budget a request can still honour in its slot. A budget larger than the
+// room left after the prompt can never fire: the thought runs into the end of the context, a context shift (n_keep 1)
+// drops the question, and the reply ends with an empty answer (Swift Flash-Next, -c 4096 with --reasoning-budget
+// 128000: 28,791 thinking tokens, no content). Fit it to the room minus an answer reserve of min(1024, room/4)
+// tokens. budget < 0 (unlimited: no sampler at all), n_ctx <= 0 (unknown) and budgets that already fit come back
+// unchanged; no room at all -> 0 (the thought closes at once). The server's off switch: PXA_RBUDGET_FIT_CTX=0.
+inline int32_t common_reasoning_budget_fit_ctx(int32_t budget, int32_t n_ctx, int32_t n_prompt) {
+    if (budget < 0 || n_ctx <= 0) {
+        return budget;
+    }
+    const int32_t room = n_ctx - std::max<int32_t>(n_prompt, 0);
+    if (room <= 0) {
+        return 0;
+    }
+    const int32_t fit = room - std::min<int32_t>(1024, room / 4);
+    return budget > fit ? fit : budget;
+}

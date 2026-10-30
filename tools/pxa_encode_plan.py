@@ -26,7 +26,7 @@ MIB = float(1 << 20)
 # ---------------------------------------------------------------------------------------------
 # tier catalog
 # ---------------------------------------------------------------------------------------------
-# bpw = the tier's bits per weight on the quantized linear layers ( and 8; the classic
+# bpw = the tier's bits per weight on the quantized linear layers (docs/pxqn-format-spec.md sections 1 and 8; the classic
 # PXQ tiers are the equal-bytes originals). cls = the quality-class label users see (owner 2026-09-30: keep the tier names,
 # add a measured class). kld = assistant-token KLD vs the BF16 model, Qwen3.8-27B, pxqn-ladder scoreboard (2026-09); None
 # means it has not been measured, and the label then says "about" and measured=False.

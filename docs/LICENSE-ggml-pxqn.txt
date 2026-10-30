@@ -1,0 +1,21 @@
+PXQN library licence (ggml-pxqn.dll, libggml-pxqn.so)
+=====================================================
+
+Copyright (c) 2026 PXA Network (https://pxanetwork.com). All rights reserved.
+
+The PXQN library is the part of PXA that runs PXQN models. It is not covered by the MIT License in LICENSE;
+these terms apply to it instead.
+
+1. Use. You may use the PXQN library free of charge, on any number of your own machines, together with PXA
+   or a program built from the PXA source code.
+2. Copies. You may copy and pass on the PXQN library only unmodified and only together with this file. You may
+   not charge anyone for it, alone or as part of a bundle.
+3. No changes. You may not modify, decompile, disassemble or reverse engineer the PXQN library, except where
+   the law of your country allows it in spite of this clause.
+4. Do not remove or work around any licence or model check in the PXQN library.
+5. No warranty. The PXQN library is provided "as is", without warranty of any kind. In no event shall the
+   authors or copyright holders be liable for any claim, damages or other liability arising from the use of
+   the library.
+6. End. These terms end automatically if you break them; you must then delete your copies.
+
+Questions: https://discord.pxanetwork.com

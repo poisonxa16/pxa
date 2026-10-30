@@ -16,7 +16,9 @@ add_library(mtmd
 target_link_libraries     (mtmd PUBLIC ggml llama)
 target_link_libraries     (mtmd PRIVATE Threads::Threads)
 target_include_directories(mtmd PUBLIC  .)
-target_include_directories(mtmd PRIVATE ../..)
+if (NOT WIN32)   # the repo root's VERSION file would shadow <version> on Windows (case-insensitive); mtmd needs only vendor/
+    target_include_directories(mtmd PRIVATE ../..)
+endif()
 target_include_directories(mtmd PRIVATE ../../vendor)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 

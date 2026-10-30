@@ -29,6 +29,16 @@ static_assert(sizeof(mmq_ids_helper_store) == 4, "unexpected size for mmq_ids_he
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
 // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
+//
+// Bug #345 (2026-10-22): a slot whose id is not an expert of this stack (id < 0 or id >= n_experts) is skipped,
+// the way the CPU mul_mat_id and the MMVQ id kernels skip it. -1 is the SER convention, and the PXA_XCACHE split
+// (GGML_OP_MOE_SPLIT_IDS) writes it on each side for every expert that lives on the other side. Before the fix a
+// negative id still counted as "a lower expert" in nex_prev, so expert_bounds[0] started at the number of such
+// slots and the compact columns [0, n_skipped) were never written: quantize_mmq_q8_1_cuda_id then gathered src1
+// rows through uninitialized pool memory -> CUDA illegal memory access (mainline Q4_K_M Nemotron 3.5 Bolt 74B on
+// 1x V100: hot/cold split + gate-less experts on the MMQ id path). Now only valid ids are counted, and the last
+// block points the unused tail [n_valid, n_tokens*n_expert_used) at row 0, so the gather stays in bounds. With
+// only valid ids (every path that ran before) n_valid == n_tokens*n_expert_used and nothing changes.
 template <int n_expert_used_template>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mmq_ids_helper(
@@ -50,7 +60,7 @@ static __global__ void mmq_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used >= 0 && expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -75,7 +85,7 @@ static __global__ void mmq_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -108,13 +118,22 @@ static __global__ void mmq_ids_helper(
         ids_dst [nex_prev + itc] = it*n_expert_used + iex_used;
     }
 
+    const bool last_expert = expert == (int) gridDim.x - 1;
+    if (last_expert) {
+        // columns that belong to no expert (skipped ids, see above): row 0 for the q8_1 gather, never read by a tile
+        const int n_slots = n_tokens*n_expert_used;
+        for (int i = nex_prev + it_compact + threadIdx.x; i < n_slots; i += warp_size) {
+            ids_src1[i] = 0;
+        }
+    }
+
     if (threadIdx.x != 0) {
         return;
     }
 
     expert_bounds[expert] = nex_prev;
 
-    if (expert < gridDim.x - 1) {
+    if (!last_expert) {
         return;
     }
 
@@ -248,6 +267,28 @@ void compute_row_ids(const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// PXA (v4-fix-mmq-id-host-experts): zero the allocation padding behind a quantised src0 that
+// lives in a COMPUTE buffer (a host-resident weight the scheduler copied to the device), so the
+// MMQ tiles that read past the last row's ne0 meet zeros, not garbage. The padding is
+// [data + ggml_nbytes, data + alloc_size): ggml_nbytes is the end extent of the tensor's
+// furthest row whatever its strides, and alloc_size is that plus the row padding the CUDA buffer
+// type adds, so the range is the tensor's own padding for ANY layout. The old check also asserted
+// ggml_is_contiguously_allocated(src0), which a strided weight fails: the scheduler's copy of a
+// half of a merged ffn_gate_up_exps (ggml_split_merged_up_gate views; ggml_dup_tensor_layout keeps
+// the merged strides) aborted every Gemma 4 QAT run with host-placed experts at this line.
+// A view would make the range belong to its parent, so views still assert.
+void ggml_cuda_mmq_id_clear_src0_padding(const ggml_tensor * src0, cudaStream_t stream) {
+    if (!src0 || !src0->buffer || ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return;
+    }
+    const size_t size_data  = ggml_nbytes(src0);
+    const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+    if (size_alloc > size_data) {
+        GGML_ASSERT(!src0->view_src);
+        CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+    }
+}
+
 void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids_tensor, ggml_tensor * dst, char * ids_data, char * src1_quantized_data) {
     GGML_ASSERT(       src1->type == GGML_TYPE_F32);
@@ -276,15 +317,12 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
-    // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-        const size_t size_data  = ggml_nbytes(src0);
-        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
-        if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
-            GGML_ASSERT(!src0->view_src);
-            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
-        }
+    // If src0 is a temporary compute buffer, clear any potential padding. Only for a whole tensor
+    // (ids_tensor != nullptr): the per-expert loops in ggml-cuda.cu pass one expert's slice with
+    // ids_tensor == nullptr, and the "tail" of a slice is the NEXT expert's first row -- they clear
+    // the whole tensor once before their loop (ggml_cuda_mmq_id_clear_src0_padding).
+    if (ids_tensor) {
+        ggml_cuda_mmq_id_clear_src0_padding(src0, stream);
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -465,6 +503,15 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         return false;
     }
 
+    // PXA (2026-10-21): mmq_ids_helper stages one entry per token of the ubatch (ne11 =
+    // src1->ne[2] at both callers) in dynamic shared memory, opted in to the card's per-block maximum. A wider
+    // ubatch cannot launch it (sm_60/61 48 KB = 12288 tokens, sm_75 16384, sm_70 24576, sm_86/89 25344) and
+    // nothing checked that launch. Such a ubatch takes the generic MUL_MAT_ID path; every ubatch that could
+    // launch before keeps this path unchanged.
+    if ((size_t) ne11 * sizeof(mmq_ids_helper_store) > ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
+        return false;
+    }
+
     if (turing_mma_available(cc)) {
         return true;
     }
@@ -486,7 +533,7 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         // GemmEx fallback (volta_h884gemm tensor cores; same path the P100 fp16-GEMM fix
         // rides, incl. the MOE_FUSED_UP_GATE precision-alias fix + MXFP4 V2 dequant).
         // Unset/0 = MMQ always (previous behavior). Decode (tiny ne11) stays MMQ/MMVQ.
-        if (cc >= CC_VOLTA && cc < CC_TURING) {
+        if (cc >= PXA_CC_VOLTA && cc < PXA_CC_TURING) {
             static const char * pxa_vci_env  = getenv("PXA_VOLTA_CUBLAS_ID_NE11");
             // Default 2048 (2026-09-30, , Gemma 4 26B-A4B UD-Q4_K_XL / QAT q4_0 on V100:
             // ub2048 pp4096 2674 -> 2780, pp512 unchanged since ne11 < 2048 keeps MMQ; ub1024 unchanged).
@@ -496,7 +543,7 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
                 return false;
             }
         }
-        return cc < CC_TURING || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+        return cc < PXA_CC_TURING || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
 
    if (amd_mfma_available(cc)) {

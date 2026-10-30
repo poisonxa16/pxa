@@ -38,6 +38,7 @@
 // SHARED with PXQ6, so PXA_PXQ6_SUB overrides it for all three code widths at once.
 #pragma once
 
+#include "pxa-env-flag.h"
 #include "../../../include/ggml-pxq2-tables.h"
 #include "../../../include/ggml-pxq3-tables.h"
 #include "../../../include/ggml-pxq1-tables.h"
@@ -76,7 +77,7 @@ static inline bool pxa_pxq1_book_ok(const float * b) {
 static inline bool pxa_pxq1_enabled() {
     static const bool on = [](){
         const char * e = getenv("PXA_PXQ1");
-        bool v = !(e && atoi(e) == 0);
+        bool v = !(e && pxa_env_value_off(e));
         if (v) {
             static const float book[2] = PXQ1_BOOK_INIT;
             if (!pxa_pxq1_book_ok(book)) {
@@ -96,7 +97,7 @@ static inline bool pxa_pxq1_enabled() {
 static inline bool pxa_pxq2_enabled() {
     static const bool on = [](){
         const char * e = getenv("PXA_PXQ2");
-        bool v = !(e && atoi(e) == 0);
+        bool v = !(e && pxa_env_value_off(e));
         if (v) {
             static const float book[4] = PXQ2_BOOK_INIT;
             if (!pxa_pxq23_book_ok(book, 4)) {
@@ -116,7 +117,7 @@ static inline bool pxa_pxq2_enabled() {
 static inline bool pxa_pxq3_enabled() {
     static const bool on = [](){
         const char * e = getenv("PXA_PXQ3");
-        bool v = !(e && atoi(e) == 0);
+        bool v = !(e && pxa_env_value_off(e));
         if (v) {
             static const float book[8] = PXQ3_BOOK_INIT;
             if (!pxa_pxq23_book_ok(book, 8)) {

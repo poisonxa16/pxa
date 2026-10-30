@@ -6,14 +6,17 @@ beyond 127.0.0.1: cards come from PXA_LAUNCH_FAKE_GPUS and the "engine" is a stu
     python3 tests/test-pxa-control.py          (wired into CTest as test-pxa-control)
 """
 import contextlib
+import hashlib
 import http.server
 import io
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import socketserver
+import struct
 import sys
 import tempfile
 import threading
@@ -28,9 +31,12 @@ TOOLS = os.path.join(ROOT, "tools")
 TMP = tempfile.mkdtemp(prefix="pxa-control-test-")
 os.environ["PXA_LAUNCH_FAKE_GPUS"] = "2x600"
 os.environ["PXA_CONTROL_CONFIG_DIR"] = os.path.join(TMP, "cfg")
+os.environ["PXA_STORE_URL"] = ""          # hermetic: the fixture store, never the live licd (the release default)
 os.environ["PXA_LAUNCH_STATE"] = os.path.join(TMP, "state")
 os.environ.pop("PXA_MODELS_DIR", None)
 os.environ["PXA_CONTROL_DISCOVER"] = "0"      # hermetic: never list the host's real servers
+for _k in ("PXQE_CUDA_LIBS", "PXQE_RUNTIME_DIR", "PXQE_ENGINE"):   # hermetic: test_08 models a computer without the CUDA 12 libraries
+    os.environ.pop(_k, None)
 for _k in ("DISPLAY", "WAYLAND_DISPLAY", "PXA_CONTROL", "PXA_CONTROL_SPAWNED", "PXA_CONTROL_IDLE_S", "PXA_CONTROL_TOKEN"):
     os.environ.pop(_k, None)                  # no browser opens, and the auto-start rule starts from its defaults
 sys.path.insert(0, TOOLS)
@@ -40,6 +46,10 @@ L = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(L)
 import pxa_control as C  # noqa: E402
 
+_bspec = importlib.util.spec_from_file_location("pxa_bench_real", os.path.join(TOOLS, "pxa-bench.py"))
+BENCH = importlib.util.module_from_spec(_bspec)        # the real summarize_runs / run_tag (FR#12 honest repeats)
+_bspec.loader.exec_module(BENCH)
+
 MODELS = os.path.join(TMP, "models")
 os.makedirs(MODELS, exist_ok=True)
 FAKE_MODEL = os.path.join(MODELS, "tiny.gguf")
@@ -48,14 +58,34 @@ with open(FAKE_MODEL, "wb") as f:
 CATALOG = {"PXA_ENHANCE", "PXA_CUDA_GRAPH_LRU", "PXQ_TEST"}
 
 
+TOKENS = {}          # port -> the session token of an in-process Control on loopback (H1: every API call needs it)
+
+
 def serve_app(app):
     srv = C.make_server(app, "127.0.0.1", 0)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    if app.token and not app.lan:
+        TOKENS[srv.server_address[1]] = app.token
     return srv, srv.server_address[1]
 
 
-def req(port, path, method="GET", body=None, headers=None, host=None):
+def token_for(port):
+    """the token a loopback Control on port wants: a live run record's first (TOKENS keeps closed test servers'
+    tokens, and a spawned Control can get their port back), else the one this test serves."""
+    for rec in C.running_controls():
+        if rec.get("port") == port and rec.get("token") and not rec.get("lan"):
+            return rec["token"]
+    return TOKENS.get(port)
+
+
+def req(port, path, method="GET", body=None, headers=None, host=None, auth=True):
+    """auth=True signs a request to a loopback Control in like its own page would (the X-PXA-Token header),
+    unless the caller already carries a cookie, a token header or a bearer; auth=False sends none."""
     h = dict(headers or {})
+    if auth and not any(k.lower() in ("cookie", "x-pxa-token", "authorization") for k in h):
+        t = token_for(port)
+        if t:
+            h["X-PXA-Token"] = t
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -247,10 +277,636 @@ class LaunchValidation(unittest.TestCase):
                          "longdoc")
         self.assertNotIn("--workload", C.launcher_argv(self.v()))
 
+    def test_ngram_toggle(self):
+        # auto (the default) sets nothing: the engine decides; on/off pin the engine switch; anything else is refused
+        r = self.v(mtp=True)
+        self.assertEqual(r["ngram"], "auto")
+        self.assertNotIn("PXA_SPEC_MTP_NGRAM", r["levers"])
+        self.assertEqual(self.v(mtp=True, ngram="on")["levers"]["PXA_SPEC_MTP_NGRAM"], "1")
+        off = self.v(mtp=True, ngram="off", levers={"PXA_ENHANCE": "1"})
+        self.assertEqual(off["levers"], {"PXA_ENHANCE": "1", "PXA_SPEC_MTP_NGRAM": "0"})
+        self.assertTrue(C.cli_line(off).startswith("PXA_ENHANCE=1 PXA_SPEC_MTP_NGRAM=0 pxa-launch "))
+        self.assertIn(["--spec", "mtp"], [C.launcher_argv(off)[i:i + 2] for i in range(len(C.launcher_argv(off)))])
+        for bad in ("yes", 1, "ON", "auto; id", ["on"], {"a": 1}):
+            with self.assertRaises(C.Invalid, msg=repr(bad)):
+                self.v(ngram=bad)
+        ui = open(os.path.join(TOOLS, "pxa_control_ui", "index.html")).read()
+        self.assertIn('id="l-ngram"', ui)
+        self.assertIn('ngram: $("#l-ngram").dataset.v', ui)
+
     def test_cli_line_quotes(self):
         r = self.v(levers={"PXA_ENHANCE": "0"})
         line = C.cli_line(r)
         self.assertTrue(line.startswith("PXA_ENHANCE=0 pxa-launch --gpus 0"))
+
+
+class OverdriveLine(unittest.TestCase):
+    """od_line lifts the launcher's one-line Overdrive verdict onto the plan heading.
+
+    The heading is the only place an operator sees WHICH setup the plan picked without
+    expanding the report, so the extraction has to survive the report's real shape (the
+    verdict line is indented, and the block below it is indented further) and must return
+    None - never a half-line - for a model of another class."""
+
+    def test_lifts_the_verdict_and_collapses_whitespace(self):
+        text = ("  class: qwen4exp\n"
+                "  OVERDRIVE: this file is the measured Flash-Next class - 24 switches will be\n"
+                "             exported (incl. PXA_XCACHE_MTP=1).\n"
+                "  Overdrive is on because this class is what it was measured on.\n")
+        self.assertEqual(C.od_line(text),
+                         "OVERDRIVE: this file is the measured Flash-Next class - 24 switches will be")
+
+    def test_off_and_absent_are_both_carried(self):
+        self.assertTrue(C.od_line("  OVERDRIVE: OFF (PXA_NO_OVERDRIVE=1).").startswith("OVERDRIVE: OFF"))
+        self.assertTrue(C.od_line("  Overdrive    APPLIES: arch qwen4exp").startswith("Overdrive APPLIES"))
+        self.assertIsNone(C.od_line("  class: qwen35moe\n  recipe: something\n"))
+        self.assertIsNone(C.od_line(""))
+        self.assertIsNone(C.od_line(None))
+
+
+# ---- box topology fixtures (2026-10-12) ------------------------------
+# CriticalTechGuy's host: dual Xeon E5-2640 v2 (8 cores / 16 threads per socket, NO AVX2), NUMA node0 =
+# 0-30:2 and node1 = 1-31:2 (INTERLEAVED numbering), GPU0 on node 0, GPU1 on node 1, GPU0<->GPU1 = SYS.
+CTG_TOPO = ("\t\x1b[4mGPU0\tGPU1\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\x1b[0m\n"
+            "GPU0\t X \tSYS\t0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30\t0\t\tN/A\n"
+            "GPU1\tSYS\t X \t1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31\t1\t\tN/A\n\n"
+            "Legend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect\n")
+CTG_LSCPU = ("Architecture:            x86_64\nCPU(s):                  32\n"
+             "Model name:              Intel(R) Xeon(R) CPU E5-2640 v2 @ 2.00GHz\n"
+             "Thread(s) per core:      2\nCore(s) per socket:      8\nSocket(s):               2\n"
+             "Flags:                   fpu vme de pse tsc msr sse sse2 ssse3 sse4_1 sse4_2 popcnt aes avx f16c rdrand\n"
+             "NUMA node(s):            2\nNUMA node0 CPU(s):       0-30:2\nNUMA node1 CPU(s):       1-31:2\n")
+# this box: 2x E5-2699 v3, node0 = 0-17,36-53, all seven cards on node 0 behind host bridges (PHB)
+BOX_TOPO = ("\tGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\n"
+            + "".join("GPU%d\t" % i + "\t".join(" X " if j == i else "PHB" for j in range(7))
+                      + "\t0-17,36-53\t0\t\tN/A\n" for i in range(7)))
+BOX_LSCPU = ("Model name: Intel(R) Xeon(R) CPU E5-2699 v3 @ 2.30GHz\nSocket(s): 2\nThread(s) per core: 2\n"
+             "Flags: fpu sse sse2 avx avx2 fma f16c\nNUMA node0 CPU(s): 0-17,36-53\nNUMA node1 CPU(s): 18-35,54-71\n")
+BOX_SIB = {c: frozenset({c, c + 36}) for c in range(36)}
+BOX_SIB.update({c + 36: frozenset({c, c + 36}) for c in range(36)})
+# a 4-GPU single-socket workstation: one node, cards behind a PLX switch (PXB) and a host bridge
+WS4_TOPO = ("\tGPU0\tGPU1\tGPU2\tGPU3\tCPU Affinity\tNUMA Affinity\n"
+            "GPU0\t X \tPXB\tPHB\tPHB\t0-23\t0\nGPU1\tPXB\t X \tPHB\tPHB\t0-23\t0\n"
+            "GPU2\tPHB\tPHB\t X \tPXB\t0-23\t0\nGPU3\tPHB\tPHB\tPXB\t X \t0-23\t0\n")
+WS4_LSCPU = "Model name: AMD Ryzen Threadripper 2920X\nSocket(s): 1\nFlags: avx avx2 fma\nNUMA node0 CPU(s): 0-23\n"
+
+
+def _topo(topo_txt, lscpu_txt, allowed=None, sib=None, container=False, nice=None, cache_mount=None):
+    tt, lt = L.parse_nvidia_topo(topo_txt), L.parse_lscpu(lscpu_txt)
+    return {"gpus": tt["gpus"], "links": tt["links"], "nodes": lt["nodes"], "sockets": lt["sockets"],
+            "flags": lt["flags"], "model": lt["model"], "siblings": sib or {}, "allowed": allowed,
+            "container": container, "cap_sys_nice": nice, "cache_dir": "/work/.cache/pxa",
+            "cache_mount": cache_mount, "source": "test"}
+
+
+class BoxTopology(unittest.TestCase):
+    """NUMA / socket detection and the CPU pool, against real `nvidia-smi topo -m` and `lscpu` text."""
+
+    def test_cpulist_strides_and_interleaving(self):
+        self.assertEqual(L._parse_cpulist("0-30:2"), set(range(0, 31, 2)))
+        self.assertEqual(L._parse_cpulist("1-31/2"), set(range(1, 32, 2)))
+        self.assertEqual(L._parse_cpulist("0-17,36-53"), set(range(18)) | set(range(36, 54)))
+        self.assertEqual(L._cpuset_to_list(set(range(0, 31, 2))), ",".join(str(c) for c in range(0, 31, 2)))
+        self.assertEqual(L._sysfs_bus_id("00000000:02:00.0"), "0000:02:00.0")
+
+    def test_his_box_parses(self):
+        t = _topo(CTG_TOPO, CTG_LSCPU)
+        self.assertEqual(t["gpus"][0]["numa"], 0)
+        self.assertEqual(t["gpus"][1]["numa"], 1)
+        self.assertEqual(t["links"][(0, 1)], "SYS")
+        self.assertEqual(t["nodes"][0], set(range(0, 31, 2)))
+        self.assertEqual(t["sockets"], 2)
+        self.assertNotIn("avx2", t["flags"])
+
+    def test_his_box_one_card_pins_to_its_own_node(self):
+        for card, node in ((0, 0), (1, 1)):
+            d = L.numa_decide(_topo(CTG_TOPO, CTG_LSCPU, allowed=set(range(32))), [card])
+            self.assertEqual(d["node"], node)
+            self.assertFalse(d["spans"])
+            self.assertEqual(L._parse_cpulist(d["pool"]), set(range(node, 32, 2)))   # never the other socket
+            self.assertEqual(d["warnings"], [])
+        # the preset's 0-15 would have named 8 CPUs of EACH socket
+        self.assertNotEqual(L._parse_cpulist("0-15"), set(range(0, 31, 2)))
+
+    def test_his_box_two_cards_warn_span(self):
+        d = L.numa_decide(_topo(CTG_TOPO, CTG_LSCPU, allowed=set(range(32))), [0, 1])
+        self.assertTrue(d["spans"])
+        self.assertIsNone(d["node"])
+        self.assertEqual(d["link"], "SYS")
+        self.assertTrue(any(w.startswith("spans: ") and "--gpus 0" in w for w in d["warnings"]))
+
+    def test_his_box_in_docker_without_sys_nice(self):
+        d = L.numa_decide(_topo(CTG_TOPO, CTG_LSCPU, allowed=set(range(32)), container=True, nice=False), [0])
+        self.assertTrue(any(w.startswith("sysnice: ") and "--cap-add SYS_NICE" in w for w in d["warnings"]))
+        d = L.numa_decide(_topo(CTG_TOPO, CTG_LSCPU, allowed=set(range(32)), container=True, nice=True), [0])
+        self.assertFalse(any(w.startswith("sysnice: ") for w in d["warnings"]))
+
+    def test_our_box_pool_is_the_measured_0_15(self):
+        t = _topo(BOX_TOPO, BOX_LSCPU, allowed=set(range(72)), sib=BOX_SIB)
+        for sel in ([0], [5, 6], [0, 1, 2, 4]):
+            d = L.numa_decide(t, sel)
+            self.assertEqual(d["node"], 0)
+            self.assertFalse(d["spans"])
+            self.assertEqual(d["pool"], "0-15")        # 16 physical cores of node 0 = the preset's measured pool
+            self.assertEqual(d["warnings"], [])
+        # a launcher held to the other socket (taskset 54-71) says so instead of silently using it
+        d = L.numa_decide(_topo(BOX_TOPO, BOX_LSCPU, allowed=set(range(54, 72)), sib=BOX_SIB), [5])
+        self.assertEqual(L._parse_cpulist(d["pool"]) - set(range(54, 72)), set())
+        self.assertTrue(any(w.startswith("cpuset: ") and "--cpuset-cpus=0-17,36-53" in w for w in d["warnings"]))
+
+    def test_four_gpu_single_node(self):
+        t = _topo(WS4_TOPO, WS4_LSCPU, allowed=set(range(24)))
+        self.assertEqual(t["links"][(0, 1)], "PXB")
+        d = L.numa_decide(t, [0, 1, 2, 3])
+        self.assertEqual(d["node"], 0)
+        self.assertFalse(d["spans"])
+        self.assertFalse(d["multi_node"])
+        self.assertEqual(d["warnings"], [])
+        self.assertEqual(len(L._parse_cpulist(d["pool"])), 16)
+
+    def test_no_numa_info_falls_back_to_allowed(self):
+        t = _topo("", "", allowed={2, 3, 4})
+        d = L.numa_decide(t, [0])
+        self.assertEqual(d["pool"], "2-4")
+        self.assertIn("allowed CPU set", d["pool_why"])
+
+
+class BoxDecisions(unittest.TestCase):
+    """KV / -b / -c for the Flash-Next class, the counts env, the cache volume and heat."""
+    FN = {"arch": "qwen4exp", "is_moe": True, "deltanet": True, "n_expert": 512, "tier": "PXQ_UNIVERSAL",
+          "mtp_tensors": 6, "kv_bytes_tok": 100352, "ple_bytes": 0}
+
+    def test_kv_pick_flashnext_only_on_p100_v100(self):
+        p100 = [(0, "P100", 60, 16384, 0, "u")]
+        self.assertEqual(L.flashnext_kv_pick(self.FN, p100), "q8_0")
+        self.assertEqual(L.flashnext_kv_pick(self.FN, [(0, "V100", 70, 16384, 0, "u")]), "q8_0")
+        self.assertIsNone(L.flashnext_kv_pick(self.FN, [(0, "3090", 86, 24576, 0, "u")]))
+        self.assertIsNone(L.flashnext_kv_pick({"arch": "qwen35"}, p100))
+
+    def test_never_b8192_on_16gb(self):
+        sel = [(0, "P100", 60, 16384, 0, "u"), (1, "P100", 60, 16384, 0, "u")]
+        cmd = ["x", "-b", "8192", "-ub", "256"]
+        line = L.flashnext_batch_cap(cmd, self.FN, sel, False)
+        self.assertEqual(cmd[2], "2048")
+        self.assertIn("DECISION batch: -b 2048 (not 8192)", line)
+        cmd = ["x", "-b", "8192", "-ub", "256"]
+        self.assertIsNone(L.flashnext_batch_cap(cmd, self.FN, sel, True))           # forced by the user
+        self.assertIsNone(L.flashnext_batch_cap(cmd, {"arch": "qwen35"}, sel, False))  # the dense cell keeps 8192
+        self.assertIsNone(L.flashnext_batch_cap(cmd, self.FN, [(0, "V100", 70, 32768, 0, "u")], False))
+        self.assertEqual(cmd[2], "8192")
+
+    def test_mtp_ctx_lowered_so_the_draft_floor_fits(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = os.path.join(d, "fn.gguf")
+            with open(m, "wb") as f:
+                f.truncate(int(27464 * 1048576))          # the 26.8 GiB on-card share of the 32 GB file
+            sel = [(0, "P100", 60, 16384, 0, "u"), (1, "P100", 60, 16384, 0, "u")]
+            c, line = L.mtp_ctx_fit(m, self.FN, sel, 32768, "f16", False, True)
+            self.assertEqual(c, 16384)
+            self.assertIn("lowered from 32768", line)
+            c, line = L.mtp_ctx_fit(m, self.FN, sel, 32768, "q8_0", False, True)   # q8_0 KV fits at 32k
+            self.assertEqual((c, line), (32768, None))
+            c, line = L.mtp_ctx_fit(m, self.FN, sel, 32768, "f16", True, True)     # the user's -c is kept, warned
+            self.assertEqual(c, 32768)
+            self.assertIn("DECISION !! ctx", line)
+            c, line = L.mtp_ctx_fit(m, self.FN, sel[:1], 32768, "f16", False, True)  # one card: the cache's job
+            self.assertEqual(c, 32768)
+            self.assertIn("expert cache plans", line)
+
+    def test_counts_env_states(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = os.path.join(d, "m.csv")
+            open(ok, "w").close()
+            self.assertEqual(L.counts_env_state(ok)[0], "ok")
+            self.assertEqual(L.counts_env_state(os.path.join(d, "new.csv"))[0], "write")
+            dang = os.path.join(d, "dang.csv")
+            os.symlink(os.path.join(d, "nowhere", "x.csv"), dang)
+            self.assertEqual(L.counts_env_state(dang)[0], "bad")
+            self.assertEqual(L.counts_env_state("")[0], "bad")
+            self.assertEqual(L.counts_env_state("/proc/no-such/x.csv")[0], "bad")
+            e = {"PXA_XCACHE_COUNTS": dang, "OTHER": "1"}
+            self.assertIn("DROPPED", L.scrub_counts_env(e))
+            self.assertNotIn("PXA_XCACHE_COUNTS", e)
+            e = {"PXA_XCACHE_COUNTS": ok}
+            self.assertIsNone(L.scrub_counts_env(e))
+            self.assertEqual(e["PXA_XCACHE_COUNTS"], ok)
+
+    def test_expert_map_under_either_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            store, rel = os.path.join(d, "store"), os.path.join(d, "release")
+            os.mkdir(store)
+            os.mkdir(rel)
+            real = os.path.join(store, "FN-32GB.relaid.gguf")
+            open(real, "w").close()
+            link = os.path.join(rel, "FN-32GB.gguf")
+            os.symlink(real, link)
+            csv = os.path.join(store, "FN-32GB.relaid.gguf.expert-counts.csv")
+            open(csv, "w").close()
+            self.assertEqual(L.overdrive_expert_map(link)[0], csv)          # map named after the real file
+            os.unlink(csv)
+            csv2 = link + ".expert-counts.csv"
+            open(csv2, "w").close()
+            self.assertEqual(L.overdrive_expert_map(link)[0], csv2)
+            os.symlink(real, os.path.join(store, "FN-32GB.gguf"))             # link beside the real file
+            os.unlink(csv2)
+            csv3 = os.path.join(store, "FN-32GB.gguf.expert-counts.csv")
+            open(csv3, "w").close()
+            self.assertEqual(L.overdrive_expert_map(real)[0], csv3)
+            # another model's map in the cache dir is never claimed
+            cache = os.path.join(d, "cache")
+            os.mkdir(cache)
+            open(os.path.join(cache, "other.gguf.expert-counts.csv"), "w").close()
+            os.unlink(csv3)
+            with mock_env(PXA_CACHE_DIR=cache):
+                self.assertIsNone(L.overdrive_expert_map(real)[0])
+
+    def test_box_decisions_his_box_flashnext(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n, txt in (("topo.txt", CTG_TOPO), ("lscpu.txt", CTG_LSCPU), ("allowed.txt", "0-31"),
+                           ("env.txt", "container=1\ncap_sys_nice=0\ncache_dir=/work/.cache/pxa\ncache_mount=/\n")):
+                with open(os.path.join(d, n), "w") as f:
+                    f.write(txt)
+            m = os.path.join(d, "fn.gguf")
+            open(m, "w").close()
+            with mock_env(PXA_LAUNCH_FAKE_TOPO=d, PXA_LAUNCH_FAKE_TEMPS="0:83,1:45"):
+                one = "\n".join(L.box_decisions(m, [0], self.FN, True))
+                two = "\n".join(L.box_decisions(m, [0, 1], self.FN, True))
+                dense = L.box_decisions(m, [0], {"arch": "qwen35"}, False)
+        self.assertIn("DECISION numa: card(s) 0 on node 0 of 2", one)
+        self.assertIn("PXA_XCACHE_CPUPOOL_CPUS=" + L._cpuset_to_list(set(range(0, 31, 2))), one)
+        self.assertIn("DECISION cpu-lib: compat (this CPU has no AVX2)", one)
+        self.assertIn("DECISION !! cache-volume", one)
+        self.assertIn("-v pxa-cache:/work/.cache/pxa", one)
+        self.assertIn("DECISION !! sys-nice", one)
+        self.assertIn("DECISION !! heat: card 0 83 C", one)
+        self.assertIn("DECISION !! cards-span-sockets", two)
+        # another model: only what is wrong (the hot card), nothing about pools or maps
+        self.assertEqual([x.split(":")[0] for x in dense], ["DECISION !! heat"])
+
+    def test_od_and_decision_lines_reach_the_plan_dict(self):
+        text = ("  OVERDRIVE: this file is the measured Flash-Next class\n"
+                "  DECISION kv: -ctk q8_0 -ctv q8_0 -- why   [override: --ctk]\n"
+                "  DECISION !! heat: card 0 83 C -- hot\n  not a decision\n")
+        self.assertEqual(C.decision_lines(text), ["kv: -ctk q8_0 -ctv q8_0 -- why [override: --ctk]",
+                                                  "!! heat: card 0 83 C -- hot"])
+        self.assertEqual(C.decision_lines(None), [])
+
+
+# ---- storage guard: fake sysfs trees (2026-10-13) -------------------------------------------
+class FakeSys:
+    """A sysfs tree under a temp dir, laid out the way a kernel does: devices under devices/<bus>/block/<name>,
+    /dev/block/<maj:min> and /class/block/<name> as RELATIVE symlinks to them, partitions inside their disk's
+    directory (no queue/ of their own), stacks (md, dm) under devices/virtual/block with slaves/<member> symlinks."""
+
+    def __init__(self, root):
+        self.root = root
+        self.dev = {}                       # name -> directory
+
+    def _link(self, name, maj, mnr, d):
+        for sub, leaf in (("dev/block", "%d:%d" % (maj, mnr)), ("class/block", name)):
+            os.makedirs(os.path.join(self.root, sub), exist_ok=True)
+            lp = os.path.join(self.root, sub, leaf)
+            os.symlink(os.path.relpath(d, os.path.dirname(lp)), lp)
+        self.dev[name] = d
+
+    def _flag(self, d, rot):
+        if rot is not None:
+            os.makedirs(os.path.join(d, "queue"), exist_ok=True)
+            with open(os.path.join(d, "queue", "rotational"), "w") as f:
+                f.write("%d\n" % rot)
+
+    def disk(self, name, rot, maj, mnr, bus="pci0000:00/0000:00:1f.2/ata1/host0/target0:0:0/0:0:0:0"):
+        d = os.path.join(self.root, "devices", bus, "block", name)
+        os.makedirs(d)
+        self._flag(d, rot)
+        self._link(name, maj, mnr, d)
+        return d
+
+    def part(self, disk, name, maj, mnr, n=1):
+        d = os.path.join(self.dev[disk], name)
+        os.makedirs(d)
+        with open(os.path.join(d, "partition"), "w") as f:
+            f.write("%d\n" % n)
+        self._link(name, maj, mnr, d)
+        return d
+
+    def stack(self, name, maj, mnr, members, own_flag=None, dm_name=None):
+        d = os.path.join(self.root, "devices", "virtual", "block", name)
+        os.makedirs(os.path.join(d, "slaves"))
+        for m in members:
+            os.symlink(os.path.relpath(self.dev[m], os.path.join(d, "slaves")), os.path.join(d, "slaves", m))
+        self._flag(d, own_flag)
+        if dm_name:
+            os.makedirs(os.path.join(d, "dm"))
+            with open(os.path.join(d, "dm", "name"), "w") as f:
+                f.write(dm_name + "\n")
+        self._link(name, maj, mnr, d)
+        return d
+
+    def loop(self, name, maj, mnr, backing):
+        d = os.path.join(self.root, "devices", "virtual", "block", name)
+        os.makedirs(os.path.join(d, "loop"))
+        with open(os.path.join(d, "loop", "backing_file"), "w") as f:
+            f.write(backing + "\n")
+        self._flag(d, 0)                    # a loop device says "not rotational" whatever is under it
+        self._link(name, maj, mnr, d)
+
+
+def mi(mount, majmin, fstype, source, root="/"):
+    """one /proc/self/mountinfo line"""
+    return "%d 1 %s %s %s rw,noatime shared:1 - %s %s rw" % (hash(mount) % 900 + 30, majmin, root, mount, fstype, source)
+
+
+class StorageGuard(unittest.TestCase):
+    """The model (and the per-layer table in it) on a rotational disk: sysfs walk, md / LVM / LUKS / loop,
+    docker bind mounts and overlay roots, an Unraid user share, and the DECISION / doctor / bug-report lines."""
+    FN = {"arch": "qwen4exp", "is_moe": True, "deltanet": True, "n_expert": 512, "tier": "PXQ_UNIVERSAL",
+          "mtp_tensors": 6, "ple_tensor": "per_layer_token_embd.weight", "ple_bytes": int(51.2e9 * 34 / 32),
+          "ple_elems": 51200245760}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pxa-storage-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.sys = FakeSys(os.path.join(self.tmp, "sys"))
+        for k in (L.STORAGE_KIND_ENV, L.STORAGE_FAKE_ENV, L.PLE_DIRECT_ENV, L.PLE_DIRECT_CACHE_ENV):
+            if k in os.environ:
+                old = os.environ.pop(k)
+                self.addCleanup(os.environ.__setitem__, k, old)
+
+    def st(self, path, *lines, fsroot=""):
+        return L.storage_of_path(path, sysroot=self.sys.root, mountinfo="\n".join(lines), fsroot=fsroot)
+
+    def test_sata_hdd_partition_is_judged_by_its_disk(self):
+        self.sys.disk("sda", 1, 8, 0)
+        self.sys.part("sda", "sda1", 8, 1)
+        r = self.st("/data/m/x.gguf", mi("/", "8:1", "ext4", "/dev/root"), mi("/data", "8:1", "xfs", "/dev/sda1"))
+        self.assertEqual((r["kind"], r["rotational"], r["devices"]), ("hdd", True, ["sda"]))
+        self.assertEqual(r["fs"], "xfs")
+
+    def test_nvme_through_a_btrfs_mount_with_an_anonymous_device_number(self):
+        self.sys.disk("nvme1n1", 0, 259, 0, bus="pci0000:80/0000:80:01.1/0000:82:00.0/nvme/nvme1")
+        self.sys.part("nvme1n1", "nvme1n1p1", 259, 1)
+        # mountinfo says 0:45 (btrfs' anonymous number): the source names the device
+        r = self.st("/fastdisk/m/x.gguf", mi("/", "8:1", "xfs", "/dev/sda1"), mi("/fastdisk", "0:45", "btrfs", "/dev/nvme1n1p1"))
+        self.assertEqual((r["kind"], r["rotational"], r["devices"]), ("nvme", False, ["nvme1n1"]))
+
+    def test_sata_ssd_is_ssd_not_nvme(self):
+        self.sys.disk("sdb", 0, 8, 16)
+        self.sys.part("sdb", "sdb1", 8, 17)
+        r = self.st("/s/x", mi("/s", "8:17", "ext4", "/dev/sdb1"))
+        self.assertEqual((r["kind"], r["rotational"]), ("ssd", False))
+
+    def test_md_over_hdds_is_rotational_whatever_the_stack_flag_says(self):
+        self.sys.disk("sdc", 1, 8, 32)
+        self.sys.disk("sdd", 1, 8, 48)
+        self.sys.stack("md0", 9, 0, ["sdc", "sdd"], own_flag=0)       # the md device's own flag is wrong; the members are the truth
+        r = self.st("/raid/x", mi("/raid", "9:0", "xfs", "/dev/md0"))
+        self.assertEqual((r["kind"], r["rotational"], r["devices"]), ("hdd", True, ["sdc", "sdd"]))
+        self.assertEqual(r["chain"], "md0 -> sdc, sdd")
+
+    def test_md_over_ssds_and_mixed_stacks(self):
+        self.sys.disk("sde", 0, 8, 64)
+        self.sys.disk("sdf", 0, 8, 80)
+        self.sys.disk("sdg", 1, 8, 96)
+        self.sys.stack("md1", 9, 1, ["sde", "sdf"], own_flag=1)       # flag says rotational, members are flash
+        self.sys.stack("md2", 9, 2, ["sde", "sdg"])
+        self.assertEqual(self.st("/a/x", mi("/a", "9:1", "xfs", "/dev/md1"))["kind"], "ssd")
+        m = self.st("/b/x", mi("/b", "9:2", "xfs", "/dev/md2"))
+        self.assertEqual((m["kind"], m["rotational"]), ("mixed", True))
+
+    def test_lvm_by_mapper_source_and_luks_over_nvme(self):
+        self.sys.disk("sdh", 1, 8, 112)
+        self.sys.part("sdh", "sdh2", 8, 114, n=2)
+        self.sys.stack("dm-0", 253, 0, ["sdh2"], dm_name="vg-models")       # LVM on an HDD partition
+        self.sys.disk("nvme0n1", 0, 259, 5, bus="pci0000:00/0000:00:03.1/0000:05:00.0/nvme/nvme0")
+        self.sys.part("nvme0n1", "nvme0n1p3", 259, 8, n=3)
+        self.sys.stack("dm-1", 253, 1, ["nvme0n1p3"], dm_name="luks-abc")   # LUKS on NVMe
+        # the mount carries an anonymous number: only the /dev/mapper name identifies the device
+        r = self.st("/lvm/x", mi("/lvm", "0:60", "btrfs", "/dev/mapper/vg-models"))
+        self.assertEqual((r["kind"], r["devices"]), ("hdd", ["sdh"]))
+        r = self.st("/enc/x", mi("/enc", "253:1", "ext4", "/dev/mapper/luks-abc"))
+        self.assertEqual((r["kind"], r["devices"]), ("nvme", ["nvme0n1"]))
+
+    def test_docker_bind_mount_gives_the_host_disk_and_an_overlay_root_does_not(self):
+        self.sys.disk("sdi", 1, 8, 128)
+        self.sys.part("sdi", "sdi1", 8, 129)
+        lines = (mi("/", "0:98", "overlay", "overlay"), mi("/models", "8:129", "xfs", "/dev/sdi1", root="/srv/models"))
+        r = self.st("/models/x.gguf", *lines)
+        self.assertEqual((r["kind"], r["devices"]), ("hdd", ["sdi"]))
+        o = self.st("/work/x.gguf", *lines)                   # inside the image / container layer
+        self.assertEqual((o["kind"], o["rotational"], o["chain"]), ("unknown", None, "overlay"))
+        self.assertIn("bind-mount", o["why"])
+
+    def test_unraid_user_share_resolves_to_the_disk_that_holds_the_file(self):
+        self.sys.disk("sdq", 1, 65, 0)
+        self.sys.stack("md3p1", 9, 3, [], own_flag=1)         # Unraid's md driver: no member list, the array flag only
+        self.sys.disk("nvme2n1", 0, 259, 9)
+        self.sys.part("nvme2n1", "nvme2n1p1", 259, 10)
+        U = L._UNRAID
+        fsroot = os.path.join(self.tmp, "fs")
+        for d in ("mnt/user/models", "mnt/disk3/models", "mnt/cache/models", "mnt/disk4/models"):
+            os.makedirs(os.path.join(fsroot, d))
+        for f in ("mnt/disk3/models/hdd.gguf", "mnt/cache/models/fast.gguf"):
+            open(os.path.join(fsroot, f), "w").close()
+        lines = (mi(U + "/user", "0:42", "fuse.shfs", "shfs"), mi(U + "/disk3", "9:3", "xfs", "/dev/md3p1"),
+                 mi(U + "/cache", "259:10", "btrfs", "/dev/nvme2n1p1"), mi(U + "/disk4", "9:3", "xfs", "/dev/md3p1"))
+        h = self.st(U + "/user/models/hdd.gguf", *lines, fsroot=fsroot)
+        self.assertEqual((h["kind"], h["chain"]), ("hdd", "shfs -> md3p1"))
+        f = self.st(U + "/user/models/fast.gguf", *lines, fsroot=fsroot)
+        self.assertEqual(f["kind"], "nvme")
+        n = self.st(U + "/user/models/nowhere.gguf", *lines, fsroot=fsroot)
+        self.assertEqual(n["kind"], "unknown")
+        self.assertIn("pool path", n["why"])
+
+    def test_loop_device_follows_its_backing_file(self):
+        self.sys.disk("sdj", 1, 8, 144)
+        self.sys.part("sdj", "sdj1", 8, 145)
+        self.sys.loop("loop3", 7, 3, "/images/m.img")
+        lines = (mi("/images", "8:145", "ext4", "/dev/sdj1"), mi("/loopimg", "7:3", "ext4", "/dev/loop3"))
+        r = self.st("/loopimg/x.gguf", *lines)
+        self.assertEqual((r["kind"], r["devices"]), ("hdd", ["sdj"]))
+        self.assertIn("loop device", r["why"])
+
+    def test_ram_and_network_and_unreadable_never_raise(self):
+        self.assertEqual(self.st("/t/x", mi("/t", "0:30", "tmpfs", "tmpfs"))["kind"], "ram")
+        n = self.st("/n/x", mi("/n", "0:31", "nfs4", "srv:/export"))
+        self.assertEqual((n["kind"], n["rotational"]), ("unknown", None))
+        self.assertIn("network", n["why"])
+        self.assertEqual(self.st("/q/x", mi("/q", "8:99", "ext4", "/dev/sdz9"))["kind"], "unknown")   # no such device in sysfs
+        self.assertEqual(self.st("/q/x", "garbage line\n\n")["kind"], "unknown")
+        self.assertEqual(self.st("/q/x")["kind"], "unknown")                                          # empty mountinfo
+
+    def test_the_real_box_answers_without_raising(self):
+        for p in (FAKE_MODEL, "/", "/proc", "/no/such/file.gguf"):
+            r = L.storage_of_path(p)
+            self.assertIn(r["kind"], ("nvme", "ssd", "hdd", "mixed", "ram", "network", "unknown"))
+
+    # ---- the decision lines ----------------------------------------------------------------------
+    def probe_for(self, kind):
+        return lambda p: {"kind": kind, "rotational": {"hdd": True, "mixed": True, "ssd": False, "nvme": False}.get(kind),
+                          "fs": "xfs", "source": "/dev/x", "devices": ["x"], "chain": "md15p1" if kind == "hdd" else "nvme1n1",
+                          "why": "queue/rotational=1" if kind == "hdd" else "queue/rotational=0"}
+
+    def decide(self, kind, prof=None, overdrive=True, model=None):
+        with mock_env(PXA_LAUNCH_FAKE_GPUS="1x600"):
+            return L.storage_decisions(model or FAKE_MODEL, prof or self.FN, overdrive, probe=self.probe_for(kind))
+
+    def test_hdd_warns_with_what_to_do(self):
+        out = self.decide("hdd")
+        self.assertEqual(len(out), 1)
+        line = out[0]
+        self.assertTrue(line.startswith("DECISION !! ple-storage: "))
+        for want in ("54.4 GiB" if False else "50.7 GiB", "md15p1", "rotational", "seek", "5x", "Move the model file", "SSD / NVMe",
+                     "PXA_PLE_MMAP=2", "O_DIRECT", "Q5_0", "[override: PXA_STORAGE_KIND=ssd"):
+            self.assertIn(want, line)
+        # the same line reaches --doctor (as a problem) and Control's plan (decision_lines)
+        self.assertEqual(C.decision_lines("  " + line)[0].split(":")[0], "!! ple-storage")
+
+    def test_mixed_stack_warns_too_and_other_models_stay_silent(self):
+        self.assertIn("some members rotational", self.decide("mixed")[0])
+        self.assertEqual(self.decide("hdd", prof={"arch": "qwen35", "ple_tensor": None}), [])         # no per-layer table
+        small = dict(self.FN, ple_bytes=int(1.5 * 1024 ** 3), ple_elems=1000)
+        self.assertEqual(self.decide("hdd", prof=small), [])                                          # under 4 GiB: the page cache holds it
+        self.assertEqual(L.storage_decisions("", self.FN, True, probe=self.probe_for("hdd")), [])
+
+    def test_ssd_is_named_for_overdrive_and_silent_otherwise(self):
+        line = self.decide("nvme")[0]
+        self.assertTrue(line.startswith("DECISION ple-storage: "))
+        self.assertNotIn("!!", line)
+        self.assertIn("NVMe", line)
+        self.assertEqual(self.decide("ssd", overdrive=False), [])
+
+    def test_unknown_disk_is_said_not_guessed(self):
+        out = self.decide("unknown")
+        self.assertEqual(len(out), 1)
+        self.assertNotIn("!!", out[0])
+        self.assertIn("cannot tell", out[0])
+        self.assertIn("PXA_STORAGE_KIND=ssd|hdd", out[0])
+
+    def test_the_users_word_beats_a_lying_virtual_disk(self):
+        with mock_env(PXA_STORAGE_KIND="ssd", PXA_LAUNCH_FAKE_GPUS="1x600"):
+            st = L.storage_of_model(FAKE_MODEL, self.probe_for("hdd"))
+            out = L.storage_decisions(FAKE_MODEL, self.FN, True, probe=self.probe_for("hdd"))
+        self.assertEqual((st["kind"], st["rotational"]), ("ssd", False))
+        self.assertIn("forced by PXA_STORAGE_KIND=ssd", st["why"])
+        self.assertTrue(out and "!!" not in out[0] and "forced by PXA_STORAGE_KIND" in out[0])
+        with mock_env(PXA_STORAGE_KIND="hdd", PXA_LAUNCH_FAKE_GPUS="1x600"):
+            self.assertIn("!! ple-storage", L.storage_decisions(FAKE_MODEL, self.FN, True, probe=self.probe_for("nvme"))[0])
+
+    # ---- PXA_PLE_DIRECT: the table stops counting as resident RAM (the PLE RAM pass) -----------------------------------
+    def test_ple_direct_mode_reads_the_env_like_the_engine(self):
+        for v, want in ((None, 0), ("", 0), ("0", 0), ("1", 1), ("2", 2), ("on", 0), (" 1", 1), ("-1", 0)):
+            self.assertEqual(L.ple_direct_mode({} if v is None else {L.PLE_DIRECT_ENV: v}), want, v)
+
+    def test_ram_accounting_lever_off_counts_the_whole_table(self):
+        full = self.FN["ple_bytes"]
+        for kind in (None, "nvme", "hdd"):
+            self.assertEqual(L.ple_host_ram_bytes(self.FN, kind, {}), full)
+        self.assertEqual(L.ple_host_ram_bytes({"arch": "qwen35", "ple_tensor": None}, "nvme", {L.PLE_DIRECT_ENV: "1"}), 0)
+        self.assertEqual(L.ple_host_ram_bytes(dict(self.FN, ple_bytes=0, ple_elems=1000), None, {}), int(1000 * 0.5625))
+
+    def test_ram_accounting_lever_on_counts_the_row_cache_only(self):
+        on = {L.PLE_DIRECT_ENV: "1"}
+        for kind in ("nvme", "ssd", "ram"):
+            self.assertEqual(L.ple_host_ram_bytes(self.FN, kind, on), 256 * 1048576, kind)
+        self.assertEqual(L.ple_host_ram_bytes(self.FN, "nvme", dict(on, **{L.PLE_DIRECT_CACHE_ENV: "512"})), 512 * 1048576)
+        self.assertEqual(L.ple_host_ram_bytes(self.FN, "nvme", dict(on, **{L.PLE_DIRECT_CACHE_ENV: "junk"})), 256 * 1048576)
+        # the engine refuses on these: the RAM path stays and the whole table is counted (the lab mode skips the refusals)
+        for kind in ("hdd", "mixed", "network", "unknown", None):
+            self.assertEqual(L.ple_host_ram_bytes(self.FN, kind, on), self.FN["ple_bytes"], kind)
+        self.assertEqual(L.ple_host_ram_bytes(self.FN, "hdd", {L.PLE_DIRECT_ENV: "2"}), 256 * 1048576)
+        tiny = dict(self.FN, ple_bytes=100 * 1048576)
+        self.assertEqual(L.ple_host_ram_bytes(tiny, "nvme", on), 100 * 1048576)          # never more than the table
+
+    def test_decision_line_says_how_the_table_is_counted(self):
+        with mock_env(PXA_PLE_DIRECT="1"):
+            out = self.decide("nvme")
+            self.assertEqual(len(out), 2)
+            self.assertTrue(out[1].startswith("DECISION ple-ram: ") and "NOT counted as resident RAM" in out[1] and "0.2 GiB" in out[1])
+            self.assertEqual(C.decision_lines("  " + out[1])[0].split(":")[0], "ple-ram")
+            bad = self.decide("hdd")
+            self.assertEqual(len(bad), 2)
+            self.assertTrue(bad[1].startswith("DECISION !! ple-ram: ") and "still counted as resident RAM" in bad[1])
+            self.assertEqual(len(self.decide("nvme", overdrive=False)), 1)                 # ple-ram only; the ple-storage line stays Overdrive-only
+            self.assertEqual(self.decide("hdd", prof={"arch": "qwen35", "ple_tensor": None}), [])
+        with mock_env(PXA_PLE_DIRECT="0"):
+            self.assertEqual(len(self.decide("nvme")), 1)                                   # lever off: no new line
+            self.assertEqual(len(self.decide("hdd")), 1)
+
+    def test_every_shard_is_checked_and_the_worst_wins(self):
+        d = os.path.join(self.tmp, "m")
+        os.makedirs(d)
+        shards = [os.path.join(d, "fn-%05d-of-00002.gguf" % i) for i in (1, 2)]
+        for sp in shards:
+            open(sp, "w").close()
+        seen = []
+
+        def probe(p):
+            seen.append(p)
+            return self.probe_for("hdd" if "-00002-of-" in p else "nvme")(p)
+        with mock_env(PXA_LAUNCH_FAKE_GPUS="1x600"):
+            st = L.storage_of_model(shards[0], probe)
+        self.assertEqual(seen, shards)
+        self.assertEqual((st["kind"], st["shards"], st["worst"]), ("hdd", 2, shards[1]))
+
+    def test_dry_run_fixtures_read_nothing_and_the_fake_env_forces_a_kind(self):
+        with mock_env(PXA_LAUNCH_FAKE_GPUS="2x600"):
+            self.assertIsNone(L.storage_of_model(FAKE_MODEL))
+            self.assertEqual(L.storage_decisions(FAKE_MODEL, self.FN, True), [])
+            self.assertIsNone(L.storage_row(FAKE_MODEL))
+            self.assertIsNone(L.storage_summary(FAKE_MODEL))
+        with mock_env(PXA_LAUNCH_FAKE_STORAGE="hdd", PXA_LAUNCH_FAKE_GPUS="2x600"):
+            self.assertIn("!! ple-storage", "\n".join(L.box_decisions(FAKE_MODEL, [0], self.FN, True)))
+
+    def test_doctor_row_and_bug_report_field(self):
+        row = L.storage_row(FAKE_MODEL, self.probe_for("hdd"))
+        self.assertIn("model on md15p1, ROTATIONAL", row)
+        self.assertIn("queue/rotational=1", row)
+        self.assertIn("NVMe", L.storage_row(FAKE_MODEL, self.probe_for("nvme")))
+        summ = L.storage_summary(FAKE_MODEL, self.probe_for("hdd"))
+        self.assertEqual((summ["kind"], summ["rotational"], summ["chain"]), ("hdd", True, "md15p1"))
+        self.assertNotIn(MODELS, json.dumps(summ))                  # a device chain, never a path
+        app = C.App(L, port=0, models_dirs=[MODELS])
+        app.seat.req = {"model": FAKE_MODEL}
+        with mock_env(PXA_LAUNCH_FAKE_STORAGE="hdd"):                 # this suite runs on fake cards: the fixture env names the disk
+            b = app.report_bundle()["bundle"]
+        self.assertIn("storage", b)
+        self.assertEqual((b["storage"]["kind"], b["storage"]["rotational"]), ("hdd", True))
+        self.assertNotIn(MODELS, json.dumps(b["storage"]))
+        app.seat.req = {}
+        self.assertIsNone(app.report_bundle()["bundle"]["storage"])
+
+    def test_q5_0_and_q4_0_tables_are_sized_by_the_profile(self):
+        """a revision-2 Flash-Next file (PLE at Q5_0 / Q4_0) must still subtract its table from the on-card share"""
+        def gguf(path, ty, elems):
+            def st(x):
+                b = x.encode()
+                return struct.pack("<Q", len(b)) + b
+            h = b"GGUF" + struct.pack("<IQQ", 3, 1, 1)
+            h += st("general.architecture") + struct.pack("<I", 8) + st("qwen4exp")
+            h += st("per_layer_token_embd.weight") + struct.pack("<IQQIQ", 2, 160, elems // 160, ty, 0)
+            with open(path, "wb") as f:
+                f.write(h)
+        el = 160 * 1000000
+        for ty, bpe in ((8, 34 / 32), (6, 22 / 32), (2, 18 / 32)):
+            p = os.path.join(self.tmp, "t%d.gguf" % ty)
+            gguf(p, ty, el)
+            prof = L.model_profile(p, "gguf")
+            self.assertEqual((prof.get("ple_type"), prof.get("ple_bytes")), (ty, int(el * bpe)), ty)
+
+
+@contextlib.contextmanager
+def mock_env(**kw):
+    old = {k: os.environ.get(k) for k in kw}
+    os.environ.update(kw)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 class Presets(unittest.TestCase):
@@ -472,6 +1128,138 @@ class AttachedSeatInFleet(unittest.TestCase):
         self.assertIn("x.running || x.attached", html)                                    # an attached seat is picked as live
 
 
+class HeaderShowsEveryServer(unittest.TestCase):
+    """cizettabg, #feature-request 2026-10-11: "All running servers displayed in the header. Currently only the
+    last one started is displayed." The header carried one pill for the server this page is pointed at, refreshed
+    only while the Servers tab was open, with a bare "(+N serving)" for the rest. It now carries a chip per
+    running server on every tab, and collapses to one chip when they do not fit or on a phone.
+
+    The browser behaviour is checked against the fake workload by tests/header-gui-check.py; what is pinned here
+    is the contract in the source: the header reads the fleet on every tab, a chip writes name + port + state,
+    and the chip, the card and the Live tile read one state function."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(TOOLS, "pxa_control_ui", "index.html"), encoding="utf-8") as f:
+            cls.html = f.read()
+
+    def test_the_header_carries_a_chip_row(self):
+        self.assertIn('<span class="fchips" id="fchips"', self.html)
+        self.assertLess(self.html.index('id="fchips"'), self.html.index('id="health"'), "the chips sit beside the pill")
+
+    def test_a_chip_writes_name_port_and_state(self):
+        for frag in ('class: "fname"', 'class: "fport mono"', 'class: "fst"'):
+            self.assertIn(frag, self.html, frag)                      # a chip is never a colour with no words on it
+
+    def test_the_fleet_is_read_on_every_tab_not_only_the_servers_tab(self):
+        self.assertIn("setInterval(() => { if (!document.hidden) loadFleet(); }, 5000)", self.html)
+        self.assertNotIn('S.tab === "servers") loadFleet()', self.html, "the old Servers-tab-only refresh is gone")
+
+    def test_the_chip_the_card_and_the_tile_read_one_state_function(self):
+        self.assertIn("function srvPhase(x)", self.html)
+        self.assertIn("const phase = srvPhase(x);", self.html)         # the card
+        self.assertIn("const st = srvPhase(x)", self.html)             # the chip
+
+    def test_a_chip_opens_that_server_on_the_servers_tab(self):
+        self.assertIn("function openFleetCard(x)", self.html)
+        self.assertIn('"data-key": x.key', self.html, "the card the chip jumps to can be found by its key")
+
+    def test_the_chips_collapse_when_they_do_not_fit_and_on_a_phone(self):
+        self.assertIn('matchMedia("(max-width:820px)")', self.html)
+        self.assertIn("box.scrollWidth <= box.clientWidth + 1", self.html, "fitting is measured, not guessed")
+        self.assertIn('class: "fchip fmore"', self.html, "the collapsed form is one chip that says how many there are")
+        self.assertIn('class: "fmenu"', self.html, "and it opens the list")
+
+    def test_a_header_with_no_room_steps_the_row_aside_rather_than_paint_over_the_pill(self):
+        self.assertIn('hd.classList.add("chipspill")', self.html, "the pill stands down for the row first")
+        self.assertIn(".hd.chipspill .pill{display:none}", self.html)
+        self.assertIn('box.style.display = "none"', self.html, "and the row stands down if even that is not enough")
+        self.assertIn('const menu = box.querySelector(".fmenu");', self.html)
+        self.assertIn('if (menu) menu.style.display = "none";', self.html, "an open list is not part of what a row costs")
+
+
+class FooterOnEveryPage(unittest.TestCase):
+    """#feature-request FR#15 (2026-10-26): the footer with the Discord link, the Ko-fi link, the PXA version and the Update
+    button showed only on the Servers page. It is now one footer of the page shell: the last child of <main>, after every
+    page's section, so every page (Home first) shows it under its own content and a page that scrolls still reaches its last
+    element above it. Plugin tabs add their sections before it. The browser side (every tab, both themes, a phone width) is
+    tests/footer-gui-check.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        import html.parser
+        ui = os.path.join(TOOLS, "pxa_control_ui")
+        with open(os.path.join(ui, "index.html"), encoding="utf-8") as f:
+            cls.html = f.read()
+        with open(os.path.join(ui, "plugin-host.js"), encoding="utf-8") as f:
+            cls.host = f.read()
+        void = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+        found = {"foots": [], "main_children": []}
+
+        class P(html.parser.HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.stack = []          # (tag, attrs) of the open elements
+                self.cur = None          # the footer being read: its ids and hrefs
+
+            def handle_starttag(self, tag, attrs):
+                a = dict(attrs)
+                if self.stack and self.stack[-1][0] == "main":
+                    found["main_children"].append((tag, a))
+                if "foot" in (a.get("class") or "").split():
+                    self.cur = {"parents": [t for t, _ in self.stack], "parent": self.stack[-1] if self.stack else None,
+                                "tag": tag, "ids": [], "hrefs": [], "depth": len(self.stack)}
+                    found["foots"].append(self.cur)
+                elif self.cur is not None:
+                    if a.get("id"):
+                        self.cur["ids"].append(a["id"])
+                    if a.get("href"):
+                        self.cur["hrefs"].append(a["href"])
+                if tag not in void:
+                    self.stack.append((tag, a))
+
+            def handle_endtag(self, tag):
+                if tag in void:
+                    return
+                while self.stack:
+                    t, _ = self.stack.pop()
+                    if self.cur is not None and len(self.stack) == self.cur["depth"]:
+                        self.cur = None
+                    if t == tag:
+                        break
+        P().feed(cls.html)
+        cls.foots, cls.main_children = found["foots"], found["main_children"]
+
+    def test_there_is_one_footer_not_a_copy_per_page(self):
+        self.assertEqual(len(self.foots), 1, "one footer for the whole app (no second one on Servers)")
+
+    def test_the_footer_belongs_to_the_shell_not_to_the_servers_page(self):
+        f = self.foots[0]
+        self.assertNotIn("section", f["parents"], "the footer sat inside the Servers section: other pages never showed it")
+        self.assertEqual(f["parent"][0], "main", "the footer is a child of <main>, shown with every page")
+
+    def test_the_footer_comes_after_every_page(self):
+        tags = [t for t, a in self.main_children]
+        self.assertIn("section", tags)
+        last_section = max(i for i, t in enumerate(tags) if t == "section")
+        foot_at = [i for i, (t, a) in enumerate(self.main_children) if "foot" in (a.get("class") or "").split()]
+        self.assertEqual(foot_at, [len(tags) - 1], "the footer is the last thing in <main>")
+        self.assertGreater(foot_at[0], last_section)
+
+    def test_the_footer_keeps_its_links_version_and_update_button(self):
+        f = self.foots[0]
+        self.assertIn("https://discord.pxanetwork.com", f["hrefs"])
+        self.assertIn("https://ko-fi.com/shatteredrealms1", f["hrefs"])
+        for i in ("sv-ver", "sv-up"):
+            self.assertIn(i, f["ids"], i)
+        self.assertEqual(self.html.count('id="sv-ver"'), 1)
+        self.assertEqual(self.html.count('id="sv-up"'), 1)
+
+    def test_a_plugin_tab_adds_its_page_before_the_footer(self):
+        self.assertNotIn("main.append(sec)", self.host, "a plugin page appended to <main> would land under the footer")
+        self.assertIn('main.insertBefore(sec, main.querySelector(":scope > .foot"))', self.host)
+
+
 class TokenAuth(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -486,7 +1274,12 @@ class TokenAuth(unittest.TestCase):
     def test_random_token_when_lan(self):
         a = C.App(L, port=7777, lan=True)
         self.assertGreaterEqual(len(a.token), 20)
-        self.assertIsNone(C.App(L, port=7777).token)
+        # H1 (the Control hardening pass): this machine only gets a fresh token per session too, never the saved LAN one
+        b, c = C.App(L, port=7777), C.App(L, port=7777)
+        self.assertGreaterEqual(len(b.token), 32)
+        self.assertNotEqual(b.token, c.token)
+        self.assertNotEqual(b.token, a.token)
+        self.assertIsNone(C.App(L, port=7777, token="").token)                 # the explicit test-only no-token mode
 
     def test_refused_without_token(self):
         self.assertEqual(req(self.port, "/api/info")[0], 401)
@@ -501,7 +1294,7 @@ class TokenAuth(unittest.TestCase):
         code, h, _ = req(self.port, "/?token=s3cret-token&x=1")
         self.assertEqual(code, 303)
         self.assertEqual(h.get("Location"), "/?x=1")
-        self.assertIn("pxa_control_token=s3cret-token", h.get("Set-Cookie", ""))
+        self.assertIn("pxa_control_token_7777=s3cret-token", h.get("Set-Cookie", ""))     # H3: one cookie per port
         self.assertIn("HttpOnly", h.get("Set-Cookie", ""))
         self.assertEqual(req(self.port, "/api/info", headers={"Cookie": "a=b; pxa_control_token=s3cret-token"})[0], 200)
         # any Host is fine on a LAN bind (the token is the guard), cross-origin POST still refused
@@ -558,7 +1351,7 @@ class Redaction(unittest.TestCase):
         self.assertEqual(self.r("/home/bob/pxa/x"), "~/pxa/x")
         self.assertEqual(self.r("/Users/carol/Library/x"), "~/Library/x")
         self.assertEqual(self.r("C:\\Users\\dave\\m.gguf"), "~\\m.gguf")
-        self.assertEqual(self.r("/root/m.gguf"), "~/m.gguf")
+        self.assertEqual(self.r("/" + "root" + "/m.gguf"), "~/m.gguf")
 
     def test_ips_hosts_users_mail(self):
         out = self.r("server 192.168.1.50:8080 from 10.0.0.7 and 127.0.0.1, host rigbox user alice mail a.b@example.com")
@@ -588,6 +1381,27 @@ class Redaction(unittest.TestCase):
                      "greedy512 sha 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "Tesla V100-SXM2-16GB cc 70",
                      "driver 535.104.05 CUDA 12.2"):
             self.assertEqual(self.r(keep), keep)
+
+    def test_product_words_are_never_identity_words(self):
+        # a rig named "pxa" (the docker service name, a Windows box called PXA) turned every PXA_REGISTRY line into
+        # "<host>_REGISTRY": the bug intake then refused the report (VS beta 2, 10-19) and the score app read "<host>-control"
+        for h in ({"pxa"}, {"PXA"}, {"pxa", "rigbox"}):
+            for keep in ("PXA_REGISTRY: card 0 sm 60 class=p100", "PXA_AUTO: CTX=163840", "PXA_TSPLIT: mode=tensor devs=5",
+                         "pxa-control", "(no PXA_REGISTRY / PXA_TSPLIT / PXA_AUTO lines in this seat's log yet)"):
+                self.assertEqual(C.redact_text(keep, h, self.U), keep, (h, keep))
+        self.assertNotIn("rigbox", C.redact_text("host rigbox PXA_AUTO: on", {"pxa", "rigbox"}, self.U))
+        # a host or user word that is also a tag word is still redacted outside the PXA_* env names
+        out = C.redact_text("PXA_AUTO: UB=512 on auto host", {"auto"}, {"registry"})
+        self.assertTrue(out.startswith("PXA_AUTO: UB=512"), out)
+        self.assertNotIn(" auto host", out)
+        self.assertEqual(C.redact_text("PXA_REGISTRY: by registry", set(), {"registry"}), "PXA_REGISTRY: by <user>")
+        old = os.environ.get("HOSTNAME")
+        os.environ["HOSTNAME"] = "pxa"
+        try:
+            hosts, _u = C._identity_words()
+        finally:
+            os.environ.pop("HOSTNAME") if old is None else os.environ.__setitem__("HOSTNAME", old)
+        self.assertNotIn("pxa", {x.lower() for x in hosts})
 
     def test_idempotent_and_recursive(self):
         o = {"a": ["/home/bob/x", {"k": "10.1.2.3"}], "n": 5, "log": ["--api-key abcdefgh12345"]}
@@ -629,6 +1443,19 @@ class ReportBundle(unittest.TestCase):
         self.assertIsNone(C.App.heat_warning(0, 79.0, []))
         self.assertIsNone(C.App.heat_warning(0, 40.0, ["gpu_idle"]))
         self.assertIn("heat_warning", self.app.rig_live()["cards"][0])
+
+    def test_banner_is_kept_after_the_log_ring_drops_it(self):
+        # an 18 min load + hours of traffic pushes the boot banner out of the 6000-line ring; the report still carries it
+        self.app.seat._append("PXA_REGISTRY: card 0 sm 60 class=p100")
+        self.app.seat._append("PXA_AUTO: CTX=163840 (no -c given)")
+        for i in range(self.app.seat.log.maxlen + 50):
+            self.app.seat._append("slot update_slots: id 0 | task %d | prompt done" % i)
+        self.assertFalse(any("PXA_REGISTRY" in x[1] for x in self.app.seat.log))
+        bu = self.app.report_bundle()["bundle"]
+        self.assertEqual(bu["banner"][:2], ["PXA_REGISTRY: card 0 sm 60 class=p100", "PXA_AUTO: CTX=163840 (no -c given)"])
+        for i in range(60):
+            self.app.seat._append("PXA_AUTO: UB=%d fits" % i)
+        self.assertEqual(len(self.app.seat.banner_lines), C.BANNER_KEEP)
 
     def test_bundle_shape_and_send_failure_is_reported(self):
         self.app.seat._append("PXA_REGISTRY: card 0 sm 60 class=p100")
@@ -757,6 +1584,77 @@ class ScoreBoardClient(unittest.TestCase):
         for bad in ("x", "0", "-4", "99999999999", None):
             with self.assertRaises(C.Invalid):
                 app.score_detail(bad)
+
+    def _fake_board(self, answers):
+        """urlopen stand-in for the board: POST /v1/score answers from `answers` (a list, one per call); records the calls."""
+        calls = []
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.close()
+
+        def urlopen(req, timeout=None):
+            calls.append((req.get_method(), req.full_url))
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return Resp(json.dumps(a).encode())
+        return urlopen, calls
+
+    def test_a_submitted_result_is_remembered_and_never_offered_again(self):
+        # FR#13: after Submit the frame closed only in the page; the same result came back on the next poll, after a reload, and
+        # the Check button stayed. Control now keeps the submitted result (its ts) in control.json.
+        R = sys.modules["pxa_control.routes"]
+        shutil.rmtree(C.config_dir(), ignore_errors=True)
+        app = C.App(L, port=0, models_dirs=[MODELS])
+        app.seat.cmd = ["llama-server", "-m", FAKE_MODEL]
+        app.seat.req = {"model": FAKE_MODEL, "gpus": [0], "port": 8999}
+        res = {"ts": 1_780_000_123.456789, "model": FAKE_MODEL, "cards": [0], "port": 8999, "reps": 3, "greedy512_sha": "ab" * 32,
+               "classes": [{"class": "prose", "decode_tps": 41.5, "prefill_tps": 0, "n_prompt": 20, "decode_all": [41], "prefill_all": []}]}
+        app.bench = {"running": False, "lines": [], "result": res, "error": None, "started": 1.0, "port": 8999, "cards": [0]}
+        self.assertFalse(R.r_bench(app, None, {})["job"]["result"].get("submitted"))
+        real = C.urllib.request.urlopen
+        # a failed send records nothing: the frame may offer the result again
+        C.urllib.request.urlopen, calls = self._fake_board([OSError("offline")])
+        try:
+            r = app.score_send({"payload": app.score_payload(res, "Zed"), "ts": res["ts"]})
+        finally:
+            C.urllib.request.urlopen = real
+        self.assertFalse(r["ok"])
+        self.assertFalse(R.r_bench(app, None, {})["job"]["result"].get("submitted"))
+        # the board takes it (held for review counts too)
+        C.urllib.request.urlopen, calls = self._fake_board([{"ok": True, "id": 7, "rank": None, "status": "flagged"}])
+        try:
+            r = app.score_send({"payload": app.score_payload(res, "Zed"), "ts": res["ts"]})
+        finally:
+            C.urllib.request.urlopen = real
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(calls, [("POST", C.score_base_url() + "/v1/score")])
+        self.assertTrue(R.r_bench(app, None, {})["job"]["result"]["submitted"])
+        self.assertIsNot(app.bench["result"].get("submitted"), True)      # the route marks a copy; the job itself is untouched
+        # the check does not offer it again, and asks the board nothing
+        C.urllib.request.urlopen, calls = self._fake_board([])
+        try:
+            c = app.score_check()
+        finally:
+            C.urllib.request.urlopen = real
+        self.assertEqual((c["available"], calls), (False, []), c)
+        self.assertIn("already", c["reason"])
+        # a reload of the page, and a restart of Control, read the same record
+        app2 = C.App(L, port=0, models_dirs=[MODELS])
+        app2.bench = dict(app.bench)
+        self.assertTrue(R.r_bench(app2, None, {})["job"]["result"]["submitted"])
+        # a new run of the same model is a new result: offered again
+        app2.bench = dict(app.bench, result=dict(res, ts=res["ts"] + 60))
+        self.assertFalse(R.r_bench(app2, None, {})["job"]["result"].get("submitted"))
+        # a bad ts in the body falls back to the current result; the record stays bounded
+        for i in range(60):
+            C._score_mark_sent(1_000.0 + i)
+        self.assertEqual(len(C.load_config()["score_sent"]), 50)
+        self.assertTrue(C._score_was_sent(1_059.0) and not C._score_was_sent(1_000.0))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1133,6 +2031,622 @@ class EncodeRedaction(unittest.TestCase):
         self.assertNotIn(ENC_SECRET, json.dumps(p))
 
 
+class BenchHistoryFields(unittest.TestCase):
+    """the bench history row carries MTP and the split mode (FR#1: the history table shows them); same values as the high-score payload"""
+
+    class FakeBench(object):
+        CLASS_PROMPTS = {c: {"prompt": c + " prompt", "n_predict": 8} for c in ("prose", "edit", "long")}
+
+        @staticmethod
+        def _get_json(url, path, timeout=10):
+            return {"model_path": FAKE_MODEL}
+
+        @staticmethod
+        def measure_once(url, prompt, n, timeout=0):
+            return {}
+
+        @staticmethod
+        def _post_json(url, path, body, timeout=0):
+            return {"timings": {"predicted_per_second": 40.0, "prompt_per_second": 900.0, "prompt_n": 20}}
+
+        @staticmethod
+        def greedy512(url):
+            return {"sha256": "cd" * 32, "empty": False}
+
+    def _run(self, cmd, gpus):
+        app = C.App(L, port=0, models_dirs=[MODELS])
+        app.seat.cmd = cmd
+        app.seat.req = {"model": FAKE_MODEL, "gpus": gpus, "port": 8999}
+        app.bench = {"running": True, "lines": [], "result": None, "error": None}
+        app._bench_run(self.FakeBench, 8999, 1, 0, gpus)
+        self.assertIsNone(app.bench["error"], app.bench["error"])
+        return app, app.bench["result"]
+
+    def test_row_stores_split_mode_and_mtp(self):
+        app, res = self._run(["llama-server", "-m", FAKE_MODEL, "-sm", "tensor", "--spec-type", "mtp:n_max=3"], [0, 1])
+        self.assertEqual((res["split_mode"], res["mtp"]), ("tensor", True))
+        stored = C.read_jsonl("bench.jsonl", limit=1)[-1]
+        self.assertEqual((stored["split_mode"], stored["mtp"], stored["ts"]), ("tensor", True, res["ts"]))
+        p = app.score_payload(res)                                   # the board payload says the same
+        self.assertEqual((p["params"]["split_mode"], p["params"]["mtp"]), (res["split_mode"], res["mtp"]))
+
+    def test_layer_plain_and_mtp_off(self):
+        _a, res = self._run(["llama-server", "-m", FAKE_MODEL], [0, 1])
+        self.assertEqual((res["split_mode"], res["mtp"]), ("layer", False))
+        _a, res = self._run(["llama-server", "-m", FAKE_MODEL], [0])
+        self.assertEqual((res["split_mode"], res["mtp"]), ("plain", False))
+        _a, res = self._run(["llama-server", "-m", FAKE_MODEL, "--spec-type", "mtp"], [0])
+        self.assertEqual((res["split_mode"], res["mtp"]), ("plain", True))
+
+    def test_route_pages_through_more_than_fifty_rows_without_telemetry(self):
+        import pxa_control.routes as R
+        app = C.App(L, port=0, models_dirs=[MODELS])
+        for i in range(60):
+            C.append_jsonl("bench.jsonl", {"ts": 1000.0 + i, "model": "m%d.gguf" % i, "classes": [], "telemetry": {"cards": [{"index": 0}]}})
+        h = R.r_bench(app, {}, {})["history"]
+        self.assertGreaterEqual(len(h), 60)
+        self.assertTrue(all("telemetry" not in r for r in h))
+        old = [r for r in h if r.get("model") == "m3.gguf"][0]       # a row from before the fields existed has neither key
+        self.assertNotIn("mtp", old)
+        self.assertNotIn("split_mode", old)
+
+
+class BenchFirstPass(unittest.TestCase):
+    """The bench reports FIRST-PASS speed (2026-10-19): a server with n-gram speculation replays an answer it already wrote,
+    so the same prompt asked again without a slot erase reads ~3x. The fake server models exactly that; the old loop
+    (warm-up on the prose prompt, then 3 reps of the same prompt, no erase) read 120 here instead of 40."""
+
+    class ReplayServer(BenchHistoryFields.FakeBench):
+        seen, erases, slots = set(), [], 2
+
+        @classmethod
+        def reset(cls, slots=2):
+            cls.seen, cls.erases, cls.slots = set(), [], slots
+
+        @classmethod
+        def _get_json(cls, url, path, timeout=10):
+            return {"model_path": FAKE_MODEL, "total_slots": cls.slots}
+
+        @classmethod
+        def measure_once(cls, url, prompt, n, timeout=0):
+            cls.seen.add(prompt)                    # the warm-up writes the start of the prose answer into the table
+            return {}
+
+        @classmethod
+        def _post_json(cls, url, path, body, timeout=0):
+            if path.startswith("/slots/"):
+                cls.erases.append(path)
+                cls.seen.clear()
+                return {"id_slot": int(path.split("/")[2].split("?")[0]), "n_erased": 0}
+            replay = body["prompt"] in cls.seen
+            cls.seen.add(body["prompt"])
+            return {"timings": {"predicted_per_second": 120.0 if replay else 40.0, "prompt_per_second": 900.0, "prompt_n": 20}}
+
+    class NoEraseServer(ReplayServer):
+        @classmethod
+        def _post_json(cls, url, path, body, timeout=0):
+            if path.startswith("/slots/"):
+                raise OSError("HTTP Error 501: slot erase not supported")
+            return BenchFirstPass.ReplayServer._post_json.__func__(cls, url, path, body, timeout)
+
+    def _run(self, mod, reps=3, warm=1):
+        app = C.App(L, port=0, models_dirs=[MODELS])
+        app.seat.cmd = ["llama-server", "-m", FAKE_MODEL, "-sm", "tensor", "--spec-type", "mtp"]
+        app.seat.req = {"model": FAKE_MODEL, "gpus": [0, 1], "port": 8999}
+        app.bench = {"running": True, "lines": [], "result": None, "error": None}
+        app._bench_run(mod, 8999, reps, warm, [0, 1])
+        self.assertIsNone(app.bench["error"], app.bench["error"])
+        return app, app.bench["result"]
+
+    def test_every_rep_is_first_pass(self):
+        self.ReplayServer.reset(slots=2)
+        _app, res = self._run(self.ReplayServer)
+        for c in res["classes"]:
+            self.assertEqual(c["decode_all"], [40.0, 40.0, 40.0], c)
+            self.assertEqual(c["decode_tps"], 40.0)
+        self.assertTrue(res["first_pass"])
+        # every slot erased before every rep (3 classes x 3 reps) and before greedy512: 10 rounds x 2 slots
+        self.assertEqual(len(self.ReplayServer.erases), 20)
+        self.assertEqual(set(self.ReplayServer.erases), {"/slots/0?action=erase", "/slots/1?action=erase"})
+        stored = C.read_jsonl("bench.jsonl", limit=1)[-1]
+        self.assertTrue(stored["first_pass"])
+
+    def test_a_server_without_erase_is_flagged(self):
+        self.NoEraseServer.reset(slots=1)
+        app, res = self._run(self.NoEraseServer)
+        self.assertFalse(res["first_pass"])
+        self.assertTrue(any("would not forget" in ln for ln in app.bench["lines"]), app.bench["lines"])
+        self.assertEqual(sum("would not forget" in ln for ln in app.bench["lines"]), 1)   # said once, not per rep
+
+    def test_warmup_uses_its_own_prompt(self):
+        """FR#12: the warm-up never asks a measured prompt (it would seed the draft table of a server that refuses the erase)"""
+        warm = []
+
+        class W(self.ReplayServer):
+            WARMUP_PROMPT = BENCH.WARMUP_PROMPT
+
+            @classmethod
+            def measure_once(cls, url, prompt, n, timeout=0):
+                warm.append(prompt)
+                return {}
+
+        W.reset(slots=1)
+        self._run(W)
+        self.assertTrue(warm and set(warm) == {BENCH.WARMUP_PROMPT}, warm)
+        self.assertNotIn(BENCH.WARMUP_PROMPT, [BENCH.CLASS_PROMPTS[c]["prompt"] for c in BENCH.CLASS_PROMPTS])
+
+    def test_refused_erase_gets_a_fresh_prompt_per_run(self):
+        """FR#12: a server without the erase replays a repeated prompt (120 vs 40 here); each run's prompt is distinct
+        (a random per-bench tag at the START), so the reps read first pass and the result still says first_pass false"""
+        prompts = []
+
+        class N(self.NoEraseServer):
+            @classmethod
+            def _post_json(cls, url, path, body, timeout=0):
+                if not path.startswith("/slots/"):
+                    prompts.append(body["prompt"])
+                return BenchFirstPass.NoEraseServer._post_json.__func__(cls, url, path, body, timeout)
+
+        N.reset(slots=1)
+        app, res = self._run(N)
+        self.assertFalse(res["first_pass"])
+        self.assertEqual(len(prompts), 9)
+        self.assertEqual(len(set(prompts)), 9)
+        self.assertTrue(all(p.startswith("[bench ") for p in prompts))
+        for c in res["classes"]:
+            self.assertEqual(c["decode_all"], [40.0, 40.0, 40.0], c)
+        prompts.clear()
+        N.reset(slots=1)
+        self._run(N)                                                   # a second bench on the same server: new prompts again
+        self.assertEqual(len(set(prompts)), 9)
+
+    def test_first_pass_vs_later_runs_and_replay_flag(self):
+        """FR#12: an erase that does not clear the drafter (the 'forget' answered, the table stayed): later runs accept
+        more drafts and read 2x+; the class is flagged and keeps its first pass. Honest runs: no flag, median kept."""
+        self.ReplayServer.reset(slots=1)
+        app, res = self._run(self.ReplayServer)
+        for c in res["classes"]:
+            self.assertEqual((c["first_pass_tps"], c["later_mean_tps"], c["replay_suspect"], c["decode_tps"]), (40.0, 40.0, False, 40.0))
+        self.assertTrue(any("prose: first pass 40.0 t/s, later runs mean 40.0 t/s" in ln for ln in app.bench["lines"]), app.bench["lines"])
+
+        class Sticky(self.ReplayServer):
+            WARMUP_PROMPT = BENCH.WARMUP_PROMPT                    # (the fallback warm-up on the prose prompt would make rep 1 replay too)
+
+            @classmethod
+            def _post_json(cls, url, path, body, timeout=0):
+                if path.startswith("/slots/"):
+                    return {"id_slot": 0, "n_erased": 0}           # erase answered, table kept
+                replay = body["prompt"] in cls.seen
+                cls.seen.add(body["prompt"])
+                return {"timings": {"predicted_per_second": 95.0 if replay else 40.0, "prompt_per_second": 900.0, "prompt_n": 20,
+                                    "draft_n": 60, "draft_n_accepted": 55 if replay else 6}}
+
+        Sticky.reset(slots=1)
+        app, res = self._run(Sticky)
+        for c in res["classes"]:
+            self.assertTrue(c["replay_suspect"], c)
+            self.assertEqual((c["first_pass_tps"], c["decode_tps"]), (40.0, 40.0))
+            self.assertEqual(c["drafts_accepted"], [6, 55, 55])
+        self.assertTrue(any("replayed" in ln for ln in app.bench["lines"]))
+
+
+    def test_summarize_runs(self):
+        s = BENCH.summarize_runs([40.0, 41.0, 39.0])
+        self.assertEqual((s["first_pass"], s["later_mean"], s["replay_suspect"], s["headline"]), (40.0, 40.0, False, 40.0))
+        s = BENCH.summarize_runs([40.0, 88.0, 90.0])                    # FR#12: later runs >2x = replay
+        self.assertEqual((s["replay_suspect"], s["headline"]), (True, 40.0))
+        self.assertAlmostEqual(s["later_vs_first"], 1.225)
+        s = BENCH.summarize_runs([40.0])
+        self.assertEqual((s["later_mean"], s["replay_suspect"], s["headline"]), (None, False, 40.0))
+        s = BENCH.summarize_runs([40.0, 88.0, 90.0], [10, 150, 160])  # with draft evidence: still flagged
+        self.assertTrue(s["replay_suspect"])
+        s = BENCH.summarize_runs([4.3, 33.4, 86.6], [0, 0, 0])        # a stalled first pass, nothing accepted anywhere: noise
+        self.assertEqual((s["replay_suspect"], s["headline"]), (False, 33.4))
+        s = BENCH.summarize_runs([4.3, 33.4, 86.6], [0, None, 0])     # incomplete draft counts: speed alone decides
+        self.assertTrue(s["replay_suspect"])
+        self.assertNotEqual(BENCH.run_tag("ab", 1), BENCH.run_tag("ab", 2))
+
+    def test_forget_helper(self):
+        self.ReplayServer.reset(slots=3)
+        self.assertTrue(C.bench_forget(self.ReplayServer, "http://x"))
+        self.assertEqual(self.ReplayServer.erases, ["/slots/%d?action=erase" % i for i in range(3)])
+        self.NoEraseServer.reset(slots=1)
+        self.assertFalse(C.bench_forget(self.NoEraseServer, "http://x"))
+
+class BenchEarlyEnd(unittest.TestCase):
+    """#361/#362 (2026-10-26): Swift-1.5 Flash-Next ended the raw-text "edit" and "long" bench prompts at once (first token
+    <|endoftext|> / <|im_end|>); the server times the first token with the prompt, so one token read 1,000,000 t/s and the
+    bench card showed it. A run that ends early is asked again with ignore_eos (the class times n_predict tokens); a run
+    that does not end early sends the same request as before; a reply of one token is never a speed."""
+
+    class EosServer(BenchHistoryFields.FakeBench):
+        """prose decodes n_predict tokens; edit/long end after 1 token unless ignore_eos (then n_predict tokens)"""
+        CLASS_PROMPTS = BENCH.CLASS_PROMPTS
+        WARMUP_PROMPT = BENCH.WARMUP_PROMPT
+        bodies = []
+        stubborn = False                     # True: even ignore_eos gives one token (a server that ignores the field)
+
+        @classmethod
+        def reset(cls, stubborn=False):
+            cls.bodies, cls.stubborn = [], stubborn
+
+        @classmethod
+        def _get_json(cls, url, path, timeout=10):
+            return {"model_path": FAKE_MODEL, "total_slots": 1}
+
+        @classmethod
+        def _post_json(cls, url, path, body, timeout=0):
+            if path.startswith("/slots/"):
+                return {"id_slot": 0, "n_erased": 0}
+            cls.bodies.append(dict(body))
+            n = body["n_predict"]
+            early = body["prompt"] != BENCH.CLASS_PROMPTS["prose"]["prompt"] and (cls.stubborn or not body.get("ignore_eos"))
+            if early:
+                return {"content": "", "tokens_predicted": 1, "stop_type": "eos",
+                        "timings": {"predicted_per_second": 1000000.0, "predicted_n": 1, "prompt_per_second": 360.0, "prompt_n": 87}}
+            return {"content": "x" * n, "tokens_predicted": n, "stop_type": "limit",
+                    "timings": {"predicted_per_second": 80.0, "predicted_n": n, "prompt_per_second": 360.0, "prompt_n": 87}}
+
+    def _run(self, mod, reps=3):
+        app = C.App(L, port=0, models_dirs=[MODELS])
+        app.seat.cmd = ["llama-server", "-m", FAKE_MODEL, "--spec-type", "mtp"]
+        app.seat.req = {"model": FAKE_MODEL, "gpus": [1], "port": 8999}
+        app.bench = {"running": True, "lines": [], "result": None, "error": None}
+        app._bench_run(mod, 8999, reps, 0, [1])
+        self.assertIsNone(app.bench["error"], app.bench["error"])
+        return app, app.bench["result"]
+
+    def test_control_bench_retries_an_early_end_with_ignore_eos(self):
+        self.EosServer.reset()
+        app, res = self._run(self.EosServer)
+        by = {c["class"]: c for c in res["classes"]}
+        for c in ("prose", "edit", "long"):
+            self.assertEqual(by[c]["decode_all"], [80.0, 80.0, 80.0], by[c])
+            self.assertEqual(by[c]["decode_tps"], 80.0)
+            self.assertLess(by[c]["decode_tps"], 5000)
+        self.assertEqual((by["prose"]["ignore_eos_runs"], by["edit"]["ignore_eos_runs"], by["long"]["ignore_eos_runs"]), (0, 3, 3))
+        prose = [b for b in self.EosServer.bodies if b["prompt"] == BENCH.CLASS_PROMPTS["prose"]["prompt"]]
+        self.assertEqual(len(prose), 3)
+        self.assertTrue(all("ignore_eos" not in b for b in prose), prose)       # an honest run sends the old request
+        self.assertEqual(sum(1 for b in self.EosServer.bodies if b.get("ignore_eos")), 6)
+        self.assertEqual(sum("ended after 1 token(s) (eos)" in ln for ln in app.bench["lines"]), 6, app.bench["lines"])
+        hist = [r for r in C.read_jsonl("history.jsonl", limit=50) if r.get("source") == "bench"][-9:]
+        self.assertTrue(all(r["decode_tps"] < 5000 for r in hist), hist)
+
+    def test_control_bench_never_reports_one_token_as_a_speed(self):
+        self.EosServer.reset(stubborn=True)
+        _app, res = self._run(self.EosServer)
+        by = {c["class"]: c for c in res["classes"]}
+        for c in ("edit", "long"):
+            self.assertEqual(by[c]["decode_tps"], 0.0, by[c])               # no number, not 1,000,000
+            self.assertEqual(by[c]["decode_all"], [0.0, 0.0, 0.0])
+        self.assertEqual(by["prose"]["decode_tps"], 80.0)
+
+    def test_pxa_bench_run_class_and_helpers(self):
+        self.EosServer.reset()
+        saved = (BENCH._post_json, BENCH.forget)
+        try:
+            BENCH._post_json = self.EosServer._post_json
+            BENCH.forget = lambda url: True
+            for cls, want_eos in (("prose", 0), ("edit", 3), ("long", 3)):
+                spec = BENCH.CLASS_PROMPTS[cls]
+                row = BENCH.run_class("http://x", cls, spec["prompt"], spec["n_predict"], 3)
+                self.assertEqual(row["decode_all"], [80.0, 80.0, 80.0], row)
+                self.assertEqual(row["ignore_eos_runs"], want_eos)
+            self.EosServer.reset(stubborn=True)
+            m = BENCH.measure_once("http://x", BENCH.CLASS_PROMPTS["edit"]["prompt"], 96)
+            self.assertEqual((m["decode_tok_s"], m["tokens_predicted"], m["ended_early"]), (0.0, 1, True))
+        finally:
+            BENCH._post_json, BENCH.forget = saved
+        self.assertEqual(BENCH.completion_body("p", 64), {"prompt": "p", "n_predict": 64, "temperature": 0.0, "seed": 0,
+                                                          "cache_prompt": False})
+        self.assertTrue(BENCH.completion_body("p", 64, ignore_eos=True)["ignore_eos"])
+        one = {"tokens_predicted": 1, "timings": {"predicted_per_second": 1e6}}
+        self.assertEqual((BENCH.ended_early(one, 96), BENCH.decode_rate(one)), (True, 0.0))
+        self.assertEqual((C.bench_ended_early(one, 96), C.bench_decode_rate(one)), (True, 0.0))
+        full = {"tokens_predicted": 96, "timings": {"predicted_per_second": 80.0}}
+        self.assertEqual((BENCH.ended_early(full, 96), BENCH.decode_rate(full)), (False, 80.0))
+        late = {"tokens_predicted": 40, "stop_type": "eos", "timings": {"predicted_per_second": 70.0}}
+        self.assertFalse(BENCH.ended_early(late, 96))                         # a real answer that ended: kept
+        self.assertFalse(C.bench_ended_early({"timings": {"predicted_per_second": 40.0}}, 96))   # no count: unchanged
+        md = BENCH.render_markdown({"generated_at": "t", "cards_line": "1x V100", "model_alias": "m", "model_path": "/m.gguf",
+                                    "model_sha": "0" * 64, "model_tier": "pxqn", "engine_build": 1, "engine_commit": "x",
+                                    "reps": 3, "board_note": "",
+                                    "classes": [{"class": "edit", "decode_tok_s": 80.0, "prefill_tok_s": 360.0, "vs_board": "-",
+                                                 "ignore_eos_runs": 3}],
+                                    "greedy": {"sha256": "a" * 64, "chars": 10, "tokens_predicted": 512, "empty": False}})
+        self.assertIn("ignore_eos", md)
+
+
+class BenchAllThinking(unittest.TestCase):
+    """#366 (beta 6): a bench class whose every token is thinking (no answer) showed a speed off zero answer tokens
+    (1,000,000 t/s on the card). The card now says "no answer: all thinking", the rate counts the thinking tokens
+    (every token the server generated), and the high-score board takes no such run."""
+
+    class ThinkServer(BenchHistoryFields.FakeBench):
+        """prose answers; edit opens a thought it never closes (raw text); long returns only reasoning_content
+        (a server that splits the thought out); with stubborn, edit/long end after one token even with ignore_eos"""
+        CLASS_PROMPTS = BENCH.CLASS_PROMPTS
+        WARMUP_PROMPT = BENCH.WARMUP_PROMPT
+        stubborn = False
+
+        @classmethod
+        def _get_json(cls, url, path, timeout=10):
+            return {"model_path": FAKE_MODEL, "total_slots": 1}
+
+        @classmethod
+        def _post_json(cls, url, path, body, timeout=0):
+            if path.startswith("/slots/"):
+                return {"id_slot": 0, "n_erased": 0}
+            n, pr = body["n_predict"], body["prompt"]
+            t = {"prompt_per_second": 360.0, "prompt_n": 87}
+            if pr == BENCH.CLASS_PROMPTS["prose"]["prompt"]:
+                return {"content": "x" * n, "tokens_predicted": n, "stop_type": "limit",
+                        "timings": dict(t, predicted_per_second=80.0, predicted_n=n)}
+            if cls.stubborn:
+                return {"content": "", "tokens_predicted": 1, "stop_type": "eos",
+                        "timings": dict(t, predicted_per_second=1000000.0, predicted_n=1)}
+            if pr == BENCH.CLASS_PROMPTS["edit"]["prompt"]:
+                return {"content": "<think>\nLet me think about the edit" + " hmm" * n, "tokens_predicted": n,
+                        "stop_type": "limit", "timings": dict(t, predicted_per_second=78.0, predicted_n=n)}
+            return {"content": "", "reasoning_content": "thinking " * n, "tokens_predicted": n, "stop_type": "limit",
+                    "timings": dict(t, predicted_per_second=75.0, predicted_n=n)}
+
+    def _run(self, stubborn=False, thinking=None):
+        self.ThinkServer.stubborn = stubborn
+        app = C.App(L, port=0, models_dirs=[MODELS])
+        app.seat.cmd = ["llama-server", "-m", FAKE_MODEL]
+        app.seat.req = {"model": FAKE_MODEL, "gpus": [1], "port": 8999}
+        if thinking:
+            app.seat.req["thinking"] = {"mode": thinking, "budget": None, "level": None}
+        app.bench = {"running": True, "lines": [], "result": None, "error": None}
+        app._bench_run(self.ThinkServer, 8999, 2, 0, [1])
+        self.assertIsNone(app.bench["error"], app.bench["error"])
+        return app, app.bench["result"]
+
+    def test_all_thinking_is_named_and_counted(self):
+        app, res = self._run()
+        by = {c["class"]: c for c in res["classes"]}
+        self.assertIsNone(by["prose"].get("no_answer"))
+        self.assertEqual((by["prose"]["decode_tps"], by["prose"]["all_thinking_runs"]), (80.0, 0))
+        for cls, rate in (("edit", 78.0), ("long", 75.0)):
+            self.assertEqual(by[cls]["no_answer"], "all thinking", by[cls])
+            self.assertEqual(by[cls]["all_thinking_runs"], 2)
+            self.assertEqual(by[cls]["decode_tps"], rate)            # the thinking tokens are the generated tokens
+        self.assertGreaterEqual(sum("no answer: all thinking" in ln for ln in app.bench["lines"]), 4, app.bench["lines"])
+        chk = app.score_check()
+        self.assertFalse(chk["available"])
+        self.assertIn("no answer", chk["reason"])
+
+    def test_no_tokens_is_no_answer_not_a_speed(self):
+        app, res = self._run(stubborn=True)
+        by = {c["class"]: c for c in res["classes"]}
+        for cls in ("edit", "long"):
+            self.assertEqual(by[cls]["decode_tps"], 0.0)
+            self.assertEqual(by[cls]["no_answer"], "ended at once", by[cls])
+        self.assertIsNone(by["prose"].get("no_answer"))
+        self.assertFalse(app.score_check()["available"])
+
+    def test_thinking_off_launch_is_never_all_thinking(self):
+        """bug #372 (beta 6 VS report): the bench asks raw /completion, so a launch with thinking OFF never reaches it;
+        a Qwen3.8 model opened a thought at the long prompt's "Answer:" and the card said "no answer: all thinking"
+        although the user had turned thinking off. With thinking off at launch the class keeps its speed and the board
+        takes it; the log says the raw prompt opened a thought."""
+        app, res = self._run(thinking="off")
+        by = {c["class"]: c for c in res["classes"]}
+        for cls, rate in (("edit", 78.0), ("long", 75.0)):
+            self.assertIsNone(by[cls]["no_answer"], by[cls])
+            self.assertEqual(by[cls]["all_thinking_runs"], 0)
+            self.assertEqual(by[cls]["decode_tps"], rate)
+        self.assertFalse(any("no answer" in ln for ln in app.bench["lines"]), app.bench["lines"])
+        self.assertTrue(any("thinking is off" in ln for ln in app.bench["lines"]), app.bench["lines"])
+        self.assertTrue(app.score_check()["available"], app.score_check())
+
+    def test_thinking_on_launch_keeps_366(self):
+        app, res = self._run(thinking="on")
+        by = {c["class"]: c for c in res["classes"]}
+        self.assertEqual(by["long"]["no_answer"], "all thinking", by["long"])
+        self.assertFalse(app.score_check()["available"])
+
+    def test_reply_kinds(self):
+        self.assertEqual(C.bench_answer_kind({"content": "Paris is the capital.", "tokens_predicted": 40}), None)
+        self.assertEqual(C.bench_answer_kind({"content": "<think>a b c", "tokens_predicted": 40}), "all thinking")
+        self.assertEqual(C.bench_answer_kind({"content": "<think>a</think>\n\nParis.", "tokens_predicted": 40}), None)
+        self.assertEqual(C.bench_answer_kind({"content": "<think>a</think>\n\n", "tokens_predicted": 40}), "all thinking")
+        self.assertEqual(C.bench_answer_kind({"content": "", "reasoning_content": "hm", "tokens_predicted": 40}), "all thinking")
+        self.assertEqual(C.bench_answer_kind({"content": "<|channel|>analysis<|message|>hmm", "tokens_predicted": 9}),
+                         "all thinking")
+        self.assertEqual(C.bench_answer_kind({"content": "", "tokens_predicted": 1}), "ended at once")
+        self.assertEqual(C.bench_answer_kind({"timings": {"predicted_per_second": 40.0}}), None)     # a test double / old engine
+
+    def test_card_says_no_answer(self):
+        with open(os.path.join(ROOT, "tools", "pxa_control_ui", "index.html"), encoding="utf-8") as f:
+            html = f.read()
+        self.assertTrue("\"no answer: \"" in html and "c.no_answer" in html, "the bench card has no no-answer label")
+        self.assertNotIn("\u2014 no answer", html)
+
+
+
+class WattBench(unittest.TestCase):
+    """Speed per watt on a benchmark row. nvidia-smi is a fake on PATH. No driver, no power-cap write."""
+
+    SMI = r"""
+import os, sys
+q = ""
+for a in sys.argv[1:]:
+    if a.startswith("--query-gpu="):
+        q = a.split("=", 1)[1]
+        break
+if q == "index,name,compute_cap,memory.total,memory.used,uuid":
+    sys.stdout.write("0, Tesla P100-PCIE-16GB, 6.0, 16384, 100, GPU-fake-0\n")
+    sys.exit(0)
+if q == "index,power.default_limit":
+    sys.stdout.write("0, 250.0\n")
+    sys.exit(0)
+if q == "index,power.draw,power.limit":
+    path = os.environ.get("PXA_WATT_FAKE_COUNT", "")
+    n = 0
+    if path:
+        try:
+            with open(path) as f:
+                n = int((f.read() or "0").strip() or "0")
+        except OSError:
+            n = 0
+        with open(path, "w") as f:
+            f.write(str(n + 1))
+    w = 100 + 50 * n
+    sys.stdout.write("0, %s, 250.0\n" % w)
+    if os.environ.get("PXA_WATT_FAKE_TWO") == "1":
+        sys.stdout.write("1, %s, 300.0\n" % (w / 2))
+    sys.exit(0)
+if os.environ.get("PXA_WATT_FAKE_BOMB") == "1":
+    open(os.environ["PXA_WATT_FAKE_BOMB_PATH"], "w").write("hit\n")
+sys.exit(1)
+"""
+
+    def _install_smi(self, directory):
+        path = os.path.join(directory, "nvidia-smi")
+        with open(path, "w") as f:
+            f.write("#!" + sys.executable + "\n" + self.SMI)
+        os.chmod(path, 0o755)
+        return path
+
+    def test_parse_skips_missing_readings(self):
+        rows = C.App.parse_power_csv("0, 100.5, 250\n1, [N/A], 250\n2, Not Supported, 300\nbad line\nindex, power.draw, power.limit\n")
+        self.assertEqual([(r["index"], r["power_w"], r["power_limit_w"]) for r in rows],
+                         [(0, 100.5, 250.0), (1, None, 250.0), (2, None, 300.0)])
+        self.assertEqual(C.App.parse_power_csv(""), [])
+        self.assertEqual(C.App.parse_power_csv(None), [])
+
+    def test_summary_avg_peak_and_tokens_per_watt(self):
+        samples = [
+            [{"index": 0, "power_w": 100.0, "power_limit_w": 250.0},
+             {"index": 1, "power_w": 80.0, "power_limit_w": 250.0},
+             {"index": 2, "power_w": None, "power_limit_w": 250.0}],
+            [{"index": 0, "power_w": 200.0, "power_limit_w": 250.0},
+             {"index": 1, "power_w": 100.0, "power_limit_w": 250.0}],
+        ]
+        one = C.App.summarize_power(samples, cards=[0], decode_tps=30)
+        self.assertEqual((one["avg_w"], one["peak_w"], one["samples"], one["tps_per_w"]), (150.0, 200.0, 2, 0.2))
+        self.assertEqual(one["cards"], [{"index": 0, "avg_w": 150.0, "peak_w": 200.0, "limit_w": 250.0, "samples": 2}])
+        both = C.App.summarize_power(samples, cards=[0, 1], decode_tps=48)
+        self.assertEqual((both["avg_w"], both["peak_w"], both["tps_per_w"]), (240.0, 300.0, 0.2))
+        self.assertEqual([c["index"] for c in both["cards"]], [0, 1])
+        empty = C.App.summarize_power([[{"index": 0, "power_w": 0.0, "power_limit_w": 250.0}]], cards=[0], decode_tps=40)
+        self.assertEqual((empty["avg_w"], empty["peak_w"], empty["tps_per_w"], empty["samples"]), (None, None, None, 0))
+        self.assertEqual(C.App.bench_decode_tps([{"class": "edit", "decode_tps": 99}, {"class": "prose", "decode_tps": 40}]), 40.0)
+        self.assertEqual(C.App.bench_decode_tps([{"class": "long", "decode_tps": 12}]), 12.0)
+        self.assertIsNone(C.App.bench_decode_tps([]))
+
+    def test_infinite_and_nan_readings_never_reach_a_row(self):
+        """A host that prints inf / nan, or a decode speed that is not a number, gives a dash (None), never NaN / Infinity in the stored JSON."""
+        rows = C.App.parse_power_csv("0, inf, 250\n1, nan, inf\n2, 120, 250\n")
+        self.assertEqual([r["power_w"] for r in rows], [None, None, 120.0])
+        self.assertIsNone(rows[1]["power_limit_w"])
+        p = C.App.summarize_power([[{"index": 0, "power_w": float("inf")}], [{"index": 0, "power_w": float("nan")}]], None, 40)
+        self.assertEqual((p["samples"], p["avg_w"], p["peak_w"], p["tps_per_w"]), (0, None, None, None))
+        p = C.App.summarize_power([[{"index": 0, "power_w": 100, "power_limit_w": float("inf")}]], None, float("inf"))
+        self.assertEqual((p["avg_w"], p["decode_tps"], p["tps_per_w"]), (100.0, None, None))
+        self.assertIsNone(p["cards"][0]["limit_w"])
+        json.loads(json.dumps(p, allow_nan=False))       # valid JSON for the browser
+
+    def test_fake_gpu_table_never_calls_nvidia_smi(self):
+        d = tempfile.mkdtemp(prefix="pxa-watt-bomb-")
+        hit = os.path.join(d, "hit")
+        self._install_smi(d)
+        saved = os.environ["PATH"]
+        os.environ["PATH"] = d + os.pathsep + saved
+        os.environ["PXA_WATT_FAKE_BOMB"] = "1"
+        os.environ["PXA_WATT_FAKE_BOMB_PATH"] = hit
+        try:
+            self.assertTrue(os.environ.get("PXA_LAUNCH_FAKE_GPUS"))
+            app = C.App(L, port=0, models_dirs=[MODELS])
+            self.assertEqual(app.sample_gpu_power(), [])
+            self.assertFalse(os.path.exists(hit))
+        finally:
+            os.environ["PATH"] = saved
+            os.environ.pop("PXA_WATT_FAKE_BOMB", None)
+            os.environ.pop("PXA_WATT_FAKE_BOMB_PATH", None)
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_sample_reads_the_fake_nvidia_smi(self):
+        d = tempfile.mkdtemp(prefix="pxa-watt-smi-")
+        self._install_smi(d)
+        saved_path = os.environ["PATH"]
+        saved_fake = os.environ.pop("PXA_LAUNCH_FAKE_GPUS", None)
+        os.environ["PATH"] = d + os.pathsep + saved_path
+        os.environ["PXA_WATT_FAKE_TWO"] = "1"
+        os.environ.pop("PXA_WATT_FAKE_COUNT", None)
+        try:
+            app = C.App(L, port=0, models_dirs=[MODELS])
+            rows = app.sample_gpu_power()
+        finally:
+            os.environ["PATH"] = saved_path
+            if saved_fake is None:
+                os.environ.pop("PXA_LAUNCH_FAKE_GPUS", None)
+            else:
+                os.environ["PXA_LAUNCH_FAKE_GPUS"] = saved_fake
+            os.environ.pop("PXA_WATT_FAKE_TWO", None)
+            shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual([(r["index"], r["power_w"], r["power_limit_w"]) for r in rows],
+                         [(0, 100.0, 250.0), (1, 50.0, 300.0)])
+
+    def test_bench_row_stores_avg_peak_and_history_keeps_it(self):
+        d = tempfile.mkdtemp(prefix="pxa-watt-run-")
+        count = os.path.join(d, "n")
+        self._install_smi(d)
+        keys = ("PATH", "PXA_LAUNCH_FAKE_GPUS", "PXA_LAUNCH_NO_NVML", "PXA_LAUNCH_NO_PROC",
+                "PXA_WATT_FAKE_COUNT", "PXA_WATT_FAKE_TWO")
+        saved = {k: os.environ.get(k) for k in keys}
+        os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
+        os.environ.pop("PXA_LAUNCH_FAKE_GPUS", None)
+        os.environ["PXA_LAUNCH_NO_NVML"] = "1"
+        os.environ["PXA_LAUNCH_NO_PROC"] = "1"
+        os.environ["PXA_WATT_FAKE_COUNT"] = count
+        os.environ["PXA_WATT_FAKE_TWO"] = "1"
+        try:
+            app = C.App(L, port=0, models_dirs=[MODELS])
+            app.power_sample_s = 0.05
+            app.seat.cmd = ["llama-server", "-m", FAKE_MODEL]
+            app.seat.req = {"model": FAKE_MODEL, "gpus": [0], "port": 8999}
+            app.bench = {"running": True, "lines": [], "result": None, "error": None}
+
+            class Slow(BenchHistoryFields.FakeBench):
+                @staticmethod
+                def _post_json(url, path, body, timeout=0):
+                    time.sleep(0.6)     # >= 2 samples at 0.05 s even when each fake nvidia-smi spawn is slow on a loaded box
+                    return BenchHistoryFields.FakeBench._post_json(url, path, body, timeout)
+
+            app._bench_run(Slow, 8999, 1, 0, [0])
+            self.assertIsNone(app.bench["error"], app.bench["error"])
+            res = app.bench["result"]
+            p = res["power"]
+            self.assertGreaterEqual(p["samples"], 2, p)
+            self.assertEqual(p["interval_s"], 0.05)
+            self.assertEqual([c["index"] for c in p["cards"]], [0])          # card 1 was drawing too, and is not in this run
+            self.assertEqual(p["cards"][0]["limit_w"], 250.0)
+            self.assertGreaterEqual(p["peak_w"], p["avg_w"])
+            self.assertGreaterEqual(p["avg_w"], 100.0)
+            self.assertEqual(p["decode_tps"], 40.0)
+            self.assertEqual(p["tps_per_w"], round(40.0 / p["avg_w"], 3))
+            self.assertTrue(any("tokens/s per watt" in ln for ln in app.bench["lines"]), app.bench["lines"])
+            stored = C.read_jsonl("bench.jsonl", limit=1)[-1]
+            self.assertEqual(stored["power"]["avg_w"], p["avg_w"])
+            self.assertIn("telemetry", stored)          # the file keeps the temperature trace; the history route drops it
+            import pxa_control.routes as R
+            row = [r for r in R.r_bench(app, {}, {})["history"] if r.get("ts") == res["ts"]][0]
+            self.assertNotIn("telemetry", row)
+            self.assertEqual(row["power"]["peak_w"], p["peak_w"])
+            self.assertEqual(row["power"]["tps_per_w"], p["tps_per_w"])
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class EncodeRoutes(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1316,6 +2830,40 @@ class EncodeRoutes(unittest.TestCase):
         code, lic = self.post("/api/encode/licence", {})
         self.assertEqual(code, 200)
         self.assertEqual(lic["encoders"][0]["licence"]["state"], "valid")
+
+    def test_06b_a_slow_stale_rescan_never_overwrites_a_newer_encoder_pick(self):
+        """The RC2.1 flake of test_06 ('free' != 'pro' right after the Pro install): the page polls /api/encode/state, and a poll whose 30 s cache had
+        expired runs a full rescan. On a slow box that rescan began BEFORE the install switched the preferred encoder to the new Pro one, finished AFTER
+        the install's own rescan and replaced the cache with its stale pick (free). A config change now voids every scan that began before it."""
+        svc = self.app.encode()
+        found = {e["edition"]: e["path"] for e in svc.encoders(True)}
+        self.assertEqual(set(found), {"free", "pro"})
+        svc.cfg_set(preferred=found["free"])
+        self.assertEqual(svc.selected(True)["edition"], "free")
+        gate, started, calls = threading.Event(), threading.Event(), []
+        real = C.ENC.AD.discover
+
+        def slow_first(*a, **kw):
+            r = real(*a, **kw)              # computed with the OLD preference ...
+            calls.append(1)
+            if len(calls) == 1:
+                started.set()
+                gate.wait(30)               # ... and delivered late, like a rescan starved of CPU
+            return r
+        C.ENC.AD.discover = slow_first
+        try:
+            poll = threading.Thread(target=lambda: svc.encoders(True), daemon=True)
+            poll.start()
+            self.assertTrue(started.wait(30))
+            svc.cfg_set(preferred=found["pro"])         # what the install does ...
+            self.assertEqual(svc.selected(True)["edition"], "pro")      # ... and its own rescan
+            gate.set()
+            poll.join(30)
+            self.assertFalse(poll.is_alive())
+        finally:
+            C.ENC.AD.discover = real
+        self.assertEqual(svc.selected()["edition"], "pro", "the stale scan replaced the cache")
+        self.assertEqual(self.get("/api/encode/state")[1]["edition"], "pro")
 
     def test_07_encode_tab_unavailable_is_a_plain_400_not_a_500(self):
         real = C.ENC
@@ -1844,7 +3392,7 @@ class TelemetryHistory(unittest.TestCase):
         app.start_telemetry()
         self.drive(app)
         u = "http://127.0.0.1:%d/api/telemetry/csv?kind=card&since=%d&step=10" % (port, time.time() - 3600)
-        with urllib.request.urlopen(u, timeout=10) as r:
+        with urllib.request.urlopen(urllib.request.Request(u, headers={"X-PXA-Token": token_for(port)}), timeout=10) as r:
             self.assertTrue(r.headers["Content-Type"].startswith("text/csv"))
             self.assertIn("attachment;", r.headers["Content-Disposition"])
             lines = r.read().decode().splitlines()
@@ -1988,6 +3536,16 @@ def sleeper(*args, secs=60):
     return p
 
 
+def os_free_port():
+    """a port the kernel just handed out (bind to 0): a fixed scan start (free_port(17950)) gave two test processes running
+    side by side (ctest -j, or the file twice at once) the same port, so one test talked to the other's Control"""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
 def wait_until(fn, timeout=15.0, step=0.1):
     end = time.time() + timeout
     while time.time() < end:
@@ -2028,7 +3586,7 @@ class ControlFirst(unittest.TestCase):
         srv, port = serve_app(app)
         self.srvs.append(srv)
         app.port = port
-        C.write_run_record(port, lan, companion=False)
+        C.write_run_record(port, lan, companion=False, token=None if lan else app.token)   # as serve() writes it (H1)
         return app, port
 
     def ns(self, *argv):
@@ -2063,11 +3621,17 @@ class ControlFirst(unittest.TestCase):
         a = self.ns("--no-control")
         self.assertEqual(L.control_decision(a, tty=True), (False, None))
         a = self.ns("-m", FAKE_MODEL, "--gpus", "0")
-        on, why = L.control_decision(a, tty=False)
-        self.assertFalse(on)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            self.assertIsNone(L.control_alongside(a, "0", tty=False))
+        # the host's own container state must not decide this case (ctest runs inside the build container)
+        _ck = L.container_kind
+        L.container_kind = lambda: None
+        try:
+            on, why = L.control_decision(a, tty=False)
+            self.assertFalse(on)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertIsNone(L.control_alongside(a, "0", tty=False))
+        finally:
+            L.container_kind = _ck
         self.assertIn("PXA Control: off (not started from a terminal", buf.getvalue())
         self.assertEqual(C.launched_servers(), {})                              # nothing recorded when off
         os.environ["PXA_CONTROL"] = "0"
@@ -2084,7 +3648,7 @@ class ControlFirst(unittest.TestCase):
         self.assertIsNone(C.find_running())
         app, port = self.up()
         r = C.find_running()
-        self.assertEqual((r["port"], r["pid"], r["url"]), (port, os.getpid(), f"http://127.0.0.1:{port}/"))
+        self.assertEqual((r["port"], r["pid"], r["url"]), (port, os.getpid(), f"http://127.0.0.1:{port}/?token={app.token}"))
         self.assertIsNone(C.find_running(port=port + 1))                        # asked for another port
         self.assertIsNone(C.find_running(lan=True))                             # a LAN one was asked for
         # a record whose process is gone is dropped; one whose port is not a Control is ignored
@@ -2214,10 +3778,12 @@ class ControlFirst(unittest.TestCase):
 
     def test_companion_closes_itself_when_idle(self):
         out = {}
-        port = C.free_port(17950)
+        port = os_free_port()
 
         def run():
-            out["rc"] = C.serve(L, port=port, open_browser=False, models_dirs=[MODELS], companion=True, idle_s=0.8)
+            # idle_s 3.0, was 0.8 (pass 8e RC): under a parallel ctest the 0.8 s timer could expire before the first poll
+            # below reached the server, which then failed "answers" although it closed exactly as designed
+            out["rc"] = C.serve(L, port=port, open_browser=False, models_dirs=[MODELS], companion=True, idle_s=3.0)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             th = threading.Thread(target=run, daemon=True)
@@ -2225,7 +3791,7 @@ class ControlFirst(unittest.TestCase):
             self.assertTrue(wait_until(lambda: C.control_answers(port), 10))
             st, _h, b = req(port, "/api/info")
             info = json.loads(b)
-            self.assertEqual((info["companion"], info["idle_exit_s"]), (True, 0.8))
+            self.assertEqual((info["companion"], info["idle_exit_s"]), (True, 3.0))
             th.join(20)
         self.assertFalse(th.is_alive(), "a background Control with nothing to do must exit")
         self.assertEqual(out.get("rc"), 0)
@@ -2233,7 +3799,7 @@ class ControlFirst(unittest.TestCase):
         self.assertEqual(C.running_controls(), [])                              # its run record is gone
 
     def test_user_opened_control_does_not_idle_out(self):
-        port = C.free_port(17960)
+        port = os_free_port()
         holder = {}
 
         def run():
@@ -2252,6 +3818,17 @@ class ControlFirst(unittest.TestCase):
         self.assertEqual(C.running_controls(), [])
 
     # ---- start or reuse ---------------------------------------------------------------------
+    def test_token_for_trusts_a_live_run_record_over_a_closed_test_server(self):
+        # a test server that served this port earlier left its token in TOKENS; the port came back to a spawned
+        # Control (ephemeral reuse, likelier under ctest -j 8), whose run record holds the token that counts
+        port = 40000 + os.getpid() % 20000
+        TOKENS[port] = "stale-token-of-a-closed-test-server"
+        try:
+            C.write_run_record(port, False, True, token="live-token-of-the-spawned-control")
+            self.assertEqual(token_for(port), "live-token-of-the-spawned-control")
+        finally:
+            TOKENS.pop(port, None)
+
     def test_ensure_control_reuses_the_running_one(self):
         app, port = self.up()
         r = C.ensure_control("/nonexistent/pxa-launch.py", port=port + 1)
@@ -2266,14 +3843,16 @@ class ControlFirst(unittest.TestCase):
         C.record_launched(k.pid, port=18128, model=FAKE_MODEL)
         os.environ["PXA_CONTROL_IDLE_S"] = "1"
         try:
-            r = C.ensure_control(os.path.join(TOOLS, "pxa-launch.py"), port=want, avoid={want + 1})
+            r = C.ensure_control(os.path.join(TOOLS, "pxa-launch.py"), port=want, avoid={want + 1},
+                                 wait_s=30.0)   # the default 8 s missed under ctest -j 4 at load ~48 (RC2.1 r21a)
         finally:
             os.environ.pop("PXA_CONTROL_IDLE_S", None)
             busy.close()
         self.assertFalse(r.get("error"), r)
         self.assertFalse(r["reused"])
         self.assertNotIn(r["port"], (want, want + 1))                           # busy, and the server's own
-        self.assertEqual(r["url"], f"http://127.0.0.1:{r['port']}/")
+        self.assertEqual(r["url"], f"http://127.0.0.1:{r['port']}/?token={token_for(r['port'])}")   # H1: opens signed in
+        self.assertGreaterEqual(len(token_for(r["port"]) or ""), 32)
         rec = C.find_running()
         self.assertTrue(rec["companion"])
         self.assertNotEqual(rec["pid"], os.getpid())
@@ -2607,8 +4186,9 @@ class V3Plans(unittest.TestCase):
             os.environ.pop("PXA_MEMINFO", None) if old is None else os.environ.__setitem__("PXA_MEMINFO", old)
 
     def test_control_version_comes_from_the_package(self):
-        with open(os.path.join(TOOLS, "pxa_control.py"), encoding="utf-8") as f:
-            src = f.read()
+        src = "".join(open(os.path.join(TOOLS, "pxa_control", _f), encoding="utf-8").read()
+                          for _f in sorted(os.listdir(os.path.join(TOOLS, "pxa_control"))) if _f.endswith(".py"))     # the package (the Control hardening pass)
+        self.assertIn("CONTROL_VERSION = package_version()", src)
         self.assertNotIn('CONTROL_VERSION = "v3"', src)
         with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as f:
             tok = C.version_token(f.read())
@@ -2656,6 +4236,38 @@ class QuantizerTag(unittest.TestCase):
                          "pxa.quantizer.license_expires": 1791244800})["quantizer"]
         self.assertEqual(q, {"edition": "pro", "licensee": "T", "license_expires": 1791244800})
         self.assertIsNone(self._facts({"general.name": "n"})["quantizer"])
+
+
+class MtpHeadFacts(unittest.TestCase):
+    """_extra_facts reports the draft head (public pxa #7): nextn/mtp tensor count and the KV, None when the header is unreadable."""
+
+    def _facts(self, hdr):
+        d = tempfile.mkdtemp(dir=TMP)
+        p = os.path.join(d, "m.gguf")
+        open(p, "wb").write(b"x")
+        fake = type("A", (), {})()
+        fake._prof_cache = {}
+        fake.L = type("LL", (), {"gguf_header": staticmethod(lambda path: hdr),
+                                  "PXQ_GGML_TYPE": {}, "NON_PXQ_GGML_TYPE": {}})
+        return C.App._extra_facts(fake, p)
+
+    def test_head_counts(self):
+        kv = {"general.architecture": "qwen35", "qwen35.nextn_predict_layers": 1}
+        with_head = {"ok": True, "kv": kv, "tensors": [("token_embd.weight", 0, 4), ("blk.64.nextn.eh_proj.weight", 0, 4)]}
+        f = self._facts(with_head)
+        self.assertEqual((f["mtp_tensors"], f["mtp_kv"]), (1, 1))
+        liar = {"ok": True, "kv": kv, "tensors": [("token_embd.weight", 0, 4)]}
+        f = self._facts(liar)
+        self.assertEqual((f["mtp_tensors"], f["mtp_kv"]), (0, 1))
+        nohead = {"ok": True, "kv": {"general.architecture": "qwen35"}, "tensors": [("token_embd.weight", 0, 4)]}
+        f = self._facts(nohead)
+        self.assertEqual((f["mtp_tensors"], f["mtp_kv"]), (0, None))
+        self.assertIsNone(self._facts({"ok": False, "kv": {}, "tensors": []})["mtp_tensors"])   # unreadable: unknown, not "no head"
+
+    def test_ui_switches_mtp_off_for_a_headless_file(self):
+        html = open(os.path.join(TOOLS, "pxa_control_ui", "index.html"), encoding="utf-8").read()
+        self.assertIn('m.mtp_head === false', html)
+        self.assertIn('mtp: $("#l-mtp").checked && !$("#l-mtp").disabled', html)
 
 
 def urllib_quote(p):
@@ -2750,7 +4362,9 @@ class LaunchCtxAndLog(unittest.TestCase):
         self.assertEqual(ctx, 32768)
         self.assertIn("was -c 4096", buf.getvalue())
         with open(os.path.join(TOOLS, "pxa-launch.py"), encoding="utf-8") as f:
-            self.assertIn("cmd, env, ctx = build_llama_cmd", f.read())
+            src = f.read()
+        self.assertIn("cmd, env, ctx = build_llama_cmd", src)
+        self.assertGreater(src.find('print(f"  serve:'), src.find("cmd, env, ctx = build_llama_cmd"))
 
     def test_a_hand_set_ctx_is_not_replaced(self):
         buf = io.StringIO()
@@ -2951,6 +4565,66 @@ class LibUpdateRoutes(unittest.TestCase):
         self.assertEqual(code, 400, d)
         self.assertIn("running", d["error"].lower(), d)
 
+    def test_a_slow_background_check_never_overwrites_a_newer_forced_answer(self):
+        """Flaky-under-load root cause (10-19): POST /settings touches the page, which starts the background
+        poller BEFORE the new channel is written, so the poller asks about `stable`; a forced ?check=1 on `beta`
+        then gets not_valued, and the slower poller used to store its older `stable` answer on top of it (the
+        page and the test then saw error=None). The answer of the check that STARTED last must stand."""
+        import threading
+        real = _LUT.LU.check
+        gate, stale_done = threading.Event(), threading.Event()
+
+        def slow_check(d, channel=None, **kw):
+            if channel == "beta":
+                return real(d, channel=channel, **kw)
+            gate.wait(5)                # the poller's stable ask finishes only after the forced beta ask
+            try:
+                return real(d, channel=channel, **kw)
+            finally:
+                stale_done.set()
+        _LUT.LU.check = slow_check
+        self.addCleanup(lambda: setattr(_LUT.LU, "check", real))
+        self.lic.valued = False
+        self.app.lib.touch()            # the poller starts while the channel is still stable
+        time.sleep(0.2)
+        self.app.lib.cfg_set(channel="beta")
+        code, d = self.get("/api/lib/update?check=1")
+        self.assertEqual((d["error"] or {}).get("code"), "not_valued", d)
+        gate.set()
+        self.assertTrue(stale_done.wait(10), "the poller never asked")
+        time.sleep(0.3)                 # its answer is stored right after the ask returns
+        code, d = self.get("/api/lib/update")
+        self.assertEqual((d["error"] or {}).get("code"), "not_valued", d)
+        self.assertFalse(d["beta"], d)
+
+    def test_apply_waits_for_the_background_check_instead_of_refusing(self):
+        """Second load-only flake (10-19, ctest -j 4): the GET that opens the page starts the poller; when its check
+        was still in flight, Apply was refused with 'A library check is already running'. A check only reads the
+        server, so the click now waits for it; an apply/rollback in flight is still refused."""
+        import threading
+        real = _LUT.LU.check
+        gate, entered = threading.Event(), threading.Event()
+
+        def slow_check(d, channel=None, **kw):
+            if threading.current_thread().name == "pxa-lib":
+                entered.set()
+                gate.wait(5)
+            return real(d, channel=channel, **kw)
+        _LUT.LU.check = slow_check
+        self.addCleanup(lambda: setattr(_LUT.LU, "check", real))
+        self.app.lib.touch()
+        self.assertTrue(entered.wait(5), "the poller never asked")
+        threading.Timer(0.5, gate.set).start()
+        code, a = self.post("/api/lib/update/apply", {})
+        self.assertEqual(code, 200, a)
+        self.assertTrue(a["applied"], a)
+        # an apply in flight is still refused
+        self.app.lib._busy = "apply"
+        self.addCleanup(lambda: setattr(self.app.lib, "_busy", ""))
+        code, r = self.post("/api/lib/update/rollback", {})
+        self.assertEqual(code, 400, r)
+        self.assertIn("already running", r["error"], r)
+
     def test_a_key_without_the_valued_role_is_refused_on_beta(self):
         self.lic.valued = False
         code, d = self.post("/api/lib/update/settings", {"channel": "beta"})
@@ -2959,6 +4633,564 @@ class LibUpdateRoutes(unittest.TestCase):
         self.assertEqual(code, 200, d)
         self.assertEqual((d["error"] or {}).get("code"), "not_valued", d)
         self.assertFalse(d["beta"], d)
+
+
+# ---------------------------------------------------------------------------------------------
+# the models PXA publishes on Hugging Face, and the one-click download (v3.1, tools/pxa_hf.py)
+# ---------------------------------------------------------------------------------------------
+# Nothing here touches the network: a fake origin stands in for huggingface.co, so the listing, the
+# ranged resume, the sha256 check and the 401 on a supporter file are all exercised for real.
+
+HF_SMALL = b"GGUF" + b"\x11" * 508                            # one file, one part
+HF_BIG = b"GGUF" + b"\x22" * 40000                            # a split model's part
+HF_MID = b"GGUF" + b"\x33" * (1 << 20)                        # more than one read, so a cancel can land mid-file
+HF_CSV = b"layer,expert\n0,3\n"
+HF_SHA = {n: hashlib.sha256(d).hexdigest() for n, d in
+          (("small.gguf", HF_SMALL), ("big-00001-of-00002.gguf", HF_BIG), ("big-00002-of-00002.gguf", HF_BIG),
+           ("one-1mib.gguf", HF_MID))}
+HF_REPOS = {
+    "poisonxa/Pub-Model": {"small.gguf": HF_SMALL, "small.gguf.expert-counts.csv": HF_CSV},
+    "poisonxa/Pub-Split": {"big-00001-of-00002.gguf": HF_BIG, "big-00002-of-00002.gguf": HF_BIG},
+    "poisonxa/Supporter-Model": {"secret.gguf": HF_SMALL},
+}
+HF_KEY = "hf_a_key_that_can_read_the_supporter_repo"
+HF_SUPPORTER = "poisonxa/Supporter-Model"
+
+
+class FakeHF(http.server.BaseHTTPRequestHandler):
+    """The three huggingface.co endpoints this feature uses, and a 401 on a gated file without the key."""
+    delay = 0.0                    # seconds before each piece: what makes a cancel land mid-file
+    seen_ranges = []               # every Range header the client sent, so a resume can be proven
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/models":
+            return self._json([{"id": r, "private": False, "downloads": 3,
+                                "lastModified": "2026-09-%02dT00:00:00Z" % (20 + i)}
+                               for i, r in enumerate(HF_REPOS)])
+        if u.path.startswith("/api/models/") and u.path.endswith("/tree/main"):
+            files = HF_REPOS.get(u.path[len("/api/models/"):-len("/tree/main")])
+            if files is None:
+                return self._send(404, b"{}")
+            return self._json([{"type": "file", "path": n, "size": len(d),
+                                "lfs": {"oid": HF_SHA.get(n) or hashlib.sha256(d).hexdigest(),
+                                        "size": len(d)}} for n, d in files.items()])
+        m = re.match(r"^/([^/]+/[^/]+)/resolve/main/(.+)$", u.path)
+        if m:
+            repo, name = m.group(1), urllib.parse.unquote(m.group(2))
+            if repo == HF_SUPPORTER and (self.headers.get("Authorization") or "") != "Bearer " + HF_KEY:
+                return self._send(401, b'{"error":"unauthorized"}')
+            data = (HF_REPOS.get(repo) or {}).get(name)
+            if data is None:
+                return self._send(404, b"{}")
+            rng = self.headers.get("Range") or ""
+            start = int(rng[6:].split("-")[0]) if rng.startswith("bytes=") else 0
+            FakeHF.seen_ranges.append((name, rng))
+            self.send_response(206 if start else 200)
+            body = data[start:]
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            for off in range(0, len(body), 65536):          # in pieces, so a cancel can catch it part-way
+                if FakeHF.delay:
+                    time.sleep(FakeHF.delay)
+                self.wfile.write(body[off:off + 65536])
+                self.wfile.flush()                          # wfile is buffered: without this nothing arrives
+            return
+        self._send(404, b"{}")
+
+    def _json(self, obj):
+        self._send(200, json.dumps(obj).encode())
+
+    def _send(self, code, body):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class CountsBesideTheModel(unittest.TestCase):
+    """The download saves the expert map under the name the engine reads: <the -m file>.expert-counts.csv.
+    A map named after the unsplit model, or the only map of a one-model repository named after another name
+    of the same file (a release dir built from a symlink), used to land under a name the engine never looked
+    for, and the expert cache fell back to whole-layer streaming (2026-10-12)."""
+
+    @staticmethod
+    def _f(name):
+        if name.endswith(".expert-counts.csv"):
+            return {"path": name, "name": name, "kind": "counts", "model": name[:-len(".expert-counts.csv")]}
+        return {"path": name, "name": name, "kind": "model"}
+
+    def _plan(self, names, want):
+        return [(f["name"], f.get("save_as")) for f in C.HF.download_plan([self._f(n) for n in names], want)]
+
+    def test_same_name_is_unchanged(self):
+        self.assertEqual(self._plan(["a.gguf", "a.gguf.expert-counts.csv"], "a.gguf"),
+                         [("a.gguf", None), ("a.gguf.expert-counts.csv", None)])
+
+    def test_split_model_takes_the_unsplit_map_under_the_first_shard_name(self):
+        got = self._plan(["b-00001-of-00002.gguf", "b-00002-of-00002.gguf", "b.gguf.expert-counts.csv"],
+                         "b-00001-of-00002.gguf")
+        self.assertEqual(got[-1], ("b.gguf.expert-counts.csv", "b-00001-of-00002.gguf.expert-counts.csv"))
+
+    def test_a_one_model_repo_pairs_its_only_map_whatever_it_is_named(self):
+        got = self._plan(["FN-32GB.gguf", "FN-32GB.relaid.gguf.expert-counts.csv"], "FN-32GB.gguf")
+        self.assertEqual(got[-1], ("FN-32GB.relaid.gguf.expert-counts.csv", "FN-32GB.gguf.expert-counts.csv"))
+
+    def test_another_models_map_is_never_taken(self):
+        got = self._plan(["x.gguf", "y.gguf", "y.gguf.expert-counts.csv"], "x.gguf")
+        self.assertEqual(got, [("x.gguf", None)])
+
+
+class FakeHFSrv(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        pass                          # a client that closes mid-body (a cancel) is not an error here
+
+
+class ModelDownloads(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.origin = FakeHFSrv(("127.0.0.1", 0), FakeHF)
+        threading.Thread(target=cls.origin.serve_forever, daemon=True).start()
+        cls.saved = C.HF.HF
+        C.HF.HF = "http://127.0.0.1:%d" % cls.origin.server_address[1]
+        cls.dl_dir = os.path.join(TMP, "hfd")
+        os.makedirs(cls.dl_dir, exist_ok=True)
+        shutil.rmtree(C.config_dir(), ignore_errors=True)
+        cls.app = C.App(L, port=7777, models_dirs=[cls.dl_dir])
+        cls.srv, cls.port = serve_app(cls.app)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.origin.shutdown()
+        cls.origin.server_close()
+        C.HF.HF = cls.saved
+
+    def setUp(self):
+        os.environ.pop("PXA_CONTROL_HF_TOKEN", None)
+        for f in os.listdir(self.dl_dir):
+            os.unlink(os.path.join(self.dl_dir, f))
+        c = dict(C.load_config(), model_dirs=[self.dl_dir], hf_org="poisonxa")
+        c.pop("hf_token", None)                # each test starts with no key, whatever the last one left
+        C.save_config(c)
+        self.app.hf.token_seen = None
+        self.app.hf_dl.job = None
+        self.app._hf_last = None
+        FakeHF.delay, FakeHF.seen_ranges = 0.0, []
+
+    def get(self, path):
+        code, _, body = req(self.port, path)
+        return code, json.loads(body)
+
+    def post(self, path, body):
+        code, _, b = req(self.port, path, "POST", body)
+        return code, json.loads(b)
+
+    def list_now(self):
+        return self.get("/api/models/available?force=1")[1]
+
+    def slurp(self, name):
+        with open(os.path.join(self.dl_dir, name), "rb") as f:
+            return f.read()
+
+    def wait_end(self, secs=30):
+        end = time.time() + secs
+        while time.time() < end:
+            d = self.get("/api/models/download")[1]["download"]
+            if d and d["state"] in ("done", "failed", "cancelled"):
+                return d
+            time.sleep(0.02)
+        self.fail("the download did not settle in %ss" % secs)
+
+    def test_the_route_set_is_registered_and_the_methods_are_enforced(self):
+        for m, p in (("GET", "/api/models/available"), ("POST", "/api/models/download"),
+                     ("GET", "/api/models/download"), ("POST", "/api/models/download/cancel"),
+                     ("POST", "/api/models/hf-token")):
+            self.assertIn((m, p), C.ROUTES)
+        self.assertEqual(req(self.port, "/api/models/available", "POST", {})[0], 405)
+        self.assertEqual(req(self.port, "/api/models/hf-token", "GET")[0], 405)
+
+    # ---- the remembered list (FR#3): a visit reads it with no network, a page reload / restart keeps it ----
+    def _count_network(self):
+        calls = []
+        real = C.HF.list_repos
+
+        def counting(*a, **k):
+            calls.append(a)
+            return real(*a, **k)
+        C.HF.list_repos = counting
+        self.addCleanup(setattr, C.HF, "list_repos", real)
+        return calls
+
+    def _fresh_app(self):
+        return C.App(L, port=7777, models_dirs=[self.dl_dir])
+
+    def test_a_torn_remembered_list_reads_as_no_list_not_a_500(self):
+        # review 10-18 night: _hf_disk_load checked that repos is a list, not that its rows are repo dicts
+        shutil.rmtree(C.config_dir(), ignore_errors=True)
+        c = dict(C.load_config(), model_dirs=[self.dl_dir], hf_org="poisonxa")
+        C.save_config(c)
+        with open(os.path.join(C.config_dir(), "hf-catalog.json"), "w") as f:
+            json.dump({"org": "poisonxa", "ts": time.time(), "repos": [1, "x", {"files": []}], "models": []}, f)
+        calls = self._count_network()
+        d = self._fresh_app().hf_available(cached_only=True)
+        self.assertEqual((d["repos"], d["ts"], d["cached"], d["stale"]), ([], None, True, True), d)
+        self.assertEqual(calls, [])
+
+    def test_cached_only_with_nothing_remembered_is_empty_and_makes_no_network_call(self):
+        shutil.rmtree(C.config_dir(), ignore_errors=True)
+        c = dict(C.load_config(), model_dirs=[self.dl_dir], hf_org="poisonxa")
+        C.save_config(c)
+        calls = self._count_network()
+        d = self._fresh_app().hf_available(cached_only=True)
+        self.assertEqual((d["repos"], d["ts"], d["cached"], d["stale"]), ([], None, True, True), d)
+        self.assertEqual(calls, [], "a cached-only read must not touch the network")
+
+    def test_the_list_survives_a_restart_and_is_read_without_the_network(self):
+        first = self.list_now()                                   # a real (fake-origin) reading, written to disk
+        self.assertTrue(os.path.isfile(os.path.join(C.config_dir(), "hf-catalog.json")))
+        self.assertEqual(oct(os.stat(os.path.join(C.config_dir(), "hf-catalog.json")).st_mode & 0o777), "0o600")
+        calls = self._count_network()
+        d = self._fresh_app().hf_available(cached_only=True)      # a new App = a restarted Control: memory is empty
+        self.assertEqual(calls, [], "cached-only must not touch the network, memory or disk")
+        self.assertEqual([r["repo"] for r in d["repos"]], [r["repo"] for r in first["repos"]])
+        self.assertTrue(d["cached"] and d["ts"] and d["age_s"] < 60 and not d["stale"], d)
+        self.assertEqual(d["ts"], first["ts"])
+
+    def test_cached_read_marks_what_is_in_the_folders_now(self):
+        self.list_now()
+        with open(os.path.join(self.dl_dir, "small.gguf"), "wb") as f:
+            f.write(HF_SMALL)
+        d = self._fresh_app().hf_available(cached_only=True)
+        by = {f["name"]: f for r in d["repos"] for f in r["files"]}
+        self.assertTrue(by["small.gguf"]["have"], by)
+
+    def test_staleness_rule_is_24_hours_and_a_torn_or_foreign_file_is_no_list(self):
+        self.list_now()
+        path = os.path.join(C.config_dir(), "hf-catalog.json")
+        with open(path) as f:
+            disk = json.load(f)
+        for age, stale in ((3600, False), (23 * 3600, False), (25 * 3600, True), (9 * 86400, True)):
+            disk["ts"] = time.time() - age
+            with open(path, "w") as f:
+                json.dump(disk, f)
+            d = self._fresh_app().hf_available(cached_only=True)
+            self.assertEqual(d["stale"], stale, (age, d["age_s"]))
+            self.assertTrue(d["repos"], "an old list is still shown: it is only marked stale")
+        with open(path, "w") as f:
+            f.write("{not json")
+        self.assertEqual(self._fresh_app().hf_available(cached_only=True)["ts"], None)
+        disk["org"] = "someone-else"
+        with open(path, "w") as f:
+            json.dump(disk, f)
+        self.assertEqual(self._fresh_app().hf_available(cached_only=True)["repos"], [], "another org's list is not ours")
+
+    def test_a_plain_read_inside_the_ttl_and_the_route_flag(self):
+        self.list_now()
+        calls = self._count_network()
+        self.assertEqual(self.get("/api/models/available")[1]["cached"], False)
+        self.assertEqual(calls, [], "inside LIST_TTL the plain read is served from memory")
+        code, d = self.get("/api/models/available?cached=1")
+        self.assertEqual((code, d["cached"], bool(d["repos"])), (200, True, True))
+        self.get("/api/models/available?force=1")
+        self.assertEqual(len(calls), 1, "force asks the origin again")
+
+    def test_the_listing_names_every_repository_and_flags_the_supporter_one(self):
+        d = self.list_now()
+        self.assertFalse(d["token_set"])
+        self.assertEqual([r["repo"] for r in d["repos"]],
+                         ["poisonxa/Supporter-Model", "poisonxa/Pub-Split", "poisonxa/Pub-Model"], d)
+        by = {r["repo"]: r for r in d["repos"]}
+        self.assertTrue(by[HF_SUPPORTER]["supporter"], "a repository only a key can read must be flagged")
+        self.assertFalse(by["poisonxa/Pub-Model"]["supporter"], by["poisonxa/Pub-Model"])
+        self.assertEqual([(f["name"], f["size_h"], f["counts"]) for f in by["poisonxa/Pub-Model"]["files"]],
+                         [("small.gguf", "512 B", True)], by["poisonxa/Pub-Model"])
+        self.assertFalse(any(f["have"] for r in d["repos"] for f in r["files"]), "nothing is here yet")
+
+    def test_the_key_is_kept_privately_never_echoed_and_clears_the_padlock_only_when_it_works(self):
+        code, d = self.post("/api/models/hf-token", {"token": HF_KEY})
+        self.assertEqual((code, d), (200, {"token_set": True}), d)
+        self.assertNotIn(HF_KEY, json.dumps(d), "the key must never come back to the page")
+        self.assertEqual(os.stat(C.config_path()).st_mode & 0o777, 0o600, "control.json holds a secret now")
+        with open(C.config_path()) as f:
+            self.assertIn(HF_KEY, f.read(), "it is kept on this machine")
+        d = self.list_now()
+        self.assertTrue(d["token_set"])
+        by = {r["repo"]: r for r in d["repos"]}
+        self.assertFalse(by[HF_SUPPORTER]["supporter"], "a key that reads the repository clears the padlock")
+        code, d = self.post("/api/models/download", {"repo": HF_SUPPORTER, "file": "secret.gguf"})
+        self.assertEqual(code, 200, d)
+        self.assertEqual(self.wait_end()["state"], "done", d)
+        self.assertEqual(self.slurp("secret.gguf"), HF_SMALL)
+
+    def test_a_key_without_access_leaves_the_padlock_on(self):
+        self.post("/api/models/hf-token", {"token": "hf_a_key_that_cannot_read_it"})
+        by = {r["repo"]: r for r in self.list_now()["repos"]}
+        self.assertTrue(by[HF_SUPPORTER]["supporter"], "a useless key must not unlock anything")
+        code, d = self.post("/api/models/download", {"repo": HF_SUPPORTER, "file": "secret.gguf"})
+        self.assertEqual((code, d["code"]), (403, "needs_token"), d)
+        self.assertFalse(os.path.exists(os.path.join(self.dl_dir, "secret.gguf")))
+
+    def test_a_short_or_absurd_key_is_refused_and_forgetting_removes_it(self):
+        for bad in ("abc", "hf_" + "x" * 600, "hf_key\nwith a newline"):
+            code, d = self.post("/api/models/hf-token", {"token": bad})
+            self.assertEqual((code, d["code"]), (400, "invalid"), d)
+            self.assertNotIn("hf_token", C.load_config(), "a refused key must not be stored")
+        self.post("/api/models/hf-token", {"token": HF_KEY})
+        self.assertEqual(self.post("/api/models/hf-token", {"token": ""})[1], {"token_set": False})
+        self.assertNotIn("hf_token", C.load_config(), "forgetting must remove it")
+
+    def test_a_download_lands_the_file_and_the_counts_csv_beside_it(self):
+        code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Model", "file": "small.gguf"})
+        self.assertEqual(code, 200, d)
+        self.assertEqual(d["download"]["files"], 2, "the gguf and the counts csv that belongs to it")
+        d = self.wait_end()
+        self.assertEqual((d["state"], d["error"]), ("done", None), d)
+        self.assertEqual(sorted(d["written"]), ["small.gguf", "small.gguf.expert-counts.csv"], d)
+        self.assertEqual(self.slurp("small.gguf"), HF_SMALL)
+        self.assertEqual(self.slurp("small.gguf.expert-counts.csv"), HF_CSV)
+        self.assertFalse([f for f in os.listdir(self.dl_dir) if f.endswith(".part")], "no .part may survive")
+        have = {f["name"] for r in self.list_now()["repos"] for f in r["files"] if f["have"]}
+        self.assertEqual(have, {"small.gguf"}, "a landed file must read as already here")
+
+    def test_a_split_model_fetches_every_part(self):
+        code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Split", "file": "big-00002-of-00002.gguf"})
+        self.assertEqual(code, 200, d)
+        self.assertEqual(d["download"]["files"], 2, "asking for one part must fetch the whole model")
+        self.assertEqual(self.wait_end()["state"], "done")
+        self.assertEqual(sorted(os.listdir(self.dl_dir)),
+                         ["big-00001-of-00002.gguf", "big-00002-of-00002.gguf"])
+
+    def test_a_repository_listing_one_part_of_a_split_model_is_refused_not_half_fetched(self):
+        both = HF_REPOS["poisonxa/Pub-Split"]
+        HF_REPOS["poisonxa/Pub-Split"] = {"big-00001-of-00002.gguf": HF_BIG}
+        try:
+            code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Split",
+                                                         "file": "big-00001-of-00002.gguf"})
+            self.assertEqual((code, d["code"]), (502, "incomplete"), d)
+            self.assertEqual(os.listdir(self.dl_dir), [], "nothing may be written for a model that cannot work")
+        finally:
+            HF_REPOS["poisonxa/Pub-Split"] = both
+
+    def test_a_file_that_does_not_match_the_published_sha_is_thrown_away(self):
+        good = bytearray(HF_BIG[:len(HF_SMALL)])
+        good[-1] ^= 0xFF                                   # same length, one wrong byte: only the sha can tell
+        HF_REPOS["poisonxa/Pub-Model"]["small.gguf"] = bytes(good)
+        try:
+            code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Model", "file": "small.gguf"})
+            self.assertEqual(code, 200, d)
+            d = self.wait_end()
+            self.assertEqual(d["state"], "failed", d)
+            self.assertIn("sha256", d["error"], d)
+            self.assertEqual(os.listdir(self.dl_dir), [], "a bad file must not be kept, not even as a .part")
+        finally:
+            HF_REPOS["poisonxa/Pub-Model"]["small.gguf"] = HF_SMALL
+
+    def test_one_download_at_a_time_and_it_resumes_where_it_stopped(self):
+        HF_REPOS["poisonxa/Pub-Big"] = {"one-1mib.gguf": HF_MID}    # 1 MiB: several reads, so a cancel lands mid-file
+        try:
+            FakeHF.delay = 0.05                     # 16 pieces of 64 KiB, so the whole file takes ~0.8 s
+            code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Big", "file": "one-1mib.gguf"})
+            self.assertEqual(code, 200, d)
+            code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Big", "file": "one-1mib.gguf"})
+            self.assertEqual((code, d["code"]), (409, "busy"), d)
+            part = os.path.join(self.dl_dir, "one-1mib.gguf.part")
+            for _ in range(400):                    # cancel as soon as a read has landed, not on a guessed sleep
+                if os.path.exists(part) and os.path.getsize(part):
+                    break
+                time.sleep(0.01)
+            self.assertEqual(self.post("/api/models/download/cancel", {})[1], {"cancelled": True})
+            d = self.wait_end()
+            self.assertEqual(d["state"], "cancelled", d)
+            self.assertTrue(os.path.exists(part), "the half-fetched file must be kept for the next attempt")
+            got = os.path.getsize(part)
+            self.assertTrue(0 < got < len(HF_MID), "the cancel must catch it part-way, not at either end")
+            # the second attempt must ask for the rest, not start over
+            FakeHF.delay, first = 0.0, len(FakeHF.seen_ranges)
+            code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Big", "file": "one-1mib.gguf"})
+            self.assertEqual(code, 200, d)
+            self.assertEqual(self.wait_end()["state"], "done", d)
+            self.assertEqual(self.slurp("one-1mib.gguf"), HF_MID)
+            self.assertEqual([r for n, r in FakeHF.seen_ranges[first:] if n == "one-1mib.gguf"],
+                             ["bytes=%d-" % got], "the resume must ask for exactly the bytes it is missing")
+        finally:
+            HF_REPOS.pop("poisonxa/Pub-Big", None)
+            self.app.hf.token_seen = None
+
+    def test_bad_input_is_a_sentence_a_page_can_show(self):
+        for body in ({"file": "small.gguf"}, {"repo": "poisonxa/Pub-Model"}, {"repo": "poisonxa/Pub-Model",
+                                                                             "file": "   "}):
+            code, d = self.post("/api/models/download", body)
+            self.assertEqual((code, d["code"]), (400, "invalid"), d)
+        code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Model", "file": "small.gguf",
+                                                     "folder": "/etc"})
+        self.assertEqual((code, d["code"]), (400, "invalid"), d)
+        self.assertIn("model folder", d["error"], d)
+        code, d = self.post("/api/models/download", {"repo": "poisonxa/Pub-Model",
+                                                     "file": "small.gguf.expert-counts.csv"})
+        self.assertEqual((code, d["code"]), (400, "invalid"), d)
+        code, d = self.post("/api/models/download", {"repo": "poisonxa/No-Such-Repo", "file": "a.gguf"})
+        self.assertEqual((code, d["code"]), (404, "not_found"), d)
+        self.assertEqual(req(self.port, "/api/models/download/cancel", "POST", {})[0], 200)
+
+
+# The engine beta channel in Control (Valued Supporters first): GET /api/update shows channel + beta_allowed, POST
+# /api/update/channel records it, GET /api/update/notes returns the verified notes as text. A fake pxa-update stands in for
+# the binary, so these test the routes and their error mapping, never a download.
+FAKE_UPDATER = r"""#!/bin/sh
+d="$PXA_FAKE_UPD_DIR"
+echo "$*" >> "$d/calls"
+case "$1" in
+  check)    ch=$(cat "$d/channel" 2>/dev/null || echo stable)
+            if [ "$ch" = beta ]; then echo "current=v3.1.0 latest=4.0-beta.1 update=yes channel=beta";
+            else echo "current=v3.1.0 latest=v3.1.0 update=no channel=stable"; fi ;;
+  channels) if [ -e "$d/valued" ]; then echo "channels=stable,beta beta=yes current=stable";
+            else echo "channels=stable beta=no current=stable"; fi ;;
+  channel)  if [ "$2" = beta ] && [ ! -e "$d/valued" ]; then
+              echo "pxa-update: the beta channel is for Valued Supporters" >&2; exit 1; fi
+            echo "$2" > "$d/channel"; echo "channel=$2" ;;
+  notes)    printf '{"version":"4.0-beta.1","build_id":"e4.0-beta.1-0123456789","notes":"# 4.0 beta\\n<b>not html</b>\\n"}\n' ;;
+  apply)    echo "installed pxa-4.0-beta.1 channel=beta version=4.0-beta.1" ;;
+  *)        exit 2 ;;
+esac
+"""
+
+
+class EngineChannelRoutes(unittest.TestCase):
+    """The Engine channel row's seams: who is offered beta, the switch, back to stable, and the notes."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="pxa-engine-ch-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.bin = os.path.join(self.d, "pxa-update")
+        with open(self.bin, "w") as f:
+            f.write(FAKE_UPDATER)
+        os.chmod(self.bin, 0o755)
+        self.saved = {k: os.environ.get(k) for k in ("PXA_UPDATE_BIN", "PXA_FAKE_UPD_DIR")}
+        self.addCleanup(self._restore_env)
+        os.environ["PXA_UPDATE_BIN"] = self.bin
+        os.environ["PXA_FAKE_UPD_DIR"] = self.d
+        R = sys.modules["pxa_control.routes"]
+        self.R = R
+        R._ENGINE_CH.update(t=0.0, beta=False, ttl=0, last="stable")      # no cached answer from another test
+        self.addCleanup(R._ENGINE_CH.update, t=0.0, beta=False, ttl=0, last="stable")
+        self.app = C.App(L, port=0, models_dirs=[MODELS])
+        self.srv, self.port = serve_app(self.app)
+        self.addCleanup(self._stop)
+
+    def _restore_env(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _stop(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def get(self, path):
+        code, _, body = req(self.port, path)
+        return code, json.loads(body)
+
+    def post(self, path, body):
+        code, _, raw = req(self.port, path, "POST", body)
+        return code, json.loads(raw)
+
+    def calls(self):
+        with open(os.path.join(self.d, "calls")) as f:
+            return [x.split()[0] for x in f.read().splitlines() if x.strip()]
+
+    def test_a_supporter_or_free_key_is_not_offered_beta_and_cannot_switch(self):
+        code, d = self.get("/api/update")
+        self.assertEqual(code, 200, d)
+        self.assertEqual((d["channel"], d["beta_allowed"], d["update"]), ("stable", False, False), d)
+        code, d = self.post("/api/update/channel", {"channel": "beta"})
+        self.assertEqual((code, d["code"]), (403, "not_valued"), d)
+        self.assertIn("Valued Supporters", d["error"])
+        self.assertFalse(os.path.exists(os.path.join(self.d, "channel")))
+
+    def test_a_valued_key_joins_beta_then_goes_back_to_stable(self):
+        open(os.path.join(self.d, "valued"), "w").close()
+        code, d = self.get("/api/update")
+        self.assertEqual((code, d["channel"], d["beta_allowed"]), (200, "stable", True), d)
+        code, d = self.post("/api/update/channel", {"channel": "beta"})
+        self.assertEqual((code, d), (200, {"ok": True, "channel": "beta"}))
+        code, d = self.get("/api/update")
+        self.assertEqual((d["channel"], d["latest"], d["update"]), ("beta", "4.0-beta.1", True), d)
+        code, d = self.post("/api/update/apply", {})
+        self.assertEqual(code, 200, d)
+        self.assertIn("channel=beta", d["output"])
+        self.assertEqual(self.R._ENGINE_CH["last"], "beta")          # the long (tunnel) timeout applies
+        code, d = self.post("/api/update/channel", {"channel": "stable"})
+        self.assertEqual((code, d["channel"]), (200, "stable"), d)
+        code, d = self.get("/api/update")
+        self.assertEqual(d["channel"], "stable", d)
+        # beta_allowed is cached: one `channels` call across the two GETs
+        self.assertEqual(self.calls().count("channels"), 1, self.calls())
+
+    def test_bad_channel_names_are_refused_before_the_binary_runs(self):
+        for bad in ("", "nightly", None, "beta; rm -rf /"):
+            code, d = self.post("/api/update/channel", {"channel": bad})
+            self.assertEqual((code, d["code"]), (400, "invalid"), (bad, d))
+        self.assertFalse(os.path.exists(os.path.join(self.d, "calls")))
+
+    def test_update_counts_only_live_servers(self):
+        # FR#14: "Stop the running servers first" with nothing running. A seat that ran and exited (proc, req and phase kept, a
+        # profile restored from control.json) is not running; a live one is, and the install is refused only then.
+        import subprocess as sp
+        done = self.app.get_seat("old", create=True)
+        done.proc = sp.Popen([sys.executable, "-c", "pass"])
+        done.proc.wait()
+        done.req, done.phase = {"port": 8123, "model": FAKE_MODEL, "gpus": [0]}, "exited (0)"
+        self.app.get_seat("restored", create=True)
+        code, d = self.get("/api/update")
+        self.assertEqual((code, d["servers_running"], d["update"]), (200, 0, False), d)
+        live = self.app.get_seat("live", create=True)
+        live.proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(live.proc.wait)
+        self.addCleanup(live.proc.kill)
+        code, d = self.get("/api/update")
+        self.assertEqual((code, d["servers_running"]), (200, 1), d)
+        code, d = self.post("/api/update/apply", {})
+        self.assertEqual((code, d["code"]), (409, "servers_running"), d)
+        live.proc.kill()
+        live.proc.wait()
+        code, d = self.get("/api/update")
+        self.assertEqual(d["servers_running"], 0, d)
+        code, d = self.post("/api/update/apply", {})
+        self.assertEqual(code, 200, d)
+
+    def test_notes_come_back_as_plain_text_fields(self):
+        code, d = self.get("/api/update/notes")
+        self.assertEqual(code, 200, d)
+        self.assertEqual((d["version"], d["build_id"]), ("4.0-beta.1", "e4.0-beta.1-0123456789"))
+        self.assertIn("<b>not html</b>", d["notes"])       # the page renders it with textContent
+        self.assertEqual(self.calls(), ["notes"])
+
+    def test_no_binary_means_no_channel_routes(self):
+        os.environ["PXA_UPDATE_BIN"] = os.path.join(self.d, "missing")
+        code, d = self.post("/api/update/channel", {"channel": "stable"})
+        if code == 404:
+            self.assertEqual(d["code"], "no_updater", d)
+        else:   # an install that ships its own pxa-update next to Control: then the route works
+            self.assertEqual(code, 200, d)
+
+    def test_the_page_carries_the_channel_row_and_renders_notes_as_text(self):
+        with open(os.path.join(TOOLS, "pxa_control_ui", "index.html"), encoding="utf-8") as f:
+            page = f.read()
+        for needle in ('id="up-ch"', 'id="up-beta"', 'id="up-stable"', 'id="up-notes"', "/api/update/channel",
+                       "/api/update/notes", "(Beta channel)", "box.textContent = d.notes"):
+            self.assertIn(needle, page)
+        self.assertNotIn("up-notes\").innerHTML", page)
 
 
 if __name__ == "__main__":

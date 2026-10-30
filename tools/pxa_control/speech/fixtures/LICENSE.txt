@@ -1,0 +1,3 @@
+question.wav: copied from the Anibal voice test fixtures (PXA's own). Generated locally with
+Kokoro-82M (Apache-2.0 weights, hexgrad/Kokoro-82M) via kokoro-onnx. Released under Apache-2.0.
+Text: "What is the weather like today?" (16 kHz mono s16le).

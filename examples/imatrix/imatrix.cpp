@@ -8,6 +8,10 @@
 #include "common.h"
 #include "llama.h"
 #include "llama-spec-features.h"
+#ifdef _WIN32
+#include "pxa-win-compat.h"   // setenv
+#endif
+#include "pxqn-dump.h"        // PXQN activation dump: fp32 -> fp16 without inf
 
 #include <cmath>
 #include <cstdio>
@@ -386,6 +390,28 @@ void IMatrixCollector::print_layer_importance() {
 bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
 
+    // PXQN node dump (private probe hook, lane flashnext-full): PXQN_DUMP_DIR + PXQN_DUMP_NODE_RE select graph
+    // NODES by name (e.g. the routing weights "ffn_moe_weights_norm-12", [n_expert_used, n_tokens] f32); their
+    // data is appended as raw f32 to <dir>/<node name>.f32 in ubatch order.
+    {
+        static const char * ndir = getenv("PXQN_DUMP_DIR");
+        static const char * nre  = getenv("PXQN_DUMP_NODE_RE");
+        if (ndir && nre && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {
+            static const std::regex node_re(nre);
+            if (std::regex_search(t->name, node_re)) {
+                if (ask) return true;
+                std::lock_guard<std::mutex> lock(m_mutex);
+                const size_t nb = ggml_nbytes(t);
+                std::vector<char> buf(nb);
+                ggml_backend_tensor_get(t, buf.data(), 0, nb);
+                std::string fn = std::string(ndir) + "/" + t->name + ".f32";
+                FILE * f = fopen(fn.c_str(), "ab");
+                if (f) { fwrite(buf.data(), 1, nb, f); fclose(f); }
+                return true;
+            }
+        }
+    }
+
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->op == GGML_OP_FUSED_UP_GATE || t->op == GGML_OP_MOE_FUSED_UP_GATE ? t->src[2] : t->src[1];
     std::string wname = filter_tensor_name(src0->name);
@@ -426,7 +452,14 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             if (std::regex_search(wname, re) && src1->nb[1] == src1->ne[0]*sizeof(float)) {
                 const int64_t n = ggml_nrows(src1)*src1->ne[0];
                 std::vector<ggml_fp16_t> h(n);
-                ggml_fp32_to_fp16_row(data, h.data(), n);
+                // never an inf in the dump: values beyond the fp16 range are saturated to +-65504 (NaN -> 0), counted per weight
+                static std::vector<float> sat_tmp;
+                static std::unordered_map<std::string, int64_t> sat_count;
+                if (const int64_t ns = pxqn_dump_to_fp16(data, h.data(), n, sat_tmp)) {
+                    int64_t & c = sat_count[wname]; c += ns;
+                    fprintf(stderr, "PXQN dump: %s: %lld value(s) beyond the fp16 range saturated to +-65504 (NaN -> 0) in this batch, %lld so far\n",
+                            wname.c_str(), (long long) ns, (long long) c);
+                }
                 std::string fn = std::string(ddir) + "/" + wname + ".f16";
                 FILE * f = fopen(fn.c_str(), "ab");
                 if (f) { fwrite(h.data(), sizeof(ggml_fp16_t), n, f); fclose(f); }
@@ -478,6 +511,53 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
         m_ids.resize(ggml_nbytes(ids));
         ggml_backend_tensor_get(ids, m_ids.data(), 0, ggml_nbytes(ids));
+
+        // PXQN routed-expert dump (private probe hook, lane flashnext-full): for weights matching PXQN_DUMP_RE,
+        // append the selected expert ids (int32, [n_tokens][n_ids]) to <dir>/<weight>.ids and, when every slot
+        // has its own input row (ffn_down_exps: src1 [cols, n_ids, n_tokens]), the rows as fp16
+        // ([n_tokens][n_ids][cols]) to <dir>/<weight>.f16. Gate/up (broadcast input) write the ids only: their
+        // rows are the shared-expert input, dumped by the dense hook in the same ubatch order.
+        {
+            static const char * edir = getenv("PXQN_DUMP_DIR");
+            static const char * ere  = getenv("PXQN_DUMP_RE");
+            if (edir && ere) {
+                static const std::regex exp_re(ere);
+                if (std::regex_search(wname, exp_re)) {
+                    const int64_t ntok = src1->ne[2];
+                    const int     nid  = (int) ids->ne[0];
+                    std::vector<int32_t> iv(ntok*nid);
+                    for (int64_t r = 0; r < ntok; ++r) {
+                        for (int k = 0; k < nid; ++k) {
+                            iv[r*nid + k] = *(const int32_t *)(m_ids.data() + r*ids->nb[1] + k*ids->nb[0]);
+                        }
+                    }
+                    const std::string base = std::string(edir) + "/" + wname;
+                    FILE * f = fopen((base + ".ids").c_str(), "ab");
+                    if (f) { fwrite(iv.data(), sizeof(int32_t), iv.size(), f); fclose(f); }
+                    if (src1->ne[1] > 1) {
+                        const int64_t nc = src1->ne[0];
+                        std::vector<ggml_fp16_t> h(ntok*nid*nc);
+                        // never an inf in the dump (same rule as the dense hook): beyond the fp16 range -> +-65504, NaN -> 0, counted per weight
+                        static std::vector<float> sat_tmp;
+                        static std::unordered_map<std::string, int64_t> sat_count;
+                        int64_t ns = 0;
+                        for (int64_t r = 0; r < ntok; ++r) {
+                            for (int k = 0; k < nid; ++k) {
+                                const float * x = (const float *)((const char *)data + (k % src1->ne[1])*src1->nb[1] + r*src1->nb[2]);
+                                ns += pxqn_dump_to_fp16(x, h.data() + (r*nid + k)*nc, nc, sat_tmp);
+                            }
+                        }
+                        if (ns) {
+                            int64_t & c = sat_count[wname]; c += ns;
+                            fprintf(stderr, "PXQN dump: %s: %lld routed value(s) beyond the fp16 range saturated to +-65504 (NaN -> 0) in this batch, %lld so far\n",
+                                    wname.c_str(), (long long) ns, (long long) c);
+                        }
+                        f = fopen((base + ".f16").c_str(), "ab");
+                        if (f) { fwrite(h.data(), sizeof(ggml_fp16_t), h.size(), f); fclose(f); }
+                    }
+                }
+            }
+        }
 
         auto & e = m_stats[wname];
 

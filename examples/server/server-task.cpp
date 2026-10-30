@@ -6,7 +6,7 @@
 
 // PXA_CACHE_DISK_v1: fsync of the temporary file and of its directory before/after the rename.
 #include <fcntl.h>
-#include <unistd.h>
+#include "pxa-unistd.h"
 
 json result_timings::to_json() const {
     json base = {

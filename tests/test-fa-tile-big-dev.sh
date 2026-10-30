@@ -24,6 +24,11 @@ set -u
 
 BIN=${1:-}
 WORK=${2:-${TMPDIR:-/tmp}}
+# A private directory per run: ctest passes the shared build dir, and the card-only ctests of one build tree run
+# on several cards at once (RC2.1 card 4 + card 6, 10-20): fixed dump names there let one card's run compare the
+# other card's dump. The run directory is removed on exit.
+WORK=$(mktemp -d "$WORK/fa-tile-big.XXXXXX") || exit 2
+trap 'rm -rf "$WORK"' EXIT
 
 if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
     echo "usage: $0 /path/to/test-fa-tile-big-dev [workdir]" >&2
@@ -49,6 +54,25 @@ rc_on=$?
 cat "$ON_LOG"
 if [ $rc_on -eq 2 ]; then
     echo "no CUDA device -- cannot run"; exit 2
+fi
+
+# Not an sm_60 / sm_70 card (2026-10-21). There the lever's kernel declines by design, so runs A and B
+# cannot say anything about it -- but they still run every case through whatever this card's CUDA backend does
+# with a 512-wide node. On sm_75+ that is the dense new-mma kernel: it ENGAGES the masked cases (so run A's
+# "every case DECLINED" contract cannot hold there) and must DECLINE the unmasked and ALiBi ones (before the
+# fix it accepted them and aborted on GGML_ASSERT(use_gqa_opt), RTX 3080 Ti sm_86). So on such a card both runs
+# must exit 0 -- no abort, no non-finite output, every engaged case within the same error bar against the CPU
+# reference -- and the driver then SKIPs (77): a pass of the lever cannot be read off this card.
+CC=$(sed -n 's/^test-fa-tile-big-dev: .*(cc \([0-9][0-9]*\))$/\1/p' "$OFF_LOG" | head -1)
+if [ -n "$CC" ] && [ "$CC" != 600 ] && [ "$CC" != 700 ]; then
+    fail=0
+    [ $rc_off -ne 0 ] && { echo "FAIL: cc $CC: the default run returned $rc_off (an abort, or an engaged case off the bar)"; fail=1; }
+    [ $rc_on  -ne 0 ] && { echo "FAIL: cc $CC: the armed run returned $rc_on (an abort, or an engaged case off the bar)"; fail=1; }
+    grep -E '^  .* FAIL' "$OFF_LOG" "$ON_LOG" && fail=1
+    [ $fail -ne 0 ] && { echo "FAIL"; exit 1; }
+    echo "SKIP: cc $CC is not an sm_60 / sm_70 card, so PXA_FA_TILE_512 never engages here; runs A and B completed"
+    echo "      clean on this card's own route ($(grep -E '^engaged ' "$OFF_LOG"))."
+    exit 77
 fi
 
 # run C (=1 with PXA_FA_TILE_512_FP32=1) -- the SAME cases with the score tile, the probabilities

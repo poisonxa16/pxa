@@ -152,11 +152,11 @@ imatrix-quantized: `quantize.imatrix.dataset = unsloth_calibration_Qwen3.8-27B.t
 **The panel layout is confirmed byte-exactly.** Predicted PXQ4 size
 `= (rows/64) * (128 + (K/32) * 1088)` reproduces the on-disk size of **all six**
 distinct PXQ4 shapes to the byte (e.g. ffn_down: 80 panels × (128 + 544×1088) =
-80 × 592,000 = 47,360,000 ✓; ffn_gate: 272 × (128 + 160×1088) = 272 × 174,208 =
-47,384,576 ✓). There is **no inter-tensor padding** in the data section. This is an
+80 × 592,000 = 47,360,000 ok; ffn_gate: 272 × (128 + 160×1088) = 272 × 174,208 =
+47,384,576 ok). There is **no inter-tensor padding** in the data section. This is an
 independent confirmation of the 128 B fp16 anchor header + 1088 B/32-col slab
 geometry from `ggml/src/pxq-cpu.h:1-17` and `ggml/src/ggml-cuda/pxa/pxq6.cuh:8-18`.
-MXFP4 checks out too: 31,457,280 elems / 32 × 17 = 16,711,680 ✓.
+MXFP4 checks out too: 31,457,280 elems / 32 × 17 = 16,711,680 ok.
 
 ## 5. Geometry gate on every PXQ4 tensor (FACT)
 
@@ -184,14 +184,14 @@ re-quantization:
 
 | tensor | axis | TP2 shard | ok | TP4 shard | ok |
 |---|---|---:|:--:|---:|:--:|
-| attn_qkv 5120x10240 | col (rows) | q1024/k1024/v3072 | ✓ all %64=0 | q512/k512/v1536 | ✓ |
-| attn_gate 5120x6144 | col | 3072 | ✓ | 1536 | ✓ |
-| attn_q 5120x12288 (2×6144) | col, **per half** | 3072/half | ✓ | 1536/half | ✓ |
-| ffn_gate/up 5120x17408 | col | 8704 | ✓ | 4352 (=68×64) | ✓ |
-| attn_output 6144x5120 | row (K) | 3072 | ✓ %32=0 | 1536 | ✓ |
-| ffn_down 17408x5120 | row (K) | 8704 | ✓ | 4352 | ✓ |
+| attn_qkv 5120x10240 | col (rows) | q1024/k1024/v3072 | ok all %64=0 | q512/k512/v1536 | ok |
+| attn_gate 5120x6144 | col | 3072 | ok | 1536 | ok |
+| attn_q 5120x12288 (2×6144) | col, **per half** | 3072/half | ok | 1536/half | ok |
+| ffn_gate/up 5120x17408 | col | 8704 | ok | 4352 (=68×64) | ok |
+| attn_output 6144x5120 | row (K) | 3072 | ok %32=0 | 1536 | ok |
+| ffn_down 17408x5120 | row (K) | 8704 | ok | 4352 | ok |
 
-MXFP4 `ssm_out` 6144x5120 row-shards to K=3072/1536, both %32=0 (MXFP4 block=32) ✓.
+MXFP4 `ssm_out` 6144x5120 row-shards to K=3072/1536, both %32=0 (MXFP4 block=32) ok.
 
 ## What this means for the vLLM backend
 

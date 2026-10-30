@@ -39,13 +39,28 @@ enum {
     GGML_CUDA_COLD_STAT_WAIT_CLK = 0,   // sum over waits of the SM clocks the wait kernel spent before the host's flag arrived (GPU idle, CPU-bound)
     GGML_CUDA_COLD_STAT_WAITS    = 1,   // waits executed (one per cold-layer node pair)
     GGML_CUDA_COLD_STAT_SKIPPED  = 2,   // requests with no cold slot at all (the host was never involved)
-    GGML_CUDA_COLD_STAT_TIMEOUTS = 3,   // waits that gave up (must stay 0: the result of such a layer is wrong)
+    GGML_CUDA_COLD_STAT_TIMEOUTS = 3,   // SLOW waits: longer than PXA_XCACHE_ASYNC_TIMEOUT_S, waited out (output unchanged; until 2026-10-26 they gave up with zero rows)
     GGML_CUDA_COLD_STAT_MAX_CLK  = 4,   // longest single wait
     GGML_CUDA_COLD_STAT_CHK_ROWS = 5,   // PXA_XCACHE_ASYNC_CHECK: rows compared (worker vs scheduler split)
     GGML_CUDA_COLD_STAT_CHK_BAD  = 6,   // rows with any differing bit
     GGML_CUDA_COLD_STAT_CHK_MAXD = 7,   // largest |a - b| seen, as the bits of a positive float
     GGML_CUDA_COLD_STAT_N        = 8
 };
+
+// ---- PXA_XCACHE_SKIP_COLD_RANK (ggml_moe_split_ids_set_skip_cold): device counters of the cold-id nodes that carry the skip -----
+// All monotonic over the process; one set per device. A "window" is one such node (one split layer of one decode / verify graph).
+enum {
+    GGML_CUDA_SKIP_STAT_WINDOWS      = 0,   // split-layer windows that ran with the skip armed
+    GGML_CUDA_SKIP_STAT_TOKENS       = 1,   // sum of their widths (tokens)
+    GGML_CUDA_SKIP_STAT_COLD_EXPERTS = 2,   // distinct cold experts per window, summed (what the cold path would have computed)
+    GGML_CUDA_SKIP_STAT_SKIP_EXPERTS = 3,   // of those, dropped (best rank in the window >= the lever)
+    GGML_CUDA_SKIP_STAT_COLD_SLOTS   = 4,   // cold (token, slot) routings
+    GGML_CUDA_SKIP_STAT_SKIP_SLOTS   = 5,   // of those, dropped
+    GGML_CUDA_SKIP_STAT_WINDOWS_HIT  = 6,   // windows that dropped at least one expert
+    GGML_CUDA_SKIP_STAT_N            = 8
+};
+// copies the device's counters (call after the device's work is complete, e.g. after llama_synchronize); false on failure
+GGML_API GGML_CALL bool   ggml_backend_cuda_xcache_skip_stats(int device, unsigned long long out[GGML_CUDA_SKIP_STAT_N]);
 
 // NULL when the device cannot map host memory (or on any allocation failure)
 GGML_API GGML_CALL struct ggml_cuda_cold_slot * ggml_backend_cuda_cold_slot_new(int device, int n_embd, int n_used, int n_tok_max);
@@ -66,6 +81,12 @@ GGML_API GGML_CALL void * ggml_backend_cuda_xcache_pinned_alloc(size_t n);
 GGML_API GGML_CALL void   ggml_backend_cuda_xcache_pinned_free(void * p);
 // one-time link probe: pinned host -> device and device -> host GB/s (best of a few 16 MiB copies), 0 on failure
 GGML_API GGML_CALL void   ggml_backend_cuda_xcache_probe_link(int device, double * h2d_gbs, double * d2h_gbs);
+
+// ---- PXA_STREAM / PXA_XCACHE zero-copy width of one stream buffer (a CUDA<d>_Stream buffer; anything else is ignored) ----
+// Graphs whose consumers of this buffer's weights are no wider than ny tokens read them in place (zero-copy); 0 = always copy
+// through the ring. The loader sets it per model (src/llama.cpp pxa_stream_make_aliases, llama_model::pxa_stream_zc_ny), so a
+// width one model needs never reaches another model's buffers; an exported PXA_STREAM_ZC_NY decides over every buffer.
+GGML_API GGML_CALL void   ggml_backend_cuda_stream_buffer_set_zc_ny(struct ggml_backend_buffer * buffer, int64_t ny);
 
 #ifdef  __cplusplus
 }

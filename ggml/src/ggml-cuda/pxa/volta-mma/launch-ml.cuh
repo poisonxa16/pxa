@@ -71,7 +71,8 @@ typedef float (*vec_dot_KQ_t)(
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33,
+        const int mask_rows) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -81,6 +82,10 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int jt       = blockIdx.x;
 
     mask += sequence*s33 + jt*ncols1*s31;
+    // PXA: the mask holds mask_rows rows per sequence (GGML_KQ_MASK_PAD is 16 here, not upstream's 64),
+    // but a Q tile is ncols1 wide (up to 64), so the last tile can reach past the mask. Rows past it do
+    // not exist: skip them (as if -inf). Every row that does exist is read exactly as before.
+    const int j_end = min(ncols1, mask_rows - jt*ncols1);
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -95,8 +100,10 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            if (j < j_end) {
+                const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
         }
 
         all_inf = warp_reduce_all(all_inf);
@@ -141,7 +148,7 @@ static bool pxa_fa_swa_kvmin_enabled() {
     static const int v = [] {
         const char * e = getenv("PXA_FA_SWA_KVMIN");
         // Default ON at ENHANCE (2026-10-04): skipped blocks are entirely -inf, so no output bit changes
-        // (identity PASS in 6 server cells, ledger gemma-fa-swa-kvmin); Gemma 4 26B-A4B QAT q4_0 on one V100, llama-bench pp4096:
+        // (identity PASS in 6 server cells); Gemma 4 26B-A4B QAT q4_0 on one V100, llama-bench pp4096:
         // ub1024 2863 -> 2936 t/s, ub512 2380 -> 2408 t/s; pp16384 ub1024 2572 -> 2631 (with the ring slack of the V100 set).
         const int on = e && *e ? atoi(e) : (ggml_pxa_config_level() >= 2 ? 1 : 0);
         if (on && e && *e) {
@@ -155,7 +162,7 @@ static bool pxa_fa_swa_kvmin_enabled() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void pxa_flash_attn_mask_to_KV_min(
-        const half2 * mask_ptr, int * KV_max_ptr, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int64_t s31, const int64_t s33, const int mask_rows) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -165,6 +172,7 @@ static __global__ void pxa_flash_attn_mask_to_KV_min(
     const int jt       = blockIdx.x;
 
     mask += sequence*s33 + jt*ncols1*s31;
+    const int j_end = min(ncols1, mask_rows - jt*ncols1); // rows past the mask do not exist (see KV_max above)
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -182,8 +190,10 @@ static __global__ void pxa_flash_attn_mask_to_KV_min(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_min_sj/2 + tid]);
-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            if (j < j_end) {
+                const float2 tmp = __half22float2(mask[j*s31 + KV_min_sj/2 + tid]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
         }
 
         all_inf = warp_reduce_all(all_inf);
@@ -612,11 +622,11 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, (int) mask->ne[1]);
         CUDA_CHECK(cudaGetLastError());
         if (pxa_kvmin) {
             ggml_cuda_kernel_launch(pxa_flash_attn_mask_to_KV_min<ncols1>, launch_params,
-                (const half2 *) mask->data, KV_max.ptr, s31, s33);
+                (const half2 *) mask->data, KV_max.ptr, s31, s33, (int) mask->ne[1]);
             CUDA_CHECK(cudaGetLastError());
         }
     }

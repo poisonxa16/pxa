@@ -2,7 +2,7 @@
 
 Covers everything since the previous release (2026-07-31).
 
-> ## ⚠ Read this before quoting any number below
+> ## Warning: Read this before quoting any number below
 >
 > **Almost every performance lever in this release ships DEFAULT OFF.** A stock build of this tag
 > behaves, on the codec decode path, essentially like the previous one. The headline **+19.9%
@@ -22,7 +22,7 @@ That is a landfill-Pascal fleet running a 122B at 33 t/s.
 
 ---
 
-## ⚠ Breaking change — `--pxq-universal` now takes a map path
+## Warning: Breaking change — `--pxq-universal` now takes a map path
 
 The three bundled tier-map presets (`12g`, `16g`, `16g-hq`) and the reference `.tiers` recipe files
 have been **removed from the current tree**, along with the copies compiled into `llama-quantize`.
@@ -106,12 +106,12 @@ perplexity **on the decode path** (`-b 1 -ub 1`, 6 chunks) 3.8109 → 3.8027, in
 slightly lower; 256-token greedy generation from an 8881-token prompt **byte-identical**, plus four
 greedy chat probes byte-identical.
 
-⚠ The first version of that gate was **vacuous** and nearly passed as evidence: `llama-perplexity`
+Warning: The first version of that gate was **vacuous** and nearly passed as evidence: `llama-perplexity`
 at `-b 512` evaluates 512-token batches, so `ne01 > 1` and the `ncols == 1` vector kernel
 `PXA_FA_GQA_PACK` replaces never executes — both arms were trivially identical. **Gate decode
 levers at `-b 1 -ub 1`.**
 
-⚠ `PXQ6_CANON_CMAX=4` evidence is **sm_60 only**. On sm_70 the split target is 16×nsm, so the S the
+Warning: `PXQ6_CANON_CMAX=4` evidence is **sm_60 only**. On sm_70 the split target is 16×nsm, so the S the
 driver selects differs and the analysis does not carry over. Measure before adopting it there.
 
 ## Opt-in performance — codec decode paths (all bit-exact, hash-verified)
@@ -123,7 +123,7 @@ hash, which is the designed outcome for a sourcing-only change.
 |---|---|
 | `PXA_PXQ6_SHFL=1` | **+4.1%.** Sustained 2048 tokens at fill 14259, bracketed: CTL-a 33.20, SHFL 34.42, CTL-b 32.89 (control spread 0.9%). Prefill flat 403.7–403.9. SASS on the fired gateup loop: 315 → 257 instructions (−18%), LDS.U.32 68 → 6, SHFL.IDX 0 → 64, LSU transactions 80 → 18 (−77%), LDG/FFMA counts byte-identical. Mechanism: that loop is **LSU-pipe bound at ~83% of structural ceiling while DRAM sits at 50%**, so moving the codebook gathers onto the idle shuffle pipe is free throughput. |
 | `PXA_PXQ3_PAIRLUT=1` | **+3.7% cold / +3.8% median.** fill 14259, n=3, bracketed CTL/LUT/CTL: 31.43 / 32.72 / 31.70 against a 0.86% control spread, `ENGAGE` asserted per arm. Registers 74 → 48 (3 → 5 blocks/SM). |
-| `-DPXQ_CANON_V2=1` (build constant) | **+3.5% clean decode, +5.7%/+6.0% with the n-gram drafter** (30.31 → 31.36; 35.86 → 37.93 cold, 38.85 → 41.20 warm). A precision *improvement*, not a trade: the chained form is 2 FFMA (2 roundings, both products exact) versus FMUL+FFMA+FADD (3 roundings). The win **amplifies** under speculation because a drafted step carries `1+n_draft` rows through the same codec kernel. ⚠ Changes the fp32 fold — re-baselining event. ⚠ Token output is **not** a valid instrument for this class of change: greedy decoding only diverges when a rounding difference flips an argmax, so identical temp-0 output is expected and is a quality result, not a null arm. |
+| `-DPXQ_CANON_V2=1` (build constant) | **+3.5% clean decode, +5.7%/+6.0% with the n-gram drafter** (30.31 → 31.36; 35.86 → 37.93 cold, 38.85 → 41.20 warm). A precision *improvement*, not a trade: the chained form is 2 FFMA (2 roundings, both products exact) versus FMUL+FFMA+FADD (3 roundings). The win **amplifies** under speculation because a drafted step carries `1+n_draft` rows through the same codec kernel. Warning: Changes the fp32 fold — re-baselining event. Warning: Token output is **not** a valid instrument for this class of change: greedy decoding only diverges when a rounding difference flips an argmax, so identical temp-0 output is expected and is a quality result, not a null arm. |
 
 `PXA_PXQ6_QPF` also ships (1-deep slab prefetch, bit-exact by construction, default off) but is
 **UNMEASURED** — no A/B is on record. Do not quote a number for it.
@@ -134,7 +134,7 @@ hash, which is the designed outcome for a sourcing-only change.
 (`qwen35moe` → `ngram-mod:n_max=4,n_min=2`): **first-request decode +23.0% on code traffic, +4.6% on
 prose, prefill neutral** (262.63 → 259.16). Cell as above, ~14–15k fill, control in the same run.
 
-⚠ **Do not quote the median-of-3 figures (+38.8%/+35.7%).** The bench replays one prompt three
+Warning: **Do not quote the median-of-3 figures (+38.8%/+35.7%).** The bench replays one prompt three
 times, so reps 2–3 hit an already-warm n-gram table — prose acceptance 1.000 is the tell. Warm
 numbers are real for multi-turn chat and agentic re-reads, but they are an upper bound, not the
 default case. The gain tracks how repetitive the OUTPUT is: high on code and tool traffic, much
@@ -222,6 +222,6 @@ effect and the exact cell it was measured on, including the ones that measured n
 constants (`PXQ6_CANON_CMAX`, `PXQ_GU_MINBLK`) are documented as constants rather than env flags,
 because flipping them changes the canonical fp32 fold and is a re-baselining event.
 
-⚠ `PXQ6_CANON_CMAX` default stays **16** even though **4** is worth +10.4% on the cell above: the
+Warning: `PXQ6_CANON_CMAX` default stays **16** even though **4** is worth +10.4% on the cell above: the
 evidence is sm_60 only, and on sm_70 the split target is 16×nsm so the selected S differs. If you run
 Pascal, build with `-DPXQ6_CANON_CMAX=4` and re-baseline.

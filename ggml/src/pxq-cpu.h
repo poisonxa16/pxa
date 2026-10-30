@@ -122,6 +122,15 @@ void pxa_pxq_mul_mat_cpu(
         const struct pxa_pxq_rowmap * rows, int ne11, int64_t ny,
         int ith, int nth);
 
+// PXQN host experts on the CPU MUL_MAT_ID work queue (2026-10-23; ggml.c, PXA_PXQN_CPU_MMID_Q): the closed
+// library's matmul split into its two halves (ggml-pxqn-api.h). pxa_pxqn_q8_col_bytes is non-zero exactly where
+// pxa_pxq_mul_mat_cpu would call the library's fast matmul for (type, k, nr0) AND the library has the split halves; it is the
+// bytes of one quantised activation column. The outputs of pxa_pxqn_mm_q8 equal pxa_pxq_mul_mat_cpu's bit for bit.
+size_t pxa_pxqn_q8_col_bytes(enum ggml_type type, int64_t k, int64_t nr0);
+void   pxa_pxqn_q8_col(enum ggml_type type, const float * x, int64_t k, void * q);
+void   pxa_pxqn_mm_q8(enum ggml_type type, const void * a, int64_t k, int64_t r0, int64_t r1,
+                      const void * const * q, float * const * out, int ny);
+
 // -------------------------------------------------------------------------------------------------
 // Graph ops and helpers reowned from ggml/src/iqk/iqk_cpu_ops.cpp (PXA 2026-08-21, iqk
 // separation phase 2). See the block comment in pxq-cpu.c for the per-function provenance.

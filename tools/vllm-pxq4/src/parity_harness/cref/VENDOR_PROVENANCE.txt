@@ -1,6 +1,6 @@
 vendor/ is a verbatim, unmodified copy taken from the READ-ONLY production tree
 
-    pxanet:/path/to/engine-repo   branch fable9-swa-kv   HEAD acf8f245
+    pxanet:/path/to/engine-repo   branch (internal)   HEAD acf8f245
 
 of exactly these files:
 

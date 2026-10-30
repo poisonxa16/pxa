@@ -1,0 +1,22 @@
+; ggml-pxqn.dll exports (Windows build). Same names as ggml-pxqn.map minus the three Linux-only parts that the Windows
+; build leaves out (pxqn-cpu-mmv.c: ggml_pxqn_cpu_mul_mat; pxqn-lock.cpp: ggml_pxqn_get_lock_api;
+; pxqn-xcache-cpupool.cpp: ggml_pxqn_xcache_cpupool_*; the RIX CPU parts ggml_pxqn_rix_swiglu and ggml_pxqn_rix_tl_off,
+; also in pxqn-cpu-mmv.c). The loader treats each of those as absent (optional symbols). scripts/pxa-def-exports-check.py
+; (ctest test-pxqn-def-exports) fails when a name here has no definition in the files the MSVC build compiles.
+LIBRARY ggml-pxqn
+EXPORTS
+    ggml_pxqn_get_api
+    ggml_pxqn_get_recipe_api
+    ggml_pxqn_get_spec_api
+    ggml_pxqn_get_specdef_api
+    ggml_pxqn_xcache_get
+    ggml_pxqn_get_tune_api
+    ggml_pxqn_get_overdrive_api
+    ggml_pxqn_lever_known
+    ggml_pxqn_xcache_learn_build
+    ggml_pxqn_xcache_counts_pick
+    ggml_pxqn_xcache_speed_write
+    ggml_pxqn_xcache_calib_step
+    ggml_pxqn_xcache_calib_consider
+    ggml_pxqn_rix_get
+    ggml_pxqn_rix_set

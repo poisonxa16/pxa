@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111214">
+<title>PXA Control - hosts</title>
+<style>
+:root { color-scheme: dark; --bg:#111214; --card:#1D1F23; --line:#33363C; --fg:#ECEDEF; --mute:#A0A4AC; --acc:#E08A3C; --bad:#E5534B; }
+* { box-sizing: border-box; }
+body { margin:0; min-height:100vh; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       padding: max(16px, env(safe-area-inset-top)) 16px 24px; }
+main { max-width:560px; margin:0 auto; display:grid; gap:14px; }
+h1 { font-size:20px; margin:4px 0 0; }
+p { margin:0; color:var(--mute); }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; display:grid; gap:10px; }
+.row { display:flex; gap:8px; align-items:center; }
+.row .grow { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.url { color:var(--mute); font-size:13px; }
+input[type=text], input[type=password] { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:#15171A; color:inherit; font:inherit; }
+button { padding:9px 14px; border-radius:8px; border:0; background:var(--acc); color:#111214; font-weight:700; font:inherit; font-weight:700; cursor:pointer; }
+button.ghost { background:transparent; color:var(--mute); border:1px solid var(--line); font-weight:500; }
+label.chk { display:flex; gap:8px; align-items:center; color:var(--mute); font-size:13px; }
+#state { padding:10px 12px; border-radius:10px; border:1px solid var(--line); display:grid; gap:8px; justify-items:start; }
+#state[hidden] { display:none; }
+#state.bad { border-color: var(--bad); }
+.empty { color:var(--mute); font-size:14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PXA Control</h1>
+  <p>Pick the rig to open. PXA Control runs on the computer with the GPUs; this app opens its page. On that computer start
+     it with <code>pxa-control --lan</code> and use the address and token it prints.</p>
+  <div id="state" hidden></div>
+  <section class="card">
+    <b>Remembered</b>
+    <div id="list"></div>
+  </section>
+  <form class="card" id="add" autocomplete="off">
+    <b>Add a rig</b>
+    <input type="text" id="addr" placeholder="192.168.1.20:7877 or https://rig.example.net" inputmode="url" required>
+    <input type="password" id="tok" placeholder="token (needed the first time on --lan)">
+    <label class="chk"><input type="checkbox" id="keep"> remember the token on this device</label>
+    <div class="row"><button type="submit">Open</button></div>
+  </form>
+</main>
+<script>
+(function () {
+  "use strict";
+  var KEY = "pxa.hosts", list = [];
+  function load() {
+    try { list = JSON.parse(localStorage.getItem(KEY) || "[]") || []; } catch (e) { list = []; }
+    if (!Array.isArray(list)) list = [];
+  }
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(list.slice(0, 20))); } catch (e) {} }
+  function norm(s) {
+    s = String(s || "").trim();
+    if (!s) return null;
+    if (!/^https?:\/\//i.test(s)) s = "http://" + s;
+    var u;
+    try { u = new URL(s); } catch (e) { return null; }
+    if (!u.port && u.protocol === "http:") u.port = "7877";
+    return u.origin;
+  }
+  function open(h, token) {
+    h.last = Date.now();
+    save();
+    var t = token || h.token;
+    location.href = h.url + "/" + (t ? "?token=" + encodeURIComponent(t) : "");
+  }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function render() {
+    var box = document.getElementById("list");
+    box.textContent = "";
+    if (!list.length) { box.appendChild(el("div", "empty", "No rig yet: add one below.")); return; }
+    list.slice().sort(function (a, b) { return (b.last || 0) - (a.last || 0); }).forEach(function (h) {
+      var row = el("div", "row");
+      var txt = el("div", "grow");
+      txt.appendChild(el("div", null, h.name || h.url));
+      txt.appendChild(el("div", "url", h.url + (h.token ? "  (token kept)" : "")));
+      var go = el("button", null, "Open");
+      go.type = "button";
+      go.addEventListener("click", function () { open(h); });
+      var rm = el("button", "ghost", "Forget");
+      rm.type = "button";
+      rm.addEventListener("click", function () { list = list.filter(function (x) { return x !== h; }); save(); render(); });
+      row.appendChild(txt); row.appendChild(go); row.appendChild(rm);
+      box.appendChild(row);
+    });
+  }
+  load();
+  // Offline screen. Two ways in: the PWA's service worker answers a page load that cannot reach this Control with
+  // this page (location is the rig), and the Android app loads its bundled copy with ?offline=1&from=<rig origin>
+  // when the rig does not answer. It names the rig, offers Try again, and keeps probing the rig (backing off from
+  // 5 s to 30 s, paused while hidden); the moment the rig answers it opens it again.
+  var qs = {};
+  location.search.replace(/^\?/, "").split("&").forEach(function (kv) {
+    if (!kv) return;
+    var i = kv.indexOf("=");
+    try { qs[decodeURIComponent(i < 0 ? kv : kv.slice(0, i))] = i < 0 ? "" : decodeURIComponent(kv.slice(i + 1)); } catch (e) {}
+  });
+  var from = qs.from ? norm(qs.from) : null;
+  // security review P10 L1: ?from= names a rig of this picker (or this Control) or nothing: a link can never make this page
+  // open another site by itself (the reopen below navigates without a tap)
+  var dropped = !!(from && from !== location.origin && !list.some(function (x) { return x && x.url === from; }));
+  if (dropped) from = null;
+  var offline = /^https?:$/.test(location.protocol) && location.pathname !== "/hosts.html";
+  if (offline || qs.offline === "1") {
+    var rig = from || (!dropped && /^https?:$/.test(location.protocol) ? location.origin : null), known = null;
+    list.forEach(function (x) { if (rig && x.url === rig) known = x; });
+    var st = document.getElementById("state");
+    st.hidden = false; st.className = "bad";
+    var where = rig ? rig.replace(/^https?:\/\//, "") : location.host;
+    var who = known && known.name && known.name !== where.split(":")[0] ? known.name + " (" + where + ")"
+                                                                       : "This PXA Control (" + where + ")";
+    st.appendChild(el("span", "msg", who + " is not answering. Is the rig on and Control running? Pick another one or try again."));
+    var again = el("button", "ghost", "Try again");
+    again.type = "button";
+    again.id = "again";
+    function reopen() {
+      if (!rig || rig === location.origin) { location.reload(); return; }
+      if (known) open(known); else location.href = rig + "/";
+    }
+    again.addEventListener("click", reopen);
+    st.appendChild(again);
+    var note = el("div", "url", "");
+    note.id = "retry";
+    st.appendChild(note);
+    // the Android app (bundled copy, file://) probes the rig natively and calls this when it answers: a page on
+    // file:// cannot fetch an http rig
+    window.pxaRigBack = function () { note.textContent = "The rig answers: opening it."; reopen(); };
+    if (rig && location.protocol === "file:") {
+      note.textContent = "It opens by itself as soon as the rig answers.";
+    } else if (rig && window.fetch) {
+      var wait = 5, left = 3, busy = false;
+      var probe = function () {
+        busy = true;
+        note.textContent = "Checking " + rig.replace(/^https?:\/\//, "") + " ...";
+        // /api/ is never answered by the service worker, so only the rig itself can answer this (any status counts)
+        fetch(rig + "/api/health?probe=" + Date.now(), {mode: "no-cors", cache: "no-store", credentials: "omit"})
+          .then(function () { note.textContent = "The rig answers: opening it."; reopen(); },
+                function () { busy = false; wait = Math.min(30, wait * 2); left = wait; tick(); });
+      };
+      var tick = function () {
+        if (busy) return;
+        if (document.hidden) { note.textContent = "Paused while in the background."; return; }
+        note.textContent = "Trying again by itself in " + left + " s.";
+      };
+      setInterval(function () {
+        if (busy || document.hidden) { tick(); return; }
+        left -= 1;
+        if (left <= 0) probe(); else tick();
+      }, 1000);
+      document.addEventListener("visibilitychange", function () { if (!document.hidden && !busy) { left = 1; tick(); } });
+      tick();
+    }
+  }
+  render();
+  document.getElementById("add").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var url = norm(document.getElementById("addr").value);
+    if (!url) { document.getElementById("addr").focus(); return; }
+    var tok = document.getElementById("tok").value.trim();
+    var keep = document.getElementById("keep").checked;
+    var h = null;
+    list.forEach(function (x) { if (x.url === url) h = x; });
+    if (!h) { h = {url: url, name: new URL(url).hostname}; list.unshift(h); }
+    if (keep && tok) h.token = tok; else if (!keep) delete h.token;
+    open(h, tok);
+  });
+})();
+</script>
+</body>
+</html>

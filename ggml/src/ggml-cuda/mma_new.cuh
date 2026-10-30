@@ -217,7 +217,7 @@ namespace ggml_cuda_mma {
     static __device__ __forceinline__ void mma(
             tile<16, 8, int> & D, const tile<16, 4, int> & A, const tile<8, 4, int> & B) {
 #ifdef INT8_MMA_AVAILABLE
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
         asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
             : "+r"(D.x[0]), "+r"(D.x[1]), "+r"(D.x[2]), "+r"(D.x[3])
             : "r"(A.x[0]), "r"(A.x[1]), "r"(B.x[0]));
@@ -229,7 +229,7 @@ namespace ggml_cuda_mma {
         asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
             : "+r"(D.x[2]), "+r"(D.x[3])
             : "r"(A.x[1]), "r"(B.x[0]));
-#endif // __CUDA_ARCH__ >= CC_AMPERE
+#endif // __CUDA_ARCH__ >= PXA_CC_AMPERE
 #else
         GGML_UNUSED(D);
         GGML_UNUSED(A);
@@ -241,7 +241,7 @@ namespace ggml_cuda_mma {
     static __device__ __forceinline__ void mma(
             tile<16, 8, int> & D, const tile<16, 8, int> & A, const tile<8, 8, int> & B) {
 #ifdef INT8_MMA_AVAILABLE
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
         asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
             : "+r"(D.x[0]), "+r"(D.x[1]), "+r"(D.x[2]), "+r"(D.x[3])
             : "r"(A.x[0]), "r"(A.x[1]), "r"(A.x[2]), "r"(A.x[3]), "r"(B.x[0]), "r"(B.x[1]));
@@ -259,7 +259,7 @@ namespace ggml_cuda_mma {
         asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
             : "+r"(D.x[2]), "+r"(D.x[3])
             : "r"(A.x[3]), "r"(B.x[1]));
-#endif // __CUDA_ARCH__ >= CC_AMPERE
+#endif // __CUDA_ARCH__ >= PXA_CC_AMPERE
 #else
         GGML_UNUSED(D);
         GGML_UNUSED(A);
@@ -274,7 +274,7 @@ namespace ggml_cuda_mma {
         const int * Axi = (const int *) A.x;
         const int * Bxi = (const int *) B.x;
         int       * Dxi = (int       *) D.x;
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
         asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
             : "+r"(Dxi[0]), "+r"(Dxi[1])
             : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
@@ -286,7 +286,7 @@ namespace ggml_cuda_mma {
         asm("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3}, {%4}, {%0, %1};"
             : "+r"(Dxi[0]), "+r"(Dxi[1])
             : "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]));
-#endif // __CUDA_ARCH__ >= CC_AMPERE
+#endif // __CUDA_ARCH__ >= PXA_CC_AMPERE
 #else
         GGML_UNUSED(D);
         GGML_UNUSED(A);
@@ -301,7 +301,7 @@ namespace ggml_cuda_mma {
         const int * Axi = (const int *) A.x;
         const int * Bxi = (const int *) B.x;
         int       * Dxi = (int       *) D.x;
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
         asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
             : "+r"(Dxi[0]), "+r"(Dxi[1])
             : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
@@ -322,7 +322,7 @@ namespace ggml_cuda_mma {
         asm("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3}, {%4}, {%0, %1};"
             : "+r"(Dxi[2]), "+r"(Dxi[3])
             : "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[3]));
-#endif // __CUDA_ARCH__ >= CC_AMPERE
+#endif // __CUDA_ARCH__ >= PXA_CC_AMPERE
 #else
         GGML_UNUSED(D);
         GGML_UNUSED(A);
@@ -337,7 +337,7 @@ namespace ggml_cuda_mma {
         const int * Axi = (const int *) A.x;
         const int * Bxi = (const int *) B.x;
         int       * Dxi = (int       *) D.x;
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
         asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
             : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
             : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
@@ -349,7 +349,7 @@ namespace ggml_cuda_mma {
         asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
             : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
             : "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]));
-#endif // __CUDA_ARCH__ >= CC_AMPERE
+#endif // __CUDA_ARCH__ >= PXA_CC_AMPERE
 #else
         GGML_UNUSED(D);
         GGML_UNUSED(A);
@@ -364,7 +364,7 @@ namespace ggml_cuda_mma {
         const int * Axi = (const int *) A.x;
         const int * Bxi = (const int *) B.x;
         int       * Dxi = (int       *) D.x;
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
         asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
             : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
             : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
@@ -385,7 +385,7 @@ namespace ggml_cuda_mma {
         asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
             : "+r"(Dxi[4]), "+r"(Dxi[5]), "+r"(Dxi[6]), "+r"(Dxi[7])
             : "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[3]));
-#endif // __CUDA_ARCH__ >= CC_AMPERE
+#endif // __CUDA_ARCH__ >= PXA_CC_AMPERE
 #else
         GGML_UNUSED(D);
         GGML_UNUSED(A);

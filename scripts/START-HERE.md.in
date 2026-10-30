@@ -17,7 +17,8 @@ Two ways in, same binaries, same one line: the **tarball** (below) or the **cont
 
 ## What you need
 
-- **Linux, x86_64.** No macOS or Windows binaries are in this package. Any x86-64 CPU works: one
+- **Linux, x86_64.** No macOS or Windows binaries are in this package (the Windows and Mac
+  downloads are separate: see `docs/install.md`). Any x86-64 CPU works: one
   without AVX2 (a pre-2013 Xeon, an AVX-only Sandy or Ivy Bridge) is detected from `/proc/cpuinfo`
   and gets the compatibility library in `lib-compat/` automatically, with one line saying so. The
   card runs at the same speed; only the work done on the CPU is slower.

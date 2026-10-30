@@ -48,20 +48,31 @@ COHERENCE_EXPECT=${COHERENCE_EXPECT:-paris}
 GATE_STRICT=${GATE_STRICT:-0}
 PROMPTS=${PROMPTS:-$HERE/prompts}
 WORKDIR=${WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/pxa-gate.XXXXXX")}
-# An externally supplied WORKDIR is not created by mktemp, and the FIRST thing the run does is
-# redirect the np=1 server log into it -- a missing directory failed that redirect and reported
-# "server would not boot at -np 1", i.e. a harness artefact wearing an engine failure's clothes
-# (2026-09-06: the np=2 arm passed in the same run only because it mkdir -p's WORKDIR/slots).
-mkdir -p "$WORKDIR" || { printf 'gate: cannot create WORKDIR %s\n' "$WORKDIR" >&2; exit 2; }   # die() is defined below
-
 pass=0; fail=0; skip=0; SRV_PID=; SKIPPED=()
-say(){ printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
-ok(){   printf '  PASS  %s\n' "$*"; pass=$((pass+1)); }
-ko(){   printf '  FAIL  %s\n' "$*"; fail=$((fail+1)); }
+# LAST-RUN.md is the record of this run. Box paths are replaced HERE, as each
+# line is written, not by a later sed: the next run would put them back.
+# GATE_RECORD stays empty during --plan so a dry run does not wipe a real record.
+GATE_RECORD=${GATE_RECORD-}
+PXA_HOST=${PXA_HOST:-$(hostname -s 2>/dev/null || true)}
+PXA_FQDN=${PXA_FQDN:-$(hostname -f 2>/dev/null || true)}
+redact_line() {
+    printf '%s' "$1" | PXA_MODEL="${MODEL:-}" PXA_BIN="${BIN:-}" PXA_WORKDIR="${WORKDIR:-}" \
+        PXA_ROOT="${ROOT:-}" PXA_PROMPTS="${PROMPTS:-}" PXA_HOST="${PXA_HOST:-}" PXA_FQDN="${PXA_FQDN:-}" \
+        python3 "$HERE/redact-paths.py"
+}
+emit() {
+    local line
+    line=$(redact_line "$1")
+    printf '%s\n' "$line"
+    if [ -n "${GATE_RECORD:-}" ]; then printf '%s\n' "$line" >> "$GATE_RECORD"; fi
+}
+say(){ emit "[$(date -u +%H:%M:%S)] $*"; }
+ok(){   emit "  PASS  $*"; pass=$((pass+1)); }
+ko(){   emit "  FAIL  $*"; fail=$((fail+1)); }
 # sk: a SKIP for a reason this gate stands behind even under GATE_STRICT -- the hardware or build
 # genuinely cannot run the check (no -np flag, no slot-erase route, no completion_probabilities,
 # no /v1/chat/completions route). Recorded by name for the final summary.
-sk(){   printf '  SKIP  %s\n' "$*"; skip=$((skip+1)); SKIPPED+=("$*"); }
+sk(){   local m; m=$(redact_line "$*"); emit "  SKIP  $m"; skip=$((skip+1)); SKIPPED+=("$m"); }
 # skc: a SKIP for an *operator choice* (a knob turned a required arm off), never a hardware gap.
 # Fine for local/dev iteration; a FAIL under GATE_STRICT=1, because a release gate is not allowed
 # to quietly ship on a weaker bar than its own defaults -- see GATE_STRICT above.
@@ -72,7 +83,23 @@ skc(){
         sk "$*"
     fi
 }
-die(){  printf 'gate: %s\n' "$*" >&2; exit 2; }
+die(){
+    local line
+    line=$(redact_line "gate: $*")
+    printf '%s\n' "$line" >&2
+    if [ -n "${GATE_RECORD:-}" ]; then printf '%s\n' "$line" >> "$GATE_RECORD"; fi
+    exit 2
+}
+dump_tail() {
+    local f=$1 n=${2:-20} line
+    [ -r "$f" ] || return 0
+    while IFS= read -r line; do emit "$line"; done < <(tail -n "$n" "$f")
+}
+# An externally supplied WORKDIR is not created by mktemp, and the FIRST thing the run does is
+# redirect the np=1 server log into it -- a missing directory failed that redirect and reported
+# "server would not boot at -np 1", i.e. a harness artefact wearing an engine failure's clothes
+# (2026-09-06: the np=2 arm passed in the same run only because it mkdir -p's WORKDIR/slots).
+mkdir -p "$WORKDIR" || die "cannot create WORKDIR"
 
 # ---- resolve BIN -----------------------------------------------------------------------------
 if [ -z "$BIN" ]; then
@@ -92,9 +119,9 @@ fi
 GATE_PLAN=${GATE_PLAN:-0}
 for a in "$@"; do [ "$a" = "--plan" ] && GATE_PLAN=1; done
 if [ "$GATE_PLAN" = 1 ]; then
-    printf 'gate --plan (dry run, no server boots) BIN=%s MODEL=%s GATE_STRICT=%s\n\n' \
-        "${BIN:-<not found>}" "${MODEL:-<unset -- not required for --plan>}" "$GATE_STRICT"
-    row(){ printf '  %-6s %-58s %s\n' "$1" "$2" "$3"; }  # verdict, arm, reason
+    emit "gate --plan (dry run, no server boots) BIN=${BIN:-<not found>} MODEL=${MODEL:-<unset -- not required for --plan>} GATE_STRICT=$GATE_STRICT"
+    emit ""
+    row(){ emit "$(printf '  %-6s %-58s %s' "$1" "$2" "$3")"; }  # verdict, arm, reason
     knob_row(){  # knob_row <arm> <disabled 0|1> <knob=val> -- the operator-choice knobs
         if [ "$2" = 1 ]; then
             [ "$GATE_STRICT" = 1 ] && row FAIL "$1" "$3 (GATE_STRICT=1: operator-disabled -> FAIL, not SKIP)" \
@@ -136,9 +163,15 @@ if [ "$GATE_PLAN" = 1 ]; then
         elif [ "$gpu_ok" = 1 ]; then row FAIL "  test-narrow-kernel-parity" "binary missing but a GPU IS present on this box -- no excuse, would FAIL"
         else row SKIP "  test-narrow-kernel-parity" "GPU-only test, no GPU present on this box (checked for real via nvidia-smi)"; fi
     fi
-    printf '\nThis is a preview only -- nothing above ran a request or booted a server. Run without\n--plan (and with MODEL set) for a real result.\n'
+    emit ""
+    emit "This is a preview only -- nothing above ran a request or booted a server. Run without --plan (and with MODEL set) for a real result."
     exit 0
 fi
+
+# A real run owns LAST-RUN.md from this point. Every emit() below appends the
+# redacted line, so the file never holds a build-machine path.
+GATE_RECORD=$HERE/LAST-RUN.md
+: > "$GATE_RECORD"
 
 [ -n "$BIN" ] && [ -x "$BIN/llama-server" ] || die "no llama-server found. Set BIN=<dir with llama-server> (looked in $ROOT/build/bin, build-spd/bin, build-tok/bin)."
 [ -n "$MODEL" ] || die "set MODEL=<path to .gguf>"
@@ -230,9 +263,9 @@ server_start(){
     local t0=$SECONDS
     until http_ok "$BASE/health"; do
         if ! kill -0 "$SRV_PID" 2>/dev/null; then
-            say "server died during boot; last lines of $WORKDIR/$name.log:"; tail -20 "$WORKDIR/$name.log"; return 1
+            say "server died during boot; last lines of $WORKDIR/$name.log:"; dump_tail "$WORKDIR/$name.log" 20; return 1
         fi
-        (( SECONDS - t0 > BOOT_TIMEOUT )) && { say "boot timeout after ${BOOT_TIMEOUT}s"; tail -20 "$WORKDIR/$name.log"; return 1; }
+        (( SECONDS - t0 > BOOT_TIMEOUT )) && { say "boot timeout after ${BOOT_TIMEOUT}s"; dump_tail "$WORKDIR/$name.log" 20; return 1; }
         sleep 5
     done
     say "server up (-np $np) after $(( SECONDS - t0 ))s"
@@ -688,6 +721,6 @@ fi
 say "=== GATE RESULT: PASS=$pass FAIL=$fail SKIP=$skip  (logs in $WORKDIR) ==="
 if [ "$skip" -gt 0 ]; then
     say "    skipped arms (a SKIP is not a FAIL, but a gate with skips has not proved what a clean gate proves -- read these before trusting the exit code):"
-    for s in "${SKIPPED[@]}"; do printf '      - %s\n' "$s"; done
+    for s in "${SKIPPED[@]}"; do emit "      - $s"; done
 fi
 [ "$fail" = 0 ]

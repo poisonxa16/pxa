@@ -61,7 +61,46 @@ class Store(object):
         except OSError:
             return False
 
-    def list(self):
+    def raw(self, sid):
+        """the file's text as it is on disk (a damaged chat can still be exported), or None."""
+        try:
+            with open(self._path(sid), "rb") as f:
+                return f.read(64 << 20).decode("utf-8", "replace")
+        except (OSError, KeyError):
+            return None
+
+    HEAD_BYTES = 64 << 10
+
+    def head(self, sid, n=HEAD_BYTES):
+        """the first n bytes of the file as text (the listing's title sniff for a damaged chat), or None."""
+        try:
+            with open(self._path(sid), "rb") as f:
+                return f.read(n).decode("utf-8", "replace")
+        except (OSError, KeyError):
+            return None
+
+    def _broken_meta(self, name):
+        """a chat file that cannot be read is LISTED (title + 'could not be read'), not hidden [ST06]: it can still be
+        exported raw or deleted. Never pruned: it may be the only copy of someone's words."""
+        sid = name[:-5]
+        if not ID_RE.match(sid):
+            return None
+        title = None
+        try:
+            txt = self.head(sid) or ""      # the title sits at the front: never the whole (up to 64 MB) file per list()
+            m = re.search(r'"title"\s*:\s*("(?:[^"\\]|\\.){1,200}")', txt)
+            if m:
+                title = json.loads(m.group(1))
+        except (ValueError, TypeError):
+            title = None
+        try:
+            upd = os.path.getmtime(os.path.join(self.dir, name))
+        except OSError:
+            upd = 0
+        return {"id": sid, "title": f"{title or 'Chat'} (could not be read)", "updated": upd, "server_name": None,
+                "preset": None, "turns": 0, "broken": True}
+
+    def list(self, include_broken=True):
         out = []
         try:
             names = os.listdir(self.dir)
@@ -71,15 +110,19 @@ class Store(object):
             if not n.endswith(".json"):
                 continue
             s = self.get(n[:-5])
-            if s:
+            if isinstance(s, dict) and s.get("id"):
                 out.append({"id": s["id"], "title": s.get("title") or "Chat", "updated": s.get("updated"),
                             "server_name": s.get("server_name"), "preset": s.get("preset"),
                             "turns": len(s.get("turns") or [])})
+            elif include_broken:
+                b = self._broken_meta(n)
+                if b:
+                    out.append(b)
         out.sort(key=lambda x: -(x["updated"] or 0))
         return out
 
     def _prune(self):
-        items = self.list()
+        items = self.list(include_broken=False)
         for x in items[MAX_SESSIONS:]:
             self.delete(x["id"])
 
@@ -129,8 +172,8 @@ class Ephemeral(object):
             disk = False
         return had or disk
 
-    def list(self):
-        return self.disk.list()
+    def list(self, include_broken=True):
+        return self.disk.list(include_broken)
 
     def create(self, *a, **k):
         return self.disk.create(*a, **k)
@@ -594,8 +637,10 @@ def switch_fork(sess, turn, index):
     return sess
 
 
-def for_client(sess, running=None):
-    """the session the page sees: no stored versions, and a 1-based branch count where there is a choice."""
+def for_client(sess, running=None, interrupted=None):
+    """the session the page sees: no stored versions, and a 1-based branch count where there is a choice.
+    `interrupted` is the pending turn of a run that no longer exists (Control stopped mid-turn): the page shows
+    the user's message with a one-click resend."""
     forks = sess.get("forks") if isinstance(sess.get("forks"), dict) else {}
     turns = []
     for i, t in enumerate(sess.get("turns") or []):
@@ -613,9 +658,11 @@ def for_client(sess, running=None):
                     active = 0
                 t["branch"] = {"i": active + 1, "n": n}
         turns.append(t)
-    out = {k: v for k, v in sess.items() if k != "forks"}
+    out = {k: v for k, v in sess.items() if k not in ("forks", "pending")}
     out["turns"] = turns
     out["running"] = running
+    out["interrupted"] = ({"user": str(interrupted.get("user") or ""), "ts": interrupted.get("ts")}
+                          if isinstance(interrupted, dict) and not running else None)
     return out
 
 

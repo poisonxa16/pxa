@@ -55,6 +55,14 @@
 // ---------------------------------------------------------------------------------------------
 // env
 // ---------------------------------------------------------------------------------------------
+// PXA_DQC_MB unset  = AUTO (default on, Volta only): the arena is sized to the whole fp16 working set of the
+//                     dequant->cuBLAS prefill GEMMs and stays resident, so every prefill after the first skips the
+//                     weight dequant. Armed only when that working set fits with PXA_DQC_RESERVE_MB (default 2048)
+//                     of VRAM to spare; otherwise it stays off. Same dequant kernel, so the result is bit-identical.
+// PXA_DQC_MB=0      = off (the incumbent per-GEMM pool dequant).
+// PXA_DQC_MB=N      = explicit N MiB ring (the original K8-C prefetch arena; thrashes if N < the working set).
+static inline bool pxa_dqc_env_set() { return getenv("PXA_DQC_MB") != nullptr; }
+
 static inline size_t pxa_dqc_mb() {
     static const size_t v = [](){
         const char * e = getenv("PXA_DQC_MB");
@@ -66,7 +74,19 @@ static inline size_t pxa_dqc_mb() {
     return v;
 }
 
-static inline bool pxa_dqc_on() { return pxa_dqc_mb() != 0; }
+// auto mode = the variable is not set at all
+static inline bool pxa_dqc_auto_mode() { static const bool v = !pxa_dqc_env_set(); return v; }
+
+static inline bool pxa_dqc_on() { return pxa_dqc_auto_mode() || pxa_dqc_mb() != 0; }
+
+static inline size_t pxa_dqc_reserve_mb() {
+    static const size_t v = [](){
+        const char * e = getenv("PXA_DQC_RESERVE_MB");
+        long x = e ? atol(e) : 2048;
+        return (size_t)(x < 0 ? 0 : x);
+    }();
+    return v;
+}
 
 static inline int64_t pxa_dqc_min_ny() {
     static const int64_t v = [](){
@@ -127,6 +147,7 @@ struct pxa_dqc_arena {
     cudaStream_t last_compute = nullptr;
     std::deque<pxa_dqc_region> live;
     std::vector<cudaEvent_t>   evfree;
+    size_t       auto_want = 0;      // AUTO mode: the working set the arena was sized to (0 = explicit ring)
 };
 
 static pxa_dqc_arena g_pxa_dqc_arena[GGML_CUDA_MAX_DEVICES];
@@ -137,11 +158,23 @@ static bool pxa_dqc_ensure(pxa_dqc_arena & a, int device) {
         return a.base != nullptr;
     }
     a.tried = true;
-    const size_t want = pxa_dqc_mb() * 1024ull * 1024ull;
+    const size_t want = a.auto_want ? a.auto_want : pxa_dqc_mb() * 1024ull * 1024ull;
     if (!want) {
         return false;
     }
     ggml_cuda_set_device(device);
+    if (a.auto_want) {
+        size_t fr = 0, tot = 0;
+        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        if (fr < want + pxa_dqc_reserve_mb() * 1024ull * 1024ull) {
+            fprintf(stderr, "PXA_DQC dev%d: auto resident dequant cache skipped (needs %zu MiB, %zu MiB free, reserve %zu MiB)\n",
+                    device, want/(1024*1024), fr/(1024*1024), pxa_dqc_reserve_mb());
+            return false;
+        }
+    }
     if (cudaMalloc(&a.base, want) != cudaSuccess) {
         a.base = nullptr;
         (void) cudaGetLastError();
@@ -158,8 +191,8 @@ static bool pxa_dqc_ensure(pxa_dqc_arena & a, int device) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&a.dq, cudaStreamNonBlocking));
     }
     CUDA_CHECK(cudaEventCreateWithFlags(&a.barrier, cudaEventDisableTiming));
-    fprintf(stderr, "PXA_DQC dev%d: arena %zu MiB, lookahead %d, min_ny %lld\n",
-            device, a.cap/(1024*1024), pxa_dqc_depth(), (long long) pxa_dqc_min_ny());
+    fprintf(stderr, "PXA_DQC dev%d: %s arena %zu MiB, lookahead %d, min_ny %lld\n",
+            device, a.auto_want ? "auto resident" : "ring", a.cap/(1024*1024), pxa_dqc_depth(), (long long) pxa_dqc_min_ny());
     return true;
 }
 
@@ -234,6 +267,19 @@ static void pxa_dqc_prefetch(int device, const pxa_dqc_key & k, cudaStream_t com
         return;                                     // one tensor larger than the whole arena
     }
     if (a.head + need > a.cap) {
+        if (a.auto_want) {
+            // AUTO mode is sized to the whole working set, so a wrap means weights outside the graph
+            // it was sized from showed up. A ring over a bigger set thrashes (measured loss): hand the
+            // arena back and run the incumbent path from here on.
+            pxa_dqc_drain(a, device);
+            ggml_cuda_set_device(device);
+            if (cudaDeviceSynchronize() != cudaSuccess) { (void) cudaGetLastError(); }
+            cudaFree(a.base);
+            a.base = nullptr;
+            a.cap  = 0;
+            fprintf(stderr, "PXA_DQC dev%d: auto cache overflowed its sizing graph, released (incumbent dequant path)\n", device);
+            return;
+        }
         pxa_dqc_drain(a, device);
     }
 
@@ -392,15 +438,69 @@ static bool pxa_dqc_node_ok(const ggml_tensor * node, int64_t min_ny, bool src0_
 }
 
 #ifndef PXA_DQC_NO_WALKER
+// AUTO mode: size the arena from the first prefill-shaped graph. Called at node 0 only. The first
+// eligible MUL_MAT decides: a decode-shaped graph (ny < min_ny) returns after a handful of nodes.
+static void pxa_dqc_auto_arm(pxa_dqc_arena & a, ggml_cgraph * cgraph, int device, int64_t min_ny) {
+    if (a.tried) {
+        return;
+    }
+    std::vector<const void *> seen;
+    size_t total = 0;
+    int probed = 0;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (!node || node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[1]) {
+            continue;
+        }
+        const ggml_tensor * src0 = node->src[0];
+        if (!ggml_is_quantized(src0->type)) {
+            continue;
+        }
+        if (probed++ == 0 && node->src[1]->ne[1] < min_ny) {
+            return;                                  // decode-shaped graph: nothing to size from
+        }
+        const bool is_split = src0->buffer && ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+        if (!pxa_dqc_node_ok(node, min_ny, is_split)) {
+            continue;
+        }
+        bool dup = false;
+        for (const void * p : seen) { if (p == src0->data) { dup = true; break; } }
+        if (dup) {
+            continue;
+        }
+        seen.push_back(src0->data);
+        const size_t bytes = (size_t) src0->ne[0] * (size_t) src0->ne[1] * sizeof(half);
+        total += (bytes + 255) & ~(size_t) 255;
+    }
+    if (!total) {
+        return;
+    }
+    a.auto_want = total + (1u << 20);
+    pxa_dqc_ensure(a, device);
+}
+
 static void pxa_dqc_walk(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, bool use_cuda_graph) {
     if (!pxa_dqc_on() || use_cuda_graph || !cgraph) {
         return;
     }
     const int device = ctx.device;
-    if (ggml_cuda_info().devices[device].cc != CC_VOLTA) {
+    if (ggml_cuda_info().devices[device].cc != PXA_CC_VOLTA) {
         return;
     }
     const int64_t     min_ny  = pxa_dqc_min_ny();
+    if (pxa_dqc_auto_mode()) {
+        pxa_dqc_arena & a = g_pxa_dqc_arena[device];
+        std::lock_guard<std::mutex> lk(a.mtx);
+        if (!a.tried) {
+            if (i != 0) {
+                return;
+            }
+            pxa_dqc_auto_arm(a, cgraph, device, min_ny);
+        }
+        if (!a.base) {
+            return;
+        }
+    }
     const int         depth   = pxa_dqc_depth();
     const cudaStream_t compute = ctx.stream();
     for (int d = 0; d <= depth; ++d) {

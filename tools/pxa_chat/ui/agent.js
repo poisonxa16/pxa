@@ -11,13 +11,25 @@
 // copy button), inline code, bold, italic, strikethrough, http(s)/mailto links. Streaming-safe: an unclosed
 // fence renders as a code block so far.
 const pxaMd = (function () {
-  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  // u06: bidi override/embedding/isolate controls (U+202A-202E, U+2066-2069) can make "evil\u202Etxt.exe" read as "evilexe.txt".
+  // Every model, tool and saved text goes through bidi(): each such character becomes a visible, inert "[U+202E]" marker.
+  // Plain right-to-left text (Hebrew, Arabic) and the benign LRM/RLM marks are untouched.
+  const BIDI = /[\u202A-\u202E\u2066-\u2069]/g;
+  const bidi = s => typeof s === "string" && BIDI.test((BIDI.lastIndex = 0, s)) ? s.replace(BIDI, c => "[U+" + c.charCodeAt(0).toString(16).toUpperCase() + "]") : s;
+  const bidiDeep = v => {
+    if (typeof v === "string") return bidi(v);
+    if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = bidiDeep(v[i]); return v; }
+    if (v && typeof v === "object") { for (const k of Object.keys(v)) v[k] = bidiDeep(v[k]); }
+    return v;
+  };
+  const esc = s => bidi(String(s)).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   const unesc = s => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
   function safeUrl(u) {
     const raw = unesc(u).trim();
     return /^(https?:\/\/|mailto:)/i.test(raw) ? esc(raw) : null;
   }
   function inline(s) {                      // s is already escaped
+    s = s.replace(/\u0000/g, "\uFFFD");     // NUL is the placeholder mark below: model text must not forge one [E10]
     const keep = [];
     const hold = h => "\u0000" + (keep.push(h) - 1) + "\u0000";
     s = s.replace(/(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/g, (m, t, c) => hold("<code>" + c.replace(/^ (.*) $/, "$1") + "</code>"));
@@ -112,9 +124,11 @@ const pxaMd = (function () {
     if (!m) return {think: "", rest: text || "", open: false};
     return {think: m[1], rest: text.slice(m[0].length).replace(/^\s+/, ""), open: !m[2]};
   }
-  return {render, inline, esc, splitThink};
+  return {render, inline, esc, splitThink, bidi, bidiDeep};
 })();
 // md:end
+const bidi = pxaMd.bidi, bidiDeep = pxaMd.bidiDeep;
+window.pxaBidi = {safe: bidi, deep: bidiDeep};
 
 // Shared by the Assistant (agent.js) and Classic (chat.js) views: functions run on the DOM the safe renderer produced
 // (syntax highlighting, math). fn(root, {view: "assistant"|"classic", live, msg}). See CHAT-PLUGINS.md.
@@ -570,7 +584,7 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
   const DOT = {ready: "ok", busy: "warn", starting: "warn pulse", error: "bad", down: "bad"};
   function serverMenu(anchor) {
     if (!A.servers.length) {
-      menu(anchor, [{head: "No server running yet"}, {label: "Go to Launch", sub: "Start a model, then come back. Chat picks it up on its own.", act: () => showTab("launch")}]);
+      menu(anchor, [{head: "No server running yet"}, {label: "Start a model", sub: "Home starts one in a click (Launch has every setting). Chat picks it up on its own.", act: () => showTab("home")}]);
       return;
     }
     menu(anchor, [{head: "Talk to"}].concat(A.servers.map(s => ({
@@ -730,7 +744,7 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     const bubble = el("div", {class: "ag-bubble"});
     if (refs && refs.length) bubble.append(el("div", {class: "ag-msg-refs"},
       ...refs.map(r => el("span", {class: "ag-ref ag-ref-ro", text: "@ " + refTitle(r.title)}))));
-    bubble.append(document.createTextNode(text));
+    bubble.append(document.createTextNode(bidi(text)));
     const m = el("div", {class: "ag-u", "data-turn": idx}, bubble, branchBar(idx),
       el("div", {class: "ag-tb"},
         iconBtn("copy", "Copy", () => copyText(m._text)),
@@ -779,16 +793,47 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     if (!p) { p = {node: el("div", {class: "ag-md"}), raw: ""}; T.texts[step] = p; T.parts.append(p.node); }
     return p;
   }
+  // s21: above BIG characters a reply is rendered in pieces: finished blocks once (frozen segments), only the live tail again on
+  // every frame. Before, each frame re-rendered the whole text, so a 1 MB reply took O(n^2) work and froze the page.
+  const BIG = 200000, SEG = 24000, FENCE_OPEN = /^\s{0,3}(`{3,}|~{3,})/;
+  function paintBig(T, p, rest, live) {
+    let z = p._fz;
+    if (z && (rest.length < z.end || rest.slice(Math.max(0, z.end - 100), z.end) !== z.chk)) z = null;      // retracted or rewritten: start over
+    if (!z) { z = p._fz = {end: 0, pos: 0, fence: null, chk: "", tail: el("div", {class: "ag-seg ag-tail"})}; p.node.replaceChildren(z.tail); }
+    const freeze = (cut, cont) => {
+      const seg = el("div", {class: "ag-seg"});
+      if (cont) seg.dataset.cont = "1";
+      seg.innerHTML = pxaMd.render(rest.slice(z.end, cut));
+      window.PXAMarkdown.process(seg, {view: "assistant", live: false, idx: T.idx});
+      z.tail.before(seg); z.end = cut; z.chk = rest.slice(Math.max(0, cut - 100), cut); z.cont = !z.blank;
+    };
+    for (;;) {                                           // scan the complete lines not seen yet for a place to cut: outside a fence, after a blank line
+      const nl = rest.indexOf("\n", z.pos);
+      if (nl < 0) break;
+      const line = rest.slice(z.pos, nl);
+      z.pos = nl + 1;
+      if (z.fence) { if (new RegExp("^\\s{0,3}" + z.fence[0] + "{" + z.fence.length + ",}\\s*$").test(line)) z.fence = null; }
+      else { const m = FENCE_OPEN.exec(line); if (m) z.fence = m[1]; }
+      if (z.fence) continue;
+      z.blank = !line.trim();
+      if (z.pos - z.end >= (z.blank ? SEG : 3 * SEG)) freeze(z.pos, z.cont);        // a paragraph with no blank line is cut at a line after 3 pieces' worth
+    }
+    z.tail.innerHTML = pxaMd.render(rest.slice(z.end));
+    if (z.cont) z.tail.dataset.cont = "1"; else delete z.tail.dataset.cont;
+    window.PXAMarkdown.process(z.tail, {view: "assistant", live: !!live, idx: T.idx});
+    return z.tail;
+  }
   function paint(T, p, live) {
     const sp = pxaMd.splitThink(p.raw);
     if (sp.think) { const k = thinkRow(T); k.body.textContent = sp.think; if (!sp.open) thinkDone(T); }
-    p.node.innerHTML = pxaMd.render(sp.rest);
-    window.PXAMarkdown.process(p.node, {view: "assistant", live: !!live, idx: T.idx});
+    let base = p.node;
+    if (sp.rest.length > BIG || (p._fz && sp.rest.length >= p._fz.end)) base = paintBig(T, p, sp.rest, live);
+    else { p._fz = null; p.node.innerHTML = pxaMd.render(sp.rest); window.PXAMarkdown.process(p.node, {view: "assistant", live: !!live, idx: T.idx}); }
     p.node.hidden = !sp.rest.trim();
     if (live) {
       $$(".ag-cursor", T.m).forEach(c => c.remove());
-      const last = p.node.lastElementChild;
-      const host = last && /^(P|LI|H\d|TD)$/.test(last.tagName) ? last : (last && last.tagName === "UL" || last && last.tagName === "OL") ? last.lastElementChild || p.node : p.node;
+      const last = base.lastElementChild;
+      const host = last && /^(P|LI|H\d|TD)$/.test(last.tagName) ? last : (last && last.tagName === "UL" || last && last.tagName === "OL") ? last.lastElementChild || base : base;
       host.append(el("span", {class: "ag-cursor", "aria-hidden": "true"}));
       p.node.hidden = false;
     }
@@ -981,9 +1026,9 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     card.replaceChildren(ico("shield", "ag-ap-ic"), el("span", {text: words}));
     card.className = "ag-ap answered " + (d.decision === "once" || d.decision === "always" ? "ok" : "no");
   }
-  function notice(text, kind, retry, host) {
+  function notice(text, kind, retry, host, label) {
     const n = el("div", {class: "ag-note " + (kind || "")}, kind === "wait" ? el("span", {class: "spin"}) : null, el("span", {text}),
-      retry ? el("button", {type: "button", class: "b", text: "Retry", onclick: () => { n.remove(); retry(); }}) : null);
+      retry ? el("button", {type: "button", class: "b", text: label || "Retry", onclick: () => { n.remove(); retry(); }}) : null);
     (host || (A.cur ? A.cur.parts : R.col)).append(n);
     scrollEnd();
     return n;
@@ -1084,6 +1129,13 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     catch (e) {
       A.run = null; A.cur = null; sendState(); T.pending.remove();
       A.turns.pop();                         // nothing was saved: Retry sends it again as a new turn
+      if (e.code === "bad_image") {          // c14: the server refused an image and says why: show the reason, give the words back
+        toast(e.message, true);
+        T.m.remove(); $$(".ag-u", R.col).forEach(n => { if (+n.dataset.turn === idx) n.remove(); });
+        if (!R.input.value) { R.input.value = text; grow(); }
+        notice(e.message + " Remove the image, then send again.", "bad", null, R.col);
+        return;
+      }
       notice(e.message, "bad", () => { T.m.remove(); $$(".ag-u", R.col).forEach(n => { if (+n.dataset.turn === idx) n.remove(); }); startTurn(text, rewind); }, T.parts);
       return;
     }
@@ -1101,7 +1153,7 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     const types = ["run.started", "status", "step", "text.delta", "think.delta", "text.retract", "tool.call", "approval.request", "approval.answered", "tool.result", "subagent", "notes", "run.done", "run.error", "run.cancelled"]
       .concat(Array.from(X.runTypes).filter(t => !/^(run\.|status$|step$|text\.|think\.|tool\.|approval\.)/.test(t)));   // plugin types: only the delta hook sees them
     for (const t of types) es.addEventListener(t, m => {
-      let ev; try { ev = JSON.parse(m.data); } catch (e) { return; }
+      let ev; try { ev = bidiDeep(JSON.parse(m.data)); } catch (e) { return; }
       if (ev.seq <= A.seq) return;
       A.seq = ev.seq; A.retries = 0;
       if (A.reconn) { A.reconn.remove(); A.reconn = null; }
@@ -1110,17 +1162,76 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
       if (T) { hk("delta", ev, T.m); if (/^run\.(done|error|cancelled)$/.test(ev.type)) hk("messageDone", T.msg || {role: "assistant", idx: T.idx, end: ev.type, data: ev.data, el: T.m}, G); }
     });
     es.onerror = () => {
-      es.close(); if (A.es === es) A.es = null;
+      es.close(); if (A.es !== es) return;
+      A.es = null;
       if (!A.run || A.run === "pending") return;
-      A.retries++;
-      if (A.retries === 2 && !A.reconn) A.reconn = notice("Reconnecting to PXA Control...", "wait");
-      if (A.retries > 12) {
-        if (A.reconn) { A.reconn.remove(); A.reconn = null; }
-        notice("Lost the connection to PXA Control. The answer keeps going on the server.", "bad", () => { A.retries = 0; listen(); });
-        return;
-      }
-      setTimeout(() => { if (A.run && !A.es) listen(); }, Math.min(8000, 800 * A.retries));
+      recover(A.run);
     };
+  }
+  // e07: EventSource hides WHY it failed (a 401 and a dead server look the same). Ask the same URL with fetch, which shows the
+  // status: 200 = the run is alive (reopen the stream from the last seq, no repeated text), 401 = this tab's token is no longer
+  // good (a restarted Control makes a fresh one), 404 = the run is gone (Control restarted: the saved chat says what was lost),
+  // anything else = Control is down or busy: keep trying with a growing pause, no give-up.
+  async function probeRun(run) {
+    const ac = new AbortController(), t = setTimeout(() => ac.abort(), 6000);
+    try {
+      const r = await fetch(`/api/chat/events?run=${encodeURIComponent(run)}&since=${A.seq}`, {signal: ac.signal, headers: {Accept: "text/event-stream"}, cache: "no-store"});
+      try { ac.abort(); } catch (e) { /* headers are enough */ }
+      return r.status === 200 ? "up" : r.status === 401 ? "auth" : r.status === 404 ? "gone" : "down";
+    } catch (e) { return "down"; }
+    finally { clearTimeout(t); }
+  }
+  function dropReconn() { if (A.reconn) { A.reconn.remove(); A.reconn = null; } }
+  function dropRun() {
+    if (A.es) A.es.close();
+    A.es = null; A.run = null;
+    const T = A.cur; A.cur = null;
+    if (T) { T.pending.remove(); if (T.status) { T.status.remove(); T.status = null; } $$(".ag-cursor", T.m).forEach(c => c.remove()); }
+    dropReconn(); sendState();
+  }
+  function signInNote(host) {
+    const inp = el("input", {type: "text", class: "ag-signin", placeholder: "paste the new address from the terminal", "aria-label": "new PXA Control address", autocomplete: "off", spellcheck: "false"});
+    const go = () => {
+      const v = inp.value.trim(); if (!v) return;
+      let tok = v;
+      try { const u = new URL(v, location.origin); tok = u.searchParams.get("token") || (/^https?:/i.test(v) ? "" : v); } catch (e) { /* a bare token */ }
+      if (!tok) { toast("That address has no ?token=... in it.", true); return; }
+      location.assign(location.origin + "/?token=" + encodeURIComponent(tok) + location.hash);   // the same tab, so the chat opens again
+    };
+    inp.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+    const n = el("div", {class: "ag-note bad ag-signin-note", role: "alert"}, el("span", {text: "You are signed out: PXA Control restarted with a new access token. Open the new address (it ends in ?token=...) to sign in again; this chat is saved."}),
+      inp, el("button", {type: "button", class: "b", text: "Sign in again", onclick: go}),
+      el("button", {type: "button", class: "b", text: "Reload", onclick: () => location.reload()}));
+    (host || R.col).append(n); scrollEnd();
+    return n;
+  }
+  async function recover(run) {
+    if (A.recovering) return;
+    A.recovering = true;
+    const t0 = Date.now();
+    try {
+      for (;;) {
+        if (A.run !== run) return;                       // the answer ended or the chat changed meanwhile
+        A.retries++;
+        const st = await probeRun(run);
+        if (A.run !== run) return;
+        if (st === "up") { dropReconn(); listen(); return; }
+        if (st === "auth") {
+          const T = A.cur; dropRun(); signInNote(T ? T.parts : null);
+          return;
+        }
+        if (st === "gone") {
+          const T = A.cur, sid = A.session, priv = A.incognito, idx = T ? T.idx : A.turns.length - 1;
+          dropRun();
+          if (sid && !priv) openSession(sid, true);      // the saved chat: the answer if it finished, else the interrupted turn with Resend
+          else notice("PXA Control restarted and this private chat's answer was lost.", "bad", () => resend(idx, A.turns[idx]), R.col);
+          return;
+        }
+        const secs = Math.round((Date.now() - t0) / 1000), txt = "Reconnecting to PXA Control..." + (secs >= 5 ? " (" + secs + " s)" : "");
+        if (!A.reconn) A.reconn = notice(txt, "wait"); else A.reconn.querySelector("span:not(.spin)").textContent = txt;
+        await new Promise(res => setTimeout(res, Math.min(8000, 800 * A.retries)));
+      }
+    } finally { A.recovering = false; }
   }
   function onEvent(ev) {
     const T = A.cur, d = ev.data || {};
@@ -1186,6 +1297,7 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
           if (d.text && !Object.values(T.texts).some(p => p.raw.trim())) { const p = textPart(T, "final"); p.raw = d.text; paint(T, p, false); }
           dedupeSubAnswers(T);
           if (d.empty) notice("The model sent an empty reply.", "quiet", () => resend(T.idx, A.turns[T.idx]));
+          if (d.truncated) notice("The answer was cut at the length limit. Say \"continue\" for the rest, or raise Max tokens in Advanced.", "quiet");
         } else if (ev.type === "run.error") notice(friendlyErr(d), "bad", () => resend(T.idx, A.turns[T.idx]));
         else notice("Stopped.", "quiet");
         footer(T, d, (Date.now() - T.t0) / 1000, ev.type);
@@ -1209,7 +1321,7 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
   // ---------------- sessions ----------------
   async function loadSessions() {
     let d; try { d = await api("/api/chat/sessions"); } catch (e) { return; }
-    A.sessions = d.sessions || [];
+    A.sessions = bidiDeep(d.sessions || []);
     renderList();
   }
   function renderList() {
@@ -1231,12 +1343,45 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     R.list.replaceChildren(...out);
   }
   function listItem(s) {
+    if (s.broken) return brokenItem(s);
     const it = el("div", {class: "ag-item" + (s.id === A.session ? " on" : ""), "data-id": s.id});
     const open = el("button", {type: "button", class: "ag-item-t", title: s.title, "aria-current": s.id === A.session ? "true" : "false", onclick: () => openSession(s.id)}, el("span", {text: s.title}));
     const acts = el("span", {class: "ag-item-acts"},
       iconBtn("edit", "Rename", () => rename(it, s)), iconBtn("trash", "Delete", () => confirmDelete(it, s)));
     it.append(open, acts);
     return it;
+  }
+  // st06: a chat file that could not be read is listed as broken: marked, with Export raw and Delete always in view; opening it
+  // shows what happened in words (the server answers 422 session_unreadable)
+  const rawUrl = id => `/api/chat/export?id=${encodeURIComponent(id)}&format=raw`;
+  function brokenItem(s) {
+    const it = el("div", {class: "ag-item broken" + (A.brokenOpen === s.id ? " on" : ""), "data-id": s.id, "data-broken": "1"});
+    const open = el("button", {type: "button", class: "ag-item-t", title: s.title, "aria-current": A.brokenOpen === s.id ? "true" : "false", onclick: () => showBroken(s)},
+      el("span", {class: "ag-broken-tag", text: "Broken"}), el("span", {text: String(s.title || "Chat").replace(/ \(could not be read\)$/, "")}));
+    const acts = el("span", {class: "ag-broken-acts"},
+      el("a", {class: "ag-broken-b", href: rawUrl(s.id), download: s.id + ".raw.json", text: "Export raw", title: "Save the damaged file as it is"}),
+      el("button", {type: "button", class: "ag-broken-b danger", text: "Delete", onclick: () => confirmDelete(it, s)}));
+    it.append(open, acts);
+    return it;
+  }
+  function showBroken(s) {
+    if (A.run) { toast("Wait for the current answer, or press Stop.", true); return; }
+    A.session = null; store.set("agent.session", null); A.brokenOpen = s.id;
+    A.turns = []; A.branchAt = {};
+    const name = String(s.title || "Chat").replace(/ \(could not be read\)$/, "");
+    R.title.textContent = name; A.title = name;
+    const del = el("button", {type: "button", class: "b danger", id: "ag-broken-del", text: "Delete this chat", onclick: () => {
+      const row = $(`.ag-item[data-id="${s.id}"]`, R.list);
+      if (row) confirmDelete(row, s); else toast("Pick the chat in the list to delete it.", true);
+    }});
+    R.col.replaceChildren(el("div", {class: "ag-broken-card", id: "ag-broken-card", role: "status"},
+      el("div", {class: "ag-broken-h", text: "This chat could not be opened"}),
+      el("p", {text: "Its file is damaged, so PXA Control cannot show the messages. Nothing was deleted: the file is still on disk."}),
+      el("p", {text: "You can save the file as it is (Export raw), or delete the chat."}),
+      el("div", {class: "ag-broken-row"}, el("a", {class: "b", id: "ag-broken-exp", href: rawUrl(s.id), download: s.id + ".raw.json", text: "Export raw"}), del)));
+    renderList(); loadHost();
+    if (window.innerWidth <= 900) setSide(false);
+    hk("sessionChange", null, G);
   }
   function rename(it, s) {
     const inp = el("input", {type: "text", class: "ag-rename", value: s.title, maxlength: "80", "aria-label": "chat name"});
@@ -1260,16 +1405,21 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     it.classList.add("confirm");
     it.replaceChildren(el("span", {class: "ag-item-q", text: "Delete this chat and its files?"}),
       el("button", {type: "button", class: "b danger ag-del-yes", text: "Delete", onclick: async () => {
-        try { await api("/api/chat/session", {method: "DELETE", body: {id: s.id}}); } catch (e) { toast(e.message, true); }
+        let gone = true;
+        try { await api("/api/chat/session", {method: "DELETE", body: {id: s.id}}); } catch (e) { gone = false; toast(e.message, true); }
+        if (gone) A.sessions = (A.sessions || []).filter(x => x.id !== s.id);      // the row goes now, not at the next list load
         it.classList.remove("confirm");
-        if (s.id === A.session) newChat(); else loadSessions();
+        if (s.id === A.session || s.id === A.brokenOpen) { A.brokenOpen = null; newChat(); } else loadSessions();
       }}),
       el("button", {type: "button", class: "b", text: "Cancel", onclick: () => { it.classList.remove("confirm"); renderList(); }}));
   }
   async function openSession(id, quiet) {
     if (A.run) { toast("Wait for the current answer, or press Stop.", true); return; }
-    let s; try { s = await api("/api/chat/session?id=" + encodeURIComponent(id)); }
-    catch (e) { if (!quiet) toast(e.message, true); A.session = null; store.set("agent.session", null); welcome(); loadSessions(); return; }
+    let s; try { s = bidiDeep(await api("/api/chat/session?id=" + encodeURIComponent(id))); }
+    catch (e) {
+      if (e.code === "session_unreadable") { const b = (A.sessions || []).find(x => x.id === id); showBroken(b || {id, title: "Chat"}); return; }
+      if (!quiet) toast(e.message, true); A.session = null; store.set("agent.session", null); welcome(); loadSessions(); return; }
+    A.brokenOpen = null;
     A.session = s.id; store.set("agent.session", s.incognito ? null : s.id);
     if (s.preset && s.preset !== A.preset && A.presets.some(p => p.id === s.preset)) setPreset(s.preset);
     if (s.server_key) A.selected = s.server_key;
@@ -1284,6 +1434,11 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
       renderSaved(t, i);
     });
     if (!(s.turns || []).length && !s.running) welcome();
+    if (s.interrupted && !s.running) {      // PXA Control stopped before this message was answered [ST02]
+      const lost = s.interrupted.user || "", u = userMsg(lost, A.turns.length);
+      notice("Interrupted: PXA Control stopped before this message was answered.", "bad",
+             () => { u.remove(); startTurn(lost); }, R.col, "Resend");
+    }
     if (s.running) {                         // re-attach to an answer still going (page reload, another tab)
       const idx = A.turns.length; A.turns.push("");
       const u = userMsg("", idx), T = asstMsg(idx); T.userEl = u; T.t0 = Date.now(); T.parts.append(T.pending);
@@ -1295,7 +1450,7 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
   }
   function newChat() {
     if (A.run) { toast("Wait for the current answer, or press Stop.", true); return; }
-    A.session = null; store.set("agent.session", null); A.turns = []; A.branchAt = {};
+    A.session = null; A.brokenOpen = null; store.set("agent.session", null); A.turns = []; A.branchAt = {};
     A.useMem = true; R.usemem.checked = true;
     A.incognito = false; syncIncog();
     A.refs = []; paintRefs(); closeAt();

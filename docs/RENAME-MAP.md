@@ -36,7 +36,7 @@ and every published `.gguf` are byte-identical and keep working.
 
 - **`llama-quantize` target names:** `PXQ4`, `PXQ4-HQ` are canonical; **old names `PXQ6`, `PXQ6HQ`
   are accepted as aliases forever** (also `PXQ4HQ`). The legacy MXFP4 repack target is `PXQ4-LEGACY`.
-  ⚠ The *string* `PXQ4` changed meaning: pre-rename it selected the MXFP4 repack (ftype 250), now it
+  Warning: The *string* `PXQ4` changed meaning: pre-rename it selected the MXFP4 repack (ftype 250), now it
   selects the 4-bit quality tier (ftype 252). Scripts that relied on the old meaning must switch to
   `PXQ4-LEGACY`.
 - **Lowercase per-tensor names** (tier maps, `--custom-q`, `--output-tensor-type`, …): canonical

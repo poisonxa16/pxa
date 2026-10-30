@@ -3,10 +3,13 @@
 #include "llama-impl.h"
 #include "llama-hparams.h"
 #include "llama-pxqn.h"          // PXQN_SITE_* for the pxqn_rot_in() call a builder makes at a site
+#include "pxa-env-flag.h"         // pxa_env_flag(): one parse rule for PXA_* on/off switches (ggml/include)
 
 #include <cstdint>
 #include <functional>
 #include <tuple>
+
+struct llama_layer;   // PXA_NEMOTRON_MTP: build_nemotron_h_mtp takes the MoE builder by reference to a layer
 
 struct llama_model;
 struct llama_context;
@@ -306,6 +309,10 @@ struct llm_build_context {
     ggml_cgraph * build_gemma4_mtp();
 
     ggml_cgraph * build_starcoder2();
+    ggml_cgraph * build_nemotron();    // PXA Nemotron port
+    ggml_cgraph * build_nemotron_h();  // PXA Nemotron port (Nemotron-H dense + MoE hybrids)
+    ggml_tensor * build_nemotron_h_mtp(ggml_cgraph * gf, ggml_tensor * prev_hidden, float kq_scale,   // PXA_NEMOTRON_MTP
+            const std::function<ggml_tensor *(ggml_tensor *, const llama_layer &, int)> & build_moe);
 
     ggml_cgraph * build_mamba();
 
@@ -382,6 +389,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_step35();
 
+    ggml_cgraph * build_flint();
+
     ggml_cgraph * build_laguna();
 
     ggml_cgraph * build_hy3();
@@ -400,14 +409,28 @@ struct llm_build_context {
     // PXA_GLM5NEXT: GLM-5.3-Flash. src/graphs/build_glm5next.cpp
     ggml_cgraph * build_glm5next();
     void          build_kpool_inputs(ggml_cgraph * gf);
+    // state_row_idx is the READ row (with the recurrent-state ring armed it may name a history
+    // plane); state_row_idx_w is the WRITE row, which is always plane 0. Pass nullptr for the
+    // write index to get today's behaviour, where one index serves both.
     ggml_tensor * build_glm5next_kda(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * state_row_idx, ggml_tensor * conv_seq_map, ggml_tensor * state_mask,
-            int il);
-    // returns the additive DSA mask (scatter path) or the I32 selected-cell table (gather path)
+            int il, ggml_tensor * state_row_idx_w = nullptr);
+    // returns the additive DSA mask (scatter path) or the I32 selected-cell table (gather path).
+    // want_mask forces the mask in BOTH paths, padded to GGML_KQ_MASK_PAD rows and cast to F16,
+    // which is what a flash_attn_ext node needs; out_sel_idx, when given, also hands back the
+    // cell table the mask was scattered from.
     ggml_tensor * build_glm5next_kpool_select(ggml_cgraph * gf, ggml_tensor * cur,
-            ggml_tensor * qr, ggml_tensor * kq_mask, int il);
+            ggml_tensor * qr, ggml_tensor * kq_mask, int il,
+            bool want_mask = false, ggml_tensor ** out_sel_idx = nullptr);
     ggml_tensor * build_glm5next_dsa(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * kq_mask, int il);
+    // the block FFN (dense for the leading blocks, MoE + clamped shared expert after), shared by
+    // the trunk loop and the NextN head.
+    ggml_tensor * build_glm5next_ffn(ggml_cgraph * gf, ggml_tensor * cur, int il);
+    // block <n_layer-1>: the NextN/MTP draft head, conditioned on the trunk's mean-collapsed
+    // hidden for the previous token. Behind PXA_GLM5NEXT_MTP, default on (=0 off).
+    ggml_tensor * build_glm5next_mtp(ggml_cgraph * gf, ggml_tensor * prev_hidden,
+            ggml_tensor * kq_mask);
 
     ggml_tensor * build_dsv4_hc_pre(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale,
             ggml_tensor * hc_base, ggml_tensor ** post, ggml_tensor ** comb, int il) const;

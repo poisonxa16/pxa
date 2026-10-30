@@ -128,7 +128,7 @@ static void verdict(const char * what, ggml_type type, int ny, int nw, int rows,
 
 template <ggml_type type, int NY, int NW, int ROWS, int VDR>
 static void case_plain(const shapebuf & S, const devbufs & D) {
-    constexpr int rpb = mmvq_rows_per_block<type, NY, ROWS>;
+    constexpr int rpb = mmvq_rows_per_block_plain<type, NY, ROWS>;   // the plain kernel's own ceiling (8 at 5..8 columns)
     const dim3 grid((S.R + rpb - 1)/rpb, 1, 1), blk(WARP_SIZE, NW, 1);
     const size_t nout = (size_t)NY*S.R;
 
@@ -155,8 +155,8 @@ static void case_plain(const shapebuf & S, const devbufs & D) {
 // than argued, on both the plain kernel and the up/gate twin, against the tile that ships today.
 template <ggml_type type, int NY, int NW, int ROWS, int VDR, bool FUSED>
 static void case_tile(const shapebuf & S, const devbufs & D) {
-    constexpr int rpb0 = mmvq_rows_per_block<type, NY, 2>;      // the shipped clamp at ncols_y > 2
-    constexpr int rpb1 = mmvq_rows_per_block<type, NY, ROWS>;
+    constexpr int rpb0 = FUSED ? mmvq_rows_per_block<type, NY, 2> : mmvq_rows_per_block_plain<type, NY, 2>;      // the shipped clamp at ncols_y > 2
+    constexpr int rpb1 = FUSED ? mmvq_rows_per_block<type, NY, ROWS> : mmvq_rows_per_block_plain<type, NY, ROWS>;
     const dim3 g0((S.R + rpb0 - 1)/rpb0, 1, 1), g1((S.R + rpb1 - 1)/rpb1, 1, 1), blk(WARP_SIZE, NW, 1);
     const size_t nout = (size_t)NY*S.R;
 
@@ -259,6 +259,7 @@ static void run_type(int R, int K, uint64_t & seed) {
     case_tile<type, 4, 4, 8, 2, false>(S, D);
     case_tile<type, 4, 4, 8, 4, false>(S, D);
     case_tile<type, 8, 2, 4, 2, false>(S, D);
+    case_tile<type, 8, 4, 8, 2, false>(S, D);   // PXA_PXQN_VERIFY_WIDE: the plain kernel's 8-row tile at 8 columns
     case_tile<type, 4, 4, 4, 2, true >(S, D);
     case_tile<type, 4, 4, 8, 2, true >(S, D);
     case_tile<type, 8, 2, 4, 2, true >(S, D);

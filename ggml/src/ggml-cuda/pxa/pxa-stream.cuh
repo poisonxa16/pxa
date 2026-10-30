@@ -34,12 +34,31 @@
 // ENV (read once):
 //   PXA_STREAM_LOOKAHEAD  nodes ahead whose streamed weights must be resident (default 16)
 //   PXA_STREAM_ZC_NY      graphs whose widest streamed-weight consumer has <= this many tokens
-//                         read the pinned host bytes directly (zero-copy) instead of copying
-//                         (default 0 = always copy; the loader sets 32 for experts mode, where a
-//                         narrow batch touches only the routed experts' rows)
+//                         read the pinned host bytes directly (zero-copy) instead of copying.
+//                         Exported, it is authoritative for every stream buffer of the process.
+//                         Unset, each stream buffer carries its own model's width, set by the
+//                         loader with ggml_backend_cuda_stream_buffer_set_zc_ny (default 0 =
+//                         always copy; 32 for experts mode, where a narrow batch touches only the
+//                         routed experts' rows; 64 for the expert cache's zero-copy cold path and
+//                         its runtime guard). The engine never writes this variable: a width it
+//                         picked for one model cannot reach another model, a later load or a
+//                         child process.
 //   PXA_STREAM_LOG        1 = one stats line per 64 graphs per device and at exit
+//
+// RING LENDING (PXA_XCACHE_RING_LEND, R3a 2026-10-25; the loader arms it per device with ggml_backend_cuda_stream_set_ring_lent).
+// With the expert cache's CPU cold path a graph narrower than the CPU-alias width (32 x n_expert / n_expert_used tokens,
+// 1638 on Flash-Next) never reads a streamed weight on the GPU, so the ring idles through every decode. A lent ring is not
+// allocated at load: the planner gave its bytes to resident experts. The first graph that does copy streamed weights
+// (pxa_stream_begin, not all zero-copy) allocates it on demand from the VRAM left free, at most the planned size and never
+// below PXA_XCACHE_RING_LEND_KEEP_MB (default 512) of free VRAM; ggml_backend_cuda_stream_ring_return() (llama_synchronize)
+// frees it again. When that allocation cannot be had (the card is full, or PXA_XCACHE_RING_LEND_FAIL=1 in a test) the graph
+// reads every streamed weight in place over the link, exactly as an all-zero-copy graph does (PXA_STREAM_ZC_NY), so a long
+// prefill never aborts on the ring. Measured G30 (w2/w3, 2234-token prompt, 64 greedy tokens): the fallback's answer
+// equals PXA_STREAM_ZC_NY=4096 on the same plan (sha 95427b95f060 both); a copied run of that plan answered f8df01b88110, so
+// copy vs in-place reads are correct-not-identical at some residencies (equal on the stock plan), like any zero-copy graph.
 #pragma once
 
+#include "pxa-env-flag.h"
 #include "../common.cuh"
 
 #include <atomic>
@@ -54,8 +73,9 @@ static int pxa_stream_lookahead() {
     static const int v = [](){ const char * e = getenv("PXA_STREAM_LOOKAHEAD"); int x = e ? atoi(e) : 16; return x < 1 ? 1 : x; }();
     return v;
 }
-static int64_t pxa_stream_zc_ny() {
-    static const int64_t v = [](){ const char * e = getenv("PXA_STREAM_ZC_NY"); return e ? (int64_t)atoll(e) : (int64_t)0; }();
+// the exported PXA_STREAM_ZC_NY (any value, empty = 0, as the old reader took it), or -1 when unset: then each buffer's own width
+static int64_t pxa_stream_zc_ny_env() {
+    static const int64_t v = [](){ const char * e = getenv("PXA_STREAM_ZC_NY"); return e ? (int64_t)atoll(e) : (int64_t)-1; }();
     return v;
 }
 static bool pxa_stream_log() {
@@ -71,9 +91,12 @@ static std::atomic<bool> g_pxa_stream_any{false};
 // the buffer type
 // ---------------------------------------------------------------------------------------------
 static size_t g_pxa_stream_ring_req[GGML_CUDA_MAX_DEVICES] = {0};
+static bool   g_pxa_stream_ring_lent[GGML_CUDA_MAX_DEVICES] = {false};   // PXA_XCACHE_RING_LEND (see the header comment)
+static std::atomic<bool> g_pxa_stream_lent_live{false};                 // some lent ring is allocated right now
 
 struct pxa_stream_buffer_context : public ggml_backend_cuda_buffer_context {
     void * host_ptr;
+    int64_t zc_ny = 0;   // graphs no wider than this read this buffer's weights in place (the owning model's width; 0 = always copy)
     pxa_stream_buffer_context(int device, void * p) : ggml_backend_cuda_buffer_context(device, p), host_ptr(p) {
         // the base class frees dev_ptr with cudaFree in its destructor; ours is host memory,
         // freed by the buffer's free function, so the base must see nullptr.
@@ -159,12 +182,19 @@ GGML_CALL static ggml_backend_buffer_t pxa_stream_buft_alloc_buffer(ggml_backend
     // would let the per-layer-embedding table take that node's free pages first. A failed bound allocation is retried under the old policy.
     cudaError_t err = cudaErrorMemoryAllocation;
 #if defined(__linux__)
-    if (g_pxa_numa_bound >= 0) {
+    // PXA_NUMA_HOST_BIND: when the cards' node has no allowed CPU, the node the CPU threads sit on (pxa_numa_stream_node)
+    if (const int bind_node = pxa_numa_stream_node(size); bind_node >= 0) {
         unsigned long m[2] = { 0, 0 };
-        m[g_pxa_numa_bound / 64] = 1UL << (g_pxa_numa_bound % 64);
-        syscall(SYS_set_mempolicy, 2 /* MPOL_BIND */, m, (unsigned long) 128);
+        m[bind_node / 64] = 1UL << (bind_node % 64);
+        const long brc = syscall(SYS_set_mempolicy, 2 /* MPOL_BIND */, m, (unsigned long) 128);
         err = cudaHostAlloc(&p, size, cudaHostAllocPortable | cudaHostAllocMapped);
-        syscall(SYS_set_mempolicy, 1 /* MPOL_PREFERRED */, m, (unsigned long) 128);
+        if (g_pxa_numa_bound >= 0) {
+            syscall(SYS_set_mempolicy, 1 /* MPOL_PREFERRED */, m, (unsigned long) 128);
+        } else {
+            syscall(SYS_set_mempolicy, 0 /* MPOL_DEFAULT */, nullptr, (unsigned long) 0);
+            GGML_CUDA_LOG_INFO("PXA_NUMA_HOST_BIND: %.2f GiB of streamed experts pinned with their pages bound to node %d%s\n",
+                    size / 1073741824.0, bind_node, brc == 0 ? "" : " (set_mempolicy refused: --cap-add SYS_NICE in a container; placed unbound)");
+        }
         if (err != cudaSuccess) { cudaGetLastError(); p = nullptr; GGML_CUDA_LOG_WARN("PXA_NUMA_BIND: the bound pinned allocation of %.0f MiB failed; retrying unbound\n", size/1024.0/1024.0); }
     }
 #endif
@@ -212,6 +242,11 @@ struct pxa_stream_dev {
     std::vector<std::pair<ggml_tensor *, void *>> restore;
     bool active = false;
 
+    // PXA_XCACHE_RING_LEND: the ring is allocated on demand (lend_want bytes at most) and returned at the next sync
+    bool   lent      = false;
+    size_t lend_want = 0;
+    long long n_lend_alloc = 0, n_lend_fail = 0, n_lend_short = 0;
+
     // stats
     long long n_graphs = 0, n_copies = 0, n_zc = 0, n_zc_graphs = 0;
     double bytes = 0;
@@ -226,12 +261,23 @@ static pxa_stream_dev g_pxa_stream[GGML_CUDA_MAX_DEVICES];
 
 static void pxa_stream_ring_ensure(int device) {
     pxa_stream_dev & s = g_pxa_stream[device];
-    if (s.ring) return;
+    if (s.ring || s.lent) return;
     size_t want = g_pxa_stream_ring_req[device];
     if (const char * e = getenv("PXA_STREAM_RING_MB")) want = (size_t)atoll(e) << 20;
     if (want == 0) want = (size_t)512 << 20;
     want = GGML_PAD(want, 1 << 20);
     ggml_cuda_set_device(device);
+    if (g_pxa_stream_ring_lent[device]) {
+        // PXA_XCACHE_RING_LEND: nothing in VRAM now; pxa_stream_lend_alloc takes it when a graph streams
+        s.device = device;
+        s.lent = true;
+        s.lend_want = want;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&s.cstream, cudaStreamNonBlocking));
+        GGML_CUDA_LOG_INFO("PXA_STREAM: device %d: ring %.1f MiB LENT to the expert cache (PXA_XCACHE_RING_LEND): not in VRAM; a graph "
+                "that streams weights allocates it from the free VRAM and the next sync returns it (short of VRAM: zero-copy reads)\n",
+                device, want/1048576.0);
+        return;
+    }
     void * p = nullptr;
     cudaError_t err = ggml_cuda_device_malloc(&p, want, device);
     if (err != cudaSuccess) {
@@ -242,16 +288,32 @@ static void pxa_stream_ring_ensure(int device) {
     s.ring = (char *)p;
     s.ring_bytes = want;
     CUDA_CHECK(cudaStreamCreateWithFlags(&s.cstream, cudaStreamNonBlocking));
-    GGML_CUDA_LOG_INFO("PXA_STREAM: device %d: ring %.1f MiB in VRAM, lookahead %d nodes, zero-copy at ny <= %lld\n",
-            device, want/1048576.0, pxa_stream_lookahead(), (long long)pxa_stream_zc_ny());
+    if (pxa_stream_zc_ny_env() >= 0) {
+        GGML_CUDA_LOG_INFO("PXA_STREAM: device %d: ring %.1f MiB in VRAM, lookahead %d nodes, zero-copy at ny <= %lld (PXA_STREAM_ZC_NY)\n",
+                device, want/1048576.0, pxa_stream_lookahead(), (long long)pxa_stream_zc_ny_env());
+    } else {
+        GGML_CUDA_LOG_INFO("PXA_STREAM: device %d: ring %.1f MiB in VRAM, lookahead %d nodes, zero-copy width per model\n",
+                device, want/1048576.0, pxa_stream_lookahead());
+    }
+}
+
+// the loader's per-model zero-copy width for one stream buffer (ggml_backend_cuda_stream_buffer_set_zc_ny); an exported
+// PXA_STREAM_ZC_NY still decides over it (pxa_stream_zc_ny_of)
+static void pxa_stream_buffer_set_zc_ny(ggml_backend_buffer_t buffer, int64_t ny) {
+    if (!pxa_stream_buffer_is(buffer)) return;
+    ((pxa_stream_buffer_context *)buffer->context)->zc_ny = ny < 0 ? 0 : ny;
 }
 
 static void pxa_stream_stats(pxa_stream_dev & s, const char * why) {
     fprintf(stderr, "PXA_STREAM stats dev=%d (%s): graphs=%lld copies=%lld bytes=%.2f GiB zero-copy-fallbacks=%lld zc-graphs=%lld\n",
             s.device, why, s.n_graphs, s.n_copies, s.bytes/1073741824.0, s.n_zc, s.n_zc_graphs);
+    if (s.lent) {
+        fprintf(stderr, "PXA_STREAM lent ring dev=%d (%s): taken back %lld times (%lld below the planned size), unavailable %lld times\n",
+                s.device, why, s.n_lend_alloc, s.n_lend_short, s.n_lend_fail);
+    }
 }
 static void pxa_stream_atexit() {
-    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) if (g_pxa_stream[d].ring) pxa_stream_stats(g_pxa_stream[d], "exit");
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) if (g_pxa_stream[d].ring || g_pxa_stream[d].lent) pxa_stream_stats(g_pxa_stream[d], "exit");
 }
 
 static inline ggml_tensor * pxa_stream_base_of(ggml_tensor * t) {
@@ -267,11 +329,22 @@ static inline int64_t pxa_stream_node_width(const ggml_tensor * n) {
     return n->ne[1]*n->ne[2]*n->ne[3];
 }
 
+// zero-copy width for a streamed base tensor (pxa_stream_base_of): the exported PXA_STREAM_ZC_NY, else its buffer's own
+static inline int64_t pxa_stream_zc_ny_of(const ggml_tensor * b) {
+    const int64_t e = pxa_stream_zc_ny_env();
+    return e >= 0 ? e : ((const pxa_stream_buffer_context *)b->buffer->context)->zc_ny;
+}
+// a node that reads streamed base b reads it in place when its width fits b's zero-copy width
+static inline bool pxa_stream_node_zc(const ggml_tensor * n, const ggml_tensor * b) {
+    const int64_t zc_ny = pxa_stream_zc_ny_of(b);
+    return zc_ny > 0 && pxa_stream_node_width(n) <= zc_ny;
+}
+
 // PXA_STREAM_ZC_GRAPHS (default 1): a graph that reads every streamed weight in place
 // (zero-copy, no wider than PXA_STREAM_ZC_NY) has nothing host-driven -- no ring, no copy stream,
 // no pointer swaps -- so it may be captured and replayed like a resident graph.
 static bool pxa_stream_zc_graphs() {
-    static const bool v = [](){ const char * e = getenv("PXA_STREAM_ZC_GRAPHS"); return !(e && atoi(e) == 0); }();
+    static const bool v = [](){ const char * e = getenv("PXA_STREAM_ZC_GRAPHS"); return !(e && pxa_env_value_off(e)); }();
     return v;
 }
 
@@ -279,20 +352,18 @@ static bool pxa_stream_zc_graphs() {
 static bool pxa_stream_graph_uses(const ggml_cgraph * cgraph) {
     if (!g_pxa_stream_any.load(std::memory_order_relaxed)) return false;
     bool uses = false;
-    int64_t widest = 0;
+    bool all_zc = true;   // every streamed weight the graph reads is read in place (its buffer's width; one model = one width)
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (pxa_stream_base_of(n->src[j])) {
+            if (const ggml_tensor * b = pxa_stream_base_of(n->src[j])) {
                 uses = true;
-                widest = std::max(widest, pxa_stream_node_width(n));
-                break;
+                if (all_zc && !pxa_stream_node_zc(n, b)) all_zc = false;
             }
         }
     }
     if (!uses) return false;
-    const int64_t zc_ny = pxa_stream_zc_ny();
-    if (zc_ny > 0 && widest <= zc_ny && pxa_stream_zc_graphs()) return false;
+    if (all_zc && pxa_stream_zc_graphs()) return false;
     return true;
 }
 
@@ -362,18 +433,73 @@ static bool pxa_stream_issue_one(pxa_stream_dev & s, pxa_stream_dev::item & it) 
     return true;
 }
 
+// PXA_XCACHE_RING_LEND_KEEP_MB: free VRAM a lent ring never takes (the CUDA pool grows during the graph; default 512)
+static size_t pxa_stream_lend_keep() {
+    static const size_t v = [](){ const char * e = getenv("PXA_XCACHE_RING_LEND_KEEP_MB"); long long x = e ? atoll(e) : 512; return (size_t)(x < 0 ? 0 : x) << 20; }();
+    return v;
+}
+// PXA_XCACHE_RING_LEND_FAIL=1 (tests only): every on-demand allocation fails, so the zero-copy fallback runs
+static bool pxa_stream_lend_fail_test() {
+    static const bool v = [](){ const char * e = getenv("PXA_XCACHE_RING_LEND_FAIL"); return e && atoi(e) != 0; }();
+    return v;
+}
+
+// a lent ring for this graph: at most lend_want, at least min_bytes (the largest streamed tensor), keeping
+// pxa_stream_lend_keep() of the device free; false = no ring (the caller reads everything in place)
+static bool pxa_stream_lend_alloc(pxa_stream_dev & s, size_t min_bytes) {
+    if (pxa_stream_lend_fail_test()) return false;
+    ggml_cuda_set_device(s.device);
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) { cudaGetLastError(); return false; }
+    const size_t keep = pxa_stream_lend_keep();
+    size_t want = std::min(s.lend_want, fr > keep ? fr - keep : (size_t)0);
+    want &= ~(((size_t)1 << 20) - 1);
+    min_bytes = GGML_PAD(min_bytes, 1 << 20);
+    if (want < s.lend_want) s.n_lend_short++;
+    for (; want >= min_bytes && want > 0; want = (want/2) & ~(((size_t)1 << 20) - 1)) {
+        void * p = nullptr;
+        if (ggml_cuda_device_malloc(&p, want, s.device) == cudaSuccess) {
+            s.ring = (char *)p;
+            s.ring_bytes = want;
+            s.head = 0;
+            s.n_lend_alloc++;
+            g_pxa_stream_lent_live.store(true);
+            if (s.n_lend_alloc == 1 || pxa_stream_log()) {
+                GGML_CUDA_LOG_INFO("PXA_STREAM: device %d: lent ring taken back for a streaming graph: %.1f of %.1f MiB (%.0f MiB free before)\n",
+                        s.device, want/1048576.0, s.lend_want/1048576.0, fr/1048576.0);
+            }
+            return true;
+        }
+        cudaGetLastError();
+    }
+    return false;
+}
+
+// return a lent ring that a graph took (the caller has synchronised the device's streams)
+static void pxa_stream_lend_return(pxa_stream_dev & s) {
+    if (!s.lent || !s.ring || s.active) return;
+    ggml_cuda_set_device(s.device);
+    CUDA_CHECK(cudaStreamSynchronize(s.cstream));
+    for (auto & r : s.live) s.ev_put(r.rel_ev);
+    s.live.clear();
+    s.head = 0;
+    CUDA_CHECK(cudaFree(s.ring));
+    s.ring = nullptr;
+    s.ring_bytes = 0;
+}
+
 static void pxa_stream_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
     if (!g_pxa_stream_any.load(std::memory_order_relaxed)) return;
     const int dev = ctx.device;
     if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return;
     pxa_stream_dev & s = g_pxa_stream[dev];
     s.active = false;
-    if (!s.ring) return;
+    if (!s.ring && !s.lent) return;
     s.plan.clear(); s.by_last.clear(); s.restore.clear();
     s.issue_idx = s.wait_idx = s.rel_idx = 0;
 
     // first/last use of every streamed base tensor, plus every view of it the graph reads
-    int64_t widest = 0;
+    bool all_zc = true;   // every read fits its buffer's zero-copy width (pxa_stream_node_zc)
     std::vector<std::pair<ggml_tensor *, int>> idx;   // base -> plan index (linear search; tens of entries per graph)
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * n = cgraph->nodes[i];
@@ -381,7 +507,7 @@ static void pxa_stream_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph 
             ggml_tensor * src = n->src[j];
             ggml_tensor * b = pxa_stream_base_of(src);
             if (!b) continue;
-            widest = std::max(widest, pxa_stream_node_width(n));
+            if (all_zc && !pxa_stream_node_zc(n, b)) all_zc = false;
             int pi = -1;
             for (int k = (int)idx.size() - 1; k >= 0 && k >= (int)idx.size() - 64; --k) if (idx[k].first == b) { pi = idx[k].second; break; }
             if (pi < 0) for (auto & pr : idx) if (pr.first == b) { pi = pr.second; break; }
@@ -407,9 +533,23 @@ static void pxa_stream_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph 
     s.n_graphs++;
     s.active = true;
 
+    // PXA_XCACHE_RING_LEND: a graph that copies needs the lent ring back; none to be had -> every read in place
+    if (!all_zc && !s.ring) {
+        size_t mx = 0;
+        for (const auto & it : s.plan) mx = std::max(mx, it.bytes);
+        if (!pxa_stream_lend_alloc(s, mx)) {
+            s.n_lend_fail++;
+            if (s.n_lend_fail == 1 || pxa_stream_log()) {
+                GGML_CUDA_LOG_WARN("PXA_STREAM: device %d: the lent ring could not be taken back (%s); this graph reads its %zu streamed "
+                        "weights in place over the link (zero-copy, as PXA_STREAM_ZC_NY would) [%lld such graphs]\n", dev,
+                        pxa_stream_lend_fail_test() ? "PXA_XCACHE_RING_LEND_FAIL" : "not enough free VRAM", s.plan.size(), s.n_lend_fail);
+            }
+            all_zc = true;
+        }
+    }
+
     // decode-width graphs: read the pinned bytes in place instead of copying them
-    const int64_t zc_ny = pxa_stream_zc_ny();
-    if (zc_ny > 0 && widest <= zc_ny) {
+    if (all_zc) {
         for (auto & it : s.plan) { it.zc = true; it.state = 2; it.released = true; }
         s.issue_idx = s.wait_idx = s.plan.size();
         s.n_zc_graphs++;

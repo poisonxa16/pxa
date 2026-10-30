@@ -966,6 +966,14 @@ static __global__ void flash_attn_mma_ext_f16(
         if (bounds) {
             kb0_start_kernel = max(kb0_start_kernel, bounds[jt].x / KQ_per_iter);
             kb0_stop_kernel  = min(kb0_stop_kernel,  bounds[jt].y / KQ_per_iter);
+            if (kb0_start_kernel >= kb0_stop_kernel) {
+                // this block's stream-k slice lies wholly outside the unmasked [KV_min, KV_max) range.
+                // process_tile always runs one last iteration at kb0_stop-1; with the clamped (empty) range that
+                // iteration landed on a tile owned by another block (double count) or below this slice. Run one
+                // iteration at the start of the block's own slice instead: it is fully masked, so it adds nothing.
+                kb0_start_kernel = kb0_start * kb_niter;
+                kb0_stop_kernel  = kb0_start_kernel + 1;
+            }
         }
 
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -1009,6 +1017,10 @@ static __global__ void flash_attn_mma_ext_f16(
     if (bounds) {
         kb0_start_kernel = max(kb0_start_kernel, bounds[jt].x / KQ_per_iter);
         kb0_stop_kernel  = min(kb0_stop_kernel,  bounds[jt].y / KQ_per_iter);
+        if (kb0_start_kernel >= kb0_stop_kernel) { // see above: empty clamped slice -> one fully masked iteration of our own slice
+            kb0_start_kernel = kb0_start * kb_niter;
+            kb0_stop_kernel  = kb0_start_kernel + 1;
+        }
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
@@ -1378,7 +1390,7 @@ void launch_fattn_mma(
 
         const int nblocks_stream_k = max_blocks;
 
-        //const bool use_stream_k = cc >= CC_ADA_LOVELACE || tiles_efficiency_percent < 75;
+        //const bool use_stream_k = cc >= PXA_CC_ADA_LOVELACE || tiles_efficiency_percent < 75;
         //  On my RTX-4080 the above is slightly slower for PP. It would be useful to try and see what happens on Blackwell
         const bool use_stream_k = tiles_efficiency_percent < 75 || Q->ne[1] > 2048;
 

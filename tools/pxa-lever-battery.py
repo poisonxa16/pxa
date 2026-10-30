@@ -122,9 +122,9 @@ CASES = [
     ("--draft-model",     GG + ["--draft-model", A.gguf],      ["-md ", "--model-draft"],
                           r"draft|speculat"),
     ("--mmproj explicit",  VL + ["--mmproj", A.mmproj_file],        ["--mmproj"], None),
-    ("sibling projector, no flag (must ANNOUNCE)",
-                          VL,                                  ["__never__"],
-                          r"mmproj: NOT attached"),
+    ("sibling projector, no flag (must ANNOUNCE; auto-found: only projector beside the only model)",
+                          VL,                                  ["--mmproj"],
+                          r"mmproj: .*auto-found"),
     # --no-mmproj SUPPRESSES the flag, so "absent from the command" is the CORRECT
     # outcome and the needle test would invert the verdict. What must not happen is
     # silence: on a model that carries vision tensors the launcher has to say the seat

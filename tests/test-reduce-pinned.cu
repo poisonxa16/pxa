@@ -17,7 +17,7 @@
 // path) -- the positive control on the negative, proving the fallback still runs and still adds up.
 //
 // Route is chosen by argv so the per-process env reads resolve before the first reduce:
-//   test-reduce-pinned intree | pinned | nccl | fused-nopeer | p2p-nopeer | nccl-all | nccl-fault
+//   test-reduce-pinned intree | pinned | nccl | fused-nopeer | p2p-nopeer | nccl-all | nccl-fault | fused-nway
 // nccl-all / nccl-fault (bug #206) take EVERY visible device, the only shape the NCCL route serves;
 // see run_case_n below.
 // The two *-nopeer routes (bug #208) arm the tensor-split reduce (PXA_TSPLIT_REDUCE=fused / p2p)
@@ -93,7 +93,7 @@ static void run_case(ggml_backend_t back[2], int64_t ne0, int64_t ne1,
 
     {
         char what[160];
-        snprintf(what, sizeof(what), "%s: pinned route %s this shape", label, expect_pinned ? "accepts" : "refuses");
+        snprintf(what, sizeof(what), "%s: pinned route %s this shape", label, (expect_pinned && lever_on) ? "accepts" : "refuses");
         check(pxa_reduce_pinned_handles(r) == (expect_pinned && lever_on), what);
     }
 
@@ -168,6 +168,12 @@ static void run_case(ggml_backend_t back[2], int64_t ne0, int64_t ne1,
 // its own partial", which is off by the whole of the other partials. That was #206: inside a
 // container with docker's 64 MB /dev/shm the four-device NCCL group failed, its status was thrown
 // away, and nothing was summed.
+// Bug #247 (2026-10-18): set by the fused-nway route. The fused route sums in ONE rank
+// order on every card (d0 + d1 + d2 + d3, in float), so every replica must equal a host float sum in that
+// order BIT FOR BIT -- which the NCCL ring / staged routes do not produce, so this also proves the fused
+// route took the reduce.
+static bool g_expect_rank_order = false;
+
 static void run_case_n(std::vector<ggml_backend_t> & back, int64_t ne0, int64_t ne1, const char * label) {
     const int    n      = (int)back.size();
     const size_t nelem  = (size_t)(ne0 * ne1);
@@ -238,6 +244,17 @@ static void run_case_n(std::vector<ggml_backend_t> & back, int64_t ne0, int64_t 
         if (bad) {
             printf("   device %d: max relative error vs the host sum = %.3g\n", d, maxrel);
         }
+        if (g_expect_rank_order) {
+            size_t diff_ro = 0;
+            for (size_t i = 0; i < nelem; ++i) {
+                volatile float acc = h[0][i];
+                for (int k = 1; k < n; ++k) { acc = acc + h[k][i]; }
+                const float ro = acc;
+                if (memcmp(&got[i], &ro, sizeof(float)) != 0) { diff_ro++; }
+            }
+            snprintf(what, sizeof(what), "%s: device %d == host rank-order float sum (%zu/%zu differ)", label, d, diff_ro, nelem);
+            check(diff_ro == 0, what);
+        }
     }
 
     for (int d = 0; d < n; ++d) {
@@ -251,9 +268,33 @@ static int main_all_devices(const std::string & route) {
     //             serves the reduce; where its group fails (#206) the reduce must still add up.
     // nccl-fault: the same, with PXA_REDUCE_NCCL_FAULT=1 -- the NCCL branch behaves as a failed group
     //             on any machine, so the demotion and the fallback are exercised everywhere.
+    // fused-nway: the fused tensor-split route over every visible device with PXA_TSPLIT_REDUCE_NWAY
+    //             unset (auto: on for four sm_60 cards) -- or as the caller's environment sets it; the
+    //             replicas must be the host rank-order float sum bit for bit (bug #247). On a group the
+    //             auto policy leaves off it is the NCCL / staged route again and only the sum is checked.
     setenv("PXA_REDUCE_NCCL", "1", 1);
     unsetenv("PXA_REDUCE_PINNED");
     unsetenv("PXA_TSPLIT_REDUCE");
+    if (route == "nccl-all" || route == "nccl-fault") {
+        // Since the fused tensor-split reduce became the engine default (PXA_TSPLIT_REDUCE unset = fused),
+        // it serves a peering pair before the NCCL branch is ever reached, so the NCCL route (and its
+        // injected fault) never ran and nccl-fault failed on every 2-card box. Stand the fused route down.
+        setenv("PXA_TSPLIT_REDUCE", "off", 1);
+    }
+    if (route == "fused-nway") {
+        setenv("PXA_TSPLIT_REDUCE", "fused", 1);
+        const char * nw = getenv("PXA_TSPLIT_REDUCE_NWAY");
+        const int ndev0 = ggml_backend_cuda_get_device_count();
+        bool all_p100 = ndev0 == 4;
+        for (int d = 0; d < ndev0 && all_p100; ++d) {
+            char desc[256] = {0};
+            ggml_backend_cuda_get_device_description(d, desc, sizeof(desc));
+            all_p100 = strstr(desc, "P100") != nullptr;
+        }
+        g_expect_rank_order = (nw && *nw) ? atoi(nw) != 0 : all_p100;
+        printf("test-reduce-pinned: fused-nway expects %s\n", g_expect_rank_order ? "the fused rank-order route (bit-exact check on)"
+                                                                                : "the old n>2 route (sum check only)");
+    }
     if (route == "nccl-fault") {
         setenv("PXA_REDUCE_NCCL_FAULT", "1", 1);
     }
@@ -304,7 +345,7 @@ static int main_all_devices(const std::string & route) {
 
 int main(int argc, char ** argv) {
     const std::string route = argc > 1 ? argv[1] : "intree";
-    if (route == "nccl-all" || route == "nccl-fault") {
+    if (route == "nccl-all" || route == "nccl-fault" || route == "fused-nway") {
         return main_all_devices(route);
     }
 
@@ -340,6 +381,20 @@ int main(int argc, char ** argv) {
     if (!back[0] || !back[1]) {
         printf("FAIL: could not initialise both CUDA backends\n");
         return 1;
+    }
+
+    // The pinned route spins with __nanosleep (sm_70 and up). On an older card the engine refuses it and
+    // keeps the existing routes ("needs >= 700 for __nanosleep"), so there every shape must be refused;
+    // the reduce itself is still checked bit for bit below.
+    if (lever_on) {
+        for (int d = 0; d < 2; ++d) {
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, d) == cudaSuccess && prop.major < 7) {
+                printf("test-reduce-pinned: device %d is sm_%d%d (< sm_70): the pinned route must refuse every shape\n",
+                       d, prop.major, prop.minor);
+                lever_on = false;
+            }
+        }
     }
 
     const int64_t n_embd = 5120;   // Qwen3.8-27B

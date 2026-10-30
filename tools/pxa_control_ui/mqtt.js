@@ -84,8 +84,8 @@ function mqRender() {
     el("div", {id: "mq-status", style: "margin-top:8px"}, mqStatusLine(st)),
     el("div", {class: "tiny", style: "margin-top:8px"},
       "The values are the same ones the Live tab shows: speed, slots, KV cache, per-card temperature, VRAM and",
-      " utilisation, and the expert map. Nothing leaves your network. The broker password is stored with your other",
-      " PXA Control settings and is never shown back to this page."));
+      " utilisation, this machine's RAM/CPU/swap, and the expert map. Nothing leaves your network. The broker",
+      " password is stored with your other PXA Control settings and is never shown back to this page."));
   save.addEventListener("click", mqSave);
   test.addEventListener("click", mqTest);
   MQ.dirty = false;

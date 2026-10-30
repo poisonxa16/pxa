@@ -145,14 +145,27 @@ if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/pxa-closed-levers.txt)
 else()
     configure_file(${_pxa_cat_src} ${PXA_CATALOG_DIR}/pxa-lever-catalog-build.inc COPYONLY)
 endif()
+# A release build (scripts/make-release-tarball.sh passes it): the binaries carry no build-machine paths (__FILE__ in
+# asserts and logs is written relative to the source tree, for host C/C++ and for nvcc's host and device passes) and
+# the registry is compiled from a copy whose evidence strings (internal record ids) are empty (common/CMakeLists.txt,
+# scripts/pxa-release-scrub.py). Code generation is unchanged. The package scan (scripts/release-scan.py) refuses a
+# build without it.
+option(PXA_RELEASE_BUILD "pxa: release build (no build-machine paths, no internal record ids in the binaries)" OFF)
+if (PXA_RELEASE_BUILD)
+    set(_pxa_pm_src "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=.")
+    set(_pxa_pm_bin "-ffile-prefix-map=${CMAKE_BINARY_DIR}=build")
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:${_pxa_pm_src};${_pxa_pm_bin}>"
+                        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_pxa_pm_src};-Xcompiler=${_pxa_pm_bin}>")
+    message(STATUS "pxa: release build: build paths mapped to . and build, registry evidence emptied")
+endif()
 # libggml-pxqn host code for baseline x86-64 (SSE2) so one library loads on any x86-64 CPU; the CPU-hot loops get an AVX2
 # clone chosen at run time (ggml/src/CMakeLists.txt, pxqn-cpu.c). OFF = inherit the engine's -mavx/-mavx2/-mfma/-mf16c.
 option(PXA_PXQN_BASELINE_X86 "pxa: build libggml-pxqn host code for baseline x86-64 with run-time AVX2 dispatch" ON)
 set(PXA_QUANTIZER_VERSION "dev" CACHE STRING "pxa: the release tag the quantizer reports and writes")
 # Which PXQN quantizer this is (docs/QUANTIZER-TIERS-AND-SERVICE-2026-09-26.md), only with PXA_PXQN_ENCODER=ON:
-#   owner  PXA's own build (the supporter quant service): every PXQN path incl. LDLQ, no license check.
+#   owner  PXA's own build (the supporter quant service): every PXQN path incl. the supporter-only encoder stage, no license check.
 #   pro    the distributed Pro build: PXQN tiers, allocator, tier maps and measure mode with RTN rounding,
-#          each run needs a signed Pro license token; the LDLQ code is not compiled in at all.
+#          each run needs a signed Pro license token; the supporter-only encoder stage is not compiled in at all.
 # PXA_LICENSE_PUBKEYS ("kid:hex32;kid2:hex32", printed by the licence tool's pubkey command) is the set of
 # Ed25519 public keys a pro build trusts; it is compiled in, never read from a path.
 set(PXA_QUANTIZER_EDITION "owner" CACHE STRING "pxa: PXQN quantizer edition, owner or pro")

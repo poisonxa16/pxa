@@ -38,7 +38,8 @@ have a working chat server.
 ## Getting help
 
 Discord: <https://discord.pxanetwork.com> — [guide 10](10-when-something-goes-wrong.md) lists the
-five things to paste so the first reply is a useful one.
+five things to paste so the first reply is a useful one. On 4.0 beta 2, Control's **Report a problem**
+sends the same kind of bundle: [Report a problem](../user/REPORT-A-PROBLEM.md).
 
 If this saved you buying a new card and you would like to chip in:
 <https://ko-fi.com/shatteredrealms1>. Entirely optional, and it gates nothing.

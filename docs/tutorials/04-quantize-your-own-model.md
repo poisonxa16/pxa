@@ -65,7 +65,7 @@ tokenizer_config.json  vocab.json
 ## Step 1 — Hugging Face folder to GGUF
 
 ```bash
-cd ~/pxa/pxa-v3/tools   # the tools/ folder inside the unpacked release
+cd ~/pxa/pxa-v4.0/tools   # the tools/ folder inside the unpacked release
 PYTHONPATH=$PWD/gguf-py python3 convert_hf_to_gguf.py ~/models/my-model \
   --outfile ~/models/my-model-f16.gguf \
   --outtype f16

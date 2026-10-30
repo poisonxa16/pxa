@@ -138,7 +138,12 @@ if (LLAMA_LLGUIDANCE)
         SOURCE_DIR ${LLGUIDANCE_SRC}
         BUILD_IN_SOURCE TRUE
         CONFIGURE_COMMAND ""
-        BUILD_COMMAND cargo build --release
+        # --package llguidance: only the C-API crate. A bare `cargo build` builds every default workspace member,
+        # including toktrie_hf_tokenizers, whose openssl-sys build script fails without libssl-dev + pkg-config
+        # (seen on a CPU build without them, gate-logs v31-llguidance). Same command as upstream llama.cpp.
+        # --locked: the crate's own Cargo.lock at the pinned GIT_TAG is the exact dependency set; cargo refuses to
+        # re-resolve it, so a build fetches the same crate versions every time.
+        BUILD_COMMAND cargo build --release --locked --package llguidance
         INSTALL_COMMAND ""
         BUILD_BYPRODUCTS ${LLGUIDANCE_PATH}/libllguidance.a ${LLGUIDANCE_PATH}/llguidance.h
         UPDATE_COMMAND ""
@@ -152,6 +157,30 @@ if (LLAMA_LLGUIDANCE)
     target_include_directories(${TARGET} PRIVATE ${LLGUIDANCE_PATH})
     set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance)
 endif ()
+
+# The registry compiles from a copy whose evidence strings (internal record ids) are empty; every other byte of the
+# source is the same (scripts/pxa-release-scrub.py). Every build does this unless PXA_REGISTRY_EVIDENCE=ON (dev builds
+# only, never a release: the package scan refuses the ids), so a dev build runs and logs exactly what a release ships.
+option(PXA_REGISTRY_EVIDENCE "pxa: compile the registry's evidence ids into the binaries (dev builds only, never a release)" OFF)
+if (PXA_REGISTRY_EVIDENCE AND PXA_RELEASE_BUILD)
+    message(FATAL_ERROR "pxa: PXA_REGISTRY_EVIDENCE=ON is a dev build: it cannot be combined with PXA_RELEASE_BUILD=ON")
+endif()
+if (PXA_REGISTRY_EVIDENCE)
+    message(WARNING "pxa: PXA_REGISTRY_EVIDENCE=ON compiles internal record ids into the binaries: a dev build, never a release")
+    target_compile_definitions(${TARGET} PUBLIC PXA_REGISTRY_EVIDENCE_IDS=1)
+else()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(_pxa_reg_rel ${CMAKE_CURRENT_BINARY_DIR}/pxa-release/pxa-registry.cpp)
+    add_custom_command(OUTPUT ${_pxa_reg_rel}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/pxa-release-scrub.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/pxa-registry.cpp ${_pxa_reg_rel}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/pxa-registry.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/pxa-release-scrub.py
+        VERBATIM)
+    get_target_property(_pxa_common_srcs ${TARGET} SOURCES)
+    list(REMOVE_ITEM _pxa_common_srcs pxa-registry.cpp)
+    list(APPEND _pxa_common_srcs ${_pxa_reg_rel})
+    set_target_properties(${TARGET} PROPERTIES SOURCES "${_pxa_common_srcs}")
+endif()
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
 target_include_directories(${TARGET} PRIVATE ${PXA_CATALOG_DIR})   # pxa-lever-catalog-build.inc (top-level CMakeLists.txt)

@@ -267,3 +267,7 @@ struct ggml_cuda_unroll<1> {
         f(0, args...);
     }
 };
+
+// PXA: the device-code / dispatch shape table of the vendored MMA flash-attention family (included last so
+// no line of the vendored headers moves; see fattn-mma-shapes.h).
+#include "fattn-mma-shapes.h"

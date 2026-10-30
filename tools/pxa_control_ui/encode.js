@@ -183,6 +183,17 @@ function libBox() {
 }
 
 // ------------------------------------------------------------------ encoder panel
+// ---- coins (owner 10-25): a PXQN encode takes coins, charged only when it completes. st.coins = the licence server's coin block
+// for this key ({cost, free, held, linked}), null when the key pays no coins or the server is older.
+function coinsSentence(n) { return "A PXQN encode takes " + n + " coins, charged only when it completes; a failed encode costs nothing."; }
+function coinsText(c) {
+  if (!c) return "";
+  return coinsSentence(c.cost) + (c.free == null ? " Link this key to your PXA wallet in PXA Control (Store) or with /wallet link to encode with coins." : " Your wallet has " + Math.max(0, c.free) + " coins free.");
+}
+// the refusal line: no linked wallet says how to link it (never "top up"); a wallet short of coins says top up
+function coinsLine(c) { return coinsText(c) + (c && c.free != null ? " Top up in the Store." : "") + " The Free encoder still works."; }
+function coinsBadge(c) { return c && c.free == null ? "No wallet linked" : "Not enough coins"; }
+// ---- end coins
 function licLine(e, st) {
   const l = e.licence || {}, out = [];
   if (!st.key_set) return [badge("bad", "No key saved"), el("span", {class: "tiny", text: " Paste your key under Get the encoder, or switch to the Free encoder."})];
@@ -190,13 +201,15 @@ function licLine(e, st) {
   const expTxt = exp && !isNaN(exp) ? ", expires " + exp.toLocaleDateString() : "";
   const sub = t => el("span", {class: "tiny", text: " " + t});
   switch (l.state) {
-    case "valid": out.push(badge("ok", "Licence OK"), sub((l.unlimited ? "unlimited encodes" : left != null ? left + " encode" + (left === 1 ? "" : "s") + " left this month" : "") + expTxt + (l.user ? " \u00b7 " + l.user : ""))); break;
+    case "valid": out.push(badge("ok", "Licence OK"), sub((l.unlimited ? "unlimited encodes" : st.coins ? coinsText(st.coins) : left != null ? left + " encode" + (left === 1 ? "" : "s") + " left this month" : "") + expTxt + (l.user ? " \u00b7 " + l.user : ""))); break;
     case "expired": out.push(badge("bad", "Licence expired"), sub("Get a fresh key from the PXA Network Discord (/encoder). The Free encoder still works.")); break;
     case "revoked": case "suspended": out.push(badge("bad", l.state === "revoked" ? "Key revoked" : "Key suspended"), sub("The licence server no longer accepts this key. Ask in the PXA Network Discord (/encoder), or use the Free encoder.")); break;
     case "refused": out.push(badge("bad", "Key refused"), sub((l.reason ? l.reason + ". " : "") + "Check the key, or ask in the PXA Network Discord (/encoder). The Free encoder still works.")); break;
     case "no_key": out.push(badge("bad", "No key"), sub("The encoder does not have your key. Paste it under Get the encoder.")); break;
     case "no_server": out.push(badge("bad", "No licence server"), sub("The encoder does not know the licence server address.")); break;
-    case "no_quota": out.push(badge("bad", "No encodes left"), sub("Your monthly quota is used up. The Free encoder still works.")); break;
+    case "no_quota": out.push(...(st.coins ? [badge("bad", coinsBadge(st.coins)), sub(coinsLine(st.coins))]
+                                           : [badge("bad", "No encodes left"), sub("Your monthly quota is used up. The Free encoder still works.")])); break;
+    case "no_coins": out.push(badge("bad", coinsBadge(st.coins || {cost: 10, free: 0})), sub(coinsLine(st.coins || {cost: 10, free: 0}))); break;
     case "offline": out.push(badge("warn", "Licence server not reachable"), sub("Check your internet; the classic tiers still work."), el("button", {class: "link", text: " Try again", onclick: enCheckLicence})); break;
     default: out.push(badge("warn", "Licence not checked"), el("button", {class: "link", text: " Check now", onclick: enCheckLicence}));
   }
@@ -229,7 +242,7 @@ function renderEncoder() {
         ...ok.map(e => el("option", {value: e.path, selected: e.selected, text: (e.edition === "pro" ? "Pro " : "Free ") + (e.version || "") + " (" + e.build_id + ")"})))));
     kids.push(el("div", {class: "kv", style: "margin-top:6px"}, el("span", {text: "Build"}), el("b", {class: "mono", text: sel.build_id + (sel.tiers.length ? " · " + sel.tiers.length + " tiers" : "")})));
     kids.push(el("div", {class: "row", id: "en-lic", style: "margin-top:6px"}, ...(sel.edition === "pro" ? licLine(sel, st) :
-      [badge("ok", "Free"), el("span", {class: "tiny", text: " Makes the classic PXQ tiers. Pro (a supporter feature) adds the PXQN tiers: the same size with much lower error."}),
+      [badge("ok", "Free"), window.tierBadge ? tierBadge("pxq") : null, el("span", {class: "tiny", text: " Makes the classic PXQ tiers. Pro (a supporter feature) adds the PXQN tiers: the same size with much lower error."}),
        el("button", {class: "link", id: "en-howpro", text: " How to get Pro", onclick: () => { EN.showGet = true; renderGet(); $("#en-get").scrollIntoView({block: "nearest"}); }})])));
     kids.push(...runtimeBox(sel, st.runtime));
   }
@@ -468,14 +481,20 @@ function renderTiersList() {
   if (chosen && chosen.available && !rec.includes(chosen)) kids.push(el("div", {class: "en-opts", style: "margin-top:10px"}, tierOpt(chosen, null)));
   const locked = p.tiers.filter(r => r.locked && r.family === "pxqn");
   if (locked.length) {
-    kids.push(el("h4", {style: "margin-top:16px"}, ed === "pro" ? "Not in your plan" : "Locked: Supporter features"));
+    kids.push(el("h4", {style: "margin-top:16px"}, ed === "pro" ? "Not in your plan" : "Locked: Supporter features", " ",
+      window.tierBadge ? tierBadge("pxqn", ed !== "pro" && !(window.pxqnUnlocked && pxqnUnlocked())) : null));
     kids.push(el("p", {class: "tiny", id: "en-plannote", style: "margin:0 0 8px", text: ed === "pro" ? (p.plan_note || "These tiers are not part of your current key's plan.") : "The Free encoder makes the classic PXQ tiers. Pro adds these PXQN tiers: the same size, much lower error. This is what they would be for this model:"}));
     kids.push(el("div", {class: "en-opts", id: "en-locked"}, ...locked.map(r => el("div", {class: "en-lock", "data-tier": r.key}, enIcon(ICON_LOCK),
       el("div", {}, el("div", {class: "t1"}, el("span", {text: r.name}), el("span", {class: "chip pxqn", text: (r.measured ? "" : "about ") + r.cls}), el("span", {class: "chip warn", text: r.locked_reason || "Supporter feature"})),
         el("div", {class: "t2"}, el("span", {text: "File " + enBytes(r.size_bytes)}), el("span", {text: "Context " + (r.verdict === "no" ? "does not fit" : "about " + enCtx(r.ctx))})))))));
     kids.push(el("div", {class: "row", style: "margin-top:10px"},
       el("button", {class: "b", id: "en-howpro2", text: "How to get Pro", onclick: () => { EN.showGet = true; renderGet(); $("#en-get").scrollIntoView({block: "nearest"}); }}),
-      el("button", {class: "b", id: "en-havekey", text: "I have a key", onclick: () => { EN.showGet = true; renderGet(); const k = $("#en-key"); if (k) k.focus(); $("#en-get").scrollIntoView({block: "nearest"}); }})));
+      el("button", {class: "b", id: "en-havekey", text: "I have a key", onclick: () => { EN.showGet = true; renderGet(); const k = $("#en-key"); if (k) k.focus(); $("#en-get").scrollIntoView({block: "nearest"}); }}),
+      // the Store path (2026-10): supporters unlock PXQN quants with coins; a grant says so instead of a lock
+      ed === "pro" ? null : (window.pxqnUnlocked && pxqnUnlocked())
+        ? el("span", {class: "chip ok", id: "en-granted", text: "PXQN is in your supporter grant: get the Pro encoder with your key"})
+        : el("button", {class: "b sup", id: "en-unlock", type: "button", text: "Unlock with supporter coins", title: "Supporters unlock PXQN quants: coins from a donation unlock the PXQN tier in the Store",
+            onclick: () => { showTab("store"); if (window.storeFocus) storeFocus("pxqn-tier"); }})));
   }
   box.replaceChildren(...kids);
   const at = $("#en-advtier"); if (at) at.replaceChildren(...p.tiers.filter(r => r.available).map(r => el("option", {value: r.key, selected: r.key === EN.tier, text: r.name + " · " + r.cls + " · " + enBytes(r.size_bytes)})));

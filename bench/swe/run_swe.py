@@ -23,7 +23,7 @@ Usage:
   python3 run_swe.py --limit 300                     # full SWE-bench Lite run
   python3 run_swe.py --grade-only                    # (re)grade whatever predictions exist
 
-Layout under /root/swe/:
+Layout under ROOT:
   repos/<org>__<repo>/          cached git checkouts (partial clone, reused across instances)
   predictions/predictions.jsonl swebench-format predictions (one row per attempted instance)
   transcripts/<instance_id>.json   full tool-loop transcript for inspection
@@ -39,7 +39,7 @@ import time
 import traceback
 from pathlib import Path
 
-ROOT = Path("/root/swe")
+ROOT = Path(os.environ.get("SWE_ROOT") or (Path.home() / "swe"))   # SWE_ROOT, else ~/swe
 REPO_CACHE = ROOT / "repos"
 PRED_DIR = ROOT / "predictions"
 TRANSCRIPT_DIR = ROOT / "transcripts"

@@ -209,6 +209,6 @@ published gate results apply to the image without a separate claim. `docker imag
 inspect` will tell you which release and which commit:
 
 ```bash
-docker image inspect ghcr.io/poisonxa16/pxa:v3 \
+docker image inspect ghcr.io/poisonxa16/pxa:v4.0 \
   --format '{{json .Config.Labels}}' | python3 -m json.tool
 ```

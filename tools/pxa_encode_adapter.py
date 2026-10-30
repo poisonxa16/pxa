@@ -98,6 +98,23 @@ def norm_tier(name):
     return re.sub(r"[^a-z0-9]+", "", str(name).lower())
 
 
+def coins_sentence(n):
+    return "A PXQN encode takes %d coins, charged only when it completes; a failed encode costs nothing." % int(n)
+
+
+def coins_view(o):
+    """the coin block of a licence server key status (coins_per_encode, free_coins, held_coins, wallet_linked, coins_note) -> {cost, free,
+    held, linked, note}, or None: an older server, or a key that pays no coins"""
+    if not isinstance(o, dict):
+        return None
+    n = o.get("coins_per_encode")
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        return None
+    num = lambda v: v if isinstance(v, int) and not isinstance(v, bool) else None  # noqa: E731
+    return {"cost": n, "free": num(o.get("free_coins")), "held": num(o.get("held_coins")), "linked": o.get("wallet_linked") is True,
+            "note": str(o.get("coins_note") or "")[:200]}
+
+
 def _licence(o):
     if not isinstance(o, dict):
         return None
@@ -817,7 +834,7 @@ def explain_make_failure(rc, err=None, text=""):
         pre = explain_failure(blob, rc)
         if pre["code"] in ("device_limit", "paused"):          # Resume on this machine cannot succeed until the key is moved or resumed
             return dict(pre, resumable=False)
-        if pre["code"] in ("no_quota", "revoked", "expired", "suspended", "disabled", "bad_key", "old_build", "offline", "lib_unloadable", "runtime_missing", "no_driver", "oom", "tier_locked") + LOCK_CODES:
+        if pre["code"] in ("no_quota", "no_coins", "revoked", "expired", "suspended", "disabled", "bad_key", "old_build", "offline", "lib_unloadable", "runtime_missing", "no_driver", "oom", "tier_locked") + LOCK_CODES:
             return dict(pre, resumable=resumable)
         return {"code": code or "failed", "message": msg if msg.endswith((".", "!", "?")) else msg + ".",
                 "hint": _MAKE_HINT.get(code) or ("Press Resume to try again." if resumable else "Open the log for details."), "resumable": resumable}
@@ -961,6 +978,13 @@ _FAILS = [
     (r"looks shared|key is paused|paused because|quantizer key is paused", "paused",
      "This key is paused because it was used from too many networks in one day.",
      "Ask an admin in the PXA Network Discord to resume it. A new key does not help while this one is paused."),
+    # coins (owner 10-25): the licence server's 402 sentences for a key that pays coins come BEFORE the generic 402 row
+    (r"not linked to a PXA wallet", "no_coins",
+     "This licence key is not linked to a PXA wallet. A PXQN encode takes 10 coins, charged only when it completes; a failed encode costs nothing.",
+     "Link it in PXA Control (Store), or link your Discord account to your wallet with /wallet link in the PXA Network Discord."),
+    (r"not enough coins", "no_coins",
+     "There are not enough coins in your wallet for this encode. A PXQN encode takes 10 coins, charged only when it completes; a failed encode costs nothing.",
+     "Donations bring coins: top up in the Store (PXA Control > Store). Meanwhile the Free encoder (classic PXQ tiers) still works."),
     (r"(?:said|HTTP) 402|no encodes left|quota", "no_quota",
      "You have no encodes left on this key.",
      "Encodes come back when your monthly quota resets. Meanwhile the Free encoder (classic PXQ tiers) still works."),

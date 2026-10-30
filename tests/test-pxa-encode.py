@@ -34,6 +34,12 @@ os.environ["PXA_LAUNCH_STATE"] = os.path.join(TMP, "state")
 os.environ.pop("PXA_ENCODER", None)
 os.environ.pop("HF_TOKEN", None)
 os.environ.pop("PXA_CALIB", None)
+# The GpuRuntime tests model a computer WITHOUT the NVIDIA CUDA 12 libraries until the runtime pack is installed. The fake encoder looks for them the
+# way the wrapper does (an older wrapper: the loader path LD_LIBRARY_PATH; a new one: PXQE_CUDA_LIBS / PXQE_RUNTIME_DIR / PXQE_ENGINE), so whatever the
+# shell that runs the tests exports must not reach it: the CUDA build image exports LD_LIBRARY_PATH=/usr/local/cuda/lib64, which carries
+# libcublas.so.12 + libcusolver.so.11, and made the older-wrapper test see no need for the download (CPU ctest failure since the tests ran there).
+for _k in ("LD_LIBRARY_PATH", "PXQE_CUDA_LIBS", "PXQE_RUNTIME_DIR", "PXQE_ENGINE"):
+    os.environ.pop(_k, None)
 os.environ["HOME"] = os.path.join(TMP, "home")
 os.makedirs(os.environ["HOME"], exist_ok=True)
 sys.path.insert(0, TOOLS)
@@ -177,6 +183,21 @@ class Rig(object):
                 break
             time.sleep(0.03)
         raise AssertionError("stage %s never became %s" % (stage, status))
+
+    def wait_pid(self, jid, timeout=10):
+        """The pid of the stage's process once Control has WRITTEN IT DOWN (job.json, what a restarted Control reads). The service marks a stage
+        running before it starts the stage's process (the legacy per-stage path), so job_view right after wait_stage can still say pid None."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                with open(os.path.join(self.svc.jobs_dir(), jid, "job.json")) as f:
+                    pid = json.load(f).get("pid")
+            except (OSError, ValueError):
+                pid = None
+            if pid and E._pid_alive(pid):
+                return pid
+            time.sleep(0.02)
+        raise AssertionError("job %s never wrote down a live process in %ds" % (jid, timeout))
 
     def wait_proc(self, jid, timeout=10):
         t0 = time.time()
@@ -979,7 +1000,8 @@ class Checks(unittest.TestCase):
         r = Rig("pro")
         real_free, real_dev = E._free_bytes, E._dev
         E._free_bytes = lambda p: 10 if p.endswith("models") else 10 ** 12
-        E._dev = lambda p: hash(p) % 1000
+        ids = {}                                                           # one fake device per distinct folder: never collides, same in every run
+        E._dev = lambda p: ids.setdefault(p, len(ids) + 1)                 # (hash(p) % 1000 put both folders on one device ~1 run in 1000)
         try:
             c = r.svc.checks(r.body())
         finally:
@@ -1284,7 +1306,15 @@ class Control(unittest.TestCase):
         r.wait_stage(jid, "reference")
         r.svc.pause(jid)
         self.assertEqual(r.svc.job_view(jid)["status"], "paused")
-        a = r.svc.job_view(jid)["pct"]
+        # a progress line the fake wrote just before SIGSTOP can still sit in the pipe and be read after pause()
+        # returns (0.143 -> 0.144 under ctest -j 4, pass 9): let the reader drain it before the no-progress check
+        a, t_end = r.svc.job_view(jid)["pct"], time.time() + 5
+        while time.time() < t_end:
+            time.sleep(0.3)
+            b = r.svc.job_view(jid)["pct"]
+            if b == a:
+                break
+            a = b
         time.sleep(1.2)
         self.assertEqual(r.svc.job_view(jid)["pct"], a)                  # the process is stopped: no progress
         r.svc.resume(jid)
@@ -1394,7 +1424,7 @@ class ResumeState(unittest.TestCase):
         r.pace(0.15)
         jid = r.svc.start(r.body())["id"]
         r.wait_stage(jid, "reference")
-        pid = r.svc.job_view(jid)["pid"]
+        pid = r.wait_pid(jid)                                                # not job_view at once: the legacy path marks the stage before it spawns
         r.svc._closed = True                                                 # Control "crashes": the child lives on, orphaned
         r2 = E.EncodeService(r.host, data=os.path.join(r.dir, "data"))
         self.assertEqual(r2.job_view(jid)["status"], "interrupted")
@@ -1720,6 +1750,10 @@ class MakeFlow(unittest.TestCase):
         r.pace(0.03)
         jid = r.svc.start(r.body())["id"]
         j = r.wait_stage(jid, "encode")
+        t0 = time.time()                                                             # make's "start" line opens the bar with an empty detail; the
+        while not next(s for s in j["stages"] if s["id"] == "encode")["detail"] and time.time() - t0 < 30:   # first progress line brings the
+            time.sleep(0.02)                                                         # encoder's message (raced under parallel test load)
+            j = r.svc.job_view(jid)
         by = {s["id"]: s for s in j["stages"]}
         self.assertEqual([by[k]["status"] for k in ("download", "convert", "reference", "skeleton", "dump", "hessians")], ["done"] * 6)
         self.assertGreater(j["pct"], 0.3)
@@ -3162,6 +3196,23 @@ class GpuRuntime(unittest.TestCase):
         j = r.svc.start(r.body("pxqn4"))
         self.assertEqual(r.wait(j["id"])["status"], "done")                                                        # LD_LIBRARY_PATH reached the encode run
 
+    def test_an_older_wrapper_on_a_loader_path_that_has_the_libraries_needs_no_download(self):
+        # the other side of the module-level pin: a computer whose own loader path carries the CUDA 12 libraries (a CUDA image, a system install)
+        # is not asked to download anything, and nothing is fetched
+        sysdir = os.path.join(self.d, "system-cuda-lib")
+        os.makedirs(sysdir)
+        for n in ("libcublas.so.12", "libcusolver.so.11"):
+            open(os.path.join(sysdir, n), "w").close()
+        os.environ["LD_LIBRARY_PATH"] = sysdir
+        try:
+            r = self.rig(old_wrapper=True)
+            rt = r.svc.state()["runtime"]
+            self.assertFalse(rt["need"], rt)
+            self.assertEqual(r.svc.state()["encoders"][0]["runtime"]["lib"], "loadable")
+            self.assertEqual(self.lic.requests, [])
+        finally:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+
     def test_the_engine_install_is_used_when_it_has_the_libraries(self):
         r = self.rig()
         os.makedirs(os.path.join(r.engine, "lib"))
@@ -3235,6 +3286,109 @@ class GpuRuntime(unittest.TestCase):
         job = self.wait_rt(r)
         self.assertEqual(job["phase"], "installed_but", job)
         self.assertIn("still cannot load", job["message"])
+
+
+class EncodeCoins(unittest.TestCase):
+    """10-25: a PXQN encode takes 10 coins, charged only when it completes. The licence server's key
+    status says so (coins_per_encode, free_coins, held_coins, wallet_linked); Control's checks, state and page follow it."""
+    SENT = "A PXQN encode takes 10 coins, charged only when it completes; a failed encode costs nothing."
+
+    def coin_rig(self, **coins):
+        c = {"coins_per_encode": 10, "free_coins": 30, "held_coins": 0, "wallet_linked": True, "coins_note": self.SENT, "remaining": 3, "free_encodes": 0}
+        c.update(coins)
+        r = Rig("pro", licence_check={"state": "valid", "user": "tester", "key_id": "K-TEST0001", "encodes_left": c["remaining"], "checked": True})
+        r.set_fake(coins_server=c)
+        return r
+
+    def lic(self, c):
+        return [x for x in c["checks"] if x["id"] == "licence"][0]
+
+    def test_enough_coins_starts_and_says_what_it_takes(self):
+        r = self.coin_rig()
+        c = r.svc.checks(r.body())
+        self.assertTrue(c["can_start"], c.get("refusal"))
+        L = self.lic(c)
+        self.assertEqual(L["status"], "ok")
+        self.assertIn(self.SENT, L["text"])
+        self.assertIn("30 coins free", L["text"])
+
+    def test_too_few_coins_is_refused_with_the_store_sentence(self):
+        r = self.coin_rig(free_coins=5, remaining=0)
+        c = r.svc.checks(r.body())
+        self.assertFalse(c["can_start"])
+        self.assertIn("not enough coins (10 per completed PXQN encode)", c["refusal"])
+        self.assertIn("top up in the Store", self.lic(c)["text"] + " " + self.lic(c)["fix"])
+
+    def test_no_wallet_says_how_to_link_it(self):
+        r = self.coin_rig(free_coins=None, held_coins=None, wallet_linked=False, remaining=0)
+        c = r.svc.checks(r.body())
+        self.assertFalse(c["can_start"])
+        self.assertIn("not linked to a PXA wallet", c["refusal"])
+
+    def test_the_encoder_saying_exhausted_on_a_coin_key_is_the_coin_sentence(self):
+        r = self.coin_rig(free_coins=0, remaining=0)
+        r.set_fake(licence_check={"state": "exhausted", "user": "tester", "key_id": "K-TEST0001", "checked": True})
+        c = r.svc.checks(r.body())
+        self.assertFalse(c["can_start"])
+        self.assertIn("not enough coins", c["refusal"])
+        self.assertNotIn("this month", c["refusal"])
+
+    def test_state_carries_the_coins_for_the_page(self):
+        r = self.coin_rig(held_coins=10)
+        self.assertIsNone(r.svc.state()["coins"])                               # the page's state never waits on the network
+        want = {"cost": 10, "free": 30, "held": 10, "linked": True, "note": self.SENT}
+        self.assertEqual(r.svc.licence_check()["coins"], want)                    # Check now asks the licence server
+        self.assertEqual(r.svc.state()["coins"], want)                            # ... and the state shows it from then on
+        self.assertIsNone(Rig("free").svc.state()["coins"])
+
+    def test_an_older_licence_server_reads_as_before(self):
+        r = Rig("pro", licence_check={"state": "valid", "encodes_left": 0})
+        c = r.svc.checks(r.body())
+        self.assertFalse(c["can_start"])
+        self.assertIn("no encodes left", c["refusal"])
+        self.assertIsNone(r.svc.licence_check()["coins"])
+
+    def test_a_coin_refusal_at_run_time_is_its_own_sentence(self):
+        for text, frag in (("pxqe: refused by the licence server (HTTP 402): not enough coins (10 per completed PXQN encode): top up in the Store",
+                            "not enough coins"),
+                           ("pxqe: refused by the licence server (HTTP 402): this licence key is not linked to a PXA wallet: link it in PXA Control "
+                            "(Store) or with /wallet link; a PXQN encode takes 10 coins, charged only when it completes", "not linked to a PXA wallet")):
+            f = AD.explain_failure(text, 3)
+            self.assertEqual(f["code"], "no_coins", text)
+            self.assertIn(frag, f["message"] + " " + f["hint"])
+            self.assertNotIn("monthly quota", f["message"] + " " + f["hint"])
+
+    def run_coins_js(self, expr):
+        """the coin helpers of encode.js (between the // ---- coins markers) evaluated in node -> the JSON of expr"""
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("no node")
+        with open(os.path.join(TOOLS, "pxa_control_ui", "encode.js")) as f:
+            js = f.read()
+        sec = "//" + js.split("// ---- coins")[1].split("// ---- end coins")[0]          # the marker line stays a comment
+        import subprocess
+        p = subprocess.run([node, "-e", sec + "\nprocess.stdout.write(JSON.stringify(" + expr + "));"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout)
+
+    def test_review_m2_the_no_wallet_line_names_wallet_link_and_never_says_top_up(self):
+        line = self.run_coins_js("coinsLine({cost: 10, free: null, held: null, linked: false})")
+        self.assertIn("or with /wallet link", line)
+        self.assertNotIn("Top up", line)
+        self.assertIn(self.SENT, line)
+        low = self.run_coins_js("coinsLine({cost: 10, free: 4, held: 10, linked: true})")
+        self.assertIn("Top up in the Store", low)
+        self.assertIn("4 coins free", low)
+        self.assertEqual(self.run_coins_js("[coinsBadge({cost: 10, free: null}), coinsBadge({cost: 10, free: 3})]"), ["No wallet linked", "Not enough coins"])
+
+    def test_the_page_has_the_sentence(self):
+        with open(os.path.join(TOOLS, "pxa_control_ui", "encode.js")) as f:
+            js = f.read()
+        self.assertIn("charged only when it completes; a failed encode costs nothing.", js)
+        self.assertIn("st.coins", js)
+        self.assertIn('"no_coins"', js)
+        for w in ("paid", "sell", "buy", "price", "\u2014"):
+            self.assertNotIn(" " + w + " ", js.split("// ---- coins")[1].split("// ---- end coins")[0] if "// ---- coins" in js else "")
 
 
 if __name__ == "__main__":

@@ -97,3 +97,7 @@
 .seg button[hidden] { display: none; }
 .lv-histbar { margin: 0 0 var(--s3, 10px); min-height: 1em; }
 .lv-histbar a { color: inherit; text-decoration: underline; }
+
+#p-live .lv-stoppedline{margin:calc(-1 * var(--s2, 8px)) 0 var(--s4);font-size:var(--fs-1)}
+#p-live .lv-stoppedline .link{font-size:inherit}
+#p-live .lv-stoppedline[hidden]{display:none}

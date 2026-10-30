@@ -216,11 +216,147 @@ static const char *json_str_after(const char *hay, const char *key, char *out, s
 }
 
 /* Exact engine names from the release notes. A .sha256 sidecar contains ".tar.gz"
- * in the middle and must not be chosen. */
+ * in the middle and must not be chosen.
+ * A release ships the arch-true name ("-sm60_61_70_75_80_86_89.tar.gz": the SASS list the files carry) beside
+ * the legacy "-sm60_61_70" alias with the same bytes. Rank (pick_url keeps the first name of the highest rank):
+ *   3 R_COVERS  an arch-true name whose list runs on every local card (or holds the 60;61;70 floor when the
+ *               local sm is unknown): preferred over the legacy alias
+ *   2 R_LEGACY  the legacy names (-sm60_61_70, -ubuntu24.04, any other -ubuntu22.04)
+ *   1 R_MAYBE   an arch-true name that has no SASS for a local card but a lower sm whose PTX could JIT up:
+ *               only when nothing better is offered
+ *   0           not an engine tarball, or an arch-true list that cannot run here (e.g. "-sm86" on a P100,
+ *               or a list without the floor when the local sm is unknown): skipped */
+#define LEGACY_SM "-sm60_61_70"
+enum { R_MAYBE = 1, R_LEGACY = 2, R_COVERS = 3 };
+#define SM_LIST_MAX 32
+#define LOCAL_SM_MAX 16
+
+/* "-sm" + two-digit sms joined by "_" right before `end`: "-sm60_61_70_75" yes, "-sm6_61"/"-sm600"/"-sm60_" no.
+ * Returns the number of sms (their values in `list`, at most SM_LIST_MAX kept), 0 when it is not such a list. */
+static int sm_list_before(const char *base, const char *end, int *list)
+{
+    if (!ends_with(base, end))
+        return 0;
+    const char *p = base + strlen(base) - strlen(end);
+    int n = 0;
+    for (;;) {
+        if (p - base < 2 || !isdigit((unsigned char) p[-1]) || !isdigit((unsigned char) p[-2]))
+            return 0;
+        p -= 2;
+        if (n < SM_LIST_MAX)
+            list[n] = (p[0] - '0') * 10 + (p[1] - '0');
+        n++;
+        if (p - base >= 3 && memcmp(p - 3, "-sm", 3) == 0)
+            return n < SM_LIST_MAX ? n : SM_LIST_MAX;
+        if (p - base < 1 || p[-1] != '_')
+            return 0;
+        p--;
+    }
+}
+
+/* "8.6" / "86" -> 86; -1 when the token is neither */
+static int sm_token(const char *t, size_t len)
+{
+    if (len == 3 && isdigit((unsigned char) t[0]) && t[1] == '.' && isdigit((unsigned char) t[2]))
+        return (t[0] - '0') * 10 + (t[2] - '0');
+    if (len == 2 && isdigit((unsigned char) t[0]) && isdigit((unsigned char) t[1]))
+        return (t[0] - '0') * 10 + (t[1] - '0');
+    return -1;
+}
+
+/* The local cards' compute capabilities as 10*major+minor (6.0 -> 60) from nvidia-smi; returns how many,
+ * 0 = unknown (no nvidia-smi, no card, an old driver without compute_cap, or any token that does not parse).
+ * PXA_UPDATE_SM ("86", "60,70"; "none" = unknown) replaces the probe: the hermetic tests set it. */
+static int local_sms(int *sms)
+{
+    static int cached = -1;
+    static int cache[LOCAL_SM_MAX];
+    if (cached < 0) {
+        char buf[512] = {0};
+        const char *env = getenv("PXA_UPDATE_SM");
+        if (env) {
+            snprintf(buf, sizeof buf, "%s", env);
+        } else {
+            FILE *f = popen("nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null", "r");
+            if (f) {
+                size_t got = fread(buf, 1, sizeof buf - 1, f);
+                buf[got] = 0;
+                if (pclose(f) != 0)
+                    buf[0] = 0;
+            }
+        }
+        int n = 0, bad = 0;
+        for (const char *p = buf; *p;) {
+            while (*p && (*p == ',' || isspace((unsigned char) *p)))
+                p++;
+            const char *t = p;
+            while (*p && *p != ',' && !isspace((unsigned char) *p))
+                p++;
+            if (p == t)
+                break;
+            int v = sm_token(t, (size_t) (p - t));
+            if (v < 0) {
+                bad = 1;
+                break;
+            }
+            if (n < LOCAL_SM_MAX)
+                cache[n++] = v;
+        }
+        cached = bad ? 0 : n;
+    }
+    for (int i = 0; i < cached; i++)
+        sms[i] = cache[i];
+    return cached;
+}
+
+static int sm_in(const int *list, int n, int sm)
+{
+    for (int i = 0; i < n; i++)
+        if (list[i] == sm)
+            return 1;
+    return 0;
+}
+
+/* `base` is "...-sm<list><end>" with a list other than the legacy one: its rank (R_COVERS / R_MAYBE), or -1 when
+ * that list cannot run here; 0 when `base` is not such a name (the legacy rules apply). SASS for X.y runs on X.z
+ * with z >= y; a lower sm's PTX may JIT on a newer card; nothing built only for newer sms runs on an older one. */
+static int arch_rank(const char *base, const char *end)
+{
+    char legacy[64];
+    int list[SM_LIST_MAX];
+    snprintf(legacy, sizeof legacy, "%s%s", LEGACY_SM, end);
+    int n = sm_list_before(base, end, list);
+    if (!n || ends_with(base, legacy))
+        return 0;
+    int sms[LOCAL_SM_MAX];
+    int k = local_sms(sms);
+    if (k == 0)   /* unknown card: only a list that holds the 60;61;70 floor outranks the legacy alias */
+        return sm_in(list, n, 60) && sm_in(list, n, 61) && sm_in(list, n, 70) ? R_COVERS : -1;
+    int all = 1;
+    for (int c = 0; c < k; c++) {
+        int sass = 0, lower = 0;
+        for (int i = 0; i < n; i++) {
+            if (list[i] / 10 == sms[c] / 10 && list[i] % 10 <= sms[c] % 10)
+                sass = 1;
+            if (list[i] < sms[c])
+                lower = 1;
+        }
+        if (!sass) {
+            if (!lower)
+                return -1;
+            all = 0;
+        }
+    }
+    return all ? R_COVERS : R_MAYBE;
+}
+
 static int is_u22(const char *base)
 {
-    return strncmp(base, "pxa-", 4) == 0 && strstr(base, "linux-x86_64")
-        && ends_with(base, "-ubuntu22.04.tar.gz");
+    if (strncmp(base, "pxa-", 4) != 0 || !strstr(base, "linux-x86_64")
+        || !ends_with(base, "-ubuntu22.04.tar.gz"))
+        return 0;
+    int a = arch_rank(base, "-ubuntu22.04.tar.gz");
+    return a > 0 ? a : a < 0 ? 0 : R_LEGACY;
 }
 
 static int is_u24(const char *base)
@@ -229,7 +365,12 @@ static int is_u24(const char *base)
         return 0;
     if (strstr(base, ".sha256") || strstr(base, "-ubuntu22.04"))
         return 0;
-    return ends_with(base, "-sm60_61_70.tar.gz") || ends_with(base, "-ubuntu24.04.tar.gz");
+    int a = arch_rank(base, ".tar.gz");
+    if (a == 0)
+        a = arch_rank(base, "-ubuntu24.04.tar.gz");
+    if (a != 0)
+        return a > 0 ? a : 0;
+    return ends_with(base, LEGACY_SM ".tar.gz") || ends_with(base, "-ubuntu24.04.tar.gz") ? R_LEGACY : 0;
 }
 
 /* 0 ok, -1 no tarball, -2 glibc unknown. */
@@ -238,6 +379,7 @@ static int pick_url(const char *json, char *url, size_t urllen)
     const char *p = json;
     char u24[1024] = {0};
     char u22[1024] = {0};
+    int r24 = 0, r22 = 0;   /* rank of the kept name: the first of the highest rank wins, so the pick is deterministic */
     while ((p = strstr(p, "browser_download_url")) != NULL) {
         char one[1024];
         if (!json_str_after(p, "browser_download_url", one, sizeof one))
@@ -246,12 +388,17 @@ static int pick_url(const char *json, char *url, size_t urllen)
         const char *base = base_name(one);
         if (strstr(base, "libggml-pxqn"))
             continue;
-        if (is_u22(base)) {
-            if (!u22[0])
+        int r;
+        if ((r = is_u22(base)) > 0) {
+            if (r > r22) {
                 snprintf(u22, sizeof u22, "%s", one);
-        } else if (is_u24(base)) {
-            if (!u24[0])
+                r22 = r;
+            }
+        } else if ((r = is_u24(base)) > 0) {
+            if (r > r24) {
                 snprintf(u24, sizeof u24, "%s", one);
+                r24 = r;
+            }
         }
     }
     int glibc = glibc_at_least(2, 38);
@@ -532,6 +679,8 @@ static int swap_link(const char *dir, const char *name, const char *target)
     return 0;
 }
 
+static int install_tarball(const char *dir, const char *tgz, const char *dl);
+
 static int apply_release(const char *dir, const char *url)
 {
     if (server_running(dir))
@@ -571,14 +720,24 @@ static int apply_release(const char *dir, const char *url)
         rm_tree(dl);
         die(1, "checksum mismatch; not installing");
     }
+    return install_tarball(dir, tgz, dl);
+}
+
+/* Unpack a checked tarball beside the other versions and swap `current`/`previous`. `dl` (may be NULL) is the
+ * caller's download directory, removed on every exit; the engine beta path (pxa_engine_update.py) passes NULL and
+ * cleans up its own directory. One archive rule set for every channel: one top directory, no user data. */
+static int install_tarball(const char *dir, const char *tgz, const char *dl)
+{
+    if (server_running(dir))
+        die(2, "a server from this install is running; stop it first");
     char top[PATH_MAX];
     int arc = archive_top(tgz, top, sizeof top);
     if (arc == -2) {
-        rm_tree(dl);
+        if (dl) rm_tree(dl);
         die(1, "this archive contains models, settings, or expert counts; refusing");
     }
     if (arc != 0) {
-        rm_tree(dl);
+        if (dl) rm_tree(dl);
         die(1, "archive has no top directory");
     }
     char dest[PATH_MAX], ver[PATH_MAX];
@@ -589,20 +748,20 @@ static int apply_release(const char *dir, const char *url)
         char stage_in[PATH_MAX];
         snprintf(stage_in, sizeof stage_in, "%s/.pxa-stage-XXXXXX", dir);
         if (!mkdtemp(stage_in)) {
-            rm_tree(dl);
+            if (dl) rm_tree(dl);
             die(1, "could not make a staging directory");
         }
-        char *argv[] = {"tar", "-xzf", tgz, "-C", stage_in, NULL};
+        char *argv[] = {"tar", "-xzf", (char *) tgz, "-C", stage_in, NULL};
         if (run(argv) != 0) {
             rm_tree(stage_in);
-            rm_tree(dl);
+            if (dl) rm_tree(dl);
             die(1, "could not unpack");
         }
         char unpacked[PATH_MAX];
         snprintf(unpacked, sizeof unpacked, "%s/%s", stage_in, top);
         if (rename(unpacked, dest) != 0) {
             rm_tree(stage_in);
-            rm_tree(dl);
+            if (dl) rm_tree(dl);
             die(1, "could not move the new version into place");
         }
         rmdir(stage_in);
@@ -613,10 +772,10 @@ static int apply_release(const char *dir, const char *url)
     if (rel_link(curlink, old, sizeof old) == 0 && strcmp(old, top) != 0)
         swap_link(dir, "previous", old);
     if (swap_link(dir, "current", top) != 0) {
-        rm_tree(dl);
+        if (dl) rm_tree(dl);
         die(1, "could not switch current");
     }
-    rm_tree(dl);
+    if (dl) rm_tree(dl);
     printf("installed %s\n", top);
     printf("next %s/current\n", dir);
     return 0;
@@ -687,17 +846,17 @@ static const char *install_dir(const char *given, char *buf, size_t buflen)
     return buf;
 }
 
-static const char *lib_tool(const char *dir, char *buf, size_t buflen)
+static const char *py_tool(const char *dir, const char *envname, const char *name, char *buf, size_t buflen)
 {
-    const char *env = getenv("PXA_LIB_UPDATE");             /* the tests point this at a scratch copy */
-    static const char *rel[] = { "current/tools/pxa_lib_update.py", "tools/pxa_lib_update.py", NULL };
+    const char *env = getenv(envname);                      /* the tests point this at a scratch copy */
+    static const char *rel[] = { "current/tools/", "tools/", NULL };
     if (env && env[0]) {
         snprintf(buf, buflen, "%s", env);
         if (access(buf, R_OK) == 0)
             return buf;
     }
     for (int i = 0; rel[i]; i++) {
-        snprintf(buf, buflen, "%s/%s", dir, rel[i]);
+        snprintf(buf, buflen, "%s/%s%s", dir, rel[i], name);
         if (access(buf, R_OK) == 0)
             return buf;
     }
@@ -708,12 +867,128 @@ static const char *lib_tool(const char *dir, char *buf, size_t buflen)
         char *sl = strrchr(self, '/');
         if (sl) {
             *sl = 0;
-            snprintf(buf, buflen, "%s/../tools/pxa_lib_update.py", self);
+            snprintf(buf, buflen, "%s/../tools/%s", self, name);
             if (access(buf, R_OK) == 0)
                 return buf;
         }
     }
     return NULL;
+}
+
+static const char *lib_tool(const char *dir, char *buf, size_t buflen)
+{
+    return py_tool(dir, "PXA_LIB_UPDATE", "pxa_lib_update.py", buf, buflen);
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Engine channels. Stable is the GitHub path above and stays exactly what it was. Beta (Valued
+ * Supporters, from the licence server) is decided in tools/pxa_engine_update.py: it verifies the
+ * signed release with the same verifier as `pxa-update lib`, downloads, checks every byte against
+ * the signature and then calls back `pxa-update apply-file`, so the one archive rule set and the
+ * current/previous swap below serve both channels. The channel is sticky in <install>/engine-channel.
+ * ------------------------------------------------------------------------------------------- */
+static void read_channel(const char *dir, char *out, size_t outlen)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/engine-channel", dir);
+    out[0] = 0;
+    char *txt = slurp(path, NULL);
+    if (!txt)
+        return;
+    char w[16] = {0};
+    if (sscanf(txt, "%15s", w) == 1 && (strcmp(w, "stable") == 0 || strcmp(w, "beta") == 0))
+        snprintf(out, outlen, "%s", w);
+    free(txt);
+}
+
+static int write_channel(const char *dir, const char *channel)
+{
+    char path[PATH_MAX], tmp[PATH_MAX];
+    snprintf(path, sizeof path, "%s/engine-channel", dir);
+    snprintf(tmp, sizeof tmp, "%s/engine-channel.new", dir);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "%s\n", channel);
+    if (fclose(f) != 0 || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+/* True when `current` is the beta release pxa_engine_update.py installed. Only then may the stable path install
+ * a stable release that is OLDER than what runs: leaving the beta is a downgrade by design. */
+static int beta_installed(const char *dir)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/engine-state.json", dir);
+    char *js = slurp(path, NULL);
+    if (!js)
+        return 0;
+    char ch[16] = {0}, top[PATH_MAX] = {0}, cur[PATH_MAX];
+    int yes = json_str_after(js, "\"channel\"", ch, sizeof ch) && strcmp(ch, "beta") == 0
+              && json_str_after(js, "\"top\"", top, sizeof top) && top[0];
+    free(js);
+    char curlink[PATH_MAX];
+    snprintf(curlink, sizeof curlink, "%s/current", dir);
+    return yes && rel_link(curlink, cur, sizeof cur) == 0 && strcmp(cur, top) == 0;
+}
+
+static int sha_hex_ok(const char *tgz, const char *hex)
+{
+    char side[PATH_MAX];
+    snprintf(side, sizeof side, "%s.pxa-want.sha256", tgz);
+    FILE *f = fopen(side, "w");
+    if (!f)
+        return 0;
+    fprintf(f, "%s  x\n", hex);
+    fclose(f);
+    int ok = sha_ok(tgz, side);
+    unlink(side);
+    return ok;
+}
+
+static int engine_main(const char *cmd, const char *arg, const char *dir, const char *channel, const char *key,
+                       const char *lic, int as_json)
+{
+    char tool[PATH_MAX];
+    if (!py_tool(dir, "PXA_ENGINE_UPDATE", "pxa_engine_update.py", tool, sizeof tool))
+        die(1, "this install has no tools/pxa_engine_update.py; the beta channel needs PXA 4.0 or newer");
+    char self[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0)
+        die(1, "could not find this program");
+    self[n] = 0;
+    char *args[20];
+    int k = 0;
+    args[k++] = (char *) "python3";
+    args[k++] = tool;
+    args[k++] = (char *) cmd;
+    if (arg)
+        args[k++] = (char *) arg;
+    args[k++] = (char *) "--dir";
+    args[k++] = (char *) dir;
+    args[k++] = (char *) "--installer";
+    args[k++] = self;
+    if (channel) {
+        args[k++] = (char *) "--channel";
+        args[k++] = (char *) channel;
+    }
+    if (key) {
+        args[k++] = (char *) "--key";
+        args[k++] = (char *) key;
+    }
+    if (lic) {
+        args[k++] = (char *) "--base-url";
+        args[k++] = (char *) lic;
+    }
+    if (as_json)
+        args[k++] = (char *) "--json";
+    args[k] = NULL;
+    execvp(args[0], args);
+    die(1, "could not run python3; the beta channel needs it");
+    return 1;
 }
 
 static int lib_main(int argc, char **argv)
@@ -770,6 +1045,11 @@ static int lib_main(int argc, char **argv)
     return 1;
 }
 
+#define USAGE "usage: pxa-update check|apply|rollback [--channel stable|beta] [--dir DIR] [--base-url URL] [--licence-url URL] [--key KEY] [--json]\n" \
+              "       pxa-update channel stable|beta | channels | notes [--dir DIR] [--licence-url URL] [--key KEY] [--json]\n" \
+              "       pxa-update apply-file TARBALL [--sha256 HEX] [--dir DIR]\n" \
+              "       pxa-update lib check|apply|rollback [--channel stable|beta] [--dir DIR] [--base-url URL] [--key KEY] [--json]"
+
 int main(int argc, char **argv)
 {
     const char *cmd = NULL;
@@ -778,6 +1058,8 @@ int main(int argc, char **argv)
     char home_dir[PATH_MAX];
     char pkg[PATH_MAX];
     int from_pkg = 0;
+    const char *channel = NULL, *key = NULL, *lic = NULL, *want_sha = NULL, *arg = NULL;
+    int as_json = 0;
     if (argc > 1 && strcmp(argv[1], "lib") == 0)
         return lib_main(argc - 2, argv + 2);
     for (int i = 1; i < argc; i++) {
@@ -787,15 +1069,25 @@ int main(int argc, char **argv)
             dir = argv[++i];
         else if (strcmp(argv[i], "--rollback") == 0 && !cmd)
             cmd = "rollback";
+        else if (strcmp(argv[i], "--channel") == 0 && i + 1 < argc)
+            channel = argv[++i];
+        else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc)
+            key = argv[++i];
+        else if (strcmp(argv[i], "--licence-url") == 0 && i + 1 < argc)
+            lic = argv[++i];
+        else if (strcmp(argv[i], "--sha256") == 0 && i + 1 < argc)
+            want_sha = argv[++i];
+        else if (strcmp(argv[i], "--json") == 0)
+            as_json = 1;
         else if (argv[i][0] != '-' && !cmd)
             cmd = argv[i];
+        else if (argv[i][0] != '-' && !arg && cmd && (strcmp(cmd, "apply-file") == 0 || strcmp(cmd, "channel") == 0))
+            arg = argv[i];
         else
-            die(1, "usage: pxa-update check|apply|rollback [--dir DIR] [--base-url URL]\n" \
-              "       pxa-update lib check|apply|rollback [--channel stable|beta] [--dir DIR] [--base-url URL] [--key KEY] [--json]");
+            die(1, USAGE);
     }
     if (!cmd)
-        die(1, "usage: pxa-update check|apply|rollback [--dir DIR] [--base-url URL]\n" \
-              "       pxa-update lib check|apply|rollback [--channel stable|beta] [--dir DIR] [--base-url URL] [--key KEY] [--json]");
+        die(1, USAGE);
     if (!dir) {
         if (own_package(pkg, sizeof pkg) == 0) {
             from_pkg = 1;
@@ -813,6 +1105,21 @@ int main(int argc, char **argv)
             dir = home_dir;
         }
     }
+    if (channel && strcmp(channel, "stable") != 0 && strcmp(channel, "beta") != 0)
+        die(1, "--channel must be stable or beta");
+    if (strcmp(cmd, "apply-file") == 0) {
+        if (!arg || !ends_with(arg, ".tar.gz"))
+            die(1, USAGE);
+        if (want_sha && (strlen(want_sha) != 64 || !sha_hex_ok(arg, want_sha)))
+            die(1, "checksum mismatch; not installing");
+        return install_tarball(dir, arg, NULL);
+    }
+    char sticky[16];
+    read_channel(dir, sticky, sizeof sticky);
+    const char *eff = channel ? channel : (sticky[0] ? sticky : "stable");
+    if (strcmp(cmd, "channel") == 0 || strcmp(cmd, "channels") == 0 || strcmp(cmd, "notes") == 0
+        || (strcmp(eff, "beta") == 0 && (strcmp(cmd, "check") == 0 || strcmp(cmd, "apply") == 0)))
+        return engine_main(cmd, arg, dir, channel, key, lic, as_json);
     if (strcmp(cmd, "rollback") == 0)
         return rollback(dir);
     if (!http_ok(base))
@@ -860,20 +1167,21 @@ int main(int argc, char **argv)
     } else {
         read_version(dir, cur, sizeof cur);
     }
-    int newer = vercmp(cur, tag) < 0;
+    int newer = vercmp(cur, tag) < 0 || beta_installed(dir);     /* leaving the beta may install an older stable */
     if (strcmp(cmd, "check") == 0) {
-        printf("current=%s latest=%s update=%s\n", cur, tag, newer ? "yes" : "no");
+        printf("current=%s latest=%s update=%s channel=stable\n", cur, tag, newer ? "yes" : "no");
         free(json);
         return 0;
     }
     if (strcmp(cmd, "apply") != 0) {
         free(json);
-        die(1, "usage: pxa-update check|apply|rollback [--dir DIR] [--base-url URL]\n" \
-              "       pxa-update lib check|apply|rollback [--channel stable|beta] [--dir DIR] [--base-url URL] [--key KEY] [--json]");
+        die(1, USAGE);
     }
     if (!newer) {
         free(json);
-        printf("current=%s latest=%s update=no\n", cur, tag);
+        if (channel || sticky[0])
+            write_channel(dir, "stable");
+        printf("current=%s latest=%s update=no channel=stable\n", cur, tag);
         return 0;
     }
     char url[1024];
@@ -883,5 +1191,8 @@ int main(int argc, char **argv)
         die(1, "could not read the system C library version; refusing to guess Ubuntu 24.04");
     if (picked != 0)
         die(1, "no engine tarball in that release");
-    return apply_release(dir, url);
+    int rc = apply_release(dir, url);
+    if (rc == 0 && (channel || sticky[0]) && write_channel(dir, "stable") != 0)
+        die(1, "installed, but could not record the stable channel");
+    return rc;
 }

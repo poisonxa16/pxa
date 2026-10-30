@@ -289,12 +289,21 @@ start. `docker ps` will show `healthy` / `unhealthy` accordingly.
 
 ```bash
 docker build -f docker/Dockerfile \
-    --build-arg CUDA_ARCHS="60;61;70" \
+    --build-arg CUDA_ARCHS="60-real;61-real;70-real;75-real;80-real;86-real;89" \
     -t pxa:local .
 ```
 
 `CUDA_ARCHS` controls which SM targets get compiled in (`60`=P100, `61`=1080 Ti/P40,
-`70`=V100). Narrow it to your exact card to shrink build time and binary size.
+`70`=V100, `75`=T4/RTX 20xx, `80`=A100, `86`=RTX 30xx, `89`=RTX 40xx; `-real` = native code only, the plain `89` also
+embeds PTX so newer cards can JIT). Narrow it to your exact card to shrink build time and binary size.
 
 `--build-arg BUILD_JOBS=6` caps the compile jobs if you need the cores for something else; the
 release image is built once, at tag time, on an idle box.
+
+LLGuidance (the fast JSON-schema / Lark grammar engine, [docs/llguidance.md](../docs/llguidance.md)) is built in by
+default: the build stage installs a pinned Rust toolchain (rustup minimal profile, `RUST_TOOLCHAIN`, default 1.85.1)
+and cmake fetches the llguidance crate at a pinned commit with its own `Cargo.lock` enforced. That fetch needs network
+access to github.com and crates.io during `docker build`. With no network, or to skip Rust entirely, pass
+`--build-arg LLAMA_LLGUIDANCE=OFF` (the image then uses the built-in GBNF grammar engine only). The runtime image
+carries no Rust either way: LLGuidance is a static library inside the binaries. `tests/test-llguidance-image.sh`
+checks all of this (`--build` for a CPU build + `test-grammar-llguidance`, `--docker` for the toolchain stage).

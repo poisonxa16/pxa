@@ -67,7 +67,8 @@ load, run, and be quietly wrong.
 ## 3. Dry-run it first. Always.
 
 The conversion reads a whole model and writes another one. Check the plan before you spend the
-time:
+time. (The converter is in the git repository, not in the release tarball, which ships the engine
+only; run it from a checkout.)
 
 ```bash
 cd tools/vllm-pxq4

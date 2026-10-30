@@ -361,6 +361,17 @@ static __global__ void solve_tri_f32_128x128_opt(const float * __restrict__ A,
     }
 }
 
+// Transposed 64x64 X tile of the tiled kernel without the +1 row padding: element (col, row)
+// lives at col*64 + (row ^ (col & 31)). The XOR is a bijection inside each column, so the tile
+// holds exactly the values the padded 64x65 layout held and every result is bit-identical; it
+// keeps the padding's conflict-free banks (a warp walking 32 columns of one row hits 32 distinct
+// banks, a warp walking 32 rows of one column reads one permuted 32-word line). Dropping the 64
+// pad floats takes the kernel from 49408 B to 49152 B of dynamic shared memory, i.e. inside the
+// 48 KB every CUDA arch grants without an opt-in (sm_60/61 have no opt-in above 48 KB at all).
+static __device__ __forceinline__ int solve_tri_sxt_idx(const int col, const int row) {
+    return col * 64 + (row ^ (col & 31));
+}
+
 static __global__ void solve_tri_f32_256x256_tiled(const float * __restrict__ A,
                                                     const float * __restrict__ B,
                                                     float * __restrict__ X,
@@ -390,8 +401,8 @@ static __global__ void solve_tri_f32_256x256_tiled(const float * __restrict__ A,
 
     extern __shared__ char smem_raw[];
     float * sA_tile = (float *)smem_raw;                    // 64×64 = 16KB
-    float * sXt_tile = sA_tile + TILE_SIZE * TILE_SIZE;     // 64×65 = 16.25KB (padded)
-    float * sA_off = sXt_tile + TILE_SIZE * (TILE_SIZE+1);  // 64×64 = 16KB (for off-diagonal blocks)
+    float * sXt_tile = sA_tile + TILE_SIZE * TILE_SIZE;     // 64×64 = 16KB (XOR-swizzled, see solve_tri_sxt_idx)
+    float * sA_off = sXt_tile + TILE_SIZE * TILE_SIZE;      // 64×64 = 16KB (for off-diagonal blocks)
 
     const int tid = lane + warp_id * WARP_SIZE;
 
@@ -423,7 +434,7 @@ static __global__ void solve_tri_f32_256x256_tiled(const float * __restrict__ A,
             const int tile_k = min(TILE_SIZE, k - tile_col);  // Actual columns in this tile
 
             // Zero-init and load X tile transposed
-            for (int i = tid; i < TILE_SIZE * (TILE_SIZE+1); i += 1024) {
+            for (int i = tid; i < TILE_SIZE * TILE_SIZE; i += 1024) {
                 sXt_tile[i] = 0.0f;
             }
             __syncthreads();
@@ -431,7 +442,7 @@ static __global__ void solve_tri_f32_256x256_tiled(const float * __restrict__ A,
             for (int i = tid; i < tile_n * tile_k; i += 1024) {
                 int local_row = i / tile_k;
                 int local_col = i % tile_k;
-                sXt_tile[local_col * (TILE_SIZE+1) + local_row] =
+                sXt_tile[solve_tri_sxt_idx(local_col, local_row)] =
                     X_batch[(tile_row + local_row) * k + tile_col + local_col];
             }
             __syncthreads();
@@ -477,10 +488,10 @@ static __global__ void solve_tri_f32_256x256_tiled(const float * __restrict__ A,
 
                     if (lane == 0) {
                         if (col0 < tile_k) {
-                            sXt_tile[col0 * (TILE_SIZE+1) + row] -= sum0;
+                            sXt_tile[solve_tri_sxt_idx(col0, row)] -= sum0;
                         }
                         if (col1 < tile_k) {
-                            sXt_tile[col1 * (TILE_SIZE+1) + row] -= sum1;
+                            sXt_tile[solve_tri_sxt_idx(col1, row)] -= sum1;
                         }
                     }
                     __syncwarp();
@@ -497,15 +508,15 @@ static __global__ void solve_tri_f32_256x256_tiled(const float * __restrict__ A,
 
                 if (lane < row) {
                     float a_val = sA_tile[row * TILE_SIZE + lane];
-                    if (col0 < tile_k) sum0 = a_val * sXt_tile[col0 * (TILE_SIZE+1) + lane];
-                    if (col1 < tile_k) sum1 = a_val * sXt_tile[col1 * (TILE_SIZE+1) + lane];
+                    if (col0 < tile_k) sum0 = a_val * sXt_tile[solve_tri_sxt_idx(col0, lane)];
+                    if (col1 < tile_k) sum1 = a_val * sXt_tile[solve_tri_sxt_idx(col1, lane)];
                 }
                 if (row > WARP_SIZE) {
                     int j2 = lane + WARP_SIZE;
                     if (j2 < row) {
                         float a_val2 = sA_tile[row * TILE_SIZE + j2];
-                        if (col0 < tile_k) sum0 += a_val2 * sXt_tile[col0 * (TILE_SIZE+1) + j2];
-                        if (col1 < tile_k) sum1 += a_val2 * sXt_tile[col1 * (TILE_SIZE+1) + j2];
+                        if (col0 < tile_k) sum0 += a_val2 * sXt_tile[solve_tri_sxt_idx(col0, j2)];
+                        if (col1 < tile_k) sum1 += a_val2 * sXt_tile[solve_tri_sxt_idx(col1, j2)];
                     }
                 }
 
@@ -515,12 +526,12 @@ static __global__ void solve_tri_f32_256x256_tiled(const float * __restrict__ A,
                 if (lane == 0) {
                     float inv_diag = 1.0f / sA_tile[row * TILE_SIZE + row];
                     if (col0 < tile_k) {
-                        sXt_tile[col0 * (TILE_SIZE+1) + row] =
-                            (sXt_tile[col0 * (TILE_SIZE+1) + row] - sum0) * inv_diag;
+                        sXt_tile[solve_tri_sxt_idx(col0, row)] =
+                            (sXt_tile[solve_tri_sxt_idx(col0, row)] - sum0) * inv_diag;
                     }
                     if (col1 < tile_k) {
-                        sXt_tile[col1 * (TILE_SIZE+1) + row] =
-                            (sXt_tile[col1 * (TILE_SIZE+1) + row] - sum1) * inv_diag;
+                        sXt_tile[solve_tri_sxt_idx(col1, row)] =
+                            (sXt_tile[solve_tri_sxt_idx(col1, row)] - sum1) * inv_diag;
                     }
                 }
                 __syncwarp();
@@ -532,7 +543,7 @@ static __global__ void solve_tri_f32_256x256_tiled(const float * __restrict__ A,
                 int local_row = i / tile_k;
                 int local_col = i % tile_k;
                 X_batch[(tile_row + local_row) * k + tile_col + local_col] =
-                    sXt_tile[local_col * (TILE_SIZE+1) + local_row];
+                    sXt_tile[solve_tri_sxt_idx(local_col, local_row)];
             }
             __syncthreads();
         }
@@ -761,21 +772,19 @@ static void solve_tri_f32_cuda(const float * A,
 
     // Handle large matrices first (256×256 and 65-128 range)
 
-    // Route sizes 65-256 to the tiled kernel
+    // Route sizes 65-256 to the tiled kernel.
+    // NOTE: ggml_cuda_op_solve_tri only calls this function for n <= MAX_N_FAST && k <= MAX_K_FAST
+    // (64/64) and sends larger systems to cuBLAS TRSM, so this branch is unreachable today; it is
+    // kept launch-safe for every arch in case those limits are ever raised.
     if (n > 64 || k > 64) {
-        // Use the tiled kernel which works for any size up to 256
-        // and only requires ~48KB shared memory (within standard limits)
         dim3 threads_256(WARP_SIZE, 32);  // 1024 threads
-        // Shared memory: 64×64 + 64×65 + 64×64 = 16KB + 16.25KB + 16KB = ~48KB
-        const size_t smem_size = (64 * 64 + 64 * 65 + 64 * 64) * sizeof(float);
-
-        // Configure extended shared memory for this kernel
-        static bool smem_configured_tiled = false;
-        if (!smem_configured_tiled) {
-            cudaFuncSetAttribute(solve_tri_f32_256x256_tiled,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-            smem_configured_tiled = true;
-        }
+        // Shared memory: 3 x 64×64 floats = 48 KB exactly (the X tile is XOR-swizzled instead of
+        // padded), which every CUDA arch allows without cudaFuncAttributeMaxDynamicSharedMemorySize.
+        // The previous padded layout needed 49408 B: above sm_60/61's hard 48 KB per-block cap, so
+        // the launch failed on every P100, and the opt-in that covered it elsewhere was a
+        // per-process, unchecked cudaFuncSetAttribute. No opt-in is needed any more.
+        constexpr size_t smem_size = 3 * 64 * 64 * sizeof(float);
+        static_assert(smem_size <= 48 * 1024, "solve_tri tiled kernel must fit the default 48 KB");
 
         solve_tri_f32_256x256_tiled<<<grid, threads_256, smem_size, stream>>>(
             A, B, X, ne02_fd, nb02, nb03, nb12, nb13, nb2, nb3, n, k);

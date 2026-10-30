@@ -37,6 +37,10 @@ static void test_fuzzing(testing & t);
 
 static bool g_python_mode = false;
 
+// the exit code ctest reads as "skipped" for test-jinja-py (tests/CMakeLists.txt, SKIP_RETURN_CODE)
+static const int JINJA_PY_SKIP_RC = 77;
+static bool python_can_import_jinja2(std::string & detail);
+
 int main(int argc, char *argv[]) {
     testing t(std::cout);
     t.verbose = true;
@@ -52,6 +56,18 @@ int main(int argc, char *argv[]) {
             g_python_mode = true;
         } else {
             t.set_filter(arg);
+        }
+    }
+
+    if (g_python_mode) {
+        // -py cross-checks every expected output against Python's jinja2. Without jinja2 there is nothing to
+        // cross-check against: say so and report SKIPPED, instead of failing every case on ModuleNotFoundError.
+        // The C++ renderer itself is covered by test-jinja (no -py) either way.
+        std::string detail;
+        if (!python_can_import_jinja2(detail)) {
+            std::cout << "SKIPPED: test-jinja -py needs python3 with the jinja2 package (pip install jinja2); "
+                      << detail << "\n";
+            return JINJA_PY_SKIP_RC;
         }
     }
 
@@ -836,6 +852,64 @@ static void test_filters(testing & t) {
 }
 
 static void test_literals(testing & t) {
+    // PXA (2026-10-23): Python string escapes (Flint's template uses replace("\x00", ""))
+    test_template(t, "escape \\xHH",
+        "{{ 'a\\x41b' }}",
+        json::object(),
+        "aAb"
+    );
+    test_template(t, "escape \\x00 in replace (Flint)",
+        "{{ s | replace('\\x00', '') }}",
+        {{"s", std::string("x\0y", 3)}},
+        "xy"
+    );
+    test_template(t, "escape \\x above 0x7f is a code point",
+        "{{ '\\xe9' }}",
+        json::object(),
+        "\xc3\xa9"
+    );
+    test_template(t, "escape \\uXXXX",
+        "{{ '\\u00e9\\u2713' }}",
+        json::object(),
+        "\xc3\xa9\xe2\x9c\x93"
+    );
+    // C++ only: Python string literals keep \ud83d\ude00 as two lone surrogates, which jinja2 cannot
+    // encode to UTF-8 (UnicodeEncodeError in test-jinja-py); our lexer joins the pair into one code point.
+    if (!g_python_mode) {
+        test_template(t, "escape surrogate pair",
+            "{{ '\\ud83d\\ude00' }}",
+            json::object(),
+            "\xf0\x9f\x98\x80"
+        );
+    }
+    test_template(t, "escape \\U",
+        "{{ '\\U0001F600' }}",
+        json::object(),
+        "\xf0\x9f\x98\x80"
+    );
+    // C++ only (Python rejects \U above 0x10FFFF at parse time and cannot encode a lone surrogate): both become U+FFFD
+    if (!g_python_mode) {
+        test_template(t, "escape \\U above U+10FFFF is U+FFFD",
+            "{{ 'a\\U00110000b' }}",
+            json::object(),
+            "a\xef\xbf\xbd" "b"
+        );
+        test_template(t, "escape lone surrogate is U+FFFD",
+            "{{ 'a\\ud800b' }}",
+            json::object(),
+            "a\xef\xbf\xbd" "b"
+        );
+    }
+    test_template(t, "escape octal",
+        "{{ '\\101\\61' }}",
+        json::object(),
+        "A1"
+    );
+    test_template(t, "unknown escape kept as written",
+        "{{ 'a\\db' }}",
+        json::object(),
+        "a\\db"
+    );
     test_template(t, "integer",
         "{{ 42 }}",
         json::object(),
@@ -2022,6 +2096,42 @@ template = env.from_string(tmpl)
 result = template.render(**vars_json)
 print(result, end='')
 )";
+
+static bool python_can_import_jinja2(std::string & detail) {
+#ifdef _WIN32
+    const char * python_executable = "python.exe";
+#else
+    const char * python_executable = "python3";
+#endif
+    const char * command_line[] = {python_executable, "-c", "import jinja2.sandbox, jinja2.ext", NULL};
+    struct subprocess_s subprocess;
+    const int options = subprocess_option_combined_stdout_stderr
+                      | subprocess_option_no_window
+                      | subprocess_option_inherit_environment
+                      | subprocess_option_search_user_path;
+    if (subprocess_create(command_line, options, &subprocess) != 0) {
+        detail = std::string(python_executable) + " could not be started";
+        return false;
+    }
+    std::string output;
+    char buffer[1024];
+    FILE * p_stdout = subprocess_stdout(&subprocess);
+    while (fgets(buffer, sizeof(buffer), p_stdout)) {
+        output += buffer;
+    }
+    int rc = -1;
+    subprocess_join(&subprocess, &rc);
+    subprocess_destroy(&subprocess);
+    if (rc != 0) {
+        const size_t nl = output.find_last_of('\n', output.size() >= 2 ? output.size() - 2 : 0);
+        detail = output.empty() ? "import failed" : output.substr(nl == std::string::npos ? 0 : nl + 1);
+        while (!detail.empty() && (detail.back() == '\n' || detail.back() == '\r')) {
+            detail.pop_back();
+        }
+        return false;
+    }
+    return true;
+}
 
 static void test_template_py(testing & t, const std::string & name, const std::string & tmpl, const json & vars, const std::string & expect) {
     t.test(name, [&tmpl, &vars, &expect](testing & t) {

@@ -18,10 +18,15 @@
 #define LLAMA_PXQN_KEY_CALIB      "pxa.pxqn.calib"      // string, sha256 of the calibration corpus
 #define LLAMA_PXQN_KEY_ALLOC      "pxa.pxqn.alloc"      // string, hash of the tier map
 #define LLAMA_PXQN_KEY_ENCODER    "pxa.pxqn.encoder"    // string, encoder build id
+#define LLAMA_PXQN_KEY_RECIPE     "pxa.pxqn.recipe"     // string, revision 2 only: the opaque sealed-recipe handle (seed + sites live in libggml-pxqn)
+// NOT the same thing as "pxa.pxqn.file_rev" (string, the per-layer-embedding table layout marker of the Pro encoder, which this reader ignores) nor
+// "pxa.recipe.id" (string, the classic quantizer's recipe label): only pxa.pxqn.rev is the rotation contract the loader gates on.
 
 // Reads the pxa.pxqn.* rotation contract. rev = 0 when the file has no pxa.pxqn.rev (an old PXQ
-// file, loads as today). THROWS std::runtime_error with a clear message when the revision is
-// newer than this build reads (rev > PXQN_REV), when a key has the wrong GGUF type, or when
+// file, loads as today). Revision 1: seed + sites from rot.seed / rot.sites (in the clear). Revision 2:
+// seed + sites resolved from pxa.pxqn.recipe by libggml-pxqn (ggml_pxqn_recipe_resolve). THROWS
+// std::runtime_error with a clear message when the revision is newer than this build reads
+// (rev > PXQN_REV_MAX), when a revision-2 handle cannot be resolved, when a key has the wrong GGUF type, or when
 // rot.sites names a site this build does not know -- each of those would otherwise decode wrong
 // without a sound.
 void llama_pxqn_read_keys(const struct gguf_context * ctx, uint32_t & rev, uint64_t & seed, uint32_t & sites);

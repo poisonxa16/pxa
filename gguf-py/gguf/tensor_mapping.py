@@ -202,6 +202,10 @@ class TensorNameMap:
         ),
 
         # Attention output norm
+        MODEL_TENSOR.ATTN_SINKS: (
+            "model.layers.{bid}.self_attn.softmax_offset", # flint
+        ),
+
         MODEL_TENSOR.ATTN_OUT_NORM: (
             "encoder.layer.{bid}.attention.output.LayerNorm",  # bert
             "encoder.layers.{bid}.norm1",                      # nomic-bert

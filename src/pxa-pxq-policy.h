@@ -160,6 +160,9 @@ static inline bool pxa_pxq_is_ssm_out(const std::string & name) {
 //
 // GGML_TYPE_COUNT ("leave it to the legacy pipeline"), mxfp4, q8_0 and f16 come back
 // untouched: rank -1 is not a ladder landing, so there is nothing for a ladder floor to lift.
+// Mamba-2 hybrids (nemotron_h) take the same floor: measured 2026-10-16 on Nemotron-3-Nano-4B (KLD vs Q8_0, wiki 8x512,
+// P100), PXQ4 0.0193 -> 0.0160 and PXQN4 0.0162 -> 0.0132 with ssm_out at q8_0 (+10% file size).
+
 static inline ggml_type pxa_pxq_ssm_out_floor(const std::string & name, ggml_type resolved) {
     if (!pxa_pxq_is_ssm_out(name)) {
         return resolved;

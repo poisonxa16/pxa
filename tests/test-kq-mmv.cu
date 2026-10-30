@@ -3,8 +3,8 @@
 // kq-mmv.cuh) against a double reference and against the incumbent q8_1 MMVQ on the same data.
 //
 // Checks (exit 0 = every one passed):
-//   (a) accuracy: Q4_K / Q5_K / Q6_K / Q8_0 x ny 1..8 x the 27B decode shapes (incl. the tensor-split halves
-//       and the 248320-row head), per path (h2 = sm_60 half2, i8 = dp4a). Reference: the dequantized weights
+//   (a) accuracy: Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 x ny 1..8 x the 27B decode shapes (incl. the tensor-split halves
+//       and the 248320-row head; Q8_0 / Q5_0 also the Nemotron-H 4B K = 3136 and Nemotron 3.5 Super shapes), per path (h2 = sm_60 half2, i8 = dp4a). Reference: the dequantized weights
 //       (host decode written from the block layouts) times the f32 x, in double, on a sample of rows.
 //       Errors are normalised per (row, column) by sqrt(sum_k (w_k x_k)^2). Pass: the new path's max and rms
 //       error <= the incumbent q8_1 MMVQ's on the same data (h2: strictly; i8 shares the q8_1 quantizer, so it
@@ -23,6 +23,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/mmvq-templates.cuh"
 #include "ggml-cuda/pxa/kq-mmv.cuh"
+#include "ggml-cuda/pxa/kq-vw.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -46,11 +47,13 @@ static int g_cc  = 600;
 
 // ------------------------------------------------------------------------------------------------ types
 struct tinfo { int kind; ggml_type gt; const char * name; int qk, bb; };
-static const tinfo TYPES[4] = {
+#define NTYPES 5
+static const tinfo TYPES[NTYPES] = {
     { KQ_Q4_K, GGML_TYPE_Q4_K, "Q4_K", 256, 144 },
     { KQ_Q5_K, GGML_TYPE_Q5_K, "Q5_K", 256, 176 },
     { KQ_Q6_K, GGML_TYPE_Q6_K, "Q6_K", 256, 210 },
     { KQ_Q8_0, GGML_TYPE_Q8_0, "Q8_0", 32,  34  },
+    { KQ_Q5_0, GGML_TYPE_Q5_0, "Q5_0", 32,  22  },
 };
 
 static inline uint16_t f2h(float f) { __half h = __float2half_rn(f); uint16_t u; memcpy(&u, &h, 2); return u; }
@@ -71,6 +74,7 @@ static void gen_weights(const tinfo & T, std::vector<uint8_t> & w, int64_t R, in
             case KQ_Q4_K: case KQ_Q5_K: put(blk, 1e-3f*(0.5f + rndf())); put(blk + 2, 2e-3f*(0.5f + rndf())); break;
             case KQ_Q6_K: put(blk + 208, 1e-3f*(0.5f + rndf())); break;
             case KQ_Q8_0: put(blk, 1e-2f*(0.5f + rndf())); break;
+            case KQ_Q5_0: put(blk, 8e-2f*(0.5f + rndf())); break;
         }
     }
 }
@@ -90,6 +94,15 @@ static void deq_row(const tinfo & T, const uint8_t * row, int64_t K, std::vector
         if (T.kind == KQ_Q8_0) {
             const double d = h2f(B);
             for (int i = 0; i < 32; ++i) o[i] = d*(int8_t)B[2 + i];
+        } else if (T.kind == KQ_Q5_0) {   // ggml dequantize_row_q5_0
+            const double d = h2f(B);
+            uint32_t qh; memcpy(&qh, B + 2, 4);
+            const uint8_t * qs = B + 6;
+            for (int j = 0; j < 16; ++j) {
+                const int x0 = ((qs[j] & 0x0F) | (((qh >> j) << 4) & 0x10)) - 16;
+                const int x1 = ((qs[j] >>   4) | ((qh >> (j + 12)) & 0x10)) - 16;
+                o[j] = d*x0; o[j + 16] = d*x1;
+            }
         } else if (T.kind == KQ_Q6_K) {
             const double d = h2f(B + 208);
             const uint8_t * ql = B, * qh = B + 128; const int8_t * sc = (const int8_t *)(B + 192);
@@ -176,6 +189,7 @@ static void inc_launch(const tinfo & T, int ny, const float * x, int64_t sx, voi
         case KQ_Q5_K: inc_launch_ny<GGML_TYPE_Q5_K>(ny, w, q8, dst, R, K, Kpad); break;
         case KQ_Q6_K: inc_launch_ny<GGML_TYPE_Q6_K>(ny, w, q8, dst, R, K, Kpad); break;
         case KQ_Q8_0: inc_launch_ny<GGML_TYPE_Q8_0>(ny, w, q8, dst, R, K, Kpad); break;
+        case KQ_Q5_0: inc_launch_ny<GGML_TYPE_Q5_0>(ny, w, q8, dst, R, K, Kpad); break;
     }
     CUCK(cudaGetLastError());
 }
@@ -435,6 +449,47 @@ static void bench_shape(const tinfo & T, int64_t K, int64_t R, int path, int ny 
         for (int i = 0; i < it; ++i) new_launch(T, path, ny, dx, K, (int)K, &m, 1, false, 0.f);
         cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1); t_new = std::min(t_new, ms/it);
     }
+    if (const char * dp = getenv("KQ_DUMP")) {   // dump the new kernel's output (bitwise A/B of two builds)
+        std::vector<float> hy((size_t)ny*R);
+        CUCK(cudaMemcpy(hy.data(), dy, hy.size()*4, cudaMemcpyDeviceToHost));
+        char fn[512]; snprintf(fn, sizeof(fn), "%s-%s-ny%d-K%lld-R%lld.bin", dp, T.name, ny, (long long)K, (long long)R);
+        FILE * f = fopen(fn, "wb"); if (f) { fwrite(hy.data(), 4, hy.size(), f); fclose(f); }
+    }
+    float t_vw = 0.f;   // the verify-width kqvw kernel on the same data (Q8_0, ny 2..6, ny*K <= KQVW_XMAX)
+    if (T.kind == KQ_Q8_0 && ny >= 2 && ny * K <= KQVW_XMAX && K % 1024 == 0) {
+        kqvw_args va = {}; va.w[0] = (const uint8_t *) dw; va.y[0] = dy; va.nb01[0] = (K/32)*34; va.sy[0] = R;
+        va.r0[0] = 0; va.r0[1] = (int) R; va.nm = 1; va.K = (int) K; va.x = dx; va.sx = K;
+        t_vw = 1e30f;
+        for (int rep = 0; rep < 3; ++rep) {
+            float ms;
+            cudaEventRecord(e0);
+            for (int i = 0; i < it; ++i) kqvw_launch(va, ny, g_nsm, 0);
+            cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1); t_vw = std::min(t_vw, ms/it);
+        }
+        printf("  bench kqvw ny=%d K=%5lld R=%6lld  %7.1f us %6.1f GB/s\n", ny, (long long)K, (long long)R, t_vw*1e3, (double)hw.size()/1e9/(t_vw*1e-3));
+        // k_kqhv (width-invariant schedule) -- time, and column c vs the one-column k_kq_mmv of column c, bitwise
+        if (kqhv_smem_bytes(ny, (int) K) <= 48 * 1024) {
+            float t_hv = 1e30f;
+            for (int rep = 0; rep < 3; ++rep) {
+                float ms;
+                cudaEventRecord(e0);
+                for (int i = 0; i < it; ++i) kqhv_launch(va, ny, g_nsm, 0);
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1); t_hv = std::min(t_hv, ms/it);
+            }
+            CUCK(cudaGetLastError());
+            std::vector<float> hv = dl(dy, (size_t)ny*R);
+            int bad = 0;
+            for (int c = 0; c < ny; ++c) {
+                mm m1{dw, dy, (int)R, R};
+                new_launch(T, KQMMV_H2, 1, dx + (size_t)c*K, K, (int)K, &m1, 1, false, 0.f);
+                std::vector<float> h1 = dl(dy, (size_t)R);
+                for (int64_t r = 0; r < R; ++r) if (memcmp(&h1[r], &hv[(size_t)c*R + r], 4) != 0) ++bad;
+            }
+            CHECK(bad == 0, "kqhv ny=%d K=%lld R=%lld: %d values differ from the one-column k_kq_mmv", ny, (long long)K, (long long)R, bad);
+            printf("  bench kqhv ny=%d K=%5lld R=%6lld  %7.1f us %6.1f GB/s  vs ny=1 kq_mmv per column: %s\n", ny, (long long)K, (long long)R,
+                   t_hv*1e3, (double)hw.size()/1e9/(t_hv*1e-3), bad ? "DIFFERS" : "bit-identical");
+        }
+    }
     const double gb = (double)hw.size()/1e9;
     printf("  bench %s %s ny=%d K=%5lld R=%6lld  incumbent %7.1f us %6.1f GB/s | new %7.1f us %6.1f GB/s  (x%.2f)\n",
            T.name, path ? "i8" : "h2", ny, (long long)K, (long long)R, t_inc*1e3, gb/(t_inc*1e-3), t_new*1e3, gb/(t_new*1e-3), t_inc/t_new);
@@ -453,7 +508,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "-width")) { width = true; bench = true; only_bench = true; }   // verify-width table
         else if (!strcmp(argv[i], "-h2")) bench_path = KQMMV_H2;
         else if (!strcmp(argv[i], "-i8")) bench_path = KQMMV_I8;
-        else if (!strcmp(argv[i], "-shape") && i + 3 < argc) {   // -shape <type index 0..3> K R: bench that one only
+        else if (!strcmp(argv[i], "-shape") && i + 3 < argc) {   // -shape <type index 0..4> K R: bench that one only
             only_type = atoi(argv[i + 1]); only_K = atoll(argv[i + 2]); only_R = atoll(argv[i + 3]); i += 3;
             bench = true; only_bench = true;
         }
@@ -466,9 +521,17 @@ int main(int argc, char ** argv) {
     const int64_t shapes[][2] = { {5120, 10240}, {5120, 6144}, {5120, 12288}, {5120, 1024}, {5120, 48},
                                   {5120, 8704}, {8704, 5120}, {3072, 5120}, {17408, 5120}, {5120, 248320} };
     const int nshapes = quick ? 3 : (int)(sizeof(shapes)/sizeof(shapes[0]));
+    // Nemotron-H 4B (Q4_K_M mix): ssm_in, ffn_up, attn_q, attn_k / v at K = 3136 (Q5_0 / Q8_0: K % 256 != 0), the head
+    const int64_t shapes32[][2] = { {3136, 17504}, {3136, 12544}, {3136, 5120}, {3136, 1024}, {3136, 131072},
+                                    // Nemotron 3.5 Super Q8_0 (todo nemo-super-nextn-identity): ssm_out 8192 x 4096 (x fits the block at ny 1,
+                                    // not at ny 2: the PXA_KQMMV_VERIFY_ID chunked form), latent down / up, the 131072-row head
+                                    {8192, 4096}, {4096, 1024}, {1024, 4096}, {4096, 131072} };
+    const int nshapes32 = quick ? 2 : (int)(sizeof(shapes32)/sizeof(shapes32[0]));
     for (const tinfo & T : TYPES) {
+        if (getenv("KQ_TYPE") && strcmp(getenv("KQ_TYPE"), T.name) != 0) continue;
         printf("%s\n", T.name);
         if (!only_bench) for (int s = 0; s < nshapes; ++s) test_shape(T, shapes[s][0], shapes[s][1], quick);
+        if (!only_bench && T.qk == 32) for (int s = 0; s < nshapes32; ++s) test_shape(T, shapes32[s][0], shapes32[s][1], quick);
         if (!only_bench) test_group(T);
         if (!only_bench) test_gu(T);
         if (!only_bench) test_bias(T);
@@ -477,13 +540,16 @@ int main(int argc, char ** argv) {
         const int path = bench_path >= 0 ? bench_path : (g_cc < 610 ? KQMMV_H2 : KQMMV_I8);
         if (width) {
             // verify widths: the Q8_0 LM head (whole / tensor-split half), attention k/v, DeltaNet beta/alpha
-            const int64_t ws[][2] = { {5120, 248320}, {5120, 124160}, {5120, 1024}, {5120, 512}, {5120, 48}, {5120, 24}, {17408, 5120} };
+            const int64_t ws[][2] = { {2048, 248320}, {2048, 81920}, {5120, 248320}, {5120, 124160}, {5120, 1024}, {5120, 512}, {5120, 48}, {5120, 24}, {17408, 5120} };
             for (const auto & s : ws)
                 for (int ny : {1, 2, 3, 4, 5, 6, 8}) if (!getenv("KQW_NY") || atoi(getenv("KQW_NY")) == ny) bench_shape(TYPES[KQ_Q8_0], s[0], s[1], path, ny);
-        } else if (only_type >= 0) bench_shape(TYPES[only_type & 3], only_K, only_R, path);
+        } else if (only_type >= 0) bench_shape(TYPES[only_type % NTYPES], only_K, only_R, path);
         else {
-            for (const tinfo & T : TYPES)
+            for (const tinfo & T : TYPES) {
+                if (getenv("KQ_TYPE") && strcmp(getenv("KQ_TYPE"), T.name) != 0) continue;
                 for (const auto & s : shapes) bench_shape(T, s[0], s[1], path);
+                if (T.qk == 32) for (const auto & s : shapes32) bench_shape(T, s[0], s[1], path);
+            }
             // verify widths on the widest per-card shape
             for (const tinfo & T : TYPES)
                 for (int ny : {2, 4, 8}) bench_shape(T, 5120, 10240, path, ny);

@@ -20,6 +20,13 @@ using chat_template_caps = jinja::caps;
 using json = nlohmann::ordered_json;
 
 struct common_chat_templates;
+struct common_chat_template;
+
+// true when the template cannot take a system message after position 0 (its source raises
+// "System message must be at the beginning", or a probe with a later system message raises while
+// the same conversation without it renders); common_chat_templates_apply then merges every later
+// system message into messages[0] (chat-template-system-msg)
+bool common_chat_template_probe_system_first_only(const common_chat_template & tmpl);
 
 namespace autoparser {
 struct generation_params;
@@ -55,6 +62,7 @@ struct common_chat_template {
     std::string eos_tok;
     std::string src;
     chat_template_caps caps;
+    bool system_first_only = false;
 
     common_chat_template(const std::string & src, const std::string & bos_token, const std::string & eos_token) {
         jinja::lexer lexer;
@@ -66,6 +74,7 @@ struct common_chat_template {
         this->eos_tok = eos_token;
 
         this->caps = jinja::caps_get(prog);
+        this->system_first_only = common_chat_template_probe_system_first_only(*this);
         // LOG_INF("%s: caps:\n%s\n", __func__, this->caps.to_string().c_str());
     }
 

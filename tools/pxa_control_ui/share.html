@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Share your rig's speed - PXA Control</title>
+<link rel="icon" href="/favicon.png">
+<link rel="stylesheet" href="/share.css">
+<script src="/share.js" defer></script>
+</head>
+<body>
+<header class="sh-hd">
+  <a class="sh-brand" href="/" title="back to PXA Control"><img src="/mark.png" alt="" width="28" height="28"><b>PXA</b> Control</a>
+  <span class="sh-free" title="the share card is free, always">Free</span>
+</header>
+<main class="sh-main" id="main">
+  <h1>Share your rig's speed</h1>
+  <p class="sh-sub">One click makes an image of a benchmark you ran: your cards, the model and the speed you measured. Nothing is sent anywhere; you post it yourself.</p>
+  <div class="sh-row">
+    <label for="sh-run">Run</label>
+    <select id="sh-run" aria-label="benchmark run"></select>
+    <label class="sh-chk"><input type="checkbox" id="sh-name"> Show my board name</label>
+  </div>
+  <p class="sh-msg" id="sh-msg" role="status" aria-live="polite"></p>
+  <figure class="sh-fig" id="sh-fig" hidden>
+    <img id="sh-img" alt="your bench card" width="1200" height="630">
+  </figure>
+  <div class="sh-actions" id="sh-actions" hidden>
+    <button class="sh-b sh-primary" id="sh-png" type="button">Save image (PNG)</button>
+    <button class="sh-b" id="sh-copy" type="button">Copy image</button>
+    <button class="sh-b" id="sh-text" type="button">Copy text for Discord</button>
+    <a class="sh-b" id="sh-svg" download="pxa-bench-card.svg">Save SVG</a>
+  </div>
+  <footer class="sh-foot">
+    <a href="https://discord.pxanetwork.com" target="_blank" rel="noopener">PXA Network Discord</a>
+    <a href="/#store">PXA Store</a>
+    <a href="https://benchmarks.pxanetwork.com" target="_blank" rel="noopener">Bench board</a>
+  </footer>
+</main>
+</body>
+</html>

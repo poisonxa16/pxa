@@ -3,9 +3,14 @@
 Off unless you turn it on (Control -> Settings -> Home Assistant, or PXA_CONTROL_MQTT=1).  When it
 is on, once every `interval` seconds Control publishes the same numbers its Live sampler already
 collects -- generation and prompt tokens/s, busy and total slots, KV-cache fill, expert-cache hit
-rate, draft acceptance, per-card temperature / VRAM / utilisation / power, host RAM+CPU, and the
-expert map's learned-session count -- as Home Assistant entities, each with its own discovery
+rate, draft acceptance, per-card temperature / VRAM / utilisation / power, host RAM+CPU+swap, and
+the expert map's learned-session count -- as Home Assistant entities, each with its own discovery
 config so nothing has to be written by hand in HA.
+
+A unit is only published with a value that is really in it.  The sampler counts host memory in MiB,
+so RAM and swap go out as MiB under a MiB unit (`device_class: data_size`) with a real percentage
+beside them, never a MiB count under a "%" unit -- which is how a healthy box came to read
+"RAM used 8386 %" in Home Assistant on 2026-10-11.
 
 Everything stays on your LAN: this module talks to the broker you name and to nothing else.
 Nothing is ever sent to us.
@@ -29,7 +34,11 @@ import struct
 import threading
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# The shape of what we publish, bumped whenever a payload changes so a reader knows a retained
+# discovery config from an older publisher is not this one.  Home Assistant re-reads a config every
+# time its payload arrives, so a unit change lands on the entities it already created; 2 is the
+# version that did that for host memory (MiB counts had been published under a "%" unit).
 
 DEFAULTS = {"enabled": False, "host": "", "port": 1883, "user": "", "password": "", "tls": False,
             "base": "pxa", "prefix": "homeassistant", "interval": 15.0, "discovery": True}
@@ -289,65 +298,103 @@ def _pct(v):
     return None if f is None else round(f * 100.0, 1)
 
 
-# (metric, label, unit, device_class, state_class, how to read it out of a server row)
+def _pct_of(part, whole):
+    """Used / total as a real percentage, or None when there is no total to divide by.
+
+    The Live sampler counts host memory in MiB (pxa_control._sample_host), so a metric that is a
+    count of MiB must never be published under a "%" unit: on 2026-10-11 that reported a box using
+    8 GiB of RAM as "RAM used 8386 %" and its 1 GiB of swap as "1026 %" in Home Assistant."""
+    p, w = _num(part), _num(whole)
+    if p is None or w is None or w <= 0:
+        return None
+    return round(p / w * 100.0, 1)
+
+
+# (metric, label, unit, device_class, state_class, how to read it, display precision)
+#
+# The unit has to be the unit the value is in, and the device_class has to be one Home Assistant
+# knows for that unit (a wrong pair is a rejected entity); % carries no device_class because HA has
+# no class for it.  Display precision is a property of the METRIC, never of the value: deriving it
+# from the number would rewrite a discovery config the moment a reading happened to land on a whole
+# number.
 SERVER_METRICS = (
-    ("tokens_per_second", "Generation speed", "tok/s", None, "measurement", lambda s: _num(s.get("dec"))),
-    ("prompt_tokens_per_second", "Prompt speed", "tok/s", None, "measurement", lambda s: _num(s.get("pre"))),
-    ("slots_busy", "Slots busy", None, None, "measurement", lambda s: _num(s.get("busy"))),
-    ("slots_total", "Slots", None, None, "measurement", lambda s: _num(s.get("slots"))),
-    ("kv_cache_used", "KV cache used", "%", None, "measurement", lambda s: _pct(s.get("ctx"))),
-    ("expert_cache_hit", "Expert cache hit", "%", None, "measurement", lambda s: _pct(s.get("xhit"))),
-    ("draft_acceptance", "Draft acceptance", "%", None, "measurement", lambda s: _pct(s.get("acc"))),
-    ("model", "Model", None, None, None, lambda s: (s.get("model") or None)),
-    ("state", "State", None, None, None, lambda s: (s.get("phase") or None)),
+    ("tokens_per_second", "Generation speed", "tok/s", None, "measurement", lambda s: _num(s.get("dec")), 1),
+    ("prompt_tokens_per_second", "Prompt speed", "tok/s", None, "measurement", lambda s: _num(s.get("pre")), 1),
+    ("slots_busy", "Slots busy", None, None, "measurement", lambda s: _num(s.get("busy")), 0),
+    ("slots_total", "Slots", None, None, "measurement", lambda s: _num(s.get("slots")), 0),
+    ("kv_cache_used", "KV cache used", "%", None, "measurement", lambda s: _pct(s.get("ctx")), 1),
+    ("expert_cache_hit", "Expert cache hit", "%", None, "measurement", lambda s: _pct(s.get("xhit")), 1),
+    ("draft_acceptance", "Draft acceptance", "%", None, "measurement", lambda s: _pct(s.get("acc")), 1),
+    ("model", "Model", None, None, None, lambda s: (s.get("model") or None), None),
+    ("state", "State", None, None, None, lambda s: (s.get("phase") or None), None),
 )
 CARD_METRICS = (
-    ("temperature", "Temperature", "°C", "temperature", "measurement", lambda c: _num(c.get("temp"))),
-    ("memory_used", "VRAM used", "MiB", None, "measurement", lambda c: _num(c.get("mem"))),
-    ("memory_total", "VRAM total", "MiB", None, None, lambda c: _num(c.get("mem_total_mib"))),
-    ("utilization", "Utilisation", "%", None, "measurement", lambda c: _num(c.get("util"))),
-    ("power", "Power", "W", "power", "measurement", lambda c: _num(c.get("power"))),
+    ("temperature", "Temperature", "°C", "temperature", "measurement", lambda c: _num(c.get("temp")), 1),
+    ("memory_used", "VRAM used", "MiB", "data_size", "measurement", lambda c: _num(c.get("mem")), 1),
+    ("memory_total", "VRAM total", "MiB", "data_size", None, lambda c: _num(c.get("mem_total_mib")), 0),
+    ("utilization", "Utilisation", "%", None, "measurement", lambda c: _num(c.get("util")), 0),
+    ("power", "Power", "W", "power", "measurement", lambda c: _num(c.get("power")), 1),
 )
 HOST_METRICS = (
-    ("ram_used", "RAM used", "%", None, "measurement", lambda h: _num(h.get("ram"))),
-    ("cpu_used", "CPU used", "%", None, "measurement", lambda h: _num(h.get("cpu"))),
-    ("swap_used", "Swap used", "%", None, "measurement", lambda h: _num(h.get("swap"))),
+    # both readings of the same memory: the share Home Assistant graphs as a percentage, and the
+    # amount in bytes-sized units, so nobody has to convert one to read the other.  The amounts carry
+    # data_size (MiB is one of its units); the shares carry no device_class, like every other percent.
+    ("ram_used", "RAM used", "%", None, "measurement",
+     lambda h: _pct_of(h.get("ram"), h.get("ram_total_mib")), 1),
+    ("ram_used_mib", "RAM used (amount)", "MiB", "data_size", "measurement",
+     lambda h: _num(h.get("ram")), 1),
+    ("ram_total_mib", "RAM total", "MiB", "data_size", None,
+     lambda h: _num(h.get("ram_total_mib")), 0),
+    ("swap_used", "Swap used", "%", None, "measurement",
+     lambda h: _pct_of(h.get("swap"), h.get("swap_total_mib")), 1),
+    ("swap_used_mib", "Swap used (amount)", "MiB", "data_size", "measurement",
+     lambda h: _num(h.get("swap")), 1),
+    ("swap_total_mib", "Swap total", "MiB", "data_size", None,
+     lambda h: _num(h.get("swap_total_mib")), 0),
+    ("cpu_used", "CPU used", "%", None, "measurement", lambda h: _num(h.get("cpu")), 1),
 )
 EXPERT_METRICS = (
     ("learned_sessions", "Expert map sessions", None, None, "measurement",
-     lambda e: _num(e.get("sessions"))),
+     lambda e: _num(e.get("sessions")), 0),
     ("learning", "Expert map", None, None, None,
-     lambda e: ("learning" if e.get("learning") else "idle")),
+     lambda e: ("learning" if e.get("learning") else "idle"), None),
 )
 
 
-def entities(snapshot, base, host_label="pxa-control"):
+def entities(snapshot, base, host_label="pxa-control", version=""):
     """Every entity as (id, metric, value, config).
 
     `snapshot` is what PXA Control's Live sampler hands over:
         {"cards": [{"index", "name", "mem_total_mib", "mem", "util", "temp", "power", ...}],
          "servers": [{"key", "name", "dec", "pre", "busy", "slots", "ctx", "xhit", "acc",
                       "model", "phase", ...}],
-         "host": {"ram", "cpu", "swap"},
+         "host": {"ram", "ram_total_mib", "cpu", "swap", "swap_total_mib"},
          "expert": {"sessions", "learning"}}
 
     The config is the Home Assistant discovery payload; the caller publishes it retained to
     `<prefix>/sensor/<id>/<metric>/config` and the value to `<base>/<id>/<metric>`.
     """
     dev_id = _dev(host_label)
+    sw = version or _version() or "unknown"
     device = {"identifiers": [dev_id], "name": host_label, "manufacturer": "PXA",
-              "model": "PXA Control", "sw_version": "3.1"}
+              "model": "PXA Control", "sw_version": sw}
+    # Home Assistant's discovery schema expects an origin block (the software the entities came
+    # from); it is also what makes every payload change when the publisher does, so a Home Assistant
+    # holding an older retained config re-reads this one instead of keeping the old units.
+    origin = {"name": "PXA Control", "sw_version": sw}
     avail = base + "/status"
     out = []
 
     def add(eid, metric, value, label, unit=None, device_class=None, state_class=None, dev=None,
-            category=None, icon=None):
+            category=None, icon=None, precision=None):
         if value is None:
             return                       # a metric this build does not report is not an entity
+        if isinstance(value, float):
+            value = round(value, 1)      # 2.7023645689978726 % is a reading, not a display
         obj = {"name": label, "unique_id": "%s_%s" % (eid, metric),
                "state_topic": "%s/%s/%s" % (base, eid, metric),
                "availability_topic": avail, "payload_available": "online",
-               "payload_not_available": "offline", "device": dev or device}
+               "payload_not_available": "offline", "device": dev or device, "origin": origin}
         if unit:
             obj["unit_of_measurement"] = unit
         if device_class:
@@ -358,13 +405,15 @@ def entities(snapshot, base, host_label="pxa-control"):
             obj["entity_category"] = category
         if icon:
             obj["icon"] = icon
+        if precision is not None and isinstance(value, (int, float)):
+            obj["suggested_display_precision"] = int(precision)
         out.append((eid, metric, value, obj))
 
     for s in snapshot.get("servers") or []:
         eid = "server_" + _slug(s.get("key") or s.get("name") or "server")
-        for metric, label, unit, dc, sc, get in SERVER_METRICS:
+        for metric, label, unit, dc, sc, get, prec in SERVER_METRICS:
             name = label if not s.get("name") else "%s %s" % (s["name"], label)
-            add(eid, metric, get(s), name, unit, dc, sc)
+            add(eid, metric, get(s), name, unit, dc, sc, precision=prec)
     for c in snapshot.get("cards") or []:
         i = c.get("index")
         eid = "gpu_%s" % i
@@ -372,20 +421,31 @@ def entities(snapshot, base, host_label="pxa-control"):
                 "manufacturer": "PXA", "via_device": dev_id}
         if c.get("name"):
             gdev["model"] = c["name"]
-        for metric, label, unit, dc, sc, get in CARD_METRICS:
+        for metric, label, unit, dc, sc, get, prec in CARD_METRICS:
             add(eid, metric, get(c), "GPU %s %s" % (i, label), unit, dc, sc, dev=gdev,
-                category="diagnostic" if metric in ("memory_total",) else None)
+                category="diagnostic" if metric in ("memory_total",) else None, precision=prec)
     h = snapshot.get("host") or {}
-    for metric, label, unit, dc, sc, get in HOST_METRICS:
-        add("host", metric, get(h), label, unit, dc, sc, category="diagnostic")
+    for metric, label, unit, dc, sc, get, prec in HOST_METRICS:
+        add("host", metric, get(h), label, unit, dc, sc, category="diagnostic", precision=prec)
     if "expert" in snapshot:
         # guarded by PRESENCE, not by an empty dict: the map's state metric is never None, so an absent
         # section would otherwise publish "idle" and tell Home Assistant the map is idle when there is
         # no map at all.
         e = snapshot.get("expert") or {}
-        for metric, label, unit, dc, sc, get in EXPERT_METRICS:
-            add("expert_map", metric, get(e), label, unit, dc, sc, icon="mdi:brain")
+        for metric, label, unit, dc, sc, get, prec in EXPERT_METRICS:
+            add("expert_map", metric, get(e), label, unit, dc, sc, icon="mdi:brain", precision=prec)
     return out
+
+
+def _version():
+    """The Control package's version token, for the origin block.  Imported lazily: pxa_control
+    imports this module, so asking it at import time would be a cycle -- and this is only reached
+    when the caller did not pass a version (the real publisher always does)."""
+    try:
+        import pxa_control as C                                       # noqa: PLC0415 - see the docstring
+        return C.CONTROL_VERSION
+    except Exception:                                                 # noqa: BLE001
+        return ""
 
 
 def discovery_topics(ents, prefix):
@@ -426,11 +486,12 @@ class Publisher(threading.Thread):
     every failure is recorded in `status()` rather than raised: a broker that went away must not
     take PXA Control with it."""
 
-    def __init__(self, cfg, snapshot_fn, host_label, log=None, clock=time.time):
+    def __init__(self, cfg, snapshot_fn, host_label, log=None, clock=time.time, version=""):
         threading.Thread.__init__(self, name="pxa-mqtt", daemon=True)
         self.cfg = dict(cfg)
         self.snapshot_fn = snapshot_fn
         self.host_label = host_label
+        self.version = version
         self.log = log or (lambda *_: None)
         self.clock = clock
         self.stop_ev = threading.Event()
@@ -465,10 +526,10 @@ class Publisher(threading.Thread):
             self.log("mqtt: connected to %s:%s" % (cfg["host"], cfg["port"]))
         c = self.client
         if cfg["discovery"]:
-            ents = entities(self._snapshot(), cfg["base"], self.host_label)
+            ents = entities(self._snapshot(), cfg["base"], self.host_label, self.version)
             for topic, payload in discovery_topics(ents, cfg["prefix"]):
                 c.publish(topic, payload, retain=True)
-        ents = entities(self._snapshot(), cfg["base"], self.host_label)
+        ents = entities(self._snapshot(), cfg["base"], self.host_label, self.version)
         for topic, payload, retain in state_topics(ents, cfg["base"]):
             c.publish(topic, payload, retain=retain)
             self.published += 1

@@ -19,6 +19,11 @@ produced from the tree BEFORE the registry took over the pxa-enhance.cuh resolve
 what the inline resolvers answered: the same values at every config level, card set and model profile, the same
 caching (once, per model-profile generation, or live), the same one-line notices.
 
+An INTENDED default change moves golden lines; refresh them only with a proof that the change is the whole delta:
+a build with that commit's resolver hunk reverted must pass the old golden 2964/2964, then --write-golden from the
+head build. 2026-10-19: d87a05f7e8 (PXA_ROUTER_FUSE mode 3 auto on one P100 x Gemma 4
+MoE, ledger gemma-router-fuse-p60) moved 7 scenarios (single sm_60 card, gemma4 profile, ENHANCE level).
+
 The second half of the test is the property the golden cannot show, because the tree before the change had no
 rows: a row is resolved on the first read of THAT row, and a variable's warning appears when its row is read,
 not when some other row is.
@@ -244,6 +249,31 @@ def lazy_checks(binp):
     return fails
 
 
+def turing_checks(binp):
+    # port of public PR #13: the lever is mainline-Q-only, so the default stays 64 (the old crossover) at every
+    # level and for every model profile; 256 is opt-in
+    checks = [({}, 64), ({"PXA_REFERENCE": "1"}, 64), ({"PXA_ENHANCE": "0"}, 64)]
+    for value, want in [("0", 0), ("128", 128), ("256", 256), ("bad", 64), ("-1", 64), ("", 64)]:
+        checks.append(({"PXA_TURING_CUBLAS_NE11": value}, want))
+    fails = []
+    for env, want in checks:
+        rc, text = run(binp, env, ["topo", "750", "get", "turing_cublas_ne11"])
+        values = [line for line in text.splitlines() if line.startswith("turing_cublas_ne11=")]
+        if rc or values != ["turing_cublas_ne11=%d" % want]:
+            fails.append("Turing default/override %r: %s" % (env, text))
+
+    args = ["topo", "750", "get", "turing_cublas_ne11"]
+    for profile in ("dense", "dense_pxq4", "pxq2_only", "pxq3_only", "dense"):
+        args += ["prof"] + PROFS[profile] + ["get", "turing_cublas_ne11"]
+    for env, want in [({}, [64] * 6), ({"PXA_TURING_CUBLAS_NE11": "128"}, [128] * 6),
+                      ({"PXA_TURING_CUBLAS_NE11": "256"}, [256] * 6)]:
+        rc, text = run(binp, env, args)
+        values = [int(line.split("=")[1]) for line in text.splitlines() if line.startswith("turing_cublas_ne11=")]
+        if rc or values != want:
+            fails.append("Turing model-profile changes %r: %s" % (env, text))
+    return fails
+
+
 # ---------------------------------------------------------------------------------------------- main
 def main():
     args = sys.argv[1:]
@@ -294,8 +324,11 @@ def main():
     lazy = lazy_checks(binp)
     for f in lazy:
         print("FAIL lazy: " + f)
-    ok = not failed and not missing and not lazy
-    print("test-pxa-lever-resolve: %s (%d scenarios against the golden, %d laziness checks)" %
+    turing = turing_checks(binp)
+    for f in turing:
+        print("FAIL Turing: " + f)
+    ok = not failed and not missing and not lazy and not turing
+    print("test-pxa-lever-resolve: %s (%d scenarios against the golden, %d laziness checks, 12 Turing checks)" %
           ("OK" if ok else "FAILED", len(res), 6))
     return 0 if ok else 1
 

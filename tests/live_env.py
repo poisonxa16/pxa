@@ -32,6 +32,7 @@ try:
 except Exception:
     pass
 cards = st.get("cards") or []
+pmode = st.get("power_mode") or "ok"      # "ok" | "na" ([N/A]) | "unsupported" ([Not Supported]) | "zero" (0.00): the power feed a test wants
 args = sys.argv[1:]
 q = next((a.split("=", 1)[1] for a in args if a.startswith("--query-gpu=")), None)
 qa = next((a.split("=", 1)[1] for a in args if a.startswith("--query-compute-apps=")), None)
@@ -40,6 +41,8 @@ def val(f, i, c):
     load, heat = c.get("load", 0.0), c.get("heat", 0.0)
     wob = math.sin(t / 3.1 + i) * .5 + math.sin(t / 1.3 + 2 * i) * .3
     power = c["idle_w"] + (c["limit_w"] - c["idle_w"]) * min(1.0, load * .9 + wob * .05 * load)
+    if f in ("power.draw", "power.limit") and pmode != "ok":
+        return {"na": "[N/A]", "unsupported": "[Not Supported]", "zero": "0.00"}.get(pmode, "[N/A]")
     return {"index": str(i), "name": c["name"], "compute_cap": c["cc"], "memory.total": str(c["mem_total"]),
             "memory.used": str(int(c["mem_base"] + c["mem_total"] * 0.08 * load)), "uuid": "GPU-fake-%%d" %% i,
             "temperature.gpu": "%%d" %% round(34 + 44 * heat + wob),
@@ -61,29 +64,54 @@ sys.exit(0)
 '''
 
 
+def write_gguf(path, arch="llama"):
+    """a tiny GGUF the model scanner accepts as a model (one transformer-block tensor): the library lists it"""
+    import struct
+
+    def s_(x):
+        b = x.encode()
+        return struct.pack("<Q", len(b)) + b
+    with open(path, "wb") as f:
+        f.write(b"GGUF" + struct.pack("<IQQ", 3, 1, 1))
+        f.write(s_("general.architecture") + struct.pack("<I", 8) + s_(arch))
+        f.write(s_("blk.0.attn_q.weight") + struct.pack("<I", 1) + struct.pack("<Q", 64) + struct.pack("<I", 1) + struct.pack("<Q", 0))
+        f.write(b"\0" * (32 - f.tell() % 32))
+        f.write(b"\0" * 128)
+
+
+
 class Engine(object):
     """One fake llama-server: a scripted workload behind the endpoints the Live tab reads."""
 
     def __init__(self, name, gpus, port=0, slots=2, dec_tps=34.0, pre_tps=820.0, spec=True, xcache=False, metrics=False, seed=1, idle_s=(2.0, 7.0),
-                 stats=True, n_ctx=32768):
+                 stats=True, n_ctx=32768, model_file="tiny.gguf", comp_delay=0.0, quiet=False):
         self.name, self.port, self.gpus, self.np = name, port, gpus, slots
+        self.model_file = model_file                       # what the fleet calls the model this server serves
         self.dec_tps, self.pre_tps, self.spec, self.xcache, self.metrics, self.stats = dec_tps, pre_tps, spec, xcache, metrics, stats
         self.n_ctx = n_ctx
+        self.quiet = quiet                                 # no scripted workload: the only requests are the ones a test sends
+        self.comp_delay = comp_delay                       # seconds each POST /completion takes (a benchmark then lasts a few seconds)
         self.rnd = random.Random(seed)
         self.idle_s = idle_s
         self.lock = threading.Lock()
         self.slots = [{"id": i, "task": -1, "busy": False, "next": time.time() + self.rnd.uniform(0.5, 3.0), "n_decoded": 0, "n_remain": -1,
                        "dtot": 0, "dacc": 0, "ema": 0.7, "ctx": 0} for i in range(slots)]
+        if quiet:
+            for sl in self.slots:
+                sl["next"] = float("inf")
         self.records = []
         self.task = 100
         self.x = {"hits": 0, "misses": 0, "swaps_started": 0, "swaps_admitted": 0, "swaps_evicted": 0}
         self.tot = {"pred": 0, "pred_s": 0.0, "pp": 0, "pp_s": 0.0}
         self.stop_ev = threading.Event()
         self.srv = None
+        self.inflight = 0
 
     # ---- workload
     def busy_fraction(self):
         with self.lock:
+            if self.inflight > 0:           # a POST /completion in flight (a benchmark): the card is working, the power feed follows
+                return 1.0
             return sum(1 for s in self.slots if s["busy"]) / float(self.np)
 
     def _tick(self, now, dt):
@@ -131,7 +159,7 @@ class Engine(object):
                     if self.spec:
                         rec["draft_n"], rec["draft_acc"] = s["dtot"], s["dacc"]
                     self.records.append(rec)
-                    s.update(busy=False, next=now + self.rnd.uniform(*self.idle_s), task=-1)
+                    s.update(busy=False, next=(float("inf") if self.quiet else now + self.rnd.uniform(*self.idle_s)), task=-1)
 
     def start(self):
         eng = self
@@ -190,6 +218,36 @@ class Engine(object):
                         return self._send(200, {"now": time.time(), "count": len(recs), "stored": len(eng.records), "records": recs})
                 self._send(404, {"error": "not found"})
 
+            def do_POST(self):
+                # /completion, the one call pxa-bench.py (and Control's Benchmark my rig) makes: a scripted answer with llama.cpp's
+                # timings, and one record in /pxa/stats like the real engine writes (so the Speed tab has something new to draw)
+                u = urllib.parse.urlparse(self.path)
+                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                except ValueError:
+                    body = {}
+                if u.path != "/completion":
+                    return self._send(404, {"error": "not found"})
+                with eng.lock:
+                    eng.inflight += 1
+                try:
+                    time.sleep(eng.comp_delay)
+                finally:
+                    with eng.lock:
+                        eng.inflight -= 1
+                n_prompt = max(8, len(str(body.get("prompt", "")).split()) * 4)
+                n_pred = int(body.get("n_predict") or 32)
+                dec, pre = eng.dec_tps * 1.04, eng.pre_tps * 1.1
+                now = time.time()
+                with eng.lock:
+                    eng.records.append({"ts": round(now, 3), "model": eng.name + ".gguf", "slot": 0, "n_prompt": n_prompt, "n_cached": 0,
+                                        "prompt_n": n_prompt, "prompt_ms": round(n_prompt / pre * 1000, 1), "prefill_tps": round(pre, 2),
+                                        "n_gen": n_pred, "gen_ms": round(n_pred / dec * 1000, 1), "decode_tps": round(dec, 2),
+                                        "split": "tensor", "n_gpu": len(eng.gpus)})
+                self._send(200, {"content": "The quick brown fox jumps over the lazy dog. " * 4, "tokens_predicted": n_pred, "tokens_evaluated": n_prompt,
+                                 "timings": {"predicted_per_second": dec, "prompt_per_second": pre, "prompt_n": n_prompt, "predicted_n": n_pred}})
+
         class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
             daemon_threads = True
             allow_reuse_address = True
@@ -218,9 +276,10 @@ CARD_KINDS = [("Tesla V100-PCIE-16GB", "7.0", 16384, 250), ("Tesla P100-PCIE-16G
 
 
 class Env(object):
-    def __init__(self, cards=4, servers=None, port=0, real=None, history=False):
+    def __init__(self, cards=4, servers=None, port=0, real=None, history=False, library=False):
         self.tmp = tempfile.mkdtemp(prefix="pxa-live-env-")
         self.history = history
+        self.library = library          # True: the model files are small but real-looking GGUFs, so the Models library lists them
         self.cards_n = cards
         self.real = real or []          # [{name, port, gpus}]: servers that already run (a real llama-server): Control just watches them
         self.port = port
@@ -241,6 +300,7 @@ class Env(object):
         env["PXA_CONTROL_CONFIG_DIR"] = os.path.join(self.tmp, "cfg")
         env["PXA_LAUNCH_STATE"] = os.path.join(self.tmp, "state")
         env["PXA_CONTROL_DISCOVER"] = "0"
+        env["PXA_STORE_URL"] = ""                 # hermetic: the fixture store, never the live licd (the release default)
         env["HOME"] = os.path.join(self.tmp, "home")
         os.makedirs(env["HOME"], exist_ok=True)
         self.models = os.path.join(self.tmp, "models")
@@ -255,11 +315,16 @@ class Env(object):
         self.srv = None
         self.app = None
         self.stop_ev = threading.Event()
+        self.power_mode = "ok"          # what the fake nvidia-smi answers for power.draw / power.limit (see SMI)
+
+    def set_power_mode(self, mode):
+        self.power_mode = mode
+        self._write_state()
 
     def _write_state(self):
         tmp = self.state_path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"cards": self.card_defs, "apps": self.apps}, f)
+            json.dump({"cards": self.card_defs, "apps": self.apps, "power_mode": self.power_mode}, f)
         os.replace(tmp, self.state_path)
 
     def _heat_loop(self):
@@ -287,23 +352,35 @@ class Env(object):
         model = os.path.join(self.models, "tiny.gguf")
         with open(model, "wb") as f:
             f.write(b"GGUF\x03\x00\x00\x00" + b"\x00" * 16)
+        if self.library:
+            write_gguf(model)
         self._write_state()
         for sp in self.spec:
             self.engines.append(Engine(**sp).start())
         threading.Thread(target=self._heat_loop, daemon=True).start()
-        self.app = C.App(self.L, models_dirs=[self.models])
+        # token="": the documented no-token test mode (H1); the browser checks drive the page, the security suite the token
+        self.app = C.App(self.L, models_dirs=[self.models], token="")
         for i, e in enumerate(self.engines):
-            sid, _ent = self.app.save_profile(None if i else "main", e.name, {"gpus": e.gpus, "model": model, "port": e.port})
+            model_i = model                                  # each server may serve its own model: the header names them
+            if e.model_file != "tiny.gguf":
+                model_i = os.path.join(self.models, e.model_file)
+                with open(model_i, "wb") as f:
+                    f.write(b"GGUF\x03\x00\x00\x00" + b"\x00" * 16)
+                if self.library:
+                    write_gguf(model_i)
+            sid, _ent = self.app.save_profile(None if i else "main", e.name, {"gpus": e.gpus, "model": model_i, "port": e.port})
             seat = self.app.get_seat(sid, create=True)
-            seat.proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(86400)"])
-            seat.req = {"port": e.port, "gpus": list(e.gpus), "model": model}
+            seat.cmd = [sys.executable, "-c", "import time; time.sleep(86400)"]   # a seat knows its command: Stop needs it
+            seat.proc = subprocess.Popen(seat.cmd)
+            seat.req = {"port": e.port, "gpus": list(e.gpus), "model": model_i}
             self.seats_procs.append(seat.proc)
             for g in e.gpus:
                 self.apps.append({"pid": seat.proc.pid, "mib": 6000 + 900 * i, "gpu": g})
         for j, r in enumerate(self.real):
             sid, _ent = self.app.save_profile(None, r["name"], {"gpus": r.get("gpus", []), "model": model, "port": r["port"]})
             seat = self.app.get_seat(sid, create=True)
-            seat.proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(86400)"])
+            seat.cmd = [sys.executable, "-c", "import time; time.sleep(86400)"]
+            seat.proc = subprocess.Popen(seat.cmd)
             seat.req = {"port": r["port"], "gpus": list(r.get("gpus", [])), "model": model}
             self.seats_procs.append(seat.proc)
         self._write_state()

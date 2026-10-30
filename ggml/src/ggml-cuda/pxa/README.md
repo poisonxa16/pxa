@@ -81,7 +81,7 @@ The PXQ4 format definition and the shared slab/panel machinery every other PXQ f
 2D tile builder `k_pxq_tiles_2d`, and the activation gather. The layout is a slab of 64 bytes of
 scale SoA followed by 64 rows × 16 bytes of nibble codes, slabs K-major inside a 64-row panel,
 panels row-major, experts outermost. Numerics for the original tier are exactly MXFP4, so
-MXFP4 ↔ PXQ4 is a lossless bit permutation. **Env:** `PXA_PXQ4=0` disables the fused kernels and
+MXFP4 <-> PXQ4 is a lossless bit permutation. **Env:** `PXA_PXQ4=0` disables the fused kernels and
 falls back to dequant→cuBLAS, which is bit-identical fp16 to the MXFP4 path; **default on**.
 
 ### `pxq6.cuh`
@@ -222,7 +222,7 @@ arithmetic perturbation converts into far more KL divergence. The host harness p
 snap at 0.0223 % (PXQ2) and 0.0178 % (PXQ3) of ‖w‖·‖x‖ — both the same size as the q8_1
 activation cost PXQ4 pays too. `docs/lab/LEVERS.md` carries the full table.
 
-⚠ **Gate this with `-b 8 -ub 8`.** `llama-perplexity` is pure prefill and at the default `-b 512`
+Warning: **Gate this with `-b 8 -ub 8`.** `llama-perplexity` is pure prefill and at the default `-b 512`
 the `ne11 <= 8` dispatch gate never opens, so both arms return bit-identical logits — a false PASS
 on a run in which the kernel never fired. And a greedy-hash *difference* is not a usable
 engagement check: 64 greedy tokens came out byte-identical across arms on three of four files.
@@ -261,8 +261,13 @@ the key is the exact `(src0_dd_i, row_diff, ne00, type)` tuple compared in full,
 every write is on the dq stream and every read on the compute stream with an event between them
 and a full-drain barrier on ring wrap; and `acquire()` declines while the consumer stream is
 capturing, because a graph that replays a baked arena pointer reads a recycled region. **Env:**
-`PXA_DQC_MB` **default 0 = off** (it changes allocation counts and stream structure, so it ships
-armed only by env); `PXA_DQC_MIN_NY` default 64. **Measured loss — see below.**
+`PXA_DQC_MB` **unset = AUTO (default on, Volta only)**: when the whole unique fp16 working set of the
+first prefill-shaped graph fits in free VRAM (minus `PXA_DQC_RESERVE_MB`, default 2048 MiB), the arena is
+sized to it and becomes a persistent resident cache (every prefill after the first skips the dequant;
+Nemotron-4-Mini-Hindi-4B 1xV100 pp512 about +12%, output sha identical). If it does not fit it logs
+"skipped" and stays off; if a later graph overflows it, it drains, frees the arena and falls back.
+`PXA_DQC_MB=0` = off, `PXA_DQC_MB=N` = the old explicit N MiB ring (the measured loss below applies to
+that ring when the working set does not fit). `PXA_DQC_MIN_NY` default 64.
 
 ### `PXA_VOLTA_CUBLAS_TILE` — lives in `ggml-cuda.cu`, listed here with the other prefill levers
 Fixed-width column tiling for the Volta quantized-weight prefill GEMM. That path is "dequantize

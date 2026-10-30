@@ -2050,6 +2050,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                                                        // n_attention_wv is 34 of 46 -- neither 0,
                                                        // nor n_layer, nor 3*n_layer
                  model.arch == LLM_ARCH_QWEN35 ||      // dense sibling of QWEN35MOE; identical hybrid layout
+                 model.arch == LLM_ARCH_NEMOTRON_H ||  // Mamba-2 hybrid: only the attention blocks carry wv
+                 model.arch == LLM_ARCH_NEMOTRON_H_MOE ||
                  model.arch == LLM_ARCH_UNKNOWN) && "n_attention_wv is unexpected");
 
     size_t total_size_org = 0;

@@ -43,8 +43,15 @@
     rd.onload = function () {
       const input = G.el && G.el.input;
       if (!input) return;
-      const chunk = String(rd.result || "").slice(0, MAX_TEXT);
+      const full = String(rd.result || "");
+      let chunk = full.slice(0, MAX_TEXT);
       if (!chunk) return;
+      if (full.length > MAX_TEXT) {
+        // c15: the box takes 100,000 characters of a file; say what was left out instead of cutting silently
+        const cut = full.length - MAX_TEXT, n = x => x.toLocaleString("en-US");
+        toast((file.name || "That file") + " is " + n(full.length) + " characters. Only the first " + n(MAX_TEXT) + " were added; the last " + n(cut) + " were cut.", true);
+        chunk += "\n[... " + n(cut) + " more characters of " + (file.name || "the file") + " were not added]";   // stays in the box (and the model sees it)
+      }
       const cur = input.value;
       input.value = (cur && !/\n$/.test(cur) ? cur + "\n\n" : cur) + chunk;
       input.dispatchEvent(new Event("input", {bubbles: true}));

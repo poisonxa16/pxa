@@ -17,8 +17,8 @@ ROWS = {
   '`PXA_PXQN_RHT_NODE_NY`': "| `PXA_PXQN_RHT_NODE_NY` | on (1) | PXQN files " + REL + ": on a P100 the verify step (2–8 tokens) of the rotated layers is about 26% faster at 4 tokens; output unchanged bit for bit. | Set 0 only to compare against the old path. |",
  },
  'docs/DEFAULTS.md': {
-  'Kernels: quantized-KV narrow attention': "| | Kernels: quantized-KV narrow attention (`PXA_FA_QKV_DIRECT`), the PXQN decode levers of the release build (`PXA_PXQN_RB`, `PXA_PXQN_RB_RHT`, `PXA_PXQN_RHT_NODE_NY`), DeltaNet conv cluster and in-place carry (`PXA_DN_CONVFUSE`, `PXA_DN_INPLACE`, `PXA_DN_CONVFUSE_NY`). | `ctx16k-fa-qkv-split-pv8`, `gemv-bw-pxqn4-rb`, `pxqn-rb-rht-unfuse`, `pxqn-rht-node-ny`, `dn-convfuse`, `dn-inplace-carry`, `ctx16k-dn-convfuse-depth`, `dnny-convfuse-ny-fire` |",
-  'ssm_out RHT ranges, concat and q8_1': "| | A PXQN V100 decode lever of the release build (`PXA_PXQN_RR_Q8`). The fused epilogue `PXA_TSPLIT_EPI_Q8` stays off. | `v100-plain-rr-q8` (+3.0% tg128), `v100-plain-epi-q8` (measured loss) |",
+  'Kernels: quantized-KV narrow attention': "| | Kernels: quantized-KV narrow attention (`PXA_FA_QKV_DIRECT`), the PXQN decode levers of the release build (`PXA_PXQN_RB`, `PXA_PXQN_RB_RHT`, `PXA_PXQN_RHT_NODE_NY`), DeltaNet conv cluster and in-place carry (`PXA_DN_CONVFUSE`, `PXA_DN_INPLACE`, `PXA_DN_CONVFUSE_NY`). | each of these is the measured default on this card class. |",
+  'ssm_out RHT ranges, concat and q8_1': "| | A PXQN V100 decode lever of the release build (`PXA_PXQN_RR_Q8`). The fused epilogue `PXA_TSPLIT_EPI_Q8` stays off. | the q8_1 fused form measured +3.0% tg128; the fused epilogue was a measured loss and stays off. |",
  },
 }
 bad = 0

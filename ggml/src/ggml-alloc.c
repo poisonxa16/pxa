@@ -372,6 +372,17 @@ struct ggml_gallocr {
     // PXA_ALLOC_FAIL_CLEAN: the last reserve failed part-way (a buffer could not be allocated), so
     // node_allocs/leaf_allocs describe a plan the buffers do not back. Zero-initialised (calloc).
     bool pxa_plan_failed;
+
+    // bug #348 (2026-10-23): pxa_measure != NULL turns the next reserve into a measurement: the plan
+    // is made as usual, pxa_measure[i] receives the bytes buffer i would need (0 for a buffer type
+    // already counted under an earlier index) and no buffer is allocated or freed. The plan left
+    // behind is not backed by buffers, so pxa_unbacked is set and the next alloc re-plans.
+    size_t * pxa_measure;
+    // bug #348: per-allocator PXA_ALLOC_FAIL_CLEAN (a speculative verify graph slot sets it): after a
+    // failed reserve, re-plan instead of placing tensors through a NULL or too-small buffer.
+    bool pxa_fail_clean;
+    // bug #348: the recorded plan came from a measurement, so no buffer backs it: the next alloc re-plans
+    bool pxa_unbacked;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -766,6 +777,15 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
         size_t cur_size = galloc->buffers[i] ? ggml_backend_buffer_get_size(galloc->buffers[i]) : 0;
         size_t new_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i]);
 
+        if (galloc->pxa_measure != NULL) {   // bug #348: measure only, count a shared allocator once
+            bool counted = false;
+            for (int j = 0; j < i; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) { counted = true; break; }
+            }
+            galloc->pxa_measure[i] = counted ? 0 : new_size;
+            continue;
+        }
+
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         if (new_size > cur_size || galloc->buffers[i] == NULL) {
 #ifndef NDEBUG
@@ -783,8 +803,32 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
         }
     }
 
+    if (galloc->pxa_measure != NULL) {
+        galloc->pxa_unbacked = true;   // the plan is not backed by buffers: the next alloc re-plans
+        return true;
+    }
     galloc->pxa_plan_failed = false;
+    galloc->pxa_unbacked    = false;
     return true;
+}
+
+// bug #348: the bytes each of the allocator's buffers would need for `graph`, without allocating
+// (sizes[n_buffers]; a buffer type shared with an earlier index reads 0). Returns false only when
+// the plan itself could not be made.
+GGML_API bool pxa_ggml_gallocr_measure_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids,
+        const int * leaf_buffer_ids, size_t * sizes) {
+    galloc->pxa_measure = sizes;
+    const bool ok = ggml_gallocr_reserve_n(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    galloc->pxa_measure = NULL;
+    return ok;
+}
+
+GGML_API void pxa_ggml_gallocr_set_fail_clean(ggml_gallocr_t galloc, bool on) {
+    if (galloc) galloc->pxa_fail_clean = on;
+}
+
+GGML_API int pxa_ggml_gallocr_n_buffers(ggml_gallocr_t galloc) {
+    return galloc ? galloc->n_buffers : 0;
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
@@ -909,6 +953,32 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         }
     }
 
+    // Leaves are only checked above when some node reads them. A leaf that no node consumes (an
+    // input expanded only so the generic input fill has a buffer to write into, e.g. glm5next's
+    // KQ_mask on the decode-gather path and in its NextN head graph) used to be placed at its old
+    // reserved size: when it grew with n_kv while the node/leaf counts stayed the same, the input
+    // fill wrote past its slot (past the compute buffer's end -> heap corruption, "free(): invalid
+    // next size" at MTP n_max=4). Check every leaf against its own reservation too.
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
+        if (!ggml_gallocr_node_needs_realloc(galloc, leaf, &leaf_alloc->leaf)) {
+            if (pxa_dbg) {
+                const int bid = leaf_alloc->leaf.buffer_id;
+                const size_t need = (bid >= 0 && bid < galloc->n_buffers)
+                    ? ggml_backend_buft_get_alloc_size(galloc->bufts[bid], leaf) : 0;
+                fprintf(stderr, "%s: PXA re-plan cause: leaf[%d] %s [%lld,%lld,%lld,%lld] needs %zu > reserved %zu\n",
+                        __func__, i, leaf->name,
+                        (long long)leaf->ne[0], (long long)leaf->ne[1], (long long)leaf->ne[2], (long long)leaf->ne[3],
+                        need, leaf_alloc->leaf.size_max);
+            }
+#ifndef NDEBUG
+            fprintf(stderr, "%s: leaf %s is not valid\n", __func__, leaf->name);
+#endif
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -919,7 +989,8 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     // Gemma-4 MTP server -c 32768 after a refused verify) or through a NULL buffer. Force a re-plan.
     static int pxa_afc = -1;
     if (pxa_afc < 0) { const char * e = getenv("PXA_ALLOC_FAIL_CLEAN"); pxa_afc = (e && atoi(e) != 0) ? 1 : 0; }
-    if ((pxa_afc && galloc->pxa_plan_failed) || ggml_gallocr_needs_realloc(galloc, graph)) {
+    if (((pxa_afc || galloc->pxa_fail_clean) && galloc->pxa_plan_failed) || galloc->pxa_unbacked ||
+            ggml_gallocr_needs_realloc(galloc, graph)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             fprintf(stderr, "%s: reallocating buffers automatically\n", __func__);

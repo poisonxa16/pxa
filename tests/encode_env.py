@@ -81,7 +81,7 @@ class Env(object):
         spec.loader.exec_module(self.L)
         import pxa_control as C
         self.C = C
-        self.app = C.App(self.L)
+        self.app = C.App(self.L, token="")   # the documented no-token test mode (H1); the security suite covers the token
         self.srv = C.make_server(self.app, "127.0.0.1", self.port)
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()

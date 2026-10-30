@@ -5,6 +5,17 @@
 
 bool pxa_verify_argmax_on();   // llama-build-context.cpp
 
+// PXA_HEAD_DUAL_PF_WHOLE (F8, 2026-10-22; default on, =0 off): under PXA_HEAD_DUAL_LAYER a prompt-sized ubatch (more
+// than 64 tokens, the gen/verify bound above) reads the WHOLE head on the last layer's card, as before the cut. The cut
+// head's first-card slice waits for the last layer at the end of every graph, so the first card's in-order stream could
+// not start the next ubatch: the two-copy pipeline of '-sm layer' prefill was lost (35B-A3B PXQN4, 2x P100, -ub 2048:
+// pp4096 1889 -> 1559, pp16384 1955 -> 1268; pp512 is one ubatch and kept its speed). Decode and verify graphs keep the
+// cut head. Same GEMV on the same rows of the same bytes: the logits are identical either way.
+static ggml_tensor * pxa_head_for_ubatch(const llama_model & model, int n_tokens) {
+    static const bool on = pxa_env_flag("PXA_HEAD_DUAL_PF_WHOLE", 1) != 0;   // only an explicit off (0/off/false/no) disables
+    return on && model.head_dual_layer && model.head_dual_whole != nullptr && n_tokens > 64 ? model.head_dual_whole : model.output;
+}
+
 // PXA_MTP_LAZY_WARMUP_v1 (level resolved by llama_pxa_mtp_lazy_warmup(), include/llama.h):
 // with lazy warmup on, nothing consumes all-token MTP hidden rows on prompt-sized batches (the
 // companion warmup is skipped), so the out_ids row-slice can be re-enabled — restoring "last layer + output norm +
@@ -131,7 +142,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             ggml_set_output(inpL);
         }
 
-        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+        cur = build_output(lctx, ctx0, inpL, pxa_head_for_ubatch(model, n_tokens), model.output_norm, cb);
         cb(cur, "result_output", -1);
         lctx.pxa_res_t = cur;   // PXA_VERIFY_ARGMAX: the decode finds the logits here, not by position
     }
@@ -233,7 +244,7 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             ggml_set_output(inpL);
         }
 
-        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+        cur = build_output(lctx, ctx0, inpL, pxa_head_for_ubatch(model, n_tokens), model.output_norm, cb);
         cb(cur, "result_output", -1);
         lctx.pxa_res_t = cur;   // PXA_VERIFY_ARGMAX: the decode finds the logits here, not by position
         if (lctx.pxa_fold_active) {

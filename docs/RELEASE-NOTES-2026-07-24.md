@@ -58,7 +58,7 @@ these lived in separate build trees; this is the single canonical build with eve
 - **bradrlaw fixes**: multi-GPU `-sm layer` no-NVLink (PHB) warning; Gemma-4 MoE fail-clean
   guard; `libnccl.so.2` release packaging fix.
 
-## Community bug-finders 🏅
+## Community bug-finders
 
 - **Last-Guitar-5924** (r/LocalLLM) — deepseek2/MLA fa-off context-decay cliff on a Tesla P40.
 - **[bradrlaw](https://github.com/bradrlaw)** — dual-GPU `-sm layer` PHB decode collapse +

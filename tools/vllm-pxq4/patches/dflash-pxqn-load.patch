@@ -1,0 +1,55 @@
+PXA Network modification notice (Apache License 2.0, section 4(b)): this patch changes
+vllm/model_executor/models/qwen3_dflash.py from vLLM (Copyright the vLLM contributors, Apache License 2.0).
+Changed by PXA Network, 2026; the change is released under the Apache License 2.0.
+See tools/vllm-pxq4/LICENSE-NOTICE.md. patch(1) skips these lines.
+
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -553,6 +553,33 @@
+         return hidden_states, residual
+ 
+ 
++def _pxa_shift_pxqn_layer_keys(quant_config, start: int) -> None:
++    """Point PXQN module entries at the drafter's offset layer prefixes.
++
++    Also install the fused-module map. DFlash does not copy one onto the
++    draft quant config, so gate_up_proj never expands to gate_proj + up_proj
++    and the fused linear stays unquantized.
++    """
++    if quant_config is None or not hasattr(quant_config, "pxqn_modules"):
++        return
++    mapping = dict(getattr(quant_config, "packed_modules_mapping", None) or {})
++    mapping.setdefault("gate_up_proj", ["gate_proj", "up_proj"])
++    mapping.setdefault("qkv_proj", ["q_proj", "k_proj", "v_proj"])
++    quant_config.packed_modules_mapping = mapping
++    mods = quant_config.pxqn_modules
++    if not mods or not start:
++        return
++    shifted = {}
++    for key, ent in mods.items():
++        parts = key.split(".")
++        if len(parts) >= 2 and parts[0] == "layers" and parts[1].isdigit():
++            parts[1] = str(int(parts[1]) + int(start))
++            shifted[".".join(parts)] = ent
++        else:
++            shifted[key] = ent
++    quant_config.pxqn_modules = shifted
++
++
+ @support_torch_compile
+ class DFlashQwen3Model(nn.Module):
+     decoder_layer_cls = DFlashQwen3DecoderLayer
+@@ -608,6 +635,13 @@
+         self.config = vllm_config.speculative_config.draft_model_config.hf_config
+         self.vocab_size = self.config.vocab_size
+         self.quant_config = get_draft_quant_config(vllm_config)
++        # The vLLM prefix of draft layer i is layers.{i + start_layer_id}
++        # (start_layer_id is the target depth). A PXQN checkpoint keys
++        # pxqn_modules as layers.{i} from the file. Shift the keys so
++        # _entries_for finds them and registers pxq4_slabs / pxq4_anchor.
++        # The entry's own "layer" field stays the checkpoint index: that is
++        # the RHT site the weights were rotated with.
++        _pxa_shift_pxqn_layer_keys(self.quant_config, start_layer_id)
+ 
+         drafter_config = getattr(self.config, "eagle_config", {})
+         drafter_config.update(getattr(self.config, "dflash_config", {}))

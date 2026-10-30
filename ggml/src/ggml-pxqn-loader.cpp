@@ -2,6 +2,7 @@
 #include "ggml-pxqn-api.h"
 #include "ggml-pxqn-tune.h"
 #include "ggml-pxqn-levers.h"
+#include "ggml-pxqn-overdrive.h"
 #include "ggml.h"
 
 #include <cstdio>
@@ -10,15 +11,18 @@
 #include <mutex>
 #include <string>
 
-#if defined(_WIN32)
+#if defined(PXA_PXQN_NO_DLOPEN)
 const struct ggml_pxqn_lib_api * ggml_pxqn_lib(void) { return nullptr; }
 ggml_pxqn_cpu_mul_mat_fn ggml_pxqn_cpu_mul_mat_get(void) { return nullptr; }
+const struct ggml_pxqn_cpu_q8_api * ggml_pxqn_cpu_q8_api_get(void) { return nullptr; }
 #else
 #include <dlfcn.h>
 
 static const struct ggml_pxqn_lib_api * g_pxqn_lib = nullptr;
 static void * g_pxqn_handle = nullptr;
 static ggml_pxqn_cpu_mul_mat_fn          g_pxqn_mmv = nullptr;   // optional extra symbol of the library (ggml-pxqn-api.h)
+static struct ggml_pxqn_cpu_q8_api      g_pxqn_q8 = { nullptr, nullptr, nullptr };   // optional: the matmul's two halves
+static bool                              g_pxqn_q8_ok = false;
 static const struct ggml_pxqn_xcache_policy * g_pxqn_xc = nullptr; // optional: the PXA_XCACHE online-adaptation policy
 static ggml_pxqn_xcache_learn_build_fn       g_pxqn_learn_build = nullptr;
 static ggml_pxqn_xcache_counts_pick_fn       g_pxqn_counts_pick = nullptr;
@@ -28,6 +32,7 @@ static ggml_pxqn_xcache_calib_consider_fn    g_pxqn_calib_consider = nullptr;
 static ggml_pxqn_xcache_cpupool_create_fn    g_pxqn_cpupool_create = nullptr;
 static ggml_pxqn_xcache_cpupool_destroy_fn   g_pxqn_cpupool_destroy = nullptr;
 static ggml_pxqn_xcache_cpupool_step_fn      g_pxqn_cpupool_step = nullptr;
+static ggml_pxqn_xcache_cpupool_gateless_fn  g_pxqn_cpupool_gateless = nullptr;
 
 static void * pxqn_try_open(const std::string & path, std::string & err) {
     void * h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -84,6 +89,13 @@ static const struct ggml_pxqn_lib_api * pxqn_load(void) {
     // the fast CPU matmul is an optional extra symbol: absent in an older library; PXA_PXQN_CPU_MMV=0 leaves it unused
     const char * mmv = getenv("PXA_PXQN_CPU_MMV");
     if (!(mmv && atoi(mmv) == 0)) g_pxqn_mmv = (ggml_pxqn_cpu_mul_mat_fn) dlsym(h, GGML_PXQN_CPU_MUL_MAT_SYM);
+    if (g_pxqn_mmv) {   // the split halves for the MUL_MAT_ID work queue: all three or none
+        g_pxqn_q8.q8_col_bytes = (size_t (*)(enum ggml_type, int64_t)) dlsym(h, GGML_PXQN_CPU_Q8_COL_BYTES_SYM);
+        g_pxqn_q8.q8_col       = (void (*)(enum ggml_type, const float *, int64_t, void *)) dlsym(h, GGML_PXQN_CPU_Q8_COL_SYM);
+        g_pxqn_q8.mm_q8        = (void (*)(enum ggml_type, const void *, int64_t, int64_t, int64_t, const void * const *,
+                                           float * const *, int)) dlsym(h, GGML_PXQN_CPU_MM_Q8_SYM);
+        g_pxqn_q8_ok = g_pxqn_q8.q8_col_bytes && g_pxqn_q8.q8_col && g_pxqn_q8.mm_q8;
+    }
     // the online-adaptation policy of the expert cache: an optional extra symbol too (PXA_XCACHE_ADAPT=0 is read by the engine)
     const char * xcp = getenv("PXA_PXQN_XCACHE");
     if (!(xcp && atoi(xcp) == 0)) {
@@ -99,6 +111,7 @@ static const struct ggml_pxqn_lib_api * pxqn_load(void) {
     g_pxqn_cpupool_create = (ggml_pxqn_xcache_cpupool_create_fn) dlsym(h, GGML_PXQN_XCACHE_CPUPOOL_CREATE_SYM);
     g_pxqn_cpupool_destroy = (ggml_pxqn_xcache_cpupool_destroy_fn) dlsym(h, GGML_PXQN_XCACHE_CPUPOOL_DESTROY_SYM);
     g_pxqn_cpupool_step = (ggml_pxqn_xcache_cpupool_step_fn) dlsym(h, GGML_PXQN_XCACHE_CPUPOOL_STEP_SYM);
+    g_pxqn_cpupool_gateless = (ggml_pxqn_xcache_cpupool_gateless_fn) dlsym(h, GGML_PXQN_XCACHE_CPUPOOL_GATELESS_SYM);
     return api;   // never unloaded: its kernels and per-device state live for the process
 }
 
@@ -119,11 +132,34 @@ const struct ggml_pxqn_lock_api * ggml_pxqn_lock(void) {
     });
     return lock;
 }
+
+const struct ggml_pxqn_recipe_api * ggml_pxqn_recipe(void) {
+    static const struct ggml_pxqn_recipe_api * rcp = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (!ggml_pxqn_lib() || !g_pxqn_handle) return;
+        auto get = (ggml_pxqn_get_recipe_api_fn) dlsym(g_pxqn_handle, "ggml_pxqn_get_recipe_api");
+        const struct ggml_pxqn_recipe_api * api = get ? get(GGML_PXQN_RECIPE_VERSION) : nullptr;
+        if (api && api->version == GGML_PXQN_RECIPE_VERSION && api->size == sizeof(struct ggml_pxqn_recipe_api) && api->resolve) rcp = api;
+    });
+    return rcp;
+}
 #endif
 
-#if defined(_WIN32)
+#if defined(PXA_PXQN_NO_DLOPEN)
 const struct ggml_pxqn_lock_api * ggml_pxqn_lock(void) { return nullptr; }
+const struct ggml_pxqn_recipe_api * ggml_pxqn_recipe(void) { return nullptr; }
 #endif
+
+bool ggml_pxqn_recipe_resolve(const char * handle, uint64_t * seed, uint32_t * sites, char * err, int errlen) {
+    const struct ggml_pxqn_recipe_api * r = ggml_pxqn_recipe();
+    if (!r) {
+        if (err && errlen > 0) snprintf(err, (size_t) errlen, "%s", ggml_pxqn_lib() ? GGML_PXQN_RECIPE_OLD_MSG : GGML_PXQN_RECIPE_NOLIB_MSG);
+        return false;
+    }
+    if (err && errlen > 0) err[0] = 0;
+    return r->resolve(handle ? handle : "", seed, sites, err, errlen) == 0;
+}
 
 bool ggml_pxqn_available(void) {
     return ggml_pxqn_lib() != nullptr;
@@ -148,9 +184,12 @@ void ggml_pxqn_lock_close(void * handle) {
     if (lk && handle) lk->close(handle);
 }
 
-#if !defined(_WIN32)
+#if !defined(PXA_PXQN_NO_DLOPEN)
 ggml_pxqn_cpu_mul_mat_fn ggml_pxqn_cpu_mul_mat_get(void) {
     return ggml_pxqn_lib() ? g_pxqn_mmv : nullptr;
+}
+const struct ggml_pxqn_cpu_q8_api * ggml_pxqn_cpu_q8_api_get(void) {
+    return ggml_pxqn_lib() && g_pxqn_mmv && g_pxqn_q8_ok ? &g_pxqn_q8 : nullptr;
 }
 const struct ggml_pxqn_xcache_policy * ggml_pxqn_xcache_policy_get(void) {
     return ggml_pxqn_lib() ? g_pxqn_xc : nullptr;
@@ -179,6 +218,9 @@ ggml_pxqn_xcache_cpupool_destroy_fn ggml_pxqn_xcache_cpupool_destroy_get(void) {
 ggml_pxqn_xcache_cpupool_step_fn ggml_pxqn_xcache_cpupool_step_get(void) {
     return ggml_pxqn_lib() ? g_pxqn_cpupool_step : nullptr;
 }
+ggml_pxqn_xcache_cpupool_gateless_fn ggml_pxqn_xcache_cpupool_gateless_get(void) {
+    return ggml_pxqn_lib() ? g_pxqn_cpupool_gateless : nullptr;
+}
 #else
 const struct ggml_pxqn_xcache_policy * ggml_pxqn_xcache_policy_get(void) { return nullptr; }
 ggml_pxqn_xcache_learn_build_fn ggml_pxqn_xcache_learn_build_get(void) { return nullptr; }
@@ -189,6 +231,7 @@ ggml_pxqn_xcache_calib_consider_fn ggml_pxqn_xcache_calib_consider_get(void) { r
 ggml_pxqn_xcache_cpupool_create_fn ggml_pxqn_xcache_cpupool_create_get(void) { return nullptr; }
 ggml_pxqn_xcache_cpupool_destroy_fn ggml_pxqn_xcache_cpupool_destroy_get(void) { return nullptr; }
 ggml_pxqn_xcache_cpupool_step_fn ggml_pxqn_xcache_cpupool_step_get(void) { return nullptr; }
+ggml_pxqn_xcache_cpupool_gateless_fn ggml_pxqn_xcache_cpupool_gateless_get(void) { return nullptr; }
 #endif
 
 bool ggml_pxqn_cpu_mmv_available(void) {
@@ -196,7 +239,7 @@ bool ggml_pxqn_cpu_mmv_available(void) {
 }
 
 // ---- the speculation selector hook (ggml-pxqn-spec.h): thin wrappers over the library's optional table ----
-#if defined(_WIN32)
+#if defined(PXA_PXQN_NO_DLOPEN)
 const struct ggml_pxqn_spec_api * ggml_pxqn_spec_table(void) { return nullptr; }
 #else
 const struct ggml_pxqn_spec_api * ggml_pxqn_spec_table(void) {
@@ -248,8 +291,57 @@ int ggml_pxqn_spec_describe(void * h, char * buf, size_t n) {
     return 0;
 }
 
+// Optional symbols. A library that does not export them, or a probe that is compiled off,
+// answers 0 and the engine keeps the behavior it had before these calls existed.
+static int (* pxqn_sym_copy_wins(void))(int32_t, int32_t) {
+    static int (* fn)(int32_t, int32_t) = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (ggml_pxqn_lib() && g_pxqn_handle) {
+            fn = (int (*)(int32_t, int32_t)) dlsym(g_pxqn_handle, "ggml_pxqn_spec_copy_wins_impl");
+        }
+    }
+    return fn;
+}
+static int (* pxqn_sym_ub_armed(void))(void) {
+    static int (* fn)(void) = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (ggml_pxqn_lib() && g_pxqn_handle) {
+            fn = (int (*)(void)) dlsym(g_pxqn_handle, "ggml_pxqn_ckpt_ub_armed_impl");
+        }
+    }
+    return fn;
+}
+static int (* pxqn_sym_ub_next(void))(int32_t, int32_t, int32_t, int32_t) {
+    static int (* fn)(int32_t, int32_t, int32_t, int32_t) = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (ggml_pxqn_lib() && g_pxqn_handle) {
+            fn = (int (*)(int32_t, int32_t, int32_t, int32_t)) dlsym(g_pxqn_handle, "ggml_pxqn_ckpt_ub_next_impl");
+        }
+    }
+    return fn;
+}
+
+int ggml_pxqn_spec_copy_wins(int32_t ngram_len, int32_t mtp_n_max) {
+    auto fn = pxqn_sym_copy_wins();
+    return fn ? fn(ngram_len, mtp_n_max) : 0;
+}
+int ggml_pxqn_ckpt_ub_armed(void) {
+    auto fn = pxqn_sym_ub_armed();
+    return fn ? fn() : 0;
+}
+int ggml_pxqn_ckpt_ub_next(int32_t ub, int32_t cap, int32_t want, int32_t nsm) {
+    auto fn = pxqn_sym_ub_next();
+    return fn ? fn(ub, cap, want, nsm) : 0;
+}
+
 // ---- the per-model / per-card speculation defaults (ggml-pxqn-spec.h): the library's optional third table ----
-#if defined(_WIN32)
+#if defined(PXA_PXQN_NO_DLOPEN)
 const struct ggml_pxqn_specdef_api * ggml_pxqn_specdef_table(void) { return nullptr; }
 #else
 const struct ggml_pxqn_specdef_api * ggml_pxqn_specdef_table(void) {
@@ -257,7 +349,7 @@ const struct ggml_pxqn_specdef_api * ggml_pxqn_specdef_table(void) {
     static const struct ggml_pxqn_specdef_api * t = nullptr;
     std::call_once(once, [] {
         // PXA_SPEC_DEFAULTS: the per-model / per-card table is armed by default (main 2026-10-04, from an earlier
-        // one measurement, ledger mtp-all-spec-defaults: Qwen3.8-27B one V100 40.9/41.2 -> 56.7/71.5 t/s with code shas
+        // one measurement: Qwen3.8-27B one V100 40.9/41.2 -> 56.7/71.5 t/s with code shas
         // equal to plain, Gemma 4 with no flags +13%, the Flash-Next 32 GB auto row no longer loses to plain).
         // PXA_SPEC_DEFAULTS=0 never arms it; PXA_REFERENCE=1 is the audit baseline.
         static constexpr bool PXA_SPEC_DEFAULTS_DEFAULT = true;
@@ -298,7 +390,7 @@ int32_t ggml_pxqn_specdef_shortlist(const char * arch, int32_t n_vocab, int32_t 
 }
 
 // ---- optional tuning switches (ggml-pxqn-tune.h): one more optional table of the library ----
-#if defined(_WIN32)
+#if defined(PXA_PXQN_NO_DLOPEN)
 uint32_t ggml_pxqn_tune_flags(void) { return 0; }
 #else
 uint32_t ggml_pxqn_tune_flags(void) {
@@ -317,7 +409,7 @@ uint32_t ggml_pxqn_tune_flags(void) {
 #endif
 
 // ---- the levers the library reads (ggml-pxqn-levers.h): optional symbol of the library ----
-#if defined(_WIN32)
+#if defined(PXA_PXQN_NO_DLOPEN)
 int ggml_pxqn_lever_builtin(const char * name) { (void) name; return 0; }
 #else
 int ggml_pxqn_lever_builtin(const char * name) {
@@ -329,4 +421,94 @@ int ggml_pxqn_lever_builtin(const char * name) {
     });
     return name && fn ? fn(name) : 0;
 }
+#endif
+
+// ---- PXA Overdrive (ggml-pxqn-overdrive.h): the recipe and its decision, one more optional table of the library ----
+#if defined(PXA_PXQN_NO_DLOPEN)
+static const struct ggml_pxqn_overdrive_api * ggml_pxqn_overdrive_table(void) { return nullptr; }
+#else
+static const struct ggml_pxqn_overdrive_api * ggml_pxqn_overdrive_table(void) {
+    static std::once_flag once;
+    static const struct ggml_pxqn_overdrive_api * t = nullptr;
+    std::call_once(once, [] {
+        if (!ggml_pxqn_lib() || !g_pxqn_handle) return;
+        auto get = (ggml_pxqn_get_overdrive_api_fn) dlsym(g_pxqn_handle, GGML_PXQN_OVERDRIVE_SYM);
+        const struct ggml_pxqn_overdrive_api * api = get ? get(GGML_PXQN_OVERDRIVE_VERSION) : nullptr;
+        if (api && api->version == GGML_PXQN_OVERDRIVE_VERSION && api->size == sizeof(struct ggml_pxqn_overdrive_api) &&
+            api->choose && api->alias_apply && api->is_member) {
+            t = api;
+        }
+    });
+    return t;
+}
+#endif
+
+bool ggml_pxqn_overdrive_available(void) {
+    return ggml_pxqn_overdrive_table() != nullptr;
+}
+bool ggml_pxqn_overdrive_choose(const struct ggml_pxqn_od_in * in, struct ggml_pxqn_od_out * out) {
+    if (out) {
+        out->recipe = 0; out->n_rows = 0; out->rows = nullptr; out->pool_name = nullptr; out->why[0] = '\0';
+    }
+    if (!in || !out) return false;
+    // the engine's own off switches (public, documented): PXA_AUTO_OVERDRIVE=0 or PXA_NO_OVERDRIVE=1 stand the set down
+    const char * od_env = getenv("PXA_AUTO_OVERDRIVE");
+    const char * od_no  = getenv("PXA_NO_OVERDRIVE");
+    if ((od_env && *od_env && atoi(od_env) == 0) || (od_no && *od_no && atoi(od_no) != 0)) return false;
+    const auto * t = ggml_pxqn_overdrive_table();
+    return t && t->choose(in, out) > 0 && out->recipe > 0 && out->n_rows > 0 && out->rows;
+}
+void ggml_pxqn_overdrive_alias_apply(void) {
+    const auto * t = ggml_pxqn_overdrive_table();
+    if (t) t->alias_apply();
+}
+int ggml_pxqn_overdrive_is_member(const char * name) {
+    const auto * t = ggml_pxqn_overdrive_table();
+    return t && name ? t->is_member(name) : 0;
+}
+
+// ---- R1 RIX (ggml-pxqn-api.h): the library's routed-expert identity switch and its CPU epilogue, optional symbols ----
+#if defined(PXA_PXQN_NO_DLOPEN)
+int  ggml_pxa_rix_available(void) { return 0; }
+int  ggml_pxa_rix_on(void) { return 0; }
+void ggml_pxa_rix_set(int on) { (void) on; }
+ggml_pxa_rix_swiglu_fn ggml_pxa_rix_swiglu_active(void) { return nullptr; }
+int  ggml_pxa_rix_maxw(void) { return 1 << 30; }
+void ggml_pxa_rix_tl_off(int off) { (void) off; }
+#else
+struct pxa_rix_syms {
+    int  (*get)(void);
+    void (*set)(int);
+    ggml_pxa_rix_swiglu_fn swiglu;
+    void (*tl_off)(int);   // optional (2026-10-26): without it every width keeps RIX (the old behaviour)
+};
+static const pxa_rix_syms & pxa_rix(void) {
+    static std::once_flag once;
+    static pxa_rix_syms s = { nullptr, nullptr, nullptr, nullptr };
+    std::call_once(once, [] {
+        if (!ggml_pxqn_lib() || !g_pxqn_handle) return;
+        pxa_rix_syms t;
+        t.get    = (int (*)(void)) dlsym(g_pxqn_handle, "ggml_pxqn_rix_get");
+        t.set    = (void (*)(int)) dlsym(g_pxqn_handle, "ggml_pxqn_rix_set");
+        t.swiglu = (ggml_pxa_rix_swiglu_fn) dlsym(g_pxqn_handle, "ggml_pxqn_rix_swiglu");
+        t.tl_off = (void (*)(int)) dlsym(g_pxqn_handle, "ggml_pxqn_rix_tl_off");
+        if (t.get && t.set && t.swiglu) s = t;   // all three or none
+    });
+    return s;
+}
+int ggml_pxa_rix_available(void) { return pxa_rix().get != nullptr; }
+int ggml_pxa_rix_on(void) { const pxa_rix_syms & s = pxa_rix(); return s.get && s.get() > 0 ? 1 : 0; }
+void ggml_pxa_rix_set(int on) { const pxa_rix_syms & s = pxa_rix(); if (s.set) s.set(on); }
+ggml_pxa_rix_swiglu_fn ggml_pxa_rix_swiglu_active(void) { const pxa_rix_syms & s = pxa_rix(); return s.get && s.get() > 0 ? s.swiglu : nullptr; }
+static int pxa_rix_maxw_env(void) {
+    // PXA_PXQN_RIX_MAXW: the widest graph (tokens) RIX covers; default = the async cold lane's width (PXA_XCACHE_ASYNC_MAXTOK, 8):
+    // above it the cold experts run on the scheduler's CPU split or the card anyway, so the prefill keeps its fast kernels; 0 = every width
+    const char * e = getenv("PXA_PXQN_RIX_MAXW");
+    if (e && *e) { const int v = atoi(e); return v <= 0 ? (1 << 30) : v; }
+    const char * a = getenv("PXA_XCACHE_ASYNC_MAXTOK");
+    const int v = a && *a ? atoi(a) : 8;
+    return v < 1 ? 1 : (v > 32 ? 32 : v);
+}
+int ggml_pxa_rix_maxw(void) { static const int v = pxa_rix_maxw_env(); return pxa_rix().tl_off ? v : (1 << 30); }
+void ggml_pxa_rix_tl_off(int off) { const pxa_rix_syms & s = pxa_rix(); if (s.tl_off) s.tl_off(off); }
 #endif

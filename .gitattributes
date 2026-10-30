@@ -1,0 +1,2 @@
+# Lever catalog: generated (scripts/pxa-lever-catalog.py); a merge keeps one side, tools/pxa-merge-fold.sh regenerates it
+common/pxa-lever-catalog.inc merge=pxa-regen

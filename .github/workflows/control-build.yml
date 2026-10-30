@@ -1,0 +1,168 @@
+name: control-build
+
+# PXA Control: the compiled, one-download builds (BUILD-CONTROL.md). Runners: hosted ubuntu, a self-hosted
+# Windows Server 2022 runner (label below; a fork without one leaves that job queued) and hosted macOS (tags and
+# dispatch only). Never on a branch push or a pull request. Signing steps run only when their secrets exist;
+# unsigned builds are labelled as such.
+on:
+  push:
+    tags: ["control-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: control-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NUITKA_VERSION: "4.2.2"
+  PYTHONUTF8: "1"
+
+jobs:
+  linux-x64:
+    name: linux x86_64 (onefile + .run)
+    runs-on: ubuntu-22.04            # glibc 2.35 = the engine release's floor
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build in the pinned image (packaging/control/Dockerfile.build-linux)
+        run: |
+          docker build -t pxa-control-build:u2204 -f packaging/control/Dockerfile.build-linux packaging/control
+          mkdir -p out
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/out":/out pxa-control-build:u2204 \
+            bash /src/packaging/control/build-linux.sh nuitka
+      - name: Smoke (start, health, signed-in page)
+        run: python3 packaging/control/measure-start.py out/nuitka/pxa-control 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pxa-control-linux-x86_64
+          path: out/nuitka/pxa-control
+      # the .run with the engine is made on the release host from the release tree (make-linux-run.sh); the engine
+      # binaries are built by the release pipeline, not here
+
+  windows-x64:
+    name: windows x64 (exe + installer)
+    runs-on: [self-hosted, Windows, vigil]
+    timeout-minutes: 90
+    env:
+      HAS_SIGN: ${{ secrets.WINDOWS_SIGN_PFX_B64 != '' }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Keep LF line endings (repo-local)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build tools (pinned)
+        run: python -m pip install --disable-pip-version-check nuitka==${{ env.NUITKA_VERSION }} zstandard==0.25.0 pillow==12.3.0 pystray==0.19.5
+      - name: Stage tools/ like build-linux.sh (+ the plugin kit and python.org's embeddable Python, pinned in stage.py)
+        env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: |
+          $a = @("out/stage", "--python-embed", "out/cache"); if ($env:TAG) { $a += @("--tag", $env:TAG) }
+          python packaging/control/stage.py @a
+      - name: Nuitka onefile exe (no console window)
+        working-directory: out/stage
+        run: >
+          python -m nuitka --standalone --onefile --assume-yes-for-downloads --msvc=latest
+          --windows-console-mode=disable --windows-icon-from-ico=../../packaging/control/pxa-control.ico
+          --company-name="PXA Network" --product-name="PXA Control" --file-version=3.1.0.0 --product-version=3.1.0.0
+          --file-description="PXA Control" --output-filename=pxa-control.exe --output-dir=../win
+          --include-package=pxa_control --include-package=pxa_chat --include-package=pxa_ctl --include-module=pxa_launch
+          --include-package=PIL --nofollow-import-to=pystray --nofollow-import-to=six
+          --include-data-dir=pxa_control_ui=pxa_control_ui --include-data-dir=pxa_chat/ui=pxa_chat/ui
+          --include-data-files=pxa_thinking_profiles.json=pxa_thinking_profiles.json
+          --include-data-files=pxa_encode_cells.json=pxa_encode_cells.json --include-data-files=pxa-bench.py=pxa-bench.py
+          --include-data-files=VERSION=VERSION --include-data-files=third_party.zip=third_party.zip
+          --include-data-files=plugin-sdk.zip=plugin-sdk.zip --include-data-files=python-embed.zip=python-embed.zip
+          --onefile-cache-mode=cached pxa_control_entry.py
+      - name: Sign the exe (only with the certificate secret)
+        if: env.HAS_SIGN == 'true'
+        env:
+          SIGN_PFX_B64: ${{ secrets.WINDOWS_SIGN_PFX_B64 }}
+          SIGN_PFX_PASS: ${{ secrets.WINDOWS_SIGN_PFX_PASS }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\s.pfx", [Convert]::FromBase64String($env:SIGN_PFX_B64))
+          signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /f "$env:RUNNER_TEMP\s.pfx" /p $env:SIGN_PFX_PASS out\win\pxa-control.exe
+          Remove-Item "$env:RUNNER_TEMP\s.pfx"
+      - name: Installer (Inno Setup 6, per-user, no admin)
+        run: iscc /DAppVersion=3.1 /DSourceExe=..\..\out\win\pxa-control.exe packaging\control\pxa-control.iss
+      - name: Sign the installer (only with the certificate secret)
+        if: env.HAS_SIGN == 'true'
+        env:
+          SIGN_PFX_B64: ${{ secrets.WINDOWS_SIGN_PFX_B64 }}
+          SIGN_PFX_PASS: ${{ secrets.WINDOWS_SIGN_PFX_PASS }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\s.pfx", [Convert]::FromBase64String($env:SIGN_PFX_B64))
+          signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /f "$env:RUNNER_TEMP\s.pfx" /p $env:SIGN_PFX_PASS packaging\control\Output\PXA-Control-Setup.exe
+          Remove-Item "$env:RUNNER_TEMP\s.pfx"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pxa-control-windows-x64
+          path: |
+            out/win/pxa-control.exe
+            packaging/control/Output/PXA-Control-Setup.exe
+
+  macos-arm64:
+    name: macos arm64 (.app + dmg)
+    runs-on: macos-14                # Apple silicon
+    timeout-minutes: 90
+    env:
+      HAS_SIGN: ${{ secrets.MAC_DEVID_P12_B64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build tools (pinned)
+        run: python -m pip install --disable-pip-version-check nuitka==${{ env.NUITKA_VERSION }} zstandard==0.25.0 pillow==12.3.0 pystray==0.19.5 pyobjc-framework-Cocoa
+      - name: Stage tools/ like build-linux.sh (+ the plugin kit)
+        env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: python packaging/control/stage.py out/stage ${TAG:+--tag "$TAG"}
+      - name: App icon (.icns from the PNG, macOS tools)
+        run: |
+          mkdir -p out/pxa.iconset
+          for s in 16 32 128 256; do
+            sips -z $s $s packaging/control/pxa-control.png --out out/pxa.iconset/icon_${s}x${s}.png >/dev/null
+            sips -z $((s*2)) $((s*2)) packaging/control/pxa-control.png --out out/pxa.iconset/icon_${s}x${s}@2x.png >/dev/null
+          done
+          iconutil -c icns out/pxa.iconset -o packaging/control/pxa-control.icns
+      - name: Nuitka .app bundle
+        working-directory: out/stage
+        run: >
+          python -m nuitka --standalone --macos-create-app-bundle --assume-yes-for-downloads
+          --macos-app-name="PXA Control" --macos-signed-app-name=net.pxanetwork.control
+          --macos-app-icon=../../packaging/control/pxa-control.icns --macos-app-mode=ui-element
+          --output-dir=../mac --output-filename="PXA Control"
+          --include-package=pxa_control --include-package=pxa_chat --include-package=pxa_ctl --include-module=pxa_launch
+          --include-package=PIL --nofollow-import-to=pystray --nofollow-import-to=six
+          --include-data-dir=pxa_control_ui=pxa_control_ui --include-data-dir=pxa_chat/ui=pxa_chat/ui
+          --include-data-files=pxa_thinking_profiles.json=pxa_thinking_profiles.json
+          --include-data-files=pxa_encode_cells.json=pxa_encode_cells.json --include-data-files=pxa-bench.py=pxa-bench.py
+          --include-data-files=VERSION=VERSION --include-data-files=third_party.zip=third_party.zip
+          --include-data-files=plugin-sdk.zip=plugin-sdk.zip
+          pxa_control_entry.py
+      - name: Sign + notarize (only with the Developer ID secrets)
+        if: env.HAS_SIGN == 'true'
+        env:
+          MAC_CERT_P12_B64: ${{ secrets.MAC_DEVID_P12_B64 }}
+          MAC_CERT_PASS: ${{ secrets.MAC_DEVID_P12_PASS }}
+          MAC_NOTARY_KEY_B64: ${{ secrets.MAC_NOTARY_KEY_B64 }}
+          MAC_NOTARY_KEY_ID: ${{ secrets.MAC_NOTARY_KEY_ID }}
+          MAC_NOTARY_ISSUER: ${{ secrets.MAC_NOTARY_ISSUER }}
+        run: bash packaging/control/macos-sign.sh "out/mac/PXA Control.app"
+      - name: DMG
+        run: hdiutil create -volname "PXA Control" -srcfolder "out/mac/PXA Control.app" -ov -format UDZO out/mac/PXA-Control-macos-arm64.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pxa-control-macos-arm64
+          path: out/mac/PXA-Control-macos-arm64.dmg

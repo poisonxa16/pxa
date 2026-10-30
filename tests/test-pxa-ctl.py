@@ -663,7 +663,10 @@ class Driver(unittest.TestCase):
 
 class NoShell(unittest.TestCase):
     def test_no_shell_true_anywhere(self):
-        files = [os.path.join(TOOLS, "pxa_control.py")] + [os.path.join(TOOLS, "pxa_ctl", f) for f in os.listdir(os.path.join(TOOLS, "pxa_ctl")) if f.endswith(".py")]
+        pkg = os.path.join(TOOLS, "pxa_control")          # the package (the Control hardening pass), every module of it
+        files = [os.path.join(TOOLS, "pxa_control.py")] + [os.path.join(dp, f) for dp, _d, fs in os.walk(pkg) for f in fs if f.endswith(".py")]
+        self.assertGreaterEqual(len(files), 7)
+        files += [os.path.join(TOOLS, "pxa_ctl", f) for f in os.listdir(os.path.join(TOOLS, "pxa_ctl")) if f.endswith(".py")]
         for p in files:
             with open(p) as f:
                 self.assertIsNone(re.search(r"shell\s*=\s*True", f.read()), p)
@@ -706,14 +709,18 @@ MODEL = os.path.join(MODELS, "Tiny-Qwen3.gguf")
 write_gguf(MODEL)
 
 
+TOKENS = {}          # port -> session token (H1, the Control hardening pass: every API call to Control carries it)
+
+
 def serve_app(app):
     srv = C.make_server(app, "127.0.0.1", 0)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    TOKENS[srv.server_address[1]] = app.token
     return srv, srv.server_address[1]
 
 
 def req(port, path, method="GET", body=None, raw=None):
-    h = {}
+    h = {"X-PXA-Token": TOKENS[port]} if TOKENS.get(port) else {}
     data = raw
     if body is not None:
         data = json.dumps(body).encode()

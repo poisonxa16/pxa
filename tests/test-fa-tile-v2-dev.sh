@@ -8,7 +8,9 @@
 #
 # It also requires the v2 kernel's own "ENGAGED" line in the armed run. Without that check a card
 # that never reaches the tile kernel at all -- anything but sm_60 -- would produce two identical
-# dumps from the SAME kernel and report a green result that proves nothing.
+# dumps from the SAME kernel and report a green result that proves nothing. Such a card SKIPs
+# (exit 77) instead -- but only after both runs completed clean: a crash on the route that card
+# does take (the sm_70 MMA kernel at the 150k-cell cases) is still a FAIL.
 #
 # usage: test-fa-tile-v2-dev.sh /path/to/test-fa-tile-v2-dev [workdir]
 
@@ -16,6 +18,11 @@ set -u
 
 BIN=${1:-}
 WORK=${2:-${TMPDIR:-/tmp}}
+# A private directory per run: ctest passes the shared build dir, and the card-only ctests of one build tree run
+# on several cards at once (RC2.1 card 4 + card 6, 10-20): fixed dump names there let one card's run compare the
+# other card's dump. The run directory is removed on exit.
+WORK=$(mktemp -d "$WORK/fa-tile-v2.XXXXXX") || exit 2
+trap 'rm -rf "$WORK"' EXIT
 
 if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
     echo "usage: $0 /path/to/test-fa-tile-v2-dev [workdir]" >&2
@@ -47,11 +54,13 @@ fail=0
 [ $rc_off -ne 0 ] && { echo "FAIL: the shipping schedule run returned $rc_off"; fail=1; }
 [ $rc_on  -ne 0 ] && { echo "FAIL: the swizzled schedule run returned $rc_on";  fail=1; }
 
+engaged=1
 if ! grep -q "PXA_FA_TILE_V2: ENGAGED" "$ON_LOG"; then
-    echo "FAIL: the armed run never printed the v2 kernel's ENGAGED line -- the tile route was not"
-    echo "      taken on this card, so byte equality here would prove nothing. This test is"
-    echo "      meaningful only where fattn.cu sends a batch to the tile-f16 kernel (sm_60)."
-    fail=1
+    engaged=0
+    echo "NOTE: the armed run never printed the v2 kernel's ENGAGED line -- the tile route was not"
+    echo "      taken on this card, so byte equality here proves nothing about the v2 schedule. It is"
+    echo "      meaningful only where fattn.cu sends a batch to the tile-f16 kernel (sm_60); elsewhere"
+    echo "      the case list still has to run clean on whatever kernel the card routes it to."
 fi
 
 if cmp -s "$OFF" "$ON"; then
@@ -63,5 +72,9 @@ else
     fail=1
 fi
 
+if [ $fail -eq 0 ] && [ $engaged -eq 0 ]; then
+    echo "SKIP: both runs completed clean, but not on the tile-f16 route (not an sm_60 card)"
+    exit 77
+fi
 [ $fail -eq 0 ] && echo "OK" || echo "FAIL"
 exit $fail

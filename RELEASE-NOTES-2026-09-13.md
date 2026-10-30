@@ -20,7 +20,7 @@ Say it once, at the top, so no line below has to repeat it.
   **2× Tesla V100 PCIe 16 GB pair (cc 7.0)** of the development box — **both cards on PCIe x4 links**,
   no NVLink. The four-card Tesla P100 (cc 6.0) rows say so explicitly. Nothing here is a claim about a
   card, a model or a batch shape that is not named.
-- ⚠ **What the cross-engine tables carry, and what they do not.** Every cross-engine cell in this
+- Warning: **What the cross-engine tables carry, and what they do not.** Every cross-engine cell in this
   note runs **stock** Qwen3.8-27B on all three sides — this engine on the stock PXQ4 (`11d6dd2a`),
   mainline `llama.cpp` and the parent engine on the stock `UD-Q4_K_S` (`b3853896`) — driven by
   the same client in the same bracket, with every quantised file on NVMe. The *weights* confound the
@@ -134,7 +134,7 @@ from Pascal up (the banner names both measurements); the flags it arms are
 `--spec-type ngram:n_max=64,n_min=2,ngram_size_n=24` with `PXA_NGRAM_RESET_STREAK=0`, and
 `PXA_SPEC_AUTO_CHAIN=cascade` restores the previous chain. The repetition
 class there reads **21.25 against mainline's 19.54, +8.8%**, at REPS 6 in one bracket (capture
-`quadrep2-w1`); the earlier REPS 3 reading of 17.60 against 18.33 undercounted this engine as much as it
+capture C); the earlier REPS 3 reading of 17.60 against 18.33 undercounted this engine as much as it
 overcounted the gap and is superseded — [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md) carries both.
 
 **And one thing about every speculative decoder, said plainly because it surprised me first.**
@@ -308,7 +308,7 @@ but its path has not yet been exercised end to end on a serving load, so it prin
 fingerprint against the wanted one when it declines, and an `ADMITTED` block when it fires. Read one
 of those two on a first boot rather than assuming.
 
-⚠ `PXA_ALLOW_GRAPH_SPLIT_HYBRID` is **not** this, and must not be used as if it were. That is a
+Warning: `PXA_ALLOW_GRAPH_SPLIT_HYBRID` is **not** this, and must not be used as if it were. That is a
 blanket bypass that admits four hybrid architectures alike, its own lever row says in as many words
 that it must not serve traffic, and its old speed figures are void because they were taken on a
 configuration that was emitting NaN. The admission above is a whitelist of one model shape; the
@@ -436,7 +436,7 @@ restores the old reserve.
   divergence no worse than the PXQ4 fused kernel's `0.000951` and same-top-p not below `98.710%`.
   Measured mean KLD **0.000026 – 0.000032** and same-top-p **99.64 – 99.75%**.
 
-  ⚠ Gate this lever with `-b 8 -ub 8`, never the default batch. `llama-perplexity` is pure prefill and
+  Warning: Gate this lever with `-b 8 -ub 8`, never the default batch. `llama-perplexity` is pure prefill and
   the dense 2D decode driver only accepts `ny <= 8`, so at `-b 512` both arms take the prefill GEMM and
   return bit-identical logits — a false pass on a run in which the kernel never executed. A greedy hash
   is not a pass condition either: the arithmetic differs by construction, so identical text would mean
@@ -834,7 +834,7 @@ is published with the rest in [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md).
 
 ## Credits
 
-Thanks to mistrjirka, a developer on the PXA Network Discord, for his help on this release.
+Thanks to the PXA Network Discord for its help on this release.
 
 ---
 

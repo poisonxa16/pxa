@@ -1,6 +1,6 @@
 # PXQ4 (GGML_TYPE_PXQ4 = 252) — complete byte-level format specification
 
-Source of truth: `/path/to/engine-repo` @ branch `fable9-swa-kv`, HEAD `acf8f245` (READ ONLY).
+Source of truth: `/path/to/engine-repo` @ an internal branch, HEAD `acf8f245` (READ ONLY).
 Every claim below is tagged FACT (read in source, with file:line), INFERENCE, or ASSUMPTION.
 
 **FILE-NAME TRAP (confirmed FACT).** The id-252 implementation lives in
@@ -93,14 +93,14 @@ there is no per-row region on disk. The real layout is panels. But
 panel_bytes            = 128 + (K/32)*1088 = 128 + 34*K
 total = (R/64)*panel_bytes = (R/64)*128 + (R/64)*34*K
                            = 2*R + (17*R*K)/32
-row_size(K)*R          = R*(2 + 17*K/32) = 2*R + 17*R*K/32     ✓ identical
+row_size(K)*R          = R*(2 + 17*K/32) = 2*R + 17*R*K/32     ok identical
 ```
 The `row_meta_size = 2` exists exactly so that ggml's `ggml_row_size` / `ggml_nbytes`
 bookkeeping lands on the panel-header bytes without ggml knowing about panels
 (FACT, comment `ggml.c:1415-1420`; `ggml-pxq6-tables.h:26`).
 
 **Alignment (INFERENCE from the arithmetic):** `panel_bytes = 128 + 34*K` with `K ≡ 0 (mod 32)`
-⇒ `34*K = 1088*(K/32)`, a multiple of 1088 and hence of 64. `128` is a multiple of 64.
+=> `34*K = 1088*(K/32)`, a multiple of 1088 and hence of 64. `128` is a multiple of 64.
 Therefore **every panel base, every slab base, and the tensor base itself are 64-byte
 aligned relative to the tensor base**, with no inter-panel padding. Panels are packed
 back-to-back (`src/pxq6-quantize.inc.cpp:302-303`, `dst + p*panel_bytes`).
@@ -111,7 +111,7 @@ bits/weight = 8 * (2 + 17*K/32) / K = 4.25 + 16/K
 ```
 which is exactly the "4.25 + 16/K bpw" in `ggml.h:465-467`. At K = 4096 → 4.25391;
 at K = 1024 → 4.2656 (the number quoted in `ggml-pxq6-tables.h:10-11` and `pxq6.cuh:20-21`).
-HQ: `8*(2 + 18*K/32)/K = 4.5 + 16/K` ✓ (`ggml.h:469-471`).
+HQ: `8*(2 + 18*K/32)/K = 4.5 + 16/K` ok (`ggml.h:469-471`).
 
 ---
 
@@ -349,7 +349,7 @@ between PXQ4 order and row-major.
 
 Zero handling (FACT, analogous statement for the sibling 5-bit tier at
 `ggml-pxq6-tables.h:62-63`; for PXQ4 INFERENCE from the arithmetic): a genuinely zero row
-is `anchor = +0.0` ⇒ every product is exactly `+0.0` regardless of the sub/code bytes.
+is `anchor = +0.0` => every product is exactly `+0.0` regardless of the sub/code bytes.
 There is no code that maps to exact zero *except* `BOOK[7] == 0.0`, which is available
 per-element.
 
@@ -371,7 +371,7 @@ Cross-check against the quantizer's own size formula (FACT,
 ```c
 exp_bytes = (R/64)*(PXQ6_HDR_BYTES + (K/32)*(tier ? PXQ6HQ_SLAB_BYTES : PXQ6_SLAB_BYTES));
 ```
-✓ same expression.
+ok same expression.
 
 Worked examples on this model's real shapes (hidden 5120):
 
@@ -435,20 +435,20 @@ INFERENCE, but a direct consequence of the FACTs in §3:
 1. **A panel is a self-contained contiguous byte range** covering exactly 64 weight rows
    and all of K. Its header holds only those 64 rows' anchors; its slabs hold only those
    64 rows' scale bytes and codes. Nothing in a panel references another panel.
-   ⇒ **Column-parallel sharding (split output rows R) at any multiple of 64 is a pure
+   => **Column-parallel sharding (split output rows R) at any multiple of 64 is a pure
    `memcpy` of whole panels** — byte-identical, no re-quantization, no header rebuild.
 
 2. **A slab is self-contained per 32-column block.** The only cross-K object is the fp16
    row anchor in the header, and it is a scalar multiplier with **no dependence on which
    K-blocks are present** (`eff = anchor * SUB16[s4]`, `pxq6.cuh:326-331`).
-   ⇒ **Row-parallel sharding (split K) at any multiple of 32 is a byte-gather: for every
+   => **Row-parallel sharding (split K) at any multiple of 32 is a byte-gather: for every
    panel, copy the 128 B header verbatim, then copy the contiguous run of slabs
    `[kb0, kb1)`.** Numerically bit-identical: each surviving element's `anchor`, `s4` and
    `code` bytes are unchanged. Note the anchor was *chosen* over the full row, so a K-shard
    is not the anchor an independent quantizer would pick — but it is the anchor the full
    product needs, and partial dot products summed across ranks reproduce the unsharded
    result exactly.
-   ⇒ For a K-shard the resulting sub-tensor is itself a valid PXQ4 tensor with
+   => For a K-shard the resulting sub-tensor is itself a valid PXQ4 tensor with
    `K' = 32*(kb1-kb0)`, `panel_bytes' = 128 + 34*K'`. Its bpw rises to `4.25 + 16/K'`
    (the 128 B header is duplicated per rank — for TP=4 on K=17408 that is
    4.25 + 16/4352 = 4.2537 bpw, +0.09% bytes/rank vs unsharded).

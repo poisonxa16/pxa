@@ -1,0 +1,22 @@
+# Field-report patches on a shipping PXA vLLM sidecar.
+# Levers stay off unless the process sets them:
+#   PXA_LPT_SOLO=1          solo-prefill (ignore the long-prefill cap when alone)
+#   PXA_SWA_KEEP_HASHED=1   hashed KV blocks go to the LRU end of the free queue
+#   PXA_LENIENT_LOGR=<x>    lenient speculative acceptance (lossy)
+#
+#   docker build -f tools/vllm-pxq4/deploy/Dockerfile.field \
+#     --build-arg BASE_IMAGE=ghcr.io/poisonxa16/pxa-vllm:sm70-v2026.10 \
+#     -t pxa-vllm:sm70-v32-field tools/vllm-pxq4
+ARG BASE_IMAGE=pxa-vllm:sm70-pxqn-dev
+FROM ${BASE_IMAGE}
+COPY patches/ /opt/pxa/field-patches/
+RUN set -e; \
+    cd /opt/vllm-venv/lib/python3.12/site-packages; \
+    patch -p1 --fuzz=0 --forward --batch < /opt/pxa/field-patches/solo-prefill-scheduler.patch; \
+    patch -p1 --fuzz=0 --forward --batch < /opt/pxa/field-patches/swa-keep-hashed-block-pool.patch; \
+    patch -p1 --fuzz=0 --forward --batch < /opt/pxa/field-patches/lenient-acceptance.patch; \
+    patch -p1 --fuzz=0 --forward --batch < /opt/pxa/field-patches/dflash-pxqn-load.patch; \
+    python3 /opt/pxa/field-patches/test_solo_prefill_helper.py; \
+    python3 /opt/pxa/field-patches/test_swa_keep_hashed.py
+LABEL org.pxa.field.patches="solo-prefill,swa-keep-hashed,lenient-acceptance" \
+      org.pxa.field.defaults="off"

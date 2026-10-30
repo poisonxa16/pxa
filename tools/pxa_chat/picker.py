@@ -1,7 +1,7 @@
 """Server picker: the running PXA servers Control knows, with friendly names, resolved context, capabilities,
 and the auto-select rule (last used if it is up, otherwise the healthiest).
 
-The hive seat rule (PXACLAW hive/lib/seat.mjs): a server is a URL and nothing else; the model id is whatever
+The seat rule: a server is a URL and nothing else; the model id is whatever
 the URL reports at /v1/models, and if it reports none the call fails loudly instead of inventing a name.
 """
 import os
@@ -41,8 +41,10 @@ def _probe(port, get=None):
         info["error"] = str(e)
     try:
         p = get(base, "/props", 2.0) or {}
-        dg = p.get("default_generation_settings") or {}
-        info["n_ctx"] = dg.get("n_ctx") or p.get("n_ctx")
+        from . import compact
+        info["n_ctx"] = compact.n_ctx_of(p)          # the per-request window (n_ctx_slot), not the whole KV ring
+        mod = p.get("modalities") if isinstance(p, dict) else None
+        info["vision"] = mod.get("vision") if isinstance(mod, dict) and isinstance(mod.get("vision"), bool) else None
         info["caps"] = p.get("chat_template_caps") or {}
         info["template"] = (p.get("chat_template") or "")[:200000]
         info["model_path"] = p.get("model_path")
@@ -63,7 +65,7 @@ def capabilities(info):
         src = "template" if tpl else "unknown"
     thinking = bool(caps.get("supports_thinking") or caps.get("supports_reasoning")
                     or "<think>" in tpl or "enable_thinking" in tpl or "reasoning_content" in tpl)
-    return {"tools": tools, "thinking": thinking, "source": src,
+    return {"tools": tools, "thinking": thinking, "source": src, "vision": info.get("vision"),
             "tools_words": "Can use tools directly" if tools else "Uses tools through text (works, a bit slower)"}
 
 

@@ -196,6 +196,14 @@ static inline const ggml_pxa_model_profile & pxa_model() {
 }
 static inline bool pxa_model_known()  { return pxa_model().valid != 0; }
 static inline bool pxa_model_is_moe() { return pxa_model().n_expert > 0; }
+// PXA_ROUTER_FUSE mode 3 auto scope (2026-10-17): exactly one visible P100 (pure sm_60) and a
+// Gemma 4 MoE model -- the one cell the sm_60-shaped router GEMV was measured on (+3.4% decode, ledger
+// gemma-router-fuse-p60). Read by the lever rule (core/levers.cu) and the PXA_AUTO banner.
+static inline bool pxa_router_fuse_gemma4_p60() {
+    const pxa_topology_t & t = g_pxa_topology;
+    return t.valid && t.ndev == 1 && t.has_sm60 && !t.mixed && pxa_model_known() && pxa_model_is_moe()
+        && strcmp(pxa_model().arch_name, "gemma4") == 0;
+}
 static inline bool pxa_model_is_deltanet() {
     // Both hybrid-recurrent classes carry Gated-DeltaNet layers; the dense one (Qwen3.5 /
     // Qwable-27B) was reported as plain "dense" until 2026-09-06 (bug
@@ -765,8 +773,10 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
             // how a PXQ tensor is read at all (off = dequant->cuBLAS expansion, a different
             // engine, not a reference), plus PXA_VOLTA_F16_GEMM (fixes an ldc overrun on sm_70)
             // and PXA_MXFP4_DEQ_V2. The banner names them instead of claiming them off.
+            // PXA_CGRAPH_OPPARAMS (bug #343) is a correctness guard, not a lever: a CUDA graph
+            // replays only when every kernel node's op_params match, so it stays on here too.
             fprintf(stderr, " reference [PXA levers OFF; stay on: PXQ codec kernels "
-                            "(PXQ6/PXQ1-3/PXQ4_2D/PXQN), VOLTA_F16_GEMM, MXFP4_DEQ_V2]");
+                            "(PXQ6/PXQ1-3/PXQ4_2D/PXQN), VOLTA_F16_GEMM, MXFP4_DEQ_V2, CGRAPH_OPPARAMS]");
         } else if (cc >= 700 && cc < 750) {
             if (pxa_volta_cublas_ne11() > 0) {
                 fprintf(stderr, " CUBLAS%d ON [+9.4%% pf]", pxa_volta_cublas_ne11());
@@ -800,6 +810,10 @@ static inline void pxa_enhance_log_startup(int ndev, const int * ccs, const char
             fprintf(stderr, " INT8_PREFILL ON [TEST all-arch]");
         } else {
             fprintf(stderr, " defaults [bit-exact set]");
+        }
+        // PXA_TURING_CUBLAS_NE11 (docs/SM75.md): shown only when opted away from the default crossover 64
+        if (cc == 750 && pxa_lever(PXA_LEVER_TURING_CUBLAS_NE11) != 64) {
+            fprintf(stderr, " TURING_CUBLAS_NE11=%lld [opt-in]", (long long) pxa_lever(PXA_LEVER_TURING_CUBLAS_NE11));
         }
     }
     if (pxa_fa_prefill_split_ne11() > 0) {
@@ -855,6 +869,7 @@ static inline void pxa_enhance_log_model_decisions() {
         const char * why =
             pxa_lever_set_by_user(PXA_LEVER_ROUTER_FUSE) ? "explicit env override" :
             mode == 1                        ? "pure-sm_70 topology x MoE model (+5.1..7.0% dec measured, single V100, PXQ2-35B)" :
+            mode == 3                        ? "one P100 x Gemma 4 MoE: sm_60-shaped router GEMV (+3.4% dec measured, 1x P100, Gemma 4 26B PXQN4)" :
             (m.n_expert == 0)                ? "OFF: dense model — no router GEMV exists, the fuse can never fire" :
             t.mixed                          ? "OFF: mixed topology (T4 measured -3.1% at -ts 1.4,0.6 — P100 gates -sm-layer decode)" :
             t.has_sm60                       ? "OFF: sm_60 present (+1.6% KILL measured on sm_60)" :

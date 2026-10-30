@@ -22,8 +22,11 @@
 //
 // Reproducibility: by default (PXA_XCACHE_ADAPT_DET=1) every swap is applied at a fixed number of decodes after it was planned
 // (waiting for its copy when it is not yet done, which at the sizes involved is rare), so the swap schedule is a function of the
-// token stream, not of copy timing.
+// token stream, not of copy timing. Across requests: every sequence that starts at position 0 starts from the planned state
+// (PXA_XCACHE_ADAPT_RESET, default on), because the hot set changes the floats (GPU kernel vs CPU cold path).
 #pragma once
+
+#include <cstdint>
 
 struct llama_model;
 
@@ -33,10 +36,19 @@ bool llama_pxa_xcache_residency_blocks(void);
 // a decode that queued n_tokens just completed (llama_synchronize): advance the adaptation by one tick
 void llama_pxa_xcache_tick(llama_model & model, int n_tokens);
 
+// a batch starts a sequence at position 0 (llama_decode, main model): with PXA_XCACHE_ADAPT_RESET (default on) the adaptation goes
+// back to the planned hot set first, so a repeated request repeats its answer exactly; =0 keeps the hot set across requests
+void llama_pxa_xcache_seq_start(llama_model & model);
+
 // the speculation companion context takes the quiet path (a switch of the PXQN library, ggml-pxqn-tune.h; off without it):
 // its decodes only note their tokens (llama_pxa_xcache_note_tokens) instead of ticking
 bool llama_pxa_xcache_companion_quiet(void);
 void llama_pxa_xcache_note_tokens(llama_model & model, int n_tokens);
+
+// PXA_XCACHE_RTIER: planner-thread jobs run and planned swaps found stale at start (false = RTIER not active)
+bool llama_pxa_xcache_rtier_stats(const llama_model * model, uint64_t * jobs, uint64_t * stale);
+// PXA_XCACHE_EVICT_FILE: evicts read back from the model file (and how many failed); false when the mode is off
+bool llama_pxa_xcache_evict_file_stats(const llama_model * model, uint64_t * reads, uint64_t * failed);
 
 // finish every copy in flight, print the summary, free the adaptor (the model destructor)
 void llama_pxa_xcache_adaptor_free(llama_model & model);

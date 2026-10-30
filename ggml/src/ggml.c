@@ -15,6 +15,7 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables ridiculous "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
+#include "pxa-env-flag.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "ggml.h"
@@ -1287,8 +1288,12 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 2,
     },
-    // PXQN3 / PXQN3S8 / PXQN4 (ids 257-259) and the ladder (260-263): 64-row panels with a 128 B anchor header
-    // (row_meta_size 2); blck 128 (N3, N3S8, N2, N1, N5) or 32 (N4, N4S8). Decoded by the closed libggml-pxqn.
+    // PXQN3 / PXQN3S8 / PXQN4 (ids 257-259, PXQ-Next revision 1 -- ggml-pxqn.h): the same
+    // 64-row panel interleave with a 128 B anchor header (row_meta_size 2). N3/N3S8 slabs span
+    // 128 K (blck_size 128: 3328 B / 3584 B per 64-row slab = 52 / 56 B per row-block), so ggml's
+    // own ne0 % blck_size checks and the generic panel K-slicer land on 128 for free. PXQN4
+    // keeps PXQ4's 32-K slab byte order with the integer-exact N4 book. No per-row CPU codec
+    // (see the PXQ note above); the CPU path is the panel dequant in pxq-cpu.c.
     [GGML_TYPE_PXQN3] = {
         .type_name                = "pxqn3",
         .blck_size                = 128,
@@ -1316,6 +1321,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 2,
     },
+    // PXQN ladder (ids 260-263, ggml-pxqn.h / spec section 8): the same panel + anchor machinery.
     [GGML_TYPE_PXQN2] = {
         .type_name                = "pxqn2",
         .blck_size                = 128,
@@ -2649,6 +2655,33 @@ inline static void ggml_vec_mad_f32(const int n, float * restrict y, const float
 #endif
 }
 
+// y (fp32) += x (fp16) * v, converting in registers (PXA_CPU_FA_F32ACC, 2026-10-22): the CPU flash-attention
+// fp32 accumulator for an F16 V row. ggml_fp16_to_fp32_row is a scalar table loop here, so convert + ggml_vec_mad_f32
+// cost ~20% of CPU prefill at 4k context; this fused form keeps the fp16 row path's speed.
+inline static void ggml_vec_mad_f32_f16(const int n, float * restrict y, const ggml_fp16_t * restrict x, const float v) {
+    int i = 0;
+#if defined(__F16C__) && defined(__AVX__)
+    const __m256 vv = _mm256_set1_ps(v);
+    for (; i + 7 < n; i += 8) {
+        const __m256 xf = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i)));
+#if defined(__FMA__)
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(xf, vv, _mm256_loadu_ps(y + i)));
+#else
+        _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_mul_ps(xf, vv), _mm256_loadu_ps(y + i)));
+#endif
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t vv = vdupq_n_f32(v);
+    for (; i + 3 < n; i += 4) {
+        const float32x4_t xf = vcvt_f32_f16(vld1_f16((const ggml_fp16_internal_t *)(x + i)));
+        vst1q_f32(y + i, vfmaq_f32(vld1q_f32(y + i), xf, vv));
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] += GGML_FP16_TO_FP32(x[i])*v;
+    }
+}
+
 inline static void ggml_vec_mad_f16(const int n, ggml_fp16_t * restrict y, const ggml_fp16_t * restrict x, const float v) {
 #if defined(GGML_SIMD)
     const int np = (n & ~(GGML_F16_STEP - 1));
@@ -3887,9 +3920,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MOE_SPLIT_IDS",
     "MOE_MERGE",
+    "SSM_SCAN2",
+    "MAMBA2_CONV",
+    "MAMBA2_SCAN",
 };
 
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4021,9 +4057,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "moe_split_ids(ids,map)",
     "moe_merge(hot,cold)",
+    "ssm_scan2(x)",
+    "mamba2_conv(rs,x)",
+    "mamba2_scan(rs,x)",
 };
 
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7547,6 +7586,24 @@ static struct ggml_tensor * ggml_up_gate_combine(
     return ggml_fused_mul_unary(ctx, gate, up, op);
 }
 
+// R1 RIX (libggml-pxqn): the routed-expert SwiGLU node carries this marker in op_params[3]; with the library's RIX switch on, the
+// CPU computes it through ggml_pxa_rix_swiglu_active, so a cold expert's activation is the same bits as a hot one's. Dense FFNs are unmarked.
+#define GGML_PXA_RIX_MARK 0x52495831
+typedef void (*ggml_pxa_rix_swiglu_fn)(int64_t n, float * y, const float * g, const float * u);
+GGML_API ggml_pxa_rix_swiglu_fn ggml_pxa_rix_swiglu_active(void);
+GGML_API int  ggml_pxa_rix_maxw(void);
+GGML_API void ggml_pxa_rix_tl_off(int off);
+
+static struct ggml_tensor * ggml_moe_up_gate_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        enum   ggml_unary_op  op) {
+    struct ggml_tensor * r = ggml_up_gate_combine(ctx, gate, up, op);
+    if (r->op == GGML_OP_FUSED_MUL_UNARY) ggml_set_op_params_i32(r, 3, GGML_PXA_RIX_MARK);
+    return r;
+}
+
 // Merged up/gate expert tensor packing, as fixed by the fused kernel itself and by the loader
 // (create_tensors_helper::merge_up_gate_exps): rows [0, ne1/2) are gate, rows [ne1/2, ne1) are up.
 // Both halves are whole rows, so no quantisation block is ever split and nb[0] stays the type size
@@ -7599,7 +7656,7 @@ struct ggml_tensor * ggml_moe_up_gate(
                     !ggml_fused_up_gate_placement_ok(as_up, as_gate))) {
         struct ggml_tensor * result_up   = ggml_mul_mat_id(ctx, as_up,   b, ids);
         struct ggml_tensor * result_gate = ggml_mul_mat_id(ctx, as_gate, b, ids);
-        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
+        return ggml_moe_up_gate_combine(ctx, result_gate, result_up, op);
     }
     // Merged single-tensor layout (as_gate == NULL, i.e. blk.N.ffn_gate_up_exps or -muge). The
     // guard above is conditioned on as_gate, so on this leg it could never fire: the node was
@@ -7612,7 +7669,7 @@ struct ggml_tensor * ggml_moe_up_gate(
         ggml_split_merged_up_gate(ctx, as_up, &gate_h, &up_h);
         struct ggml_tensor * result_up   = ggml_mul_mat_id(ctx, up_h,   b, ids);
         struct ggml_tensor * result_gate = ggml_mul_mat_id(ctx, gate_h, b, ids);
-        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
+        return ggml_moe_up_gate_combine(ctx, result_gate, result_up, op);
     }
     GGML_ASSERT(!ggml_is_transposed(as_up));
     GGML_ASSERT(!as_gate || !ggml_is_transposed(as_gate));
@@ -7718,7 +7775,7 @@ struct ggml_tensor * ggml_moe_up_gate_ext(
         if (as_gate_b) {
             result_gate = ggml_add_id(ctx, result_gate, as_gate_b, ids);
         }
-        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
+        return ggml_moe_up_gate_combine(ctx, result_gate, result_up, op);
     }
     // Merged single-tensor layout -- see the twin comment in ggml_moe_up_gate(). The bias mirrors
     // the weight packing: one row per expert holding the gate half first, then the up half, and
@@ -7741,7 +7798,7 @@ struct ggml_tensor * ggml_moe_up_gate_ext(
             result_up   = ggml_add_id(ctx, result_up,   up_b_h,   ids);
             result_gate = ggml_add_id(ctx, result_gate, gate_b_h, ids);
         }
-        return ggml_up_gate_combine(ctx, result_gate, result_up, op);
+        return ggml_moe_up_gate_combine(ctx, result_gate, result_up, op);
     }
 
     GGML_ASSERT(!ggml_is_transposed(as_up));
@@ -8666,6 +8723,47 @@ struct ggml_tensor * ggml_get_rows(
 
     return result;
 }
+
+// ggml_get_rows_typed
+//
+// ggml_get_rows above widens every gather to F32 ("TODO: implement non F32 return"), which for a
+// quantised or half-precision source means the gather WRITES four bytes per element where the
+// rows themselves occupy one or two -- and hands the consumer a widened tensor it then has to
+// read at that width. Where the consumer can take the source type (a mul_mat with a quantised or
+// F16 src0 is the ordinary case, not a special one), the widening is pure overhead.
+//
+// This is the same op with the result typed as the source. On the bits it is a row COPY: the
+// I32 case ggml_get_rows already special-cases is exactly this, generalised to every fixed-block
+// type. Out-of-range indices zero the row, as they do in the widening gather -- a zeroed block
+// of any admitted type dequantises to 0.0, so the two agree in value as well as in shape.
+struct ggml_tensor * ggml_get_rows_typed(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->ne[2] == b->ne[1]);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+    // a row must be a whole number of blocks, or "copy the row" is not expressible in bytes
+    GGML_ASSERT(a->ne[0] % ggml_blck_size(a->type) == 0);
+    // the gather reads whole rows at a->nb[1]; a row-interleaved source is not one
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
+
+    bool is_node = false;
+    if (a->grad || b->grad) {
+        // the backward pass of a typed gather would have to quantise; nothing builds one
+        GGML_ABORT("ggml_get_rows_typed: no backward pass");
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
+
+    result->op   = GGML_OP_GET_ROWS;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 
 // ggml_get_rows_back
 
@@ -9884,6 +9982,32 @@ void ggml_op_set_save_strides(struct ggml_tensor * a, int64_t row_stride, int64_
     a->op_params[3] = (int32_t) step_stride;
 }
 
+// PXA_SPEC_CKPT_REPLAY (2026-10-14): turn a GGML_OP_DELTA_NET node built WITHOUT saved_steps into a
+// replay-capture verify. Instead of one state row per step, the kernel writes into `pack` (one
+// sequence only) the state it starts from and every token's recurrence inputs:
+//   [ state S_v*S_v*H_v | q S_k*n_tokens*H_k | k S_k*n_tokens*H_k | v S_v*H_v*n_tokens | g H_v*n_tokens | beta H_v*n_tokens ]
+// (q/k in the op's own [S_k, n_tokens, H_k] order, v as [S_v, H_v, n_tokens], g/beta as [H_v, n_tokens]).
+// A rollback to "k+1 tokens accepted" re-runs the SAME recurrence kernel over those k+1 tokens from the
+// captured start state (ggml_backend_cuda_delta_net_replay), reproducing the per-step row bit for bit.
+// op_params[4] = 1 marks it; CUDA only (the CPU op asserts). Not in ggml.h on purpose: declared by its
+// callers (src/llama-delta-net.cpp, tests/test-spec-rollback-cost.cpp) so no CUDA TU recompiles for it.
+GGML_API void ggml_delta_net_set_replay_capture(struct ggml_tensor * a, struct ggml_tensor * pack);
+void ggml_delta_net_set_replay_capture(struct ggml_tensor * a, struct ggml_tensor * pack) {
+    GGML_ASSERT(a->op == GGML_OP_DELTA_NET);
+    GGML_ASSERT(a->src[6] == NULL && "replay capture replaces the per-step capture");
+    GGML_ASSERT(a->op_params[1] == 0 && "replay capture: scalar (Gated DeltaNet) gate only");
+    GGML_ASSERT(pack != NULL && pack->type == GGML_TYPE_F32);
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * v = a->src[2];
+    const int64_t S_k = q->ne[0], n_tokens = q->ne[1], H_k = q->ne[2], n_seqs = q->ne[3];
+    const int64_t S_v = v->ne[0], H_v = v->ne[2];
+    GGML_ASSERT(n_seqs == 1 && "replay capture: one sequence per verify batch");
+    const int64_t need = S_v*S_v*H_v + n_tokens*(2*S_k*H_k + S_v*H_v + 2*H_v);
+    GGML_ASSERT(ggml_nelements(pack) >= need);
+    a->src[6] = pack;
+    a->op_params[4] = 1;
+}
+
 struct ggml_tensor * ggml_delta_net(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -10212,6 +10336,24 @@ struct ggml_tensor * ggml_moe_cold_wait(
     memcpy((char *) result->op_params + 2*sizeof(int32_t), &slot, sizeof(slot));
 
     return result;
+}
+
+// PXA_XCACHE_SKIP_COLD_RANK (see ggml.h): op_params[3] = the 1-based rank from which a cold expert is dropped, src[3] = the weights
+void ggml_moe_split_ids_set_skip_cold(
+        struct ggml_tensor  * split,
+        struct ggml_tensor  * weights,
+        int                   rank) {
+    GGML_ASSERT(split->op == GGML_OP_MOE_SPLIT_IDS);
+    const int side = ggml_get_op_params_i32(split, 0), both = ggml_get_op_params_i32(split, 2);
+    GGML_ASSERT((side == 1 && both == 0) || (side == 0 && both == 1));
+    if (rank <= 0) return;
+    const struct ggml_tensor * ids = split->src[0];
+    GGML_ASSERT(weights != NULL && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT((weights->ne[0] == 1 && weights->ne[1] == ids->ne[0] && weights->ne[2] == ids->ne[1]) ||
+                (weights->ne[0] == ids->ne[0] && weights->ne[1] == ids->ne[1] && weights->ne[2] == 1));
+    GGML_ASSERT(split->src[3] == NULL);
+    ggml_set_op_params_i32(split, 3, rank);
+    split->src[3] = weights;
 }
 
 struct ggml_tensor * ggml_moe_merge(
@@ -10778,6 +10920,157 @@ struct ggml_tensor * ggml_ssm_scan(
     result->src[4] = B;
     result->src[5] = C;
     result->src[6] = sq;
+
+    return result;
+}
+
+// ggml_ssm_scan2 (PXA Nemotron-H, Mamba-2)
+
+struct ggml_tensor * ggml_ssm_scan2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * A,
+        struct ggml_tensor  * B,
+        struct ggml_tensor  * C) {
+    GGML_ASSERT(ggml_is_contiguous(s));
+    GGML_ASSERT(ggml_is_contiguous(dt));
+    GGML_ASSERT(ggml_is_contiguous(A));
+    GGML_ASSERT(s->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32);
+    GGML_ASSERT(A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32 && C->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == ggml_type_size(x->type));
+    GGML_ASSERT(B->nb[0] == ggml_type_size(B->type));
+    GGML_ASSERT(C->nb[0] == ggml_type_size(C->type));
+    GGML_ASSERT(x->nb[1] == x->ne[0]*x->nb[0]);
+    GGML_ASSERT(B->nb[1] == B->ne[0]*B->nb[0]);
+    GGML_ASSERT(C->nb[1] == C->ne[0]*C->nb[0]);
+    GGML_ASSERT(ggml_are_same_shape(B, C));
+    {
+        const int64_t d_state      = s->ne[0];
+        const int64_t head_dim     = x->ne[0];
+        const int64_t n_head       = x->ne[1];
+        const int64_t n_seq_tokens = x->ne[2];
+        const int64_t n_seqs       = x->ne[3];
+        GGML_ASSERT(dt->ne[0] == n_head && dt->ne[1] == n_seq_tokens && dt->ne[2] == n_seqs);
+        GGML_ASSERT(s->ne[1] == head_dim && s->ne[2] == n_head && s->ne[3] == n_seqs);
+        GGML_ASSERT(B->ne[0] == d_state && B->ne[2] == n_seq_tokens && B->ne[3] == n_seqs);
+        GGML_ASSERT(n_head % B->ne[1] == 0);
+        GGML_ASSERT(A->ne[0] == 1 && A->ne[1] == n_head);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + ggml_nelements(s));
+
+    result->op     = GGML_OP_SSM_SCAN2;
+    result->grad   = NULL;
+    result->src[0] = s;
+    result->src[1] = x;
+    result->src[2] = dt;
+    result->src[3] = A;
+    result->src[4] = B;
+    result->src[5] = C;
+
+    return result;
+}
+
+// ggml_mamba2_conv / ggml_mamba2_scan (PXA Nemotron-H phase 2: in-place Mamba-2 mixer, see ggml.h)
+
+static void ggml_mamba2_check_routing(const struct ggml_tensor * rs, const struct ggml_tensor * ids,
+        const struct ggml_tensor * mask, int64_t n_seqs) {
+    GGML_ASSERT(rs->type == GGML_TYPE_F32 && rs->nb[0] == sizeof(float) && ggml_nrows(rs) == rs->ne[1]);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ggml_nelements(ids) == n_seqs);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 && mask->ne[0] == 1 && mask->ne[1] == n_seqs && mask->ne[2] == 1 && mask->ne[3] == 1);
+}
+
+struct ggml_tensor * ggml_mamba2_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rs,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * mask) {
+    const int64_t d_conv   = w->ne[0];
+    const int64_t conv_dim = w->ne[1];
+    const int64_t n_tok    = x->ne[1];
+    const int64_t n_seqs   = ids->ne[0];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && x->ne[0] == conv_dim && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(w) && w->ne[2] == 1 && w->ne[3] == 1);
+    GGML_ASSERT(d_conv == 4);
+    GGML_ASSERT(n_seqs >= 1 && n_tok >= 1 && n_tok % n_seqs == 0);
+    GGML_ASSERT(rs->ne[0] >= (d_conv - 1)*conv_dim);
+    ggml_mamba2_check_routing(rs, ids, mask, n_seqs);
+    if (b) {
+        GGML_ASSERT(b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) && ggml_nelements(b) == conv_dim);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_dim, n_tok);
+
+    result->op     = GGML_OP_MAMBA2_CONV;
+    result->grad   = NULL;
+    result->src[0] = rs;
+    result->src[1] = x;
+    result->src[2] = w;
+    result->src[3] = ids;
+    result->src[4] = mask;
+    result->src[5] = b;     // optional: last
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mamba2_scan(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rs,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * A,
+        struct ggml_tensor  * B,
+        struct ggml_tensor  * C,
+        struct ggml_tensor  * dt_b,
+        struct ggml_tensor  * D,
+        struct ggml_tensor  * z,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * mask,
+        int64_t               s_off) {
+    const int64_t head_dim     = x->ne[0];
+    const int64_t n_head       = x->ne[1];
+    const int64_t n_seq_tokens = x->ne[2];
+    const int64_t n_seqs       = x->ne[3];
+    const int64_t d_state      = B->ne[0];
+    const int64_t n_group      = B->ne[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32 && A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32);
+    GGML_ASSERT(C->type == GGML_TYPE_F32 && dt_b->type == GGML_TYPE_F32 && D->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && x->nb[1] == head_dim*sizeof(float));
+    GGML_ASSERT(z->nb[0] == sizeof(float) && z->nb[1] == head_dim*sizeof(float) && ggml_are_same_shape(x, z));
+    GGML_ASSERT(B->nb[0] == sizeof(float) && B->nb[1] == d_state*sizeof(float));
+    GGML_ASSERT(C->nb[0] == sizeof(float) && C->nb[1] == d_state*sizeof(float) && ggml_are_same_shape(B, C));
+    GGML_ASSERT(dt->nb[0] == sizeof(float) && dt->ne[0] == n_head && dt->ne[1] == n_seq_tokens && dt->ne[2] == n_seqs);
+    GGML_ASSERT(B->ne[2] == n_seq_tokens && B->ne[3] == n_seqs && n_group >= 1 && n_head % n_group == 0);
+    GGML_ASSERT(ggml_is_contiguous(A) && ggml_nelements(A) == n_head);
+    GGML_ASSERT(ggml_is_contiguous(D) && ggml_nelements(D) == n_head);
+    GGML_ASSERT(ggml_is_contiguous(dt_b) && ggml_nelements(dt_b) == n_head);
+    GGML_ASSERT(s_off >= 0 && s_off + d_state*head_dim*n_head <= rs->ne[0]);
+    ggml_mamba2_check_routing(rs, ids, mask, n_seqs);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*n_head, n_seq_tokens*n_seqs);
+
+    int32_t params[2] = { (int32_t) (s_off & 0xffffffff), (int32_t) (s_off >> 32) };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op      = GGML_OP_MAMBA2_SCAN;
+    result->grad    = NULL;
+    result->src[0]  = rs;
+    result->src[1]  = x;
+    result->src[2]  = dt;
+    result->src[3]  = A;
+    result->src[4]  = B;
+    result->src[5]  = C;
+    result->src[6]  = dt_b;
+    result->src[7]  = D;
+    result->src[8]  = z;
+    result->src[9]  = ids;
+    result->src[10] = mask;
 
     return result;
 }
@@ -14643,8 +14936,34 @@ static void ggml_compute_forward_argmax_f32(
         }
         return;
     }
-    if (ggml_get_op_params_i32(dst, 0) == 1) {
-        // PXA_ARGMAX_VAL: (index, max, sumexp) per row, lowest index on ties
+    if (ggml_get_op_params_i32(dst, 0) == 3) {
+        // PXA_SAMPLED_TOPW: the top-W window per row, dst row = W values sorted descending then W ids (as floats);
+        // equal values keep the lower id first and an element equal to the minimum of a full window does not enter
+        // (common/sampling.cpp pxa_topk_window, the CPU sampler's raw window); short rows pad with (-inf, -1)
+        const int W = ggml_get_op_params_i32(dst, 1);
+        GGML_ASSERT(W >= 1 && W <= 128 && dst->ne[0] == 2*W);
+        for (int64_t i1 = 0; i1 < ne01; i1++) {
+            const float * src = (const float *) ((const char *) src0->data + i1*nb01);
+            float * d = (float *) ((char *) dst->data + i1*dst->nb[1]);
+            float wl[128]; int32_t wid[128]; int cnt = 0;
+            for (int64_t i0 = 0; i0 < ne00; ++i0) {
+                const float x = src[i0];
+                if (cnt == W && !(x > wl[W-1])) continue;
+                int j = cnt < W ? cnt++ : W - 1;
+                while (j > 0 && wl[j-1] < x) { wl[j] = wl[j-1]; wid[j] = wid[j-1]; --j; }
+                wl[j] = x; wid[j] = (int32_t) i0;
+            }
+            for (int k = 0; k < W; ++k) {
+                d[k]     = k < cnt ? wl[k] : -INFINITY;
+                d[W + k] = k < cnt ? (float) wid[k] : -1.0f;
+            }
+        }
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 0) == 1 || ggml_get_op_params_i32(dst, 0) == 4) {
+        // PXA_ARGMAX_VAL: (index, max, sumexp) per row, lowest index on ties; mode 4 (PXA_DRAFT_ARGMAX) adds
+        // max2 = the largest value at any other column
+        const bool w4 = ggml_get_op_params_i32(dst, 0) == 4;
         for (int64_t i1 = 0; i1 < ne01; i1++) {
             const float * src = (const float *) ((const char *) src0->data + i1*nb01);
             float * d = (float *) ((char *) dst->data + i1*dst->nb[1]);
@@ -14653,10 +14972,13 @@ static void ggml_compute_forward_argmax_f32(
                 if (src[i0] > mx) { mx = src[i0]; im = i0; }
             }
             double se = 0.0;
+            float m2 = -INFINITY;
             for (int64_t i0 = 0; i0 < ne00; ++i0) {
                 se += exp((double) src[i0] - (double) mx);
+                if (w4 && i0 != im) m2 = fmaxf(m2, src[i0]);
             }
             d[0] = (float) im; d[1] = mx; d[2] = (float) se;
+            if (w4) d[3] = m2;
         }
         return;
     }
@@ -16266,6 +16588,8 @@ static void ggml_compute_forward_fused_mul_unary_f32(
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
     GGML_ASSERT(ggml_are_same_shape(src0, src1));
     GGML_ASSERT(op == GGML_UNARY_OP_GELU || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU);
+    const ggml_pxa_rix_swiglu_fn rixf = op == GGML_UNARY_OP_SILU && dst->op_params[3] == GGML_PXA_RIX_MARK && dst->ne[2] <= ggml_pxa_rix_maxw() ?
+                                        ggml_pxa_rix_swiglu_active() : NULL;
 
     for (int i1 = ir0; i1 < ir1; i1++) {
         float * z = (float *) ((char *) dst->data  + i1*( dst->nb[1]));
@@ -16275,7 +16599,9 @@ static void ggml_compute_forward_fused_mul_unary_f32(
             case GGML_UNARY_OP_GELU: ggml_vec_gelu_f32(nc, z, x); ggml_vec_mul_f32(nc, z, z, y); break;
             case GGML_UNARY_OP_RELU: ggml_vec_relu_f32(nc, z, x); ggml_vec_mul_f32(nc, z, z, y); break;
             case GGML_UNARY_OP_SILU: {
-                if (limit < 1e-6f) {
+                if (limit < 1e-6f && rixf) {
+                    rixf(nc, z, x, y);
+                } else if (limit < 1e-6f) {
                     ggml_vec_mul_silu_f32(nc, z, x, y);
                 } else {
                     // TODO: simdify this
@@ -17404,6 +17730,55 @@ static int ggml_compute_forward_mul_mat(
 
 // ggml_compute_forward_mul_mat_id
 
+// PXA_CPU_MMID_TILED (default 1): bit-identical CPU MUL_MAT_ID work queue + same-order tiles (see below); 0 = old path,
+// 2 = the work queue with the plain per-pair vec_dot (no tiles; for measurement).
+static int pxa_mmid_tiled_mode_v = -1;
+static int pxa_mmid_tiled_mode(void) {
+    int v = pxa_mmid_tiled_mode_v;
+    if (v < 0) {
+        const char * e = getenv("PXA_CPU_MMID_TILED");
+        v = (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 2 : 1;
+        pxa_mmid_tiled_mode_v = v;
+    }
+    return v;
+}
+void ggml_pxa_set_cpu_mmid_tiled(int mode) { pxa_mmid_tiled_mode_v = mode == 0 ? 0 : mode == 2 ? 2 : 1; }
+// queue shape knobs (tuning only; every setting gives the same bytes): rows per work item, and the minimum average number of
+// columns per routed expert (in tenths) for the queue to run at all (below it the op is weight-bandwidth bound and the old
+// static per-expert row split streams better: 30B-A3B T=4 old 2.33 ms vs queue 2.43 vs tiles 2.52)
+static int pxa_mmid_env_int(const char * name, int def, int lo, int hi) {
+    const char * e = getenv(name);
+    int v = e ? atoi(e) : def;
+    return v < lo ? lo : v > hi ? hi : v;
+}
+static int pxa_mmid_rc_v = -1, pxa_mmid_cpe10_v = -1;
+static int pxa_mmid_rc(void)    { if (pxa_mmid_rc_v    < 0) pxa_mmid_rc_v    = pxa_mmid_env_int("PXA_CPU_MMID_RC", 32, 2, 4096) & ~1; return pxa_mmid_rc_v; }
+static int pxa_mmid_cpe10(void) { if (pxa_mmid_cpe10_v < 0) pxa_mmid_cpe10_v = pxa_mmid_env_int("PXA_CPU_MMID_CPE10", 20, 0, 100000); return pxa_mmid_cpe10_v; }
+
+// PXA_PXQN_CPU_MMID_Q (default 1; 2026-10-23): host PXQN experts (the closed library's fast CPU matmul) on a
+// work queue like the vec_dot types': every activation column is quantised ONCE (all threads, before the barrier; the old path
+// re-quantised it in every thread for every routed expert) and (expert, PXA_PXQN_CPU_MMID_RC-row chunk, 64-column chunk) items go
+// to whichever thread is free (the old path split every expert's rows statically over the threads). Same quantiser and chunk
+// kernels: every output is bit-identical. 0 = the old per-expert pxa_pxq_mul_mat_cpu call.
+static int pxa_pxqn_mmid_q_v = -1;
+static int pxa_pxqn_mmid_q(void) {
+    int v = pxa_pxqn_mmid_q_v;
+    if (v < 0) {
+        const char * e = getenv("PXA_PXQN_CPU_MMID_Q");
+        v = (e && e[0] == '0') ? 0 : 1;
+        pxa_pxqn_mmid_q_v = v;
+    }
+    return v;
+}
+void ggml_pxa_set_cpu_mmid_pxqn(int mode) { pxa_pxqn_mmid_q_v = mode == 0 ? 0 : 1; }
+// rows per work item (a multiple of 8; tuning only, every setting gives the same bytes)
+static int pxa_pxqn_mmid_rc_v = -1;
+static int pxa_pxqn_mmid_rc(void) {
+    if (pxa_pxqn_mmid_rc_v < 0) pxa_pxqn_mmid_rc_v = pxa_mmid_env_int("PXA_PXQN_CPU_MMID_RC", 64, 8, 1 << 20) & ~7;
+    return pxa_pxqn_mmid_rc_v;
+}
+void ggml_pxa_set_cpu_mmid_pxqn_rc(int rc) { pxa_pxqn_mmid_rc_v = rc < 8 ? 8 : (rc & ~7); }
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -17413,6 +17788,10 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * ids = dst->src[2];
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // R1 RIX scope (PXA_PXQN_RIX_MAXW): a graph wider than the RIX width (a prefill ubatch) runs the library's default kernels on this
+    // thread, the RIX=0 bits, as the card keeps its prefill GEMM there; set per op, so the async lane's decode widths keep the mirror
+    if (ggml_pxa_rix_swiglu_active()) ggml_pxa_rix_tl_off(ids->ne[1] > ggml_pxa_rix_maxw());
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -17468,6 +17847,20 @@ static void ggml_compute_forward_mul_mat_id(
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
+        if (pxa_mmid_tiled_mode()) {
+            // PXA: every thread quantizes whole rows of the flattened [ne11*ne12*ne13] set (the old loop split only
+            // i11, so with ne11 == 1 -- the up/gate input -- one thread quantized the whole batch). Same from_float
+            // per row, same bytes.
+            const int64_t nrows1 = ne11*ne12*ne13;
+            for (int64_t ir = ith; ir < nrows1; ir += nth) {
+                const int64_t i13 =  ir/(ne11*ne12);
+                const int64_t i12 = (ir - i13*ne11*ne12)/ne11;
+                const int64_t i11 =  ir - i13*ne11*ne12 - i12*ne11;
+                from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+                           (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                           ne10);
+            }
+        } else {
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
@@ -17477,9 +17870,27 @@ static void ggml_compute_forward_mul_mat_id(
                 }
             }
         }
+        }
     }
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
+
+    // PXA_PXQN_CPU_MMID_Q: quantised activation columns of the PXQN work queue, after the row map (64-byte aligned; the planner
+    // reserves them). Every thread derives the same decision. Row ir = i11 + i12*ne11 of src1 -> column buffer ir.
+    const size_t pxqn_qcol = pxa_pxqn_mmid_q() && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ne13 == 1
+                           ? pxa_pxqn_q8_col_bytes(type, ne00, ne01) : 0;
+    char * pxqn_q8 = NULL;
+    if (pxqn_qcol) {
+        char * p = (char *) GGML_PAD((uintptr_t) (matrix_rows + n_as*ne12), 64);
+        if ((size_t) (p - (char *) params->wdata) + pxqn_qcol*(size_t) (ne11*ne12) <= params->wsize) pxqn_q8 = p;
+    }
+    if (pxqn_q8) {
+        const int64_t nrows1 = ne11*ne12;
+        for (int64_t ir = ith; ir < nrows1; ir += nth) {
+            const int64_t i12 = ir/ne11, i11 = ir - i12*ne11;
+            pxa_pxqn_q8_col(type, (const float *) ((const char *) src1->data + i12*nb12 + i11*nb11), ne00, pxqn_q8 + ir*pxqn_qcol);
+        }
+    }
 
     GGML_ASSERT(ids->ne[1] == dst->ne[2]);
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
@@ -17509,9 +17920,131 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+        atomic_store(&params->shared->current_chunk, nth);
     }
 
     ggml_barrier(params->shared);
+
+    // PXA (2026-10-16): one work queue over (expert, 32-row chunk, 64-column chunk) items for all
+    // experts, taken with an atomic counter (no static per-expert row split, so a slow or preempted thread no longer
+    // holds the op). Q8_0, Q4_K and Q6_K experts use same-order tile kernels (ggml_pxa_vec_dot_*_tile: Q8_0 2 rows x 4
+    // columns, the K-quants 1 row x 4 columns) in place of one vec_dot per (row, column); every other type calls its
+    // own vec_dot once per output exactly as the loop below. Every output is the exact vec_dot value: bit-identical.
+    // PXA_CPU_MMID_TILED=0 restores the old path (2 = queue without tiles).
+    // Few columns per routed expert (decode, small batches: weight-bandwidth bound) keep the old static row split, which
+    // streams longer contiguous weight runs per thread (30B-A3B tg32 23.9 old vs 22.9 queue; T=4 op 2.33 vs 2.52 ms): the
+    // queue runs only when the average routed expert has at least PXA_CPU_MMID_CPE10/10 columns (default 2.0). Every
+    // thread derives the same decision from matrix_row_counts after the barrier. Single-column items of a batch use the
+    // plain vec_dot (one weight stream) instead of the 2-row Q8_0 tile. Every path gives the same exact vec_dot values.
+    if (pxqn_q8) {
+        // (expert, RC-row chunk, 64-column chunk) items in expert order, row chunks fastest (consecutive items stream consecutive
+        // panels of one expert); inside an item the columns go in tiles of 8, as the old per-expert call tiled them
+        const int64_t RC   = pxa_pxqn_mmid_rc();
+        const int64_t CC   = 64;
+        const int64_t n_rc = (ne01 + RC - 1)/RC;
+        int     cur_e  = 0;
+        int64_t base_e = 0;
+        int64_t item   = ith;
+        for (;;) {
+            while (cur_e < n_as) {
+                const int64_t cne = matrix_row_counts[cur_e];
+                const int64_t n_items_e = cne > 0 ? n_rc*((cne + CC - 1)/CC) : 0;
+                if (item < base_e + n_items_e) break;
+                base_e += n_items_e;
+                ++cur_e;
+            }
+            if (cur_e >= n_as) break;
+            const int64_t li  = item - base_e;
+            const int64_t r0  = (li % n_rc)*RC, r1 = MIN(r0 + RC, ne01);
+            const int64_t c0  = (li / n_rc)*CC, c1 = MIN(c0 + CC, matrix_row_counts[cur_e]);
+            const char * src0_cur = (const char *) src0->data + cur_e*nb02;
+            for (int64_t ic = c0; ic < c1; ic += 8) {
+                const int nc = (int) MIN(8, c1 - ic);
+                const void * qv[8];
+                float      * ov[8];
+                for (int c = 0; c < nc; ++c) {
+                    const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_e, ic + c);
+                    qv[c] = pxqn_q8 + ((rm.i1 % ne11) + (int64_t) rm.i2*ne11)*pxqn_qcol;
+                    ov[c] = (float *) ((char *) dst->data + (rm.i1*nb1 + rm.i2*nb2));
+                }
+                pxa_pxqn_mm_q8(type, src0_cur, ne00, r0, r1, qv, ov, nc);
+            }
+            item = atomic_fetch_add(&params->shared->current_chunk, 1);
+        }
+        return;
+    }
+
+    const int pxa_mmid_mode = pxa_mmid_tiled_mode();
+    bool pxa_mmid_queue = !gemv && vec_dot && pxa_mmid_mode && !pxa_pxq_is_cpu_supported(type);
+    if (pxa_mmid_queue) {
+        int64_t n_act = 0, n_cols = 0;
+        for (int e = 0; e < n_as; ++e) { n_cols += matrix_row_counts[e]; n_act += matrix_row_counts[e] > 0; }
+        pxa_mmid_queue = n_act > 0 && 10*n_cols >= (int64_t) pxa_mmid_cpe10()*n_act;
+    }
+    if (pxa_mmid_queue) {
+        typedef void (*pxa_tile_t)(int, int, int, const void *, size_t, const void * const *, float * const *, int);
+        pxa_tile_t tile = NULL;
+        if (pxa_mmid_mode == 1 && ggml_pxa_vec_dot_q8_0_q8_0_tile_native()) {
+            if      (type == GGML_TYPE_Q8_0 && vec_dot_type == GGML_TYPE_Q8_0) tile = (pxa_tile_t) ggml_pxa_vec_dot_q8_0_q8_0_tile;
+            else if (type == GGML_TYPE_Q4_K && vec_dot_type == GGML_TYPE_Q8_K) tile = (pxa_tile_t) ggml_pxa_vec_dot_q4_K_q8_K_tile;
+            else if (type == GGML_TYPE_Q6_K && vec_dot_type == GGML_TYPE_Q8_K) tile = (pxa_tile_t) ggml_pxa_vec_dot_q6_K_q8_K_tile;
+        }
+        const int tile_rows = type == GGML_TYPE_Q8_0 ? 2 : 32;
+        const void * wdata_q   = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const size_t row_size  = ggml_row_size(vec_dot_type, ne10);
+        const int64_t nr0      = ne01;
+        const int64_t RC       = pxa_mmid_rc();
+        const int64_t CC       = 64;
+        const int64_t n_rc     = (nr0 + RC - 1)/RC;
+        int     cur_e  = 0;
+        int64_t base_e = 0;
+        int64_t item   = ith;
+        for (;;) {
+            while (cur_e < n_as) {
+                const int64_t cne = matrix_row_counts[cur_e];
+                const int64_t n_items_e = cne > 0 ? n_rc*((cne + CC - 1)/CC) : 0;
+                if (item < base_e + n_items_e) break;
+                base_e += n_items_e;
+                ++cur_e;
+            }
+            if (cur_e >= n_as) break;
+            const int64_t li   = item - base_e;
+            const int64_t rc   = li % n_rc;
+            const int64_t cc   = li / n_rc;
+            const int64_t cne  = matrix_row_counts[cur_e];
+            const int64_t ir0s = rc*RC, ir0e = MIN(ir0s + RC, nr0);
+            const int64_t ic0s = cc*CC, ic0e = MIN(ic0s + CC, cne);
+            const char * src0_cur = (const char *) src0->data + cur_e*nb02;
+            for (int64_t ic = ic0s; ic < ic0e; ic += 4) {
+                const int nc = (int) MIN(4, ic0e - ic);
+                const void * yv[4];
+                float      * dcol[4];
+                for (int c = 0; c < nc; ++c) {
+                    const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_e, ic + c);
+                    const int64_t i11 = rm.i1 % ne11;
+                    const int64_t i12 = rm.i2;
+                    yv[c]   = (const char *) wdata_q + (src1_cont || src1->type != vec_dot_type
+                                ? (i11 + i12*ne11)*row_size
+                                : (i11*nb11 + i12*nb12));
+                    dcol[c] = (float *) ((char *) dst->data + (rm.i1*nb1 + rm.i2*nb2));
+                }
+                if (tile && nc > 1) {
+                    for (int64_t ir = ir0s; ir < ir0e; ir += tile_rows) {
+                        const int nr = (int) MIN(tile_rows, ir0e - ir);
+                        tile((int) ne00, nr, nc, src0_cur + ir*nb01, nb01, yv, dcol, (int) ir);
+                    }
+                } else {
+                    for (int c = 0; c < nc; ++c) {
+                        for (int64_t ir = ir0s; ir < ir0e; ++ir) {
+                            vec_dot((int) ne00, &dcol[c][ir], 0, src0_cur + ir*nb01, 0, yv[c], 0, 1);
+                        }
+                    }
+                }
+            }
+            item = atomic_fetch_add(&params->shared->current_chunk, 1);
+        }
+        return;
+    }
 
     // compute each matrix multiplication in sequence
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -17700,6 +18233,31 @@ void ggml_pxa_lean_mmid_expert(const struct ggml_tensor * node, int expert, cons
 void ggml_pxa_lean_fused_mul_unary(struct ggml_tensor * node, int ith, int nth) {
     struct ggml_compute_params params = { /*.ith =*/ ith, /*.nth =*/ nth, /*.wsize =*/ 0, /*.wdata =*/ NULL, /*.shared =*/ NULL };
     ggml_compute_forward_fused_mul_unary(&params, node);
+}
+
+// gate-less activation (2026-10-19): node = UNARY(RELU) of x, or SQR of that UNARY(RELU); rows [ith/nth] of node are
+// written straight from x (the RELU node in between is not materialised): the same two element functions ggml_graph_compute runs
+// (ggml_vec_relu_f32, then ggml_vec_sqr_f32 on its result), so the values are bit-identical.
+bool ggml_pxa_lean_relu_ok(const struct ggml_tensor * node) {
+    if (!node) return false;
+    const struct ggml_tensor * relu = node->op == GGML_OP_SQR ? node->src[0] : node;
+    if (!relu || relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU) return false;
+    const struct ggml_tensor * x = relu->src[0];
+    return x && x->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_is_contiguous(node) &&
+           ggml_are_same_shape(x, node);
+}
+
+void ggml_pxa_lean_relu_act(struct ggml_tensor * node, int ith, int nth) {
+    const bool sq = node->op == GGML_OP_SQR;
+    const struct ggml_tensor * x = (sq ? node->src[0] : node)->src[0];
+    const int64_t n  = ggml_nrows(node), nc = node->ne[0];
+    const int64_t dr = (n + nth - 1)/nth;
+    const int64_t r0 = dr*ith, r1 = MIN(r0 + dr, n);
+    for (int64_t r = r0; r < r1; ++r) {
+        float * y = (float *) ((char *) node->data + r*node->nb[1]);
+        ggml_vec_relu_f32((int) nc, y, (const float *) ((const char *) x->data + r*x->nb[1]));
+        if (sq) ggml_vec_sqr_f32((int) nc, y, y);
+    }
 }
 
 
@@ -18632,11 +19190,64 @@ static void ggml_compute_forward_get_rows_f32(
     }
 }
 
+// Type-preserving gather (ggml_get_rows_typed): dst carries src0's type, so a gathered row is
+// the source row's bytes. Every branch below widens to F32; this one copies.
+static void ggml_compute_forward_get_rows_raw(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nc = ne00;
+    const int64_t nr = ggml_nelements(src1);
+
+    GGML_ASSERT(dst->type == src0->type);
+    GGML_ASSERT(ne0  == nc);
+    GGML_ASSERT(ne02 == ne11);
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+    GGML_ASSERT(nb0  == ggml_type_size(dst->type));
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const size_t row_size = ggml_row_size(src0->type, nc);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int dr  = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        char * drow = (char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3;
+
+        if (i01 >= 0 && i01 < ne01) {
+            memcpy(drow, (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03, row_size);
+        } else {
+            memset(drow, 0, row_size);
+        }
+    }
+}
+
 static void ggml_compute_forward_get_rows(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
+
+    // ggml_get_rows_typed. F32 and I32 already reach a byte-exact copy through the branches
+    // below, so they are left on their existing paths and nothing default moves.
+    if (dst->type == src0->type && src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_I32) {
+        ggml_compute_forward_get_rows_raw(params, dst);
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
@@ -21750,6 +22361,18 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     const int64_t Dkv = MAX(Dk, Dv);
 
+    // PXA_CPU_FA_F32ACC (2026-10-22): an F16 V used to be accumulated in an fp16 VKQ16 row
+    // (ggml_vec_mad_f16 rounds the running sum to fp16 on every key), so the error grows with the
+    // number of keys: tiny Flint, CPU FA, c4096: KLD 0.002 vs mainline's tiled f32 path, 0.00004
+    // without FA. The F16 row now goes through v_to_float into V32 and the fp32 VKQ32 accumulator
+    // like every other V type. PXA_CPU_FA_F16ACC=1 restores the fp16 accumulator.
+    static int pxa_cpu_fa_f16acc = -1;
+    if (pxa_cpu_fa_f16acc < 0) {
+        const char * e = getenv("PXA_CPU_FA_F16ACC");
+        pxa_cpu_fa_f16acc = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    const bool f16acc = v->type == GGML_TYPE_F16 && pxa_cpu_fa_f16acc == 1;
+
     // loop over n_batch and n_head
     for (int ir = ir0; ir < ir1; ++ir) {
         // q indices
@@ -21768,7 +22391,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*Dkv); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*Dkv); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
+        if (f16acc) {
             memset(VKQ16, 0, Dkv*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, Dkv*sizeof(float));
@@ -21810,7 +22433,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
+            if (f16acc) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -21842,6 +22465,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 // .to_float (nothing to convert), so it must use its rows directly -- calling
                 // v_to_float on it would be a null call. Every other V type goes through the
                 // converter into V32 as before.
+                if (v->type == GGML_TYPE_F16) {
+                    // V += v*expf(s - M), the F16 row converted in registers (PXA_CPU_FA_F32ACC)
+                    ggml_vec_mad_f32_f16(Dv, VKQ32, (const ggml_fp16_t *) v_data, vs);
+                } else {
                 const float * v_f32;
                 if (v->type == GGML_TYPE_F32) {
                     v_f32 = (const float *) v_data;
@@ -21852,12 +22479,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
                 // V += v*expf(s - M)
                 ggml_vec_mad_f32(Dv, VKQ32, v_f32, vs);
+                }
             }
 
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        if (f16acc) {
             for (int64_t d = 0; d < Dv; ++d) {
                 VKQ32[d] = GGML_FP16_TO_FP32(VKQ16[d]);
             }
@@ -22448,6 +23076,233 @@ static int ggml_compute_forward_ssm_conv(const struct ggml_compute_params * para
     }
 }
 
+// ggml_compute_forward_ssm_scan2 (PXA Nemotron-H, Mamba-2; mainline ops.cpp math, scalar loop)
+
+static void ggml_compute_forward_ssm_scan2_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0]; // s  {d_state, dim, n_head, n_seqs}
+    const struct ggml_tensor * src1 = dst->src[1]; // x  {dim, n_head, n_seq_tokens, n_seqs}
+    const struct ggml_tensor * src2 = dst->src[2]; // dt {n_head, n_seq_tokens, n_seqs}
+    const struct ggml_tensor * src3 = dst->src[3]; // A  {1, n_head}
+    const struct ggml_tensor * src4 = dst->src[4]; // B  {d_state, n_group, n_seq_tokens, n_seqs}
+    const struct ggml_tensor * src5 = dst->src[5]; // C  {d_state, n_group, n_seq_tokens, n_seqs}
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc = src0->ne[0]; // d_state
+    const int64_t nr = src0->ne[1]; // head dim
+    const int64_t nh = src1->ne[1]; // n_head
+    const int64_t ng = src4->ne[1]; // n_group
+    const int64_t nt = src1->ne[2]; // tokens per sequence
+    const int64_t ns = src1->ne[3]; // sequences
+
+    const size_t s_off = ggml_nelements(src1) * sizeof(float);
+
+    const int dh  = (int)((nh + nth - 1)/nth);
+    const int ih0 = dh*ith;
+    const int ih1 = (int) MIN(ih0 + dh, nh);
+
+    for (int64_t i3 = 0; i3 < ns; ++i3) {
+        for (int64_t i2 = 0; i2 < nt; ++i2) {
+            const float * x  = (const float *) ((const char *) src1->data + i2*src1->nb[2] + i3*src1->nb[3]);
+            const float * dt = (const float *) ((const char *) src2->data + i2*src2->nb[1] + i3*src2->nb[2]);
+            const float * A  = (const float *) src3->data;
+            const float * B  = (const float *) ((const char *) src4->data + i2*src4->nb[2] + i3*src4->nb[3]);
+            const float * C  = (const float *) ((const char *) src5->data + i2*src5->nb[2] + i3*src5->nb[3]);
+                  float * y  = (      float *) ((      char *) dst->data  + (i2*nh*nr + i3*nt*nh*nr)*sizeof(float));
+            // the first token reads the incoming state; later tokens read what the previous token wrote
+            const float * s0 = i2 == 0 ? (const float *) ((const char *) src0->data + i3*src0->nb[3])
+                                       : (const float *) ((const char *) dst->data + s_off + i3*src0->nb[3]);
+                  float * s  = (float *) ((char *) dst->data + s_off + i3*src0->nb[3]);
+
+            for (int h = ih0; h < ih1; ++h) {
+                const float dt_sp = dt[h] <= 20.0f ? log1pf(expf(dt[h])) : dt[h];
+                const float dA    = expf(dt_sp * A[h]);
+                const int   g     = (int)(h / (nh / ng));
+                for (int64_t i1 = 0; i1 < nr; ++i1) {
+                    const int64_t ii   = i1 + h*nr;
+                    const float   x_dt = x[ii] * dt_sp;
+                    float sumf = 0.0f;
+                    for (int64_t i0 = 0; i0 < nc; ++i0) {
+                        const float st = s0[i0 + ii*nc]*dA + B[i0 + g*nc]*x_dt;
+                        sumf += st*C[i0 + g*nc];
+                        s[i0 + ii*nc] = st;
+                    }
+                    y[ii] = sumf;
+                }
+            }
+        }
+        if (nt == 0) {
+            // no tokens: carry the state through unchanged
+            for (int h = ih0; h < ih1; ++h) {
+                memcpy((char *) dst->data + s_off + i3*src0->nb[3] + h*src0->nb[2],
+                       (const char *) src0->data + i3*src0->nb[3] + h*src0->nb[2], src0->nb[2]);
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_ssm_scan2(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ssm_scan2_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_mamba2_conv / _scan (PXA Nemotron-H phase 2). CPU reference for the in-place ops:
+// same math as the unfused CPU graph, silu as the scalar ggml_silu_f32 (the graph builder uses these ops only on
+// layers whose recurrent state lives in a device buffer, so the CPU path of a model never changes).
+
+static void ggml_compute_forward_mamba2_conv_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * rs   = dst->src[0];
+    const struct ggml_tensor * x    = dst->src[1];
+    const struct ggml_tensor * w    = dst->src[2];
+    const struct ggml_tensor * ids  = dst->src[3];
+    const struct ggml_tensor * mask = dst->src[4];
+    const struct ggml_tensor * b    = dst->src[5];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc  = w->ne[0];       // d_conv (4)
+    const int64_t nr  = w->ne[1];       // conv_dim
+    const int64_t nt  = x->ne[1];       // tokens
+    const int64_t ns  = ids->ne[0];     // sequences
+    const int64_t nst = nt / ns;        // tokens per sequence
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t is = 0; is < ns; ++is) {
+        const int32_t row = ((const int32_t *) ids->data)[is];
+        const float   m   = *(const float *) ((const char *) mask->data + is*mask->nb[1]);
+        float * win = (float *) ((char *) rs->data + row*rs->nb[1]);     // {nc - 1, nr}
+        for (int64_t ic = ir0; ic < ir1; ++ic) {
+            const float * cw = (const float *) w->data + ic*nc;
+            float s0 = win[0 + ic*(nc - 1)] * m;
+            float s1 = win[1 + ic*(nc - 1)] * m;
+            float s2 = win[2 + ic*(nc - 1)] * m;
+            for (int64_t it = 0; it < nst; ++it) {
+                const int64_t tok = is*nst + it;
+                const float xv = *(const float *) ((const char *) x->data + tok*x->nb[1] + ic*sizeof(float));
+                float sumf = 0.0f;
+                sumf += s0*cw[0];
+                sumf += s1*cw[1];
+                sumf += s2*cw[2];
+                sumf += xv*cw[3];
+                if (b) {
+                    sumf = sumf + ((const float *) b->data)[ic];
+                }
+                ((float *) ((char *) dst->data + tok*dst->nb[1]))[ic] = ggml_silu_f32(sumf);
+                s0 = s1; s1 = s2; s2 = xv;
+            }
+            win[0 + ic*(nc - 1)] = s0;
+            win[1 + ic*(nc - 1)] = s1;
+            win[2 + ic*(nc - 1)] = s2;
+        }
+    }
+}
+
+static void ggml_compute_forward_mamba2_scan_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * rs   = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];  // x  {head_dim, n_head, nst, ns}
+    const struct ggml_tensor * src2 = dst->src[2];  // dt {n_head, nst, ns}
+    const struct ggml_tensor * src3 = dst->src[3];  // A  {1, n_head}
+    const struct ggml_tensor * src4 = dst->src[4];  // B  {d_state, n_group, nst, ns}
+    const struct ggml_tensor * src5 = dst->src[5];  // C
+    const struct ggml_tensor * dtb  = dst->src[6];  // dt_b {n_head}
+    const struct ggml_tensor * Dt   = dst->src[7];  // D {1, n_head}
+    const struct ggml_tensor * zt   = dst->src[8];  // z  {head_dim, n_head, nst, ns}
+    const struct ggml_tensor * ids  = dst->src[9];
+    const struct ggml_tensor * mask = dst->src[10];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc = src4->ne[0];  // d_state
+    const int64_t nr = src1->ne[0];  // head dim
+    const int64_t nh = src1->ne[1];  // n_head
+    const int64_t ng = src4->ne[1];  // n_group
+    const int64_t nt = src1->ne[2];  // tokens per sequence
+    const int64_t ns = src1->ne[3];  // sequences
+
+    const int64_t s_off = (int64_t) (uint32_t) dst->op_params[0] | ((int64_t) dst->op_params[1] << 32);
+
+    const int dh  = (int)((nh + nth - 1)/nth);
+    const int ih0 = dh*ith;
+    const int ih1 = (int) MIN(ih0 + dh, nh);
+
+    const float * A  = (const float *) src3->data;
+    const float * DB = (const float *) dtb->data;
+    const float * DD = (const float *) Dt->data;
+
+    for (int64_t i3 = 0; i3 < ns; ++i3) {
+        const int32_t row = ((const int32_t *) ids->data)[i3];
+        const float   m   = *(const float *) ((const char *) mask->data + i3*mask->nb[1]);
+        float * s = (float *) ((char *) rs->data + row*rs->nb[1]) + s_off;   // {d_state, head_dim, n_head}
+        for (int h = ih0; h < ih1; ++h) {
+            for (int64_t i = 0; i < nc*nr; ++i) {
+                s[i + h*nc*nr] *= m;
+            }
+        }
+        for (int64_t i2 = 0; i2 < nt; ++i2) {
+            const float * x  = (const float *) ((const char *) src1->data + i2*src1->nb[2] + i3*src1->nb[3]);
+            const float * dt = (const float *) ((const char *) src2->data + i2*src2->nb[1] + i3*src2->nb[2]);
+            const float * B  = (const float *) ((const char *) src4->data + i2*src4->nb[2] + i3*src4->nb[3]);
+            const float * C  = (const float *) ((const char *) src5->data + i2*src5->nb[2] + i3*src5->nb[3]);
+            const float * z  = (const float *) ((const char *) zt->data   + i2*zt->nb[2]   + i3*zt->nb[3]);
+                  float * y  = (      float *) ((      char *) dst->data  + (i2 + i3*nt)*dst->nb[1]);
+            for (int h = ih0; h < ih1; ++h) {
+                const float dt_raw = dt[h] + DB[h];
+                const float dt_sp  = dt_raw <= 20.0f ? log1pf(expf(dt_raw)) : dt_raw;
+                const float dA     = expf(dt_sp * A[h]);
+                const int   g      = (int)(h / (nh / ng));
+                for (int64_t i1 = 0; i1 < nr; ++i1) {
+                    const int64_t ii   = i1 + h*nr;
+                    const float   x_dt = x[ii] * dt_sp;
+                    float sumf = 0.0f;
+                    for (int64_t i0 = 0; i0 < nc; ++i0) {
+                        const float st = s[i0 + ii*nc]*dA + B[i0 + g*nc]*x_dt;
+                        sumf += st*C[i0 + g*nc];
+                        s[i0 + ii*nc] = st;
+                    }
+                    const float yd = sumf + x[ii]*DD[h];
+                    y[ii] = yd * ggml_silu_f32(z[ii]);
+                }
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_mamba2_conv(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    ggml_compute_forward_mamba2_conv_f32(params, dst);
+}
+
+static void ggml_compute_forward_mamba2_scan(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    ggml_compute_forward_mamba2_scan_f32(params, dst);
+}
+
 // ggml_compute_forward_ssm_scan
 
 static void ggml_compute_forward_ssm_scan_f32(
@@ -22650,6 +23505,8 @@ static void ggml_compute_forward_delta_net_f32(
     const struct ggml_tensor * src4 = dst->src[4];
     const struct ggml_tensor * src5 = dst->src[5];
     const struct ggml_tensor * src6 = dst->src[6];
+    // PXA_SPEC_CKPT_REPLAY: the replay-capture pack layout is written by the CUDA kernel only
+    GGML_ASSERT(dst->op_params[4] == 0 && "PXA_SPEC_CKPT_REPLAY capture is CUDA-only");
 
     const int64_t head_dim = src0->ne[0];
     const int64_t n_tokens = src0->ne[1];
@@ -23202,6 +24059,28 @@ static void ggml_compute_forward_dsv4_hc_expand(
 
 // ggml_compute_forward_mask_to_idx
 
+// PXA_XCACHE_SKIP_COLD_RANK: the best (smallest) 1-based rank expert e gets from any token of the window ids [n_used, n_tok];
+// a token ranks its slot k by the routing weight w[k] (ties: the lower slot first). n_used + 1 when no token routes to e.
+static int ggml_moe_skip_cold_best_rank(const struct ggml_tensor * ids, const struct ggml_tensor * w, int32_t e) {
+    const int64_t n_used = ids->ne[0], n_tok = ids->ne[1];
+    const size_t wk = w->ne[0] == 1 ? w->nb[1] : w->nb[0];
+    const size_t wt = w->ne[0] == 1 ? w->nb[2] : w->nb[1];
+    int best = (int) n_used + 1;
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t k = 0; k < n_used; ++k) {
+            if (*(const int32_t *) ((const char *) ids->data + k*ids->nb[0] + t*ids->nb[1]) != e) continue;
+            const float wv = *(const float *) ((const char *) w->data + k*wk + t*wt);
+            int r = 1;
+            for (int64_t j = 0; j < n_used; ++j) {
+                const float wj = *(const float *) ((const char *) w->data + j*wk + t*wt);
+                r += (wj > wv) || (wj == wv && j < k);
+            }
+            if (r < best) best = r;
+        }
+    }
+    return best;
+}
+
 // PXA expert cache (see ggml_moe_split_ids / ggml_moe_merge in ggml.h)
 static void ggml_compute_forward_moe_split_ids(
         const struct ggml_compute_params * params,
@@ -23216,6 +24095,8 @@ static void ggml_compute_forward_moe_split_ids(
     const int32_t * m = (const int32_t *) map->data;
     const int64_t nr = ids->ne[1];
     const int both = ggml_get_op_params_i32(dst, 2);
+    // PXA_XCACHE_SKIP_COLD_RANK (ggml_moe_split_ids_set_skip_cold): cold ids whose expert's best 1-based rank over the window is >= skip -> -1
+    const int skip = (side == 1 || both) && dst->src[3] ? ggml_get_op_params_i32(dst, 3) : 0;
     const int64_t r0 = (nr * params->ith) / params->nth;
     const int64_t r1 = (nr * (params->ith + 1)) / params->nth;
     for (int64_t i1 = r0; i1 < r1; ++i1) {
@@ -23228,10 +24109,12 @@ static void ggml_compute_forward_moe_split_ids(
                 if (side == 0) r = v >= 0 ? v : -1;
                 else           r = v <= -2 ? -2 - v : -1;
             }
+            if (skip > 0 && side == 1 && r >= 0 && ggml_moe_skip_cold_best_rank(ids, dst->src[3], e) >= skip) r = -1;
             y[i0] = r;
             if (both) {   // PXA_XCACHE_SPLIT_ONE: the cold side in the second [n_used, n_tok] half
                 int32_t rc = -1;
                 if (e >= 0 && e < n_map && m[e] <= -2) rc = -2 - m[e];
+                if (skip > 0 && rc >= 0 && ggml_moe_skip_cold_best_rank(ids, dst->src[3], e) >= skip) rc = -1;
                 ((int32_t *) ((char *) dst->data + nr*dst->nb[1] + i1*dst->nb[1]))[i0] = rc;
             }
         }
@@ -25317,6 +26200,18 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
             } break;
+        case GGML_OP_SSM_SCAN2:
+            {
+                ggml_compute_forward_ssm_scan2(params, tensor);
+            } break;
+        case GGML_OP_MAMBA2_CONV:
+            {
+                ggml_compute_forward_mamba2_conv(params, tensor);
+            } break;
+        case GGML_OP_MAMBA2_SCAN:
+            {
+                ggml_compute_forward_mamba2_scan(params, tensor);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 ggml_compute_forward_solve_tri(params, tensor);
@@ -26491,6 +27386,9 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
             }
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_SCAN2:
+        case GGML_OP_MAMBA2_CONV:
+        case GGML_OP_MAMBA2_SCAN:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -27251,6 +28149,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_SCAN2:
+        case GGML_OP_MAMBA2_CONV:
+        case GGML_OP_MAMBA2_SCAN:
             {
                 n_tasks = n_threads;
             } break;
@@ -27396,6 +28297,10 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
                     cur += n_as * src1->ne[2] * sizeof(int64_t); // matrix_rows
+                    // PXA_PXQN_CPU_MMID_Q: the quantised activation columns of the PXQN work queue (+ 64-byte alignment);
+                    // reserved whatever the switch says so a test can flip it between computes
+                    const size_t pxqn_qcol = pxa_pxqn_q8_col_bytes(src0->type, src0->ne[0], src0->ne[1]);
+                    if (pxqn_qcol) cur += 64 + pxqn_qcol*(size_t) (src1->ne[1]*src1->ne[2]);
                 } break;
             case GGML_OP_MOE_FUSED_UP_GATE:
                 {
@@ -30895,7 +31800,7 @@ int ggml_pxa_config_level(void) {
         level = 0;
     } else {
         e = getenv("PXA_ENHANCE");
-        level = (e && atoi(e) == 0) ? 1 : 2;
+        level = (e && pxa_env_value_off(e)) ? 1 : 2;
     }
     cached = level;
     return level;

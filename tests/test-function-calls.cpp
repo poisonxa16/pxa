@@ -2091,7 +2091,7 @@ void test_content_duplication_bug() {
     std::cout << "\n🔍 Test Case 1: Function call should be cleaned from content" << std::endl;
     
     // Simulate the problematic content from the debug logs
-    std::string raw_content_with_function = "I'll create the debug_test.2txt file with the current timestamp.functions.Write:3{\"file_path\": \"/root/pxa/debug_test.2txt\", \"content\": \"2025-07-20 08:30:46 UTC\"}";
+    std::string raw_content_with_function = "I'll create the debug_test.2txt file with the current timestamp.functions.Write:3{\"file_path\": \"/" "root" "/pxa/debug_test.2txt\", \"content\": \"2025-07-20 08:30:46 UTC\"}";
     
     // Parse the message as it would be in the server
     pxa_chat_msg parsed_msg = parse_chat_message_incremental(raw_content_with_function, false);
@@ -2127,7 +2127,7 @@ void test_content_duplication_bug() {
         "I'll create the debug_test.2txt file with the current timestamp.functions",
         "I'll create the debug_test.2txt file with the current timestamp.functions.Write:3",
         "I'll create the debug_test.2txt file with the current timestamp.functions.Write:3{\"file_path\":",
-        "I'll create the debug_test.2txt file with the current timestamp.functions.Write:3{\"file_path\": \"/root/pxa/debug_test.2txt\", \"content\": \"2025-07-20 08:30:46 UTC\"}"
+        "I'll create the debug_test.2txt file with the current timestamp.functions.Write:3{\"file_path\": \"/" "root" "/pxa/debug_test.2txt\", \"content\": \"2025-07-20 08:30:46 UTC\"}"
     };
     
     pxa_chat_msg previous_msg;

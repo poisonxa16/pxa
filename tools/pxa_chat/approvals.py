@@ -2,7 +2,7 @@
 
 Only calls this server issued can be answered (a random id per pending call, bound to its run), each answer is
 "once", "always" (this chat, this tool; never offered for shell) or "deny", and no answer within the timeout
-is a deny. Same shape as the Mythos park-and-resume approvals, in memory (a pending call dies with its run).
+is a deny. Same shape as our in-house agent's park-and-resume approvals, in memory (a pending call dies with its run).
 
 Host access grants are "always" scopes with a `host:` prefix. They are deliberately the same in-memory dict:
 nothing about host access is ever written to disk, so a Control restart, a new chat, or the host switch going

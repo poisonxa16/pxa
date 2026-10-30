@@ -1,4 +1,4 @@
-# pxa server image — Pascal/Volta (sm 60;61;70): P100, GTX 1080 Ti/P40, V100.
+# pxa server image — native SASS for Pascal/Volta/Turing/Ampere/Ada (sm 60;61;70;75;80;86;89) + compute_89 PTX for newer cards: P100, GTX 1080 Ti/P40, V100, T4/RTX 20xx, A100, RTX 30/40.
 #
 # Multi-stage build. The build stage matches the CUDA 12.8 devel base this engine is
 # developed and gated against; the runtime stage ships only the binaries, the shared
@@ -12,7 +12,7 @@
 #
 # Build:
 #   docker build -f docker/Dockerfile \
-#     --build-arg CUDA_ARCHS="60;61;70" \
+#     --build-arg CUDA_ARCHS="60-real;61-real;70-real;75-real;80-real;86-real;89" \
 #     -t ghcr.io/poisonxa16/pxa:latest .
 #
 # Models are NOT baked into this image — mount a model directory at /models (see
@@ -26,19 +26,52 @@ ARG BASE_CUDA_RUN_CONTAINER=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_V
 # ---------------------------------------------------------------------------
 # Build stage
 # ---------------------------------------------------------------------------
-FROM ${BASE_CUDA_DEV_CONTAINER} AS build
-
-# sm 60 = P100, sm 61 = GTX 1080 Ti / P40, sm 70 = V100. Override for a narrower image
-# (e.g. "70" only) or to add newer archs; the shipped defaults gate every card this
-# engine's benchmark table covers.
-ARG CUDA_ARCHS="60;61;70"
-# Cap parallel compile jobs on shared build hosts; empty/0 means use nproc.
-ARG BUILD_JOBS="0"
+# The toolchain is its own stage so it can be built and checked without compiling the engine (no nvcc run):
+#   docker build -f docker/Dockerfile --target toolchain .   (tests/test-llguidance-image.sh --docker does this)
+FROM ${BASE_CUDA_DEV_CONTAINER} AS toolchain
 
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
-        build-essential cmake git ca-certificates python3 && \
+        build-essential cmake git ca-certificates curl python3 && \
     rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain, BUILD STAGE ONLY: LLGuidance (-DLLAMA_LLGUIDANCE=ON, common/CMakeLists.txt) is a Rust crate that
+# cmake builds with `cargo build` into a static library linked into libcommon, i.e. into the binaries themselves. The
+# runtime stage below copies binaries/.so files only, so it carries no rustc, no cargo and no crate sources.
+# Pinned: rustup-init 1.28.2 (sha256-checked per arch) installing toolchain 1.85.1 with the minimal profile (rustc,
+# cargo, rust-std; no docs, no clippy/rustfmt). 1.85.1 is the toolchain the LLGuidance build was verified with
+# (tests/test-llguidance-image.sh --build). Set LLAMA_LLGUIDANCE=OFF to build without network access to github.com /
+# crates.io: the crate is fetched at a pinned commit and its Cargo.lock is enforced (--locked), but it is fetched.
+ARG RUST_TOOLCHAIN=1.85.1
+ARG RUSTUP_VERSION=1.28.2
+ARG LLAMA_LLGUIDANCE=ON
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:${PATH}
+RUN if [ "${LLAMA_LLGUIDANCE}" = "ON" ]; then \
+        case "$(uname -m)" in \
+            x86_64)  triple=x86_64-unknown-linux-gnu;  sum=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;; \
+            aarch64) triple=aarch64-unknown-linux-gnu; sum=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
+            *) echo "no pinned rustup-init for $(uname -m)" >&2; exit 1 ;; \
+        esac && \
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${triple}/rustup-init" && \
+        echo "${sum}  /tmp/rustup-init" | sha256sum -c - && \
+        chmod +x /tmp/rustup-init && \
+        /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" && \
+        rm -f /tmp/rustup-init && \
+        cargo --version && rustc --version; \
+    fi
+
+FROM toolchain AS build
+
+# sm 60 = P100, sm 61 = GTX 1080 Ti / P40, sm 70 = V100, sm 75 = T4 / RTX 20xx, sm 80 = A100, sm 86 = RTX 30xx / A10, sm 89 = RTX 40xx / L4: native SASS for each ("-real"), PTX only for
+# 89 so newer cards still JIT (no first-start JIT on any listed card). Override for a narrower image
+# (e.g. "70" only) or to add newer archs; the shipped defaults gate every card this
+# engine's benchmark table covers.
+ARG CUDA_ARCHS="60-real;61-real;70-real;75-real;80-real;86-real;89"
+# Cap parallel compile jobs on shared build hosts; empty/0 means use nproc.
+ARG BUILD_JOBS="0"
+# Re-declared so the value passed with --build-arg reaches this stage's cmake line.
+ARG LLAMA_LLGUIDANCE=ON
 
 WORKDIR /src
 COPY . .
@@ -54,17 +87,29 @@ COPY . .
 # machine's instruction set (a build host with AVX-512 makes an image that stops with "Illegal
 # instruction" on a Haswell or a Zen 2 box). Fast = AVX, AVX2, FMA, F16C (any CPU since 2013).
 # llama-imatrix is the open activation-dump tool PXA Control's Encode tab runs.
+# LLAMA_LLGUIDANCE (default ON, see the Rust block above) puts the LLGuidance grammar engine into the binaries; the
+# grep after the build fails the image if it was asked for and did not make it into llama-server. The Rust standard
+# library LLGuidance links in carries DWARF debug info (~11 MB per executable that pulls it in; the Release C++ code has
+# none), so the executables get --strip-debug: symbols (.symtab, backtraces) stay, only .debug_* sections go.
 RUN cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
         -DBUILD_SHARED_LIBS=ON \
         -DLLAMA_CURL=OFF \
+        -DLLAMA_LLGUIDANCE="${LLAMA_LLGUIDANCE}" \
         -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
         -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
         -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
     && cmake --build build --target llama-server llama-cli llama-bench llama-quantize llama-perplexity llama-imatrix \
-        -j "$([ "${BUILD_JOBS}" != "0" ] && [ -n "${BUILD_JOBS}" ] && echo "${BUILD_JOBS}" || nproc)"
+        -j "$([ "${BUILD_JOBS}" != "0" ] && [ -n "${BUILD_JOBS}" ] && echo "${BUILD_JOBS}" || nproc)" \
+    && if [ "${LLAMA_LLGUIDANCE}" = "ON" ]; then \
+        grep -q 'LLAMA_LLGUIDANCE:BOOL=ON' build/CMakeCache.txt && \
+        grep -q llg_new_constraint_any build/bin/llama-server && \
+        echo "llama-server links LLGuidance" && \
+        strip --strip-debug build/bin/llama-server build/bin/llama-cli build/bin/llama-bench \
+            build/bin/llama-quantize build/bin/llama-perplexity build/bin/llama-imatrix; \
+    fi
 
 # lib-compat: the same libggml.so for plain x86-64 (no AVX / AVX2 / FMA / F16C), the one the entrypoint puts first on the
 # library path on a CPU without them (tools/pxa-cpu-check.sh reads /proc/cpuinfo). The fast library stops with "Illegal
@@ -99,11 +144,19 @@ RUN mkdir -p /src/pxqn-dist && \
     else echo "WARNING: no libggml-pxqn.so -- open fallback image (no PXQN, Overdrive hooks off)"; fi
 
 # The lever catalog the image ships is the one the engine embeds: build/pxa-catalog, the PUBLIC table (owner 2026-10-08:
-# no closed rows in what ships). A private-tree build checks the catalog and the shipped binaries for closed lever names.
+# no closed rows in what ships). A private-tree build checks the catalog, the shipped binaries AND the shipped text files
+# (every non-binary file the runtime stage COPYs from the source tree: the launcher, Control, the converter;
+# 2026-10-18, the same rule as make-release-tarball.sh's text guard) for closed lever names.
 RUN cp build/pxa-catalog/pxa-lever-catalog-build.inc /src/pxa-lever-catalog.inc && \
     if [ -f scripts/pxa-closed-levers.txt ]; then \
         python3 scripts/pxa-lever-catalog.py --assert-clean build/pxa-catalog/pxqn-closed-levers.inc /src/pxa-lever-catalog.inc \
-            build/bin/llama-server build/bin/llama-cli build/src/libllama.so build/ggml/src/libggml.so build/examples/mtmd/libmtmd.so; \
+            build/bin/llama-server build/bin/llama-cli build/bin/llama-bench build/bin/llama-quantize build/bin/llama-perplexity \
+            build/bin/llama-imatrix build/src/libllama.so build/ggml/src/libggml.so build/examples/mtmd/libmtmd.so \
+            $(grep -rIl '' tools/pxa-launch.py tools/pxa-entrypoint.sh tools/pxa-cpu-check.sh tools/pxa_control.py tools/pxa_hf.py \
+                tools/pxa_expert_map.py tools/pxa-bench.py tools/pxa_explain_footer.py tools/pxa_thinking.py tools/pxa_thinking_profiles.json \
+                tools/pxa_telemetry.py tools/pxa_mqtt.py tools/pxa_encode.py tools/pxa_encode_adapter.py tools/pxa_encode_pkg.py \
+                tools/pxa_encode_plan.py tools/pxa_encode_cells.json tools/pxa_control_ui tools/pxa_control tools/pxa_ctl tools/pxa_chat \
+                convert_hf_to_gguf.py gguf-py/gguf 2>/dev/null); \
     fi
 
 # ---------------------------------------------------------------------------
@@ -146,10 +199,12 @@ COPY tools/pxa-entrypoint.sh /usr/local/bin/pxa-entrypoint
 # the CPU preflight the entrypoint sources (lib/ or lib-compat/); pxa-launch carries the Python twin
 COPY tools/pxa-cpu-check.sh  /usr/local/bin/pxa-cpu-check.sh
 # PXA Control (`docker run -p 7777:7777 IMAGE gui`): the launcher's web front end, stdlib only.
-COPY tools/pxa_control.py tools/pxa_expert_map.py tools/pxa-bench.py tools/pxa_explain_footer.py tools/pxa_thinking.py tools/pxa_thinking_profiles.json tools/pxa_telemetry.py tools/pxa_mqtt.py /usr/local/bin/
+COPY tools/pxa_control.py tools/pxa_hf.py tools/pxa_expert_map.py tools/pxa-bench.py tools/pxa_explain_footer.py tools/pxa_thinking.py tools/pxa_thinking_profiles.json tools/pxa_telemetry.py tools/pxa_mqtt.py /usr/local/bin/
 # the Encode tab: the wizard backend, the one adapter that knows the quantizer command line, the package installer, the arithmetic, the measured cells
 COPY tools/pxa_encode.py tools/pxa_encode_adapter.py tools/pxa_encode_pkg.py tools/pxa_encode_plan.py tools/pxa_encode_cells.json /usr/local/bin/
 COPY tools/pxa_control_ui /usr/local/bin/pxa_control_ui
+# PXA Control is a package (the Control hardening pass); tools/pxa_control.py above is its shim
+COPY tools/pxa_control /usr/local/bin/pxa_control
 # the Profiles tab's backend (per-card power, clocks, auto-starts; stdlib only)
 COPY tools/pxa_ctl /usr/local/bin/pxa_ctl
 # the Chat tab's in-house agent (stdlib package; Control runs without it, minus the Assistant view)
@@ -201,6 +256,7 @@ RUN mkdir -p /models /work/.cache/pxa \
 ENV LLAMA_ARG_HOST=0.0.0.0 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    PYTHONDONTWRITEBYTECODE=1 \
     # PXA levers — these are the shipped defaults of the unified build of 2026-09-03 (see
     # docker/README.md for what each does); left unset here so the binary's own
     # compiled-in defaults apply. Uncomment / pass -e to override:

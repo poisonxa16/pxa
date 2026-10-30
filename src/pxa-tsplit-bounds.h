@@ -74,6 +74,28 @@ static inline std::vector<int> pxa_tsplit_create_split(int nr, int granularity, 
 }
 
 
+// '-sm tensor' block-granular cut with equal shares (2026-10-14): every card gets
+// floor(nchunk/n) chunks and the remainder chunks go, one each, to the cards with the least memory
+// committed (mem: bytes already placed per card, including what is not split). Unlike create_split it
+// never moves more than one chunk per card away from the even share, whatever the memory imbalance.
+static inline std::vector<int> pxa_tsplit_parity_split(int nr, int granularity, const std::vector<size_t> & mem) {
+    GGML_ASSERT(granularity > 0 && nr % granularity == 0 && !mem.empty());
+    const int n = (int) mem.size(), nchunk = nr / granularity;
+    std::vector<int> result(n, nchunk / n);
+    std::vector<bool> extra(n, false);
+    for (int r = 0; r < nchunk % n; ++r) {
+        int ibest = -1;
+        for (int i = 0; i < n; ++i) {
+            if (extra[i]) continue;
+            if (ibest < 0 || mem[i] < mem[ibest]) ibest = i;
+        }
+        extra[ibest] = true;
+        ++result[ibest];
+    }
+    for (auto & v : result) v *= granularity;
+    return result;
+}
+
 // PXQN RHT (ggml-pxqn.h PXQN_RHT_BLOCK): a rotated site rotates each device's activation slice per 128-block
 // at K offset k0, so both the slice width and every slice offset must be multiples of 128. The dense/shared
 // FFN cut (down dim 0, up/gate dim 1) is one chunk vector, so its granularity must be raised to 128 whenever

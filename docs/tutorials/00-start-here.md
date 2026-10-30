@@ -8,8 +8,10 @@ everyone else stopped tuning for that silicon years ago — so I wrote the quant
 the GPU code that those cards are actually good at. You download one file, point it at a model,
 and you have a private chat server on hardware that costs less than a night out.
 
-Nothing here talks to the internet once it is running, nothing phones home, and there is no
-account to make.
+The engine does not talk to the internet once it is running, nothing phones home, and there is no
+account to make. PXA Control, the page that starts it, reaches the network only for what you ask of
+it (model downloads, the Store, updates, Report a problem, the benchmark board) and to refresh its list
+of published models when that list is a day old.
 
 ---
 

@@ -14,7 +14,10 @@ import numpy as np
 # PXA PXQ E16-row family: +2 B/row anchor meta (128 B fp16 anchors per 64-row panel),
 # interleaved in the tensor blob. GGML_QUANT_SIZES only covers the per-block slab bytes, so
 # gguf-py must add row_meta to round-trip these tensors without truncating the anchors.
-_PXA_ROW_META = {248: 2, 252: 2, 253: 2, 254: 2, 255: 2, 256: 2}  # PXQ1/PXQ4/PXQ4HQ/PXQ2/PXQ3/PXQ6
+# PXQ1/PXQ4/PXQ4HQ/PXQ2/PXQ3/PXQ6 (248, 252-256), PXQN3/3S8/4/2/1/4S8/5 (257-263), PXA4 (264); must stay in step with
+# gguf_reader.py's _pxa_rm (the reader sizes the blob with that table and reshapes it with quant_shape_to_byte_shape).
+_PXA_ROW_META = {248: 2, 252: 2, 253: 2, 254: 2, 255: 2, 256: 2,
+                 257: 2, 258: 2, 259: 2, 260: 2, 261: 2, 262: 2, 263: 2, 264: 2}
 
 
 def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:

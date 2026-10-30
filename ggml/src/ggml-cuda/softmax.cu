@@ -7,6 +7,10 @@
 
 #include "common.cuh"
 #include "softmax.cuh"
+#include "pxa/kv-band.cuh"
+
+// pxa/kv-band.cu: PXA_KV_BAND_EXACT on NVIDIA cc >= 6.0 (Pascal added 2026); HIP keeps the old walk
+bool pxa_kv_band_softmax_applies(int cc);
 
 template <typename T>
 static __device__ __forceinline__ float t2f32(T val) {
@@ -18,8 +22,54 @@ __device__ float __forceinline__ t2f32<half>(half val) {
     return __half2float(val);
 }
 
+// PXA_KV_BAND_EXACT (pxa/kv-band.cuh). A KV band can start at any cell of the unified ring and every other cell of
+// the row is masked to -inf, so the terms that reach the row sum do not depend on where the band sits -- but the
+// thread slot a column is summed in does (column c goes to thread c % block_size), and so does the order of the
+// tree that folds the slots. The row is therefore walked from its first open column: column `first + i` takes the
+// slot column `i` took, and a band at any cell is summed exactly as the same band at cell 0. When that column is 0
+// (no band offset, no mask, or nothing open) the walk is the one of before, bit for bit. Returns the anchor; every
+// thread's vals[] is visible to every other thread when it returns.
+static __device__ __forceinline__ int soft_max_band_warp_min(int x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x = min(x, __shfl_xor_sync(0xffffffff, x, mask, 32));
+    }
+    return x;
+}
+
+static __device__ __forceinline__ int soft_max_band_anchor(const float * vals, const int ncols, const int block_size,
+        const int tid, const int warp_id, const int lane_id, float * buf_iw) {
+    int a = ncols;
+    for (int col0 = 0; col0 < ncols; col0 += block_size) {
+        const int col = col0 + tid;
+        if (col >= ncols) {
+            break;
+        }
+        if (!(vals[col] == -INFINITY)) { // open: anything but a masked -inf (a NaN counts, as it did in the sum)
+            a = col; // this thread's columns rise, so its first open one is its smallest
+            break;
+        }
+    }
+    a = soft_max_band_warp_min(a);
+    if (block_size > WARP_SIZE) {
+        int * buf = (int *) buf_iw;
+        __syncthreads();
+        if (warp_id == 0) {
+            buf[lane_id] = ncols;
+        }
+        __syncthreads();
+        if (lane_id == 0) {
+            buf[warp_id] = a;
+        }
+        __syncthreads();
+        a = soft_max_band_warp_min(buf[lane_id]);
+    }
+    __syncthreads();
+    return a < ncols ? a : 0;
+}
+
 template <bool vals_smem, int ncols_template, int block_size_template, typename T>
-static __global__ void soft_max_f32_nosinks(const float * x, const T * mask, float * dst, const int ncols_par, const int nrows_y, const float scale, const float max_bias, const float m0, const float m1, uint32_t n_head_log2, float cap_params0, float cap_params1, bool do_softcap) {
+static __global__ void soft_max_f32_nosinks(const float * x, const T * mask, float * dst, const int ncols_par, const int nrows_y, const float scale, const float max_bias, const float m0, const float m1, uint32_t n_head_log2, float cap_params0, float cap_params1, bool do_softcap, bool band) {
     const int ncols = ncols_template == 0 ? ncols_par : ncols_template;
 
     const int tid  = threadIdx.x;
@@ -75,19 +125,27 @@ static __global__ void soft_max_f32_nosinks(const float * x, const T * mask, flo
         max_val = warp_reduce_max(max_val);
     }
 
+    const int anchor = band && mask ? soft_max_band_anchor(vals, ncols, block_size, tid, warp_id, lane_id, buf_iw) : 0;
+
     float tmp = 0.0f; // partial sum
 
 #pragma unroll
-    for (int col0 = 0; col0 < ncols; col0 += block_size) {
+    for (int col0 = anchor; col0 < ncols; col0 += block_size) {
         const int col = col0 + tid;
 
-        if (ncols_template == 0 && col >= ncols) {
+        if ((ncols_template == 0 || anchor != 0) && col >= ncols) {
             break;
         }
 
         const float val = expf(vals[col] - max_val);
         tmp += val;
         vals[col] = val;
+    }
+    if (anchor > 0) {
+        for (int col = tid; col < anchor; col += block_size) {
+            vals[col] = 0.0f; // masked: what expf(-inf - max) gave
+        }
+        __syncthreads();
     }
 
     // find the sum of exps in the block
@@ -124,7 +182,7 @@ static __global__ void soft_max_f32_nosinks(const float * x, const T * mask, flo
 }
 
 template<typename T>
-static void soft_max_f32_cuda_nosinks(const float * x, const T * mask, float * dst, const int ncols_x, const int nrows_x, const int nrows_y, const float scale, const float max_bias, float cap_params0, float cap_params1, bool do_softcap, cudaStream_t stream) {
+static void soft_max_f32_cuda_nosinks(const float * x, const T * mask, float * dst, const int ncols_x, const int nrows_x, const int nrows_y, const float scale, const float max_bias, float cap_params0, float cap_params1, bool do_softcap, cudaStream_t stream, bool band = false) {
     int nth = WARP_SIZE;
     while (nth < ncols_x && nth < CUDA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
     const dim3 block_dims(nth,     1, 1);
@@ -142,36 +200,36 @@ static void soft_max_f32_cuda_nosinks(const float * x, const T * mask, float * d
     if (shmem < ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
         switch (ncols_x) {
             case 32:
-                soft_max_f32_nosinks<true, 32, 32><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 32, 32><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
             case 64:
-                soft_max_f32_nosinks<true, 64, 64><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 64, 64><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
             case 128:
-                soft_max_f32_nosinks<true, 128, 128><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 128, 128><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
             case 256:
-                soft_max_f32_nosinks<true, 256, 256><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 256, 256><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
             case 512:
-                soft_max_f32_nosinks<true, 512, 512><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 512, 512><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
             case 1024:
-                soft_max_f32_nosinks<true, 1024, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 1024, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
             case 2048:
-                soft_max_f32_nosinks<true, 2048, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 2048, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
             case 4096:
-                soft_max_f32_nosinks<true, 4096, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 4096, 1024><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
             default:
-                soft_max_f32_nosinks<true, 0, 0><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+                soft_max_f32_nosinks<true, 0, 0><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
                 break;
         }
     } else {
         const size_t shmem_low = WARP_SIZE*sizeof(float);
-        soft_max_f32_nosinks<false, 0, 0><<<block_nums, block_dims, shmem_low, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap);
+        soft_max_f32_nosinks<false, 0, 0><<<block_nums, block_dims, shmem_low, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2, cap_params0, cap_params1, do_softcap, band);
     }
 }
 
@@ -239,15 +297,20 @@ void ggml_cuda_op_soft_cap_max(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
     //printf("%s: %g, %g, %g, %g, %p, %d\n", __func__, params[0], params[1], params[2], params[3], (const void *)src1, use_f16);
+    // PXA_KV_BAND_ANCHOR0: every row proven to open at column 0 walks from 0 either way (the walk of before)
+    const bool band = src1 != nullptr && pxa_kv_band_softmax_applies(ggml_cuda_info().devices[ctx.device].cc) &&
+                      !pxa_kv_band_anchor0_proven(src1, ne00, nrows_y, false, stream);
 
     if (use_f16) {
         const half * src1_dd = (const half *)src1_d;
 
-        soft_max_f32_cuda_nosinks(src0_d, src1_dd, dst_d, ne00, nrows_x, nrows_y, params[0], params[1], params[2], params[3], true, stream);
+        soft_max_f32_cuda_nosinks(src0_d, src1_dd, dst_d, ne00, nrows_x, nrows_y, params[0], params[1], params[2], params[3], true, stream,
+                                  band);
     } else {
         const float * src1_dd = (const float *)src1_d;
 
-        soft_max_f32_cuda_nosinks(src0_d, src1_dd, dst_d, ne00, nrows_x, nrows_y, params[0], params[1], params[2], params[3], true, stream);
+        soft_max_f32_cuda_nosinks(src0_d, src1_dd, dst_d, ne00, nrows_x, nrows_y, params[0], params[1], params[2], params[3], true, stream,
+                                  band);
     }
 }
 
@@ -272,6 +335,7 @@ struct soft_max_params {
     float max_bias;
     float m0;
     float m1;
+    bool  band; // PXA_KV_BAND_EXACT: walk each row from its first open column
 };
 
 #ifdef __clang__
@@ -345,18 +409,26 @@ static __global__ void soft_max_f32(
         max_val = warp_reduce_max(max_val);
     }
 
+    const int anchor = p.band && mask ? soft_max_band_anchor(vals, ncols, block_size, tid, warp_id, lane_id, buf_iw) : 0;
+
     float tmp = 0.0f; // partial sum
 #pragma unroll
-    for (int col0 = 0; col0 < ncols; col0 += block_size) {
+    for (int col0 = anchor; col0 < ncols; col0 += block_size) {
         const int col = col0 + tid;
 
-        if (ncols_template == 0 && col >= ncols) {
+        if ((ncols_template == 0 || anchor != 0) && col >= ncols) {
             break;
         }
 
         const float val = expf(vals[col] - max_val);
         tmp += val;
         vals[col] = val;
+    }
+    if (anchor > 0) {
+        for (int col = tid; col < anchor; col += block_size) {
+            vals[col] = 0.0f; // masked: what expf(-inf - max) gave
+        }
+        __syncthreads();
     }
 
     // find the sum of exps in the block
@@ -515,6 +587,8 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     params.max_bias = max_bias;
     params.m0 = m0;
     params.m1 = m1;
+    params.band = src1 != nullptr && pxa_kv_band_softmax_applies(ggml_cuda_info().devices[ctx.device].cc) &&
+                  !pxa_kv_band_anchor0_proven(src1, ne00, nrows_y, false, stream); // PXA_KV_BAND_ANCHOR0, as above
 
     if (use_f16) {
         soft_max_f32_cuda(src0_d, (const half  *) src1_d, (const float *) src2_d, dst_d, params, stream);

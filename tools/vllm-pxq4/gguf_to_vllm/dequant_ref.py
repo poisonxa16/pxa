@@ -164,7 +164,7 @@ def dequant_pxq_panel(blob, type_id: int, N: int, K: int, book, sub) -> np.ndarr
     """Decode a PXQ2/PXQ3/PXQ4/PXQ4HQ panel tensor to float32 [N, K].
 
     Only used when a module the policy does NOT serve happens to be a panel tier -- the
-    m2-fp16 control arm, and any tensor whose fused partners force the module dense. The
+    fp16 control arm, and any tensor whose fused partners force the module dense. The
     normal path never calls it: a served panel tensor is a byte move, not a decode.
 
     ``book``/``sub`` are the FILE's own tables, never the compiled-in defaults; the caller

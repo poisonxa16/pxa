@@ -353,3 +353,5 @@ void quantize_tensor_q8_1_cuda(const struct ggml_tensor * src, void * vy, const 
     const uint64_t stride = src->nb[2]/sizeof(float);
     quantize_q8_1<<<num_blocks, block_size, 0, stream>>>((const float *)src->data, vy, src->ne[0], src_padded_col_size, stride);
 }
+
+#include "pxa/pxa-vfuse.cuh"

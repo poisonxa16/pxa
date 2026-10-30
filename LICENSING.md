@@ -2,12 +2,14 @@
 
 This repository is one clone containing two engines under two different
 permissive licences. They are compatible, but they are not the same licence,
-and each keeps its own notices.
+and each keeps its own notices. The PXQN library that PXA releases ship as a binary has
+its own terms (last row of the table).
 
 | path | what | licence | upstream |
 |---|---|---|---|
 | repository root | `pxa` inference engine (C/C++) | **MIT** — see `LICENSE` | llama.cpp / ggml and the MIT-licensed lineage recorded in `NOTICE` |
 | `tools/vllm-pxq4/`, `pxa/pxq4/` | the PXQ4 quantization plugin for vLLM (Python + CUDA) | **Apache-2.0**, matching vLLM — see `tools/vllm-pxq4/LICENSE-NOTICE.md` | vLLM -> the Volta vLLM fork |
+| `ggml-pxqn.dll` / `libggml-pxqn.so` (shipped as a binary) | the PXQN library that runs PXQN models | **PXQN library licence**, free of charge, not MIT — see `docs/LICENSE-ggml-pxqn.txt`; the release packages carry it next to `LICENSE` | — |
 
 Attribution for each side lives with that side: `NOTICE` at the root for the engine,
 `tools/vllm-pxq4/LICENSE-NOTICE.md` for the vLLM plugin. Apache-2.0 section 4 requires that

@@ -2,6 +2,7 @@
 #include "server-queue.h"
 #include "speculative.h"
 #include "json-schema-to-grammar.h"
+#include "pxa-mtp-dump.h"   // PXA_DUMP_MTP_EMBD_v1
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
@@ -69,6 +70,7 @@ struct server_slot {
 
     int32_t n_prompt_tokens = 0;
     int32_t n_prompt_tokens_cache = 0;
+    pxa_mtp_dump_buf mtp_dump; // PXA_DUMP_MTP_EMBD_v1: this request's conditioning rows until the prompt is done
     int32_t n_prompt_tokens_processed = 0;
     // PXA_SLOT_FORK_v1: prompt tokens this request did NOT have to prefill because its prefix was
     // forked off another slot's live KV. 0 whenever no fork happened.
@@ -300,6 +302,10 @@ struct server_metrics {
     void reset_bucket();
 };
 
+#include "pxa-wedge-policy.h"   // PXA_JIT_WEDGE_v1
+// PXA_JIT_WEDGE_v1: install the process-wide wedge policy (main(), once the backends are up)
+void pxa_wedge_policy_set(const pxa_wedge_policy & p);
+
 struct server_context {
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
@@ -319,10 +325,15 @@ struct server_context {
     std::atomic<int64_t> last_decode_start_us{0};
     std::atomic<int64_t> last_decode_done_us{0};
     bool pxa_decode_wedged(int64_t stall_ms) const;
+    // PXA_JIT_WEDGE_v1: completed llama_decode calls of this context (the JIT window counts these)
+    // and the stall limit to use instead of `base` right now (stretched while the device JIT-compiles).
+    std::atomic<int64_t> pxa_decodes_done{0};
+    int64_t pxa_wedge_limit_ms(int64_t base) const;
 
     bool clean_kv_cache = true;
     bool add_bos_token = true;
     bool has_eos_token = false;
+    std::vector<llama_token> eog_tokens; // every EOG token (common_eog_tokens), banned by ignore_eos
 
     // PXA_PROMPT_INTERLEAVE_v1 (PXA_KERNEL_FIX_20260611): alternation flip-flop between
     // pure-prompt ticks and pure-decode ticks on recurrent/hybrid models (see update_slots).

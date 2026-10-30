@@ -47,6 +47,81 @@
 // the k-pool indexer inputs, shared by every MLA block of the graph
 // ---------------------------------------------------------------------------------------
 
+// PXA_GLM5NEXT_FA (2026-09-13) — build the MLA layers' attention as ONE flash_attn_ext node
+// instead of the mul_mat -> soft_max -> mul_mat chain this file writes by hand.
+//
+// It could not be done before: with wk_b absorbed the MLA attends over the 512-wide compressed
+// latent, and every flash-attention predicate in this tree rejected head dim 512 below Turing, so
+// there was no kernel to call. There is one now (ggml-cuda/pxa/fattn-tile-big.cu, head sizes
+// 512/512 and 576/512 on sm_60 and sm_70, itself behind PXA_FA_TILE_512), and the sparse
+// index-list path (ggml-cuda/dsa_attn.cu, PXA_DSA_ATTN) serves the same node shape with no
+// head-dim restriction at all.
+//
+// DEFAULT OFF, and the graph gate mirrors each kernel's own gate rather than merely hoping the
+// kernel declines: with PXA_GLM5NEXT_FA unset nothing below is built, so the off arm is the
+// shipped graph node-for-node and an A/B is not paying for dead nodes (the lesson written into
+// build_deepseek4.cpp, where an unhonoured switch left 43 index-list nodes per decode graph in
+// the baseline).
+//
+// The index list is set ONLY when PXA_DSA_ATTN is also armed, because src[5] is a REQUEST the
+// CUDA backend DECLINES when it cannot honour it — a node carrying a list nothing serves would
+// land on the CPU backend, which is a slower wrong thing to measure.
+static bool pxa_glm5next_fa_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_GLM5NEXT_FA");
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            fprintf(stderr, "PXA_GLM5NEXT_FA: armed -- the MLA layers build ONE flash_attn_ext node "
+                            "over the 512-wide latent (needs PXA_FA_TILE_512 for the sm_60/sm_70 "
+                            "tile kernel, or PXA_DSA_ATTN for the index-list path)\n");
+        }
+        return on;
+    }();
+    return v;
+}
+
+// PXA_GLM5NEXT_MTP (2026-09-13) -- build block 45, the NextN/MTP draft head.
+//
+// The file has carried the head since the first port (blk.45: the full MLA sextet, the DSA indexer
+// sextet, MoE 288 + shared, and nextn.{eh_proj, enorm, hnorm, shared_head_norm}) and the loader has
+// created it under -mtp all along; only the graph refused to build it. What the block is NOT is as
+// informative as what it is: it carries NO hc_* tensors, so it is a plain single-stream block, not
+// a fifth member of the four-stream manifold -- it takes the trunk's MEAN-COLLAPSED hidden, which
+// is the shape qwen35 and deepseek2 already use. It also carries no nextn.embed_tokens and no
+// nextn.shared_head_head, so it shares tok_embd and output.weight with the trunk.
+//
+// DEFAULT ON since 2026-10-18 (C063), =0 off. The head is only ever built for an MTP
+// companion context, i.e. when the run asks for --spec-type mtp: a plain run builds the same trunk
+// graph either way. Before the flip an explicit --spec-type mtp on glm5next aborted on the assert in
+// build_glm5next() unless this env was set; the ring is armed (3cfa77b7be) and n_max=1/4 are
+// bit-identical to plain on the tiny NextN gate. PXA_GLM5NEXT_MTP=0 restores the refusal (assert).
+// The head costs +2.60 GiB on whichever card holds block 45 (place its routed experts with -ot).
+// WHO asks for it is scoped elsewhere: the server's AUTO speculation arms glm5next MTP only with the routed experts resident
+// on the cards (pxa_registry_spec_stream_off); with -ot CPU / streamed experts only an explicit --spec-type
+// mtp or PXA_GLM5NEXT_MTP=1 does.
+static bool pxa_glm5next_mtp_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_GLM5NEXT_MTP");
+        const bool on = e == nullptr || *e == 0 || atoi(e) != 0;
+        if (on) {
+            fprintf(stderr, "PXA_GLM5NEXT_MTP: armed -- block 45 builds as the NextN draft head "
+                            "(--spec-type mtp makes the loader create it; the recurrent-state ring "
+                            "is armed with it, for the rollback on a rejected draft)\n");
+        }
+        return on;
+    }();
+    return v;
+}
+
+// Mirror of the kernel-side gate in ggml-cuda/dsa_attn.cu, INCLUDING its default.
+static bool pxa_glm5next_dsa_index_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_DSA_ATTN");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+
 void llm_build_context::build_kpool_inputs(ggml_cgraph * gf) {
     auto & in = llama_kpool_get_inputs(lctx);
     const auto & d = llama_kpool_get_dims(lctx);
@@ -127,7 +202,8 @@ ggml_tensor * llm_build_context::build_glm5next_kda(
         ggml_tensor * state_row_idx,
         ggml_tensor * conv_seq_map,
         ggml_tensor * state_mask,
-        int           il) {
+        int           il,
+        ggml_tensor * state_row_idx_w) {
     const auto & layer = model.layers[il];
 
     const int64_t head_dim = hparams.n_embd_head_kda;
@@ -155,6 +231,46 @@ ggml_tensor * llm_build_context::build_glm5next_kda(
     //
     // the recurrent row: gather, reset, split into the conv window and the delta state
     //
+
+    // 2026-09-13 -- the recurrent-state ring.
+    //
+    // With the ring armed s_l is (1 + n_rs_seq) PLANES of rs_plane_rows rows, plane-major:
+    //     row(plane p, seq s) = p*rs_plane_rows + s
+    // plane 0 is live and plane 1+t holds the state after batch row t, which is exactly what the
+    // conv and delta-rule kernels already compute per step -- so arming the ring changes only
+    // the STORE ADDRESS of that capture, and rolling a rejected draft back becomes a read index
+    // instead of a device copy. `state_all` already spans every plane (n_slots is the whole
+    // tensor height), so a read index naming plane r resolves without any view change; what this
+    // block adds is (a) the separate WRITE index, which always names plane 0, and (b) the
+    // capture destination and its two strides.
+    //
+    // The capture is armed only when this ubatch would fill the planes it needs: more than one
+    // token in the sequence (one token has no intermediate state) and no more steps than there
+    // are planes. The LAST step needs no plane -- that state is the live one and the scatter
+    // below writes it. Outside those bounds the capture stays off and the rollback falls back to
+    // the copy path, which llama_set_inputs records in rs_capture_ok; it never reads a plane
+    // that was not written.
+    const uint32_t rs_plane_rows = kv_self.rs_ring_armed() ? kv_self.rs_plane_rows : 0u;
+    ggml_tensor * per_step_conv = nullptr;
+    ggml_tensor * per_step_ckpt = nullptr;
+    int64_t rs_sv_row_stride  = 0;
+    int64_t rs_sv_step_stride = 0;
+    if (rs_plane_rows > 0 && kv_self.save_per_step_ssm && n_seq_tokens > 1 &&
+        n_slots % rs_plane_rows == 0 && n_seq_tokens <= (int64_t)(n_slots / rs_plane_rows)) {
+        const int64_t n_planes    = (int64_t) n_slots / rs_plane_rows;   // 1 + n_rs_seq
+        GGML_ASSERT(n_planes >= 2);
+        const size_t  es          = ggml_element_size(s_l);
+        const int64_t plane_elems = state_dim * (int64_t) rs_plane_rows;
+        const int64_t hist_elems  = plane_elems * (n_planes - 1);
+        rs_sv_row_stride  = state_dim;
+        rs_sv_step_stride = plane_elems;
+        // a state row is (conv window | delta state); both captures start at plane 1, the conv
+        // half at row offset 0 and the delta half at conv_state_dim.
+        per_step_conv = ggml_view_1d(ctx0, s_l, hist_elems, (size_t) plane_elems * es);
+        per_step_ckpt = ggml_view_1d(ctx0, s_l, hist_elems - conv_state_dim,
+                (size_t)(plane_elems + conv_state_dim) * es);
+    }
+    ggml_tensor * state_row_idx_wr = state_row_idx_w ? state_row_idx_w : state_row_idx;
 
     ggml_tensor * state_all = ggml_view_2d(ctx0, s_l, state_dim, n_slots, s_l->nb[1], 0);
     ggml_tensor * state_row = ggml_get_rows(ctx0, state_all, state_row_idx);   // [state_dim, 1]
@@ -194,7 +310,11 @@ ggml_tensor * llm_build_context::build_glm5next_kda(
             ggml_concat(ctx0, conv_w_2d(layer.ssm_conv1d_q), conv_w_2d(layer.ssm_conv1d_k), 1),
             conv_w_2d(layer.ssm_conv1d_v), 1);   // [d_conv, 3*d_inner]
 
-    ggml_tensor * conv_raw = ggml_ssm_conv(ctx0, conv_states, qkv, conv_w, conv_seq_map, nullptr);
+    ggml_tensor * conv_raw = ggml_ssm_conv(ctx0, conv_states, qkv, conv_w, conv_seq_map, per_step_conv);
+    // retarget the conv half of the per-step capture into the ring's planes (0,0 = unchanged)
+    if (per_step_conv && (rs_sv_row_stride > 0 || rs_sv_step_stride > 0)) {
+        ggml_op_set_save_strides(conv_raw, rs_sv_row_stride, rs_sv_step_stride);
+    }
     cb(conv_raw, "kda_conv_raw", il);
 
     ggml_tensor * conv_out = ggml_view_2d(ctx0, conv_raw, conv_dim, n_tokens,
@@ -278,7 +398,11 @@ ggml_tensor * llm_build_context::build_glm5next_kda(
     //
 
     ggml_tensor * dn = ggml_delta_net_ext(ctx0, Qcur, Kcur, Vcur, g1, beta, state,
-                                          nullptr, /*g_per_channel*/ 1);
+                                          per_step_ckpt, /*g_per_channel*/ 1);
+    // and the delta half of the same capture
+    if (per_step_ckpt && (rs_sv_row_stride > 0 || rs_sv_step_stride > 0)) {
+        ggml_op_set_save_strides(dn, rs_sv_row_stride, rs_sv_step_stride);
+    }
     cb(dn, "kda_delta_net", il);
 
     const int64_t out_size = head_dim*n_head_k*n_tokens*n_seqs;
@@ -301,7 +425,8 @@ ggml_tensor * llm_build_context::build_glm5next_kda(
 
     // one producer, one scatter: no per-token in-place aliasing for ggml-alloc to trip over
     ggml_tensor * new_row = ggml_concat(ctx0, new_conv, new_ssm, 0);   // [state_dim, n_seqs]
-    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, s_l, new_row, state_row_idx));
+    // the scatter always writes plane 0; only the gather above may name a history plane
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, s_l, new_row, state_row_idx_wr));
 
     //
     // output gate and projection
@@ -337,7 +462,9 @@ ggml_tensor * llm_build_context::build_glm5next_kpool_select(
         ggml_tensor * cur,
         ggml_tensor * qr,
         ggml_tensor * kq_mask,
-        int           il) {
+        int           il,
+        bool          want_mask,
+        ggml_tensor ** out_sel_idx) {
     const auto & layer = model.layers[il];
     const auto & in    = llama_kpool_get_inputs(lctx);
     const auto & d     = llama_kpool_get_dims(lctx);
@@ -377,7 +504,15 @@ ggml_tensor * llm_build_context::build_glm5next_kpool_select(
         // write is a plain view -- no scatter, no k_idxs input
         ggml_tensor * dst = ggml_view_2d(ctx0, idx_l, 3*n_ei, n_tokens,
                 idx_l->nb[1], idx_l->nb[1]*kv_head);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, packed, dst));
+        ggml_tensor * wr = ggml_cpy(ctx0, packed, dst);
+        ggml_build_forward_expand(gf, wr);
+        // PXA_GLM5NEXT_GRAPH_REUSE: let a reused graph re-point this write at the new kv_head
+        if (llama_pxa_glm5next_graph_reuse() && idx_l->extra == nullptr) {
+            if ((int) lctx.pxa_idx_cc.size() < n_layer) lctx.pxa_idx_cc.resize(n_layer);
+            lctx.pxa_idx_cc[il].cpy  = wr;
+            lctx.pxa_idx_cc[il].step = idx_l->nb[1];
+            lctx.pxa_idx_cc_graph    = gf;
+        }
     }
 
     const int64_t n_cells = idx_l->ne[1];
@@ -459,9 +594,19 @@ ggml_tensor * llm_build_context::build_glm5next_kpool_select(
         // order of each backend's sum_rows reduction, so this is a bit-identical substitution
         // rather than an approximation (tests/test-kpool-score.cpp asserts that). See the
         // contract note on ggml_kpool_score().
+        // Banner: every other lever in this graph says so on stderr when it is armed, and an A/B
+        // whose arms cannot be told apart in the log is void rather than a wash. Bit-identical
+        // or not, the arm has to be provable from the boot log.
         static const bool fused_score = [] {
+            // default ON since 10-24; PXA_KPOOL_FUSED_SCORE=0 = the unfused chain
             const char * e = getenv("PXA_KPOOL_FUSED_SCORE");
-            return e != nullptr && atoi(e) != 0;
+            const bool on = e == nullptr || atoi(e) != 0;
+            if (on) {
+                fprintf(stderr, "PXA_KPOOL_FUSED_SCORE: armed -- the indexer's relu/mul/sum_rows "
+                                "chain becomes one ggml_kpool_score node (five fewer nodes per MLA "
+                                "block; bit-identical, tests/test-kpool-score.cpp pins it)\n");
+            }
+            return on;
         }();
 
         // PXA_KPOOL_SCORE_TILE: with the fusion in place, the one remaining full-size tensor in
@@ -541,7 +686,14 @@ ggml_tensor * llm_build_context::build_glm5next_kpool_select(
     }
     GGML_ASSERT(sel_idx->ne[0] == (int64_t) d.n_sel);
 
-    if (d.gather) {
+    if (out_sel_idx) {
+        *out_sel_idx = sel_idx;
+    }
+
+    // want_mask: the flash-attention arm needs the n_kv-wide additive mask in BOTH branches
+    // (the kernel masks; it does not gather by itself), so the decode ubatch takes the scatter
+    // construction below rather than returning the cell table.
+    if (d.gather && !want_mask) {
         cb(sel_idx, "indexer_sel_idx", il);
         return sel_idx;
     }
@@ -576,6 +728,22 @@ ggml_tensor * llm_build_context::build_glm5next_kpool_select(
     // what a shared-indexer layer would reuse and it must already be causal.
     sel = ggml_add(ctx0, sel, ggml_view_2d(ctx0, kq_mask, n_kv, n_tokens, kq_mask->nb[1], 0));
     cb(sel, "indexer_sel", il);
+
+    if (want_mask) {
+        // ggml_flash_attn_ext wants an F16 mask whose row count is padded to GGML_KQ_MASK_PAD;
+        // the padded rows belong to no query (dst has exactly n_tokens rows) so they are simply
+        // masked out. The pad block is built with the same fill -> repeat leaf shape as the
+        // selection mask above so it costs one node, not a copy of the mask.
+        const int64_t n_pad = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
+        if (n_pad > n_tokens) {
+            ggml_tensor * pad = ggml_repeat_4d(ctx0,
+                    ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -INFINITY),
+                    n_kv, n_pad - n_tokens, 1, 1);
+            sel = ggml_concat(ctx0, sel, pad, 1);
+        }
+        sel = ggml_cast(ctx0, sel, GGML_TYPE_F16);
+        cb(sel, "indexer_sel_f16", il);
+    }
 
     return sel;
 }
@@ -619,25 +787,71 @@ ggml_tensor * llm_build_context::build_glm5next_dsa(
     // the selection. Built from `cur` and `qr`, so it must come before the cache write is
     // consumed but after the row for this token exists -- which is why the write is expanded
     // inside build_glm5next_kpool_select().
-    ggml_tensor * sel = build_glm5next_kpool_select(gf, cur, qr, kq_mask, il);
+    const bool fa_arm = pxa_glm5next_fa_enabled();
+
+    ggml_tensor * sel = build_glm5next_kpool_select(gf, cur, qr, kq_mask, il, fa_arm);
 
     // append this ubatch's latents to the cache (contiguous run from kv_head)
     {
         ggml_tensor * k_l = kv_self.k_l[il];
         const size_t row = ggml_row_size(k_l->type, kv_lora);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, kv_cmpr,
-                ggml_view_2d(ctx0, k_l, kv_lora, n_tokens, row, row*kv_head)));
+        ggml_tensor * k_wr = ggml_cpy(ctx0, kv_cmpr,
+                ggml_view_2d(ctx0, k_l, kv_lora, n_tokens, row, row*kv_head));
+        ggml_build_forward_expand(gf, k_wr);
 
         ggml_tensor * v_l = kv_self.v_l[il];
         GGML_ASSERT(v_l && "glm5next needs the transposed latent store: run with -fa off and -mla 1");
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_transpose(ctx0, kv_cmpr),
+        ggml_tensor * v_wr = ggml_cpy(ctx0, ggml_transpose(ctx0, kv_cmpr),
                 ggml_view_2d(ctx0, v_l, n_tokens, kv_lora,
                         ggml_row_size(v_l->type, kv_self.size),
-                        ggml_row_size(v_l->type, kv_head))));
+                        ggml_row_size(v_l->type, kv_head)));
+        ggml_build_forward_expand(gf, v_wr);
+
+        // PXA_GLM5NEXT_GRAPH_REUSE (default off): register both writes so update_cache_copies()
+        // can re-point them at the next kv_head. Unregistered (switch off) => reuse is refused.
+        // The transposed V write steps one element per cell, so only block-size-1 types qualify.
+        if (llama_pxa_glm5next_graph_reuse() && k_l->extra == nullptr && v_l->extra == nullptr &&
+            ggml_blck_size(v_l->type) == 1 && (int) lctx.cache_copies.size() >= 2*(il + 1)) {
+            lctx.cache_copies[2*il+0].cpy  = k_wr;
+            lctx.cache_copies[2*il+0].step = row;
+            lctx.cache_copies[2*il+1].cpy  = v_wr;
+            lctx.cache_copies[2*il+1].step = ggml_element_size(v_l);
+        }
     }
 
     ggml_tensor * out;
-    if (d.gather) {
+    if (fa_arm) {
+        //
+        // ONE node. The selection is already an additive mask over the whole cache and it
+        // already carries causality, so the attention is an ordinary masked flash-attention over
+        // the compressed latent -- with K and V the SAME tensor, which is what makes the sparse
+        // kernel's value gather free.
+        //
+        ggml_tensor * k_l = kv_self.k_l[il];
+        ggml_tensor * k   = ggml_view_2d(ctx0, k_l, kv_lora, n_kv, k_l->nb[1], 0);
+        GGML_ASSERT(k->type == GGML_TYPE_F16 &&
+                    "glm5next: the flash-attention arm needs an F16 latent cache (-ctk f16)");
+
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q_abs, k, k, sel, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+
+        if (pxa_glm5next_dsa_index_enabled()) {
+            // The sparse path: hand the kernel the rows each query can actually see. The width
+            // is the kernel's launch geometry (256-multiple) and doubles as slack.
+            ggml_tensor * idx = ggml_mask_to_index(ctx0, sel, GGML_PAD((int64_t) d.n_sel, 256));
+            cb(idx, "dsa_mask_to_idx", il);
+            ggml_build_forward_expand(gf, idx);
+            fa->src[5] = idx;
+        }
+        cb(fa, "kqv_fa", il);                                       // [512, n_head, n_tokens]
+
+        ggml_tensor * kqv = ggml_cont(ctx0, ggml_permute(ctx0, fa, 0, 2, 1, 3));
+        kqv = ggml_mul_mat(ctx0, layer.wv_b, kqv);                  // [256, n_tokens, n_head]
+        cb(kqv, "kqv", il);
+
+        out = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3)); // [256, n_head, n_tokens]
+        out = ggml_reshape_2d(ctx0, out, head_v_mla*n_head, n_tokens);
+    } else if (d.gather) {
         //
         // decode: attend over ONLY the selected latents, so the cost follows top_k rather than
         // the context length. This is the point of DSA, not an optimisation to defer.
@@ -706,6 +920,145 @@ ggml_tensor * llm_build_context::build_glm5next_dsa(
 }
 
 // ---------------------------------------------------------------------------------------
+// the block FFN: three leading dense blocks, then MoE + clamped shared expert
+// ---------------------------------------------------------------------------------------
+//
+// Lifted verbatim out of the trunk loop (2026-09-13) so the NextN head can run the SAME feed
+// forward the trunk runs -- block 45's MoE is block 44's MoE with different weights, and a second
+// transcription of a 288-expert sigmoid-routed clamped-SwiGLU block is a second place to get the
+// clamp order wrong. `cur` is the ffn-pre hidden BEFORE ffn_norm; the returned tensor is the
+// block's FFN output with no residual applied, exactly as the loop expected it.
+ggml_tensor * llm_build_context::build_glm5next_ffn(ggml_cgraph * gf, ggml_tensor * cur, int il) {
+    const auto & layer = model.layers[il];
+
+    cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
+    cb(cur, "ffn_norm", il);
+
+    if (il < (int) hparams.n_layer_dense_lead) {
+        cur = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                layer.ffn_up,   nullptr, nullptr,
+                layer.ffn_gate, nullptr, nullptr,
+                layer.ffn_down, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, false);
+        cb(cur, "ffn_out", il);
+    } else {
+        ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
+                layer.ffn_gate_inp,
+                layer.ffn_up_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                layer.ffn_exp_probs_b,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU,
+                hparams.expert_weights_norm,
+                hparams.expert_weights_scale != 0.0f,
+                hparams.expert_weights_scale,
+                (llm_expert_gating_func_type) hparams.expert_gating_func,
+                cb, il, gf, /*add_input*/ false);
+        cb(moe_out, "ffn_moe_out", il);
+
+        // The shared expert's SwiGLU clamps the GATE to [-inf, limit] and the UP to
+        // [-limit, limit] and only then multiplies -- it is NOT silu-then-clamp. Built
+        // inline (exactly as build_deepseek4.cpp does) so llm_build_ffn's fused SILU path
+        // stays byte-untouched for every other architecture.
+        ggml_tensor * shexp;
+        {
+            ggml_tensor * up   = llm_build_lora_mm(lctx, ctx0, layer.ffn_up_shexp,   cur);
+            ggml_tensor * gate = llm_build_lora_mm(lctx, ctx0, layer.ffn_gate_shexp, cur);
+
+            const float limit = hparams.swiglu_limits_shared[il];
+            if (limit > 1e-6f) {
+                up   = ggml_clamp(ctx0, up,   -limit,    limit);
+                gate = ggml_clamp(ctx0, gate, -INFINITY, limit);
+            }
+            ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up);
+            shexp = llm_build_lora_mm(lctx, ctx0, layer.ffn_down_shexp, act);
+        }
+        cb(shexp, "ffn_shexp", il);
+
+        cur = ggml_add(ctx0, moe_out, shexp);
+        cb(cur, "ffn_out", il);
+    }
+
+    return cur;
+}
+
+// ---------------------------------------------------------------------------------------
+// the NextN / MTP draft head (block 45)
+// ---------------------------------------------------------------------------------------
+//
+// One block, run on its own graph, conditioned on the trunk's hidden for the PREVIOUS token and
+// the embedding of the token the trunk just produced:
+//
+//     h  = eh_proj( RMSNorm(embd(tok), enorm) || RMSNorm(prev_hidden, hnorm) )    [2*n_embd -> n_embd]
+//     h  = h + MLA_DSA( RMSNorm(h, attn_norm) )
+//     h  = h + FFN( h )                                                           (the trunk's FFN)
+//     logits = output( RMSNorm(h, shared_head_norm) )
+//
+// The two residuals are plain adds because the block has no hyper-connection mixer; the trunk's
+// build_dsv4_hc_pre/post pair has nothing to read on this block and is not called.
+ggml_tensor * llm_build_context::build_glm5next_mtp(ggml_cgraph * gf, ggml_tensor * prev_hidden,
+                                                    ggml_tensor * kq_mask) {
+    const int il = (int) hparams.n_layer - 1;
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm &&
+                "glm5next: the NextN head needs blk.<n_layer-1>.nextn.{eh_proj,enorm,hnorm} -- "
+                "run with -mtp so the loader creates block 45");
+    // The MLA blocks carry the q LoRA PAIR (wq_a/wq_b), never a fused wq -- asserting on wq here
+    // asked block 45 for a tensor no glm5next block has.
+    GGML_ASSERT(layer.wq_a && layer.wq_b && layer.wkv_a_mqa && layer.wk_b && layer.wv_b && layer.wo &&
+                "glm5next: the NextN head's MLA tensors are missing");
+
+    ggml_tensor * token_emb = build_inp_embd_mtp(model.tok_embd);
+
+    ggml_tensor * e = llm_build_norm(ctx0, token_emb,   hparams, layer.nextn.enorm, nullptr,
+                                     LLM_NORM_RMS, cb, il);
+    ggml_tensor * h = llm_build_norm(ctx0, prev_hidden, hparams, layer.nextn.hnorm, nullptr,
+                                     LLM_NORM_RMS, cb, il);
+    ggml_tensor * cur = llm_build_lora_mm(lctx, ctx0, layer.nextn.eh_proj,
+                                          ggml_concat(ctx0, e, h, 0));
+    cb(cur, "mtp_fused", il);
+
+    ggml_tensor * residual = cur;
+    ggml_tensor * attn_in  = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr,
+                                            LLM_NORM_RMS, cb, il);
+    cb(attn_in, "attn_norm", il);
+    ggml_build_forward_expand(gf, attn_in);
+
+    // block 45 is an MLA block (head_count_kv == 1), so it attends exactly the way blocks
+    // 3,7,...,43 do -- over the k-pool selection its own indexer produces, into its own KV rows.
+    cur = build_glm5next_dsa(gf, attn_in, kq_mask, il);
+    cur = ggml_add(ctx0, cur, residual);
+    cb(cur, "attn_out", il);
+
+    residual = cur;
+    cur = build_glm5next_ffn(gf, cur, il);
+    cur = ggml_add(ctx0, cur, residual);
+    cur = lctx.cvec.apply_to(ctx0, cur, il);
+    cb(cur, "l_out", il);
+
+    // PXA_MTP_READBACK_v1: this row IS the head's conditioning hidden for the next draft step and
+    // the draft loop reads it back with llama_get_embeddings_ith(). Without the output flag
+    // ggml-alloc may hand its buffer to a later node once the head's own lm_head has consumed it,
+    // and the D2H copy then reads whatever landed there -- right logits, wrong hidden, and every
+    // chain conditioned on it collapses.
+    if (llama_pxa_mtp_head_output()) {
+        ggml_set_output(cur);
+    }
+    cb(cur, "result_mtp_embd", -1);
+
+    // no nextn.shared_head_head in this file: the head shares the trunk's output.weight, and
+    // shared_head_norm stands in for output_norm.
+    cur = build_output(lctx, ctx0, cur,
+                       model.output_mtp ? model.output_mtp : model.output,
+                       layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm,
+                       cb, false);
+    cb(cur, "result_output", -1);
+    return cur;
+}
+
+// ---------------------------------------------------------------------------------------
 // the trunk
 // ---------------------------------------------------------------------------------------
 
@@ -716,8 +1069,33 @@ ggml_cgraph * llm_build_context::build_glm5next() {
     const int     n_trunk = n_layer - (int) hparams.nextn_predict_layers;
 
     GGML_ASSERT(hc == 4 && "glm5next: only hyper_connection.count == 4 is implemented");
-    GGML_ASSERT(cparams.mtp_op_type == MTP_OP_NONE &&
-                "glm5next: the NextN/MTP head is loaded but not built yet");
+    GGML_ASSERT((cparams.mtp_op_type == MTP_OP_NONE || pxa_glm5next_mtp_enabled()) &&
+                "glm5next: the NextN/MTP head is loaded but not built -- PXA_GLM5NEXT_MTP=0 is set (unset it)");
+
+    // The head runs on its own graph: one block conditioned on the trunk's hidden for the
+    // previous token, never interleaved into the trunk loop.
+    if (cparams.mtp_op_type != MTP_OP_NONE) {
+        // PXA_MTP_BATCH_SLOTS_ROWS_v1: one hidden row per BATCH token, for every MTP op type --
+        // a single [n_embd] row breaks the moment a draft step carries more than one row.
+        ggml_tensor * prev_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        ggml_set_name(prev_hidden, "inp_mtp_states");
+        ggml_set_input(prev_hidden);
+        lctx.inp_mtp_states = prev_hidden;
+
+        // The head is an MLA block, so it attends through the k-pool selection like any other --
+        // and the plan is per-BATCH, so the head's own batch needs its own. Without this the head
+        // graph inherits whatever plan the trunk's last ubatch left behind and
+        // llama_kpool_set_inputs() fills this graph's tensors from that grid.
+        llama_kpool_build_plan(lctx, batch, is_reserve);
+
+        ggml_tensor * head_mask = build_inp_KQ_mask();
+        ggml_build_forward_expand(gf, head_mask);
+        build_kpool_inputs(gf);
+
+        ggml_tensor * head = build_glm5next_mtp(gf, prev_hidden, head_mask);
+        ggml_build_forward_expand(gf, head);
+        return gf;
+    }
 
     // One sequence per batch: both the recurrent carry and the pool grid are per-sequence, and
     // a wrong multi-sequence layout corrupts silently rather than failing.
@@ -760,7 +1138,14 @@ ggml_cgraph * llm_build_context::build_glm5next() {
     cb(lctx.inp_qnext_state_mask, "inp_qnext_state_mask", -1);
     ggml_set_input(lctx.inp_qnext_state_mask);
 
-    ggml_tensor * state_row_idx = ggml_view_1d(ctx0, lctx.inp_s_seq_qnext, 1, 0);
+    // With the ring armed the index tensor carries two vectors and the KDA blocks need BOTH:
+    // the READ row (which may be a history plane) lives in the second half, the WRITE row (always
+    // plane 0) in the first. Ring off -> one view serves both and nothing changes.
+    ggml_tensor * state_row_idx_w = ggml_view_1d(ctx0, lctx.inp_s_seq_qnext, 1, 0);
+    ggml_tensor * state_row_idx   = lctx.kv_self.rs_ring_armed()
+        ? ggml_view_1d(ctx0, lctx.inp_s_seq_qnext, 1,
+                       (size_t) n_tokens * lctx.inp_s_seq_qnext->nb[1])
+        : state_row_idx_w;
     ggml_tensor * conv_seq_map  = ggml_view_2d(ctx0, lctx.inp_conv_seq_map, 1, n_tokens,
                                                lctx.inp_conv_seq_map->nb[1], 0);
     ggml_tensor * state_mask    = ggml_view_2d(ctx0, lctx.inp_qnext_state_mask, 1, 1,
@@ -791,7 +1176,8 @@ ggml_cgraph * llm_build_context::build_glm5next() {
         ggml_build_forward_expand(gf, cur);
 
         if (hparams.is_recurrent(il)) {
-            cur = build_glm5next_kda(gf, cur, state_row_idx, conv_seq_map, state_mask, il);
+            cur = build_glm5next_kda(gf, cur, state_row_idx, conv_seq_map, state_mask, il,
+                                     state_row_idx_w);
         } else {
             cur = build_glm5next_dsa(gf, cur, kq_mask, il);
         }
@@ -808,54 +1194,7 @@ ggml_cgraph * llm_build_context::build_glm5next() {
         ggml_build_forward_expand(gf, post);
         ggml_build_forward_expand(gf, comb);
 
-        cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
-        cb(cur, "ffn_norm", il);
-
-        if (il < (int) hparams.n_layer_dense_lead) {
-            cur = llm_build_ffn(ctx0, lctx, nullptr, cur,
-                    layer.ffn_up,   nullptr, nullptr,
-                    layer.ffn_gate, nullptr, nullptr,
-                    layer.ffn_down, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, false);
-            cb(cur, "ffn_out", il);
-        } else {
-            ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
-                    layer.ffn_gate_inp,
-                    layer.ffn_up_exps,
-                    layer.ffn_gate_exps,
-                    layer.ffn_down_exps,
-                    layer.ffn_exp_probs_b,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU,
-                    hparams.expert_weights_norm,
-                    hparams.expert_weights_scale != 0.0f,
-                    hparams.expert_weights_scale,
-                    (llm_expert_gating_func_type) hparams.expert_gating_func,
-                    cb, il, gf, /*add_input*/ false);
-            cb(moe_out, "ffn_moe_out", il);
-
-            // The shared expert's SwiGLU clamps the GATE to [-inf, limit] and the UP to
-            // [-limit, limit] and only then multiplies -- it is NOT silu-then-clamp. Built
-            // inline (exactly as build_deepseek4.cpp does) so llm_build_ffn's fused SILU path
-            // stays byte-untouched for every other architecture.
-            ggml_tensor * shexp;
-            {
-                ggml_tensor * up   = llm_build_lora_mm(lctx, ctx0, layer.ffn_up_shexp,   cur);
-                ggml_tensor * gate = llm_build_lora_mm(lctx, ctx0, layer.ffn_gate_shexp, cur);
-
-                const float limit = hparams.swiglu_limits_shared[il];
-                if (limit > 1e-6f) {
-                    up   = ggml_clamp(ctx0, up,   -limit,    limit);
-                    gate = ggml_clamp(ctx0, gate, -INFINITY, limit);
-                }
-                ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up);
-                shexp = llm_build_lora_mm(lctx, ctx0, layer.ffn_down_shexp, act);
-            }
-            cb(shexp, "ffn_shexp", il);
-
-            cur = ggml_add(ctx0, moe_out, shexp);
-            cb(cur, "ffn_out", il);
-        }
+        cur = build_glm5next_ffn(gf, cur, il);
 
         inpL = build_dsv4_hc_post(cur, residual, post, comb, il);
         inpL = lctx.cvec.apply_to(ctx0, inpL, il);
@@ -880,6 +1219,14 @@ ggml_cgraph * llm_build_context::build_glm5next() {
         cur = ggml_scale(ctx0, acc, 1.0f/(float) hc);
     }
     cb(cur, "hc_head", -1);
+
+    // the head conditions on THIS row -- the mean-collapsed hidden, before output_norm. Flag it as
+    // an output or ggml-alloc is free to reuse its buffer once build_output has read it, and the
+    // read-back then returns whatever landed there.
+    if (lctx.cparams.mtp) {
+        cb(cur, "result_mtp_embd", -1);
+        ggml_set_output(cur);
+    }
 
     cur = build_output(lctx, ctx0, cur, model.output, model.output_norm, cb);
     cb(cur, "result_output", -1);

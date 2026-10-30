@@ -3357,6 +3357,26 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         }
     }
 
+    // GLM-5.3 (glm-think-off): the template opens <think> in the generation prompt and never reads
+    // enable_thinking; with thinking off the engine closes the block (<think></think>) and the
+    // generation is content
+    {
+        auto tst = peg_tester("models/templates/GLM-5.3-Flash.jinja", detailed_debug);
+
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .expect_reconstruction()
+            .run();
+    }
+
     // Verify the throw path produces a readable error message, not std::out_of_range.
     // #20424 introduced effective_input = generation_prompt + input, but the throw
     // uses input.substr(result.end) where result.end is in effective_input space.

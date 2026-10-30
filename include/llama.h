@@ -206,16 +206,16 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_PXQ_UNIVERSAL = 256, // mixed PXQ2/PXQ3/PXQ4 per-tensor tier map (--pxq-universal)
         LLAMA_FTYPE_MOSTLY_PXQ6          = 257, // 5-bit quality tier: LM32 5-bit codes x E16-row scales, ~5.27 bpw (gguf tensor type id 256)
         LLAMA_FTYPE_MOSTLY_PXQ1          = 248, // sub-2-bit tier: 1-bit sign codes x E16-row scales, ~1.26 bpw (PXQ-UNIVERSAL Tier0)
-        // PXQN (PXQ-Next revision 1), decoded by the closed libggml-pxqn
-        LLAMA_FTYPE_MOSTLY_PXQN3         = 258, // PXQN, 3.25 + 16/K bpw
-        LLAMA_FTYPE_MOSTLY_PXQN3S8       = 259, // PXQN, 3.50 + 16/K bpw
-        LLAMA_FTYPE_MOSTLY_PXQN4         = 260, // PXQN, 4.25 + 16/K bpw
+        // PXQ-Next revision 1 (working name PXQN, private format; ggml types 257-259, ggml-pxqn.h)
+        LLAMA_FTYPE_MOSTLY_PXQN3         = 258, // 3-bit N3 int book x SUB16/16 x row anchor, 3.25 + 16/K bpw (gguf type 257)
+        LLAMA_FTYPE_MOSTLY_PXQN3S8       = 259, // PXQN3 with SUB16 per 8, 3.50 + 16/K bpw (gguf type 258)
+        LLAMA_FTYPE_MOSTLY_PXQN4         = 260, // 4-bit N4 int book in PXQ4's slab order, 4.25 + 16/K bpw (gguf type 259)
         LLAMA_FTYPE_MOSTLY_PXQN          = 261, // PXQN allocator mix over {N3, N3S8, N4, q8_0} at a byte budget
-        // PXQN ladder tiers
-        LLAMA_FTYPE_MOSTLY_PXQN2         = 262, // PXQN, 2.25 + 16/K bpw
-        LLAMA_FTYPE_MOSTLY_PXQN1         = 263, // PXQN, 1.25 + 16/K bpw
-        LLAMA_FTYPE_MOSTLY_PXQN4S8       = 264, // PXQN, 4.50 + 16/K bpw
-        LLAMA_FTYPE_MOSTLY_PXQN5         = 265, // PXQN, 5.25 + 16/K bpw
+        // PXQN revision-1 ladder (spec section 8; ggml types 260-263): the byte cost of each old tier
+        LLAMA_FTYPE_MOSTLY_PXQN2         = 262, // 2-bit N2 int book x SUB16/16, 2.25 + 16/K bpw (gguf type 260) vs PXQ2
+        LLAMA_FTYPE_MOSTLY_PXQN1         = 263, // 1-bit signs x SUB16/16, 1.25 + 16/K bpw (gguf type 261) vs PXQ1
+        LLAMA_FTYPE_MOSTLY_PXQN4S8       = 264, // N4 int book x SUB16/8, 4.50 + 16/K bpw (gguf type 262) vs PXQ4-HQ
+        LLAMA_FTYPE_MOSTLY_PXQN5         = 265, // 5-bit uniform x SUB16/16, 5.25 + 16/K bpw (gguf type 263) vs PXQ6
         LLAMA_FTYPE_MOSTLY_PXA4          = 266, // PXA4 subscriber flagship tier, ~5.06 bpw (gguf type 264)
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
@@ -372,6 +372,12 @@ extern "C" {
         int32_t  fit_margin;
         bool     fit;
         int32_t  worst_graph_tokens;
+        int32_t  pxa_cold_threads;   // CPU threads the expert-cache cold path will run on (the front end's -t; <= 0 = unknown):
+                                     // the Nemotron-H cold path auto choice (src/llama-pxa-cold-auto.h). An exported
+                                     // PXA_XCACHE_COLD_THREADS wins.
+        bool     pxa_all_outputs;    // the contexts of this load want every token's logits or embeddings (perplexity, KLD,
+                                     // imatrix, --embedding): PXA_STREAM_WEIGHTS=auto plans for the full logits reservation
+                                     // and the head's wide GEMM instead of the logits cap such contexts never take (bug #339)
         enum ggml_type type_k_first;
         enum ggml_type type_k_last;
         enum ggml_type type_v_first;
@@ -572,6 +578,19 @@ extern "C" {
     // Call once at the start of the program
     LLAMA_API void llama_backend_init(void);
 
+    // PXA: call right before exec()ing a fresh image of a PXA program, so the new image's lab-knob warning does not
+    // read this image's own setenv defaults as the user's (bug #324). No effect on any lever.
+    LLAMA_API void llama_pxa_mark_engine_env(void);
+    // How many times this context reused its previous compute graph (graph_reuse). Diagnostic.
+    LLAMA_API int64_t llama_pxa_n_graph_reuse(const struct llama_context * ctx);
+    // Speculative decoding: reserve the verify graph slots (widths 2..max_width, capped by the slot cache width) now,
+    // each for the largest context extent that keeps a VRAM margin free, so later prompts cannot run the card out of
+    // memory growing them. Widths that do not fit run on the main graph (same output). Returns the slots reserved.
+    // Call once after the context and any speculative companions exist, before the first request.
+    LLAMA_API int32_t llama_pxa_verify_slots_reserve(struct llama_context * ctx, int32_t max_width);
+    // PXA_GLM5NEXT_GRAPH_REUSE=1 (default off): let glm5next decode reuse its graph.
+    LLAMA_API bool llama_pxa_glm5next_graph_reuse(void);
+
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
@@ -752,10 +771,17 @@ extern "C" {
     // opposed to rejecting a parameter, which asking again would not change. A caller
     // that chose the context size itself can use this to ask for a smaller one.
     LLAMA_API bool llama_context_creation_failed_on_alloc(void);
+    // Bug #344: one line saying why the most recent llama_init_from_model refused on memory (e.g. "device 0: 99.5 MiB
+    // free after the GEMM pool, under the 128 MiB floor (PXA_POOL_FLOOR_MB)"); "" when it did not or gave no numbers.
+    // Valid until the next llama_init_from_model.
+    LLAMA_API const char * llama_context_creation_failed_detail(void);
     // PXA_AUTO_UB_FASTEST: refuse a model load whose placement would stream weights (set by the
     // common -ub walk around one load; cleared on every set), and whether the last load was so refused.
     LLAMA_API void llama_pxa_set_stream_refuse(bool on);
     LLAMA_API bool llama_pxa_load_refused_stream(void);
+    // PXA_PROFILE_KEEP_TARGET=2: the caller marks a separate-file draft model load (set true before, false after), so
+    // that load does not replace the target's PXA model profile. Inert at the default 1 (gemma4_mtp companions only).
+    LLAMA_API void llama_pxa_set_loading_draft(bool on);
 
     LLAMA_API void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_off);
 
@@ -1038,6 +1064,10 @@ extern "C" {
         LLAMA_SPEC_CKPT_PER_STEP    =  1,
         LLAMA_SPEC_CKPT_GPU_FALLBACK =  2,
         LLAMA_SPEC_CKPT_CPU         =  3,
+        // PXA_SPEC_CKPT_REPLAY: per-step semantics (llama_spec_ckpt_init resolves it to PER_STEP), but the
+        // rollback keeps ONE start state + the verify's per-token recurrence inputs and re-runs the
+        // recurrence over the accepted tokens: VRAM ~ one state plane at any draft depth, output identical.
+        LLAMA_SPEC_CKPT_REPLAY      =  4,
     };
 
     // Initialise the checkpoint system for the upcoming speculation window.
@@ -1055,6 +1085,13 @@ extern "C" {
     // when the context's fixed mode is not per-step (gpu-fallback / cpu / none). A verify batch
     // wider than this cannot be checkpointed. Used by PXA_SPEC_FIXED_WIDTH.
     LLAMA_API int llama_spec_ckpt_fixed_capacity(const struct llama_context * ctx);
+
+    // The fixed checkpoint mode chosen at speculative init (LLAMA_SPEC_CKPT_NONE before it ran).
+    LLAMA_API int llama_spec_ckpt_fixed_mode(const struct llama_context * ctx);
+
+    // PXA_MTP_FALLBACK_RELEASE: free the checkpoint buffers llama_spec_ckpt_init allocated and reset the
+    // fixed mode, for a speculative chain that failed to build after them. Returns the bytes freed.
+    LLAMA_API size_t llama_spec_ckpt_release(struct llama_context * ctx);
 
     // Save the current recurrent state as a speculative checkpoint.
     LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
@@ -1150,8 +1187,8 @@ extern "C" {
                     llama_seq_id   seq_id);
 
     // Returns the smallest position present in the KV cache for the specified sequence.
-    // This is the position of the first occupied cell, not a true minimum once
-    // cells are no longer packed in position order.
+    // Scans every cell. The lowest cell index is not that position once a ring
+    // has written a newer token into a hole below an older one.
     LLAMA_API llama_pos llama_kv_cache_seq_pos_min(
         struct llama_context * ctx,
         llama_seq_id   seq_id);
@@ -1246,6 +1283,16 @@ extern "C" {
 
     LLAMA_API bool llama_pxa_host_timing_enabled(void);
     LLAMA_API void llama_pxa_host_timing_add_sample(int64_t us);
+
+    // PXA_THREAD_PLACE (default OFF): the calling thread takes its place in the Overdrive thread plan (src/llama-pxa-thread-place.h):
+    // role "decode" = the thread that calls llama_decode (pinned to a core of the cards' node outside the cold-expert pool),
+    // role "aux" = an HTTP / helper thread (given the mask of the CPUs the pool does not use). Moves threads only; no-op with the lever off.
+    // _tick: from the decode loop, cheap; re-sweeps the CUDA driver's helper threads when the process's thread count changed.
+    // _report: once at boot, logs one line of what was placed.
+    LLAMA_API bool llama_pxa_thread_place_on(void);
+    LLAMA_API void llama_pxa_thread_place_self(const char * role);
+    LLAMA_API void llama_pxa_thread_place_tick(void);
+    LLAMA_API void llama_pxa_thread_place_report(void);
 
     // PXA_SWA_TRUNCATE_GUARD_v1: sliding-window attention size (0 on non-SWA arches).
     LLAMA_API uint32_t llama_model_n_swa(const struct llama_model * model);
@@ -1462,12 +1509,29 @@ extern "C" {
     // nodes (PXA_VERIFY_ARGMAX lever on, qwen35/qwen35moe target) and the decode is one ubatch;
     // otherwise the decode copies the logits as usual. The request is cleared by the decode.
     LLAMA_API void llama_set_argmax_only(struct llama_context * ctx, bool on);
+    // PXA_SAMPLED_TOPW: the next decode copies the head's top-W window back instead of the logits (when the graph has one);
+    // llama_get_topw_ith reads the first W (<= llama_topw_width) entries of output row i, sorted descending, lower id first on ties
+    LLAMA_API void    llama_set_topw_only(struct llama_context * ctx, bool on);
+    LLAMA_API int32_t llama_topw_width(struct llama_context * ctx);
+    // PXA_SPEC_LAZY_HIDDEN (2026-10-24): on this context a ONE-TOKEN target decode leaves its MTP hidden row on the
+    // device instead of copying it back with the logits; the first reader (llama_get_embeddings*, the MTP feature
+    // views, a state save) fetches it, and the next decode drops it unread. Off by default; the speculative layer
+    // turns it on for the selector's Gemma 4 assistant row, where most rounds are plain and never read the row.
+    LLAMA_API void    llama_set_embd_lazy(struct llama_context * ctx, bool on);
+    LLAMA_API int32_t llama_get_topw_ith(struct llama_context * ctx, int32_t i, int32_t W, llama_token * ids, float * vals);
     // true when the context's graph carries the argmax nodes (the lever is live for this context)
     LLAMA_API bool llama_argmax_available(struct llama_context * ctx);
     // After an argmax-only decode: the greedy token of output i (same indexing as
     // llama_get_logits_ith), lowest id on exact ties; -1 when the last decode was not argmax-only
     // (then the logits are there instead). p_top (optional) = softmax probability of that token.
     LLAMA_API int32_t llama_get_argmax_ith(struct llama_context * ctx, int32_t i, float * p_top);
+    // PXA (review-kernels L4): true when the LAST llama_get_argmax_ith call read a row whose maximum is not finite
+    // (all NaN / -inf, or +inf) or whose index is out of range. The logits of an argmax-only decode were not copied,
+    // so the caller cannot redraw on the host: it routes the step to its softfail handling instead.
+    LLAMA_API bool llama_get_argmax_softfailed(struct llama_context * ctx);
+    // PXA_DRAFT_ARGMAX: (second-largest logit) - (largest) of the row the last llama_get_argmax_ith read, when its graph
+    // carries the 4-float argmax rows (the qwen35 MTP draft head); NAN otherwise
+    LLAMA_API float llama_get_argmax_last_d2(struct llama_context * ctx);
 
     // PXA_MTP_FOLD (2026-09-28). Attach the MTP companion to its target so a single-sequence
     // pure-greedy verify can run the head's update pass over every verify row inside the verify graph.

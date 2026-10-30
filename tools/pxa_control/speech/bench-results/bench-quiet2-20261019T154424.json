@@ -1,0 +1,212 @@
+{
+ "box_before": {
+  "machine": "x86_64",
+  "load": [
+   28.8095703125,
+   33.92529296875,
+   38.26904296875
+  ],
+  "affinity": [
+   36,
+   37,
+   38,
+   39,
+   40,
+   41,
+   42,
+   43,
+   44,
+   45,
+   46,
+   47,
+   48,
+   49,
+   50,
+   51,
+   52,
+   53
+  ],
+  "cpu": "Intel(R) Xeon(R) CPU E5-2699 v3 @ 2.30GHz",
+  "quiet": "NOT-QUIET"
+ },
+ "vigil": {
+  "stt_s": 0.26,
+  "tts_first_s": 0.38,
+  "total_median_s": 0.87,
+  "source": "vigil README Latency 2026-10-11"
+ },
+ "runs": 10,
+ "load_and_warm_s": 22.6,
+ "info_before": {
+  "api": "pxa-speech/1",
+  "rate_in": 16000,
+  "uptime_s": 22.6,
+  "sessions": 0,
+  "load_s": {
+   "stt": 17.25,
+   "stt_warm": 0.265,
+   "tts": 3.287,
+   "tts_warm": 1.799
+  },
+  "stt": {
+   "engine": "whisper.cpp",
+   "rate": 16000,
+   "calls": 1,
+   "busy_s": 0.265,
+   "threads": 4,
+   "model": "kokoro-82m-onnx-q8",
+   "audio_ctx": "auto"
+  },
+  "tts": {
+   "engine": "kokoro",
+   "rate": 16000,
+   "voices": [
+    "am_michael",
+    "bf_emma",
+    "bm_george"
+   ],
+   "calls": 2,
+   "busy_s": 1.799,
+   "cache": {
+    "on": true,
+    "hits": 0,
+    "size": 2
+   },
+   "threads": 4,
+   "model": "kokoro-82m-onnx-q8",
+   "voice": "bm_george",
+   "providers": [
+    "CPUExecutionProvider"
+   ]
+  }
+ },
+ "stt": {
+  "median_s": 0.184,
+  "p90_s": 0.187,
+  "min_s": 0.182,
+  "n": 10,
+  "heard": "What is the weather like today?"
+ },
+ "tts_first": {
+  "median_s": 0.519,
+  "p90_s": 0.528,
+  "min_s": 0.495,
+  "n": 10
+ },
+ "tts_whole": {
+  "median_s": 2.709,
+  "p90_s": 2.789,
+  "min_s": 2.656,
+  "n": 10
+ },
+ "total": {
+  "median_s": 0.828,
+  "p90_s": 0.842,
+  "min_s": 0.779,
+  "n": 10,
+  "endpoint_median_s": 0.281,
+  "finish_median_s": 0.001,
+  "tts_median_s": 0.545,
+  "stt_reused": "10/10",
+  "heard": "What is the weather like today?",
+  "hang_ms": 300
+ },
+ "direct": {
+  "stt": {
+   "median_s": 0.183,
+   "p90_s": 0.19,
+   "min_s": 0.178,
+   "n": 10
+  },
+  "tts_first": {
+   "median_s": 0.522,
+   "p90_s": 0.559,
+   "min_s": 0.492,
+   "n": 10
+  }
+ },
+ "tts_first_cached": {
+  "median_s": 0.001,
+  "p90_s": 0.001,
+  "min_s": 0.001,
+  "n": 10
+ },
+ "info_after": {
+  "api": "pxa-speech/1",
+  "rate_in": 16000,
+  "uptime_s": 137.6,
+  "sessions": 0,
+  "load_s": {
+   "stt": 17.25,
+   "stt_warm": 0.265,
+   "tts": 3.287,
+   "tts_warm": 1.799
+  },
+  "stt": {
+   "engine": "whisper.cpp",
+   "rate": 16000,
+   "calls": 52,
+   "busy_s": 9.23,
+   "threads": 4,
+   "model": "kokoro-82m-onnx-q8",
+   "audio_ctx": "auto"
+  },
+  "tts": {
+   "engine": "kokoro",
+   "rate": 16000,
+   "voices": [
+    "am_michael",
+    "bf_emma",
+    "bm_george"
+   ],
+   "calls": 66,
+   "busy_s": 90.567,
+   "cache": {
+    "on": true,
+    "hits": 20,
+    "size": 4
+   },
+   "threads": 4,
+   "model": "kokoro-82m-onnx-q8",
+   "voice": "bm_george",
+   "providers": [
+    "CPUExecutionProvider"
+   ]
+  }
+ },
+ "box_after": {
+  "machine": "x86_64",
+  "load": [
+   31.34130859375,
+   32.3857421875,
+   37.06201171875
+  ],
+  "affinity": [
+   36,
+   37,
+   38,
+   39,
+   40,
+   41,
+   42,
+   43,
+   44,
+   45,
+   46,
+   47,
+   48,
+   49,
+   50,
+   51,
+   52,
+   53
+  ],
+  "cpu": "Intel(R) Xeon(R) CPU E5-2699 v3 @ 2.30GHz",
+  "quiet": "NOT-QUIET"
+ },
+ "vs_vigil": {
+  "stt": 0.708,
+  "tts_first": 1.366,
+  "total": 0.952
+ }
+}

@@ -13,6 +13,7 @@
 // cannot contract them into an FMA. The greedy sha of a fused arm against the unfused arm is the
 // test of this claim.
 #include "hc-fused.cuh"
+#include "pxa/pxa-hccn-pf.cuh"
 
 template <int block_size>
 static __global__ void k_hc_combine_norm(
@@ -87,6 +88,59 @@ static __global__ void k_hc_gate_mix(const char * __restrict__ x, const char * _
     dst[i] = __fmul_rn(inv_hc, acc);
 }
 
+// PXA_VFUSE bit 32 (2026-10-26): k_hc_gate_mix that also writes the q8_1 of its output for the quantized GEMVs that
+// read it (the attention / DeltaNet input projections), so they skip their quantize_q8_1 launch. The mix is k_hc_gate_mix's
+// code line for line; the q8_1 is quantize_q8_1's arithmetic on the same lanes: with n_embd % 32 == 0 and no row padding
+// (the caller checks) the warp of output i holds exactly q8_1 block i / 32, lane = element % 32.
+static __global__ void k_hc_gate_mix_q8(const char * __restrict__ x, const char * __restrict__ g, float * __restrict__ dst,
+        const int n_embd, const int n_hc, const int nt, const int64_t x_nb1, const int64_t g_nb1, const float inv_hc,
+        block_q8_1 * __restrict__ q8) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= (int64_t) n_embd*nt) {
+        return;
+    }
+    const int e = (int) (i % n_embd);
+    const int t = (int) (i / n_embd);
+    const float * xr = (const float *) (x + t*x_nb1);
+    const float * gr = (const float *) (g + t*g_nb1);
+    float acc = 0.0f;
+    for (int c = 0; c < n_hc; ++c) {
+        const float s  = 1.0f / (1.0f + expf(-gr[c*n_embd + e]));
+        const float gc = __fmul_rn(xr[c*n_embd + e], s);
+        acc = c == 0 ? gc : __fadd_rn(acc, gc);
+    }
+    const float xi = __fmul_rn(inv_hc, acc);
+    dst[i] = xi;
+
+    float amax = fabsf(xi);
+    float sum = xi;
+    amax = warp_reduce_max(amax);
+    sum = warp_reduce_sum(sum);
+    const float d = amax / 127;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int64_t ib = i / QK8_1, iqs = i % QK8_1;
+    q8[ib].qs[iqs] = q;
+    if (iqs > 0) {
+        return;
+    }
+    reinterpret_cast<half&>(q8[ib].ds.x) = d;
+    reinterpret_cast<half&>(q8[ib].ds.y) = sum;
+}
+
+bool ggml_cuda_op_hc_gate_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * g = dst->src[1];
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) return false;
+    int n_hc;
+    memcpy(&n_hc, dst->op_params, sizeof(int));
+    const int n_embd = (int) dst->ne[0], nt = (int) dst->ne[1];
+    if (n_embd % QK8_1 != 0) return false;
+    const int64_t n = (int64_t) n_embd*nt;
+    k_hc_gate_mix_q8<<<(unsigned) ((n + 255)/256), 256, 0, ctx.stream()>>>((const char *) x->data, (const char *) g->data,
+        (float *) dst->data, n_embd, n_hc, nt, x->nb[1], g->nb[1], 1.0f/(float) n_hc, (block_q8_1 *) q8);
+    return true;
+}
+
 void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * r = dst->src[0];
     const ggml_tensor * b = dst->src[1];
@@ -108,6 +162,20 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, ggml_tensor *
             g ? (const float *) g->data : nullptr, (float *) dst->data, n_embd, n_hc,
             r->nb[1], r->nb[2], b->nb[1], j->nb[0], j->nb[1], dst->nb[3], inv_hc, eps);
     }
+}
+
+bool ggml_cuda_op_hc_combine_norm_pf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * r = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * j = dst->src[2];
+    const ggml_tensor * g = dst->src[3];
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) return false;
+    const int n_embd = (int) r->ne[0], n_hc = (int) r->ne[1], nt = (int) r->ne[2];
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    return pxa_hc_combine_norm_pf_launch((const char *) r->data, (const char *) b->data, (const char *) j->data,
+        g ? (const float *) g->data : nullptr, (float *) dst->data, n_embd, n_hc, nt,
+        r->nb[1], r->nb[2], b->nb[1], j->nb[0], j->nb[1], dst->nb[3], 1.0f/(float) n_hc, eps, ctx.stream());
 }
 
 void ggml_cuda_op_hc_gate_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

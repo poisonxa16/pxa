@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "pxa-env-flag.h"
 #include "fa-route.cuh"
 #include "levers.cuh"
 
@@ -17,6 +18,7 @@
 #include "../../fattn-new-mma.cuh"
 #include "../../dsa_attn.cuh"
 #include "../fattn-volta-mma.cuh"
+#include "../volta-mma/fattn-mma-shapes.h"
 #include "../fattn-volta-tile.cuh"
 #include "../fattn-tile-v2.cuh"
 #include "../fattn-tile-big.cuh"
@@ -43,11 +45,11 @@
 
 
 static inline bool mma_better_than_turing(const int cc) {
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) > CC_TURING;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) > PXA_CC_TURING;
 }
 
 // PXQ port of parent-upstream PR #2144 (merged 2026-07-17):
-// on sm_60 (P100/CC_PASCAL) the fp16 FA vec kernel accumulates the online-softmax
+// on sm_60 (P100/PXA_CC_PASCAL) the fp16 FA vec kernel accumulates the online-softmax
 // denominator and the P.V product in fp16, flipping ~3-4% of decode top-1 tokens vs an
 // all-fp32 reference. P100 decode is memory-bandwidth-bound, so routing decode
 // (batch <= 8) to the fp32 vec kernel is measured-free upstream (tg128 96.79 vs 96.61
@@ -59,7 +61,7 @@ static bool pxq_sm60_fa_vec_f32_enabled() {
 }
 
 static inline bool pxq_use_sm60_vec_f32(const int cc, const ggml_tensor * Q) {
-    return cc == CC_PASCAL && Q->ne[1] <= 8 && pxq_sm60_fa_vec_f32_enabled();
+    return cc == PXA_CC_PASCAL && Q->ne[1] <= 8 && pxq_sm60_fa_vec_f32_enabled();
 }
 
 // PXA_FA_TILE256 (2026-08-03): on pre-Volta cards the D=256 head had NO tile/mma prefill kernel,
@@ -168,6 +170,13 @@ static int pxa_fa_d512_volta_mode() {
 
 // True when SOME 512/512 route is both armed and structurally able to serve this node. The
 // dispatcher and the support query must agree on this, so both ask exactly this question.
+// PXA_FA_D512_QPF (2026-10-17, default ON): a marked 512/512 node WIDER than 8 query columns (a
+// prefill ubatch; the builder marks one only for a quantized cache, see src/llama-build-context.cpp) goes to the
+// MMA kernel under the default tile mode too -- the tile kernel is the decode schedule. =0: mode 2 is tile only.
+static bool pxa_fa_d512_pf_mma(const ggml_tensor * dst, int cc) {
+    static const bool on = [](){ const char * e = getenv("PXA_FA_D512_QPF"); return !(e && *e && pxa_env_value_off(e)); }();
+    return on && dst->src[0] && dst->src[0]->ne[1] > 8 && ggml_cuda_fattn_volta_mma_d512_supported(dst, cc);
+}
 static bool pxa_fa_d512_volta_takes(const ggml_tensor * dst, int cc) {
     // The one door: only a node the graph builder marked (after its width cut, context floor,
     // every-card probe, architecture and offload checks) is served. An unmarked 512/512 node -
@@ -177,7 +186,7 @@ static bool pxa_fa_d512_volta_takes(const ggml_tensor * dst, int cc) {
     }
     switch (pxa_fa_d512_volta_mode()) {
         case 1:  return ggml_cuda_fattn_volta_mma_d512_supported(dst, cc);
-        case 2:  return ggml_cuda_fattn_volta_tile_d512_supported(dst, cc);
+        case 2:  return pxa_fa_d512_pf_mma(dst, cc) || ggml_cuda_fattn_volta_tile_d512_supported(dst, cc);
         default: return false;
     }
 }
@@ -249,7 +258,7 @@ static bool pxa_fa_mma_volta_take(const ggml_tensor * Q) {
     // 2026-09-20: =2 is DISABLED. The decode-width instances of this kernel are stubs on sm_70 (only the
     // large-batch column counts are built), so lifting the gate faults the card with an unspecified
     // launch failure at widths 1, 2 and 4. The value is accepted and treated as =1, loudly.
-    const bool take = Q->ne[1] > 8;
+    const bool take = pxa_fattn_mma_shapes::volta_takes_width((int) Q->ne[1]);
     if (take) {
         static std::atomic<bool> told{false};
         if (!told.exchange(true)) {
@@ -508,7 +517,7 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
     // The two texts differed here and the difference is PRESERVED: the dispatcher also asked
     // fast_fp16_available(cc) before choosing the f16 vec kernel, the support query did not.
     // Unreachable in this build (no HIP target), kept so the move changes nothing.
-    if (cc >= CC_OFFSET_AMD) {
+    if (cc >= PXA_CC_OFFSET_AMD) {
         const bool f16_route = precision == GGML_PREC_DEFAULT && fast_fp16_available(cc);
         const bool supported = precision == GGML_PREC_DEFAULT
                              ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
@@ -528,7 +537,7 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
     // claims it, and llm_build_kqv() builds the unfused chain instead. The predicate is fenced by
     // the graph builder's mark in op_params[5] -- see pxa_fa_d512_volta_takes().
     if (pxa_fa_d512_volta_takes(dst, cc)) {
-        const bool mma = pxa_fa_d512_volta_mode() == 1;
+        const bool mma = pxa_fa_d512_volta_mode() == 1 || pxa_fa_d512_pf_mma(dst, cc);
         return pxa_fa_take(mma ? PXA_FA_ROUTE_D512_MMA : PXA_FA_ROUTE_D512_TILE, true, "PXA_FA_D512_VOLTA");
     }
 
@@ -669,12 +678,15 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
     // ---- Turing and newer --------------------------------------------------------------------
     // Two decode shortcuts the dispatcher has and the support query never had; they are
     // substitutions for the rows below, which is where the support answer keeps coming from.
+    // PXA: a shortcut node the kernel does not serve (no mask, ALiBi) is left to those rows
+    // instead of reaching GGML_ASSERT(use_gqa_opt) -- see ggml_cuda_fattn_new_mma_serves().
     if (dispatch && new_mma_available(cc) && K->ne[0] == 128 && V->ne[0] == 128 && Q->ne[0] == 128 && Q->ne[1] == 1 &&
-            (Q->ne[2] / K->ne[2] == 12 || Q->ne[2] / K->ne[2] == 6 || Q->ne[2] / K->ne[2] == 10)) {
+            (Q->ne[2] / K->ne[2] == 12 || Q->ne[2] / K->ne[2] == 6 || Q->ne[2] / K->ne[2] == 10) &&
+            ggml_cuda_fattn_new_mma_serves(dst)) {
         return pxa_fa_take(PXA_FA_ROUTE_MMA_NEW, true, "new mma, D=128 decode");
     }
     if (dispatch && new_mma_available(cc) && K->ne[0] == 256 && V->ne[0] == 256 && Q->ne[0] == 256 && Q->ne[1] == 1 &&
-            Q->ne[2] / K->ne[2] == 6) {
+            Q->ne[2] / K->ne[2] == 6 && ggml_cuda_fattn_new_mma_serves(dst)) {
         return pxa_fa_take(PXA_FA_ROUTE_MMA_NEW, true, "new mma, D=256 decode");
     }
 
@@ -689,12 +701,34 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
     static const bool pxa_fa_vec_ny = [](){
         const char * e = getenv("PXA_FA_VEC_NY");
         const bool v = e && atoi(e) != 0;
-        if (v) fprintf(stderr, "PXA_FA_VEC_NY: armed (2..4-column FA -> one-column f32 vector kernel)\n");
+        if (v) fprintf(stderr, "PXA_FA_VEC_NY: armed (2..8-column FA -> one-column f32 vector kernel)\n");
         return v;
     }();
-    const bool pxa_vec_ny_ok = pxa_fa_vec_ny && Q->ne[1] >= 2 && Q->ne[1] <= 4 && !new_mma_available(cc);
+    // 2026-10-16: the window is 2..8 (was 2..4): an n_max 4 chain verifies 5 columns. Because the f32 vector
+    // kernel runs one column per block with a compile-time KV split on NVIDIA, every column is the bs1 computation at any
+    // width, so armed, the verify forward is bitwise the one-token forwards (pxa-bi-probe, 27B PXQN4, K = 2..4: logits
+    // 382/382 and the memory state 138/138 bitwise, below the PXA_FA_D256_VOLTA_TILE KV floor).
+    const bool pxa_vec_ny_ok = pxa_fa_vec_ny && Q->ne[1] >= 2 && Q->ne[1] <= 8 && !new_mma_available(cc);
     if ((Q->ne[1] == 1 || pxa_vec_ny_ok) && can_use_vector_kernel && !mma_faster_for_bs1 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
         return pxa_fa_take(PXA_FA_ROUTE_VEC_F32, ggml_cuda_fattn_vec_f32_is_supported(ctx, dst), Q->ne[1] == 1 ? "bs1 vector kernel" : "PXA_FA_VEC_NY");
+    }
+
+    // PXA (2026-10-21): a node of the new-mma family below that the kernel does not serve is
+    // DECLINED. Both texts used to answer by head size and GQA ratio alone, so a 512/512 node with no mask or
+    // with ALiBi was accepted and then aborted in ggml_cuda_flash_attn_ext_mma_new() (GGML_ASSERT(use_gqa_opt),
+    // RTX 3080 Ti sm_86, test-fa-tile-big-dev), and a 320/256 node at GQA 4/8/12 reached
+    // GGML_ASSERT(gqa_ratio % 16 == 0). Each side keeps its own family text (below), so a node outside it
+    // routes exactly as before; every node the kernel ran before passes ggml_cuda_fattn_new_mma_serves() and
+    // keeps its route.
+    if (new_mma_available(cc) &&
+            (dispatch ? ((K->ne[0] == 576 && V->ne[0] == 512) ||
+                         (K->ne[0] == 320 && V->ne[0] == 256) ||
+                         (K->ne[0] == 512 && V->ne[0] == 512) ||
+                         (K->ne[0] == 192 && V->ne[0] == 128 && mma_better_than_turing(cc)))
+                      : (Q->ne[0] == 576 || Q->ne[0] == 320 || Q->ne[0] == 512 ||
+                         (K->ne[0] == 192 && V->ne[0] == 128 && mma_better_than_turing(cc)))) &&
+            !ggml_cuda_fattn_new_mma_serves(dst)) {
+        return pxa_fa_take(PXA_FA_ROUTE_NONE, false, "new mma family, a shape the kernel does not serve");
     }
 
     // The 576/512, 320/256, 512/512 and 192/128 family. The two texts phrase the SAME family
@@ -707,7 +741,9 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
                  (K->ne[0] == 320 && V->ne[0] == 256) ||
                  (K->ne[0] == 512 && V->ne[0] == 512) ||
                  (K->ne[0] == 192 && V->ne[0] == 128 && mma_better_than_turing(cc)))) {
-            return pxa_fa_take(PXA_FA_ROUTE_MMA_NEW, true, "new mma, large head");
+            // PXA: false only where the family's narrowest tile overflows the card's shared
+            // memory (512/512 on sm_75); the support query below says the same, so this is never dispatched.
+            return pxa_fa_take(PXA_FA_ROUTE_MMA_NEW, ggml_cuda_fattn_new_mma_fits(ctx.device, dst), "new mma, large head");
         }
     } else {
         if (new_mma_available(cc) &&
@@ -715,7 +751,10 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
                  (K->ne[0] == 192 && V->ne[0] == 128 && mma_better_than_turing(cc)))) {
             if (Q->ne[0] == 576 || Q->ne[0] == 512 || Q->ne[0] == 320) {
                 const int gqa_ratio = Q->ne[2]/K->ne[2];
-                return pxa_fa_take(PXA_FA_ROUTE_MMA_NEW, (gqa_ratio % 4) == 0, "new mma, large head");
+                // PXA: and a tile of the family must fit the card's per-block shared memory
+                // (512/512 on sm_75 does not: declined, the graph keeps the unfused chain instead of aborting).
+                return pxa_fa_take(PXA_FA_ROUTE_MMA_NEW, (gqa_ratio % 4) == 0 && ggml_cuda_fattn_new_mma_fits(ctx.device, dst),
+                                   "new mma, large head");
             }
             return pxa_fa_take(PXA_FA_ROUTE_MMA_NEW, true, "new mma, large head");
         }

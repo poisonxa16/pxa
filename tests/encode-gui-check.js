@@ -463,7 +463,8 @@ async function runChecks() {
   for (const [mode, needle] of [['bad_signature', 'signature'], ['bad_checksum', 'damaged'], ['revoked', 'revoked'], ['noquota', 'no encodes left'], ['server_error', 'having trouble'], ['invalid_key', 'does not recognise'], ['wrong_platform', 'does not match'], ['bad_manifest_file', 'does not match its checksum'], ['link_expired', 'expired']]) {
     await ctl('licence_mode?m=' + mode);
     await api('/api/encode/get', {edition: 'pro'});
-    await page.waitForFunction(() => { const e = document.querySelector('#en-pkgmsg'); return !!e && /refused|damaged|revoked|no encodes|trouble|signature/.test(e.innerText); }, {timeout: T}).catch(() => {});
+    // wait for THIS ask to finish (the previous mode's refusal is still on the page, so its text alone proves nothing)
+    await waitUntil(async () => { const s = JSON.parse((await api('/api/encode/state')).body); return s.pkg && !s.pkg.running; }, T);
     await page.reload();
     await page.waitForSelector('#en-edition', {timeout: T});
     const m = await api('/api/encode/state');
@@ -556,12 +557,14 @@ async function runChecks() {
   LIB = Object.assign(base(), {error: {code: 'refused', message: 'no'}});
   await page.click('#en-libcheck');
   check(await waitAny(['#en-liberr'], T), 'a refused key stays a red error');
+  await waitUntil(async () => /refused/i.test(await text('#en-liberr')), T);   // the row may still hold the previous answer
   check(/refused/i.test(await text('#en-liberr')), 'the refusal says why: ' + (await text('#en-liberr')).slice(0, 90));
   check((await count('#en-libinfo')) === 0, 'and the neutral hint is gone');
 
   LIB = Object.assign(base(), {error: {code: 'not_valued', message: 'Valued Supporters only.'}, beta: false});
   await page.click('#en-libcheck');
   check(await waitAny(['#en-liberr'], T), 'a refusal is a sentence in the row, not a dead button');
+  await waitUntil(async () => /Valued Supporter/.test(await text('#en-liberr')), T);
   check(/Valued Supporter/.test(await text('#en-liberr')), 'the refusal says why: ' + (await text('#en-liberr')).slice(0, 90));
   check(!(await page.locator('#en-libbeta').isVisible()), 'and a channel this key may not have is not offered at all');
 

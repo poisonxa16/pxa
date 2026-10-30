@@ -27,3 +27,8 @@ void ggml_cuda_op_fused_rms_rms_add(ggml_backend_cuda_context & ctx, ggml_tensor
 // G2-F3 NORMFUSE: fused rms-norm emitting a q8_1 sidecar of its own output (bit-identical to
 // norm-then-quantize_q8_1). Returns false if the shape is outside the bit-exact envelope.
 bool ggml_cuda_op_fused_rms_norm_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * q8, int64_t ncols_padded);
+
+// PXA_NORM_ADD_SCALE: FUSED_RMS_NORM(norm) -> ADD(resid) [-> MUL(one-element scale)] in one kernel, written to out
+// (bit-identical to the three kernels, see norm.cu). false = outside the envelope, nothing launched.
+bool ggml_cuda_op_fused_rms_norm_add_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
+        const ggml_tensor * resid, const ggml_tensor * scale, ggml_tensor * out);

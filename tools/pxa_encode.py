@@ -148,14 +148,36 @@ def _dev(p):
         return None
 
 
+_WINDOWS = os.name == "nt"
+# signals Windows lacks: SIGKILL (its SIGTERM is already a hard kill), SIGSTOP / SIGCONT (no pause there: the job flag only)
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+_SIGSTOP = getattr(signal, "SIGSTOP", None)
+_SIGCONT = getattr(signal, "SIGCONT", None)
+
+
 def _pid_alive(pid):
     if not pid:
         return False
+    if _WINDOWS:                    # os.kill(pid, 0) there sends CTRL_C_EVENT: ask kernel32 through Control's own check
+        try:
+            from pxa_control import core
+            return bool(core.pid_alive(int(pid)))
+        except Exception:           # noqa: BLE001 - cannot tell: never signal what cannot be confirmed
+            return False
     try:
         os.kill(int(pid), 0)
         return True
     except (OSError, ValueError):
         return False
+
+
+def _group_signal(pid, sig):
+    """Signal pid's process group. Windows has no os.killpg / os.getpgid: raises OSError there and the caller stops the process itself."""
+    if sig is None:
+        return
+    if not (hasattr(os, "killpg") and hasattr(os, "getpgid")):
+        raise OSError("no process groups on this platform")
+    os.killpg(os.getpgid(int(pid)), sig)
 
 
 def _sha256_file(path, progress=None, cancelled=None):
@@ -197,6 +219,7 @@ class EncodeService(object):
         self.jobs = {}
         self.rt = {}
         self._found = (0.0, [])
+        self._cfg_gen = 0                   # bumped by every cfg_set: a rescan that began before it must not overwrite the cache (see encoders)
         self._insp = {}
         self.pkg = {"running": False, "phase": "idle", "pct": 0.0, "message": "", "error": None, "edition": None}
         self.rtpkg = {"running": False, "phase": "idle", "pct": 0.0, "message": "", "error": None}      # the GPU runtime download (cuBLAS / cuSOLVER)
@@ -223,6 +246,8 @@ class EncodeService(object):
                     e[k] = v
             c["encode"] = e
         self.host.cfg_update(fn)
+        with self.lock:
+            self._cfg_gen += 1
 
     def _key(self):
         k = self.cfg().get("licence_key") or ""
@@ -249,6 +274,7 @@ class EncodeService(object):
         t, found = self._found
         if found and not force and time.time() - t < 30:
             return found
+        gen = self._cfg_gen
         c = self.cfg()
         configured = [c.get("preferred")] + list(c.get("extra") or [])
         found = AD.discover([x for x in configured if x], self.host.engine_dirs(), env=self._probe_env())
@@ -259,7 +285,11 @@ class EncodeService(object):
             seen = self._lic_seen.get(f["path"])
             if f.get("ok") and f.get("licence") and seen and time.time() - seen[0] < 900 and not f["licence"].get("checked"):
                 f["licence"] = seen[1]      # a rescan asks the encoder offline: keep what the licence server said a few minutes ago
-        self._found = (time.time(), found)
+        with self.lock:
+            # a scan that began before a config change (preferred encoder, key, extra) holds a stale pick: it answers its own caller
+            # but never replaces the newer scan's cache (a slow poll's rescan finishing last made a fresh Pro install read as Free)
+            if gen == self._cfg_gen:
+                self._found = (time.time(), found)
         return found
 
     def _probe_env(self):
@@ -290,7 +320,8 @@ class EncodeService(object):
             if rc == 0 and isinstance(o, dict):
                 al = o.get("allowed_tiers")
                 out = {"tier": str(o.get("tier") or "")[:30], "allowed": {AD.norm_tier(t) for t in al if isinstance(t, str)} if isinstance(al, list) and al else None,
-                       "remaining": o.get("remaining"), "unlimited": bool(o.get("unlimited")), "lock": AD.lock_policy(o.get("lock"))}
+                       "remaining": o.get("remaining"), "unlimited": bool(o.get("unlimited")), "lock": AD.lock_policy(o.get("lock")),
+                       "coins": AD.coins_view(o)}
         except ValueError:
             out = None
         self._kstat = (time.time(), out, sel["path"])
@@ -433,6 +464,7 @@ class EncodeService(object):
         sel["licence"] = r.get("licence")
         if r.get("licence") and r["licence"].get("checked"):
             self._lic_seen[sel["path"]] = (time.time(), r["licence"])
+        self.key_status()                  # what an encode takes in coins (the page shows it from the cached answer)
         return self.state()
 
     def cancel_get(self):
@@ -589,9 +621,16 @@ class EncodeService(object):
                 "licence_server": PK.licence_url(c).split("://", 1)[-1], "pkg": pkg, "update": self._update_view(upd) if upd else {"available": []},
                 "defaults": {"work_dir": self.default_work(), "out_dir": self.default_out()}, "runtime": self.runtime_view(sel),
                 "catalog": [{"key": t["key"], "name": t["name"], "family": t["family"], "bpw": t["bpw"], "cls": t["cls"]} for t in PL.TIERS],
-                "hf_token": bool(PL.hf_token()), "jobs": self.job_list(), "how_to_get_pro": {
+                "hf_token": bool(PL.hf_token()), "jobs": self.job_list(), "coins": self._coins_cached(sel), "how_to_get_pro": {
                     "kofi": "https://ko-fi.com/shatteredrealms1", "discord": "https://discord.pxanetwork.com",
                     "text": "Pro is a supporter feature: support PXA on Ko-fi, then use /encoder in the PXA Network Discord to get your key."}}
+
+    def _coins_cached(self, sel):
+        """the coin block of the last key status for the selected encoder (no network: the state never waits on the licence server)"""
+        hit = self._kstat
+        if not sel or sel.get("edition") != "pro" or not self._key() or not hit or not hit[1] or hit[2] != sel["path"]:
+            return None
+        return hit[1].get("coins")
 
     @staticmethod
     def _enc_view(f):
@@ -946,6 +985,27 @@ class EncodeService(object):
                 "dump_cards": [c["index"] for c in local if c["index"] in (body.get("cards") or [c["index"]])] or [c["index"] for c in local],
                 "licence_ack": bool(body.get("licence_ack")), "targets": body.get("cards")}
 
+    def _coin_check(self, add, lic, st, left):
+        """the licence line of a key that pays coins (the licence server's key status has coins_per_encode): what an encode takes and
+        whether the wallet covers it. -> True when it added the line. An older server (no coin block) leaves the quota lines as they were.
+        The server's `remaining` already counts what the coins cover (free encodes left + free coins // cost)."""
+        ks = self.key_status()
+        coins = ks.get("coins") if ks else None
+        if not coins or lic.get("unlimited") or st == "offline":
+            return False
+        sent = AD.coins_sentence(coins["cost"])
+        can = isinstance(ks.get("remaining"), int) and ks["remaining"] > 0
+        if can:
+            add("licence", "Licence key", "ok", "Key accepted%s. %s%s" % (" for %s" % lic["user"] if lic.get("user") else "", sent,
+                (" Your wallet has %d coins free." % max(0, coins["free"])) if coins["free"] is not None else ""))
+        elif coins["free"] is None:
+            add("licence", "Licence key", "bad", "This licence key is not linked to a PXA wallet. " + sent,
+                "Link it in PXA Control (Store), or link your Discord account to your wallet with /wallet link in the PXA Network Discord.")
+        else:
+            add("licence", "Licence key", "bad", "Your wallet has %d coins free: not enough coins (%d per completed PXQN encode). %s" % (
+                max(0, coins["free"]), coins["cost"], sent), "Donations bring coins: top up in the Store (PXA Control > Store).")
+        return True
+
     def checks(self, body, fresh=True):
         if fresh:
             self._kstat = None                      # the licence server's lock switch can change at any time: ask again at every check
@@ -993,6 +1053,8 @@ class EncodeService(object):
                 elif st in ("no_key", "no_server"):
                     add("licence", "Licence key", "bad", "The encoder does not have your key." if st == "no_key" else "The encoder does not know the licence server.",
                         "Paste your key in Get the encoder.")
+                elif self._coin_check(add, lic, st, left):
+                    pass
                 elif (left == 0 and not lic.get("unlimited")) or st == "no_quota":
                     add("licence", "Licence key", "bad", "You have no encodes left this month.", "Quota resets monthly; the Free encoder still works.")
                 elif st == "offline":
@@ -1207,10 +1269,14 @@ class EncodeService(object):
                 rt.cancel.set()
             if kill and p is not None and p.poll() is None:
                 try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGCONT)
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    _group_signal(p.pid, _SIGCONT)
+                    _group_signal(p.pid, _SIGKILL)
                 except OSError:
-                    pass
+                    if not hasattr(os, "killpg"):       # Windows: terminate the process itself (a hard kill there)
+                        try:
+                            p.send_signal(signal.SIGTERM)
+                        except (OSError, ValueError):
+                            pass
 
     def recover(self):
         """Load every job on disk. One that was running when Control (or the machine) went away is `interrupted` and can be resumed."""
@@ -1382,7 +1448,7 @@ class EncodeService(object):
         j["status"] = "paused"
         p = rt.proc
         if p and p.poll() is None:
-            self._signal(p, signal.SIGSTOP)
+            self._signal(p, _SIGSTOP)
         self._save(j)
         return self.job_view(jid)
 
@@ -1393,7 +1459,7 @@ class EncodeService(object):
             j["status"] = "running"
             p = rt.proc
             if p and p.poll() is None:
-                self._signal(p, signal.SIGCONT)
+                self._signal(p, _SIGCONT)
             self._save(j)
             return self.job_view(jid)
         if j["status"] in ("interrupted", "failed", "cancelled"):
@@ -1420,14 +1486,14 @@ class EncodeService(object):
         p = rt.proc
         if p and p.poll() is None:
             if rt.paused:
-                self._signal(p, signal.SIGCONT)
+                self._signal(p, _SIGCONT)
             self._signal(p, signal.SIGINT)
             threading.Thread(target=self._escalate, args=(p,), daemon=True).start()
         rt.paused = False
         return {"ok": True}
 
     def _escalate(self, p):
-        for sig, wait in ((signal.SIGTERM, 6), (signal.SIGKILL, 0)):
+        for sig, wait in ((signal.SIGTERM, 6), (_SIGKILL, 0)):
             t0 = time.time()
             while time.time() - t0 < (6 if sig == signal.SIGTERM else 0.1):
                 if p.poll() is not None:
@@ -1464,14 +1530,16 @@ class EncodeService(object):
         return out
 
     def _signal(self, p, sig):
+        if sig is None:                                         # a signal this platform lacks (Windows: SIGSTOP / SIGCONT)
+            return
         try:
-            os.killpg(os.getpgid(p.pid), sig)
+            _group_signal(p.pid, sig)
         except (OSError, ProcessLookupError):
-            try:
-                p.send_signal(sig)
-            except OSError:
+            try:                                                # no group (Windows): Popen takes SIGTERM only, = TerminateProcess
+                p.send_signal(sig if hasattr(os, "killpg") else signal.SIGTERM)
+            except (OSError, ValueError):
                 pass
-        if sig in (signal.SIGSTOP, signal.SIGCONT):             # pause / resume must reach the whole tree, not only the command that started it
+        if sig is not None and sig in (_SIGSTOP, _SIGCONT):             # pause / resume must reach the whole tree, not only the command that started it
             for c in self._descendants(p.pid):
                 try:
                     os.kill(c, sig)
@@ -1482,8 +1550,13 @@ class EncodeService(object):
         pid = j.get("pid")
         if pid and _pid_alive(pid):
             try:
-                os.killpg(os.getpgid(int(pid)), signal.SIGCONT)
-                os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+                try:
+                    _group_signal(pid, _SIGCONT)
+                    _group_signal(pid, signal.SIGTERM)
+                except OSError:
+                    if hasattr(os, "killpg"):
+                        raise
+                    os.kill(int(pid), signal.SIGTERM)           # Windows: TerminateProcess
                 for c in self._descendants(pid):               # a paused job's workers (own sessions) are stopped: they get the TERM too, then are woken to act on it
                     for sg in (signal.SIGTERM, signal.SIGCONT):
                         try:
@@ -1494,7 +1567,12 @@ class EncodeService(object):
                 while _pid_alive(pid) and time.time() - t0 < 6:
                     time.sleep(0.2)
                 if _pid_alive(pid):
-                    os.killpg(os.getpgid(int(pid)), signal.SIGKILL)
+                    try:
+                        _group_signal(pid, _SIGKILL)
+                    except OSError:
+                        if hasattr(os, "killpg"):
+                            raise
+                        os.kill(int(pid), signal.SIGTERM)
             except OSError:
                 pass
         j["pid"] = None
@@ -1610,7 +1688,7 @@ class EncodeService(object):
         j["pid"] = p.pid
         self._save(j)
         if rt.paused:
-            self._signal(p, signal.SIGSTOP)
+            self._signal(p, _SIGSTOP)
         tail = collections.deque(maxlen=80)
         try:
             for line in p.stdout:

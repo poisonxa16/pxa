@@ -3,6 +3,7 @@
 #include "llama-pxa-place.h"
 #include "ggml.h"
 #include "ggml-pxqn-api.h"   // ggml_pxqn_cpu_mmv_available
+#include "pxa-env-flag.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -142,6 +143,13 @@ bool pxa_type_cpu_fast(int t) {
 // fixed cost is the submit / wait kernels and the worker's op chain (~8 CPU ops with a thread barrier each). A first estimate, to be replaced by the
 // measured value (PXA_XCACHE_COST_LAYER_US overrides it).
 #define PXA_XC_PXQN_CPU_LAYER_US_V2_ASYNC 250.0
+// C042 small tail (one sm_70 card, CPU cold path, deficit <= free/2) on the async CPU-pool cold path (2026-10-19):
+// 35B-A3B PXQN4 on one V100 (card 4, -t 8, pool pinned on node 1, box NOT quiet), greedy512 prose/code/chat t/s by forced L
+// (PXA_XCACHE_LAYERS): split path L9 (the 1300 us price) 66.9/67.3/67.8 vs v3.1 60.5/64.7/62.5; async L16 77.7/78.0/74.7 vs v3.1
+// 59.2/57.4/59.3; async sweep at load ~90: L12 72.1/68.8/69.0, L16 73.3/74.5/67.3, L20 75.9/66.5/68.7, L24 75.7/70.0/72.0, L30
+// 66.6/64.2/61.2 -> a plateau L16-L24 where one more cold layer costs about what the miss it saves does (268 us/% x ~0.27%/layer
+// = ~70-100 us). The async summary at L16 agrees: CPU sub-graph 275 us, GPU wait 184 us per cold layer-step. 100 us -> L17.
+#define PXA_XC_SMALLTAIL_ASYNC_LAYER_US 100.0
 
 double pxa_xc_width_factor(double width) {
     if (!(width > 1.0)) return 1.0;
@@ -180,6 +188,19 @@ pxa_xc_cost pxa_xc_cost_for(int cc, bool zc, int n_used, const std::vector<size_
     return c;
 }
 
+// C042 small-tail scope (2026-10-18): one sm_70 card, CPU cold path, deficit <= half the free VRAM.
+// There the ring (wide graphs only) needs one layer, and an auto slack credit is safe (measured: 35B-A3B PXQN4 on one V100).
+// PXA_XCACHE_SMALLTAIL_SM60 (2026-10-23; default 0 = sm_70 only): =1 admits one sm_60 card to the same scope (one-layer
+// ring + the auto slack credit). Generic code stays closed on P100; the registry arms it only where it was measured (PXA_AUTO_FLINT_1CARD).
+static bool pxa_xc_small_tail_sm60() {
+    const char * e = getenv("PXA_XCACHE_SMALLTAIL_SM60");
+    return pxa_env_value_flag(e, 0);
+}
+
+bool pxa_xc_small_tail(size_t n_dev, int cc, bool cold_zc, size_t deficit, size_t free_bytes) {
+    return n_dev == 1 && (cc == 70 || (cc == 60 && pxa_xc_small_tail_sm60())) && !cold_zc && deficit > 0 && 2*deficit <= free_bytes;
+}
+
 // R4 (default): confine the cold experts to the L least-hot layers. Every layer that holds a cold
 // expert pays the cold-path latency per token (a CPU dispatch or a zero-copy read + the merge), so
 // spreading a 2-5% miss over all layers costs more than whole-layer placement. For each per-layer
@@ -197,7 +218,9 @@ pxa_xc_cost pxa_xc_cost_for(int cc, bool zc, int n_used, const std::vector<size_
 // PXA_XCACHE_LAYERS=N forces L = N (sweeps; the smallest feasible L >= N if N is not feasible).
 bool pxa_xc_choose(const std::vector<int> & layers, const std::vector<size_t> & expert_bytes,
         const std::vector<size_t> & max_tensor_bytes, const std::vector<std::vector<double>> & counts,
-        int n_expert, size_t target, pxa_xc_choice & out, const pxa_xc_cost & cost) {
+        int n_expert, size_t target, pxa_xc_choice & out, const pxa_xc_cost & cost, int ring_layers) {
+    const bool ring_lent = ring_layers < 0;   // R3a: reported, not charged (the backend allocates it on demand)
+    ring_layers = ring_layers == 1 || ring_layers == -1 ? 1 : 2;
     if (const char * pl = getenv("PXA_XCACHE_PLANNER")) {
         if (strcmp(pl, "r3") == 0 || strcmp(pl, "r3x") == 0) {
             return pxa_xc_choose_r3x(layers, expert_bytes, max_tensor_bytes, counts, n_expert, target, out);
@@ -237,15 +260,21 @@ bool pxa_xc_choose(const std::vector<int> & layers, const std::vector<size_t> & 
     items.reserve((size_t)nl*n_expert);
     double total = 0;
     // per layer: counts ascending, prefix sums = mass of the bottom-k experts
+    // A layer's expert count is its counts row's size (n_expert = the widest layer): Nemotron 3.5 Bolt has 240 or 304 experts per
+    // layer under an expert_count of 496. At least one expert of every layer stays hot: a layer's cap is min(cap, n_l - 1). With
+    // every layer at n_expert (all other models) that is cap itself, so the plan is the one this function always made.
     std::vector<std::vector<double>> pre(nl);
+    std::vector<int> ne_l(nl);
     for (int l = 0; l < nl; ++l) {
-        if ((int)counts[l].size() != n_expert) return false;
+        const int n_l = (int)counts[l].size();
+        if (n_l <= 1 || n_l > n_expert) return false;
+        ne_l[l] = n_l;
         std::vector<double> c = counts[l];
         if (lw[l] != 1.0) for (auto & v : c) v *= lw[l];
         std::sort(c.begin(), c.end());
-        pre[l].assign(n_expert + 1, 0.0);
-        for (int e = 0; e < n_expert; ++e) pre[l][e + 1] = pre[l][e] + c[e];
-        for (int e = 0; e < n_expert; ++e) { items.push_back({counts[l][e]*lw[l], l, e, counts[l][e]}); total += counts[l][e]; }
+        pre[l].assign(n_l + 1, 0.0);
+        for (int e = 0; e < n_l; ++e) pre[l][e + 1] = pre[l][e] + c[e];
+        for (int e = 0; e < n_l; ++e) { items.push_back({counts[l][e]*lw[l], l, e, counts[l][e]}); total += counts[l][e]; }
     }
     std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
         if (a.c != b.c) return a.c < b.c;
@@ -259,7 +288,8 @@ bool pxa_xc_choose(const std::vector<int> & layers, const std::vector<size_t> & 
         r.resize(nl);
         for (int l = 0; l < nl; ++l) r[l] = l;
         std::sort(r.begin(), r.end(), [&](int a, int b) {
-            if (pre[a][cap] != pre[b][cap]) return pre[a][cap] < pre[b][cap];
+            const double ma = pre[a][std::min(cap, ne_l[a] - 1)], mb = pre[b][std::min(cap, ne_l[b] - 1)];
+            if (ma != mb) return ma < mb;
             return a < b;
         });
     }
@@ -277,15 +307,16 @@ bool pxa_xc_choose(const std::vector<int> & layers, const std::vector<size_t> & 
         std::fill(cnt.begin(), cnt.end(), 0);
         size_t bytes = 0, max_l = 0, max_t = 0; double miss = 0;
         for (const auto & it : items) {
-            if (!allow[it.l] || cnt[it.l] >= cap) continue;
+            if (!allow[it.l] || cnt[it.l] >= std::min(cap, ne_l[it.l] - 1)) continue;
             ++cnt[it.l];
             bytes += expert_bytes[it.l];
             miss  += it.raw;
             max_l = std::max(max_l, (size_t)cnt[it.l]*expert_bytes[it.l]);
             max_t = std::max(max_t, (size_t)cnt[it.l]*max_tensor_bytes[it.l]);
             if (cold) (*cold)[it.l].push_back(it.e);
-            const size_t ring = 2*max_l + max_t + 32*MiB;
-            if (bytes > ring && bytes - ring >= target) { bytes_o = bytes; ring_o = ring; miss_o = miss; return true; }
+            const size_t ring = (size_t)ring_layers*max_l + max_t + 32*MiB;
+            const size_t ring_charge = ring_lent ? 0 : ring;
+            if (bytes > ring_charge && bytes - ring_charge >= target) { bytes_o = bytes; ring_o = ring; miss_o = miss; return true; }
         }
         return false;
     };
@@ -339,9 +370,12 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
     bool any_expert_stream = false, any_dense_stream = false;
     for (size_t d = 0; d < nd; ++d) {
         const auto & dev = in.devices[d];
-        // the same test the context applies after the pool pre-grow (bug #266): the floor must stay free
-        const size_t fit_need = dev.need_resident + dev.pool_need + in.floor_bytes;
-        char buf[512];
+        // the same test the context applies after the pool pre-grow (bug #266): the floor must stay free.
+        // bug #339: an all-outputs context reserves the full logits (ctx_logits: what the cap would have saved)
+        const size_t ctx_l = in.ctx_guard ? dev.ctx_logits : 0;
+        const size_t ctx_h = in.ctx_guard ? dev.ctx_head : 0;
+        const size_t fit_need = dev.need_resident + dev.pool_need + in.floor_bytes + ctx_l;
+        char buf[768];
         if (fit_need <= dev.free_bytes && in.spill_extra == 0) {
             snprintf(buf, sizeof(buf), "dev%d fits resident (%.0f of %.0f MiB)", dev.id, fit_need/(double)MiB, dev.free_bytes/(double)MiB);
             why += (why.empty() ? "" : "; ") + std::string(buf);
@@ -353,6 +387,17 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
         const size_t want_free = dev.need_resident + dev.pool_need + 512*MiB + spec_res;
         const size_t deficit = want_free > dev.free_bytes ? want_free - dev.free_bytes : 0;
         const size_t target = deficit + deficit/20 + in.spill_extra;
+        // bug #339 guard (pxa_place_input::ctx_guard): what a plan must free net of its ring so that, by this estimate, the floor
+        // + the speculative chain + an all-outputs context's full logits and head GEMM growth stay free after the pool (the
+        // context's own test, pxa_pool_pregrow, plus what the run then takes). 0 = no guard. Split-graph compute only on the xcache path.
+        auto guard_for = [&](size_t extra) -> size_t {
+            if (!in.ctx_guard) return 0;
+            const size_t need = dev.need_resident + dev.pool_need + in.floor_bytes + spec_res + ctx_l + ctx_h + extra;
+            return need > dev.free_bytes ? need - dev.free_bytes : 0;
+        };
+        const size_t guard_wl = guard_for(0);
+        size_t sel_target = target;   // whole-layer / dense selections: raised to guard_wl below when they would miss it
+        bool guard_hit = false;       // the guard raised a target on this device
 
         // candidate groups on this device, by layer
         std::map<int, std::vector<const pxa_place_tensor *>> exps, down, upgate;
@@ -376,7 +421,7 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
                 for (auto & t : sel) bytes += t.bytes;
                 const size_t ring = pxa_place_ring_bytes(sel);
                 best = sel;
-                if (bytes > ring && bytes - ring >= target) return true;
+                if (bytes > ring && bytes - ring >= sel_target) return true;
             }
             return false;
         };
@@ -391,12 +436,14 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
             bool have = true;
             for (auto & kv : exps) {
                 const int il = kv.first;
-                if (il < 0 || il >= in.n_layer || (int)in.xc_counts[il].size() != in.n_expert) { have = false; break; }
+                if (il < 0 || il >= in.n_layer) { have = false; break; }
+                const int ne_l = il < (int)in.xc_n_expert_l.size() && in.xc_n_expert_l[il] > 0 ? in.xc_n_expert_l[il] : in.n_expert;
+                if ((int)in.xc_counts[il].size() != ne_l) { have = false; break; }
                 size_t e_all = 0, e_max = 0;
                 for (auto * t : kv.second) {
-                    if (t->bytes % (size_t)in.n_expert) { have = false; break; }
-                    e_all += t->bytes/in.n_expert;
-                    e_max  = std::max(e_max, t->bytes/(size_t)in.n_expert);
+                    if (t->bytes % (size_t)ne_l) { have = false; break; }
+                    e_all += t->bytes/ne_l;
+                    e_max  = std::max(e_max, t->bytes/(size_t)ne_l);
                 }
                 if (!have) break;
                 layers.push_back(il); eb.push_back(e_all); tb.push_back(e_max); cnts.push_back(in.xc_counts[il]);
@@ -411,8 +458,28 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
                 }
                 if (in.xc_verify_width > 1.0 && !getenv("PXA_XCACHE_COST_MISS_US")) cost.miss_us *= pxa_xc_width_factor(in.xc_verify_width);
             }
-            const size_t xc_target = target + in.xc_extra_compute > in.xc_slack_credit ? target + in.xc_extra_compute - in.xc_slack_credit : 1;
-            if (have && pxa_xc_choose(layers, eb, tb, cnts, in.n_expert, xc_target, xc, cost)) {
+            // C042 small-tail rule (pxa_place_input::xc_ring1_auto): one-layer ring + the auto slack credit
+            const bool   small_tail = pxa_xc_small_tail(nd, dev.cc, in.xc_cold_zc, deficit, dev.free_bytes);
+            // C042 small tail on the async CPU-pool cold path (pxa_place_input::xc_async_cost, 2026-10-19): a cold layer
+            // costs no scheduler split and no host sync there, so its fixed price is the measured small-tail one, not the split path's
+            if (small_tail && in.xc_async_cost && in.xc_cold_pxqn && !in.xc_plan_v2 && !getenv("PXA_XCACHE_COST_LAYER_US")) {
+                cost.layer_us = PXA_XC_SMALLTAIL_ASYNC_LAYER_US;
+            }
+            const bool   ring_lend  = in.xc_ring_lend && !in.xc_cold_zc;   // R3a: CPU cold path only (zero-copy reads the ring from 65 tokens)
+            const int    ring_l     = (in.xc_ring1_auto && small_tail ? 1 : 2) * (ring_lend ? -1 : 1);
+            const size_t credit     = in.xc_slack_credit + (small_tail ? in.xc_slack_auto : 0);
+            const size_t xc_target = target + in.xc_extra_compute > credit ? target + in.xc_extra_compute - credit : 1;
+            bool xc_ok = have && pxa_xc_choose(layers, eb, tb, cnts, in.n_expert, xc_target, xc, cost, ring_l);
+            const size_t guard_xc = guard_for(in.xc_extra_compute);
+            if (xc_ok && guard_xc > 0 && xc.cold_bytes < (ring_lend ? 0 : xc.ring) + guard_xc) {
+                // bug #339: the plan the credit allows misses the guard: choose again with the guard as the target (the same
+                // search, so the cheapest cold set that leaves the floor free); none -> whole layers with the guard below
+                pxa_xc_choice xg;
+                xc_ok = pxa_xc_choose(layers, eb, tb, cnts, in.n_expert, guard_xc, xg, cost, ring_l);
+                if (xc_ok) xc = xg;
+                guard_hit = true;
+            }
+            if (xc_ok) {
                 r.xc_cost_layer_us = cost.layer_us;
                 r.xc_cost_miss_us  = cost.miss_us;
                 size_t n_cold = 0;
@@ -423,19 +490,25 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
                 r.xc_miss = xc.total > 0 ? xc.miss/xc.total : 0;
                 r.xc_cap  = xc.cap;
                 r.xc_layers = xc.n_layers;
+                size_t n_all = 0;
+                for (const auto & c : cnts) n_all += c.size();
                 r.dev_stream[d] = xc.cold_bytes;
                 r.dev_ring[d]   = xc.ring;
+                r.xc_ring_lent  = r.xc_ring_lent || ring_lend;
                 r.streamed     += xc.cold_bytes;
                 ok = true; xc_done = true;
                 any_expert_stream = true;
                 snprintf(xc_what, sizeof(xc_what), "routed experts EXPERT-GRANULAR: %zu of %zu experts cold in %d of %zu layers "
                         "(cap %d/layer, %.2f%% of routings per the counts; +%.0f MiB split-graph compute; cold path %s, "
-                        "cost %.0f us/layer + %.0f us/%% miss, sm_%d)",
-                        n_cold, layers.size()*(size_t)in.n_expert, xc.n_layers, layers.size(), xc.cap, 100.0*r.xc_miss,
-                        in.xc_extra_compute/(double)MiB, in.xc_cold_zc ? "zero-copy" : "cpu", cost.layer_us, cost.miss_us, dev.cc);
+                        "cost %.0f us/layer + %.0f us/%% miss, sm_%d; ring %d layer%s%s, slack credit %.0f MiB%s)",
+                        n_cold, n_all, xc.n_layers, layers.size(), xc.cap, 100.0*r.xc_miss,
+                        in.xc_extra_compute/(double)MiB, in.xc_cold_zc ? "zero-copy" : "cpu", cost.layer_us, cost.miss_us, dev.cc,
+                        abs(ring_l), abs(ring_l) == 1 ? "" : "s", ring_lend ? " LENT (not charged, on demand)" : "",
+                        credit/(double)MiB, small_tail ? ", small-tail rule" : "");
                 what = xc_what;
             }
         }
+        if (!xc_done && guard_wl > sel_target) { sel_target = guard_wl; guard_hit = true; }
         if (xc_done) {
         } else if (!exps.empty()) {
             ok = try_select(exps, {});
@@ -462,7 +535,7 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
         }
         if (!ok) {
             const size_t freed = bytes > r.dev_ring[d] ? bytes - r.dev_ring[d] : 0;
-            r.dev_deficit[d] = target > freed ? target - freed : 0;
+            r.dev_deficit[d] = sel_target > freed ? sel_target - freed : 0;
         }
         snprintf(buf, sizeof(buf), "dev%d short by %.0f MiB (resident need %.0f + pool %.0f + 512 margin%s vs %.0f free): "
                 "streams %.0f MiB of %s, ring %.0f MiB%s",
@@ -470,6 +543,12 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
                 spec_res ? (" + " + std::to_string((unsigned long long)(spec_res/MiB)) + " speculative chain").c_str() : "", dev.free_bytes/(double)MiB,
                 bytes/(double)MiB, what, r.dev_ring[d]/(double)MiB, ok ? "" : " -- STILL SHORT, the load may fail");
         why += (why.empty() ? "" : "; ") + std::string(buf);
+        if (ctx_l + ctx_h > 0 || guard_hit) {
+            snprintf(buf, sizeof(buf), " [ctx guard: all-outputs context +%.0f MiB logits +%.0f MiB head GEMM; %s]",
+                    ctx_l/(double)MiB, ctx_h/(double)MiB,
+                    guard_hit ? "re-planned to keep the floor free after the pool (PXA_PLACE_CTX_GUARD=0 = off)" : "the plan already leaves it");
+            why += buf;
+        }
     }
     if (r.streamed > 0) {
         r.mode = any_expert_stream && !any_dense_stream ? 2 : 3;
@@ -512,4 +591,14 @@ std::string pxa_place_json(const pxa_place_result & r) {
     for (char c : r.reason) { if (c == '"' || c == '\\') s += '\\'; s += c; }
     s += "\"}";
     return s;
+}
+
+size_t pxa_place_head_pool_need(size_t lib_need, int64_t K, int64_t N, int64_t T, bool quantized, size_t slice_bytes) {
+    if (K <= 0 || N <= 0 || T <= 0) return lib_need;
+    const size_t whole = (size_t) K*(size_t) N*2;   // the f16 copy of the whole head
+    // the library's estimate holds that copy only on its dequant path (MMQ: a q8_1 copy of the activations instead)
+    if (!quantized || slice_bytes == 0 || whole <= slice_bytes || lib_need < whole) return lib_need;
+    int64_t rows = (int64_t) (slice_bytes/((size_t) K*2));
+    rows = std::max<int64_t>(64, rows - rows % 64);
+    return (size_t) rows*(size_t) K*2 + (size_t) T*(size_t) K*2;   // one slice + the f16 activations; F32 straight into dst
 }

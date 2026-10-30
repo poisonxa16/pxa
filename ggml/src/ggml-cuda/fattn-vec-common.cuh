@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "pxa-env-flag.h"
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
@@ -900,10 +901,97 @@ static void on_no_fattn_vec_case(const int Dk, const int Dv) {
     }
 }
 
+// PXA_FA_VEC_NY1_PAD (default ON, =0 off; 2026-10-20): the PXA_FA_VEC_NY1_SPLIT verify split is
+// the decode step's split only if it is picked from the decode step's n_kv. The KV cache pads n_kv to 256, so a verify batch whose
+// columns straddle a 256 boundary has K->ne[1] = the padded length of its LAST column, while the decode of an earlier column ran at
+// 256 keys fewer: ntiles_KQ (n_kv / D) caps the split, so at short context (n_kv / D <= the occupancy split) those columns got a
+// larger split and a different reduction order than their decode (27B, Nemotron-H layouts). When the two
+// candidate splits differ, launch_fattn runs a second pass with the n_kv - 256 split into a scratch buffer and copies it over every
+// column whose mask has no visible key in the last 256 rows (= the columns whose decode ran at n_kv - 256). Masked rows add
+// bitwise zero to the online softmax and the combine, so the extra pass is bitwise the decode of those columns.
+// Scope: one sequence (Q->ne[3] == 1), a 2-D mask, no SWA, no caller-forced split; else the old behaviour.
+static inline bool pxa_fa_vec_ny1_pad_enabled() {
+    static const bool on = [](){ const char * e = getenv("PXA_FA_VEC_NY1_PAD"); return !(e && *e && pxa_env_value_off(e)); }();
+    return on;
+}
+
+// One block per verify column: if mask row `col` has no visible key (> -inf) in [n_kv - tail, n_kv), copy the column's
+// ne02*DV floats (all heads) from `lo` to `dst`. dst / lo are the FA output layout [DV, ne02, ne01] (one sequence).
+static __global__ void pxa_fa_ny1_pad_select(const half * __restrict__ mask, const size_t mask_nb1, const int n_kv, const int tail,
+                                             const float * __restrict__ lo, float * __restrict__ dst, const int col_floats) {
+    const int col = blockIdx.x;
+    const half * row = (const half *) ((const char *) mask + (size_t) col*mask_nb1);
+    int visible = 0;
+    for (int i = n_kv - tail + threadIdx.x; i < n_kv; i += blockDim.x) {
+        visible |= __half2float(row[i]) != -INFINITY;
+    }
+    if (__syncthreads_or(visible)) {
+        return;
+    }
+    const size_t off = (size_t) col*col_floats;
+    for (int i = threadIdx.x; i < col_floats; i += blockDim.x) {
+        dst[off + i] = lo[off + i];
+    }
+}
+
+// The split-count heuristic of launch_fattn as a function of its inputs (factored out 2026-10-16, so
+// PXA_FA_QKV_NY1 can reproduce the width-1 decode split per verify column). Same arithmetic, same order.
+static inline int fattn_pick_parallel_blocks(const int nsm, const int max_blocks_per_sm, const int ntiles_total,
+                                             const int ntiles_KQ, const int n_kv, const int DV, const int ncols1,
+                                             const bool log_kps) {
+    // parallel_blocks should be at least large enough to achieve max. occupancy for a single wave:
+    int parallel_blocks = std::max((nsm * max_blocks_per_sm) / ntiles_total, 1);
+
+    // parallel_blocks must not be larger than what the tensor size allows:
+    parallel_blocks = std::min(parallel_blocks, ntiles_KQ);
+
+    // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+    // Test whether parallel_blocks can be set to a higher value for better efficiency.
+    const int blocks_per_wave = nsm * max_blocks_per_sm;
+    int nwaves_best = 0;
+    int efficiency_percent_best = 0;
+    for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KQ; ++parallel_blocks_test) {
+        const int nblocks_total = ntiles_total * parallel_blocks_test;
+        const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+        const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+
+        // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+        if (efficiency_percent_best >= 90 && nwaves > nwaves_best) {
+            break;
+        }
+
+        if (efficiency_percent > efficiency_percent_best) {
+            nwaves_best = nwaves;
+            efficiency_percent_best = efficiency_percent;
+            parallel_blocks = parallel_blocks_test;
+        }
+    }
+
+    // PXA_FA_KEYS_PER_SPLIT: override the occupancy-derived split with a keys-per-CTA ladder.
+    // Gated to the D=256 single-column decode path (see the header block above).
+    if (DV == 256 && ncols1 == 1) {
+        const int kps = pxa_fa_keys_per_split();
+        if (kps > 0) {
+            int pb_new = (n_kv + kps - 1) / kps;
+            pb_new = std::max(pb_new, 1);
+            pb_new = std::min(pb_new, ntiles_KQ);
+            if (pb_new != parallel_blocks) {
+                if (log_kps) {
+                    pxa_fa_keys_per_split_log(n_kv, parallel_blocks, pb_new, ntiles_KQ);
+                }
+                parallel_blocks = pb_new;
+            }
+        }
+    }
+    return parallel_blocks;
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int KQ_row_granularity, const bool need_f16_K, const bool need_f16_V, const int warp_size = WARP_SIZE) {
+    const int KQ_row_granularity, const bool need_f16_K, const bool need_f16_V, const int warp_size = WARP_SIZE,
+    const int2 * ext_KV_min_max = nullptr, const int force_parallel_blocks = 0) {
+    // ext_KV_min_max / force_parallel_blocks (PXA_FA_QKV_NY1): a caller-built per-column-tile KV table and split count
 
     const bool is_mla = DV == 512; // TODO better parameterization
 
@@ -1019,7 +1107,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || (n_swa > 0 && K->ne[1] >= FATTN_KQ_STRIDE + n_swa))) {
+    if (!ext_KV_min_max && mask && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || (n_swa > 0 && K->ne[1] >= FATTN_KQ_STRIDE + n_swa))) {
         const int s31 = mask->nb[1] / sizeof(half2);
         const int s33 = mask->nb[3] / sizeof(half2);
 
@@ -1051,47 +1139,32 @@ void launch_fattn(
     GGML_ASSERT(K->ne[1] % KQ_row_granularity == 0);
     const int ntiles_KQ = K->ne[1] / KQ_row_granularity; // Max. number of parallel blocks limited by tensor size.
 
-    // parallel_blocks should be at least large enough to achieve max. occupancy for a single wave:
-    parallel_blocks = std::max((nsm * max_blocks_per_sm) / ntiles_total, 1);
+    // PXA_FA_VEC_NY1_SPLIT (kernel default 0; the registry sets 1 for Nemotron-H MoE; 10-19, todo nemo-super-nextn-identity): a one-column-per-block vec kernel
+    // (ncols1 == 1: the NVIDIA f32 vec path) at a speculative-verify width 2..8 takes the KV split the ONE-token decode step picks
+    // (the occupancy heuristic evaluated for one column tile), so every verify column walks the same key ranges and folds them in
+    // the same combine as the decode step: bitwise the width-1 attention. The heuristic over ny column tiles picks fewer splits once
+    // n_kv / 128 exceeds them (Nemotron Super PXQN2 on 2x P100: K=2 verify bitwise 64/64 at n_kv ~90, 0/32 at n_kv ~1860, first
+    // divergent node fa-7). Decode (one column) and prefill widths are untouched.
+    // Default OFF in the kernel: the registry turns it on for Nemotron-H MoE only (common/pxa-registry.cpp; on the 27B W3 MTP cell it
+    // changed the MTP text and cost 1-2%), so every other arch keeps its verify split byte-for-byte. =1 forces it anywhere.
+    static const bool pxa_vec_ny1_split = [](){ const char * e = getenv("PXA_FA_VEC_NY1_SPLIT"); return e && *e && atoi(e) != 0; }();
+    const int ntiles_split = (pxa_vec_ny1_split && ncols1 == 1 && Q->ne[1] >= 2 && Q->ne[1] <= 8)
+        ? (Q->ne[2] / ncols2) * Q->ne[3]          // = the decode step's ntiles_total (one column tile)
+        : ntiles_total;
+    parallel_blocks = force_parallel_blocks > 0 ? force_parallel_blocks
+        : fattn_pick_parallel_blocks(nsm, max_blocks_per_sm, ntiles_split, ntiles_KQ, (int) K->ne[1], DV, ncols1, true);
 
-    // parallel_blocks must not be larger than what the tensor size allows:
-    parallel_blocks = std::min(parallel_blocks, ntiles_KQ);
-
-    // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
-    // Test whether parallel_blocks can be set to a higher value for better efficiency.
-    const int blocks_per_wave = nsm * max_blocks_per_sm;
-    int nwaves_best = 0;
-    int efficiency_percent_best = 0;
-    for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KQ; ++parallel_blocks_test) {
-        const int nblocks_total = ntiles_total * parallel_blocks_test;
-        const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-        const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
-
-        // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
-        if (efficiency_percent_best >= 90 && nwaves > nwaves_best) {
-            break;
-        }
-
-        if (efficiency_percent > efficiency_percent_best) {
-            nwaves_best = nwaves;
-            efficiency_percent_best = efficiency_percent;
-            parallel_blocks = parallel_blocks_test;
-        }
-    }
-
-    // PXA_FA_KEYS_PER_SPLIT: override the occupancy-derived split with a keys-per-CTA ladder.
-    // Gated to the D=256 single-column decode path (see the header block above).
-    if (DV == 256 && ncols1 == 1) {
-        const int kps = pxa_fa_keys_per_split();
-        if (kps > 0) {
-            const int n_kv = (int) K->ne[1];
-            int pb_new = (n_kv + kps - 1) / kps;
-            pb_new = std::max(pb_new, 1);
-            pb_new = std::min(pb_new, ntiles_KQ);
-            if (pb_new != parallel_blocks) {
-                pxa_fa_keys_per_split_log(n_kv, parallel_blocks, pb_new, ntiles_KQ);
-                parallel_blocks = pb_new;
-            }
+    // PXA_FA_VEC_NY1_PAD (see pxa_fa_vec_ny1_pad_enabled): the split the decode step of a column one KV pad (256) shorter picked.
+    constexpr int pxa_kv_pad = 256;
+    int pb_lo = 0;
+    if (ntiles_split != ntiles_total && force_parallel_blocks <= 0 && !ext_KV_min_max && mask && n_swa == 0 &&
+            Q->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 && K->ne[1] >= 2*pxa_kv_pad && K->ne[1] % pxa_kv_pad == 0 &&
+            pxa_fa_vec_ny1_pad_enabled()) {
+        const int n_kv_lo = (int) K->ne[1] - pxa_kv_pad;
+        const int pb = fattn_pick_parallel_blocks(nsm, max_blocks_per_sm, ntiles_split, n_kv_lo / KQ_row_granularity, n_kv_lo,
+                                                  DV, ncols1, false);
+        if (pb != parallel_blocks) {
+            pb_lo = pb;
         }
     }
 
@@ -1104,6 +1177,17 @@ void launch_fattn(
     if (parallel_blocks > 1) {
         dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
         dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+    }
+    // PXA_FA_VEC_NY1_PAD second pass buffers (allocated after the main ones, freed first: the VMM pool is LIFO).
+    ggml_cuda_pool_alloc<float>  lo_dst(pool);
+    ggml_cuda_pool_alloc<float>  lo_tmp(pool);
+    ggml_cuda_pool_alloc<float2> lo_tmp_meta(pool);
+    if (pb_lo > 0) {
+        lo_dst.alloc(ggml_nelements(KQV));
+        if (pb_lo > 1) {
+            lo_tmp.alloc(pb_lo*ggml_nelements(KQV));
+            lo_tmp_meta.alloc(pb_lo*ggml_nrows(KQV));
+        }
     }
 
     float scale         = 1.0f;
@@ -1125,31 +1209,46 @@ void launch_fattn(
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
-    fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
-        (const char *) Q->data,
-        K_data,
-        V_data,
-        mask ? ((const char *) mask->data) : nullptr,
-        sinks ? ((const char *) sinks->data) : nullptr,
-        KV_min_max.ptr,
-        parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
-        scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-        Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
-        nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
-    );
-    CUDA_CHECK(cudaGetLastError());
+    // kernel + combine for one split count into `out` (factored for PXA_FA_VEC_NY1_PAD; the main pass is the unchanged launch)
+    auto launch_pass = [&](const int pb, float * tmp, float2 * tmp_meta, float * out) {
+        dim3 bn = blocks_num;
+        bn.y = pb;
+        fattn_kernel<<<bn, block_dim, nbytes_shared, main_stream>>>(
+            (const char *) Q->data,
+            K_data,
+            V_data,
+            mask ? ((const char *) mask->data) : nullptr,
+            sinks ? ((const char *) sinks->data) : nullptr,
+            ext_KV_min_max ? ext_KV_min_max : KV_min_max.ptr,
+            pb > 1 ? tmp : out, tmp_meta,
+            scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+            Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+            K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+            nb21, nb22, nb23,
+            mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+            mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        );
+        CUDA_CHECK(cudaGetLastError());
 
-    if (parallel_blocks > 1) {
-        const dim3 block_dim_combine(DV, 1, 1);
-        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
-        const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
+        if (pb > 1) {
+            const dim3 block_dim_combine(DV, 1, 1);
+            const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
+            const size_t nbytes_shared_combine = pb*sizeof(float2);
 
-        flash_attn_combine_results<DV>
-            <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
-            (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            flash_attn_combine_results<DV>
+                <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
+                (tmp, tmp_meta, out, pb);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    };
+
+    launch_pass(parallel_blocks, dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data);
+
+    if (pb_lo > 0) {
+        launch_pass(pb_lo, lo_tmp.ptr, lo_tmp_meta.ptr, lo_dst.ptr);
+        pxa_fa_ny1_pad_select<<<(unsigned) Q->ne[1], 256, 0, main_stream>>>(
+            (const half *) mask->data, mask->nb[1], (int) K->ne[1], pxa_kv_pad, lo_dst.ptr, (float *) KQV->data,
+            (int) (Q->ne[2]*DV));
+        CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaGetLastError());
 }

@@ -46,6 +46,10 @@ LEVEL_RE = re.compile(r"^[A-Za-z_]{1,16}$")
 # budget; "off" switches thinking off, "max" = unlimited (-1).
 EFFORTS = ("off", "low", "medium", "high", "max")
 EFFORT_BUDGET = {"off": 0, "low": 1024, "medium": 4096, "high": 16384, "max": -1}
+# #365 (beta 6): a thinking budget never fills the context. Below this many tokens per slot a thinking model gets a
+# warning (raise the context or turn thinking off); the budget itself is always fitted, see fit_budget().
+THINK_CTX_MIN = 16384
+FIT_PROMPT_MAX = 8192
 # what the client may say about thinking on its own (any of these = the request has its own setting)
 _CLIENT_KW = ("enable_thinking", "thinking", "reasoning", "reasoning_effort", "reasoning_strength",
               "thinking_budget", "thinking_mode")
@@ -462,7 +466,7 @@ def _strip_client(body):
     return body
 
 
-def apply_effort(body, p, settings, reserve=None):
+def apply_effort(body, p, settings, reserve=None, ctx=None):
     """The admin's effort selector on a request that has no pxa_thinking. -> (body, notes).
     No effort set: unchanged. The request's own thinking setting wins unless settings.lock."""
     s = settings or {}
@@ -479,9 +483,9 @@ def apply_effort(body, p, settings, reserve=None):
     lv = (p or {}).get("levels") or {}
     level = eff if eff in (lv.get("values") or ()) else None
     if eff == "off":
-        body, n = apply_request(body, p, "off", budget=0, reserve=reserve)
+        body, n = apply_request(body, p, "off", budget=0, reserve=reserve, ctx=ctx)
     else:
-        body, n = apply_request(body, p, "on", budget=EFFORT_BUDGET[eff], level=level, reserve=reserve)
+        body, n = apply_request(body, p, "on", budget=EFFORT_BUDGET[eff], level=level, reserve=reserve, ctx=ctx)
     return body, notes + [f"effort {eff}: thinking budget {EFFORT_BUDGET[eff]}"] + n
 
 
@@ -491,7 +495,7 @@ CLIENT_EFFORT = {"none": "off", "off": "off", "minimal": "low", "low": "low", "m
                  "high": "high", "xhigh": "max", "max": "max"}
 
 
-def map_client_effort(body, p, reserve=None):
+def map_client_effort(body, p, reserve=None, ctx=None):
     """-> (body, notes). Only when the body has a top-level reasoning_effort; else unchanged."""
     if not isinstance(body, dict) or "reasoning_effort" not in body:
         return body, []
@@ -507,10 +511,50 @@ def map_client_effort(body, p, reserve=None):
     budget = body.pop("thinking_budget_tokens", None)
     b = EFFORT_BUDGET[eff] if budget is None else int(budget)
     if eff == "off":
-        body, n = apply_request(body, p, "off", budget=0, reserve=reserve)
+        body, n = apply_request(body, p, "off", budget=0, reserve=reserve, ctx=ctx)
     else:
-        body, n = apply_request(body, p, "on", budget=b, level=level, reserve=reserve)
+        body, n = apply_request(body, p, "on", budget=b, level=level, reserve=reserve, ctx=ctx)
     return body, [f"reasoning_effort {raw} -> thinking budget {b}"] + n
+
+
+def answer_room(ctx, reserve=1024):
+    """-> (thinking cap, answer room, prompt room) for a context of ctx tokens per slot. The answer keeps
+    min(reserve, ctx/4) tokens and the prompt min(ctx/4, FIT_PROMPT_MAX); thinking may use the rest."""
+    ctx = int(ctx)
+    answer = min(int(reserve), ctx // 4)
+    prompt = min(ctx // 4, FIT_PROMPT_MAX)
+    return max(0, ctx - answer - prompt), answer, prompt
+
+
+def slot_ctx(ctx, np=None):
+    """the context one request can use: ctx split over np slots (np unknown or 1: all of it); None when unknown"""
+    try:
+        ctx = int(ctx or 0)
+        np = int(np or 1)
+    except (TypeError, ValueError):
+        return None
+    if ctx <= 0:
+        return None
+    return ctx // np if np > 1 else ctx
+
+
+def fit_budget(b, ctx, reserve=None):
+    """#365: a thinking budget (-1 = unlimited) that would leave no room for the answer in a context of ctx tokens per
+    slot -> (the budget capped below the context, notes). b None (nothing set) or ctx unknown: unchanged, no note."""
+    if b is None or not ctx or int(ctx) <= 0 or os.environ.get("PXA_CONTROL_THINK_FIT", "1") == "0":
+        return b, []            # PXA_CONTROL_THINK_FIT=0: the off switch (budgets passed as set, as before #365)
+    if reserve is None:
+        reserve = load_table().get("answer_reserve", 1024)
+    cap, answer, prompt = answer_room(ctx, reserve)
+    b = int(b)
+    if 0 <= b <= cap:
+        return b, []
+    notes = [f"thinking budget {'unlimited' if b < 0 else b} capped at {cap} tokens: the context is {ctx} tokens per "
+             f"slot, and {answer} tokens are kept for the answer and {prompt} for the prompt"]
+    if int(ctx) < THINK_CTX_MIN:
+        notes.append(f"the context ({ctx} tokens per slot) is small for a thinking model: raise the context to "
+                     f"{THINK_CTX_MIN} or more for long thinking, or turn thinking off")
+    return cap, notes
 
 
 def effective_budget(p, settings):
@@ -607,9 +651,11 @@ def _apply_method(body, p, mode, use_fallback, notes):
     return None
 
 
-def apply_request(body, p, mode="auto", budget=None, level=None, use_fallback=False, reserve=None):
+def apply_request(body, p, mode="auto", budget=None, level=None, use_fallback=False, reserve=None, ctx=None):
     """An OpenAI chat body -> (new body, notes). mode on|off|auto; budget None = the suggestion,
-    -1 = unlimited. use_fallback: the family's next method (e.g. the soft tag instead of the kwarg)."""
+    -1 = unlimited. use_fallback: the family's next method (e.g. the soft tag instead of the kwarg).
+    ctx: the served context per slot when known (#365): the budget is fitted below it (fit_budget) and max_tokens
+    is never raised past it; None = as before."""
     t = load_table()
     reserve = t.get("answer_reserve", 1024) if reserve is None else reserve
     body = dict(body or {})
@@ -636,13 +682,19 @@ def apply_request(body, p, mode="auto", budget=None, level=None, use_fallback=Fa
         or (on is False and used in (EF, None))
     b = p["budget"]["suggested"] if budget is None else int(budget)
     enf = p["budget"]["enforce"]
+    fitted = False
+    if thinking_now and ctx:
+        b, fn = fit_budget(b, ctx, reserve)
+        fitted = bool(fn)
+        notes += fn
+        reserve = min(reserve, answer_room(ctx, reserve)[1])
     if thinking_now and b is not None and b >= 0:
         if p["mechanism"] == "budget-kwarg" and p.get("budget_kwarg"):
             kw = dict(body.get("chat_template_kwargs") or {})
             kw[p["budget_kwarg"]] = b
             body["chat_template_kwargs"] = kw
             notes.append(f"thinking budget {b} via chat_template_kwargs.{p['budget_kwarg']}")
-        if enf == "engine" and (budget is not None or mode != "auto"):
+        if enf == "engine" and (budget is not None or mode != "auto" or fitted):
             body["thinking_budget_tokens"] = b
             notes.append(f"thinking budget {b} tokens (engine-enforced)")
         if b > 0:
@@ -662,8 +714,10 @@ def apply_request(body, p, mode="auto", budget=None, level=None, use_fallback=Fa
 # ---------------------------------------------------------------------------------------------
 # apply: one server launch
 # ---------------------------------------------------------------------------------------------
-def launch_args(p, settings):
-    """-> (argv to append to llama-server, notes). Only what the engine can set server-wide."""
+def launch_args(p, settings, ctx=None, np=None):
+    """-> (argv to append to llama-server, notes). Only what the engine can set server-wide.
+    ctx/np: the planned context and parallel slots when known (#365): the budget is fitted below the context per slot,
+    and a thinking model with no budget gets one that leaves room for the answer; unknown = as before."""
     s = clean_settings(settings)
     out, notes = [], []
     if not p or not p.get("supported"):
@@ -705,6 +759,13 @@ def launch_args(p, settings):
     b = s["budget"]
     thinking = mode == "on" or (mode == "auto" and p["default"] in ("on", "always", "template")) \
         or (mode == "off" and used in (EF, None))
+    slot = slot_ctx(ctx, np)
+    if thinking and slot:
+        want = b if b is not None else (-1 if p["budget"]["enforce"] == "engine" else None)
+        nb, fn = fit_budget(want, slot)
+        if fn:
+            b = nb
+            notes += fn
     if p["mechanism"] == "budget-kwarg" and p.get("budget_kwarg") and mode != "off" and b is not None:
         kwargs[p["budget_kwarg"]] = b
     if kwargs:

@@ -66,6 +66,8 @@
 //    Prefill/MTP-verify/mixed-seq batches keep the eager path (their node order differs anyway).
 
 #pragma once
+#include "pxa-env-flag.h"
+#include "pxa-dn-outgate-row.cuh"   // pxa_dn_rms_silu_gate_row (shared with the closed PXA_PXQN_RQ8 producer)
 
 #include "pxa-enhance.cuh"   // level default: REFERENCE -> 0 (eager path); env always wins
 #include <vector>
@@ -423,22 +425,87 @@ static __global__ void pxa_dn_gather_mask_f32x4(
     }
 }
 static bool pxa_dn_gm_lean_on() {
-    static const bool on = [] { const char * e = getenv("PXA_DN_GM_LEAN"); return !(e && atoi(e) == 0); }();
+    static const bool on = [] { const char * e = getenv("PXA_DN_GM_LEAN"); return !(e && pxa_env_value_off(e)); }();
     return on;
 }
-// true when no node after the MUL (index j) reads G, directly or through a view, and G is not a graph output
-static bool pxa_dn_gm_g_dead(const ggml_cgraph * cgraph, int j, const ggml_tensor * G) {
-    if (G->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
-    for (int k = j + 1; k < cgraph->n_nodes; ++k) {
-        const ggml_tensor * n = cgraph->nodes[k];
-        if (n == G || n->view_src == G) return false;
-        for (int q = 0; q < GGML_MAX_SRC; ++q) {
-            const ggml_tensor * t = n->src[q];
-            if (!t) continue;
-            if (t == G || t->view_src == G) return false;
-        }
+// PXA_DN_GDEAD_INDEX (default 1; 0 = the plain forward scans), K2, 2026-10-14.
+// pxa_dn_gm_g_dead and pxa_dn_carry_try's "who else reads M" walked EVERY later node (x GGML_MAX_SRC, with a
+// view_src dereference per source) once or twice per gather site. Measured on 1x V100 Qwen3.8-27B PXQN4 tg
+// (PXA_OP_SUBMIT + an LD_PRELOAD SIGPROF sampler): 149 us of host time per DeltaNet layer, 7.2 ms of the 17.5 ms
+// a token spends submitting, and pxa_try_deltanet_gather_mask's own code was 2/3 of all graph-eval host samples.
+// In layer 0 the GPU has nothing queued yet, so the scan is a 118-141 us idle gap on the card every token.
+// Now the candidates come from the per-evaluation consumer index (pxa_cons_get, ggml-cuda.cu): T's slot plus, for
+// each view of T in it, that view's slot (view_src is always the root, so one level reaches views of views). Every
+// node that can satisfy the scan's predicate references T or a view of T, so it is a candidate; the SAME predicate
+// is then applied to the candidates after j. A slot with more than 3 consumers falls back to the scan. Same kernels,
+// same arguments: output-identical by construction. PXA_DN_GDEAD_CHECK=1 runs both and aborts on a disagreement.
+static inline bool pxa_dn_gdead_index_on() {
+    static const bool v = [] { const char * e = getenv("PXA_DN_GDEAD_INDEX"); return !(e && pxa_env_value_off(e)); }();
+    return v;
+}
+static inline bool pxa_dn_gdead_check_on() {
+    static const bool v = [] { const char * e = getenv("PXA_DN_GDEAD_CHECK"); return e && atoi(e) != 0; }();
+    return v;
+}
+static inline const pxa_cons_slot * pxa_cons_find(const pxa_cons_index & x, const void * t) {
+    uint32_t h = pxa_cons_hash(t) & x.mask;
+    for (;;) {
+        const pxa_cons_slot & sl = x.tab[h];
+        if (!sl.key) return nullptr;
+        if (sl.key == t) return &sl;
+        h = (h + 1) & x.mask;
+    }
+}
+// node indices that can read T directly or through a view of T (duplicates possible); false = use the scan
+static bool pxa_dn_readers(const ggml_cgraph * cgraph, const ggml_tensor * T, int (&out)[16], int & n) {
+    n = 0;
+    if (!(pxa_dn_gdead_index_on() && pxa_consumer_index_on() && cgraph->n_nodes > 64)) return false;
+    const pxa_cons_index & x = pxa_cons_get(cgraph);
+    const pxa_cons_slot * s = pxa_cons_find(x, T);
+    if (!s) return true;
+    if (s->cnt > 3) return false;
+    for (int a = 0; a < s->cnt; ++a) {
+        const int k = s->idx[a];
+        out[n++] = k;
+        const ggml_tensor * V = cgraph->nodes[k];
+        if (V->view_src != T) continue;
+        const pxa_cons_slot * sv = pxa_cons_find(x, V);
+        if (!sv) continue;
+        if (sv->cnt > 3) return false;
+        for (int b = 0; b < sv->cnt; ++b) out[n++] = sv->idx[b];
     }
     return true;
+}
+static inline bool pxa_dn_reads_g(const ggml_tensor * n, const ggml_tensor * G) {
+    if (n == G || n->view_src == G) return true;
+    for (int q = 0; q < GGML_MAX_SRC; ++q) {
+        const ggml_tensor * t = n->src[q];
+        if (t && (t == G || t->view_src == G)) return true;
+    }
+    return false;
+}
+// true when no node after the MUL (index j) reads G, directly or through a view, and G is not a graph output
+static bool pxa_dn_gm_g_dead_scan(const ggml_cgraph * cgraph, int j, const ggml_tensor * G) {
+    for (int k = j + 1; k < cgraph->n_nodes; ++k) {
+        if (pxa_dn_reads_g(cgraph->nodes[k], G)) return false;
+    }
+    return true;
+}
+static bool pxa_dn_gm_g_dead(const ggml_cgraph * cgraph, int j, const ggml_tensor * G) {
+    if (G->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
+    int c[16]; int n = 0;
+    if (pxa_dn_readers(cgraph, G, c, n)) {
+        bool dead = true;
+        for (int a = 0; a < n && dead; ++a) {
+            if (c[a] > j && pxa_dn_reads_g(cgraph->nodes[c[a]], G)) dead = false;
+        }
+        if (pxa_dn_gdead_check_on() && dead != pxa_dn_gm_g_dead_scan(cgraph, j, G)) {
+            fprintf(stderr, "PXA_DN_GDEAD_CHECK: g_dead index=%d scan=%d at node %d (%s)\n", (int) dead, (int) !dead, j, G->name);
+            GGML_ABORT("PXA_DN_GDEAD_CHECK g_dead");
+        }
+        return dead;
+    }
+    return pxa_dn_gm_g_dead_scan(cgraph, j, G);
 }
 
 // Fires on the GET_ROWS node when the next non-no-op node is the broadcast MUL of it. Returns the
@@ -800,35 +867,9 @@ static __global__ void pxa_dn_rms_silu_gate_f32(
         const int ncols, const float eps, void * __restrict__ vq8 = nullptr) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    const float * xr = x + (int64_t)row*ncols;
-    const float * zr = z + (int64_t)row*ncols;
-    float       * dr = dst + (int64_t)row*ncols;
-
-    float tmp = 0.0f;
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = xr[col];
-        tmp += xi * xi;
-    }
-    tmp = warp_reduce_sum(tmp);
-    if (block_size > WARP_SIZE) {
-        __shared__ float s_sum[32];
-        const int warp_id = tid / WARP_SIZE;
-        const int lane_id = tid % WARP_SIZE;
-        if (lane_id == 0) {
-            s_sum[warp_id] = tmp;
-        }
-        __syncthreads();
-        tmp = lane_id < block_size/WARP_SIZE ? s_sum[lane_id] : 0.0f;
-        tmp = warp_reduce_sum(tmp);
-    }
-    const float mean  = tmp / ncols;
-    const float scale = rsqrtf(mean + eps);
-
-    for (int col = tid; col < ncols; col += block_size) {
-        const float v  = scale * w[col] * xr[col];
-        const float zi = zr[col];
-        dr[col] = zi * v / (1.0f + expf(-zi));
-    }
+    float * dr = dst + (int64_t)row*ncols;
+    // the row body lives in pxa-dn-outgate-row.cuh (shared with the closed PXA_PXQN_RQ8 copy of this kernel)
+    pxa_dn_rms_silu_gate_row<block_size>(x + (int64_t)row*ncols, w, z + (int64_t)row*ncols, dr, ncols, eps);
     // G2-F2 QUANTFOLD epilogue: emit the FLAT q8_1 sidecar of dst (bit-identical to
     // quantize_q8_1 of the flattened output; requires ncols % 32 == 0, driver-guarded).
     // This row owns flat chunks [row*ncols/32, (row+1)*ncols/32), one warp per chunk.
@@ -1230,32 +1271,56 @@ static int pxa_try_deltanet_cluster(ggml_backend_cuda_context & ctx, const ggml_
 // ---------------------------------------------------------------------------------------------
 // Out-gate handler: FUSED_RMS_NORM(delta-net output, ssm_norm) + FUSED_MUL_UNARY(z, ., SILU) -> 1.
 // Returns true if fused (caller then skips one node).
-static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-    if (!(pxa_fuse_deltanet_mask() & 2)) return false;
-    if (i + 1 >= cgraph->n_nodes) return false;
+// PXA_PXQN_OG_RR (sm_60 row-block route, closed library): the head-split out_in RHT chain that reads the out-gate output M
+// (views of M -> n PXQN_RHT -> CONCAT -> [reshape] -> PXQN MUL_MAT, pxa_pxqn_rht_ranges_match) is served by the out-gate's own
+// launch. Returns how far the caller advances past node i (the MUL_MAT runs as the next node), 0 = declined, nothing launched.
+static int pxa_dn_outgate_rr_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, const ggml_tensor * F,
+                                 ggml_tensor * M, int ncols, int nrows, float eps) {
+    int j = i + 2;
+    while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])) ++j;
+    if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_PXQN_RHT) return 0;
+    const float * xb = nullptr; int nr = 0; int64_t off[4], k0[4]; ggml_tensor * cat = nullptr;
+    const int jm = pxa_pxqn_rht_ranges_match(cgraph, j, &xb, nr, off, k0, &cat);
+    if (jm <= j || xb != (const float *) M->data || !cat || cat->ne[0] != ggml_nelements(M)) return 0;
+    if (!ops_are_same_device(cgraph, i, jm)) return 0;
+    const ggml_tensor * r0 = cgraph->nodes[j];
+    const uint64_t seed = (uint64_t)(uint32_t) r0->op_params[0] | ((uint64_t)(uint32_t) r0->op_params[1] << 32);
+    if (ggml_cuda_pxqn_dn_outgate_rr(ctx, (const float *)F->src[0]->data, (const float *)F->src[1]->data,
+                                     (const float *)M->src[0]->data, (float *)M->data, ncols, nrows, eps,
+                                     pxa_dn_rms_block_size(ncols), nr, off, k0, seed, r0->op_params[2], r0->op_params[3], cat,
+                                     cgraph->nodes[jm]) != 0) {
+        return 0;
+    }
+    return jm - 1 - i;
+}
+
+// Returns the number of nodes the caller advances past i (1 = the out-gate pair; more with PXA_PXQN_OG_RR), 0 = not fused.
+static int pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (!(pxa_fuse_deltanet_mask() & 2)) return 0;
+    if (i + 1 >= cgraph->n_nodes) return 0;
 
     ggml_tensor * F = cgraph->nodes[i];
     ggml_tensor * M = cgraph->nodes[i+1];
-    if (M->op != GGML_OP_FUSED_MUL_UNARY) return false;
-    if ((ggml_unary_op)M->op_params[0] != GGML_UNARY_OP_SILU) return false;
+    if (M->op != GGML_OP_FUSED_MUL_UNARY) return 0;
+    if ((ggml_unary_op)M->op_params[0] != GGML_UNARY_OP_SILU) return 0;
     float limit;
     memcpy(&limit, (const float *)M->op_params + 1, sizeof(float));
-    if (limit >= 1e-6f) return false;                    // limited variant not replicated
-    if (M->src[1] != F || !M->src[0]) return false;
+    if (limit >= 1e-6f) return 0;                    // limited variant not replicated
+    if (M->src[1] != F || !M->src[0]) return 0;
     // anchor strictly to the DeltaNet out-gate: rms input is a reshape of a view of DELTA_NET
     if (!F->src[0] || F->src[0]->op != GGML_OP_RESHAPE ||
         !F->src[0]->src[0] || F->src[0]->src[0]->op != GGML_OP_VIEW ||
         !F->src[0]->src[0]->src[0] || F->src[0]->src[0]->src[0]->op != GGML_OP_DELTA_NET) {
-        return false;
+        return 0;
     }
-    if (F->type != GGML_TYPE_F32 || M->type != GGML_TYPE_F32) return false;
-    if (F->src[0]->type != GGML_TYPE_F32 || M->src[0]->type != GGML_TYPE_F32) return false;
-    if (F->ne[2] != 1 || F->ne[3] != 1) return false;
-    if (!F->src[1] || ggml_nrows(F->src[1]) != 1 || F->src[1]->ne[0] != F->ne[0]) return false;
-    if (F->src[1]->type != GGML_TYPE_F32) return false;
-    if (!ggml_are_same_shape(M->src[0], M) || !ggml_are_same_shape(F, M)) return false;
-    if (!ggml_is_contiguous(F->src[0]) || !ggml_is_contiguous(M->src[0]) || !ggml_is_contiguous(M)) return false;
-    if (!ops_are_same_device(cgraph, i, i+1)) return false;
+    if (F->type != GGML_TYPE_F32 || M->type != GGML_TYPE_F32) return 0;
+    if (F->src[0]->type != GGML_TYPE_F32 || M->src[0]->type != GGML_TYPE_F32) return 0;
+    if (F->ne[2] != 1 || F->ne[3] != 1) return 0;
+    if (!F->src[1] || ggml_nrows(F->src[1]) != 1 || F->src[1]->ne[0] != F->ne[0]) return 0;
+    if (F->src[1]->type != GGML_TYPE_F32) return 0;
+    if (!ggml_are_same_shape(M->src[0], M) || !ggml_are_same_shape(F, M)) return 0;
+    if (!ggml_is_contiguous(F->src[0]) || !ggml_is_contiguous(M->src[0]) || !ggml_is_contiguous(M)) return 0;
+    if (!ops_are_same_device(cgraph, i, i+1)) return 0;
 
     // The kernel below writes M and deliberately leaves F's own dst UNWRITTEN, on the claim
     // that F's only consumer is M. That claim was asserted from the anchor pattern, never
@@ -1265,7 +1330,7 @@ static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml
     // fusion already does before it swallows a node.
     if (pxa_fuse_deltanet_war() && !pxa_g2_sole_consumer(cgraph, i, F, M)) {
         pxa_dn_fire_log("outgate", false);
-        return false;
+        return 0;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1302,7 +1367,7 @@ static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml
           pxa_g2_addfuse_no_shifted_overlap(M, F->src[1]))) {
         pxa_dn_outgate_dbg(M, F->src[0], M->src[0], false);
         pxa_dn_fire_log("outgate", false);
-        return false;
+        return 0;
     }
     pxa_dn_outgate_dbg(M, F->src[0], M->src[0], true);
 
@@ -1318,7 +1383,18 @@ static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml
         pxa_g2_normfuse_wanted(ctx, cgraph, i + 1, M, g2_padded)) {
         g2_q8 = pxa_g2_q8_buf(ctx.device, ctx.stream(), (size_t)(g2_padded/QK8_1)*sizeof(block_q8_1));
     }
-    {
+    if (!g2_q8) {
+        // PXA_PXQN_OG_RR (sm_60 only; declines on sm_70+ inside the closed library)
+        const int og = pxa_dn_outgate_rr_try(ctx, cgraph, i, F, M, ncols, nrows, eps);
+        if (og > 0) { pxa_dn_fire_log("outgate", true); return og; }
+    }
+    // PXA_PXQN_RQ8: the closed library's copy of this kernel also writes the rotated q8_1 of M for the
+    // ssm_out GEMV (out_in PXQN_RHT -> MUL_MAT right after M), which then skips its RHT + quantize launch; same bits in M
+    const ggml_tensor * rq_rht = nullptr, * rq_mm = nullptr;
+    const bool rq8 = !g2_q8 && pxa_find_rht_mm(cgraph, i + 1, M, rq_rht, rq_mm) &&
+        ggml_cuda_pxqn_dn_outgate(ctx, (const float *)F->src[0]->data, (const float *)F->src[1]->data, (const float *)M->src[0]->data,
+                                  (float *)M->data, ncols, nrows, eps, pxa_dn_rms_block_size(ncols), rq_rht, rq_mm) == 0;
+    if (!rq8) {
         const float * gx = (const float *)F->src[0]->data;
         const float * gw = (const float *)F->src[1]->data;
         const float * gz = (const float *)M->src[0]->data;
@@ -1344,7 +1420,7 @@ static bool pxa_try_deltanet_outgate(ggml_backend_cuda_context & ctx, const ggml
     // F's own dst is deliberately left unwritten: its only consumer is M (verified above against
     // the graph by pxa_g2_sole_consumer, not asserted from the anchor pattern).
     pxa_dn_fire_log("outgate", true);
-    return true;
+    return 1;
 }
 
 // =============================================================================================
@@ -1488,6 +1564,33 @@ static inline bool pxa_dn_reads(const ggml_tensor * n, const ggml_tensor * t) {
     return false;
 }
 
+// K7 (2026-10-14; PXA_DN_GDEAD_INDEX, PXA_DN_GDEAD_CHECK as for the g_dead scans): does any node
+// after the conv (ci) other than the skipped cluster nodes (S, T, C) and no-ops read RAW? The planners used to answer it
+// by walking every later node (O(n_nodes) per DeltaNet layer, twice a layer: once from the carry at the GET_ROWS and
+// once at the SSM_CONV); the candidates now come from the consumer index, and the same predicate decides.
+static bool pxa_dn_raw_other_reader(const ggml_cgraph * cgraph, int ci, const ggml_tensor * RAW,
+                                    const ggml_tensor * S, const ggml_tensor * T, const ggml_tensor * C) {
+    auto other = [&](const ggml_tensor * n) -> bool {
+        if (n == S || n == T || n == C || ggml_is_noop(n)) return false;
+        return pxa_dn_reads(n, RAW);
+    };
+    auto scan = [&]() -> bool {
+        for (int k = ci + 1; k < cgraph->n_nodes; ++k) if (other(cgraph->nodes[k])) return true;
+        return false;
+    };
+    int c[16]; int nc = 0;
+    if (pxa_dn_readers(cgraph, RAW, c, nc)) {
+        bool o = false;
+        for (int a = 0; a < nc && !o; ++a) o = c[a] > ci && other(cgraph->nodes[c[a]]);
+        if (pxa_dn_gdead_check_on() && o != scan()) {
+            fprintf(stderr, "PXA_DN_GDEAD_CHECK: conv RAW-readers index=%d scan=%d at node %d (%s)\n", (int) o, (int) !o, ci, RAW->name);
+            GGML_ABORT("PXA_DN_GDEAD_CHECK conv");
+        }
+        return o;
+    }
+    return scan();
+}
+
 // The deferred copy is made after all (the fused conv declined): exactly the gather + mask the
 // bit2 path would have launched at the GET_ROWS. The row is still unmodified -- the setup scan
 // proved nothing touches it before the absorbed SET_ROWS, and nothing of ours has written it.
@@ -1546,11 +1649,7 @@ static bool pxa_dn_convfuse_plan(const ggml_cgraph * cgraph, int ci, int & a, px
     if (P.tail_off != (int64_t)((cd + 1)*sizeof(float)) || P.T->nb[0] != sizeof(float) || P.T->nb[1] != 4*sizeof(float)) PXA_CF_NO(17);
     if (!ops_are_same_device(cgraph, ci, a)) PXA_CF_NO(18);
     // RAW's dst is not written: its only readers may be the SILU (a) and the conv-tail CONT (a+2)
-    for (int k = ci + 1; k < cgraph->n_nodes; ++k) {
-        const ggml_tensor * n = cgraph->nodes[k];
-        if (n == P.S || n == P.C || ggml_is_noop(n)) continue;
-        if (pxa_dn_reads(n, RAW)) PXA_CF_NO(19);
-    }
+    if (pxa_dn_raw_other_reader(cgraph, ci, RAW, P.S, P.S, P.C)) PXA_CF_NO(19);
     // the softplus the kernel replaces is the exact ggml_cuda_fused_softplus shape
     const ggml_tensor * alpha = P.AD->src[0];
     if (!ggml_is_contiguous(P.MU) || ggml_nelements(P.MU) != ggml_nelements(alpha)) PXA_CF_NO(20);
@@ -1855,13 +1954,9 @@ static bool pxa_dn_convfuse_plan_ny(const ggml_cgraph * cgraph, int ci, int & a,
     if (P.RAW != RAW || P.ny != ny) PXA_CF_NO(15);
     if (P.cd != cd) PXA_CF_NO(16);
     if (!ops_are_same_device(cgraph, ci, a)) PXA_CF_NO(18);
-    for (int k = ci + 1; k < cgraph->n_nodes; ++k) {
-        const ggml_tensor * nn = cgraph->nodes[k];
-        // the conv-tail CONT reads RAW through its view T (as at ny=1, where C is skipped the same way):
-        // the kernel writes that tail straight into the row, so C is never run
-        if (nn == P.S || nn == P.T || nn == P.C || ggml_is_noop(nn)) continue;
-        if (pxa_dn_reads(nn, RAW)) PXA_CF_NO(19);
-    }
+    // the conv-tail CONT reads RAW through its view T (as at ny=1, where C is skipped the same way):
+    // the kernel writes that tail straight into the row, so C is never run
+    if (pxa_dn_raw_other_reader(cgraph, ci, RAW, P.S, P.T, P.C)) PXA_CF_NO(19);
     const ggml_tensor * alpha = P.AD->src[0];
     if (!ggml_is_contiguous(P.MU) || ggml_nelements(P.MU) != ggml_nelements(alpha)) PXA_CF_NO(20);
     if (!ggml_is_contiguous(P.AD->src[1]) || !ggml_is_contiguous(P.MU->src[1])) PXA_CF_NO(21);
@@ -1935,16 +2030,36 @@ static bool pxa_dn_carry_try(const ggml_cgraph * cgraph, int i, int j) {
         (float *) SR->data != P.state_base || SR->src[1] != IDX ||
         (const int32_t *) IDX->data != P.state_idx || SR->buffer != SRC->buffer) return false;
     // M is read by the conv (src0) and the recurrence (src5) and nothing else
-    for (int k = j + 1; k < cgraph->n_nodes; ++k) {
-        const ggml_tensor * n = cgraph->nodes[k];
-        if (ggml_is_noop(n)) continue;
-        if (n->view_src == M) return false;
-        for (int q = 0; q < GGML_MAX_SRC; ++q) {
-            const ggml_tensor * s = n->src[q];
-            if (!s || !(s == M || s->view_src == M)) continue;
-            if ((n == RAW && q == 0) || (n == P.D && q == 5)) continue;
+    // (PXA_DN_GDEAD_INDEX: the same predicate, on the consumer-index candidates instead of every later node)
+    {
+        auto other_reader = [&](const ggml_tensor * n) -> bool {
+            if (ggml_is_noop(n)) return false;
+            if (n->view_src == M) return true;
+            for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                const ggml_tensor * s = n->src[q];
+                if (!s || !(s == M || s->view_src == M)) continue;
+                if ((n == RAW && q == 0) || (n == P.D && q == 5)) continue;
+                return true;
+            }
             return false;
+        };
+        auto scan = [&]() -> bool {
+            for (int k = j + 1; k < cgraph->n_nodes; ++k) if (other_reader(cgraph->nodes[k])) return true;
+            return false;
+        };
+        int c[16]; int nc = 0;
+        bool other;
+        if (pxa_dn_readers(cgraph, M, c, nc)) {
+            other = false;
+            for (int a = 0; a < nc && !other; ++a) other = c[a] > j && other_reader(cgraph->nodes[c[a]]);
+            if (pxa_dn_gdead_check_on() && other != scan()) {
+                fprintf(stderr, "PXA_DN_GDEAD_CHECK: carry M-readers index=%d scan=%d at node %d (%s)\n", (int) other, (int) !other, j, M->name);
+                GGML_ABORT("PXA_DN_GDEAD_CHECK carry");
+            }
+        } else {
+            other = scan();
         }
+        if (other) return false;
     }
     // nothing but the gather (and the SET_ROWS it pairs with) touches the state storage in between
     {
@@ -1967,6 +2082,49 @@ static bool pxa_dn_carry_try(const ggml_cgraph * cgraph, int i, int j) {
 
 // At an SSM_CONV node: the fused conv cluster. Returns the number of EXTRA nodes consumed, or 0
 // (then the caller runs the conv eagerly, after materializing a deferred carry if one is pending).
+// PXA_DN_CF_DIRECT (2026-10-16; plain decode ny=1 only): an output the plan routes through the scratch
+// (shifted alias over a live input) whose ONLY readers are inside the absorbed cluster (the DELTA_NET through its permute
+// views) is not copied into place: the recurrence reads it straight from the scratch through a shallow copy of the
+// DELTA_NET node whose q/k/v/g sources point into the scratch. Same kernels, same values, same order: bit-identical; it
+// removes up to 4 DtoD copies (+ their stream gaps) per DeltaNet layer. A reader after the cluster (index, or the scan
+// when the index declines) keeps the copy. =0 restores the copies. Unset = off here; the V70 cell rule (src/llama.cpp
+// pxa_one_v100_q35: qwen35 on one sm_70 device) sets it to 1 (measured +1.5% server decode, sha identical 6/6).
+// ggml/src/ggml-backend.cpp (review-kernels L1): does this cgraph reach the end of the whole graph (no unseen later split
+// or callback chunk)? Unknown views answer false.
+extern "C" bool ggml_backend_pxa_graph_reaches_end(const struct ggml_cgraph * cgraph);
+static inline bool pxa_dn_cf_direct_on() {
+    static const bool v = [] { const char * e = getenv("PXA_DN_CF_DIRECT"); return e ? atoi(e) != 0 : false; }();
+    return v;
+}
+// does any real node after `last` read T (directly or through a view of T)? A graph output (T, or a view of T,
+// flagged OUTPUT: the host reads it after the graph) counts as a reader. The caller has already checked that the
+// cgraph reaches the end of the whole graph (no unseen later split or callback chunk) and that T is a plain
+// compute-buffer tensor (not a view, not in a persistent buffer).
+static bool pxa_dn_read_after(const ggml_cgraph * cgraph, int first, int last, const ggml_tensor * T) {
+    if (T->flags & GGML_TENSOR_FLAG_OUTPUT) return true;
+    auto outv = [&](const ggml_tensor * n) -> bool { return n->view_src == T && (n->flags & GGML_TENSOR_FLAG_OUTPUT); };
+    auto rd = [&](const ggml_tensor * n) -> bool { return !ggml_is_noop(n) && pxa_dn_reads(n, T); };
+    auto scan = [&]() -> bool {
+        for (int k = first; k < cgraph->n_nodes; ++k) if (outv(cgraph->nodes[k])) return true;
+        for (int k = last + 1; k < cgraph->n_nodes; ++k) if (rd(cgraph->nodes[k])) return true;
+        return false;
+    };
+    int c[16]; int nc = 0;
+    if (pxa_dn_readers(cgraph, T, c, nc)) {
+        bool o = false;
+        for (int q = 0; q < nc && !o; ++q) {
+            const ggml_tensor * n = cgraph->nodes[c[q]];
+            o = outv(n) || (c[q] > last && rd(n));
+        }
+        if (pxa_dn_gdead_check_on() && o != scan()) {
+            fprintf(stderr, "PXA_DN_GDEAD_CHECK: cf-direct readers index=%d scan=%d after node %d (%s)\n", (int) o, (int) !o, last, T->name);
+            GGML_ABORT("PXA_DN_GDEAD_CHECK cf-direct");
+        }
+        return o;
+    }
+    return scan();
+}
+
 static int pxa_try_deltanet_convfuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int ci) {
     int a = -1;
     pxa_dn_cl P;
@@ -2035,16 +2193,63 @@ static int pxa_try_deltanet_convfuse(ggml_backend_cuda_context & ctx, const ggml
             optr[3], (int) alpha->ne[0], sp_n);
     }
     CUDA_CHECK(cudaGetLastError());
+    const int consumed = (a - ci) + 22 + P.extra;
+    int direct = 0;
+    if (P.ny == 1 && P.cf_scratch && pxa_dn_cf_direct_on() && ggml_backend_pxa_graph_reaches_end(cgraph)) {
+        for (int k = 0; k < 4; ++k) {
+            const ggml_tensor * o = outs[k];
+            if (!(P.cf_scratch & (1 << k)) || o->view_src != nullptr || o->buffer == nullptr ||
+                ggml_backend_buffer_get_usage(o->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) continue;
+            if (!pxa_dn_read_after(cgraph, ci, ci + consumed, o)) direct |= 1 << k;
+        }
+        // a recurrence source that overlaps a direct output without lying inside it (it straddles two outputs, or an
+        // output and other memory) cannot be pointed into one scratch: that output keeps its copy
+        for (int q = 0; q < 5 && direct; ++q) {
+            const ggml_tensor * t = P.D->src[q];
+            if (!t || !t->data) continue;
+            const char * p0 = (const char *) t->data;
+            const char * p1 = p0 + ggml_nbytes(t);
+            for (int k = 0; k < 4; ++k) {
+                if (!(direct & (1 << k))) continue;
+                const char * lo = (const char *) outs[k]->data;
+                const char * hi = lo + ggml_nbytes(outs[k]);
+                if (p1 > lo && p0 < hi && (p0 < lo || p1 > hi)) direct &= ~(1 << k);
+            }
+        }
+    }
     for (int k = 0; k < 4; ++k) {
-        if (P.cf_scratch & (1 << k)) {
+        if ((P.cf_scratch & (1 << k)) && !(direct & (1 << k))) {
             CUDA_CHECK(cudaMemcpyAsync(outs[k]->data, optr[k], ggml_nbytes(outs[k]), cudaMemcpyDeviceToDevice, ctx.stream()));
         }
     }
-    ggml_cuda_op_delta_net_ex3(ctx, P.D, P.state_base + P.conv_elems, P.state_idx, P.state_row_stride,
+    // PXA_DN_CF_DIRECT: the recurrence's q/k/v/g sources that lie inside a direct output read the scratch instead
+    ggml_tensor Dl, Sl[5];
+    ggml_tensor * Dr = P.D;
+    if (direct) {
+        Dl = *P.D;
+        for (int q = 0; q < 5; ++q) {
+            const ggml_tensor * t = P.D->src[q];
+            if (!t || !t->data) continue;
+            const char * p = (const char *) t->data;
+            for (int k = 0; k < 4; ++k) {
+                if (!(direct & (1 << k))) continue;
+                const char * lo = (const char *) outs[k]->data;
+                const char * hi = lo + ggml_nbytes(outs[k]);
+                if (p < lo || p + ggml_nbytes(t) > hi) continue;
+                Sl[q] = *t;
+                Sl[q].data = (char *) optr[k] + (p - lo);
+                Dl.src[q] = &Sl[q];
+                break;
+            }
+        }
+        Dr = &Dl;
+    }
+    ggml_cuda_op_delta_net_ex3(ctx, Dr, P.state_base + P.conv_elems, P.state_idx, P.state_row_stride,
                                inplace ? (const float *) pxa_dn_carry_pending.MSK->data : nullptr);
     if (inplace) pxa_dn_carry_pending.active = false;
     pxa_dn_fire_log(P.ny > 1 ? "dn-convfuse-ny" : "dn-convfuse", true);
     pxa_dn_fire_log("dn-inplace", inplace);
     pxa_dn_fire_log("row-absorb", true);
-    return (a - ci) + 22 + P.extra;
+    if (P.ny == 1 && P.cf_scratch && pxa_dn_cf_direct_on()) pxa_dn_fire_log("dn-cf-direct", direct == P.cf_scratch);
+    return consumed;
 }

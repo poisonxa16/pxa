@@ -1,3 +1,4 @@
+#include "pxa-env-flag.h"
 #include "speculative.h"
 #include "pxa-mtp-batch-slots.h"
 #include "pxa-mtp-cache-only.h"
@@ -55,13 +56,48 @@ static bool pxa_mtp_prefetch_enabled() {
 // separate commit decode. Needs PXA_VERIFY_ARGMAX=1 and PXA_VERIFY_GRAPH_CACHE>=w; only a single-sequence
 // pure-greedy verify folds, everything else commits as before. Greedy output is unchanged: only which
 // draft token the next round proposes (and the head's K/V rows it attends to) come from the fold.
-// PXA_VERIFY_NO_LOGITS_COPY (default OFF; src/llama-build-context.cpp has the graph half): the Gemma-4
+// PXA_VERIFY_NO_LOGITS_COPY (default OFF, on in the Gemma-4 / Flash-Next V100 sets of src/llama.cpp, =0 off;
+// src/llama-build-context.cpp has the graph half): the Gemma-4
 // assistant drafter's argmax draw reads the device argmax instead of a full logit row. Only when the
 // draw is a plain argmax whose probability decides nothing (p_min <= 0, no depth cutoff, no
 // PXA_MTP_STATS, no PXA_SPEC_SAMPLED request sampler); every other case keeps the logits copy.
 static bool pxa_nlc_on() {
     static const bool v = [] { const char * e = getenv("PXA_VERIFY_NO_LOGITS_COPY"); return e && *e && atoi(e) != 0; }();
     return v;
+}
+// PXA_DRAFT_ARGMAX (default ON, =0 off; the engine scopes it by arch, src/llama-build-context.cpp pxa_amax_draft_ok):
+// the qwen35moe drafter's greedy draw reads the device argmax row even when p_min > 0. The device top-1 probability
+// (full softmax over the head's columns) is a lower bound of the top-k-renormalised one the host gate compares, so
+// it decides the gate only when it clears p_min by PXA_DRAFT_ARGMAX_MARGIN (default 1e-3); any other draw fetches
+// the row (llama_get_logits_ith fills it from the device) and the host decides as before. PXA_DRAFT_ARGMAX_CHECK=1
+// recomputes every device-decided draw on the host and counts token / gate disagreements (expected 0).
+static bool pxa_dargmax_on() {
+    static const bool v = [] { const char * e = getenv("PXA_DRAFT_ARGMAX"); return !(e && *e && pxa_env_value_off(e)); }();
+    return v;
+}
+static float pxa_dargmax_margin() {
+    static const float v = [] { const char * e = getenv("PXA_DRAFT_ARGMAX_MARGIN"); const float m = e ? (float) atof(e) : 1e-3f; return m >= 0.0f ? m : 1e-3f; }();
+    return v;
+}
+static bool pxa_dargmax_check_on() {
+    static const bool v = [] { const char * e = getenv("PXA_DRAFT_ARGMAX_CHECK"); return e && *e && atoi(e) != 0; }();
+    return v;
+}
+struct pxa_dargmax_stats { std::atomic<uint64_t> dev{0}, devf{0}, host{0}, chk{0}, bad_tok{0}, bad_gate{0}; };
+static pxa_dargmax_stats & pxa_dargmax_st() {
+    static pxa_dargmax_stats st;
+    static const bool armed = [] {
+        atexit([] {
+            auto & s = pxa_dargmax_st();
+            if (s.dev + s.devf + s.host == 0) return;
+            fprintf(stderr, "PXA_DRAFT_ARGMAX: %llu device pass / %llu device fail / %llu host draft draws; check %llu, %llu token / %llu gate mismatches\n",
+                    (unsigned long long) s.dev.load(), (unsigned long long) s.devf.load(), (unsigned long long) s.host.load(), (unsigned long long) s.chk.load(),
+                    (unsigned long long) s.bad_tok.load(), (unsigned long long) s.bad_gate.load());
+        });
+        return true;
+    }();
+    (void) armed;
+    return st;
 }
 static bool pxa_mtp_fold_on() {
     static const bool v = [] { const char * e = getenv("PXA_MTP_FOLD"); return e && *e && atoi(e) != 0; }();
@@ -446,7 +482,7 @@ struct common_speculative_state {
 };
 
 static bool pxa_g4_gate_on() {
-    static const bool v = [](){ const char * e = getenv("PXA_GEMMA4_MTP_GATE"); return !(e && atoi(e) == 0); }();
+    static const bool v = [](){ const char * e = getenv("PXA_GEMMA4_MTP_GATE"); return !(e && pxa_env_value_off(e)); }();
     return v;
 }
 static int pxa_g4_backoff_max() {
@@ -674,6 +710,37 @@ static bool pxa_mtp_adaptive_k_enabled() {
     return v != 0;
 }
 
+// PXA_MTP_DEEP=B[:PD[:T]] (2026-10-25, default off; =0 off): acceptance-adaptive draft depth UPWARD, the
+// counterpart of PXA_MTP_ADAPTIVE_K. The configured n_max stays the ceiling (the batch, KV and verify reserves are sized
+// from it, so no chain ever exceeds it). While the running acceptance EMA is >= T (default 0.80) the chain may run to
+// n_max with the p_min floor lowered to PD (default 0.5); below T it is capped at min(B, n_max) (default 3) with the
+// configured p_min. The EMA folds the accept ratio of the first B draft positions only, so a deep chain's lower tail
+// acceptance does not knock it back to the base depth. Greedy output is unchanged: only how many draft tokens the
+// verifier sees changes, and the qwen4exp verify columns are bitwise one-token decode up to width 8.
+struct pxa_mtp_deep_cfg { bool on; int base; float pmin_deep; float thr; };
+static const pxa_mtp_deep_cfg & pxa_mtp_deep() {
+    static const pxa_mtp_deep_cfg c = [] {
+        pxa_mtp_deep_cfg r{false, 3, 0.5f, 0.80f};
+        const char * e = getenv("PXA_MTP_DEEP");
+        if (!e || !*e || atof(e) <= 0.0f) return r;
+        float b = 3.0f, pd = 0.5f, t = 0.80f;
+        if (sscanf(e, "%f:%f:%f", &b, &pd, &t) < 1) return r;
+        r.on = true; r.base = std::max(1, (int) b); r.pmin_deep = pd; r.thr = t;
+        fprintf(stderr, "PXA_MTP_DEEP: on (base depth %d below acceptance EMA %.2f; at or above it n_max with p_min %.2f)\n",
+                r.base, (double) r.thr, (double) r.pmin_deep);
+        return r;
+    }();
+    return c;
+}
+static bool pxa_mtp_ak_track() { return pxa_mtp_adaptive_k_enabled() || pxa_mtp_deep().on; }
+// returns the chain depth for this cycle and lowers p_min when the chain runs deep
+static int pxa_mtp_deep_apply(float ema, int n_draft, float & p_min) {
+    const auto & d = pxa_mtp_deep();
+    if (!d.on) return n_draft;
+    if (ema >= d.thr) { p_min = std::min(p_min, d.pmin_deep); return n_draft; }
+    return std::min(n_draft, d.base);
+}
+
 // PXA_MTP_STATS (2026-09-08): per-cycle accounting of the MTP self-speculation
 // loop, so the reason a draft chain is SHORT is measurable instead of inferred. Off by default
 // (one getenv-cached bool); PXA_MTP_STATS=1 turns it on, PXA_MTP_STATS_EVERY (default 200) sets
@@ -810,6 +877,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
     // PXA_MTP_DRAFT_GUARD: per-seq request sampler, registered whatever PXA_SPEC_SAMPLED says
     std::unordered_map<llama_seq_id, common_sampler *> pxa_guard_smpl_by_seq;
     std::unordered_map<llama_seq_id, std::vector<std::vector<pxa_spec_cand>>> pxa_draft_q_by_seq;
+    // PXA_SPEC_EXACT_NMIN_v1: per-seq, the pre-draw length bound of the SAMPLED draft this seq last
+    // produced (see pxa_spec_nmin_len); -1 = greedy draft, no draft, or PXA_SPEC_EXACT=0. Cleared and
+    // set together with pxa_draft_q_by_seq.
+    std::unordered_map<llama_seq_id, int> pxa_draft_pre_len_by_seq;
 
     // Gemma-4 assistant drafter acceptance gate (PXA_GEMMA4_MTP_GATE, default on). One MTP cycle costs a
     // 2-row MoE verify plus a draft step (~14 ms against 8.4 ms for a plain token on a V100), so a draft
@@ -820,6 +891,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
     // whatever is drafted is untouched.
     float    pxa_g4_ema      = 0.85f;
     bool     pxa_nlc_prob_free = false;   // PXA_VERIFY_NO_LOGITS_COPY: set by the draft call (p_min <= 0 etc.)
+    bool     pxa_dargmax_ok    = false;   // PXA_DRAFT_ARGMAX: the drawn probability decides only p_min (set by the draft call)
+    float    pxa_dargmax_pmin  = -1.0f;   // PXA_DRAFT_ARGMAX: the p_min of the last draft call (< 0: none yet)
     uint32_t pxa_g4_drafted  = 0;    // tokens the last draft() emitted; consumed by accept()
     int      pxa_g4_skip     = 0;    // steps left to sit out
     bool     pxa_sel_owned   = false; // PXA_SPEC_SELECT is armed on this chain: it decides plain vs draft, the gate stands down
@@ -1059,11 +1132,17 @@ struct common_speculative_state_mtp : public common_speculative_state {
         );
         pxa_g4_drafted = constant_draft_positions ? (uint32_t) result.size() : 0;
 
+        // PXA_SPEC_EXACT_NMIN_v1: the expert-cache cuts below look at the drafted TOKENS (their cold-expert
+        // bill) to decide how many to keep. For an argmax draft that is fine (exact-match verify); for a
+        // sampled draft it keeps x_i depending on x_i, which biases the output exactly like the old p_min
+        // gate did. Under PXA_SPEC_EXACT they are skipped for sampled drafts (all default off anyway).
+        const bool pxa_exact_sampled = pxa_draft_pre_len_by_seq.count(seq_id) > 0;
+
         // PXA_XCACHE_MTP_RESIDENT (2026-10-07, expert-cache draft budget): default off. A 4-wide verify is 1.8-1.9x a
         // plain round, and about 70% of rounds already fall back to plain. When armed, drop the
         // unaccepted tail if the draft miss bill exceeds PXA_XCACHE_MTP_RESIDENT_MS (default 3000).
         // Bill is cold layers * 484 us * draft_len / 4. Budget is microseconds, default 3000.
-        if (!result.empty()) {
+        if (!result.empty() && !pxa_exact_sampled) {
             static const int arm = getenv("PXA_XCACHE_MTP_RESIDENT") ? atoi(getenv("PXA_XCACHE_MTP_RESIDENT")) : 0;
             static const int budget = getenv("PXA_XCACHE_MTP_RESIDENT_MS") ? atoi(getenv("PXA_XCACHE_MTP_RESIDENT_MS")) : 3000;
             if (arm && budget > 0) {
@@ -1147,8 +1226,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
             st.acc_hist[n_accepted < 8 ? n_accepted : 8] += 1;
         }
         // PXA_MTP_ADAPTIVE_K: fold the realized accept ratio into the running EMA that drives K.
-        if (pxa_mtp_adaptive_k_enabled() && n_tested(pxa_ak_drafted) > 0) {
+        if (pxa_mtp_ak_track() && n_tested(pxa_ak_drafted) > 0) {
             float f = (float) n_accepted / (float) n_tested(pxa_ak_drafted); // bug #228
+            if (pxa_mtp_deep().on) {   // PXA_MTP_DEEP: the first B positions only (depth-independent)
+                const int b = pxa_mtp_deep().base;
+                f = (float) std::min<int>((int) n_accepted, b) / (float) std::min<int>((int) n_tested(pxa_ak_drafted), b);
+            }
             if (f > 1.0f) f = 1.0f;
             pxa_ak_ema = 0.85f * pxa_ak_ema + 0.15f * f;
             pxa_ak_drafted = 0;
@@ -1981,6 +2064,9 @@ struct common_speculative {
     void * sel = nullptr;
     int    sel_n_active = 1;                                // slots decoding this tick (set by the server)
     std::unordered_map<llama_seq_id, bool> sel_no_draft;    // the last round of this seq verified no draft
+    // PXA_SPEC_LAZY_HIDDEN (2026-10-24): a plain round leaves the target's hidden row on the device and only marks the
+    // stored copy stale; the selector's MTP pick fetches it (ensure_sequence_hidden) right before the drafter reads it
+    bool   sel_lazy_hidden = false;
 
     common_speculative() = default;
     common_speculative(std::vector<common_speculative_config> c, std::vector<std::unique_ptr<common_speculative_state>> i)
@@ -2176,7 +2262,7 @@ done:
 // initialization of the speculative decoding system
 //
 // PXA_SPEC_SELECT: 1 arms the selector (needs libggml-pxqn), 0 never does. Default OFF until the cell matrix says
-// otherwise (ledger spec-selfmeasuring-selector).
+// otherwise.
 static constexpr bool PXA_SPEC_SELECT_DEFAULT = false;
 // -1 = PXA_SPEC_SELECT is not set (the per-model table below may then decide), 0 = set off, 1 = set on
 static int pxa_spec_select_env() {
@@ -2193,6 +2279,46 @@ static int pxa_spec_select_env() {
 static bool pxa_spec_select_enabled() {
     const int e = pxa_spec_select_env();
     return e < 0 ? PXA_SPEC_SELECT_DEFAULT : e != 0;
+}
+
+bool common_speculative_pxa_drop_shallow_front(common_params_speculative & params, llama_context * ctx_tgt) {
+    if (!params.pxa_ngram_auto_front) {
+        return false;
+    }
+    int cap = -1;   // the n_max common_speculative_init's checkpoint clamp would give every stage (-1 = none)
+    const bool applies = params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_AUTO || params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_PER_STEP ||
+                         params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_REPLAY;
+    if (applies && ctx_tgt && llama_model_has_recurrent(llama_get_model(ctx_tgt))) {
+        const int want   = std::max(1, params.get_max_stage_n_max() + 1);
+        const int afford = llama_spec_ckpt_budget_max_tokens(ctx_tgt, want);
+        if (afford >= 2 && afford < want) {
+            cap = afford - 1;
+        } else if (afford < 2 && want > 2) {
+            const char * e = getenv("PXA_SPEC_CKPT_CLAMP1");
+            if (!(e && pxa_env_value_off(e))) cap = 1;
+        }
+    }
+    if (cap < 0) {
+        return false;   // no clamp: the table keeps its own depth; common_speculative_init decides with the same numbers
+    }
+    // decide on a copy clamped the way common_speculative_init clamps, then drop from the real chain
+    common_params_speculative probe = params;
+    for (auto & st : probe.stages) {
+        if ((st.has_n_max_override() ? st.n_max : probe.n_max) > cap) st.n_max = cap;
+    }
+    if (probe.n_max > cap) probe.n_max = cap;
+    int t = 0, h = 0;
+    if (!common_speculative_drop_shallow_ngram_front(probe, &t, &h)) {
+        params.pxa_ngram_auto_front = probe.pxa_ngram_auto_front;   // cleared, or kept when the env said keep
+        return false;
+    }
+    params.pxa_ngram_auto_front = false;
+    params.stages.erase(params.stages.begin());
+    const auto rs = params.get_resolved_stages();
+    params.type = rs.empty() ? COMMON_SPECULATIVE_TYPE_NONE : rs.front().type;
+    LOG_INF("%s: PXA_SPEC_MTP_NGRAM: the checkpoint budget holds the n-gram table to %d tokens, no deeper than the MTP head's %d, "
+            "so it could not add a token: MTP alone (PXA_SPEC_MTP_NGRAM_SHALLOW=1 keeps the table)\n", __func__, t, h);
+    return true;
 }
 
 common_speculative * common_speculative_init(
@@ -2216,7 +2342,8 @@ common_speculative * common_speculative_init(
     // small shadows whatever the draft length is, so clamping the chain for them would cost draft
     // depth for nothing.
     const bool pxa_ckpt_budget_applies = params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_AUTO ||
-                                         params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_PER_STEP;
+                                         params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_PER_STEP ||
+                                         params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_REPLAY;   // PXA_SPEC_CKPT_REPLAY
     if (pxa_ckpt_budget_applies && llama_model_has_recurrent(llama_get_model(ctx_tgt))) {
         const int want   = std::max(1, params.get_max_stage_n_max() + 1);
         const int afford = llama_spec_ckpt_budget_max_tokens(ctx_tgt, want);
@@ -2254,7 +2381,7 @@ common_speculative * common_speculative_init(
             // leaving the depth as asked. Measured on a V100 (27B PXQN 3.97 bpw, -c 131072 q4_0, -ub 512): the
             // default depth 3 then failed to boot (MTP context GEMM pool OOM) while an explicit mtp:n_max=1
             // boots at 15981 MiB and decodes +50% over plain. 0 = the old behaviour.
-            static const bool clamp1 = [](){ const char * e = getenv("PXA_SPEC_CKPT_CLAMP1"); return !(e && atoi(e) == 0); }();
+            static const bool clamp1 = [](){ const char * e = getenv("PXA_SPEC_CKPT_CLAMP1"); return !(e && pxa_env_value_off(e)); }();
             if (clamp1 && want > 2) {
                 LOG_WRN("%s: recurrent checkpoint budget: this context cannot afford even a two-token per-step "
                         "checkpoint by the budget; every stage is clamped to n_max=1 (PXA_SPEC_CKPT_CLAMP1=0 -> leave it)\n", __func__);
@@ -2270,6 +2397,20 @@ common_speculative * common_speculative_init(
                 LOG_WRN("%s: recurrent checkpoint budget: this context cannot afford even a two-token per-step "
                         "checkpoint; the checkpoint mode is left to resolve itself\n", __func__);
             }
+        }
+    }
+
+    // PXA_SPEC_MTP_NGRAM_SHALLOW_v1 (2026-10-20): the auto n-gram stage in front of MTP pays for itself
+    // only when it can draft DEEPER than the head. When the checkpoint budget clamps it to the head's depth or less, it never
+    // adds a token and only costs its per-step lookup: measured on one V100-16GB, 27B PXQN4 W3, -c 8192, f16 KV (budget 4 ->
+    // table n_max 3 = the head's 3): prose -1.24% (se 0.37%, REPS 6 paired), code +0.3%, chat +0.1%, draft counts identical.
+    // So the auto rule falls back to MTP alone there. PXA_SPEC_MTP_NGRAM=1 (forced) keeps the table whatever its depth;
+    // PXA_SPEC_MTP_NGRAM_SHALLOW=1 keeps it too (the old behaviour).
+    {
+        int t_n = 0, h_n = 0;
+        if (common_speculative_drop_shallow_ngram_front(params, &t_n, &h_n)) {
+            LOG_INF("%s: PXA_SPEC_MTP_NGRAM: the checkpoint budget holds the n-gram table to %d tokens, no deeper than the MTP head's %d, "
+                    "so it could not add a token: MTP alone (PXA_SPEC_MTP_NGRAM_SHALLOW=1 keeps the table)\n", __func__, t_n, h_n);
         }
     }
 
@@ -2347,14 +2488,32 @@ common_speculative * common_speculative_init(
         configs.push_back(common_speculative_config(stage, stage_params));
     }
 
+    // PXA_MTP_FALLBACK_RELEASE (default 1): when THIS call allocated the recurrent checkpoint buffers and the
+    // chain then fails to build (the MTP context misses the GEMM-pool floor), free them before returning
+    // nullptr - the server's auto fallback decodes plain and would otherwise carry them for the life of the
+    // process (155 MiB at 2 tokens on the 27B, on the card that was already too tight). =0: keep them.
+    bool pxa_ckpt_ours = false;
+    auto pxa_ckpt_giveback = [&]() {
+        static const bool on = [](){ const char * e = getenv("PXA_MTP_FALLBACK_RELEASE"); return !(e && pxa_env_value_off(e)); }();
+        if (pxa_ckpt_ours && on) {
+            const size_t freed = llama_spec_ckpt_release(ctx_tgt);
+            LOG_WRN("%s: the speculative chain was not built; released its recurrent checkpoint buffers (%.2f MiB) "
+                    "(PXA_MTP_FALLBACK_RELEASE=0 keeps them)\n", __func__, freed / 1048576.0);
+            pxa_ckpt_ours = false;
+        }
+    };
+
     if (!configs.empty() && llama_model_has_recurrent(llama_get_model(ctx_tgt))) {
         const int ckpt_tokens = std::max(1, params.get_max_stage_n_max() + 1);
+        const bool pxa_ckpt_fresh = llama_spec_ckpt_fixed_mode(ctx_tgt) == LLAMA_SPEC_CKPT_NONE;
         const int actual_mode = llama_spec_ckpt_init(ctx_tgt, params.recurrent_ckpt_mode, ckpt_tokens);
+        pxa_ckpt_ours = pxa_ckpt_fresh && actual_mode != LLAMA_SPEC_CKPT_NONE;
         if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
             LOG_ERR("%s: failed to prepare recurrent checkpoint mode '%s' during speculative init (max_tokens=%d)\n",
                     __func__,
                     params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_PER_STEP ? "per-step" :
                     params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_GPU_FALLBACK ? "gpu-fallback" :
+                    params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_REPLAY ? "replay" :
                     params.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_CPU ? "cpu" : "auto",
                     ckpt_tokens);
             if (ctx_dft != nullptr) {
@@ -2404,9 +2563,17 @@ common_speculative * common_speculative_init(
 
                 if (!ctx_mtp && !pxa_defer) {
                     const llama_model * model = llama_get_model(ctx_tgt);
-                    ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), config.params.cparams_dft);
+                    // PXA_MTP_INIT_FAULT=1 (test hook, bug #344): behave as if the MTP context did not fit, so the server's
+                    // plain-decode fallback can be proven on a CPU with a tiny model (tests/mtp-init-fallback-tiny-test.sh)
+                    static const bool pxa_mtp_init_fault = getenv("PXA_MTP_INIT_FAULT") && atoi(getenv("PXA_MTP_INIT_FAULT")) != 0;
+                    if (pxa_mtp_init_fault) {
+                        LOG_WRN("%s: PXA_MTP_INIT_FAULT: the MTP context is refused as if it did not fit (test hook)\n", __func__);
+                    } else {
+                        ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), config.params.cparams_dft);
+                    }
                     if (!ctx_mtp) {
                         LOG_ERR("%s: failed to create MTP context\n", __func__);
+                        pxa_ckpt_giveback();
                         return nullptr;
                     }
                     if (use_shared) {
@@ -2477,6 +2644,7 @@ common_speculative * common_speculative_init(
 
     if (impls.empty()) {
         LOG_WRN("%s", "no implementations specified for speculative decoding\n");
+        pxa_ckpt_giveback();
         return nullptr;
     }
 
@@ -2578,14 +2746,47 @@ common_speculative * common_speculative_init(
                 plain_with_companion = e && *e ? atoi(e) != 0 : pxa_sel_table;
             }
             cfg.flags = (!has_mtp || constant_pos || plain_with_companion) ? GGML_PXQN_SPEC_FLAG_PLAIN_OK : 0u;
+            // PXA_SPEC_SELECT_PLAIN_FIRST: every request starts in plain until plain is priced at its depth (3 clean rounds);
+            // plain's fresh price against its last price is a depth gauge: moved, and the drafter's cost line (measured at
+            // the old context length) is rescaled, mostly forgotten and probed at once; not moved, and the incumbent runs on,
+            // with the MTP probe keeping its long gap across the boundary while plain leads by a wide margin. On by default
+            // only where the per-model table armed the selector over an assistant drafter that reads the target's KV (the
+            // Gemma 4 row: one V100 at an 8k prompt paid 14-19 drafter rounds per 512 tokens at 1.8x a plain round);
+            // PXA_SPEC_SELECT_PLAIN_FIRST=0 restores the old schedule, =1 asks for it on any chain with plain legal.
+            bool plain_first = false;
+            if (has_mtp && (cfg.flags & GGML_PXQN_SPEC_FLAG_PLAIN_OK)) {
+                const char * e = getenv("PXA_SPEC_SELECT_PLAIN_FIRST");
+                plain_first = e && *e ? atoi(e) != 0 : (pxa_sel_table && constant_pos);
+            }
+            if (plain_first) {
+                cfg.flags |= GGML_PXQN_SPEC_FLAG_PLAIN_FIRST;
+            }
+            // PXA_SPEC_LAZY_HIDDEN: no per-token drafter work in a plain round. The assistant drafter reads the target's
+            // KV, so the only thing a plain round hands it is the last hidden row (11 KB D2H + a host copy on the Gemma 4
+            // 26B row, every token). With this on that row stays on the device until the selector picks the drafter;
+            // most rounds never read it. Same row, same draft, same tokens. On by default where the per-model table armed
+            // the selector over an assistant drafter (constant draft positions); PXA_SPEC_LAZY_HIDDEN=0 off, =1 asks for
+            // it on any constant-position chain with plain legal.
+            bool lazy_hidden = false;
+            if (has_mtp && constant_pos && (cfg.flags & GGML_PXQN_SPEC_FLAG_PLAIN_OK) && ctx_tgt != nullptr) {
+                const char * e = getenv("PXA_SPEC_LAZY_HIDDEN");
+                lazy_hidden = e && *e ? atoi(e) != 0 : pxa_sel_table;
+            }
             result->sel = ggml_pxqn_spec_create(&cfg);
             if (result->sel) {
                 if (auto * ms = common_speculative_get_mtp_state(result)) {
                     ms->pxa_sel_owned = true;
                 }
+                if (lazy_hidden) {
+                    result->sel_lazy_hidden = true;
+                    llama_set_embd_lazy(ctx_tgt, true);
+                    LOG_INF("%s: PXA_SPEC_LAZY_HIDDEN: a plain round leaves the hidden row on the device; the drafter fetches it "
+                            "when the selector picks it (=0 off)\n", __func__);
+                }
                 LOG_INF("%s: PXA_SPEC_SELECT: the self-measuring selector is deciding per round (table stage %s, MTP depth %d, "
-                        "plain round %s); the static rows stay as the fallback, PXA_SPEC_SELECT=0 turns it off\n", __func__,
-                        has_ngram ? "yes" : "no", mtp_n_max, (cfg.flags & GGML_PXQN_SPEC_FLAG_PLAIN_OK) ? "legal" : "not offered");
+                        "plain round %s%s); the static rows stay as the fallback, PXA_SPEC_SELECT=0 turns it off\n", __func__,
+                        has_ngram ? "yes" : "no", mtp_n_max, (cfg.flags & GGML_PXQN_SPEC_FLAG_PLAIN_OK) ? "legal" : "not offered",
+                        (cfg.flags & GGML_PXQN_SPEC_FLAG_PLAIN_FIRST) ? ", plain first with a depth gauge per request (PXA_SPEC_SELECT_PLAIN_FIRST=0 off)" : "");
             }
         } else if (!eligible || other_gate) {
             LOG_INF("%s: PXA_SPEC_SELECT: not armed (%s)\n", __func__,
@@ -2702,6 +2903,7 @@ llama_tokens common_speculative_draft(
             if (qit != qst->pxa_draft_q_by_seq.end()) {
                 qit->second.clear();
             }
+            qst->pxa_draft_pre_len_by_seq.erase(draft_seq_id);   // PXA_SPEC_EXACT_NMIN_v1
         }
     }
 
@@ -2774,6 +2976,12 @@ llama_tokens common_speculative_draft(
             if (mtp_i < 0) {
                 return;
             }
+            // PXA_SPEC_LAZY_HIDDEN: the server skipped the per-tick ensure; fetch the row now that the drafter runs
+            if (spec->sel_lazy_hidden && draft_base_pos > 0) {
+                if (auto * ms = common_speculative_get_mtp_state(spec); ms != nullptr && ms->ctx_tgt != nullptr) {
+                    (void) common_speculative_ensure_sequence_hidden(spec, ms->ctx_tgt, draft_seq_id, draft_base_pos - 1);
+                }
+            }
             common_params_speculative ip = mtp_params;
             if (width > 0 && ip.n_max > width) {
                 ip.n_max = width;
@@ -2802,8 +3010,14 @@ llama_tokens common_speculative_draft(
                 break;
             default:   // STATIC: the chain's own order, table first
                 if (ng_i >= 0) {
-                    result = std::move(ng_draft);
-                    win((size_t) ng_i, result);
+                    const int mtp_ceiling = mtp_i >= 0 ? mtp_params.n_max : 0;
+                    const int copy = ggml_pxqn_spec_copy_wins((int32_t) ng_draft.size(), mtp_ceiling);
+                    if (copy < 0) {
+                        run_mtp(0);   // the copy is shorter than the MTP ceiling; it does not replace the head
+                    } else {
+                        result = std::move(ng_draft);
+                        win((size_t) ng_i, result);
+                    }
                 } else {
                     run_mtp(0);
                 }
@@ -2840,6 +3054,23 @@ llama_tokens common_speculative_draft(
             impl->n_draft_below_floor++; // PXA_SPEC_STAGE_DIAG_v1
             result.clear();
             continue;
+        }
+        // A long prompt-copy replaces the MTP head. A shorter one is not a replacement: drop it
+        // and ask MTP. No opinion (0) keeps today's rule, which stops at this draft.
+        if (common_speculative_type_is_self_spec(impl->type)) {
+            int mtp_max = 0;
+            for (size_t j = i + 1; j < spec->impls.size(); ++j) {
+                if (spec->impls[j]->type != COMMON_SPECULATIVE_TYPE_MTP) {
+                    continue;
+                }
+                const auto & later = use_runtime_stage_overrides ? runtime_stages[j] : spec->configs[j].stage;
+                mtp_max = common_speculative_get_runtime_params(spec->configs[j], params, later).n_max;
+                break;
+            }
+            if (ggml_pxqn_spec_copy_wins((int32_t) result.size(), mtp_max) < 0) {
+                result.clear();
+                continue;
+            }
         }
         LOG_DBG("%s: called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n", __func__,
                 common_speculative_type_to_str(impl.get()->type).c_str(), prompt_tgt.size(),
@@ -2976,6 +3207,10 @@ bool common_speculative_select_no_draft(const common_speculative * spec, llama_s
     }
     const auto it = spec->sel_no_draft.find(seq_id);
     return it != spec->sel_no_draft.end() && it->second;
+}
+
+bool common_speculative_lazy_hidden(const common_speculative * spec) {
+    return spec != nullptr && spec->sel != nullptr && spec->sel_lazy_hidden;
 }
 
 static bool common_speculative_has_type(const common_speculative * spec, common_speculative_type type) {
@@ -3550,7 +3785,7 @@ static llama_token pxa_spec_draw_draft(common_speculative_state_mtp & state, lla
         }
     }
     // PXA_VERIFY_NO_LOGITS_COPY: the last decode on ctx was argmax-only (pxa_nlc_request) -> its row
-    if (pxa_nlc_on()) {
+    if (pxa_nlc_on() && state.pxa_nlc_prob_free) {
         float p_top = 0.0f;
         const llama_token id = llama_get_argmax_ith(ctx, idx, &p_top);
         if (id >= 0) {
@@ -3560,13 +3795,74 @@ static llama_token pxa_spec_draw_draft(common_speculative_state_mtp & state, lla
             return id;
         }
     }
+    // PXA_DRAFT_ARGMAX: the device row decides when the gate cannot go the other way; else the exact host draw below.
+    // The host gate compares p = 1 / sum_{top k} e^(l - max) (k = PXA_MTP_PMIN_TOPK, or the full softmax at k < 2). From the
+    // device row (max, S = sum_all e^(l - max), d2 = max2 - max): S bounds the top-k sum from above and 1 + e^d2 from below,
+    // and 1 + (k - 1) e^d2 from above, so p lies in [1 / min(S, 1 + (k-1) e^d2), 1 / (1 + e^d2)]. The draw is decided on the
+    // device when that whole interval sits on one side of p_min by the margin.
+    if (pxa_dargmax_on() && state.pxa_dargmax_ok) {
+        float p_top = 0.0f;
+        const llama_token id = llama_get_argmax_ith(ctx, idx, &p_top);
+        if (id >= 0 && !llama_get_argmax_softfailed(ctx)) {
+            auto & st = pxa_dargmax_st();
+            const float pmin = state.pxa_dargmax_pmin;
+            const float mg   = pxa_dargmax_margin();
+            int   decided = 0;     // 1 = passes the gate, -1 = fails it, 0 = fetch the row
+            float pv      = p_top;
+            if (out_prob == nullptr) {
+                decided = 1;
+            } else if (pmin >= 0.0f) {
+                const int    k  = pxa_mtp_pmin_topk();
+                const float  d2 = llama_get_argmax_last_d2(ctx);
+                double lo = p_top, hi = 1.0;
+                if (k >= 2 && !std::isnan(d2)) {
+                    const double S  = p_top > 0.0f ? 1.0 / (double) p_top : INFINITY;
+                    const double e2 = exp((double) d2);
+                    lo = 1.0 / std::min(S, 1.0 + (double) (k - 1) * e2);
+                    hi = 1.0 / (1.0 + e2);
+                } else if (k < 2) {
+                    hi = p_top;    // the host's full softmax is the device's up to rounding
+                }
+                if (lo >= (double) pmin + mg)      { decided =  1; pv = (float) lo; }
+                else if (hi < (double) pmin - mg)  { decided = -1; pv = (float) hi; }
+            }
+            if (decided != 0) {
+                if (pxa_dargmax_check_on()) {
+                    float hp = 0.0f;
+                    const llama_token hid = common_sampler_sample_speculative(nullptr, ctx, idx, &hp, pxa_mtp_pmin_topk());
+                    const uint64_t n = st.chk.fetch_add(1) + 1;
+                    const bool bad_tok = hid != id;
+                    const bool bad_gate = out_prob != nullptr && pmin >= 0.0f && ((decided == 1 && hp < pmin) || (decided == -1 && hp >= pmin));
+                    if (bad_tok) st.bad_tok++;
+                    if (bad_gate) st.bad_gate++;
+                    if ((bad_tok || bad_gate) && st.bad_tok + st.bad_gate <= 8) {
+                        LOG_WRN("PXA_DRAFT_ARGMAX_CHECK: MISMATCH device %d p %.6f (%s) vs host %d p %.6f (p_min %.3f)\n",
+                                (int) id, (double) pv, decided == 1 ? "pass" : "fail", (int) hid, (double) hp, (double) pmin);
+                    }
+                    if (n % 500 == 0) {
+                        LOG_INF("PXA_DRAFT_ARGMAX_CHECK: %llu checked, %llu token / %llu gate mismatches; %llu device pass / %llu device fail / %llu host draws\n",
+                                (unsigned long long) n, (unsigned long long) st.bad_tok.load(), (unsigned long long) st.bad_gate.load(),
+                                (unsigned long long) st.dev.load(), (unsigned long long) st.devf.load(), (unsigned long long) st.host.load());
+                    }
+                }
+                if (decided == 1) st.dev++; else st.devf++;
+                if (out_prob) *out_prob = pv;   // on the same side of p_min as the host's probability
+                static std::atomic<bool> told{false};
+                if (!told.exchange(true)) LOG_INF("%s: PXA_DRAFT_ARGMAX: first device-decided draft draw\n", __func__);
+                return id;
+            }
+            st.host++;
+        }
+    }
     return common_sampler_sample_speculative(nullptr, ctx, idx, out_prob, pxa_mtp_pmin_topk());
 }
 
 // PXA_VERIFY_NO_LOGITS_COPY: ask the NEXT decode on the drafter context for argmax rows only
 static void pxa_nlc_request(common_speculative_state_mtp & state, llama_seq_id seq_id, llama_context * ctx) {
-    if (!pxa_nlc_on()) return;
-    if (!state.pxa_nlc_prob_free || !llama_argmax_available(ctx)) {
+    if (!pxa_nlc_on() && !pxa_dargmax_on()) return;
+    const bool want = (pxa_nlc_on() && state.pxa_nlc_prob_free) || (pxa_dargmax_on() && state.pxa_dargmax_ok);   // PXA_DRAFT_ARGMAX
+    if (!want || !llama_argmax_available(ctx)) {
+        if (!pxa_nlc_on()) return;   // PXA_DRAFT_ARGMAX alone: an arch without the draft argmax node stays quiet
         static std::atomic<int> told{0};
         if (told.fetch_add(1) < 3) LOG_INF("%s: PXA_VERIFY_NO_LOGITS_COPY: drafter keeps the logits copy (prob_free=%d argmax_graph=%d)\n",
                 __func__, (int) state.pxa_nlc_prob_free, (int) llama_argmax_available(ctx));
@@ -3632,7 +3928,10 @@ static bool mtp_model_uses_recurrent_conditioning(const common_speculative_state
     }
 
     std::string arch{llama_model_arch_string(model)};
-    return arch == "qwen35" || arch == "qwen35moe" || arch == "qwen4exp";
+    // glm5next: the NextN block reads eh_proj(enorm(embd(tok)) || hnorm(prev_hidden)), which is the
+    // same recurrent conditioning, so its eager warmup needs the same right-shift by one.
+    // PXA_NEMOTRON_MTP: nemotron_h_moe pairs token p with the hidden of p-1 the same way (mainline graph_mtp)
+    return arch == "qwen35" || arch == "qwen35moe" || arch == "qwen4exp" || arch == "glm5next" || arch == "nemotron_h_moe";
 }
 
 static void mtp_clear_target_hidden(common_speculative_state_mtp & state, llama_seq_id seq_id) {
@@ -3668,6 +3967,22 @@ bool common_speculative_has_sequence_hidden(const common_speculative * spec, lla
 
     auto it = mtp_state->target_hidden_by_seq.find(seq_id);
     return it != mtp_state->target_hidden_by_seq.end() && !it->second.empty();
+}
+
+// PXA_SPEC_LAZY_HIDDEN: what capture_output_hidden does to the stored state, without the row: the stored hidden is
+// no longer this sequence's last one (empty = has_sequence_hidden() false, capacity kept) and the cached draft
+// built on it is dropped, so the next ensure_sequence_hidden() reads the last decode's row
+void common_speculative_mark_hidden_stale(common_speculative * spec, llama_seq_id seq_id) {
+    pxa_mtp_prefetch_wait_seq(seq_id); // PXA_MTP_PREFETCH: drain in-flight companion commit before touching ctx_mtp
+    auto * mtp_state = common_speculative_get_mtp_state(spec);
+    if (mtp_state == nullptr) {
+        return;
+    }
+    auto it = mtp_state->target_hidden_by_seq.find(seq_id);
+    if (it != mtp_state->target_hidden_by_seq.end()) {
+        it->second.clear();
+    }
+    mtp_invalidate_cached_draft(*mtp_state, seq_id);
 }
 
 void common_speculative_clear_sequence_hidden(common_speculative * spec, llama_seq_id seq_id) {
@@ -4406,6 +4721,21 @@ void common_speculative_set_request_sampler(common_speculative * spec, llama_seq
     }
 }
 
+// PXA_SPEC_EXACT_NMIN_v1: the pre-draw length bound of the sampled draft just produced for `seq_id`
+// (pxa_spec_nmin_len), or -1 for an argmax draft / no draft / PXA_SPEC_EXACT=0. Read-only: call it
+// after common_speculative_draft and before the next draft for the same seq.
+int common_speculative_draft_pre_len(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || !common_sampler_spec_sampled_active()) {
+        return -1;
+    }
+    auto * mtp_state = common_speculative_get_mtp_state(spec);
+    if (mtp_state == nullptr) {
+        return -1;
+    }
+    const auto it = mtp_state->pxa_draft_pre_len_by_seq.find(seq_id);
+    return it == mtp_state->pxa_draft_pre_len_by_seq.end() ? -1 : it->second;
+}
+
 // Hand over the proposal distributions of the draft just produced for `seq_id`, and leave the store
 // empty so the same q can never be read twice.
 bool common_speculative_take_draft_q(common_speculative * spec, llama_seq_id seq_id,
@@ -4486,6 +4816,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     // q for this step's tokens -- the one way this rule could silently stop being lossless.
     auto & pxa_qs = state.pxa_draft_q_by_seq[seq_id];
     pxa_qs.clear();
+    state.pxa_draft_pre_len_by_seq.erase(seq_id);   // PXA_SPEC_EXACT_NMIN_v1: set again at the end
 
     if (!smpl) return drafts;
 
@@ -4511,6 +4842,15 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         }
         n_draft = k_adapt;
     }
+    // PXA_MTP_DEEP: base depth until the acceptance EMA clears its threshold, then n_max at the lower p_min
+    if (pxa_mtp_deep().on) {
+        n_draft = pxa_mtp_deep_apply(state.pxa_ak_ema, n_draft, p_min);
+    }
+
+    // PXA_SPEC_EXACT_NMIN_v1: the longest this draft can be, known before any of its tokens is drawn.
+    // Only the caps above and the gate of the FIRST row (computed from committed text alone) may
+    // lower it; the gates of rows 1.. are computed from drawn tokens and never do.
+    int pxa_pre_len = n_draft;
 
     common_sampler_reset(smpl);
 
@@ -4529,6 +4869,9 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     // PXA_VERIFY_NO_LOGITS_COPY: the drawn probability only matters to p_min, the depth cutoff and the
     // stats; with all three off the argmax row is the whole answer (also read by the next commit)
     state.pxa_nlc_prob_free = p_min <= 0.0f && pxa_spec_depth_cutoff_floor(1 << 30) <= 0.0f && !pxa_st.on;
+    // PXA_DRAFT_ARGMAX: with the depth cutoff and the stats off the probability decides only the p_min gate
+    state.pxa_dargmax_ok   = pxa_spec_depth_cutoff_floor(1 << 30) <= 0.0f && !pxa_st.on;
+    state.pxa_dargmax_pmin = p_min;
     // PXA_MTP_STATS: with p_min == 0 the draft loop skips the full-vocab softmax entirely; ask for
     // the probability anyway while the counters are on, so the p distribution is observable.
     auto prob_ptr = (p_min > 0 || pxa_st.on || pxa_dc_floor > 0.0f) ? &prob : nullptr;
@@ -4542,6 +4885,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     if (last.last_id >= 0) {
         if (last.prob < p_min) {
             n_draft = 1;
+            pxa_pre_len = 1; // PXA_SPEC_EXACT_NMIN_v1: the cached row's gate (max q under PXA_SPEC_EXACT)
             pxa_st_stop = 0; // PXA_MTP_STATS: chain collapsed to the cached token by p_min
         }
         current_input_id = last.last_id;
@@ -4665,11 +5009,26 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         current_n_past++;
 
         if (prob_ptr && prob < p_min) {
+            if (i == 0) {
+                pxa_pre_len = 1;   // PXA_SPEC_EXACT_NMIN_v1: row 0 (no cached token) is committed-text-only
+            }
             pxa_st_stop = 1;
             break;
         }
     }
     llama_batch_free(mtp_batch);
+
+    // PXA_SPEC_EXACT_NMIN_v1: publish the bound only for a sampled draft under the exact rule; anything
+    // else keeps the drawn-length n_min, which is exact for argmax drafts (exact-match verify).
+    if (pxa_spec_exact_on()) {
+        bool pxa_sampled = false;
+        for (const auto & q : pxa_qs) {
+            if (!q.empty()) { pxa_sampled = true; break; }
+        }
+        if (pxa_sampled) {
+            state.pxa_draft_pre_len_by_seq[seq_id] = pxa_pre_len;
+        }
+    }
     llama_set_mtp_op_type(ctx, MTP_OP_NONE);
 
     // Purge the metadata for the draft tokens.
@@ -4689,7 +5048,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     // PXA_MTP_ADAPTIVE_K: record how many draft tokens we emitted this cycle so accept() can form
     // the accept ratio for the EMA. (Inert unless the controller is enabled.)
-    if (pxa_mtp_adaptive_k_enabled()) {
+    if (pxa_mtp_ak_track()) {
         state.pxa_ak_drafted = (uint32_t) drafts.size();
     }
 
@@ -4739,6 +5098,7 @@ bool common_speculative_draft_batched(
         if (auto * qst = common_speculative_get_mtp_state(spec)) {
             for (const auto & r : reqs) {
                 qst->pxa_draft_q_by_seq[r.seq_id].clear();
+                qst->pxa_draft_pre_len_by_seq.erase(r.seq_id);   // PXA_SPEC_EXACT_NMIN_v1: argmax drafts
             }
         }
     }
@@ -4875,6 +5235,9 @@ bool common_speculative_draft_batched(
                         (double) mtp_state->pxa_ak_ema, n_draft, k_adapt);
             }
             n_draft = k_adapt;
+        }
+        if (pxa_mtp_deep().on) {   // PXA_MTP_DEEP: same rule as the serial drafter (sc.params is this step's copy)
+            n_draft = pxa_mtp_deep_apply(mtp_state->pxa_ak_ema, n_draft, sc.params.p_min);
         }
         sc.state.n_draft = n_draft;
 
@@ -5046,7 +5409,7 @@ bool common_speculative_draft_batched(
             llama_kv_cache_seq_rm(ctx, chain.seq_id, chain.purge_p0(), chain.purge_p1());
         }
 
-        if (pxa_mtp_adaptive_k_enabled()) {
+        if (pxa_mtp_ak_track()) {
             mtp_state->pxa_ak_drafted = (uint32_t) chain.drafts.size();
         }
 

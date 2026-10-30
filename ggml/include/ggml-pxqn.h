@@ -75,9 +75,9 @@ extern "C" {
 // (kept at this line count on purpose: the public headers' line layout
 //  matches the earlier revision, so ccache's preprocessed-mode hashes
 //  still hit for every file that includes this header)
-//
+#define PXQN_REV_MAX          2u      // the newest revision this build READS (2: sealed recipe handle, pxa.pxqn.recipe)
 
-#define PXQN_REV              1u      // the revision this build reads and writes
+#define PXQN_REV              1u      // the revision the open quantizer writes (rotation in the clear)
 
 // Rotation granularity along K: every rotated tensor (any type) cuts at multiples of this.
 #define PXQN_RHT_BLOCK        128

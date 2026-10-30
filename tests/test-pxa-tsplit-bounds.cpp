@@ -63,6 +63,22 @@ int main() {
     { bool fb = false; int g = pxa_tsplit_rht_granularity(64, 17472, true, &fb); CHECK(g == 64 && fb, "fallback"); }
     // not rotated: untouched
     CHECK(pxa_tsplit_rht_granularity(64, 17408, false) == 64, "unrotated");
+    // '-sm tensor' block-granular expert cut (pxa_tsplit_parity_split): Flash-Next n_ff 640 in 128-K blocks on two
+    // cards is 3:2, the odd block goes to the card with less memory committed, never more than one block off even.
+    {
+        auto r = pxa_tsplit_parity_split(640, 128, { 1000, 2000 });
+        CHECK(r == std::vector<int>({384, 256}), "parity 2-way to the emptier card: %d %d", r[0], r[1]);
+        r = pxa_tsplit_parity_split(640, 128, { 3000, 2000 });
+        CHECK(r == std::vector<int>({256, 384}), "parity 2-way other card: %d %d", r[0], r[1]);
+        r = pxa_tsplit_parity_split(640, 128, { 0, (size_t) 1 << 40 });   // a huge imbalance still moves one block only
+        CHECK(r == std::vector<int>({384, 256}), "parity bounded: %d %d", r[0], r[1]);
+        r = pxa_tsplit_parity_split(640, 64, { 5, 1 });                  // even: no remainder, memory ignored
+        CHECK(r == std::vector<int>({320, 320}), "parity even: %d %d", r[0], r[1]);
+        r = pxa_tsplit_parity_split(1408, 128, { 4, 1, 3, 2 });          // 11 blocks on 4 cards: 2,3,3,3 by memory
+        CHECK(r == std::vector<int>({256, 384, 384, 384}), "parity 4-way: %d %d %d %d", r[0], r[1], r[2], r[3]);
+        int sum = 0; for (int v : r) sum += v;
+        CHECK(sum == 1408, "parity sum %d", sum);
+    }
     printf(fails ? "FAILED %d\n" : "OK\n", fails);
     return fails ? 1 : 0;
 }

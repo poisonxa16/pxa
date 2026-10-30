@@ -23,4 +23,6 @@ These templates can be updated with the following commands:
 ./scripts/get_chat_template.py Qwen/Qwen3-0.6B                               > models/templates/Qwen-Qwen3-0.6B.jinja
 ./scripts/get_chat_template.py zai-org/GLM-4.5                               > models/templates/zai-org-GLM-4.5.jinja
 ./scripts/get_chat_template.py deepseek-ai/DeepSeek-V3.1                     > models/templates/deepseek-ai-DeepSeek-V3.1.jinja
+# ByteDance-Seed/Seed-OSS-36B-Instruct (Apache-2.0): its chat_template.jinja, byte for byte (test-chat-auto-parser, test-chat)
+curl -fsSL https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct/raw/main/chat_template.jinja > models/templates/ByteDance-Seed-OSS.jinja
 ```

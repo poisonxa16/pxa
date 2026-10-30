@@ -309,15 +309,40 @@ if (GGML_CUDA)
             if (GGML_NATIVE AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.6" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
                 set(CMAKE_CUDA_ARCHITECTURES "native")
             elseif (GGML_CUDA_F16 OR GGML_CUDA_DMMV_F16)
-                # canonical PXQ arch list: Pascal (P100 sm_60 / 1080Ti sm_61), Volta (V100 sm_70),
+                # canonical PXQ arch list: Pascal (P100 sm_60 / 1080Ti sm_61), Volta (V100 sm_70), Turing (sm_75),
                 # Ampere (3090-class sm_86), Ada (4090-class sm_89)
-                set(CMAKE_CUDA_ARCHITECTURES "60;61;70;86;89")
+                set(CMAKE_CUDA_ARCHITECTURES "60;61;70;75;86;89")
             else()
                 set(CMAKE_CUDA_ARCHITECTURES "50;61;70;75;80")
                 #set(CMAKE_CUDA_ARCHITECTURES "OFF") # use this to compile much faster, but only F16 models work
             endif()
         endif()
         message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+
+        # PXA_JIT_FIRST_START_v1: the SASS ("real") archs this build carries, as one token for
+        # ggml-cuda.cu ("60_61_70_75_86_89"), so the backend can tell when a card has no native
+        # code and the driver will JIT-compile the PTX on first start (the server's wedge watchdog
+        # then allows for the compile). "-virtual" entries are PTX only; "native", "all",
+        # "all-major" and hand-written -gencode flags leave the list empty = unknown.
+        set(PXA_CUDA_SASS_LIST "")
+        set(PXA_CUDA_PTX_ONLY ON)
+        foreach(_pxa_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            if (_pxa_arch MATCHES "^([0-9]+[a-z]?)(-real)?$")
+                list(APPEND PXA_CUDA_SASS_LIST "${CMAKE_MATCH_1}")
+            endif()
+            if (NOT _pxa_arch MATCHES "^[0-9]+[a-z]?-virtual$")
+                set(PXA_CUDA_PTX_ONLY OFF)
+            endif()
+        endforeach()
+        if (PXA_CUDA_PTX_ONLY AND CMAKE_CUDA_ARCHITECTURES)
+            # only "-virtual" entries: no SASS at all, every card JIT-compiles
+            set_property(SOURCE ggml-cuda.cu APPEND PROPERTY COMPILE_DEFINITIONS "PXA_CUDA_SASS_ARCHS=none")
+            message(STATUS "PXA: PTX only (no SASS); every card JIT-compiles the kernels on first start")
+        elseif (PXA_CUDA_SASS_LIST)
+            string(REPLACE ";" "_" PXA_CUDA_SASS_TOKEN "${PXA_CUDA_SASS_LIST}")
+            set_property(SOURCE ggml-cuda.cu APPEND PROPERTY COMPILE_DEFINITIONS "PXA_CUDA_SASS_ARCHS=${PXA_CUDA_SASS_TOKEN}")
+            message(STATUS "PXA: native SASS for sm ${PXA_CUDA_SASS_TOKEN}; other cards JIT from PTX on first start")
+        endif()
 
         if (GGML_MUSA)
             set(CMAKE_CUDA_COMPILER ${MUSAToolkit_MCC_EXECUTABLE})
@@ -353,11 +378,15 @@ if (GGML_CUDA)
             ggml-cuda/pxa/pxqn-api-impl.cu
             ggml-cuda/pxa/pxq4-rb.cu
             ggml-cuda/pxa/pxqn-tune.cu
+            ggml-cuda/pxa/pxqn-mega.cu
             ggml-cuda/pxa/template-instances/mmvq-instance-pxqn4.cu
             ggml-cuda/pxa/template-instances/mmvq-instance-pxqn4s8.cu)
         foreach(_pxqn_src ${GGML_SOURCES_PXQN_CUDA})
             list(REMOVE_ITEM GGML_SOURCES_CUDA ${CMAKE_CURRENT_SOURCE_DIR}/${_pxqn_src})
         endforeach()
+        # Source properties of the closed-library sources (closed tree only; absent from the public tree, which does
+        # not compile those sources)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/pxqn-closed-props.cmake OPTIONAL)
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-wmma*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-mma*.cu")
@@ -1463,7 +1492,7 @@ if (GGML_CUDA)
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
     endif()
     if (PXA_X86_COMPAT)
-        # ccache and nvcc (impl ccache-nvcc-host-flags-key): ccache's key for an nvcc compile is the preprocessed text, and it does
+        # ccache and nvcc: ccache's key for an nvcc compile is the preprocessed text, and it does
         # not see host flags passed with -Xcompiler. The lib-compat objects differ from the fast build's ONLY in those flags, so the
         # shared cache would hand this build the fast build's AVX2 objects. One declaration that only this build pre-includes
         # puts the compat objects under their own keys. Nothing in the header may change code generation.
@@ -1584,6 +1613,9 @@ target_compile_definitions(ggml PUBLIC  ${GGML_CDEF_PUBLIC})
 target_compile_definitions(ggml PRIVATE $<$<CONFIG:Release>:NDEBUG>)
 target_include_directories(ggml PUBLIC ../include)
 target_include_directories(ggml PRIVATE . ${GGML_EXTRA_INCLUDES})
+if (WIN32)
+    target_include_directories(ggml PRIVATE win-compat)   # dlfcn.h over LoadLibrary for ggml-pxqn-loader.cpp
+endif()
 target_link_directories(ggml PRIVATE ${GGML_EXTRA_LIBDIRS})
 if(MSVC)
     set_target_properties(ggml PROPERTIES
@@ -1616,7 +1648,7 @@ if (PXA_PXQN_CLOSED_SRC)
         message(WARNING "PXA_PXQN_CLOSED_SRC=ON needs BUILD_SHARED_LIBS=ON (libggml-pxqn is loaded next to libggml.so); "
                         "this static build has no PXQN support")
     else()
-        set(_pxqn_srcs pxqn-cpu.c pxqn-cpu-mmv.c pxqn-lib.cpp pxqn-lock.cpp pxqn-spec-select.cpp pxqn-spec-defaults.cpp pxqn-xcache-policy.cpp pxqn-tune.cpp pxqn-xcache-learn.cpp pxqn-xcache-cpupool.cpp)
+        set(_pxqn_srcs pxqn-cpu.c pxqn-cpu-mmv.c pxqn-lib.cpp pxqn-lock.cpp pxqn-recipe.cpp pxqn-spec-select.cpp pxqn-spec-defaults.cpp pxqn-xcache-policy.cpp pxqn-tune.cpp pxqn-xcache-learn.cpp pxqn-xcache-cpupool.cpp pxqn-overdrive.cpp)
         # the CPU matmul (pxqn-cpu-mmv.c): its AVX2 and baseline copies must produce the same bits (no FMA contraction, ever),
         # and the file is baseline x86-64 whatever the directory-scope ARCH flags say: the AVX2 clone sits behind
         # target("avx2") and a run-time cpuid choice, everything else must run on the oldest x86-64 CPU
@@ -1625,6 +1657,12 @@ if (PXA_PXQN_CLOSED_SRC)
                 "-march=x86-64;-mtune=generic;-mno-avx;-mno-avx2;-mno-fma;-mno-f16c;-mno-avx512f;-ffp-contract=off")
         else()
             set_source_files_properties(pxqn-cpu-mmv.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+        endif()
+        if (MSVC)
+            # Windows (ggml-pxqn.dll): the three Linux-only parts stay out -- the fast CPU matmul (GCC vector code,
+            # pthread), locked models (sockets + system libcrypto via dlopen) and the expert-cache CPU pool (pthread
+            # affinity). The loader treats each as an absent optional symbol (ggml-pxqn.def lists what is exported).
+            list(REMOVE_ITEM _pxqn_srcs pxqn-cpu-mmv.c pxqn-lock.cpp pxqn-xcache-cpupool.cpp)
         endif()
         if (GGML_CUDA)
             list(APPEND _pxqn_srcs ${GGML_SOURCES_PXQN_CUDA})
@@ -1635,8 +1673,14 @@ if (PXA_PXQN_CLOSED_SRC)
         if (NOT _pxqn_rev)
             set(_pxqn_rev "unknown")
         endif()
-        target_compile_definitions(ggml-pxqn PRIVATE ${GGML_CDEF_PUBLIC} GGML_SHARED GGML_BUILD
+        target_compile_definitions(ggml-pxqn PRIVATE ${GGML_CDEF_PUBLIC} GGML_SHARED GGML_BUILD GGML_PXQN_LIBRARY
                                    $<$<CONFIG:Release>:NDEBUG> PXA_PXQN_BUILD_ID="${_pxqn_rev}")
+        # Windows: the three gu_* test hooks are not exported from ggml-pxqn.dll (ggml-cuda.h, GGML_PXQN_HOOK_API);
+        # a test build that needs them exported there turns this on. No effect on other platforms.
+        option(PXA_PXQN_EXPORT_TEST_HOOKS "pxa: Windows test builds: also export the gu_* test hooks from ggml-pxqn.dll" OFF)
+        if (PXA_PXQN_EXPORT_TEST_HOOKS)
+            target_compile_definitions(ggml-pxqn PRIVATE GGML_PXQN_EXPORT_TEST_HOOKS)
+        endif()
         target_include_directories(ggml-pxqn PRIVATE . ../include ${GGML_EXTRA_INCLUDES})
         # pxqn-closed-levers.inc: the lever names the library reads (generated with the public catalog, top-level CMakeLists.txt)
         if (PXA_CATALOG_DIR)
@@ -1645,6 +1689,19 @@ if (PXA_PXQN_CLOSED_SRC)
         # locked models (pxqn-lock.cpp): the licence server's lock-signing public key(s) the library trusts, "kid:hex64[;kid:hex64]" (-DPXA_LOCK_PUBKEYS=...)
         string(REPLACE ";" "," _pxqn_lock_pubkeys "${PXA_LOCK_PUBKEYS}")
         target_compile_definitions(ggml-pxqn PRIVATE PXA_LOCK_PUBKEYS="${_pxqn_lock_pubkeys}")
+        # PXA_PXQN_KS2_SASS (pxqn.cu): the embedded re-banked sm_60 GEMM cubin runs only when its source sha equals this one,
+        # the sha256 of the three sources scripts/pxa-ks2-cubin-gen.sh hashes, in its order; editing one re-runs configure
+        set(_ks2_srcs ggml-cuda/pxa/pxqn-gemm.cuh ggml-cuda/pxa/pxqn-kern.cuh ../../scripts/pxqn-ks2-cubin.cu)
+        set(_ks2_cat "")
+        foreach(_f ${_ks2_srcs})
+            if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_f})
+                file(READ ${CMAKE_CURRENT_SOURCE_DIR}/${_f} _ks2_txt)
+                string(APPEND _ks2_cat "${_ks2_txt}")
+                set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${_f})
+            endif()
+        endforeach()
+        string(SHA256 _ks2_sha "${_ks2_cat}")
+        target_compile_definitions(ggml-pxqn PRIVATE PXQN_KS2_SRC_SHA="${_ks2_sha}")
         target_compile_features(ggml-pxqn PRIVATE c_std_11)
         set_target_properties(ggml-pxqn PROPERTIES POSITION_INDEPENDENT_CODE ON
                               C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden)
@@ -1674,9 +1731,19 @@ if (PXA_PXQN_CLOSED_SRC)
             message(STATUS "ggml-pxqn: host code built for baseline x86-64 (SSE2), AVX2 clones of the CPU-hot loops behind run-time dispatch")
         endif()
         target_link_libraries(ggml-pxqn PRIVATE ggml Threads::Threads ${GGML_EXTRA_LIBS})
+        if (MSVC)
+            target_sources(ggml-pxqn PRIVATE win-compat/ggml-pxqn.def)
+            target_include_directories(ggml-pxqn PRIVATE win-compat)   # strings.h
+            # only the .def names leave the DLL (the top level turns WINDOWS_EXPORT_ALL_SYMBOLS on for shared builds;
+            # the licensed library hides its internals like the Linux version script does)
+            set_target_properties(ggml-pxqn PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF)
+            target_compile_options(ggml-pxqn PRIVATE
+                "$<$<COMPILE_LANGUAGE:C,CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/win-compat/pxqn-msvc-compat.h>")
+        else()
         target_link_options(ggml-pxqn PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/ggml-pxqn.map"
                             "LINKER:-Bsymbolic" "LINKER:--no-undefined")
         set_target_properties(ggml-pxqn PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ggml-pxqn.map)
+        endif()
         if (MATH_LIBRARY)
             target_link_libraries(ggml-pxqn PRIVATE ${MATH_LIBRARY})
         endif()

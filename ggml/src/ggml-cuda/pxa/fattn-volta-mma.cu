@@ -1,7 +1,10 @@
+#include "pxa-env-flag.h"
 #include "fattn-volta-mma.cuh"
 #include "volta-mma/fattn-mma-ml.cuh"
+#include "volta-mma/fattn-mma-shapes.h"
 #include "core/levers.cuh"
 #include "../convert.cuh"
+#include "../../pxqn-v70-plan.h"
 
 #include <atomic>
 #include <cstdio>
@@ -119,9 +122,18 @@ static bool pxa_volta_mma_q8_scratch_fits(const ggml_tensor * K, const ggml_tens
     if (need + PXA_VOLTA_Q8_SCRATCH_MARGIN > free_bytes) {
         static std::atomic<bool> told{false};
         if (!told.exchange(true)) {
+            // The vendored launch still consumes the whole K/V image and does not return a
+            // per-chunk softmax state, so a short stage cannot be merged yet. The row count is
+            // the stage a later kernel has to walk. The decline itself is unchanged.
+            const int64_t per = K->ne[1] > 0 ? ggml_nelements(K) / K->ne[1] : 0;
+            const bool v_view = V->view_src && (V->view_src == K ||
+                                               (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            const int chunk = pxqn_v70::fa_kv_chunk(K->ne[1], per * (int64_t) sizeof(half), v_view ? 1 : 2,
+                                                    free_bytes, PXA_VOLTA_Q8_SCRATCH_MARGIN);
             fprintf(stderr, "PXA_FA_MMA_VOLTA_Q8: declining the q8_0 K/V cache on device %d -- the f16 staging "
-                            "needs %.0f MiB and only %.0f MiB is free; attention keeps its previous route\n",
-                    dev, need/1048576.0, free_bytes/1048576.0);
+                            "needs %.0f MiB and only %.0f MiB is free (a %d-row stage would fit); "
+                            "attention keeps its previous route\n",
+                    dev, need/1048576.0, free_bytes/1048576.0, chunk);
         }
         return false;
     }
@@ -134,7 +146,7 @@ static bool pxa_volta_mma_q8_scratch_fits(const ggml_tensor * K, const ggml_tens
 }
 
 bool ggml_cuda_fattn_volta_mma_supported(const ggml_tensor * dst, int cc) {
-    if (cc != GGML_CUDA_CC_VOLTA) {
+    if (!pxa_fattn_mma_shapes::volta_route_arch(cc)) {
         return false;
     }
 
@@ -170,7 +182,7 @@ bool ggml_cuda_fattn_volta_mma_supported(const ggml_tensor * dst, int cc) {
         // route serves the deep node, as before).
         static const bool q4_on = [](){
             const char * e = getenv("PXA_FA_MMA_VOLTA_Q4");
-            return !(e && *e && atoi(e) == 0);
+            return !(e && *e && pxa_env_value_off(e));
         }();
         const bool q8_pair = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
         const bool q4_pair = q4_on && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0;
@@ -223,19 +235,24 @@ bool ggml_cuda_fattn_volta_mma_supported(const ggml_tensor * dst, int cc) {
 }
 
 // mainline's ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1, specialised for
-// Volta: turing_mma_available() is false there, so the 8/ncols2 rung is skipped.
+// Volta. The rung is chosen by pxa_fattn_mma_shapes::volta_pick_ncols1() -- the same function the
+// host table test (tests/test-fa-volta-mma-shapes.cpp) checks against the device-code guards.
+// Bug #22738: upstream gates both narrow rungs (8/ncols2 and 16/ncols2) on Turing MMA, and the
+// 16-column variants are compiled out on sm_70 at every ncols2; the port kept the 16/ncols2 rung, so
+// a node with ncols2 = 1 (odd GQA ratio, e.g. Nemotron-3-Nano-4B's 5, or no GQA packing) at widths
+// 9..16 -- a speculative verify batch -- aborted the process. The ladder now starts at 32/ncols2 (a
+// 32-column tile with the tail rows masked), as upstream runs it on Volta. Every width that ran
+// before keeps its rung and its bits.
 template <int DKQ, int DV, int ncols2>
 static void pxa_volta_mma_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
+    const int ncols1 = pxa_fattn_mma_shapes::volta_pick_ncols1((int) Q->ne[1], ncols2);
 
-    if (Q->ne[1] <= 16/ncols2) {
-        pxa_volta_fa::ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
-        return;
-    }
-    if (Q->ne[1] <= 32/ncols2) {
+    if (ncols1 == 32/ncols2) {
         pxa_volta_fa::ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
+    GGML_ASSERT(ncols1 == 64/ncols2);
     pxa_volta_fa::ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 
@@ -250,19 +267,12 @@ static void pxa_volta_mma_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_te
     const bool use_gqa_opt = pxa_volta_mma_use_gqa_opt(dst);
     const int  gqa_ratio   = Q->ne[2] / K->ne[2];
 
-    if (use_gqa_opt && gqa_ratio % 8 == 0) {
-        pxa_volta_mma_switch_ncols1<DKQ, DV, 8>(ctx, dst);
-        return;
+    switch (pxa_fattn_mma_shapes::volta_pick_ncols2(gqa_ratio, use_gqa_opt)) {
+        case 8:  pxa_volta_mma_switch_ncols1<DKQ, DV, 8>(ctx, dst); return;
+        case 4:  pxa_volta_mma_switch_ncols1<DKQ, DV, 4>(ctx, dst); return;
+        case 2:  pxa_volta_mma_switch_ncols1<DKQ, DV, 2>(ctx, dst); return;
+        default: pxa_volta_mma_switch_ncols1<DKQ, DV, 1>(ctx, dst); return;
     }
-    if (use_gqa_opt && gqa_ratio % 4 == 0) {
-        pxa_volta_mma_switch_ncols1<DKQ, DV, 4>(ctx, dst);
-        return;
-    }
-    if (use_gqa_opt && gqa_ratio % 2 == 0) {
-        pxa_volta_mma_switch_ncols1<DKQ, DV, 2>(ctx, dst);
-        return;
-    }
-    pxa_volta_mma_switch_ncols1<DKQ, DV, 1>(ctx, dst);
 }
 
 void ggml_cuda_flash_attn_ext_volta_mma(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -325,7 +335,7 @@ void ggml_cuda_fattn_volta_mma_d512_arm_report(void) {
 }
 
 bool ggml_cuda_fattn_volta_mma_d512_supported(const ggml_tensor * dst, int cc) {
-    if (cc != GGML_CUDA_CC_VOLTA) {
+    if (!pxa_fattn_mma_shapes::volta_route_arch(cc)) {
         return false;
     }
 
@@ -341,7 +351,28 @@ bool ggml_cuda_fattn_volta_mma_d512_supported(const ggml_tensor * dst, int cc) {
         return false; // this is the 512/512 family and nothing else
     }
     if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
-        return false; // the vendored launcher has no quantized-KV staging here
+        // PXA_FA_D512_QPF (2026-10-17, default ON; =0 restores the f16-only admission): a MATCHED
+        // q8_0 or q4_0 cache at prefill widths. The launcher stages K and V to f16 from the CUDA pool with the
+        // backend's own converters (the PXA_FA_MMA_VOLTA_Q8 machinery above, same fit test), so the global
+        // layers of a Gemma 4 long prompt on a quantized cache stop paying the unfused chain's quantized
+        // K*Q, the transposed V copy and the f32 score matrix. Decode widths keep the old refusal.
+        static const bool qpf = [](){ const char * e = getenv("PXA_FA_D512_QPF"); return !(e && *e && pxa_env_value_off(e)); }();
+        const bool q8_pair = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+        const bool q4_pair = K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0;
+        if (!qpf || !(q8_pair || q4_pair) || Q->ne[1] <= 8) {
+            return false;
+        }
+        if (ggml_is_contiguously_allocated(K) ? (ggml_get_to_fp16_cuda(K->type)    == nullptr)
+                                              : (ggml_get_to_fp16_nc_cuda(K->type) == nullptr)) {
+            return false;
+        }
+        if (ggml_is_contiguously_allocated(V) ? (ggml_get_to_fp16_cuda(V->type)    == nullptr)
+                                              : (ggml_get_to_fp16_nc_cuda(V->type) == nullptr)) {
+            return false;
+        }
+        if (!pxa_volta_mma_q8_scratch_fits(K, V)) {
+            return false;
+        }
     }
     if (!mask) {
         return false; // the KV_max bound reads the mask
@@ -363,7 +394,7 @@ bool ggml_cuda_fattn_volta_mma_d512_supported(const ggml_tensor * dst, int cc) {
     }
     // ncols2 == 8 is the only packing instantiated for this family, and the
     // 512/512 rows of the kernel are implemented only with the GQA optimization.
-    if ((Q->ne[2] / K->ne[2]) % 8 != 0) {
+    if ((Q->ne[2] / K->ne[2]) % pxa_fattn_mma_shapes::volta_d512_ncols2() != 0) {
         return false;
     }
     if (!pxa_volta_mma_use_gqa_opt(dst)) {
@@ -384,8 +415,29 @@ void ggml_cuda_flash_attn_ext_volta_mma_d512(ggml_backend_cuda_context & ctx, gg
         ggml_cuda_fattn_volta_mma_d512_arm_report(); // harmless if the lever already armed it
     }
 
-    if (Q->ne[1] <= 4) {
+    static_assert(pxa_fattn_mma_shapes::volta_d512_ncols2() == 8, "the 512/512 instantiations are ncols2 = 8");
+    if (pxa_fattn_mma_shapes::volta_d512_pick_ncols1((int) Q->ne[1]) == 4) {
         pxa_volta_fa::ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 4, 8>(ctx, dst);
+        return;
+    }
+    // PXA_FA_D512_KVSTEP (2026-10-18; default 128, =32 restores the vendored staging): keys per
+    // softmax step of the 64-column kernel at PREFILL widths (> 16 query rows: the QPF route of a quantized KV
+    // cache, or the opt-in fused f16 route). The 64-column kernel spills its 512-wide V accumulator; 128 keys per
+    // step (32-wide K/V loads) pays that spill traffic and the rescale a quarter as often. Not bit-identical to
+    // 32 (softmax rescale granularity). Decode and verify widths (<= 16 rows) keep the vendored 32-key staging.
+    static const int kvstep = [](){
+        const char * e = getenv("PXA_FA_D512_KVSTEP");
+        const int v = (e && *e) ? atoi(e) : 128;
+        const int k = (v == 32 || v == 64) ? v : 128;
+        fprintf(stderr, "PXA_FA_D512_KVSTEP=%d (head-512 sm_70 prefill: keys per softmax step of the 64-column MMA kernel; =32 vendored)\n", k);
+        return k;
+    }();
+    if (Q->ne[1] > 16 && kvstep == 128) {
+        ggml_cuda_flash_attn_ext_volta_mma_d512_kv128(ctx, dst);
+        return;
+    }
+    if (Q->ne[1] > 16 && kvstep == 64) {
+        ggml_cuda_flash_attn_ext_volta_mma_d512_kv64(ctx, dst);
         return;
     }
     pxa_volta_fa::ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 8, 8>(ctx, dst);

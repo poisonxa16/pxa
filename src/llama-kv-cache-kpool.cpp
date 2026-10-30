@@ -463,6 +463,35 @@ void llama_kpool_build_plan(llama_context & lctx, const llama_batch & batch, boo
     g_kpool.reserve_only = false;
 }
 
+// pxa_reserve_real_graph() (PXA_SCHED_RESERVE_REAL) builds a real-path graph from a SYNTHETIC
+// batch -- n_tokens BOS at the end of the context, kv.head moved there -- in between two builds
+// of the same real ubatch, and that build plans with worst_case = false, i.e. through the
+// carried incremental plan above. The synthetic batch's cells are not in the cache, so it took
+// the from-scratch path: same layout, but `is_new`/`n_new` marked for the synthetic positions,
+// with applied_used left at kv.used. The real ubatch's rebuild then took the "already applied"
+// re-verify branch and kept those marks: a decode that completed a pool lost its pooled-key
+// write (n_new 1 -> 0) and the indexer scored that pool with a stale key. Only requests that
+// re-reserved on such a token were hit, so a greedy request's output depended on the requests
+// before it. A reserve is a sizing pass: it now leaves the plan exactly as it found it.
+static llama_kpool_plan g_kpool_saved;
+static bool             g_kpool_saving = false;
+
+void llama_kpool_reserve_begin(llama_context & /*lctx*/) {
+    GGML_ASSERT(!g_kpool_saving && "k-pool reserve scopes do not nest");
+    g_kpool_saved  = g_kpool;   // a copy: the synthetic build still plans from the carried state
+    g_kpool_saving = true;
+}
+
+void llama_kpool_reserve_end(llama_context & /*lctx*/) {
+    GGML_ASSERT(g_kpool_saving && "llama_kpool_reserve_end() without llama_kpool_reserve_begin()");
+    // the input tensors are the graph's, not the plan's: the next real build registers its own
+    const llama_kpool_inputs inputs = g_kpool.inputs;
+    g_kpool        = std::move(g_kpool_saved);
+    g_kpool.inputs = inputs;
+    g_kpool_saved  = llama_kpool_plan();
+    g_kpool_saving = false;
+}
+
 bool llama_kpool_replan_for_reuse(llama_context & lctx, const llama_batch & batch) {
     if (!g_kpool.built || g_kpool.reserve_only) {
         return false;

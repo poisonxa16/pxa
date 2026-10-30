@@ -59,11 +59,12 @@
 #p-encode .en-path button{flex:none;height:34px;padding:0 10px}
 #p-encode pre.log{height:260px}
 #p-encode .en-grid2{display:grid;gap:var(--s4);grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
-#p-encode .en-pick{display:grid;gap:2px;max-height:50vh;overflow:auto;border:1px solid var(--line);border-radius:var(--r1);padding:4px}
-#p-encode .en-pick button{display:flex;gap:8px;align-items:center;border:0;background:none;color:var(--text);text-align:left;padding:7px 8px;border-radius:6px;cursor:pointer;font-size:var(--fs-1);min-width:0}
-#p-encode .en-pick button:hover{background:var(--surface-2)}
-#p-encode .en-pick button .k{font-size:10.5px;font-weight:700;color:var(--faint);text-transform:uppercase;letter-spacing:.05em;flex:none;width:40px}
-#p-encode .en-pick button span.n{overflow-wrap:anywhere;min-width:0}
+/* the picker is a <dialog> appended to body, outside #p-encode: scope it by the dialog's id */
+#en-dlg .en-pick{display:grid;gap:2px;max-height:50vh;overflow:auto;border:1px solid var(--line);border-radius:var(--r1);padding:4px}
+#en-dlg .en-pick button{display:flex;gap:8px;align-items:center;border:0;background:none;color:var(--text);text-align:left;padding:7px 8px;border-radius:6px;cursor:pointer;font-size:var(--fs-1);min-width:0}
+#en-dlg .en-pick button:hover{background:var(--surface-2)}
+#en-dlg .en-pick button .k{font-size:10.5px;font-weight:700;color:var(--faint);text-transform:uppercase;letter-spacing:.05em;flex:none;width:52px}
+#en-dlg .en-pick button span.n{overflow-wrap:anywhere;min-width:0}
 .en-dlg{width:min(640px,96vw);height:auto}
 #p-encode .en-masked{font-family:var(--mono);font-size:var(--fs-1);padding:7px 10px;background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--r1);overflow-wrap:anywhere}
 #p-encode .en-jobrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--line);font-size:var(--fs-1)}

@@ -6,7 +6,12 @@
 Starts llama-server with MODEL_A as -m and MODEL_B registered with --hot-model, and checks:
   1. /v1/models lists both, MODEL_A on the cards at open;
   2. greedy output of each model through the hot-swap server equals a single-model server of that
-     model (before any swap, after a swap in, after a swap back, and once more);
+     model that saw the SAME request history (before any swap, after a swap in, after a swap back,
+     and once more). The reference server runs colours, sea, colours, sea; a model's first visit is
+     compared with the first pair and every later visit with the second pair, so "colours after sea
+     (and after a park)" is compared with "colours after sea, never parked" -- the fair pair of
+     FAIR-CHECK.md. Comparing it with a colours prompt that never followed sea also fails on a
+     server that never swaps (a cross-request carry of the engine), so it says nothing about park;
   3. an unknown model name gets 404; an unnamed request is served by the model on the cards;
   4. requests for both models fired concurrently are all served, each by the model it named;
   5. a conversation on A resumes after a round trip through B without re-prefilling its history
@@ -24,6 +29,20 @@ SRV = os.path.join(BD, "bin", "llama-server")
 FLAGS = os.environ.get("HS_FLAGS", "-c 4096 -np 2 -t 4").split()
 LOGDIR = tempfile.mkdtemp(prefix="hotswap-e2e-")
 fails = []
+
+# what binary this run counts: build commit and the mtime of the server and the ggml libraries it loads
+try:
+    ver = subprocess.run([SRV, "--version"], capture_output=True, text=True, timeout=60)
+    print("binary:", " ".join((ver.stdout + ver.stderr).split())[:300], flush=True)
+except Exception as e:
+    print("binary: --version failed:", e, flush=True)
+for root in ("bin", "src", "ggml/src"):
+    d = os.path.join(BD, root)
+    if os.path.isdir(d):
+        for f in sorted(os.listdir(d)):
+            if f == "llama-server" or (f.startswith("libggml") and ".so" in f):
+                fp = os.path.join(d, f)
+                print(f"mtime: {fp} {time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(os.path.getmtime(fp)))}", flush=True)
 
 
 def fail(msg):
@@ -83,15 +102,26 @@ def gen(model, prompt, n=48):
     return r["content"]
 
 
-# ---- reference outputs from single-model servers
+# ---- reference outputs from single-model servers, with the same request history each model sees
+# on the hot-swap server: refs[key][0] = (P1, P2) on a fresh server, refs[key][1] = (P1, P2) after it.
 refs = {}
 for path, key in ((MA, "A"), (MB, "B")):
     p = start(["-m", path], "ref-" + key)
     if not p:
         fail(f"reference server for {path} did not start")
         sys.exit(1)
-    refs[key] = (gen("x", P1), gen("x", P2))
+    first = (gen("x", P1), gen("x", P2))
+    after = (gen("x", P1), gen("x", P2))
+    refs[key] = (first, after)
     stop(p)
+    if first != after:
+        print(f"note: model {key} answers differently after an earlier request on a server that never "
+              f"swaps (engine cross-request carry, not a hot-swap fault): {first!r} then {after!r}", flush=True)
+
+
+def p1_ok(key, out):
+    """P1 deep into a run: either single-server P1 answer of that model (history-independent checks)."""
+    return out in (refs[key][0][0], refs[key][1][0])
 
 # ---- the hot-swap server
 p = start(["-m", MA, "-a", "alpha", "--hot-model", f"beta={MB}"], "hotswap")
@@ -109,11 +139,17 @@ try:
 
     seq = [("alpha", "A"), ("beta", "B"), ("alpha", "A"), ("beta", "B")]
     outs = []
+    visits = {}
     for name, key in seq:
         o = (gen(name, P1), gen(name, P2))
         outs.append(o)
-        if o != refs[key]:
-            fail(f"{name} differs from its single-model server: {o!r} vs {refs[key]!r}")
+        k = min(visits.get(key, 0), 1)
+        visits[key] = visits.get(key, 0) + 1
+        want = refs[key][k]
+        what = "first visit vs fresh server" if k == 0 else "after a swap vs the same history on one server"
+        print(f"CMP {name} visit {visits[key]} ({what}): {'equal' if o == want else 'DIFFERS'}", flush=True)
+        if o != want:
+            fail(f"{name} differs from its single-model server ({what}): {o!r} vs {want!r}")
     if outs[0] == outs[1]:
         fail("the two models answered identically -- routing is not happening")
 
@@ -122,7 +158,7 @@ try:
         fail(f"unknown model: HTTP {st} {r}")
     st, props = req("GET", "/props")
     active = props["hot_swap"]["active"]
-    if gen(None, P1) != refs["A" if active == "alpha" else "B"][0]:
+    if not p1_ok("A" if active == "alpha" else "B", gen(None, P1)):
         fail(f"an unnamed request was not served by the model on the cards ({active})")
 
     # concurrency: 8 requests alternating models, all at once
@@ -137,8 +173,7 @@ try:
     for t in th: t.start()
     for t in th: t.join()
     for i, (name, out) in sorted(res.items()):
-        want = refs["A" if name == "alpha" else "B"][0]
-        if out != want:
+        if not p1_ok("A" if name == "alpha" else "B", out):
             fail(f"concurrent request {i} for {name} got another answer: {out!r}")
 
     # conversation resume: history on alpha survives a trip through beta

@@ -46,6 +46,7 @@ async function until(fn, ms = 20000) { try { await page.waitForFunction(fn, null
   check(await visible('#ag-drawer'), 'the gear opens the settings drawer');
   check(await widthOf('#ag-drawer') > 200, 'the open drawer has a real column (' + (await widthOf('#ag-drawer')) + 'px)');
   check(!(await visible('#ag-sys')), 'Simple mode hides the advanced knobs (system prompt)');
+  check(!(await visible('#ag-stop')) && !(await visible('#ag-jschema')) && !(await visible('#ag-grammar')), 'Simple mode hides stop / JSON schema / grammar');
   await snap('chat-settings-simple');
 
   console.log(`[${WIDTH}px] A. the host-access switch can be worked from there`);
@@ -66,6 +67,7 @@ async function until(fn, ms = 20000) { try { await page.waitForFunction(fn, null
   await page.click('#ag-mode button[data-v=advanced]'); await sleep(500);
   check(await visible('#ag-drawer'), 'switching to Advanced leaves the drawer open');
   check(await visible('#ag-sys'), 'Advanced shows the system prompt (the knobs Simple hides)');
+  check(await visible('#ag-stop') && await visible('#ag-jschema') && await visible('#ag-grammar'), 'Advanced shows stop sequences, JSON schema and grammar [P08]');
   await snap('chat-settings-advanced');
   await page.click('#ag-mode button[data-v=simple]'); await sleep(300);
   // the drawer's own close button, which is what a phone has (there the open drawer is an overlay over the

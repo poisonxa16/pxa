@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# PXA one-command installer (Pascal 6.0/6.1 and Volta 7.0 GPUs, Linux x86_64).
+# PXA one-command installer (Pascal 6.0/6.1, Volta 7.0 and Turing 7.5 GPUs, Linux x86_64).
 #   curl -fsSL https://raw.githubusercontent.com/poisonxa16/pxa/main/install.sh | bash
 #   ... | bash -s -- --docker          pull the container image instead
 #   ... | bash -s -- --dir /opt/pxa    install somewhere else (default ~/.local/share/pxa)
-#   ... | bash -s -- --version v3
+#   ... | bash -s -- --version v4.0
 set -euo pipefail
 
 REPO=poisonxa16/pxa
@@ -34,20 +34,21 @@ if [ "$MODE" = tarball ]; then
   glibc_at_least 2 35 || die "PXA needs glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+); this host has ${glibc:-unknown}."
 fi
 
-# 2. GPU check: every card must be compute capability 6.0, 6.1 or 7.0
+# 2. GPU check: every card must be compute capability 6.0, 6.1, 7.0 or 7.5 (the release builds carry
+#    sm_60, sm_61, sm_70 and sm_75 kernels: P100, GTX 10xx/P40, V100, T4/RTX 20xx/GTX 16xx)
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found: install the NVIDIA driver first."
 caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '[:blank:]' | sort -u | paste -sd' ')
 [ -n "$caps" ] || die "nvidia-smi reported no GPUs."
 newer=0
 for c in $caps; do
   case "$c" in
-    6.0|6.1|7.0) ;;
-    *) echo "install.sh: warning: PXA is built for Pascal (6.0, 6.1) and Volta (7.0); this host also has compute capability $c." >&2
+    6.0|6.1|7.0|7.5) ;;
+    *) echo "install.sh: warning: PXA is built for Pascal (6.0, 6.1), Volta (7.0) and Turing (7.5); this host also has compute capability $c." >&2
        echo "install.sh: installing anyway. Point PXA at the supported cards (pxa --gpus, or CUDA_VISIBLE_DEVICES=<their numbers>)." >&2
        newer=1 ;;
   esac
 done
-[ "$newer" = 0 ] || printf '%s\n' "$caps" | grep -qE '6\.0|6\.1|7\.0' || die "PXA is built for Pascal (6.0, 6.1) and Volta (7.0); this host reports only: $caps"
+[ "$newer" = 0 ] || printf '%s\n' "$caps" | grep -qE '6\.0|6\.1|7\.0|7\.5' || die "PXA is built for Pascal (6.0, 6.1), Volta (7.0) and Turing (7.5); this host reports only: $caps"
 
 # 3. resolve the release
 if [ "$VERSION" = latest ]; then api="https://api.github.com/repos/$REPO/releases/latest"

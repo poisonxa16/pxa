@@ -14,7 +14,10 @@
 //   - QKVD_DUMP=<file> writes the outputs to <file> and each case's errors to <file>.err;
 //     QKVD_CMP=<file> reads such a pair (the incumbent arm) and prints the two routes' errors side
 //     by side plus the max arm-vs-arm difference; with a comparison the case passes only if the
-//     new route's max abs error is <= the incumbent's.
+//     new route's max abs error is <= the incumbent's; with QKVD_EXACT=1 it passes only if every output byte equals
+//     the incumbent arm's (an identity claim).
+//   test-fa-qkv-direct colcheck                      every verify column vs its own one-token decode, byte compare
+//     (PXA_FA_QKV_NY1 / PXA_FA_QKV_UNIF; red check: PXA_FA_QKV_NY1=0 must FAIL it)
 //
 //   test-fa-qkv-direct                               accuracy + determinism, all cases
 //   test-fa-qkv-direct perf <type> <w> <n_kv> [iters] [gqa]
@@ -50,6 +53,8 @@ struct fa_case {
     ggml_tensor * out = nullptr;
     std::vector<float> qh, kd, vd;   // kd / vd token-major: [(j*nh_kv + h)*D]
     std::vector<ggml_fp16_t> mh;
+    std::vector<uint8_t> kq, vq;     // the quantized cache bytes (colcheck rebuilds width-1 nodes from them)
+    size_t row_sz = 0;
     int D, nb, n_kv, nh, nh_kv, nb_pad;
     float scale;
     ~fa_case() { if (buf) ggml_backend_buffer_free(buf); if (ctx) ggml_free(ctx); }
@@ -116,7 +121,68 @@ static bool build_case(fa_case & fc, ggml_backend_t be, ggml_type tkv, int nb, i
     ggml_backend_tensor_set(kc, kq.data(), 0, kq.size());
     ggml_backend_tensor_set(vc, vq.data(), 0, vq.size());
     ggml_backend_tensor_set(m, fc.mh.data(), 0, fc.mh.size() * sizeof(ggml_fp16_t));
+    fc.kq = std::move(kq); fc.vq = std::move(vq); fc.row_sz = row_sz;
     return true;
+}
+
+// colcheck (PXA_FA_QKV_NY1 / PXA_FA_QKV_UNIF): every column t of a width-nb verify node must equal, byte for byte, the
+// one-token decode of that token: a width-1 node over the first pad256(last_t + 1) cells with mask row t.
+static void run_colcheck(ggml_backend_t be, ggml_type tkv, int nb, int n_kv, int valid, int nh, int nh_kv) {
+    char name[160];
+    snprintf(name, sizeof(name), "colcheck %s width %d n_kv %d valid %d heads %d/%d", ggml_type_name(tkv), nb, n_kv, valid, nh, nh_kv);
+    fa_case fw;
+    if (!build_case(fw, be, tkv, nb, n_kv, valid, nh, nh_kv, 0xc01u + nb * 31u + (unsigned) valid, false)) {
+        printf("  FAIL %s: CUDA declines the node\n", name); ++g_fail; return;
+    }
+    const int D = fw.D;
+    std::vector<float> ow((size_t) D * nh * nb);
+    if (ggml_backend_graph_compute(be, fw.gf) != GGML_STATUS_SUCCESS) { printf("  FAIL %s: compute\n", name); ++g_fail; return; }
+    ggml_backend_tensor_get(fw.out, ow.data(), 0, ow.size() * sizeof(float));
+    int bad_cols = 0; double maxd = 0.0;
+    for (int t = 0; t < nb; ++t) {
+        const int last = valid - nb + t;
+        const int n1 = GGML_PAD(last + 1, 256);
+        ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ggml_context * c1 = ggml_init(ip);
+        ggml_tensor * q = ggml_new_tensor_4d(c1, GGML_TYPE_F32, D, 1, nh, 1);
+        ggml_tensor * kc = ggml_new_tensor_1d(c1, tkv, (int64_t) D * n1 * nh_kv);
+        ggml_tensor * vc = ggml_new_tensor_1d(c1, tkv, (int64_t) D * n1 * nh_kv);
+        ggml_tensor * k = ggml_view_3d(c1, kc, D, n1, nh_kv, fw.row_sz * nh_kv, fw.row_sz, 0);
+        ggml_tensor * v = ggml_view_3d(c1, vc, D, n1, nh_kv, fw.row_sz * nh_kv, fw.row_sz, 0);
+        const int pad1 = GGML_PAD(1, GGML_KQ_MASK_PAD);
+        ggml_tensor * m = ggml_new_tensor_4d(c1, GGML_TYPE_F16, n1, pad1, 1, 1);
+        ggml_tensor * o = ggml_flash_attn_ext(c1, q, k, v, m, fw.scale, 0.0f, 0.0f);
+        ggml_cgraph * g1 = ggml_new_graph(c1);
+        ggml_build_forward_expand(g1, o);
+        ggml_backend_buffer_t b1 = ggml_backend_alloc_ctx_tensors(c1, be);
+        std::vector<float> q1((size_t) D * nh);
+        for (int h = 0; h < nh; ++h) memcpy(q1.data() + (size_t) h * D, fw.qh.data() + ((size_t) h * nb + t) * D, D * sizeof(float));
+        ggml_backend_tensor_set(q, q1.data(), 0, q1.size() * sizeof(float));
+        ggml_backend_tensor_set(kc, fw.kq.data(), 0, fw.row_sz * (size_t) n1 * nh_kv);
+        ggml_backend_tensor_set(vc, fw.vq.data(), 0, fw.row_sz * (size_t) n1 * nh_kv);
+        std::vector<ggml_fp16_t> m1((size_t) n1 * pad1, ggml_fp32_to_fp16(-INFINITY));
+        memcpy(m1.data(), fw.mh.data() + (size_t) t * n_kv, (size_t) n1 * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(m, m1.data(), 0, m1.size() * sizeof(ggml_fp16_t));
+        std::vector<float> o1((size_t) D * nh);
+        const bool ok_c = ggml_backend_graph_compute(be, g1) == GGML_STATUS_SUCCESS;
+        if (ok_c) ggml_backend_tensor_get(o, o1.data(), 0, o1.size() * sizeof(float));
+        ggml_backend_buffer_free(b1); ggml_free(c1);
+        if (!ok_c) { printf("  FAIL %s: width-1 compute t=%d\n", name, t); ++g_fail; return; }
+        bool same = true;
+        for (int h = 0; h < nh; ++h) {
+            const float * a = ow.data() + ((size_t) t * nh + h) * D;
+            const float * b = o1.data() + (size_t) h * D;
+            if (memcmp(a, b, D * sizeof(float)) != 0) {
+                same = false;
+                for (int c = 0; c < D; ++c) maxd = std::max(maxd, (double) std::fabs(a[c] - b[c]));
+            }
+        }
+        bad_cols += same ? 0 : 1;
+    }
+    printf("  %s %s: %d/%d columns byte-identical to their one-token decode%s\n", bad_cols ? "FAIL" : "ok  ", name,
+           nb - bad_cols, nb, bad_cols ? "" : "");
+    if (bad_cols) { printf("       max|diff| %.3g\n", maxd); ++g_fail; }
+    fflush(stdout);
 }
 
 // Double reference for (t, h) rows, split over threads. Returns nmse and max abs error.
@@ -190,6 +256,7 @@ static void run_accuracy(ggml_backend_t be, ggml_type tkv, int nb, int n_kv, int
     reference_errors(fc, o1, nmse, maxabs);
 
     double arm_diff = -1.0, inc_max = -1.0, inc_nmse = -1.0;
+    bool arm_bytes_equal = true;   // QKVD_EXACT compares bytes (a -0 / +0 or NaN-payload difference counts)
     if (io.dump) fwrite(o1.data(), sizeof(float), n_out, io.dump);
     if (io.dump_err) fprintf(io.dump_err, "%.17g %.17g\n", maxabs, nmse); // round-trips exactly
     if (io.cmp) {
@@ -197,17 +264,21 @@ static void run_accuracy(ggml_backend_t be, ggml_type tkv, int nb, int n_kv, int
         if (fread(ob.data(), sizeof(float), n_out, io.cmp) == n_out) {
             arm_diff = 0.0;
             for (size_t i = 0; i < n_out; ++i) arm_diff = std::max(arm_diff, (double) std::fabs(o1[i] - ob[i]));
+            arm_bytes_equal = memcmp(o1.data(), ob.data(), n_out * sizeof(float)) == 0;
         }
     }
     if (io.cmp_err && fscanf(io.cmp_err, "%lf %lf", &inc_max, &inc_nmse) != 2) { inc_max = inc_nmse = -1.0; }
     const bool vs_ok = inc_max < 0 || maxabs <= inc_max;
-    const bool ok = nmse < 1e-3 && det && vs_ok;
+    // QKVD_EXACT=1 (with QKVD_CMP): an identity claim -- any nonzero byte difference against the incumbent arm fails
+    static const bool exact = getenv("QKVD_EXACT") && atoi(getenv("QKVD_EXACT")) != 0;
+    const bool exact_ok = !exact || !io.cmp || (arm_diff >= 0.0 && arm_bytes_equal);
+    const bool ok = nmse < 1e-3 && det && vs_ok && exact_ok;
     printf("  %s %s: max|err| %.3g", ok ? "ok  " : "FAIL", name, maxabs);
     if (inc_max >= 0) printf(" (incumbent %.3g)", inc_max);
     printf("  nmse %.3g", nmse);
     if (inc_nmse >= 0) printf(" (incumbent %.3g)", inc_nmse);
     printf("  determinism %s", det ? "5/5 byte-identical" : "DIFFERS");
-    if (arm_diff >= 0) printf("  max|arm diff| %.3g", arm_diff);
+    if (arm_diff >= 0) printf("  max|arm diff| %.3g%s", arm_diff, exact && !arm_bytes_equal ? " (QKVD_EXACT: NOT BYTE-IDENTICAL)" : "");
     printf("\n");
     fflush(stdout);
     if (!ok) ++g_fail;
@@ -241,6 +312,23 @@ int main(int argc, char ** argv) {
     if (ggml_backend_cuda_get_device_count() < 1) { printf("SKIP: no CUDA device\n"); return 0; }
     ggml_backend_t be = ggml_backend_cuda_init(0, nullptr);
     if (!be) { printf("SKIP: cuda init failed\n"); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "colcheck")) {
+        // verify columns vs their one-token decodes, the PXA_FA_QKV_NY1 promise (and PXA_FA_QKV_UNIF's)
+        for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+            for (int nb = 2; nb <= 8; ++nb) {
+                run_colcheck(be, t, nb, 2048, 1500 + nb, 24, 4);
+                run_colcheck(be, t, nb, 32768, 20560 + nb, 24, 4);
+            }
+            run_colcheck(be, t, 4, 2048, 1025, 24, 4);   // straddles 1024: k_max 1024,1024,1024,1280
+            run_colcheck(be, t, 4, 2048, 1026, 24, 4);
+            run_colcheck(be, t, 3, 2048, 1025, 16, 4);   // GQA 4
+            run_colcheck(be, t, 3, 4096, 3000, 32, 4);   // GQA 8
+            run_colcheck(be, t, 2, 8192, 300, 24, 4);    // short cache in a long view
+        }
+        ggml_backend_free(be);
+        printf("%s\n", g_fail ? "FAILED" : "PASSED");
+        return g_fail ? 1 : 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "perf")) {
         const char * tn = argc > 2 ? argv[2] : "q4_0";
         const int w = argc > 3 ? atoi(argv[3]) : 1;
@@ -279,6 +367,14 @@ int main(int argc, char ** argv) {
         run_accuracy(be, t, 8, 2048, 2048, 32, 4, false, io);
         run_accuracy(be, t, 2, 256, 200, 24, 4, false, io);           // one split unit, partly valid
         run_accuracy(be, t, 4, 768, 700, 24, 4, false, io);
+        // PXA_FA_QKV_NY1 verify columns that straddle a 256-key boundary (k_max_c differs inside a column pair:
+        // the PXA_FA_QKV_NY1_SHARE kernel runs such a pair one column at a time), and a deep pair-shared case
+        run_accuracy(be, t, 4, 2048, 1025, 24, 4, false, io);         // columns 1021..1024: k_max 1024,1024,1024,1280
+        run_accuracy(be, t, 3, 2048, 1025, 24, 4, false, io);         // 1022..1024: k_max 1024,1024,1280
+        run_accuracy(be, t, 4, 2048, 1026, 24, 4, false, io);         // 1022..1025: 1024,1024,1280,1280
+        run_accuracy(be, t, 4, 32768, 20560, 24, 4, false, io);       // the beta-2 long-prompt depth (~20.5k)
+        run_accuracy(be, t, 2, 32768, 20561, 16, 4, false, io);       // GQA 4
+        run_accuracy(be, t, 3, 32768, 20560, 32, 4, false, io);       // GQA 8
         run_accuracy(be, t, 1, 131072, 131000, 12, 2, false, io);     // one card of a tensor split, deep
         run_accuracy(be, t, 3, 131072, 130001, 12, 2, false, io);
         run_accuracy(be, t, 8, 65536, 60000, 12, 2, false, io);

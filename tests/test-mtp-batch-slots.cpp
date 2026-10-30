@@ -512,7 +512,10 @@ static void case_semantics() {
         lo.seq_id = 3; lo.n_draft = 4; lo.p_min = 0.75f; lo.have_prob = true;
         lo.n_past = 40; lo.id_last = 7; lo.hidden_seed = 900;
         lo.probs = { 0.2f };
-        const seq_record & s0 = serial({ lo }).seqs.at(3);
+        // Name the record. A reference into serial()'s temporary is dangling once the full
+        // expression ends, and MSVC reclaims that stack before CHECK runs.
+        const run_record r0 = serial({ lo });
+        const seq_record & s0 = r0.seqs.at(3);
         CHECK(s0.drafts.size() == 1, "(d) a below-floor FIRST token is kept: drafted %zu, want 1", s0.drafts.size());
         CHECK(s0.n_decode == 1 && s0.stop == 1, "(d) first-token floor break: n_decode %d stop %d",
               (int) s0.n_decode, (int) s0.stop);
@@ -520,7 +523,8 @@ static void case_semantics() {
         seq_plan hi = lo;                             // first fine, second under the floor
         hi.seq_id = 4;
         hi.probs = { 0.9f, 0.2f };
-        const seq_record & s1 = serial({ hi }).seqs.at(4);
+        const run_record r1 = serial({ hi });
+        const seq_record & s1 = r1.seqs.at(4);
         CHECK(s1.drafts.size() == 1, "(d) a below-floor LATER token is dropped: drafted %zu, want 1", s1.drafts.size());
         CHECK(s1.n_decode == 2 && s1.stop == 1, "(d) later-token floor break: n_decode %d stop %d",
               (int) s1.n_decode, (int) s1.stop);
@@ -533,7 +537,8 @@ static void case_semantics() {
         p.seq_id = 5; p.n_draft = 3; p.p_min = 0.0f; p.have_prob = false;
         p.n_past = 10; p.id_last = 2; p.hidden_seed = 3;
         p.probs = { 0.0f, 0.0f, 0.0f };
-        const seq_record & s = serial({ p }).seqs.at(5);
+        const run_record r = serial({ p });
+        const seq_record & s = r.seqs.at(5);
         CHECK(s.drafts.size() == 3 && s.stop == 2, "(e) an unarmed floor must not truncate the chain");
     }
 }

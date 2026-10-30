@@ -86,8 +86,8 @@ docker compose up -d
 
 ```
 [+] Running 2/2
- ✔ Network docker_default   Created
- ✔ Container docker-pxa-1   Started
+ - Network docker_default   Created
+ - Container docker-pxa-1   Started
 ```
 
 Watch it come up:
@@ -186,7 +186,7 @@ wait for a load. It is the same reasoning described in
 | thing | what it does | change it? |
 |---|---|---|
 | `image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-...}` | which release to run | only to pin an older version |
-| `VLLM_VERSION` | which vLLM sidecar image to run (it keeps the `v2026.10` tag; v3 did not change it) | no |
+| `VLLM_VERSION` | which vLLM sidecar image to run (it keeps its own `v2026.10` tag, separate from the engine image) | no |
 | `MODELS_DIR` / `MODEL_FILE` / `GPUS` | the three you must set | yes |
 | `PXA_PORT`, `VLLM_PORT` | host ports | yes, one place each |
 | `CTX` | context length, `-c` | yes — see [guide 02 §6](02-pick-settings-for-your-cards.md) |

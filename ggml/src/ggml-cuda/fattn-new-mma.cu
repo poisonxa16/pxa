@@ -252,19 +252,19 @@ struct fattn_mma_f16_config<256, 256> {
     }
 
     static int get_nbatch_combine_host(const int cc, const int ncols) {
-        if (ggml_cuda_highest_compiled_arch(cc) == CC_TURING) {
+        if (ggml_cuda_highest_compiled_arch(cc) == PXA_CC_TURING) {
             return ncols <= 16 ? 128 : 64;
         }
         return 64;
     }
 
     static constexpr __device__ int get_nbatch_combine_device(int ncols) {
-#if __CUDA_ARCH__ == CC_TURING
+#if __CUDA_ARCH__ == PXA_CC_TURING
         return ncols <= 16 ? 128 : 64;
 #else
         GGML_UNUSED(ncols);
         return 128;
-#endif // __CUDA_ARCH__ == CC_TURING
+#endif // __CUDA_ARCH__ == PXA_CC_TURING
     }
 };
 
@@ -372,33 +372,33 @@ struct fattn_mma_f16_config<576, 512> {
     static constexpr int  nstages_target = 1;
 
     static int get_nbatch_K2_host(const int cc, const int ncols) {
-        if (ggml_cuda_highest_compiled_arch(cc) == CC_TURING) {
+        if (ggml_cuda_highest_compiled_arch(cc) == PXA_CC_TURING) {
             return ncols <= 16 ? 96 : 160;
         }
         return ncols <= 16 ? 288 : 160;
     }
 
     static constexpr __device__ int get_nbatch_K2_device(int ncols) {
-#if __CUDA_ARCH__ == CC_TURING
+#if __CUDA_ARCH__ == PXA_CC_TURING
         return ncols <= 16 ? 96 : 160;
 #else
         return ncols <= 16 ? 288 : 160;
-#endif // __CUDA_ARCH__ == CC_TURING
+#endif // __CUDA_ARCH__ == PXA_CC_TURING
     }
 
     static int get_nbatch_V2_host(const int cc, const int ncols) {
-        if (ggml_cuda_highest_compiled_arch(cc) == CC_TURING) {
+        if (ggml_cuda_highest_compiled_arch(cc) == PXA_CC_TURING) {
             return ncols <= 16 ? 64 : 128;
         }
         return ncols <= 16 ? 256 : 128;
     }
 
     static constexpr __device__ int get_nbatch_V2_device(int ncols) {
-#if __CUDA_ARCH__ == CC_TURING
+#if __CUDA_ARCH__ == PXA_CC_TURING
         return ncols <= 16 ? 64 : 128;
 #else
         return ncols <= 16 ? 256 : 128;
-#endif // __CUDA_ARCH__ == CC_TURING
+#endif // __CUDA_ARCH__ == PXA_CC_TURING
     }
 
     static int get_nbatch_combine_host(const int /*cc*/, const int /*ncols*/) {
@@ -1470,12 +1470,12 @@ static __global__ void flash_attn_ext_f16(
         NO_DEVICE_CODE;
         return;
     }
-#if __CUDA_ARCH__ == CC_TURING
+#if __CUDA_ARCH__ == PXA_CC_TURING
     if constexpr (ncols1*ncols2 > 32) {
         NO_DEVICE_CODE;
         return;
     }
-#endif __CUDA_ARCH__ == CC_TURING
+#endif __CUDA_ARCH__ == PXA_CC_TURING
 
     static_assert(!mla || DKQ >= DV, "MLA needs DKQ >= DV");
 
@@ -1530,6 +1530,13 @@ static __global__ void flash_attn_ext_f16(
         int kb0_stop_kernel  = kb0_stop  * kb_niter;
         if (KV_max) {
             kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[jt] / c::nbatch_fa);
+            if (kb0_start_kernel >= kb0_stop_kernel) {
+                // (same fix as fattn-mma-f16): a stream-k slice wholly above KV_max would run process_tile's
+                // last iteration at kb0_stop-1, a tile another block owns (double count). Run one fully masked
+                // iteration at the start of this block's own slice instead.
+                kb0_start_kernel = kb0_start * kb_niter;
+                kb0_stop_kernel  = kb0_start_kernel + 1;
+            }
         }
 
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -1577,6 +1584,10 @@ static __global__ void flash_attn_ext_f16(
     int kb0_stop_kernel  = kb0_stop  * kb_niter;
     if (KV_max) {
         kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[jt] / c::nbatch_fa);
+        if (kb0_start_kernel >= kb0_stop_kernel) { // see above: empty clamped slice -> one fully masked iteration of our own slice
+            kb0_start_kernel = kb0_start * kb_niter;
+            kb0_stop_kernel  = kb0_start_kernel + 1;
+        }
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
@@ -1938,7 +1949,7 @@ static void launch_fattn_new_mma(
 
         const int nblocks_stream_k = max_blocks;
 
-        const bool use_stream_k = cc >= CC_ADA_LOVELACE || tiles_efficiency_percent < 75;
+        const bool use_stream_k = cc >= PXA_CC_ADA_LOVELACE || tiles_efficiency_percent < 75;
 
         blocks_num.x = use_stream_k ? nblocks_stream_k : ntiles_total;
         blocks_num.y = 1;
@@ -2046,6 +2057,38 @@ static void launch_fattn_new_mma(
 }
 
 
+// Dynamic shared memory of one (DKQ, DV, ncols1, ncols2) instance on a card of compute capability cc.
+// ONE formula for the launcher below and for ggml_cuda_fattn_new_mma_fits() (the FA route's fit test).
+template <int DKQ, int DV, int ncols1, int ncols2>
+static size_t ggml_cuda_fattn_new_mma_nbytes_shared(const int cc) {
+    typedef fattn_mma_f16_config<DKQ, DV> c;
+
+    const int nstages = cp_async_available(cc) ? c::nstages_target : 0;
+
+    constexpr int ncols         = ncols1 * ncols2;
+    constexpr int ntiles        = ncols <= 8 && DKQ < 512 ? 1 : 2; // Number of tiles per warp.
+    constexpr int cols_per_warp = ntiles * tile_B::I;
+    constexpr int nwarps_max_x  = (ncols + cols_per_warp - 1) / cols_per_warp;
+    constexpr int nwarps_max_y  = c::nbatch_fa / tile_A::I;
+    constexpr int nwarps        = nwarps_max_x*nwarps_max_y <= c::nwarps_max ? nwarps_max_x*nwarps_max_y : c::nwarps_max;
+
+    const int nbatch_K2      = c::get_nbatch_K2_host     (cc, ncols);
+    const int nbatch_V2      = c::get_nbatch_K2_host     (cc, ncols);
+    const int nbatch_combine = c::get_nbatch_combine_host(cc, ncols);
+
+    const size_t nbytes_shared_KV_1stage = c::nbatch_fa         * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_KV_2stage = c::nbatch_fa         *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
+    const size_t nbytes_shared_mask      = ncols1               * (c::nbatch_fa/2 + 4)                    * sizeof(half2);
+    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
+
+    const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
+
+    return std::max(nbytes_shared_combine, c::Q_in_reg ?
+        std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
+                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -2053,8 +2096,6 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ct
     const int cc = ggml_cuda_info().devices[id].cc;
 
     typedef fattn_mma_f16_config<DKQ, DV> c;
-
-    const int nstages = cp_async_available(cc) ? c::nstages_target : 0;
 
     constexpr int ncols         = ncols1 * ncols2;
     //constexpr int ntiles        = DKQ == 512 ? 2 : ncols <= 8 && DKQ < 576 ? 1 : 2; // Number of tiles per warp.
@@ -2066,25 +2107,26 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ct
 
     constexpr bool is_mla = (DKQ == 576 && DV == 512) || (DKQ == 320 && DV == 256);
 
-    const int nbatch_K2      = c::get_nbatch_K2_host     (cc, ncols);
-    const int nbatch_V2      = c::get_nbatch_K2_host     (cc, ncols);
-    const int nbatch_combine = c::get_nbatch_combine_host(cc, ncols);
-
     static_assert(DKQ   % tile_B::J     == 0, "bad DKQ");
     static_assert(DV    % tile_A::J     == 0, "bad DV");
     static_assert(ncols % cols_per_warp == 0, "bad ncols");
 
-    const size_t nbytes_shared_KV_1stage = c::nbatch_fa         * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_KV_2stage = c::nbatch_fa         *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
-    const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
-    const size_t nbytes_shared_mask      = ncols1               * (c::nbatch_fa/2 + 4)                    * sizeof(half2);
-    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
+    const size_t nbytes_shared_total = ggml_cuda_fattn_new_mma_nbytes_shared<DKQ, DV, ncols1, ncols2>(cc);
 
-    const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
-
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, c::Q_in_reg ?
-        std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
-                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+    // PXA (2026-10-21): the opt-in below can ask for more than the card allows. On sm_75
+    // (64 KB per block) the wide 576/512 and 320/256 tiles need 66-94 KB and every 512/512 tile 82-98 KB, so
+    // cudaFuncSetAttribute failed and CUDA_CHECK aborted the process at the first prompt (sm_80+ fit them all:
+    // 163 KB / 99 KB). A tile that does not fit now runs as the half-as-wide instance of the same head size,
+    // which takes the same per-column arithmetic over more blocks; it recurses down to an instance that fits.
+    // Only shapes that aborted before can take this branch, so every card that ran this kernel before runs the
+    // same instance with the same launch. 512/512 has no instance that fits 64 KB: ggml_cuda_fattn_new_mma_fits()
+    // declines it in the FA route instead (the graph keeps the unfused chain). Only existing instances are named.
+    if constexpr (ncols1 > 1 && (DKQ == 576 || DKQ == 512 || DKQ == 320) && ((ncols1/2)*ncols2) % 16 == 0) {
+        if (nbytes_shared_total > ggml_cuda_info().devices[id].smpbo) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, ncols1/2, ncols2>(ctx, dst);
+            return;
+        }
+    }
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
@@ -2121,6 +2163,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ct
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
+    // sm_75: flash_attn_ext_f16 compiles every variant with ncols1*ncols2 > 32 to NO_DEVICE_CODE for
+    // __CUDA_ARCH__ == 750 (and the Turing nbatch configs above are sized for 64 KB of shared memory at
+    // <= 32 columns), so on a Turing device the host must never pick the 64-column tile below: a wide
+    // batch stays on the 32-column tile, which walks the same Q columns in more blocks. Without this a
+    // 576/512 (MLA, gqa % 8 or % 16) or 320/256 prefill trapped on sm_75. Every other arch, including
+    // sm_90+ JIT-ing compute_89, reports a highest compiled arch != 750 and keeps the old choice.
+    const bool turing = ggml_cuda_highest_compiled_arch(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) == PXA_CC_TURING;
 
     if constexpr ((DKQ == 576 || DKQ == 512) && ncols2 <= 4) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, ncols2>(ctx, dst);
@@ -2147,7 +2196,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         return;
     }
 
-    if (Q->ne[1] <= 32/ncols2) {
+    if (turing || Q->ne[1] <= 32/ncols2) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -2195,6 +2244,28 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 
     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+}
+
+// PXA (2026-10-21): the FA route's fit test for this kernel family. False when the narrowest
+// instance the dispatcher below can pick for this node does not fit the card's per-block shared memory, so the
+// route declines the node (the graph builder then keeps its unfused chain) instead of aborting in
+// cudaFuncSetAttribute. Only 512/512 can fail on a shipped arch: sm_75 allows 64 KB per block and its narrowest
+// tiles need 82 KB ((2,8)) and 82 KB ((4,4)); sm_80/86/89 fit every 512/512 tile (largest 98 KB). The wider
+// 576/512 and 320/256 tiles that exceed sm_75 step down to a narrower instance in the launcher, and their
+// narrowest instances fit 64 KB, so they always answer true here.
+bool ggml_cuda_fattn_new_mma_fits(const int device, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!(Q->ne[0] == 512 && K->ne[0] == 512 && V->ne[0] == 512)) {
+        return true;
+    }
+    const int    cc        = ggml_cuda_info().devices[device].cc;
+    const size_t smpbo     = ggml_cuda_info().devices[device].smpbo;
+    const int    gqa_ratio = Q->ne[2] / K->ne[2];
+    const size_t need = gqa_ratio % 8 == 0 ? ggml_cuda_fattn_new_mma_nbytes_shared<512, 512, 2, 8>(cc)
+                                           : ggml_cuda_fattn_new_mma_nbytes_shared<512, 512, 4, 4>(cc);
+    return need <= smpbo;
 }
 
 void ggml_cuda_flash_attn_ext_mma_new(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2273,7 +2344,7 @@ void ggml_cuda_flash_attn_ext_mma_new(ggml_backend_cuda_context & ctx, ggml_tens
     }
     GGML_ASSERT(Q->ne[0] == 576 && K->ne[0] == 576 && V->ne[0] == 512);
     if (gqa_ratio == 20 && Q->ne[1] <= 4 && K->ne[1] >= 2048) {
-        if (ggml_cuda_info().devices[ctx.device].cc >= CC_ADA_LOVELACE) {
+        if (ggml_cuda_info().devices[ctx.device].cc >= PXA_CC_ADA_LOVELACE) {
             ggml_cuda_flash_attn_ext_mma_f16_case<576, 512, 1, 16>(ctx, dst);
         } else {
             ggml_cuda_flash_attn_ext_mma_f16_case<576, 512, 1, 32>(ctx, dst);
@@ -2345,3 +2416,64 @@ void ggml_cuda_flash_attn_ext_mma_new(ggml_backend_cuda_context & ctx, ggml_tens
     //}
 }
 
+// PXA (2026-10-21): the shapes ggml_cuda_flash_attn_ext_mma_new() serves. Every condition below is one
+// of the GGML_ASSERT / GGML_ABORT lines of that function and of launch_fattn_new_mma(), or the NO_DEVICE_CODE
+// logit-softcap variants of flash_attn_ext_f16 (head 128 and 256 only), read in the same order. The FA route
+// (pxa/core/fa-route.cu) asks it before every new-mma pick, so a node that would abort here is declined by the
+// support query (the scheduler then runs it elsewhere) or left to the rows below the dispatch-only decode
+// shortcuts, instead of taking the process down. Seen on an RTX 3080 Ti (sm_86, test-fa-tile-big-dev): a 512/512
+// node with no mask, or with ALiBi, was accepted and then hit GGML_ASSERT(use_gqa_opt). Every node that ran here
+// before passes every condition, so its route and its output are unchanged.
+bool ggml_cuda_fattn_new_mma_serves(const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    // ggml_cuda_flash_attn_ext_mma_new: GGML_ASSERT(use_gqa_opt), use_gqa_opt = mask && max_bias == 0.0f
+    if (mask == nullptr || max_bias != 0.0f) {
+        return false;
+    }
+    // launch_fattn_new_mma
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mask->type != GGML_TYPE_F16 || mask->ne[1] < GGML_PAD(Q->ne[1], 16)) {
+        return false;
+    }
+    if (K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[3] != 1) {
+        return false;
+    }
+    // K and V are converted to f16 first when they are not f16 already
+    if ((K->type != GGML_TYPE_F16 && ggml_get_to_fp16_cuda(K->type) == nullptr) ||
+        (V->type != GGML_TYPE_F16 && ggml_get_to_fp16_cuda(V->type) == nullptr)) {
+        return false;
+    }
+    // ggml_cuda_flash_attn_ext_mma_new: GGML_ASSERT(Q->ne[2] % K->ne[2] == 0)
+    if (K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+    const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
+    const int64_t DKQ       = K->ne[0];
+    const int64_t DV        = V->ne[0];
+    if (Q->ne[0] != DKQ) {
+        return false;
+    }
+    // flash_attn_ext_f16: use_logit_softcap && !(DKQ == 128 || DKQ == 256) -> NO_DEVICE_CODE
+    if (logit_softcap != 0.0f && DKQ != 128 && DKQ != 256) {
+        return false;
+    }
+    // the head-size cases of ggml_cuda_flash_attn_ext_mma_new, each with the GQA ratios it does not abort on
+    if (DKQ == 128) return DV == 128 && (gqa_ratio == 12 || gqa_ratio == 6 || gqa_ratio == 10);
+    if (DKQ == 256) return DV == 256 && gqa_ratio == 6;
+    if (DKQ == 192) return DV == 128 || (DV == 192 && gqa_ratio == 1);
+    if (DKQ == 320) return DV == 256 && gqa_ratio % 16 == 0;
+    if (DKQ == 512) return DV == 512 && gqa_ratio % 4 == 0;
+    if (DKQ == 576) return DV == 512 && gqa_ratio % 4 == 0;
+    return false;
+}

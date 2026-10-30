@@ -1,3 +1,4 @@
+#include "pxa-env-flag.h"
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "convert.cuh"
@@ -181,7 +182,7 @@ static __global__ void k_set_rows_f32_rows(const float * __restrict__ src0, cons
     }
 }
 static bool pxa_set_rows_fast() {
-    static const bool on = [] { const char * e = getenv("PXA_SET_ROWS_FAST"); return !(e && *e && atoi(e) == 0); }();
+    static const bool on = [] { const char * e = getenv("PXA_SET_ROWS_FAST"); return !(e && *e && pxa_env_value_off(e)); }();
     return on;
 }
 

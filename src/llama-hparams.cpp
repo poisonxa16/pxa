@@ -218,6 +218,95 @@ static void llm_load_hparams_dspark(llama_model_loader & ml, llama_model & model
                    hparams.dsv4_hc_mult);
 }
 
+
+// DeepSeek-V4.1 ("deepseek41") keys on top of the V4 set. Key spellings follow the ISTA
+// GGUF header verbatim (lanes/NAMES-deepseek41.md). Every list is validated here so the
+// loader and the graph can trust the per-layer flags without re-checking.
+static void llm_load_hparams_dsv41(llama_model_loader & ml, llama_hparams & hparams) {
+    const uint32_t n_layer = hparams.n_layer;
+    if (hparams.dsv4_hash_layer_count != 0) {
+        throw std::runtime_error(format("DeepSeek-V4.1 has no hash-routed layers (hash_layer_count = %u)",
+                    hparams.dsv4_hash_layer_count));
+    }
+    {
+        std::string scoring;
+        if (ml.get_key(LLM_KV_EXPERT_SCORING_FUNC, scoring, false) && scoring != "sqrtsoftplus") {
+            throw std::runtime_error("DeepSeek-V4.1: expert_scoring_func '" + scoring + "' is not sqrtsoftplus");
+        }
+    }
+    ml.get_key(LLM_KV_ATTENTION_CANDIDATE_BLOCK_SIZE,      hparams.dsv41_cand_block_size);
+    ml.get_key(LLM_KV_ATTENTION_CANDIDATE_TOPK_BLOCKS,     hparams.dsv41_cand_topk_blocks);
+    ml.get_key(LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER_ID, hparams.dsv41_cand_source_layer);
+
+    auto read_layers = [&](llm_kv kid, bool required, uint32_t & n, std::array<uint32_t, llama_hparams::DSV41_MAX_SRC> & dst,
+                           std::array<bool, LLAMA_MAX_LAYERS> * flags, uint32_t limit) {
+        std::vector<uint32_t> v;
+        if (!ml.get_arr(kid, v, required)) {
+            n = 0;
+            return;
+        }
+        if (v.size() > llama_hparams::DSV41_MAX_SRC) {
+            throw std::runtime_error(format("DeepSeek-V4.1: %s has %zu entries (max %u)",
+                        ml.llm_kv(kid).c_str(), v.size(), llama_hparams::DSV41_MAX_SRC));
+        }
+        n = (uint32_t) v.size();
+        for (uint32_t i = 0; i < n; ++i) {
+            if (v[i] >= limit || (i > 0 && v[i] <= v[i-1])) {
+                throw std::runtime_error(format("DeepSeek-V4.1: %s[%u] = %u is out of range or not ascending",
+                            ml.llm_kv(kid).c_str(), i, v[i]));
+            }
+            dst[i] = v[i];
+            if (flags) {
+                (*flags)[v[i]] = true;
+            }
+        }
+    };
+    read_layers(LLM_KV_KV_SOURCE_LAYER_IDS,           true,  hparams.dsv41_n_kv_source,      hparams.dsv41_kv_source_layers,     &hparams.dsv41_is_kv_source,    n_layer);
+    read_layers(LLM_KV_INDEX_SOURCE_LAYER_IDS,        true,  hparams.dsv41_n_index_source,   hparams.dsv41_index_source_layers,  &hparams.dsv41_is_index_source, n_layer);
+    read_layers(LLM_KV_DSV41_DSPARK_TARGET_LAYER_IDS, false, hparams.dsv41_n_dspark_targets, hparams.dsv41_dspark_target_layers, nullptr,                       n_layer);
+
+    // Every source layer compresses (ratio 1 or 2); raw-SWA layers cannot be a source.
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if ((hparams.dsv41_is_kv_source[il] || hparams.dsv41_is_index_source[il]) && hparams.dsv4_compress_ratios[il] == 0) {
+            throw std::runtime_error(format("DeepSeek-V4.1: layer %u is a kv/index source but has compress ratio 0", il));
+        }
+    }
+    if (!hparams.dsv41_is_kv_source[hparams.dsv41_cand_source_layer]) {
+        throw std::runtime_error(format("DeepSeek-V4.1: candidate_source_layer_id %u is not a kv source layer",
+                    hparams.dsv41_cand_source_layer));
+    }
+    if (hparams.dsv41_cand_block_size == 0 || hparams.dsv41_cand_topk_blocks == 0) {
+        throw std::runtime_error("DeepSeek-V4.1: candidate_block_size / candidate_topk_blocks must be > 0");
+    }
+
+    hparams.dsv41_engram_present = false;
+    ml.get_key(LLM_KV_ENGRAM_PRESENT, hparams.dsv41_engram_present, false);
+    if (hparams.dsv41_engram_present) {
+        read_layers(LLM_KV_ENGRAM_LAYER_IDS, true, hparams.dsv41_n_engram, hparams.dsv41_engram_layers, &hparams.dsv41_is_engram, n_layer);
+        std::vector<uint32_t> rows;
+        ml.get_arr(LLM_KV_ENGRAM_NUM_EMBEDDINGS, rows, true);
+        if (rows.size() != hparams.dsv41_n_engram) {
+            throw std::runtime_error(format("DeepSeek-V4.1: engram.num_embeddings has %zu entries, engram.layer_ids %u",
+                        rows.size(), hparams.dsv41_n_engram));
+        }
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i] == 0) {
+                throw std::runtime_error("DeepSeek-V4.1: engram.num_embeddings has a zero entry");
+            }
+            hparams.dsv41_engram_rows[i] = rows[i];
+        }
+        ml.get_key(LLM_KV_ENGRAM_HEAD_DIM,              hparams.dsv41_engram_head_dim);
+        ml.get_key(LLM_KV_ENGRAM_N_HEADS,               hparams.dsv41_engram_n_heads);
+        ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE,        hparams.dsv41_engram_max_ngram);
+        ml.get_key(LLM_KV_ENGRAM_VOCAB_SIZE,            hparams.dsv41_engram_vocab);
+        ml.get_key(LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE, hparams.dsv41_engram_cvocab);
+        ml.get_key(LLM_KV_ENGRAM_PAD_TOKEN_ID,          hparams.dsv41_engram_pad_id);
+        if (hparams.dsv41_engram_max_ngram < 2 || hparams.dsv41_engram_n_heads == 0 || hparams.dsv41_engram_head_dim == 0) {
+            throw std::runtime_error("DeepSeek-V4.1: engram max_ngram_size >= 2, n_heads and head_dim > 0 required");
+        }
+    }
+}
+
 void llm_load_hparams(
         llama_model_loader & ml,
         llama_model & model, bool ignore_vocab) {
@@ -278,7 +367,12 @@ void llm_load_hparams(
     ml.get_key(LLM_KV_CONTEXT_LENGTH,    hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,  hparams.n_embd);
     ml.get_key(LLM_KV_EXPERT_COUNT,      hparams.n_expert,      false);
-    ml.get_key(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used, false);
+    // PXA: expert_used_count may be a per-layer array (Nemotron 3.5 Bolt: 0 on the non-MoE layers); a scalar fills
+    // every layer, so a scalar file reads exactly as before. n_expert_used is the max over the layers.
+    std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
+    if (ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer, false)) {
+        hparams.n_expert_used = *std::max_element(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.begin() + hparams.n_layer);
+    }
 
     GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
     GGML_ASSERT(hparams.n_expert_used <= hparams.n_expert);
@@ -1285,6 +1379,75 @@ void llm_load_hparams(
                 }
             } break;
 
+        case LLM_ARCH_NEMOTRON:
+            {
+                // PXA Nemotron port (mainline src/models/nemotron.cpp load_arch_hparams)
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
+                switch (hparams.n_layer) {
+                    case 32: model.type = e_model::MODEL_4B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
+            {
+                // PXA Nemotron port (mainline src/models/nemotron-h.cpp load_arch_hparams)
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+                ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+                ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+                ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+                hparams.ssm_mamba2 = true;
+                if (model.arch == LLM_ARCH_NEMOTRON_H) {
+                    // dense Nemotron-H: converters on transformers >= 5 copy the config's default expert counts
+                    // into the GGUF; there are no routed experts in this arch
+                    hparams.n_expert      = 0;
+                    hparams.n_expert_used = 0;
+                    std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
+                }
+
+                // a layer is recurrent (Mamba-2) iff it has neither KV heads nor an FFN;
+                // attention layers have KV heads and n_ff == 0; MLP / MoE layers have n_ff > 0
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0 && hparams.n_ff(i) == 0;
+                }
+
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps, false);
+                if (!ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps, false)) {
+                    hparams.f_norm_rms_eps = hparams.f_norm_eps;
+                }
+
+                // expert_feed_forward_length is per layer in Nemotron 3.5 Bolt (Puzzle); a scalar fills every layer
+                std::fill(hparams.n_ff_exp_arr.begin(), hparams.n_ff_exp_arr.end(), 0);
+                if (ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer, false)) {
+                    hparams.n_ff_exp = *std::max_element(hparams.n_ff_exp_arr.begin(), hparams.n_ff_exp_arr.begin() + hparams.n_layer);
+                }
+                ml.get_key(LLM_KV_MOE_LATENT_SIZE,                   hparams.moe_latent_size,      false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp,           false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared,      false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm,  false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+
+                // PXA_NEMOTRON_MTP: a file (or a trunk + attached mtp-*.gguf head, PXA_MTP_HEAD_FILE) with
+                // nextn_predict_layers > 0 carries the NextN draft head as the tail block blk.<n_layer-1>:
+                // attention + latent MoE + nextn.{eh_proj,enorm,hnorm,shared_head_norm}. It has KV heads AND an
+                // FFN, so the recurrent rule above already leaves it non-recurrent. Same KV bookkeeping as qwen35.
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                if (hparams.nextn_predict_layers > 0) {
+                    if (model.mtp) {
+                        hparams.n_layer_kv_from_start = hparams.n_layer;
+                    } else {
+                        hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                    }
+                }
+
+                switch (hparams.n_layer) {
+                    case 52: model.type = e_model::MODEL_30B_A3B; break; // Nemotron 3 Nano 30B-A3B
+                    case 56: model.type = e_model::MODEL_9B;      break; // Nemotron Nano 9B v2
+                    case 42: model.type = e_model::MODEL_4B;      break; // Nemotron 3 Nano 4B
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_STARCODER2:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
@@ -1848,6 +2011,41 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_FLINT:
+            {
+                // PXA_FLINT (port of upstream PR 30928, FlintForCausalLM): GQA + per-layer Q/K RMS norm,
+                // learnable attention sinks, interleaved SWA (window from the GGUF) whose full-attention
+                // layers are NoPE (attention.rope_pattern), sigmoid router + normalised top-k, an ungated
+                // shared expert, and n_layer_dense_lead dense SiLU MLP layers in front.
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
+                hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_TYPE_NONE;
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func, false);
+                if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SIGMOID;
+                }
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
+                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+                {
+                    std::array<uint32_t, LLAMA_MAX_LAYERS> rope_on;
+                    std::fill(rope_on.begin(), rope_on.end(), 1u);
+                    ml.get_key_or_arr(LLM_KV_ATTENTION_ROPE_PATTERN, rope_on, hparams.n_layer, false);
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.nope_layers[i] = rope_on[i] ? 0 : 1;
+                    }
+                }
+                // one rope theta for the RoPE'd (sliding) layers: build_std_attention picks the _swa pair
+                // for n_swa > 0, so keep it equal to the trained base unless the GGUF says otherwise.
+                hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+                model.type = e_model::MODEL_UNKNOWN;
+            } break;
         case LLM_ARCH_STEP35:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -2168,7 +2366,10 @@ void llm_load_hparams(
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             {
+                // DeepSeek-V4.1 shares every V4 key below; its own keys are read at the end
+                // of this case. Paths for deepseek4 are unchanged.
                 // Adapted from llama.cpp src/models/deepseek4.cpp
                 // (llama_model_deepseek4::load_arch_hparams, lines 18-60) @ upstream
                 // commit 82dbc4f01, PR #24162 and follow-ups.
@@ -2253,6 +2454,15 @@ void llm_load_hparams(
                 }
                 for (uint32_t il = 0; il < hparams.n_layer; ++il) {
                     const uint32_t r = hparams.dsv4_compress_ratios[il];
+                    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+                        // V4.1: 0 = raw SWA, 2 = CSA2 (encoder), 1 = decoder reading source KV
+                        if (r > 2) {
+                            throw std::runtime_error(format(
+                                        "DeepSeek-V4.1 loader only supports compression ratios 0, 1 and 2 (layer %u has %u)",
+                                        il, r));
+                        }
+                        continue;
+                    }
                     if (r != 0 && r != 4 && r != 128) {
                         throw std::runtime_error(format(
                                     "DeepSeek-V4 loader only supports compression ratios 0, 4 and 128 (layer %u has %u)",
@@ -2263,6 +2473,10 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
                 if (hparams.expert_gating_func != LLM_EXPERT_GATING_FUNC_SQRT_SOFTPLUS) {
                     throw std::runtime_error("DeepSeek-V4 loader currently expects sqrtsoftplus MoE scoring");
+                }
+
+                if (model.arch == LLM_ARCH_DEEPSEEK41) {
+                    llm_load_hparams_dsv41(ml, hparams);
                 }
 
                 // Upstream additionally does:

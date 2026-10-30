@@ -1,0 +1,16 @@
+
+Windows package: third-party runtime files
+------------------------------------------
+
+The bin folder of the Windows engine package also carries runtime files that are not part of pxa:
+
+    cudart64_12.dll, cublas64_12.dll, cublasLt64_12.dll
+        NVIDIA CUDA 12 runtime libraries, Copyright (c) NVIDIA Corporation.
+        Redistributed as allowed by the NVIDIA CUDA Toolkit End User License Agreement
+        (https://docs.nvidia.com/cuda/eula/index.html). They are used unmodified.
+
+    vcruntime140.dll, vcruntime140_1.dll, msvcp140*.dll, concrt140.dll, vccorlib140.dll, vcomp140.dll
+        Microsoft Visual C++ runtime, Copyright (c) Microsoft Corporation.
+        Redistributed as allowed by the Microsoft Visual Studio license terms for distributable code.
+
+The NVIDIA display driver is not included. Install it from NVIDIA.

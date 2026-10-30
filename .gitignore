@@ -191,3 +191,9 @@ pxa/pxq4/box.env
 # pxa-update binary (built into the tarball; never commit it)
 /tools/pxa-update
 /bin/pxa-update
+docs/CHANGELOG.md.lock
+
+# changelog fragments (docs/CHANGELOG-RULE.md rule 6): directories, not dependency files
+!changelog.d
+!tools/pxa-private/changelog.d
+!tools/pxa-private/changelog.d/folded

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "pxa-env-flag.h"
 #include "reduce.cuh"
 #include "ggml-common.h"
 #include "ggml-backend.h"
@@ -22,7 +23,7 @@ static __global__ void k_add(int nelem, const T * __restrict__ src, T * __restri
     int i = blockIdx.x*block_size + threadIdx.x;
     if (i >= nelem) return;
     if constexpr (std::is_same_v<T, nv_bfloat16>) {
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
         dst[i] += src[i];
 #else
         dst[i] = __float2bfloat16((float)src[i] + (float)dst[i]);
@@ -222,9 +223,9 @@ static pxa_rp_pipeline * pxa_rp_get() {
         return nullptr;
     }
     for (int i = 0; i < 2; ++i) {
-        if (info.devices[i].cc < CC_VOLTA) {
+        if (info.devices[i].cc < PXA_CC_VOLTA) {
             fprintf(stderr, "PXA_REDUCE_ROUTE: pinned requested but device %d has cc=%d (needs >= %d for __nanosleep) -- staying on the existing routes\n",
-                    i, info.devices[i].cc, CC_VOLTA);
+                    i, info.devices[i].cc, PXA_CC_VOLTA);
             return nullptr;
         }
     }
@@ -317,7 +318,7 @@ static __global__ void k_pxa_reduce_pinned(
         __threadfence_system();
         long long spins = 0;
         while (*(const volatile int *)other != token) {
-#if __CUDA_ARCH__ >= CC_VOLTA
+#if __CUDA_ARCH__ >= PXA_CC_VOLTA
             __nanosleep(100);
 #endif
             if (++spins > PXA_RP_SPIN_MAX) { *(volatile int *)err_flag = 1; s_timed_out = 1; break; }
@@ -515,7 +516,27 @@ static int  pxa_ts_env_int(const char * name, int dflt) {
     return (e && *e) ? atoi(e) : dflt;
 }
 
-static bool pxa_ts_nway()     { static const bool v = pxa_ts_env_int("PXA_TSPLIT_REDUCE_NWAY", 0)    != 0; return v; }
+// PXA_TSPLIT_REDUCE_NWAY (the fused route on 3+ devices). Unset = AUTO since 2026-10-18 (
+// cell C031): ON for a group of exactly FOUR sm_60 cards -- the 4x P100 quad, the only n > 2 group measured
+// -- once phase 3 sums in one rank order on every card (bug #247), OFF elsewhere. Without it a 4-way
+// decode reduce took the stock NCCL / staged routes. =1 forces it on for any n > 2 group, =0 restores
+// the old selection exactly (NCCL / staged for every n > 2 reduce).
+static int  pxa_ts_nway_env() { static const int v = [](){ const char * e = getenv("PXA_TSPLIT_REDUCE_NWAY");
+                                                           return (e && *e) ? (atoi(e) != 0 ? 1 : 0) : -1; }(); return v; }
+static bool pxa_ts_nway_auto_group(const int * grp, int n) {
+    if (n != 4) return false;
+    const auto & info = ggml_cuda_info();
+    for (int i = 0; i < n; ++i) {
+        if (grp[i] < 0 || grp[i] >= info.device_count || info.devices[grp[i]].cc != PXA_CC_PASCAL) return false;
+    }
+    return true;
+}
+static bool pxa_ts_nway_for(const int * grp, int n) {
+    if (n <= 2) return true;
+    const int e = pxa_ts_nway_env();
+    if (e >= 0) return e == 1;
+    return pxa_ts_nway_auto_group(grp, n);
+}
 static bool pxa_ts_prefill()  { static const bool v = pxa_ts_env_int("PXA_TSPLIT_REDUCE_PREFILL",0) != 0; return v; }
 // Default OFF: this one widens the route predicate of a path that ships, so with every lever unset
 // the shipping selection must stay exactly what it was. Turn it on for a process that holds cards
@@ -676,30 +697,34 @@ static __global__ void k_pxa_tsplit_fused(
     __syncthreads();
     __threadfence_system();   // acquire whatever the peers published
 
-    // Phase 3 -- own first, then the peers in rank order, in destination precision, in place into
-    // our own tensor. Nobody else reads this buffer, so there is no back edge to wait for.
+    // Phase 3 -- every rank's partial in ONE canonical rank order (own included at its own rank), in
+    // destination precision, in place into our own tensor. Nobody else reads this buffer, so there is
+    // no back edge to wait for. Bug #247 (2026-10-18): this used to be "own first,
+    // then the peers", which at n >= 3 gave each replica of the 'replicated' activation a different
+    // summation order (rank 2 computed (d2+d0)+d1+d3, rank 0 (d0+d1)+d2+d3), so the replicas drifted
+    // apart in the low bits. Rank order makes every replica bit-identical at any n; at n = 2 it equals
+    // the old own + peer exactly (IEEE addition is commutative), so the pair route is unchanged.
     const bool bad = s_bad != 0;
     for (int i = gtid; i < nvec; i += gnt) {
         const int off = i * VEC;
         T acc[VEC];
-        *(int4 *)acc = *(const int4 *)(sendbuf + off);
         #pragma unroll
         for (int r = 0; r < NRANK; ++r) {
-            if (r == task.rank) continue;
             T o[VEC];
-            *(int4 *)o = *(const int4 *)((const T *)((const char *)task.rdata[r] + soff_b) + off);
+            const T * src = r == task.rank ? sendbuf : (const T *)((const char *)task.rdata[r] + soff_b);
+            *(int4 *)o = *(const int4 *)(src + off);
             #pragma unroll
-            for (int k = 0; k < VEC; ++k) acc[k] += o[k];
+            for (int k = 0; k < VEC; ++k) acc[k] = r == 0 ? o[k] : acc[k] + o[k];
         }
         #pragma unroll
         for (int k = 0; k < VEC; ++k) recvbuf[off + k] = bad ? pxa_ts_poison<T>() : acc[k];
     }
     if (bid == 0 && tid < count - tail) {
-        T acc = sendbuf[tail + tid];
+        T acc;
         #pragma unroll
         for (int r = 0; r < NRANK; ++r) {
-            if (r == task.rank) continue;
-            acc += ((const T *)((const char *)task.rdata[r] + soff_b))[tail + tid];
+            const T v = r == task.rank ? sendbuf[tail + tid] : ((const T *)((const char *)task.rdata[r] + soff_b))[tail + tid];
+            acc = r == 0 ? v : acc + v;
         }
         recvbuf[tail + tid] = bad ? pxa_ts_poison<T>() : acc;
     }
@@ -887,10 +912,11 @@ static pxa_ts_pipeline * pxa_ts_get(const int * idx, int nhave, size_t need_byte
         "blocks=%d threads=%d nway=%s prefill=%s pairmap=%s bit-identity=%s\n",
         pxa_ts_pull() ? "pull(peer-read)" : "push(peer-write,local-poll)",
         devs, info.devices[idx[0]].cc,
-        info.devices[idx[0]].cc >= CC_VOLTA ? "nanosleep" : "clock64",
+        info.devices[idx[0]].cc >= PXA_CC_VOLTA ? "nanosleep" : "clock64",
         PXA_TS_POOL, nhave, (size_t)(q->buf_bytes >> 10), q->blocks, q->threads,
-        pxa_ts_nway() ? "on" : "off", pxa_ts_prefill() ? "on" : "off", pxa_ts_pairmap() ? "on" : "off",
-        nhave == 2 ? "exact-vs-p2p-direct" : "ORDER DIFFERS from p2p-direct (n>2)");
+        pxa_ts_nway_env() == 1 ? "on" : pxa_ts_nway_env() == 0 ? "off" : (pxa_ts_nway_auto_group(idx, nhave) ? "auto(on: 4x sm_60)" : "auto(off)"),
+        pxa_ts_prefill() ? "on" : "off", pxa_ts_pairmap() ? "on" : "off",
+        nhave == 2 ? "exact-vs-p2p-direct" : "rank-order sum, replicas bit-identical (n>2; order differs from NCCL / p2p-direct; PXA_TSPLIT_REDUCE_NWAY=0 = old route)");
     g_pxa_ts_pipe[have] = q;
     g_pxa_ts_ngroup.store(have + 1, std::memory_order_release);
     return q;
@@ -961,7 +987,6 @@ static bool pxa_tsplit_reduce_handles(const struct ggml_tensor * dst) {
     if (!ggml_is_contiguous(dst))                           return false;
     const int nhave = dst->op_params[2];
     if (nhave < 2)                                          return false;
-    if (_r == PXA_TS_FUSED && nhave > 2 && !pxa_ts_nway())  return false;  // see the bit-identity note
     if (dst->ne[1] >= 32 && !pxa_ts_prefill())              return false;  // prefill keeps the ring
     // The kernel treats every participant as one flat, contiguous, 16-byte-aligned run of `nelem`
     // elements and moves it with int4 loads and stores. Nothing upstream promises that, so check it
@@ -987,6 +1012,8 @@ static bool pxa_tsplit_reduce_handles(const struct ggml_tensor * dst) {
         for (int i = 0; i < dst->op_params[1] && ngrp < GGML_CUDA_MAX_DEVICES; ++i) {
             if (dst->src[i]) grp[ngrp++] = i;
         }
+        // n > 2 on the fused route: PXA_TSPLIT_REDUCE_NWAY (auto = the 4x sm_60 quad, see above)
+        if (_r == PXA_TS_FUSED && ngrp > 2 && !pxa_ts_nway_for(grp, ngrp)) return false;
         if (!pxa_tsplit_p2p_group(grp, ngrp)) {
             static std::atomic<bool> said{false};
             if (!said.exchange(true)) {
@@ -1162,11 +1189,20 @@ static int pxa_ts_collect_idx(const ggml_tensor * dst, int * idx);
 // =============================================================================================
 #include "pxa/pxqn.cuh"
 #include "pxa/pxa-epi-push.cuh"
+#include "cpy.cuh"
+#include "binbcast.cuh"
 #include <deque>
+#include <thread>
 #include <unordered_map>
+#include "pxa/pxa-epi-stash.h"
+
+// PXA_PF_SLICE (see the PXA_PF_SLICE block after pxa_pf_run): planned with the epilogues, skipped nodes checked first
+static void pxa_pfs_plan_build(int n, ggml_cgraph ** graphs, const int * devs, const void * key_owner, uint64_t key_gen);
+static bool pxa_pfs_take(const ggml_tensor * t);
+static std::atomic<int> g_pfs_n{0};
 
 static bool pxa_ts_epi_on() {
-    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI"); return !(e && *e && atoi(e) == 0); }();
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI"); return !(e && *e && pxa_env_value_off(e)); }();
     return v;
 }
 // PXA_TSPLIT_EPI_Q8 (default 0 = the old rule; 1 = on): on a card whose sm_70 q8_1 sidecar is live the
@@ -1178,6 +1214,17 @@ static bool pxa_ts_epi_on() {
 // sm_70 critical path than the 8-block reduce + multi-block norm/RHT it replaces, so it stays opt-in.
 static bool pxa_ts_epi_q8_on() {
     static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_Q8"); return e && *e && atoi(e) != 0; }();
+    return v;
+}
+// PXA_TSPLIT_EPI_MT (2026-10-16; default 0 since g27mt-2037, =1 on): the epilogue also takes the reduces of the
+// speculative verify widths (2..4 rows; the planner required one row before, so every split verify forward ran the
+// fused reduce + add + multi-block norm/RHT apart). One block, k_pxa_tsplit_epi_mt: bit-identical to the unfused
+// launches (the same per-row arithmetic); no q8_1 sidecar (the sm_70 PXA_TSPLIT_EPI_Q8 plans stay one-row).
+// PXA_TSPLIT_EPI_MT: default OFF (opt-in, =1). Bit-identical, but the 2x P100 27B MTP server cell g27mt-2037 (REPS 6, same
+// bracket) measured no gain: greedy -0.3/+0.2/+1.0%, sampled -0.7/-2.3/-1.3% vs off (prose/code/chat); one 1024-thread block
+// per row leaves the peer exchange on nrows SMs where the unfused path spreads it over p->blocks.
+static bool pxa_ts_epi_mt_on() {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_MT"); return e && *e && atoi(e) != 0; }();
     return v;
 }
 // ggml-cuda.cu pxa_pxqn_q8_wanted's rule on a split graph: a PXQN4 / PXQN4S8 MUL_MAT within 16 nodes reads rht
@@ -1202,15 +1249,16 @@ struct pxa_epi_half {
     const ggml_tensor * gemv     = nullptr;   // producer push: the MUL_MAT whose output is the partial
     const ggml_tensor * push_add = nullptr;   //   and the folded ADD's other operand (or nullptr)
     std::atomic<int>    pushed{0};        // this graph's GEMV dispatch pushed the payload itself
+    long long           push_call = -1;   // PXA_TSPLIT_EPI_PUSH_EAGER: the group call whose slot the GEMV wrote
     bool                q8 = false;       // PXA_TSPLIT_EPI_Q8: also write the sm_70 q8_1 sidecar of the RHT output
     bool                norm_only = false;   // PXA_TSPLIT_EPI_NORM: no RHT follows the norm; the epilogue writes the norm
 };
 struct pxa_epi_plan {
     const ggml_tensor * R = nullptr;
     int                 ndev = 0;
-    int                 dev[2] = { -1, -1 };
+    int                 dev[4] = { -1, -1, -1, -1 };   // 2..4 cards (n > 2: the fused NWAY route)
     bool                ok = true;
-    pxa_epi_half        h[2];
+    pxa_epi_half        h[4];
 };
 enum { PXA_EPI_ADD = 1, PXA_EPI_NORM = 2, PXA_EPI_RHT = 3 };
 struct pxa_epi_skip { pxa_epi_plan * p; int kind; int rank; };
@@ -1237,10 +1285,27 @@ static bool pxa_ts_epi_norm_ok(int device) {
 
 // PXA_TSPLIT_EPI_PUSH (default ON with the epilogue): the partial's PXQN GEMV writes the peer's staging slot
 static bool pxa_ts_epi_push_on() {
-    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_PUSH"); return !(e && *e && atoi(e) == 0); }();
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_PUSH"); return !(e && *e && pxa_env_value_off(e)); }();
     return v;
 }
 static_assert(PXQN_PUSH_POOL == PXA_TS_POOL, "the GEMV push and the reduce ring must agree on the slot count");
+
+// PXA_TSPLIT_EPI_PUSH_EAGER (2026-10-18; OPT-IN =1, default OFF: measured-loss ~-1% on 2x P100 plain
+// decode, hold 5: the GEMV's peer writes cost more than the ~10 us/reduce they move): the producer push also when the split graph
+// is NOT captured (plain eager decode, the default on the P100 pair). There the slot is host-known: the scheduler runs
+// the splits of a graph in order on one thread, so the group's call counter at the GEMV dispatch is exactly the call
+// the upcoming reduce takes (no reduce of the group runs in between: the GEMV's input is the previous reduce's output).
+// The GEMV then reads an always-zero device int as its counter and its y2 already points at that slot. Same bytes as
+// the epilogue's own push (the PUSH GEMV instance writes y unchanged and the peer copy is the same float), so the reduce
+// output is bit-identical; what moves is the ~10 us single-block payload push off the epilogue's critical path.
+// Guards: only on the thread that planned the graph, and the reduce aborts if the call it takes is not the one the
+// GEMV wrote (a scheduler that ran splits concurrently would trip it rather than read a stale slot).
+static bool pxa_ts_epi_push_eager_on() {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_PUSH_EAGER"); return e && *e && atoi(e) != 0; }();
+    return v;
+}
+// pass 8e review R3: written by the planning thread every graph, read by PXA_TSPLIT_WORKERS enqueue threads
+static std::atomic<std::thread::id> g_epi_plan_thread{};
 
 // the MUL_MAT whose output `t` is (through views that keep its data and layout), or nullptr
 static const ggml_tensor * pxa_epi_gemv_of(const ggml_tensor * t) {
@@ -1263,11 +1328,159 @@ static inline bool pxa_epi_f32_row(const ggml_tensor * t, const ggml_tensor * li
 
 // devs[k]: the CUDA device of split graph k, or -1 (not a CUDA split). Runs on the scheduler thread
 // before any split of this graph is computed.
-extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int * devs) {
+// PXA_TSPLIT_EPI_PLAN_US=1 (diagnostic, default off): host cost of the per-graph planning (both plans), printed per
+// 256 graphs as mean / max microseconds -- it runs before the first split of every decode token is enqueued.
+struct pxa_epi_plan_timer {
+    // pass 8e review R9: =0 is off, like every other switch here (it used to turn the diagnostic on)
+    static bool on() { static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_PLAN_US"); return e && *e && atoi(e) != 0; }(); return v; }
+    std::chrono::steady_clock::time_point t0;
+    pxa_epi_plan_timer() { if (on()) t0 = std::chrono::steady_clock::now(); }
+    ~pxa_epi_plan_timer() {
+        if (!on()) return;
+        static long long n = 0, sum = 0, mx = 0;
+        const long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        ++n; sum += us; mx = std::max(mx, us);
+        if (n % 256 == 0) {
+            fprintf(stderr, "PXA_TSPLIT_EPI_PLAN_US: %lld graphs, last 256: mean %.1f us, max %lld us\n", n, sum / 256.0, mx);
+            sum = 0; mx = 0;
+        }
+    }
+};
+
+// PXA_TSPLIT_EPI_PLAN_CACHE (2026-10-18; default ON, =0 rebuilds every graph as before): the plan is a pure
+// function of the scheduler's split graphs (nodes, wiring, shapes, data addresses), the process-constant switches and
+// the per-device q8_1 sidecar state. The scheduler bumps a generation every time it re-splits (and so re-allocates) a
+// graph; a reused graph (llama graph reuse: no split, no alloc) keeps it. Rebuilding the plan cost ~1.35 ms of host time
+// per 27B decode token on the P100 pair, all of it before the first split is enqueued (GPU idle). On the same
+// (scheduler, generation, split count) and the same sidecar state the plan of the previous graph is kept as is and
+// only its per-graph flags are reset, so the dispatch sees exactly the plan a rebuild would produce. The plans of up
+// to 8 other schedulers (MTP draft and verify slots alternate within a round) are kept aside the same way.
+static bool pxa_ts_epi_plan_cache_on() {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_PLAN_CACHE"); return !(e && *e && pxa_env_value_off(e)); }();
+    return v;
+}
+static struct {
+    bool                 valid = false;      // g_epi_plans etc. hold the plan of (owner, gen, n)
+    const void *         owner = nullptr;
+    uint64_t             gen = 0;
+    int                  n = -1;
+    int                  nok = 0;
+    std::vector<int64_t> ne0;                // reduce widths the plan asked the q8_1 sidecar about
+    std::vector<uint8_t> fp;                 // the sidecar answers the plan was built with
+    long long            hits = 0, builds = 0;
+} g_epi_cache;
+// The fingerprint holds every planner input that can change while a scheduler keeps its split generation: the
+// per-device q8_1 sidecar state and (pass 8e review R5) the peer matrix that pxa_tsplit_reduce_handles() reads through
+// pxa_tsplit_p2p_group(). The matrix is set at backend init today, so it never moves after the first plan; the check
+// keeps a cached plan from outliving a matrix that someday changes (a plan built on the staged route while the fused
+// route now takes the reduce, or the reverse, would skip a norm the reduce no longer writes).
+static void pxa_epi_cache_fp(const std::vector<int64_t> & ne0, std::vector<uint8_t> & fp) {
+    fp.clear();
+    const int nd = ggml_cuda_info().device_count;
+    for (int d = 0; d < nd; ++d) {
+        fp.push_back((uint8_t) d);
+        fp.push_back(ggml_cuda_pxqn_q8sc_active(d) ? 1 : 0);
+        for (int64_t c : ne0) fp.push_back(ggml_cuda_pxqn_q8sc_buf(d, c, nullptr) != nullptr ? 1 : 0);
+        for (int e = 0; e < nd && e < GGML_CUDA_MAX_DEVICES; ++e) {
+            const int pr[2] = { d, e };
+            fp.push_back(e != d && pxa_tsplit_p2p_group(pr, 2) ? 1 : 0);
+        }
+    }
+}
+// Multi-entry: the plans of the other schedulers of the process (MTP draft / per-width verify slots, a second
+// context) wait in a small stash and are swapped in and out (O(1): container swaps keep every element, so the plan
+// pointers in the maps stay valid). A stale entry never matches again: generations are process-wide unique.
+struct pxa_epi_stash_t {
+    std::deque<pxa_epi_plan>                                plans;
+    std::unordered_map<const ggml_tensor *, pxa_epi_plan *> by_reduce;
+    std::unordered_map<const ggml_tensor *, pxa_epi_skip>   skip, push;
+    bool                 valid = false;
+    const void *         owner = nullptr;
+    uint64_t             gen = 0;
+    int                  n = -1, nok = 0;
+    std::vector<int64_t> ne0;
+    std::vector<uint8_t> fp;
+    uint64_t             used = 0;
+};
+static pxa_epi_stash_t g_epi_stash[8];
+static uint64_t        g_epi_tick = 0;
+static void pxa_epi_swap_active(pxa_epi_stash_t & s) {
+    g_epi_plans.swap(s.plans); g_epi_by_reduce.swap(s.by_reduce); g_epi_skip.swap(s.skip); g_epi_push.swap(s.push);
+    std::swap(g_epi_cache.valid, s.valid); std::swap(g_epi_cache.owner, s.owner); std::swap(g_epi_cache.gen, s.gen);
+    std::swap(g_epi_cache.n, s.n); std::swap(g_epi_cache.nok, s.nok);
+    g_epi_cache.ne0.swap(s.ne0); g_epi_cache.fp.swap(s.fp);
+}
+static bool pxa_epi_cache_match(bool valid, const void * owner, uint64_t gen, int nn,
+                                const void * key_owner, uint64_t key_gen, int n) {
+    return valid && owner == key_owner && gen == key_gen && nn == n;
+}
+// pass 8e review R8: one scheduler keeps at most one stash entry. Its split generation only grows, so every older
+// entry of the same owner is stale for good; drop it (and its containers) instead of letting duplicates crowd out
+// the still-valid plans of the other schedulers.
+static void pxa_epi_stash_drop_owner(const void * owner, const pxa_epi_stash_t * keep) {
+    pxa_epi_stash_drop_owner(g_epi_stash, owner, keep, [](pxa_epi_stash_t & st) {
+        st.n = -1; st.plans.clear(); st.by_reduce.clear(); st.skip.clear(); st.push.clear(); st.ne0.clear(); st.fp.clear();
+    });
+}
+
+// key_owner/key_gen (pass 8e review R4: arguments, no longer a side channel set by a separate call): the scheduler
+// and its split generation, or nullptr for a graph that must not be cached.
+extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int * devs, const void * key_owner, uint64_t key_gen) {
+    pxa_epi_plan_timer pxa_plan_timer;
+    pxa_pfs_plan_build(n, graphs, devs, pxa_ts_epi_plan_cache_on() ? key_owner : nullptr, key_gen);
+    const bool pxa_cache = pxa_ts_epi_plan_cache_on();
+    const bool pxa_keyed = key_owner != nullptr && pxa_cache;
+    if (pxa_keyed) {
+        static thread_local std::vector<uint8_t> fp;
+        bool hit = false;
+        if (pxa_epi_cache_match(g_epi_cache.valid, g_epi_cache.owner, g_epi_cache.gen, g_epi_cache.n, key_owner, key_gen, n)) {
+            pxa_epi_cache_fp(g_epi_cache.ne0, fp);
+            hit = fp == g_epi_cache.fp;
+        } else {
+            for (auto & st : g_epi_stash) {
+                if (!pxa_epi_cache_match(st.valid, st.owner, st.gen, st.n, key_owner, key_gen, n)) continue;
+                pxa_epi_cache_fp(st.ne0, fp);
+                if (fp == st.fp) {
+                    pxa_epi_swap_active(st);   // the plan of the previous graph goes to the stash in its place
+                    st.used = ++g_epi_tick;
+                    if (st.valid) pxa_epi_stash_drop_owner(st.owner, &st);   // the parked plan's owner: one entry
+                    pxa_epi_stash_drop_owner(key_owner, nullptr);            // the active owner: none in the stash
+                    hit = true;
+                }
+                break;
+            }
+        }
+        if (hit) {
+            for (auto & p : g_epi_plans) {
+                // every half the plan can hold (2..4 cards since C031), not just the pair's two
+                for (int r = 0; r < (int)(sizeof(p.h) / sizeof(p.h[0])); ++r) {
+                    p.h[r].add_skipped.store(0, std::memory_order_relaxed);
+                    p.h[r].pushed.store(0, std::memory_order_relaxed);
+                    p.h[r].push_call = -1;
+                }
+            }
+            g_epi_plan_thread.store(std::this_thread::get_id(), std::memory_order_release);
+            ++g_epi_cache.hits;
+            g_epi_n.store(g_epi_cache.nok, std::memory_order_release);
+            return;
+        }
+    }
+    if (pxa_cache && g_epi_cache.valid) {
+        // keep the plan being replaced: same scheduler's stale entry first, then an empty slot, then the oldest
+        pxa_epi_stash_t * slot = pxa_epi_stash_pick(g_epi_stash, g_epi_cache.owner);
+        pxa_epi_swap_active(*slot);
+        slot->used = ++g_epi_tick;
+        pxa_epi_stash_drop_owner(slot->owner, slot);
+    }
+    if (pxa_keyed) pxa_epi_stash_drop_owner(key_owner, nullptr);   // the plan built below is this owner's only valid one
+    g_epi_cache.valid = false;
+    g_epi_cache.ne0.clear();
+    ++g_epi_cache.builds;
     g_epi_plans.clear();
     g_epi_by_reduce.clear();
     g_epi_skip.clear();
     g_epi_push.clear();
+    g_epi_plan_thread.store(std::this_thread::get_id(), std::memory_order_release);
     g_epi_n.store(0, std::memory_order_release);
     if (!pxa_ts_epi_on() || pxa_tsplit_route() != PXA_TS_FUSED) return;
 
@@ -1298,6 +1511,9 @@ extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int *
                         if (t->op == GGML_OP_PXQN_RHT && t->src[0] == h.norm &&
                             ggml_cuda_pxqn_rms_rht_ok(nullptr, h.norm, t) && pxa_epi_f32_row(t, o.p->R)) {
                             h.rht = t; h.stage = 2;
+                            if (std::find(g_epi_cache.ne0.begin(), g_epi_cache.ne0.end(), t->ne[0]) == g_epi_cache.ne0.end()) {
+                                g_epi_cache.ne0.push_back(t->ne[0]);
+                            }
                             h.q8 = pxa_ts_epi_q8_on() && ggml_cuda_pxqn_q8sc_active(d) &&
                                    ggml_cuda_pxqn_q8sc_buf(d, t->ne[0], nullptr) != nullptr && pxa_epi_q8_wanted(g, i);
                         } else if (t->op != GGML_OP_PXQN_RHT && pxa_ts_epi_norm_ok(d) &&
@@ -1315,13 +1531,17 @@ extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int *
                 for (auto & o : open[d]) if (o.p->ok && o.p->h[o.rank].stage < 2) keep.push_back(o);
                 open[d].swap(keep);
             }
-            if (t->op == GGML_OP_REDUCE && t->op_params[2] == 2 && t->op_params[4] == 0 &&
-                t->type == GGML_TYPE_F32 && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
+            if (t->op == GGML_OP_REDUCE && t->op_params[2] >= 2 && t->op_params[2] <= 4 && t->op_params[4] == 0 &&
+                t->type == GGML_TYPE_F32 && (t->ne[1] == 1 || (pxa_ts_epi_mt_on() && t->ne[1] >= 2 && t->ne[1] <= 4)) &&
+                t->ne[2] == 1 && t->ne[3] == 1 &&
                 t->ne[0] % 128 == 0 && t->ne[0] >= 1024 && t->ne[0] <= 11264 &&
                 !pxa_reduce_pinned_handles(t) && pxa_tsplit_reduce_handles(t)) {
                 int idx[GGML_CUDA_MAX_DEVICES];
                 const int nd = pxa_ts_collect_idx(t, idx);
-                bool ok = nd == 2;
+                bool ok = nd >= 2 && nd <= 4;   // n > 2 only reaches here when the fused route takes it
+                if (std::find(g_epi_cache.ne0.begin(), g_epi_cache.ne0.end(), t->ne[0]) == g_epi_cache.ne0.end()) {
+                    g_epi_cache.ne0.push_back(t->ne[0]);
+                }
                 for (int r = 0; r < nd && ok; ++r) {
                     ok = (pxa_ts_epi_q8_on() || !ggml_cuda_pxqn_q8sc_active(idx[r])) && pxa_epi_f32_row(t->src[idx[r]], t);
                 }
@@ -1351,6 +1571,7 @@ extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int *
     std::unordered_map<const ggml_tensor *, pxa_epi_plan *> norms;
     for (auto & p : g_epi_plans) {
         for (int r = 0; r < p.ndev; ++r) if (p.h[r].stage != 2) p.ok = false;
+        for (int r = 0; r < p.ndev; ++r) if (p.R->ne[1] > 1 && p.h[r].q8) p.ok = false;   // EPI_MT: no q8_1 sidecar
         if (!p.ok) continue;
         for (int r = 0; r < p.ndev; ++r) if (!p.h[r].norm_only) norms[p.h[r].norm] = &p;
     }
@@ -1383,7 +1604,7 @@ extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int *
             if (p.h[r].rht) g_epi_skip[p.h[r].rht] = { &p, PXA_EPI_RHT, r };
             // producer push: the partial (or the folded ADD's partial operand) is a MUL_MAT's output
             pxa_epi_half & h = p.h[r];
-            if (pxa_ts_epi_push_on() && pxa_tsplit_graph_enabled() && !pxa_ts_pull()) {
+            if (pxa_ts_epi_push_on() && (pxa_tsplit_graph_enabled() || pxa_ts_epi_push_eager_on()) && !pxa_ts_pull()) {
                 if (h.add) {
                     const ggml_tensor * g0 = pxa_epi_gemv_of(h.add->src[0]);
                     const ggml_tensor * g1 = g0 ? nullptr : pxa_epi_gemv_of(h.add->src[1]);
@@ -1416,11 +1637,30 @@ extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int *
         fprintf(stderr, "PXA_TSPLIT_EPI: %d of %d reduces take the fused epilogue ([add] + reduce + RMS norm [+ RHT128] in one "
                         "launch per card, bit-identical; PXA_TSPLIT_EPI=0 turns it off)\n", nok, (int) g_epi_plans.size());
     }
+    static std::atomic<bool> said_mt{false};
+    if (!said_mt.load(std::memory_order_relaxed)) {
+        int nmt = 0;
+        for (auto & p : g_epi_plans) if (p.ok && p.R->ne[1] > 1) ++nmt;
+        if (nmt > 0 && !said_mt.exchange(true)) {
+            fprintf(stderr, "PXA_TSPLIT_EPI_MT: %d reduces of %lld rows take the fused epilogue (bit-identical; "
+                            "opt-in via PXA_TSPLIT_EPI_MT=1)\n", nmt, (long long) g_epi_plans.front().R->ne[1]);
+        }
+    }
+    if (pxa_keyed) {
+        g_epi_cache.owner = key_owner; g_epi_cache.gen = key_gen; g_epi_cache.n = n;
+        g_epi_cache.nok = nok;
+        pxa_epi_cache_fp(g_epi_cache.ne0, g_epi_cache.fp);
+        g_epi_cache.valid = true;
+    }
+    if (pxa_epi_plan_timer::on() && (g_epi_cache.builds & 63) == 1) {
+        fprintf(stderr, "PXA_TSPLIT_EPI_PLAN_CACHE: builds %lld hits %lld\n", g_epi_cache.builds, g_epi_cache.hits);
+    }
     g_epi_n.store(nok, std::memory_order_release);
 }
 
 // Dispatch hook: true when this node's work is done by a planned epilogue (the node is skipped).
 extern "C" bool ggml_cuda_pxa_epi_take(int device, const ggml_tensor * t) {
+    if (g_pfs_n.load(std::memory_order_acquire) != 0 && pxa_pfs_take(t)) return true;
     if (g_epi_n.load(std::memory_order_acquire) == 0) return false;
     if (t->op != GGML_OP_ADD && t->op != GGML_OP_FUSED_RMS_NORM && t->op != GGML_OP_PXQN_RHT) return false;
     auto it = g_epi_skip.find(t);
@@ -1437,7 +1677,7 @@ extern "C" bool ggml_cuda_pxa_epi_take(int device, const ggml_tensor * t) {
 
 // GEMV dispatch hook (pxqn.cu): where a planned partial's GEMV pushes its output. Only once the group's
 // pipeline exists (never built from here: a build synchronises, which a capture cannot).
-extern "C" bool ggml_cuda_pxa_epi_push_args(int device, const ggml_tensor * dst, pxqn_push_args * out) {
+extern "C" bool ggml_cuda_pxa_epi_push_args(int device, const ggml_tensor * dst, pxqn_push_args * out, cudaStream_t stream) {
     if (g_epi_n.load(std::memory_order_acquire) == 0 || g_epi_push.empty()) return false;
     auto it = g_epi_push.find(dst);
     if (it == g_epi_push.end()) return false;
@@ -1452,9 +1692,22 @@ extern "C" bool ggml_cuda_pxa_epi_push_args(int device, const ggml_tensor * dst,
     const int rank = p->rank_of[device];
     const int peer = 1 - rank;
     if (rank < 0 || rank > 1) return false;
-    out->y2          = (float *)(p->d[peer].stage + ((size_t)0 * 2 + rank) * p->buf_bytes);
+    // captured (PXA_TSPLIT_GRAPH): slot 0 + the device counter; eager: the host-known slot + an always-zero int
+    const bool dyn = pxa_tsplit_graph_enabled();
+    if (!dyn && std::this_thread::get_id() != g_epi_plan_thread.load(std::memory_order_acquire)) return false;
+    // pass 8e review R2: an eager slot is a host value baked into the launch, so a captured GEMV would replay it
+    // forever; on a capturing stream leave the push to the epilogue (which the reduce's own capture refusal covers)
+    if (!dyn && stream) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        if (cs != cudaStreamCaptureStatusNone) return false;
+    }
+    const long long call = p->calls;
+    const size_t slot = dyn ? 0 : (size_t)(call % PXA_TS_POOL);
+    out->y2          = (float *)(p->d[peer].stage + (slot * 2 + rank) * p->buf_bytes);
     out->add         = ep->h[r].push_add ? (const float *)ep->h[r].push_add->data : nullptr;
-    out->ctr         = p->d[rank].ctr;
+    out->ctr         = dyn ? p->d[rank].ctr : p->d[rank].ctr + 8;   // ctr[8..15]: never written, zeroed at build
+    if (!dyn) ep->h[r].push_call = call;
     out->slot_floats = (long long)(2 * p->buf_bytes / sizeof(float));
     return true;
 }
@@ -1475,16 +1728,52 @@ static pxa_epi_plan * pxa_epi_find(const ggml_tensor * R) {
     return it == g_epi_by_reduce.end() ? nullptr : it->second;
 }
 
+// the open norm tail at the group's size (2..4 cards)
+template <int NR> static void pxa_epi_norm_launch_n(size_t smem, cudaStream_t stream, const float * pa, const float * pb,
+        float * xout, const pxa_ts_task & task, int token, int * err, const float * w, float * y, int ncols, float eps, int push) {
+    const int opt = pxa_epi_lean_opt(ncols);   // PXA_TSPLIT_EPI_LEAN (pxa-tsplit-epi.cuh), bit-identical either way
+    if (opt & 1) smem = std::max(smem, (size_t)2*ncols*sizeof(float));
+    k_pxa_tsplit_epi<NR, pxa_epi_tail_norm><<<1, 1024, smem, stream>>>(
+        pa, pb, xout, task, token, err, w, y, nullptr, ncols, eps, 0, 0, 0, 0, push, nullptr, 0, opt);
+}
+static void pxa_epi_norm_launch(int n, size_t smem, cudaStream_t stream, const float * pa, const float * pb, float * xout,
+        const pxa_ts_task & task, int token, int * err, const float * w, float * y, int ncols, float eps, int push) {
+    switch (n) {
+        case 2: pxa_epi_norm_launch_n<2>(smem, stream, pa, pb, xout, task, token, err, w, y, ncols, eps, push); break;
+        case 3: pxa_epi_norm_launch_n<3>(smem, stream, pa, pb, xout, task, token, err, w, y, ncols, eps, push); break;
+        case 4: pxa_epi_norm_launch_n<4>(smem, stream, pa, pb, xout, task, token, err, w, y, ncols, eps, push); break;
+        default: GGML_ABORT("PXA_TSPLIT_EPI: unsupported group size %d", n);
+    }
+}
+template <int NR> static void pxa_epi_norm_mt_launch_n(unsigned nrows, size_t smem, cudaStream_t stream, const float * pa,
+        const float * pb, float * xout, const pxa_ts_task & task, int token, int * err, const float * w, float * y,
+        int ncols, int nr, float eps) {
+    const int opt = pxa_epi_lean_opt(ncols);
+    if (opt & 1) smem = std::max(smem, (size_t)2*ncols*sizeof(float));
+    k_pxa_tsplit_epi_mt<NR, pxa_epi_tail_norm><<<nrows, 1024, smem, stream>>>(
+        pa, pb, xout, task, token, err, w, y, nullptr, ncols, nr, eps, 0, 0, 0, 0, opt);
+}
+static void pxa_epi_norm_mt_launch(int n, unsigned nrows, size_t smem, cudaStream_t stream, const float * pa, const float * pb,
+        float * xout, const pxa_ts_task & task, int token, int * err, const float * w, float * y, int ncols, int nr, float eps) {
+    switch (n) {
+        case 2: pxa_epi_norm_mt_launch_n<2>(nrows, smem, stream, pa, pb, xout, task, token, err, w, y, ncols, nr, eps); break;
+        case 3: pxa_epi_norm_mt_launch_n<3>(nrows, smem, stream, pa, pb, xout, task, token, err, w, y, ncols, nr, eps); break;
+        case 4: pxa_epi_norm_mt_launch_n<4>(nrows, smem, stream, pa, pb, xout, task, token, err, w, y, ncols, nr, eps); break;
+        default: GGML_ABORT("PXA_TSPLIT_EPI: unsupported group size %d", n);
+    }
+}
+
 // One card's epilogue half; the wiring of pxa_tsplit_reduce_half with a single chunk.
 static void pxa_tsplit_epi_half(ggml_backend_cuda_context & ctx_i, pxa_ts_pipeline * p, pxa_epi_plan * ep, int r_plan,
                                 int n_dev, int dev_i, int slot, int token) {
     pxa_tsplit_reduce_check_fault();
     const int rank = p->rank_of[dev_i];
-    GGML_ASSERT(rank >= 0 && n_dev == 2);
+    GGML_ASSERT(rank >= 0 && n_dev >= 2 && n_dev <= 4);
     pxa_epi_half & h = ep->h[r_plan];
     GGML_ASSERT(ctx_i.device == dev_i && ep->dev[r_plan] == dev_i);
     const int64_t ncols = h.part->ne[0];
-    GGML_ASSERT((size_t)ncols*sizeof(float) <= p->buf_bytes);
+    const int64_t nrows = ggml_nrows(h.part);   // > 1: PXA_TSPLIT_EPI_MT
+    GGML_ASSERT((size_t)(ncols*nrows)*sizeof(float) <= p->buf_bytes);
 
     ggml_cuda_set_device(dev_i);
     cudaStream_t stream = ctx_i.stream();
@@ -1492,6 +1781,11 @@ static void pxa_tsplit_epi_half(ggml_backend_cuda_context & ctx_i, pxa_ts_pipeli
 
     const bool dyn = pxa_tsplit_graph_enabled();
     const int  this_slot = dyn ? 0 : slot % PXA_TS_POOL;
+    // pass 8e review R1: token is the 32-bit (int)(call + 1); compare in the same width so the check survives 2^31 calls
+    if (!dyn && h.pushed.load(std::memory_order_acquire) && (int)(h.push_call + 1) != token) {
+        GGML_ABORT("PXA_TSPLIT_EPI_PUSH_EAGER: the GEMV pushed into call %lld's slot, the reduce takes call %d "
+                   "(splits ran out of order; PXA_TSPLIT_EPI_PUSH_EAGER=0)", h.push_call, token - 1);
+    }
     const int  flag_ints = PXA_TS_FLAG_STRIDE / (int)sizeof(int);
     const size_t flag_stride_rank = (size_t)p->blocks * flag_ints;
     const size_t flag_stride_slot = (size_t)n_dev * flag_stride_rank;
@@ -1519,8 +1813,16 @@ static void pxa_tsplit_epi_half(ggml_backend_cuda_context & ctx_i, pxa_ts_pipeli
         }
         task.nwrite = w;
         for (int r = 0; r < n_dev; ++r) { task.rdata[r] = area(rank, r); task.rflag[r] = line(rank, r); }
+        task.lines  = p->blocks;   // PXA_TSPLIT_EPI_RSAG's second token round uses line 1 (pull: 0, one round)
     }
-    task.nelem = (int)ncols;
+    task.nelem = (int)(ncols*nrows);
+    if (pxa_epi_rsag_on(pxa_epi_rsag_bit(), n_dev) && task.lines >= 2 && nrows == 1) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            fprintf(stderr, "PXA_TSPLIT_EPI_RSAG on: %d-card epilogue exchange split (each range to its owner, the owner's sum "
+                            "to all; bit-identical; =0 -> one round)\n", n_dev);
+        }
+    }
     if (dyn) {
         task.ctr        = p->d[rank].ctr;
         task.slot_bytes = (long long)n_dev * (long long)p->buf_bytes;
@@ -1533,12 +1835,44 @@ static void pxa_tsplit_epi_half(ggml_backend_cuda_context & ctx_i, pxa_ts_pipeli
     float eps;
     memcpy(&eps, h.norm->op_params, sizeof(float));
     const ggml_tensor * rht = h.rht;
+    if (nrows > 1) {   // PXA_TSPLIT_EPI_MT: every payload is pushed by the epilogue (the producer push is one-row only)
+        GGML_ASSERT(!h.q8 && !h.pushed.load(std::memory_order_acquire) && nrows <= 4 && nrows <= p->blocks);
+        // block b writes row b of y once it has read row b of pa / pb: an output over a dying input at the SAME address
+        // is safe, at a shift a block could overwrite rows another block has not read yet -> y goes to a pool buffer and
+        // is copied over (ggml_cuda_pxqn_rms_rht's rule; the same values either way)
+        float * ydst = h.norm_only ? (float *)h.norm->data : (float *)rht->data;
+        const size_t nb = (size_t)(ncols*nrows)*sizeof(float);
+        auto shifted = [&](const void * q) {
+            if (!q || q == (const void *)ydst) return false;
+            const char * y0 = (const char *)ydst, * q0 = (const char *)q;
+            return y0 < q0 + nb && q0 < y0 + nb;
+        };
+        float * y = ydst;
+        ggml_cuda_pool_alloc<float> y_tmp(ctx_i.pool());
+        const bool y_copy = shifted(pa) || shifted(pb);
+        if (y_copy) y = y_tmp.alloc((size_t)(ncols*nrows));
+        if (h.norm_only) {
+            GGML_ASSERT(rht == nullptr);
+            pxa_epi_norm_mt_launch(n_dev, (unsigned)nrows, (size_t)ncols*sizeof(float), stream,
+                pa, pb, (float *)h.part->data, task, token, (int *)p->err_dev,
+                (const float *)h.norm->src[1]->data, y, (int)ncols, (int)nrows, eps);
+        } else {
+            const uint64_t seed = (uint64_t)(uint32_t) rht->op_params[0] | ((uint64_t)(uint32_t) rht->op_params[1] << 32);
+            ggml_cuda_pxqn_epi_rht_mt_launch(stream, (size_t)ncols*sizeof(float),
+                pa, pb, (float *)h.part->data, task, token, (int *)p->err_dev,
+                (const float *)h.norm->src[1]->data, y, ggml_cuda_pxqn_xmax_buf(dev_i, ncols, nrows),
+                (int)ncols, (int)nrows, eps, seed, rht->op_params[2], rht->op_params[3], (int64_t)rht->op_params[4]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (y_copy) CUDA_CHECK(cudaMemcpyAsync(ydst, y, nb, cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
     if (h.norm_only) {
         GGML_ASSERT(rht == nullptr);
-        k_pxa_tsplit_epi<2, pxa_epi_tail_norm><<<1, 1024, (size_t)ncols*sizeof(float), stream>>>(
+        pxa_epi_norm_launch(n_dev, (size_t)ncols*sizeof(float), stream,
             pa, pb, (float *)h.part->data, task, token, (int *)p->err_dev,
-            (const float *)h.norm->src[1]->data, (float *)h.norm->data, nullptr, (int)ncols, eps,
-            0, 0, 0, 0, h.pushed.load(std::memory_order_acquire) ? 0 : 1, nullptr, 0);
+            (const float *)h.norm->src[1]->data, (float *)h.norm->data, (int)ncols, eps,
+            h.pushed.load(std::memory_order_acquire) ? 0 : 1);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1909,9 +2243,22 @@ struct pxa_rt_scope {
 // The scheduler drops its per-reduce backend drain for exactly the nodes the predicate above
 // accepts. Registered from a file-scope constructor; the slot it writes is a plain function
 // pointer, zero-initialised before any dynamic initialisation runs, so the order is safe.
+// PXA_TSPLIT_WORKERS auto (defined in ggml-backend.cpp, same library; declared here and not in the public header so the
+// change does not rebuild every translation unit): the CUDA backend registers a test that says whether a tensor split
+// over the first n_dev devices is a group the per-device enqueue workers are a measured win on. Unset (every non-CUDA
+// build) = workers only when PXA_TSPLIT_WORKERS=1 asks for them.
+void ggml_backend_set_tsplit_workers_auto(bool (*fn)(int n_dev));
+// PXA_TSPLIT_WORKERS auto: the scheduler's split devices are CUDA0..n_dev-1 in order; the workers default on
+// where they were measured, a split over exactly four sm_60 cards (the same group test as the n-way reduce's auto).
+static bool pxa_tsplit_workers_auto(int n_dev) {
+    if (n_dev != 4 || ggml_cuda_info().device_count < n_dev) return false;
+    const int grp[4] = { 0, 1, 2, 3 };
+    return pxa_ts_nway_auto_group(grp, 4);
+}
 static struct pxa_reduce_pinned_registrar {
     pxa_reduce_pinned_registrar() {
         ggml_backend_set_reduce_pinned_predicate(&pxa_reduce_pinned_handles);
+        ggml_backend_set_tsplit_workers_auto(&pxa_tsplit_workers_auto);
     }
 } g_pxa_reduce_pinned_registrar;
 
@@ -2009,7 +2356,7 @@ static void pxa_nccl_route_fail(const char * where, const char * why, int nreduc
 // PXA_TSPLIT_PF=0 restores the previous route selection exactly. PXA_TSPLIT_PF_CHUNKS (1..8,
 // default 4) sets K.
 // ---------------------------------------------------------------------------
-#define PXA_PF_MAX_CHUNKS 8
+#define PXA_PF_MAX_CHUNKS 16   // 8 for the default chunking; PXA_PF_SLICE pushes up to 16 slices
 
 static bool pxa_pf_enabled() {
     static const bool v = [](){
@@ -2024,7 +2371,7 @@ static int pxa_pf_chunks() {
     static const int v = [](){
         const char * e = getenv("PXA_TSPLIT_PF_CHUNKS");
         int k = (e && *e) ? atoi(e) : 4;
-        return std::max(1, std::min(PXA_PF_MAX_CHUNKS, k));
+        return std::max(1, std::min(8, k));
     }();
     return v;
 }
@@ -2035,6 +2382,8 @@ struct pxa_pf_dev {
     size_t       size   = 0;
     cudaEvent_t  ready  = nullptr;                    // compute stream reached this reduce
     cudaEvent_t  pushed[PXA_PF_MAX_CHUNKS] = {};      // my chunk c landed on the peer
+    cudaEvent_t  sliced[PXA_PF_MAX_CHUNKS] = {};      // PXA_PF_SLICE: slice c of my partial is final (compute stream)
+    cudaEvent_t  drained = nullptr;                   // PXA_PF_SLICE: my adds of the last reduce are done (compute stream)
 };
 static pxa_pf_dev g_pxa_pf[GGML_CUDA_MAX_DEVICES];
 
@@ -2055,14 +2404,28 @@ static bool pxa_pf_handles(const ggml_tensor * dst) {
     return pxa_tsplit_p2p_group(grp, 2);
 }
 
+// PXA_PF_SLICE plan of one reduce (defined below); the route reads it to take the producers' slice pushes
+struct pxa_pfs_plan;
+static pxa_pfs_plan * pxa_pfs_find(const ggml_tensor * R, bool armed[2], int * nslice, int64_t * slice_elems);
+
 static void pxa_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     auto & info = ggml_cuda_info();
     const size_t nbytes = ggml_nbytes(dst);
     const int64_t nelem = ggml_nelements(dst);
     const size_t esz    = ggml_element_size(dst);
-    const int K = (int)std::min<int64_t>(pxa_pf_chunks(), std::max<int64_t>(1, nelem / 4096));
+    int K = (int)std::min<int64_t>(pxa_pf_chunks(), std::max<int64_t>(1, nelem / 4096));
     // chunk boundaries in elements, multiples of 256 so every chunk start is 512-byte aligned
     int64_t per = ((nelem + K - 1) / K + 255) / 256 * 256;
+    // PXA_PF_SLICE: a planned reduce whose producer(s) already pushed their partial slice by slice. The chunks are then
+    // the slices (both directions and the adds), and an armed device's push is not issued again here.
+    bool armed[2] = { false, false };
+    {
+        int ns = 0; int64_t sl = 0;
+        if (pxa_pfs_find(dst, armed, &ns, &sl) && (armed[0] || armed[1])) {
+            K   = ns;
+            per = sl;
+        }
+    }
 
     for (int d = 0; d < 2; ++d) {
         auto & s = g_pxa_pf[d];
@@ -2070,8 +2433,10 @@ static void pxa_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         if (!s.copy) {
             CUDA_CHECK(cudaStreamCreateWithFlags(&s.copy, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&s.ready, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&s.drained, cudaEventDisableTiming));
             for (int c = 0; c < PXA_PF_MAX_CHUNKS; ++c) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&s.pushed[c], cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&s.sliced[c], cudaEventDisableTiming));
             }
             static std::atomic<bool> said{false};
             if (!said.exchange(true)) {
@@ -2091,6 +2456,7 @@ static void pxa_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
     // pushes: device d's copy engine writes d's partial into the peer's staging buffer
     for (int d = 0; d < 2; ++d) {
+        if (armed[d]) continue;                                          // PXA_PF_SLICE: the producer pushed it
         const int p = 1 - d;
         auto & s = g_pxa_pf[d];
         ggml_cuda_set_device(info.all_ctx[d]->device);
@@ -2128,8 +2494,373 @@ static void pxa_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             }
             CUDA_CHECK(cudaGetLastError());
         }
+        // PXA_PF_SLICE: the next reduce's producer push into my staging waits for this (instead of `ready`, which
+        // that producer runs too early to see)
+        CUDA_CHECK(cudaEventRecord(s.drained, st));
     }
     ggml_cuda_set_device(ctx.device);
+}
+
+// =============================================================================================
+// PXA_PF_SLICE (2026-10-17) -- the prefill all-reduce overlapped with the GEMM that produces it.
+//
+// WHAT IT FIXES. On a P100 pair (-sm tensor, the cards meet at the host bridge) the PF route above moves each
+// 2048-token partial (5120 x 2048 f16, 21 MB) at ~2.2 GB/s per direction: ~9.4 ms per reduce, 128 reduces per
+// ubatch, ~1.2 s of a 5.85 s ubatch on the 27B dense, all of it AFTER the GEMM that produced the partial
+// (nvprof 2026-10-17, race-1017/runs/prof-1017-1810).
+//
+// THE ROUTE. Before the splits run, every PF reduce (two cards, >= 256 tokens) is matched per card to its producer:
+// a PXQN MUL_MAT followed by a short elementwise chain (the f16 cast, the residual ADD, a CONT) that ends in the
+// reduce's source, as consecutive real nodes of that card's split. The k-scalar GEMM then runs in token slices
+// (pxqn.cu); after each slice the chain runs on that slice (sliced clones of the chain nodes, through the same op
+// functions the dispatcher calls) and the slice is pushed to the peer's staging buffer on the copy stream while the
+// next slice computes. The chain nodes are skipped at dispatch, and pxa_pf_run adds chunk = slice.
+//
+// NUMERICS. Bit-identical by construction: the GEMM's per-output instruction sequence does not depend on the launch
+// width (pxqn-gemm.cuh), the chain ops are elementwise and run the same functions on the same bytes, and the reduce's
+// adds are the route's own.
+//
+// SAFETY. A chain node is written slice by slice while the GEMM still writes later slices, so the plan refuses any
+// chain whose written buffers overlap the GEMM output, an earlier chain buffer or an outside operand anywhere but at
+// an exact in-place position. Outside operands must be computed before the GEMM node. A producer pushes into the
+// peer's staging only after the peer's adds of the previous reduce (`drained`), and only once the staging and the
+// copy stream exist (the first reduce of a size sets them up). Anything not matched or declined runs as before.
+//
+// PXA_PF_SLICE=0 turns it off (PXA_REFERENCE=1 too); PXA_PF_SLICE_TOK=<n> forces the slice width (rounded up to 128);
+// PXA_PF_SLICE_LOG=1 prints the plan of every graph.
+// =============================================================================================
+#define PXA_PFS_MAX_CHAIN 4
+
+struct pxa_pfs_half {
+    const ggml_tensor * mm     = nullptr;
+    ggml_tensor *       chain[PXA_PFS_MAX_CHAIN] = {};   // execution order; chain[nchain-1] is the reduce source
+    int                 nchain = 0;
+    // one-shot flags, so a plan can never act twice or outlive the graph it was made for (tensor structs are reused
+    // by later graphs, and not every compute goes through the scheduler that rebuilds the plans)
+    std::atomic<int>    begun{0};     // the GEMM went sliced
+    std::atomic<int>    skip{0};      // bit c: chain node c was run by the producer and is still to be passed at dispatch
+    std::atomic<int>    pushed{0};    // every slice was pushed; the reduce takes (clears) it
+};
+struct pxa_pfs_ref { pxa_pfs_plan * p; int rank; int idx; };
+struct pxa_pfs_plan {
+    const ggml_tensor * R = nullptr;
+    int64_t ny = 0, ne0 = 0, slice = 0;   // tokens, row length, tokens per slice
+    int     nslice = 0;
+    pxa_pfs_half h[2];
+};
+static std::deque<pxa_pfs_plan>                                                g_pfs_plans;
+static std::unordered_map<const ggml_tensor *, std::pair<pxa_pfs_plan *, int>> g_pfs_by_mm;     // GEMM -> (plan, rank)
+static std::unordered_map<const ggml_tensor *, pxa_pfs_ref>                    g_pfs_skip;      // chain node -> (plan, rank, index)
+static std::unordered_map<const ggml_tensor *, pxa_pfs_plan *>                 g_pfs_by_reduce;
+
+static bool pxa_pfs_on() {
+    static const bool v = [](){
+        const char * e = getenv("PXA_PF_SLICE");
+        if (e && *e) return atoi(e) != 0;
+        const char * r = getenv("PXA_REFERENCE");
+        return !(r && atoi(r) != 0);
+    }();
+    return v;
+}
+static int64_t pxa_pfs_tok_env() {
+    static const int64_t v = [](){ const char * e = getenv("PXA_PF_SLICE_TOK"); return e && *e ? (int64_t) atoll(e) : (int64_t) 0; }();
+    return v;
+}
+static int pxa_pfs_log_level() {     // PXA_PF_SLICE_LOG: 1 = the plan count every prompt graph, 2 = + why each overlap was declined
+    static const int v = [](){ const char * e = getenv("PXA_PF_SLICE_LOG"); return e ? atoi(e) : 0; }();
+    return v;
+}
+static bool pxa_pfs_log() { return pxa_pfs_log_level() != 0; }
+// [ne0, ny] contiguous rows: the reduce source's shape
+static bool pxa_pfs_rows_ok(const ggml_tensor * t, const ggml_tensor * like) {
+    return t && t->data && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && ggml_is_contiguous(t) &&
+           t->ne[0] == like->ne[0] && t->ne[1] == like->ne[1] && t->ne[2] == 1 && t->ne[3] == 1;
+}
+static bool pxa_pfs_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+    const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+// rank r's half of reduce R: 0 = matched, else the reason it was not
+static int pxa_pfs_match(pxa_pfs_half & h, const ggml_tensor * R, int r, ggml_cgraph ** graphs, const int * devs,
+                         const std::unordered_map<const ggml_tensor *, std::pair<int, int>> & pos) {
+    auto it = pos.find(R->src[r]);
+    if (it == pos.end()) return 1;                        // the partial is not a node of a CUDA split
+    const int k = it->second.first;
+    if (devs[k] != r) return 2;                           // pxa_pf_run's indexing: rank r's partial lives on device r
+    const ggml_cgraph * g = graphs[k];
+    int idx = it->second.second;
+    ggml_tensor * rev[PXA_PFS_MAX_CHAIN]; int nrev = 0;
+    const ggml_tensor * ext[PXA_PFS_MAX_CHAIN]; int ext_rev[PXA_PFS_MAX_CHAIN]; int next = 0;
+    ggml_tensor * cur = g->nodes[idx];
+    while (cur->op != GGML_OP_MUL_MAT) {
+        if (nrev == PXA_PFS_MAX_CHAIN) return 3;
+        if (!pxa_pfs_rows_ok(cur, R)) return 4;
+        int j = idx - 1;
+        while (j >= 0 && ggml_is_noop(g->nodes[j])) --j;
+        if (j < 0) return 5;
+        ggml_tensor * pred = g->nodes[j];                 // the chain is consecutive real nodes of this split
+        switch (cur->op) {
+            case GGML_OP_CPY:
+                if (cur->src[1] != cur || cur->src[0] != pred) return 6;   // the ggml_cast form only
+                break;
+            case GGML_OP_CONT:
+            case GGML_OP_DUP:
+                if (cur->src[0] != pred) return 6;
+                break;
+            case GGML_OP_ADD: {
+                const int a = cur->src[0] == pred ? 0 : cur->src[1] == pred ? 1 : -1;
+                if (a < 0 || cur->src[1 - a] == pred) return 6;
+                if (!pxa_pfs_rows_ok(cur->src[1 - a], R)) return 7;        // a same-shape operand (no broadcast)
+                ext_rev[next] = nrev;                                       // read by the step that is rev[nrev]
+                ext[next++] = cur->src[1 - a];
+                break;
+            }
+            default: return 8;
+        }
+        rev[nrev++] = cur;
+        cur = pred;
+        idx = j;
+    }
+    if (!ggml_cuda_pxqn_type(cur->src[0]->type)) return 9;
+    if (cur->type != GGML_TYPE_F32 || !pxa_pfs_rows_ok(cur, R)) return 10;
+    // outside operands: computed before the GEMM (an earlier node of this split, another split, a leaf)
+    for (int e = 0; e < next; ++e) {
+        for (const ggml_tensor * u = ext[e]; u; u = u->view_src) {
+            auto pe = pos.find(u);
+            if (pe != pos.end() && pe->second.first == k && pe->second.second >= idx) return 11;
+        }
+    }
+    h.mm = cur;
+    h.nchain = nrev;
+    for (int c = 0; c < nrev; ++c) h.chain[c] = rev[nrev - 1 - c];
+    // every chain node is written slice by slice while later slices of the GEMM and of the chain are still to come. Chain
+    // step c (w) may share bytes with x (the GEMM output, an earlier step, or an outside operand read at a step <= c) only
+    // where x is already dead when each slice of w lands: slice [t0,t1) of w writes [w0 + sw*t0, w0 + sw*t1) (sw = w's row
+    // bytes); by then x's rows < t1 are consumed (step <= c of the same slice ran first) and x's later slices write at
+    // >= x0 + sx*t1, so w's finished rows are never overwritten either (the push reads them on the copy stream). Needed for
+    // every slice end t1 in [128, ny]: w0 + sw*t1 <= x0 + sx*t1, linear in t1, both ends checked. Position for position in
+    // place is d = 0, sw = sx. (The graph allocator hands x's bytes to w once x is dead in graph order, e.g. the f16 cast
+    // placed on the f32 residual the add consumed: same bytes, half the row, always behind the reader.)
+    auto rowb = [](const ggml_tensor * t) { return (int64_t) ggml_element_size(t) * t->ne[0]; };
+    // An operand of step c itself (read and written by the same kernel) may only be shared exactly in place.
+    auto shareable = [&](const ggml_tensor * w, const ggml_tensor * x, bool own_operand) {
+        if (!pxa_pfs_overlap(w, x)) return true;
+        const int64_t d = (int64_t) ((const char *) w->data - (const char *) x->data);
+        const int64_t g = rowb(x) - rowb(w);
+        if (own_operand) return d == 0 && g == 0;
+        return g * 128 >= d && g * R->ne[1] >= d;
+    };
+    for (int c = 0; c < h.nchain; ++c) {
+        const ggml_tensor * w = h.chain[c];
+        const ggml_tensor * bad = nullptr; const char * what = "";
+        if (!shareable(w, h.mm, c == 0)) { bad = h.mm; what = "gemm"; }
+        for (int b = 0; !bad && b < c; ++b) if (!shareable(w, h.chain[b], b + 1 == c)) { bad = h.chain[b]; what = "step"; }
+        for (int e = 0; !bad && e < next; ++e) {
+            const int step = h.nchain - 1 - ext_rev[e];
+            if (pxa_pfs_overlap(w, ext[e]) && (step > c || !shareable(w, ext[e], step == c))) { bad = ext[e]; what = "outside"; }
+        }
+        if (bad) {
+            if (pxa_pfs_log_level() >= 2) {
+                fprintf(stderr, "PXA_PF_SLICE: rank %d reduce %s: step %d %s %s (%s) overlaps %s %s %s (%s) at %+lld B, rows %lld/%lld B\n",
+                        r, R->name, c, ggml_op_name(w->op), ggml_type_name(w->type), w->name, what, ggml_op_name(bad->op),
+                        ggml_type_name(bad->type), bad->name, (long long) ((const char *) w->data - (const char *) bad->data),
+                        (long long) rowb(w), (long long) rowb(bad));
+            }
+            return 12;
+        }
+    }
+    const ggml_tensor * P = h.nchain ? h.chain[h.nchain - 1] : h.mm;
+    if (P != R->src[r] || P->type != R->type) return 13;
+    return 0;
+}
+
+// The last graph whose node scan found no reduce of prefill size (decode). Same key = the scheduler reused the graph
+// as it was (same nodes, same shapes: the generation moves on every re-split), so the scan would find none again;
+// skipping it saves the walk over every node of every split before the first enqueue (~15k nodes on the 4-card
+// 27B split). PXA_TSPLIT_EPI_PLAN_CACHE=0 (key_owner nullptr) scans every graph as before.
+static struct { const void * owner = nullptr; uint64_t gen = 0; int n = -1; } g_pfs_none_key;
+
+static void pxa_pfs_plan_build(int n, ggml_cgraph ** graphs, const int * devs, const void * key_owner, uint64_t key_gen) {
+    g_pfs_n.store(0, std::memory_order_release);
+    g_pfs_plans.clear();
+    g_pfs_by_mm.clear();
+    g_pfs_skip.clear();
+    g_pfs_by_reduce.clear();
+    if (n <= 0 || !pxa_pfs_on() || !pxa_pf_enabled()) return;
+    if (key_owner != nullptr && g_pfs_none_key.owner == key_owner && g_pfs_none_key.gen == key_gen && g_pfs_none_key.n == n) return;
+    {   // default scope = where it was measured (the P100 pair, cc 6.0); PXA_PF_SLICE=1 in the environment forces it on other cards
+        static const bool forced = [](){ const char * e = getenv("PXA_PF_SLICE"); return e && *e && atoi(e) != 0; }();
+        if (!forced) {
+            for (int k = 0; k < n; ++k) {
+                if (devs[k] >= 0 && ggml_cuda_info().devices[devs[k]].cc != 600) return;
+            }
+        }
+    }
+    std::vector<ggml_tensor *> red;
+    bool any_big = false;   // a reduce of prefill size at all (shape only: the key above may skip on it)
+    for (int k = 0; k < n; ++k) {
+        if (devs[k] < 0) continue;
+        const ggml_cgraph * g = graphs[k];
+        for (int i = 0; i < g->n_nodes; ++i) {
+            ggml_tensor * t = g->nodes[i];
+            // the reduces ggml_cuda_op_reduce sends down the PF route (the same predicates, in its order)
+            if (t->op != GGML_OP_REDUCE || t->op_params[3] == 1 || t->ne[1] < 256) continue;
+            any_big = true;
+            if (std::find(red.begin(), red.end(), t) != red.end()) continue;
+            if (pxa_reduce_pinned_handles(t) || pxa_tsplit_reduce_handles(t) || !pxa_pf_handles(t)) continue;
+            red.push_back(t);
+        }
+    }
+    if (!any_big && key_owner != nullptr) { g_pfs_none_key.owner = key_owner; g_pfs_none_key.gen = key_gen; g_pfs_none_key.n = n; }
+    if (red.empty()) return;
+    std::unordered_map<const ggml_tensor *, std::pair<int, int>> pos;
+    for (int k = 0; k < n; ++k) {
+        if (devs[k] < 0) continue;
+        const ggml_cgraph * g = graphs[k];
+        for (int i = 0; i < g->n_nodes; ++i) pos[g->nodes[i]] = { k, i };
+    }
+    auto & info = ggml_cuda_info();
+    const int nsm = std::min(info.devices[0].nsm, info.devices[1].nsm);
+    int why[16] = {};
+    for (ggml_tensor * R : red) {
+        const int64_t ny = R->ne[1];
+        int64_t tok = pxa_pfs_tok_env();
+        if (tok <= 0) {
+            // one resident wave of the k-scalar GEMM (3 blocks per SM, 64-row panels, 128-token tiles) per slice: the
+            // sliced grid then needs as many waves as the whole one rounds up to
+            const int64_t panels = std::max<int64_t>(1, R->ne[0] / 64);
+            tok = std::max<int64_t>(1, (3 * (int64_t) nsm) / panels) * 128;
+        }
+        tok = (tok + 127) / 128 * 128;
+        if (tok * PXA_PF_MAX_CHUNKS < ny) tok = ((ny + PXA_PF_MAX_CHUNKS - 1) / PXA_PF_MAX_CHUNKS + 127) / 128 * 128;
+        const int nslice = (int) ((ny + tok - 1) / tok);
+        if (nslice < 2) { why[14]++; continue; }
+        g_pfs_plans.emplace_back();
+        pxa_pfs_plan & p = g_pfs_plans.back();
+        p.R = R; p.ny = ny; p.ne0 = R->ne[0]; p.slice = tok; p.nslice = nslice;
+        int w0 = pxa_pfs_match(p.h[0], R, 0, graphs, devs, pos);
+        int w1 = w0 ? 0 : pxa_pfs_match(p.h[1], R, 1, graphs, devs, pos);
+        if (w0 || w1) {
+            why[w0 ? w0 : w1]++;
+            g_pfs_plans.pop_back();
+            continue;
+        }
+        g_pfs_by_reduce[R] = &p;
+        for (int r = 0; r < 2; ++r) {
+            g_pfs_by_mm[p.h[r].mm] = { &p, r };
+            for (int c = 0; c < p.h[r].nchain; ++c) g_pfs_skip[p.h[r].chain[c]] = { &p, r, c };
+        }
+    }
+    const int nok = (int) g_pfs_plans.size();
+    static std::atomic<bool> said{false};
+    if (pxa_pfs_log() || (nok > 0 && !said.exchange(true))) {
+        fprintf(stderr, "PXA_PF_SLICE: %d of %d prefill reduces overlap their producing GEMM (%d slices of %lld tokens; "
+                        "bit-identical; PXA_PF_SLICE=0 turns it off)", nok, (int) red.size(),
+                nok ? g_pfs_plans.front().nslice : 0, nok ? (long long) g_pfs_plans.front().slice : 0LL);
+        bool any = false;
+        for (int w = 1; w < 16; ++w) if (why[w]) { fprintf(stderr, "%s%d:%d", any ? " " : " declined ", w, why[w]); any = true; }
+        fprintf(stderr, "\n");
+    }
+    g_pfs_n.store(nok, std::memory_order_release);
+}
+
+static bool pxa_pfs_take(const ggml_tensor * t) {
+    if (t->op != GGML_OP_CPY && t->op != GGML_OP_ADD && t->op != GGML_OP_CONT && t->op != GGML_OP_DUP) return false;
+    auto it = g_pfs_skip.find(t);
+    if (it == g_pfs_skip.end()) return false;
+    const int bit = 1 << it->second.idx;
+    return (it->second.p->h[it->second.rank].skip.fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
+}
+
+static pxa_pfs_plan * pxa_pfs_find(const ggml_tensor * R, bool armed[2], int * nslice, int64_t * slice_elems) {
+    armed[0] = armed[1] = false;
+    if (g_pfs_n.load(std::memory_order_acquire) == 0) return nullptr;
+    auto it = g_pfs_by_reduce.find(R);
+    if (it == g_pfs_by_reduce.end()) return nullptr;
+    pxa_pfs_plan * p = it->second;
+    for (int r = 0; r < 2; ++r) armed[r] = p->h[r].pushed.exchange(0, std::memory_order_acq_rel) != 0;
+    *nslice      = p->nslice;
+    *slice_elems = p->slice * p->ne0;
+    return p;
+}
+
+// pxqn.cu, k-scalar route: true = run the GEMM in *nslice token slices of *slice tokens and call
+// ggml_cuda_pxa_pfs_slice after each one (which then also runs the chain and the push)
+extern "C" bool ggml_cuda_pxa_pfs_begin(ggml_backend_cuda_context * ctx, const ggml_tensor * mm, int * nslice, int64_t * slice) {
+    if (g_pfs_n.load(std::memory_order_acquire) == 0) return false;
+    auto it = g_pfs_by_mm.find(mm);
+    if (it == g_pfs_by_mm.end()) return false;
+    pxa_pfs_plan * p = it->second.first;
+    const int r = it->second.second, peer = 1 - r;
+    if (ctx->device != r) return false;
+    if (!g_pxa_pf[r].copy || !g_pxa_pf[peer].stage || g_pxa_pf[peer].size < ggml_nbytes(p->R)) return false;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx->stream(), &cs));
+    if (cs != cudaStreamCaptureStatusNone) return false;
+    if (p->h[r].begun.exchange(1, std::memory_order_acq_rel)) return false;
+    p->h[r].skip.store((1 << p->h[r].nchain) - 1, std::memory_order_release);
+    *nslice = p->nslice;
+    *slice  = p->slice;
+    return true;
+}
+
+static ggml_tensor pxa_pfs_clone(const ggml_tensor * t, int64_t t0, int64_t n) {
+    ggml_tensor c = *t;
+    c.data  = (char *) t->data + t0 * t->nb[1];
+    c.ne[1] = n;
+    c.nb[2] = c.nb[1] * c.ne[1];
+    c.nb[3] = c.nb[2] * c.ne[2];
+    return c;
+}
+
+// slice s of the GEMM is enqueued: run the chain on it, then push it to the peer
+extern "C" void ggml_cuda_pxa_pfs_slice(ggml_backend_cuda_context * ctx, const ggml_tensor * mm, int s) {
+    auto it = g_pfs_by_mm.find(mm);
+    GGML_ASSERT(it != g_pfs_by_mm.end());
+    pxa_pfs_plan * p = it->second.first;
+    const int r = it->second.second, peer = 1 - r;
+    pxa_pfs_half & h = p->h[r];
+    const int64_t t0 = (int64_t) s * p->slice;
+    const int64_t n  = std::min<int64_t>(p->slice, p->ny - t0);
+    ggml_tensor cm = pxa_pfs_clone(h.mm, t0, n);
+    ggml_tensor cc[PXA_PFS_MAX_CHAIN];
+    ggml_tensor ce[PXA_PFS_MAX_CHAIN];                    // the outside operand of chain node c (an ADD), sliced
+    for (int c = 0; c < h.nchain; ++c) {
+        const ggml_tensor * w = h.chain[c];
+        cc[c] = pxa_pfs_clone(w, t0, n);
+        for (int q = 0; q < GGML_MAX_SRC; ++q) {
+            const ggml_tensor * x = w->src[q];
+            if (!x) continue;
+            ggml_tensor * m = nullptr;
+            if (x == w)         m = &cc[c];
+            else if (x == h.mm) m = &cm;
+            else for (int b = 0; b < c && !m; ++b) if (x == h.chain[b]) m = &cc[b];
+            if (!m) { ce[c] = pxa_pfs_clone(x, t0, n); m = &ce[c]; }
+            cc[c].src[q] = m;
+        }
+        switch (w->op) {
+            case GGML_OP_CPY:  ggml_cuda_cpy(*ctx, cc[c].src[0], &cc[c], true); break;
+            case GGML_OP_CONT:
+            case GGML_OP_DUP:  ggml_cuda_dup(*ctx, &cc[c]);                    break;
+            case GGML_OP_ADD:  ggml_cuda_op_add(*ctx, &cc[c]);                 break;
+            default: GGML_ABORT("PXA_PF_SLICE: op %s was not planned", ggml_op_name(w->op));
+        }
+    }
+    auto & info = ggml_cuda_info();
+    const ggml_tensor * P = h.nchain ? h.chain[h.nchain - 1] : h.mm;
+    auto & sd = g_pxa_pf[r];
+    CUDA_CHECK(cudaEventRecord(sd.sliced[s], ctx->stream()));
+    if (s == 0) CUDA_CHECK(cudaStreamWaitEvent(sd.copy, g_pxa_pf[peer].drained, 0));   // the peer's last adds read its staging
+    CUDA_CHECK(cudaStreamWaitEvent(sd.copy, sd.sliced[s], 0));
+    const size_t  esz = ggml_element_size(P);
+    const int64_t e0  = t0 * p->ne0;
+    CUDA_CHECK(cudaMemcpyPeerAsync(g_pxa_pf[peer].stage + e0 * esz, info.all_ctx[peer]->device,
+                                   (const char *) P->data + e0 * esz, info.all_ctx[r]->device,
+                                   (size_t) (n * p->ne0) * esz, sd.copy));
+    CUDA_CHECK(cudaEventRecord(sd.pushed[s], sd.copy));
+    if (s == p->nslice - 1) h.pushed.store(1, std::memory_order_release);
 }
 
 void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2222,7 +2953,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
     // It does not work at all if not all GPUs participate in the reduce op, and we
     // get suboptimal prompt processing performance when we have more than 2 GPUs.
     // Hence, if enabled, we use NCCL only for the cases where it works and performs well.
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
     constexpr bool bf16_supported = true;
 #else
     constexpr bool bf16_supported = false;

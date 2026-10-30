@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import statistics
 import subprocess
@@ -82,6 +83,18 @@ GREEDY_PROMPT = (
     "reach, starting with the ridge line where they begin."
 )
 GREEDY_N = 512
+
+# The warm-up never uses a measured prompt (FR#12, todo control-bench-honest): a drafter that learns
+# from what it generated (an n-gram table, ngram-mod, a suffix tree) would otherwise have seen the
+# measured answer already, and on a server that refuses the slot erase run 1 would be replay.
+WARMUP_PROMPT = (
+    "List five everyday objects made mostly of copper and say in a few words why copper is used "
+    "for each one."
+)
+
+# A later run this much faster than run 1 is flagged as replay (FR#12 saw >2x); on an honest bench
+# every run is a first pass and they differ by noise (a few percent).
+REPLAY_SUSPECT_RATIO = 1.15
 
 _BADGE_COLORS = {"prose": "#2f6fed", "edit": "#2fa84f", "long": "#a259e6"}
 
@@ -196,9 +209,90 @@ def model_sha256(path, chunk=1 << 24):
 # ---------------------------------------------------------------------------------------------
 # Measurement: warm-up (owner rule -- 60s before the open bracket), REPS x class, greedy512.
 # ---------------------------------------------------------------------------------------------
-def measure_once(url, prompt, n_predict, timeout=600):
+# A run that ends before it decodes has no decode rate (#361/#362, 2026-10-26): the server times the first token with the
+# prompt, so a reply of ONE token reads 1 token / 1 us = 1,000,000 t/s. A chat model given a raw-text bench prompt can end at
+# once (Swift-1.5 Flash-Next answered the "edit" and "long" prompts with <|endoftext|> / <|im_end|> as its first token, and
+# both classes read 1,000,000 t/s). Such a run is asked again with ignore_eos (one retry), so the class times n_predict
+# tokens; a run that still decodes fewer than MIN_DECODE_TOKENS reports 0 (no number) instead of 1e6. A run that does not
+# end early sends the same request as before, so every earlier number is unchanged.
+MIN_DECODE_TOKENS = 2
+
+
+def completion_body(prompt, n_predict, ignore_eos=False):
+    """the bench's /completion request (greedy, seed 0, no prompt cache); ignore_eos only on the early-end retry"""
     body = {"prompt": prompt, "n_predict": n_predict, "temperature": 0.0, "seed": 0,
             "cache_prompt": False}
+    if ignore_eos:
+        body["ignore_eos"] = True
+    return body
+
+
+def tokens_predicted(r):
+    """generated tokens of a /completion reply (tokens_predicted, else timings.predicted_n); None when the server says neither"""
+    n = r.get("tokens_predicted")
+    if n is None:
+        n = (r.get("timings") or {}).get("predicted_n")
+    try:
+        return None if n is None else int(n)
+    except (TypeError, ValueError):
+        return None
+
+
+def ended_early(r, n_predict):
+    """True when a /completion reply stopped (end of generation, a stop word) before a quarter of n_predict tokens, or
+    decoded fewer than MIN_DECODE_TOKENS: its decode rate is not a speed. Unknown token count -> False (unchanged)."""
+    n = tokens_predicted(r)
+    if n is None:
+        return False
+    return n < max(MIN_DECODE_TOKENS, n_predict // 4)
+
+
+def decode_rate(r):
+    """the server's decode t/s, or 0.0 when the reply decoded fewer than MIN_DECODE_TOKENS tokens (1e6 is not a speed)"""
+    n = tokens_predicted(r)
+    if n is not None and n < MIN_DECODE_TOKENS:
+        return 0.0
+    return (r.get("timings") or {}).get("predicted_per_second") or 0.0
+
+
+# #366: a thinking model can spend every token of a bench reply inside its thought; that rate counts thinking tokens
+# and the reply has no answer, so the card says "no answer: all thinking" rather than show it as a plain speed.
+THINK_TAGS = (("<think>", "</think>"), ("<seed:think>", "</seed:think>"), ("<|START_THINKING|>", "<|END_THINKING|>"),
+              ("[THINK]", "[/THINK]"), ("<|channel|>analysis", "<|channel|>final"),
+              ("<|begin_of_thought|>", "<|end_of_thought|>"))
+_SPECIAL_RE = re.compile(r"<\|[^|<>]{0,40}\|>")
+
+
+def answer_kind(r):
+    """-> None (the reply has an answer, or too little is known to tell), "all thinking" (a thought that never
+    closes, nothing after it, or only reasoning_content) or "ended at once" (under MIN_DECODE_TOKENS tokens, no text).
+    Same rule as Control's bench (tools/pxa_control/core.py bench_answer_kind)."""
+    r = r or {}
+    if "content" not in r and "reasoning_content" not in r:
+        return None
+    answer = r.get("content") if isinstance(r.get("content"), str) else ""
+    rc = r.get("reasoning_content") if isinstance(r.get("reasoning_content"), str) else ""
+    thought = bool(rc.strip())
+    for op, cl in THINK_TAGS:
+        if op in answer:
+            thought = True
+            after = answer.split(op, 1)[1]
+            answer = after.split(cl, 1)[1] if cl in after else ""
+        elif cl in answer:                  # the prompt opened the thought
+            thought = True
+            answer = answer.split(cl, 1)[1]
+    if _SPECIAL_RE.sub("", answer).strip():
+        return None
+    if thought:
+        return "all thinking"
+    n = tokens_predicted(r)
+    if n is not None and n < MIN_DECODE_TOKENS:
+        return "ended at once"
+    return None
+
+
+def measure_once(url, prompt, n_predict, timeout=600, ignore_eos=False):
+    body = completion_body(prompt, n_predict, ignore_eos)
     t0 = time.time()
     r = _post_json(url, "/completion", body, timeout=timeout)
     wall = time.time() - t0
@@ -208,16 +302,25 @@ def measure_once(url, prompt, n_predict, timeout=600):
     n_pred = r.get("tokens_predicted")
     if decode is None and wall > 0 and n_pred:
         decode = n_pred / wall
+    if n_pred is not None and n_pred < MIN_DECODE_TOKENS:
+        decode = 0.0                     # one token in ~0 s reads 1e6 t/s: not a speed
     return {
         "decode_tok_s": decode or 0.0,
         "prefill_tok_s": prefill or 0.0,
         "wall_s": wall,
         "tokens_predicted": n_pred,
+        "prompt_n": timings.get("prompt_n") or r.get("tokens_evaluated"),
+        "draft_n": timings.get("draft_n"),
+        "draft_accepted": timings.get("draft_n_accepted"),
         "content": r.get("content", ""),
+        "answer_kind": answer_kind(r),
+        "stop_type": r.get("stop_type"),
+        "ended_early": ended_early(r, n_predict),
+        "ignore_eos": bool(ignore_eos),
     }
 
 
-def warmup(url, seconds, prompt):
+def warmup(url, seconds, prompt=WARMUP_PROMPT):
     if seconds <= 0:
         return
     print("pxa-bench: warming up for %ds (owner rule: warm before the open bracket) ..." % seconds)
@@ -233,22 +336,112 @@ def warmup(url, seconds, prompt):
     print("pxa-bench: warmed with %d request(s) over %ds" % (n, seconds))
 
 
-def run_class(url, cls, prompt, n_predict, reps):
-    decodes, prefills = [], []
+def forget(url):
+    """Erase every slot so the next request is measured FIRST PASS (2026-10-19): the reps ask the same prompt, and a
+    server with n-gram speculation otherwise replays its own earlier answer from the table (up to ~2x on a spec run).
+    -> True when every slot was erased; False when the server refused (another engine): the result says so."""
+    try:
+        n = int((_get_json(url, "/props", timeout=10) or {}).get("total_slots") or 1)
+    except Exception:
+        n = 1
+    ok = True
+    for sid in range(max(1, min(n, 64))):
+        try:
+            r = _post_json(url, "/slots/%d?action=erase" % sid, {}, timeout=30)
+            if isinstance(r, dict) and r.get("error"):
+                ok = False
+        except Exception:
+            ok = False
+    return ok
+
+
+def run_tag(session, rep):
+    """FR#12: when the server refuses the slot erase, the run's prompt starts with this tag instead, so
+    no run re-uses another run's prefix (the session is random per bench, so a second bench on the
+    same server does not repeat the first one's prompts either)."""
+    return "[bench %s run %d]\n" % (session, rep)
+
+
+def summarize_runs(decodes, accepted=None):
+    """FR#12: run 1 (the first pass) vs the mean of runs 2..N for one class.
+
+    -> {"first_pass", "later_mean", "later_vs_first", "replay_suspect", "headline"}. headline is the
+    median of all runs, or the first pass when a later run is REPLAY_SUSPECT_RATIO or more faster
+    than run 1 (then the later runs were replay and must not lift the number). `accepted` (accepted
+    draft tokens per run, same order) is optional: when the server reports it for every run and no
+    later run accepted more drafts than run 1, a faster later run is noise (a slow first pass), not
+    replay, and is not flagged."""
+    if accepted is not None and len(accepted) == len(decodes) and all(a is not None for a in accepted):
+        acc = [a for a, x in zip(accepted, decodes) if x]
+    else:
+        acc = None
+    d = [float(x) for x in decodes if x]
+    if not d:
+        return {"first_pass": 0.0, "later_mean": None, "later_vs_first": None,
+                "replay_suspect": False, "headline": 0.0}
+    first = d[0]
+    later = d[1:]
+    later_mean = sum(later) / len(later) if later else None
+    ratio = (later_mean / first - 1.0) if (later_mean is not None and first > 0) else None
+    suspect = bool(later) and first > 0 and max(later) >= first * REPLAY_SUSPECT_RATIO
+    if suspect and acc and len(acc) == len(d) and max(acc[1:]) <= acc[0]:
+        suspect = False          # no more drafts accepted than the first pass: the speed-up was noise, not replay
+    return {"first_pass": first, "later_mean": later_mean, "later_vs_first": ratio,
+            "replay_suspect": suspect, "headline": first if suspect else statistics.median(d)}
+
+
+def run_class(url, cls, prompt, n_predict, reps, session=None):
+    decodes, prefills, accepted = [], [], []
+    eos_runs = think_runs = none_runs = 0
+    first_pass = True
+    session = session or os.urandom(3).hex()
     for i in range(reps):
-        m = measure_once(url, prompt, n_predict)
+        erased = forget(url)
+        first_pass = erased and first_pass
+        # a server that refused the erase gets a fresh prompt per run (FR#12): no prefix re-use at least
+        p_i = prompt if erased else run_tag(session, i + 1) + prompt
+        m = measure_once(url, p_i, n_predict)
+        if m.get("ended_early"):
+            # #361: the model ended at once on this raw-text prompt (a chat model may): ask again, EOS ignored, from
+            # erased slots, so the class times n_predict tokens instead of reading 1e6 t/s off one token
+            print("   [%s] rep %d/%d: the model ended after %s token(s)%s on this raw-text prompt; asked again with ignore_eos" % (
+                cls, i + 1, reps, m.get("tokens_predicted"), (" (%s)" % m["stop_type"]) if m.get("stop_type") else ""))
+            forget(url)
+            m = measure_once(url, p_i, n_predict, ignore_eos=True)
+            eos_runs += 1
+        kind = m.get("answer_kind")
+        if kind == "all thinking":
+            think_runs += 1
+        elif kind:
+            none_runs += 1
         if m["decode_tok_s"]:
             decodes.append(m["decode_tok_s"])
+            accepted.append(m.get("draft_accepted"))
         if m["prefill_tok_s"]:
             prefills.append(m["prefill_tok_s"])
-        print("   [%s] rep %d/%d: decode %.1f t/s%s" % (
+        print("   [%s] rep %d/%d: decode %.1f t/s%s%s" % (
             cls, i + 1, reps, m["decode_tok_s"],
-            (", prefill %.1f t/s" % m["prefill_tok_s"]) if m["prefill_tok_s"] else ""))
+            (", prefill %.1f t/s" % m["prefill_tok_s"]) if m["prefill_tok_s"] else "",
+            (", drafts %s/%s accepted" % (m["draft_accepted"], m["draft_n"])) if m.get("draft_n") else "")
+            + ((", no answer: %s" % kind) if kind else ""))
+    no_answer = None
+    if reps and think_runs + none_runs >= reps:
+        no_answer = "all thinking" if think_runs else "ended at once"
+    s = summarize_runs(decodes, accepted)
     return {
         "class": cls,
-        "decode_tok_s": statistics.median(decodes) if decodes else 0.0,
+        "decode_tok_s": s["headline"],
         "prefill_tok_s": statistics.median(prefills) if prefills else 0.0,
         "reps": reps,
+        "first_pass": first_pass,
+        "first_pass_tok_s": s["first_pass"],
+        "later_mean_tok_s": s["later_mean"],
+        "replay_suspect": s["replay_suspect"],
+        "decode_all": decodes,
+        "ignore_eos_runs": eos_runs,
+        "all_thinking_runs": think_runs,
+        "no_answer_runs": none_runs,
+        "no_answer": no_answer,
     }
 
 
@@ -321,12 +514,37 @@ def render_markdown(result):
         "  **EMPTY -- FAIL**" if g.get("empty") else ""))
     lines.append("- **Generated:** %s" % result["generated_at"])
     lines.append("")
-    lines.append("| class | decode t/s (median x%s) | prefill t/s (median) | vs published board |"
+    lines.append("| class | decode t/s (median x%s) | first pass t/s | later runs mean t/s | prefill t/s (median) | vs published board |"
                  % result.get("reps", 3))
-    lines.append("|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|")
+    flagged = []
     for row in result.get("classes", []):
-        lines.append("| %s | %.1f | %.1f | %s |" % (
-            row["class"], row["decode_tok_s"], row["prefill_tok_s"], row["vs_board"]))
+        fp, lm = row.get("first_pass_tok_s"), row.get("later_mean_tok_s")
+        lines.append("| %s | %.1f%s | %s | %s | %.1f | %s |" % (
+            row["class"], row["decode_tok_s"],
+            (" (first pass)" if row.get("replay_suspect") else "")
+            + ((" (no answer: %s)" % row["no_answer"]) if row.get("no_answer") else ""),
+            "%.1f" % fp if fp else "-", "%.1f" % lm if lm else "-",
+            row["prefill_tok_s"], row["vs_board"]))
+        if row.get("replay_suspect"):
+            flagged.append(row["class"])
+    lines.append("")
+    lines.append("_Every run starts from a server told to forget its earlier replies (slot erase), so each "
+                 "one is a first pass; run 1 is shown next to the mean of the later runs._")
+    if flagged:
+        lines.append("")
+        lines.append("**Later runs were much faster than the first pass for %s: the server replayed "
+                     "an earlier answer, so the first pass is the number shown.**" % ", ".join(flagged))
+    eos = [row["class"] for row in result.get("classes", []) if row.get("ignore_eos_runs")]
+    if eos:
+        lines.append("")
+        lines.append("_The model ended at once on the raw-text prompt of %s (a chat model may), so those runs were "
+                     "asked again with ignore_eos and time the full token count._" % ", ".join(eos))
+    silent = [row["class"] for row in result.get("classes", []) if row.get("no_answer")]
+    if silent:
+        lines.append("")
+        lines.append("**No answer for %s: every run was all thinking or ended at once, so that rate is not a speed "
+                     "to compare. Try a larger context or thinking off.**" % ", ".join(silent))
     lines.append("")
     lines.append("_%s_" % result.get("board_note", ""))
     lines.append("")
@@ -438,7 +656,7 @@ def run_bench(url, a):
 
     model_sha, _sha_how = (None, "skipped (--no-sha)") if a.no_sha else model_sha256(model_path)
 
-    warmup(url, a.warmup, CLASS_PROMPTS["prose"]["prompt"])
+    warmup(url, a.warmup)
 
     board = load_board(a.board_json)
     names = [c.get("name") for c in cards]
@@ -457,6 +675,7 @@ def run_bench(url, a):
         row["vs_board"] = format_vs_board(row["decode_tok_s"], board_row)
         class_results.append(row)
 
+    forget(url)
     g = greedy512(url)
 
     return {
@@ -598,6 +817,23 @@ def run_selftest():
             ok = False
     else:
         print("SELFTEST: card_class_from_name OK")
+
+    # #366: a reply that is all thinking has no answer; the card says so instead of showing a bare rate
+    for r, want in (({"content": "<think>the passage is about", "tokens_predicted": 512}, "all thinking"),
+                    ({"content": "<think>hm</think>\nIt describes a harbour.", "tokens_predicted": 512}, None),
+                    ({"content": "", "reasoning_content": "let me think", "tokens_predicted": 512}, "all thinking"),
+                    ({"content": "<|im_end|>", "tokens_predicted": 1}, "ended at once"),
+                    ({"content": "plain answer", "tokens_predicted": 512}, None)):
+        got = answer_kind(r)
+        if got != want:
+            print("SELFTEST FAIL: answer_kind(%r) = %r, want %r" % (r, got, want))
+            ok = False
+    think = dict(sample, classes=[dict(sample["classes"][0], all_thinking_runs=3, no_answer="all thinking")])
+    if "no answer: all thinking" in render_markdown(think):
+        print("SELFTEST: answer_kind + no-answer label OK")
+    else:
+        print("SELFTEST FAIL: markdown card missing the no-answer label")
+        ok = False
 
     print("SELFTEST: %s" % ("ALL PASS" if ok else "FAILURES ABOVE"))
     return ok

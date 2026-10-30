@@ -1,0 +1,67 @@
+PXA Network modification notice (Apache License 2.0, section 4(b)): this patch changes
+vllm/v1/core/sched/scheduler.py from vLLM (Copyright the vLLM contributors, Apache License 2.0).
+Changed by PXA Network, 2026; the change is released under the Apache License 2.0.
+See tools/vllm-pxq4/LICENSE-NOTICE.md. patch(1) skips these lines.
+
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -71,6 +71,20 @@
+     if _ddtree_debug_enabled():
+         logger.info("DFlash DDTree debug: %s", message % args if args else message)
+ 
++_PXA_LPT_SOLO = os.environ.get("PXA_LPT_SOLO", "0") == "1"
++
++
++def _pxa_lpt(sched) -> int:
++    thr = sched.scheduler_config.long_prefill_token_threshold
++    if _PXA_LPT_SOLO and thr > 0:
++        try:
++            n = len(sched.running) + len(sched.waiting) + len(getattr(sched, "skipped_waiting", ()) or ())
++        except TypeError:
++            n = 2
++        if n <= 1:
++            return 0
++    return thr
++
+ 
+ class Scheduler(SchedulerInterface):
+     def __init__(
+@@ -442,7 +456,7 @@
+         end = start + num_new_tokens
+         if end < prefill_end:
+             max_prefill_tokens = self.max_num_scheduled_tokens
+-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
++            long_prefill_threshold = _pxa_lpt(self)
+             if long_prefill_threshold > 0:
+                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+             aligned_end = end // block_size * block_size
+@@ -539,7 +553,7 @@
+                     ddtree_payload_for_tree_schedule
+                 )
+                 remaining_output_tokens = self._remaining_output_tokens(request)
+-                threshold = self.scheduler_config.long_prefill_token_threshold
++                threshold = _pxa_lpt(self)
+                 max_len_tokens = self.max_model_len - 1 - request.num_computed_tokens
+                 _ddtree_debug_log(
+                     "schedule candidate req=%s base_new=%d tree_new=%d "
+@@ -572,8 +586,9 @@
+                         request.request_id,
+                         num_new_tokens,
+                     )
+-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
++            _pxa_thr = _pxa_lpt(self)
++            if 0 < _pxa_thr < num_new_tokens:
++                num_new_tokens = _pxa_thr
+             num_new_tokens = min(num_new_tokens, token_budget)
+ 
+             # Make sure the input position does not exceed the max model len.
+@@ -893,7 +908,7 @@
+                     # `request.num_prompt_tokens` to consider the resumed
+                     # requests, which have output tokens.
+                     num_new_tokens = request.num_tokens - num_computed_tokens
+-                    threshold = self.scheduler_config.long_prefill_token_threshold
++                    threshold = _pxa_lpt(self)
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
+ 

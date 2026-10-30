@@ -1,0 +1,27 @@
+/* Wallet panel on the Store tab. Colours are the page tokens, so light and dark stay in step. */
+.wl{display:grid;gap:var(--s4);margin-bottom:var(--s5)}
+.wl h3{margin:0}
+.wl-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:var(--s4) var(--s5);min-width:0}
+.wl-bal{font-size:var(--fs-6);font-weight:750;line-height:1;letter-spacing:-.6px;font-variant-numeric:tabular-nums;color:var(--text)}
+.wl-bal small{font-size:var(--fs-2);font-weight:600;color:var(--dim);margin-left:6px;letter-spacing:0}
+.wl-split{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--dim);font-size:var(--fs-1);margin:8px 0 0}
+.wl-split b{color:var(--text);font-weight:700;font-variant-numeric:tabular-nums}
+.wl-id{font-family:var(--mono);font-size:var(--fs-1);overflow-wrap:anywhere;color:var(--text)}
+.wl-acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:var(--s3)}
+.wl-two{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);gap:var(--s4);align-items:start}
+.wl-earn{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:0}
+.wl-earn li{display:flex;justify-content:space-between;gap:12px;align-items:baseline;padding:8px 0;border-bottom:1px solid var(--line)}
+.wl-earn li span{min-width:0}
+.wl-earn b{font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--text)}
+.wl-pos{color:var(--ok);font-variant-numeric:tabular-nums}
+.wl-neg{color:var(--text);font-variant-numeric:tabular-nums}
+.wl-field{display:block;width:100%;margin:4px 0 12px;box-sizing:border-box}
+.coin{font-weight:700;font-variant-numeric:tabular-nums}
+.coin small{color:var(--dim);font-weight:600}
+@media (max-width:820px){
+  .wl-two{grid-template-columns:1fr}
+  .wl-card{padding:var(--s4)}
+  .wl-bal{font-size:var(--fs-5)}
+  .wl-acts .b{flex:1 1 calc(50% - 8px);min-height:44px;justify-content:center}
+  .wl-earn li{flex-direction:column;align-items:flex-start;gap:2px}
+}

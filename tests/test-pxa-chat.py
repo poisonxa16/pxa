@@ -160,6 +160,9 @@ class TestGuards(unittest.TestCase):
         for h in ("127.0.0.1", "localhost", "10.0.0.5", "192.168.1.1", "::1", "169.254.169.254", "100.100.1.1", "x.local"):
             self.assertIsNotNone(guards.private_host(h), h)
         self.assertIsNone(guards.private_host("93.184.216.34"))
+        for h in ("64:ff9b::a00:1", "64:ff9b:1::c0a8:101", "2002:c0a8:109::1", "::ffff:10.0.0.1"):   # NAT64 / 6to4 / mapped home addresses
+            self.assertIsNotNone(guards.private_host(h), h)
+        self.assertIsNone(guards.private_host("2606:4700:4700::1111"))
         fake = lambda h, p: [(2, 1, 6, "", ("10.1.2.3", 0))]
         self.assertIsNotNone(guards.private_host("rebind.example", resolver=fake))
 
@@ -662,8 +665,8 @@ class TestMemoryStore(unittest.TestCase):
 
     def test_secrets_and_style_refused(self):
         for bad in ("My password is hunter22", "api key: sk-abcdefghijklmnop", "ghp_abcdefghijklmnopqrstu",
-                    "AKIAABCDEFGHIJKLMNOP", "Bearer abcdefghijklmnop", "xoxb-1234567890-abc",
-                    "card 4111 1111 1111 1111", "-----BEGIN RSA PRIVATE KEY-----"):
+                    "AKIA" + "ABCDEFGHIJKLMNOP", "Bearer abcdefghijklmnop", "xox" + "b-1234567890-abc",
+                    "card 4111 1111 1111 1111", "-----BEGIN RSA " + "PRIVATE KEY-----"):   # fixtures assembled at run time: no key shape in the source
             with self.assertRaises(memory.MemoryError_) as cm:
                 self.st.add(bad)
             self.assertIn("secret", str(cm.exception))
@@ -807,9 +810,80 @@ class TestTools(unittest.TestCase):
         ok, out = tools.execute("run_command", {"command": "sleep 5", "timeout": 1}, tools.Ctx(sb, advanced=True))
         self.assertIn("longer than 1 s", out)
 
+    def test_run_command_log_never_carries_the_output_text(self):
+        # review 10-18 night: when the output named the sandbox path, 3000 chars of raw stdout/stderr went to the server
+        # log (every traceback does that), and control.log is what people attach to bug reports
+        sb = tempfile.mkdtemp(dir=TMP)
+        cmd = "python3 -c \"import os; print('MARKER-PRIVATE-VALUE-1'); print(os.getcwd())\""
+        with self.assertLogs("pxa_control.chat", level="WARNING") as cm:
+            ok, out = tools.execute("run_command", {"command": cmd}, tools.Ctx(sb, chat_id="c9", advanced=True))
+        self.assertTrue(ok, out)
+        self.assertNotIn(sb, out)                                   # the model sees the relative form
+        self.assertIn("MARKER-PRIVATE-VALUE-1", out)                 # ... and the output itself
+        joined = "\n".join(cm.output)
+        self.assertIn("carried the sandbox path", joined)
+        self.assertNotIn("MARKER-PRIVATE-VALUE-1", joined, "the server log must not carry the command's output")
+        self.assertIn(os.path.realpath(sb), joined)                 # the path itself stays server-side (harness pathleak)
+
     def test_run_command_always_asks(self):
         need = tools.approval_needed("run_command", {"command": "ls"}, tools.Ctx(TMP))
         self.assertFalse(need["always_ok"])
+
+    @staticmethod
+    def _trickle_server(seconds=8.0, every=0.2):
+        """a page whose body arrives one byte at a time: before review 10-18 night web_fetch read it until EOF (per-recv
+        timeout only) and had no stopper, so a hostile site held a worker thread + socket for as long as it liked."""
+        import socket as _s
+        srv = _s.socket(); srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1); srv.bind(("127.0.0.1", 0)); srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    c.settimeout(2)
+                    c.recv(4096)
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n")
+                    t0 = time.time()
+                    while time.time() - t0 < seconds:
+                        c.sendall(b"x")
+                        time.sleep(every)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+        threading.Thread(target=serve, daemon=True).start()
+        return srv, srv.getsockname()[1]
+
+    def test_web_fetch_has_one_deadline_for_the_whole_page(self):
+        srv, port = self._trickle_server()
+        try:
+            ctx = tools.Ctx(tempfile.mkdtemp(dir=TMP), approved_private=True)
+            ctx.fetch_total_s = 1.0
+            t0 = time.time()
+            ok, out = tools.execute("web_fetch", {"url": f"http://127.0.0.1:{port}/drip"}, ctx)
+            took = time.time() - t0
+            self.assertFalse(ok, out)
+            self.assertIn("longer than 1 s", out)
+            self.assertLess(took, 4.0, "the fetch outlived its deadline: %.1f s" % took)
+        finally:
+            srv.close()
+
+    def test_stop_ends_a_web_fetch_in_flight(self):
+        srv, port = self._trickle_server()
+        try:
+            ctx = tools.Ctx(tempfile.mkdtemp(dir=TMP), approved_private=True)
+            threading.Timer(0.5, tools.interrupt, (ctx,)).start()
+            t0 = time.time()
+            ok, out = tools.execute("web_fetch", {"url": f"http://127.0.0.1:{port}/drip"}, ctx)
+            took = time.time() - t0
+            self.assertFalse(ok, out)
+            self.assertIn("stopped", out)
+            self.assertLess(took, 4.0, "Stop did not end the fetch: %.1f s" % took)
+        finally:
+            srv.close()
 
     def test_web_fetch_private_refused_without_approval(self):
         ok, out = tools.execute("web_fetch", {"url": f"http://127.0.0.1:{P_NATIVE}/health"}, tools.Ctx(TMP))
@@ -854,15 +928,61 @@ _spec.loader.exec_module(L)
 import pxa_control as C  # noqa: E402
 
 
+TOKENS = {}          # port -> session token (H1, the Control hardening pass: every API call to Control carries it)
+
+
 def http(port, path, method="GET", body=None):
     data = json.dumps(body).encode() if body is not None else None
-    rq = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method=method,
-                                headers={"Content-Type": "application/json"} if data else {})
+    h = {"Content-Type": "application/json"} if data else {}
+    if TOKENS.get(port):
+        h["X-PXA-Token"] = TOKENS[port]
+    rq = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method=method, headers=h)
     try:
         with urllib.request.urlopen(rq, timeout=20) as r:
             return r.status, r.read(), r.headers
     except urllib.error.HTTPError as e:
         return e.code, e.read(), e.headers
+
+
+class TestBrokenSessionListing(unittest.TestCase):
+    """[ST06] a damaged chat file is listed as broken; review 10-18 night: the listing must not read the whole file."""
+
+    def setUp(self):
+        self.st = sessions.Store(tempfile.mkdtemp(dir=TMP))
+        os.makedirs(self.st.dir, exist_ok=True)
+
+    def _broken(self, sid, title, pad):
+        with open(os.path.join(self.st.dir, sid + ".json"), "wb") as f:
+            f.write(('{"id": "%s", "title": %s, "turns": [' % (sid, json.dumps(title))).encode() + b" " * pad + b"<<< not json")
+
+    def test_listed_with_title_and_raw_export_still_whole(self):
+        self._broken("brokenchat01", "Plans for été", 1000)
+        rows = self.st.list()
+        self.assertEqual([(r["id"], r["title"], r["broken"]) for r in rows],
+                         [("brokenchat01", "Plans for été (could not be read)", True)])
+        self.assertEqual(self.st.list(include_broken=False), [])
+        self.assertTrue(self.st.raw("brokenchat01").endswith("<<< not json"))      # the export is the whole file
+
+    def test_listing_reads_only_the_head_of_a_big_broken_file(self):
+        self._broken("brokenchat02", "Big one", 8 << 20)
+        reads = []
+        real_open = open
+
+        def spy(path, *a, **k):
+            f = real_open(path, *a, **k)
+            if str(path).endswith("brokenchat02.json") and "b" in (a[0] if a else k.get("mode", "r")):
+                real_read = f.read
+                f.read = lambda n=-1: (reads.append(n), real_read(n))[1]
+            return f
+        sessions.open = spy
+        try:
+            rows = self.st.list()
+        finally:
+            del sessions.open
+        self.assertEqual([r["title"] for r in rows], ["Big one (could not be read)"])
+        self.assertTrue(reads, "the listing read the file")
+        self.assertTrue(all(0 < n <= sessions.Store.HEAD_BYTES for n in reads),
+                        "list() read the whole broken file (%r bytes); only its head belongs in a listing" % reads)
 
 
 class TestRoutes(unittest.TestCase):
@@ -876,6 +996,7 @@ class TestRoutes(unittest.TestCase):
         cls.srv = C.make_server(cls.app, "127.0.0.1", 0)
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
         cls.port = cls.srv.server_address[1]
+        TOKENS[cls.port] = cls.app.token
 
     @classmethod
     def tearDownClass(cls):
@@ -938,17 +1059,22 @@ class TestRoutes(unittest.TestCase):
         png = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
         got = routes.take_images({"images": [
             {"media_type": "image/png", "data": "data:image/png;base64," + png},
-            {"media_type": "image/svg+xml", "data": png},
-            {"media_type": "image/png", "data": "@@@"},
-            "nope",
-        ] + [{"media_type": "image/png", "data": png}] * 5})
+            {"media_type": "image/png", "data": png}] * 2})
         self.assertEqual([x["data"] for x in got], [png] * 4)
+        for bad in ({"media_type": "image/svg+xml", "data": png}, {"media_type": "image/png", "data": "@@@"},
+                    {"media_type": "image/png", "data": png[:-3]}, "nope", {"media_type": "image/png", "data": ""},
+                    {"media_type": "image/png", "data": "data:image/svg+xml;base64," + png}):       # C14: refused, with the reason
+            with self.assertRaises(routes.ChatError) as cm:
+                routes.take_images({"images": [bad]})
+            self.assertEqual(cm.exception.code, "bad_image")
+        with self.assertRaises(routes.ChatError):                                                    # a 5th image is refused too
+            routes.take_images({"images": [{"media_type": "image/png", "data": png}] * 5})
         st, body, _ = http(self.port, "/api/chat/servers")
         self.assertEqual(json.loads(body)["servers"][0]["status"], "ready")
         st, body, _ = http(self.port, "/api/chat/run", "POST", {
             "message": "hello there", "preset": "chat", "advanced": False,
             "repeat_penalty": 1.25, "seed": 7,
-            "images": [{"media_type": "image/png", "data": png}, {"media_type": "text/plain", "data": png}],
+            "images": [{"media_type": "image/png", "data": png}],
         })
         self.assertEqual(st, 200, body[:300])
         d = json.loads(body)
@@ -1010,8 +1136,31 @@ class TestRoutes(unittest.TestCase):
         st, body, _ = http(self.port, "/api/chat/events?run=nope")
         self.assertEqual((st, json.loads(body)["code"]), (404, "unknown_run"))
 
+    def test_saved_is_released_even_when_the_save_prologue_fails(self):
+        # review 10-18 night: saved.set() sat in a finally around store.save only; an error before it (a damaged messages
+        # field, a fork commit) left every waiter hanging: SSE 3 s, the next run 10 s, branch 30 s then 409
+        import pxa_chat
+        real = sessions.commit_forks
+
+        def boom(_s):
+            raise RuntimeError("fork commit failed on purpose")
+        sessions.commit_forks = boom
+        try:
+            st, body, _ = http(self.port, "/api/chat/run", "POST", {"message": "hello saved", "preset": "chat", "advanced": False})
+            self.assertEqual(st, 200, body[:300])
+            d = json.loads(body)
+            t0 = time.time()
+            evs = self._events(d["run_id"])
+            self.assertEqual(evs[-1]["type"], "run.done", [e["type"] for e in evs])
+            self.assertLess(time.time() - t0, 2.5, "the closing SSE event waited on a save that never finished")
+            hub = pxa_chat._hubs[id(self.app)]
+            self.assertTrue(hub.runs[d["run_id"]].saved.wait(1.0), "saved never set after a failed save")
+        finally:
+            sessions.commit_forks = real
+
     def _events(self, run_id, approve=None):
-        rq = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/chat/events?run={run_id}&since=0")
+        rq = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/chat/events?run={run_id}&since=0",
+                                    headers={"X-PXA-Token": TOKENS.get(self.port) or ""})
         evs = []
         with urllib.request.urlopen(rq, timeout=30) as r:
             self.assertIn("text/event-stream", r.headers.get("Content-Type"))

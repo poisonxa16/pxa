@@ -625,6 +625,11 @@ class GGUFWriter:
     def add_tags(self, tags: Sequence[str]) -> None:
         self.add_array(Keys.General.TAGS, tags)
 
+    # metadata.py writes a model card's `datasets:` list through this (general.datasets, string array); it was
+    # missing, so any model card naming its datasets (Nemotron 3.5 Bolt) aborted the conversion in prepare_metadata
+    def add_datasets(self, datasets: Sequence[str]) -> None:
+        self.add_array(Keys.General.DATASETS, [str(d) for d in datasets])
+
     def add_languages(self, languages: Sequence[str]) -> None:
         self.add_array(Keys.General.LANGUAGES, languages)
 
@@ -735,6 +740,9 @@ class GGUFWriter:
 
     def add_sliding_window_pattern(self, value: Sequence[bool]) -> None:
         self.add_array(Keys.Attention.SLIDING_WINDOW_PATTERN.format(arch=self.arch), value)
+
+    def add_rope_pattern(self, value: Sequence[bool]) -> None:
+        self.add_array(Keys.Attention.ROPE_PATTERN.format(arch=self.arch), value)
 
     def add_dense_features_dims(self, dense:str, in_f:int, out_f:int) -> None:
         self.add_uint32(Keys.LLM.DENSE_FEAT_IN_SIZE.format(arch=self.arch, dense=dense), in_f)
@@ -1021,6 +1029,9 @@ class GGUFWriter:
 
     def add_add_space_prefix(self, value: bool) -> None:
         self.add_bool(Keys.Tokenizer.ADD_PREFIX, value)
+
+    def add_metaspace_prepend_scheme(self, value: str) -> None:
+        self.add_string(Keys.Tokenizer.METASPACE_PREPEND, value)
 
     def add_remove_extra_whitespaces(self, value: bool) -> None:
         self.add_bool(Keys.Tokenizer.REMOVE_EXTRA_WS, value)

@@ -31,6 +31,10 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#include <sys/mman.h>   // posix_madvise (PXA_PLE_LAZY copies)
+#endif
 #include <thread>
 
 #if defined(_WIN32)
@@ -221,6 +225,88 @@ namespace GGUFMeta {
             return set(ctx, key.c_str(), target, ovrd);
         }
     };
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// PXA_NEMOTRON_MTP (2026-10-17): attach an EXTERNAL NextN / MTP head file to a trunk-only model.
+//
+// NVIDIA ships the Nemotron 3.5 MTP head as its own GGUF ("mtp-<model>-Q8_0.gguf"): the model's full
+// metadata with block_count = n_trunk + nextn_predict_layers, the tail block blk.<n_trunk>.* and copies of
+// token_embd / output / output_norm. Our PXQ / PXQN trunks are made from the trunk alone, so the head has to
+// join at load time. PXA_MTP_HEAD_FILE=<path> (default unset = off) appends the head's TAIL-BLOCK tensors
+// (blk.<i>.* with i >= the trunk's block_count) as one more file of this model and takes the head's
+// per-layer metadata (block_count, nextn_predict_layers and every per-layer array, which must agree with
+// the trunk on the trunk layers). The head's duplicate token_embd / output / output_norm are NOT loaded:
+// the trunk's own copies serve the head (the shipped head reuses the trunk's lm_head and embeddings).
+// Nothing changes for a model loaded without the variable, or for a file that already carries a head.
+static size_t pxa_gguf_scalar_size(enum gguf_type t) {
+    switch (t) {
+        case GGUF_TYPE_UINT8:  case GGUF_TYPE_INT8:  case GGUF_TYPE_BOOL: return 1;
+        case GGUF_TYPE_UINT16: case GGUF_TYPE_INT16:                      return 2;
+        case GGUF_TYPE_UINT32: case GGUF_TYPE_INT32: case GGUF_TYPE_FLOAT32: return 4;
+        case GGUF_TYPE_UINT64: case GGUF_TYPE_INT64: case GGUF_TYPE_FLOAT64: return 8;
+        default: return 0;
+    }
+}
+
+static double pxa_kv_num(const gguf_context * g, int k, int i) {
+    enum gguf_type t = gguf_get_kv_type(g, k);
+    const void * p = nullptr;
+    if (t == GGUF_TYPE_ARRAY) {
+        t = gguf_get_arr_type(g, k);
+        p = (const char *) gguf_get_arr_data(g, k) + (size_t) i * pxa_gguf_scalar_size(t);
+    } else {
+        p = gguf_get_val_data(g, k);
+    }
+    switch (t) {
+        case GGUF_TYPE_UINT8:   return *(const uint8_t  *) p;
+        case GGUF_TYPE_INT8:    return *(const int8_t   *) p;
+        case GGUF_TYPE_UINT16:  return *(const uint16_t *) p;
+        case GGUF_TYPE_INT16:   return *(const int16_t  *) p;
+        case GGUF_TYPE_UINT32:  return *(const uint32_t *) p;
+        case GGUF_TYPE_INT32:   return *(const int32_t  *) p;
+        case GGUF_TYPE_UINT64:  return (double) *(const uint64_t *) p;
+        case GGUF_TYPE_INT64:   return (double) *(const int64_t  *) p;
+        case GGUF_TYPE_FLOAT32: return *(const float    *) p;
+        case GGUF_TYPE_FLOAT64: return *(const double   *) p;
+        case GGUF_TYPE_BOOL:    return *(const int8_t   *) p ? 1.0 : 0.0;
+        default:                return std::nan("");
+    }
+}
+
+static bool pxa_kv_is_num(const gguf_context * g, int k) {
+    enum gguf_type t = gguf_get_kv_type(g, k);
+    if (t == GGUF_TYPE_ARRAY) t = gguf_get_arr_type(g, k);
+    return pxa_gguf_scalar_size(t) != 0;
+}
+
+// copy one scalar KV keeping its type (numeric and string scalars)
+static void pxa_kv_copy_scalar(gguf_context * dst, const gguf_context * src, int k) {
+    const char * key = gguf_get_key(src, k);
+    switch (gguf_get_kv_type(src, k)) {
+        case GGUF_TYPE_UINT8:   gguf_set_val_u8  (dst, key, gguf_get_val_u8  (src, k)); break;
+        case GGUF_TYPE_INT8:    gguf_set_val_i8  (dst, key, gguf_get_val_i8  (src, k)); break;
+        case GGUF_TYPE_UINT16:  gguf_set_val_u16 (dst, key, gguf_get_val_u16 (src, k)); break;
+        case GGUF_TYPE_INT16:   gguf_set_val_i16 (dst, key, gguf_get_val_i16 (src, k)); break;
+        case GGUF_TYPE_UINT32:  gguf_set_val_u32 (dst, key, gguf_get_val_u32 (src, k)); break;
+        case GGUF_TYPE_INT32:   gguf_set_val_i32 (dst, key, gguf_get_val_i32 (src, k)); break;
+        case GGUF_TYPE_UINT64:  gguf_set_val_u64 (dst, key, gguf_get_val_u64 (src, k)); break;
+        case GGUF_TYPE_INT64:   gguf_set_val_i64 (dst, key, gguf_get_val_i64 (src, k)); break;
+        case GGUF_TYPE_FLOAT32: gguf_set_val_f32 (dst, key, gguf_get_val_f32 (src, k)); break;
+        case GGUF_TYPE_FLOAT64: gguf_set_val_f64 (dst, key, gguf_get_val_f64 (src, k)); break;
+        case GGUF_TYPE_BOOL:    gguf_set_val_bool(dst, key, gguf_get_val_bool(src, k)); break;
+        case GGUF_TYPE_STRING:  gguf_set_val_str (dst, key, gguf_get_val_str (src, k)); break;
+        default: break;
+    }
+}
+
+const char * llama_pxa_mtp_head_file(void) {
+    static const char * path = [] {
+        const char * e = getenv("PXA_MTP_HEAD_FILE");
+        return (e && *e) ? e : (const char *) nullptr;
+    }();
+    return path;
 }
 
 static bool parse_tensor_layer_index(const std::string & name, uint32_t & layer) {
@@ -445,7 +531,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     // pxa.pxqn.rev = an old PXQ file, which loads exactly as before.
     {
         uint32_t pxqn_rev = 0; uint64_t pxqn_seed = 0; uint32_t pxqn_sites = 0;
-        llama_pxqn_read_keys(meta, pxqn_rev, pxqn_seed, pxqn_sites);   // throws on rev > 1 / malformed
+        llama_pxqn_read_keys(meta, pxqn_rev, pxqn_seed, pxqn_sites);   // throws on rev > PXQN_REV_MAX / malformed / unresolvable
         bool has_pxqn = false;
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             if (cur->type == GGML_TYPE_PXQN3 || cur->type == GGML_TYPE_PXQN3S8 || cur->type == GGML_TYPE_PXQN4 ||
@@ -609,6 +695,113 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         }
 
         LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
+    }
+
+    // PXA_NEMOTRON_MTP: external NextN head (see llama_pxa_mtp_head_file above)
+    if (const char * head_path = llama_pxa_mtp_head_file()) {
+        const std::string k_bc    = llm_kv(LLM_KV_BLOCK_COUNT);
+        const std::string k_nextn = llm_kv(LLM_KV_NEXTN_PREDICT_LAYERS);
+        const int mk_bc    = gguf_find_key(meta, k_bc.c_str());
+        const int mk_nextn = gguf_find_key(meta, k_nextn.c_str());
+        if (mk_bc < 0) {
+            throw std::runtime_error(format("PXA_MTP_HEAD_FILE: the model has no %s", k_bc.c_str()));
+        }
+        const uint32_t n_trunk = (uint32_t) pxa_kv_num(meta, mk_bc, 0);
+        if (mk_nextn >= 0 && pxa_kv_num(meta, mk_nextn, 0) > 0) {
+            LLAMA_LOG_WARN("%s: PXA_MTP_HEAD_FILE ignored: %s already carries a NextN head\n", __func__, fname.c_str());
+        } else {
+            ggml_context * hctx = nullptr;
+            struct gguf_init_params hparams_g = { /*.no_alloc = */ true, /*.ctx = */ &hctx };
+            struct gguf_context * hg = gguf_init_from_file(head_path, hparams_g);
+            if (!hg) {
+                throw std::runtime_error(format("PXA_MTP_HEAD_FILE: cannot read GGUF %s", head_path));
+            }
+            const int hk_arch = gguf_find_key(hg, "general.architecture");
+            const std::string harch = hk_arch >= 0 ? gguf_get_val_str(hg, hk_arch) : "";
+            const int hk_bc    = gguf_find_key(hg, k_bc.c_str());
+            const int hk_nextn = gguf_find_key(hg, k_nextn.c_str());
+            const uint32_t h_bc    = hk_bc    >= 0 ? (uint32_t) pxa_kv_num(hg, hk_bc, 0)    : 0;
+            const uint32_t h_nextn = hk_nextn >= 0 ? (uint32_t) pxa_kv_num(hg, hk_nextn, 0) : 0;
+            if (harch != arch_name || h_nextn == 0 || h_bc != n_trunk + h_nextn) {
+                gguf_free(hg);
+                throw std::runtime_error(format("PXA_MTP_HEAD_FILE: %s is not a NextN head for this model "
+                        "(arch %s vs %s, block_count %u vs trunk %u, nextn_predict_layers %u)",
+                        head_path, harch.c_str(), arch_name.c_str(), h_bc, n_trunk, h_nextn));
+            }
+
+            // metadata: every "<arch>." key of the head. Per-layer arrays must agree with the trunk on the
+            // trunk's layers (the head file carries the same model's metadata); scalars the trunk already
+            // has stay the trunk's; block_count / nextn_predict_layers come from the head.
+            const std::string prefix = arch_name + ".";
+            int n_kv_taken = 0;
+            for (int hk = 0; hk < gguf_get_n_kv(hg); ++hk) {
+                const char * key = gguf_get_key(hg, hk);
+                if (strncmp(key, prefix.c_str(), prefix.size()) != 0) {
+                    continue;
+                }
+                const int mk = gguf_find_key(meta, key);
+                const bool h_arr = gguf_get_kv_type(hg, hk) == GGUF_TYPE_ARRAY;
+                if (hk == hk_bc || hk == hk_nextn) {
+                    gguf_remove_key(meta, key);
+                    gguf_set_val_u32(meta, key, hk == hk_bc ? h_bc : h_nextn);
+                    n_kv_taken++;
+                    continue;
+                }
+                if (!h_arr) {
+                    if (mk < 0) {
+                        pxa_kv_copy_scalar(meta, hg, hk);   // only keys the trunk lacks; the trunk's own scalars stay
+                        n_kv_taken++;
+                    }
+                    continue;
+                }
+                const enum gguf_type at = gguf_get_arr_type(hg, hk);
+                const int an = gguf_get_arr_n(hg, hk);
+                if (at == GGUF_TYPE_STRING || an != (int) h_bc) {
+                    continue;   // not a per-layer array
+                }
+                if (mk >= 0) {
+                    if (!pxa_kv_is_num(meta, mk)) {
+                        continue;
+                    }
+                    const bool m_arr = gguf_get_kv_type(meta, mk) == GGUF_TYPE_ARRAY;
+                    if (m_arr && gguf_get_arr_n(meta, mk) != (int) n_trunk) {
+                        continue;
+                    }
+                    for (uint32_t il = 0; il < n_trunk; ++il) {
+                        const double a = pxa_kv_num(meta, mk, m_arr ? (int) il : 0);
+                        const double b = pxa_kv_num(hg, hk, (int) il);
+                        if (a != b) {
+                            gguf_free(hg);
+                            throw std::runtime_error(format("PXA_MTP_HEAD_FILE: %s[%u] = %g in the head but %g in the trunk "
+                                    "-- the head belongs to a different model", key, il, b, a));
+                        }
+                    }
+                    gguf_remove_key(meta, key);
+                }
+                gguf_set_arr_data(meta, key, at, gguf_get_arr_data(hg, hk), an);
+                n_kv_taken++;
+            }
+
+            // tensors: the tail block(s) only
+            const uint16_t fidx = (uint16_t) files.size();
+            files.emplace_back(new llama_file(head_path, "rb"));
+            contexts.emplace_back(hctx);
+            int n_added = 0;
+            size_t b_added = 0;
+            for (ggml_tensor * cur = ggml_get_first_tensor(hctx); cur; cur = ggml_get_next_tensor(hctx, cur)) {
+                uint32_t bl = 0;
+                if (!parse_tensor_layer_index(cur->name, bl) || bl < n_trunk) {
+                    continue;
+                }
+                weights.emplace_back(files.back().get(), fidx, cur->name, hg, cur);
+                n_added++;
+                b_added += ggml_nbytes(cur);
+            }
+            gguf_free(hg);
+            LLAMA_LOG_INFO("%s: PXA_MTP_HEAD_FILE: attached %d head tensors (%.1f MiB) and %d metadata keys from %s; "
+                           "block_count %u -> %u\n", __func__, n_added, b_added/1024.0/1024.0, n_kv_taken, head_path,
+                           n_trunk, h_bc);
+        }
     }
 
     n_kv      = gguf_get_n_kv(meta);
@@ -1279,6 +1472,52 @@ bool llama_model_loader::load_all_data(
             void * progress_callback_user_data) {
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    // PXA_LOAD_SKIP_DATA=1 (diagnostic, default off; --no-mmap loads only): every weight is
+    // allocated and placed exactly as a real load does (same buffers, same devices, same -ot and
+    // -ts), but no tensor data is read from the file; each tensor is zeroed instead. Everything
+    // that happens after the weights (KV, compute buffers, recurrent checkpoints, the MTP companion
+    // context, the CUDA pools grown by the warmup decode) then allocates exactly as it would, so a
+    // multi-card fit can be read in minutes instead of after a disk-bound read of the whole file.
+    // The model's outputs are meaningless; never use it for anything but a fit probe.
+    if (const char * e = getenv("PXA_LOAD_SKIP_DATA"); e != nullptr && atoi(e) != 0) {
+        if (use_mmap) {
+            static bool warned_mmap = false;
+            if (!warned_mmap) {
+                LLAMA_LOG_WARN("%s: PXA_LOAD_SKIP_DATA is set but mmap is in use - ignored; add --no-mmap for a fit probe\n", __func__);
+                warned_mmap = true;
+            }
+        } else {
+            static bool warned = false;
+            if (!warned) {
+                LLAMA_LOG_WARN("%s: PXA_LOAD_SKIP_DATA=1: FIT PROBE - no weight data is read, every weight is zero; "
+                               "outputs are meaningless\n", __func__);
+                warned = true;
+            }
+            constexpr size_t zchunk = 16u * 1024u * 1024u;
+            std::vector<uint8_t> zeros;
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+                if (cur->buffer == nullptr || get_weight(ggml_get_name(cur)) == nullptr) {
+                    continue;
+                }
+                const size_t n_size = ggml_nbytes(cur);
+                if (ggml_backend_buffer_is_host(cur->buffer)) {
+                    memset(cur->data, 0, n_size);
+                    continue;
+                }
+                if (zeros.empty()) {
+                    zeros.assign(zchunk, 0);
+                }
+                for (size_t off = 0; off < n_size; off += zchunk) {
+                    ggml_backend_tensor_set(cur, zeros.data(), off, std::min(zchunk, n_size - off));
+                }
+            }
+            if (progress_callback) {
+                return progress_callback(1.0f, progress_callback_user_data);
+            }
+            return true;
+        }
+    }
+
     // PXA_PARALLEL_LOAD: opt-in multi-threaded loader (port of parent-upstream PR#2057 + PR#2102).
     // Parallelism only exists for non-mmap loads: the upstream rewrite serializes every tensor
     // behind one mutex when mmap is in use (identical work, extra thread overhead), so with mmap
@@ -1380,6 +1619,15 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
+#if defined(_POSIX_MAPPED_FILES)
+                if (pxa_lazy_mapping && n_size >= ((size_t) 1 << 20)) {
+                    // the mapping was not populated (PXA_PLE_LAZY): ask for this tensor's range in one go, so the copy below
+                    // reads it with large sequential I/O instead of one small readahead window per page fault
+                    const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+                    uint8_t * a0 = (uint8_t *) ((uintptr_t) data & ~(uintptr_t) (pg - 1));
+                    posix_madvise(a0, (size_t) ((data + n_size) - a0), POSIX_MADV_WILLNEED);
+                }
+#endif
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {

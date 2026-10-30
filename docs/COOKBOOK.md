@@ -157,6 +157,51 @@ pair — which is exactly why the engine only fills the cells it has measured. M
 own cards. The published pair numbers and the protocol behind them are in
 [`bench/fair-battle.md`](../bench/fair-battle.md).
 
+## 2× Tesla P100 — Qwen3.6-35B-A3B (PXQN4 with its MTP head): what a bare launch does
+
+A bare `llama-server -m <Qwen3.6-35B-A3B-MTP-PXQN4>.gguf` on two P100 16 GB (layer split) now arms two things by itself: the P60 verify stack (eleven kernel
+levers that are off in the engine) and the file's own MTP head at depth 3 behind a 0.85 confidence floor. Before, it armed the n-gram stage only and ran every
+class at 74 t/s. Measured 2026-10-16 on one box, the bare launch against the plain decode of the same stack (125 t/s), greedy and sampled (temperature 1,
+top-k 40), 6 prompts x 256 tokens per class, sampled over three seeds, node-1 cores, box load 14-20 (not quiet):
+
+| launch (t/s, gain over plain) | prose | code | chat | sampled prose | sampled code | sampled chat |
+|---|---:|---:|---:|---:|---:|---:|
+| before: bare launch, n-gram chain, no stack | 74 (-41%) | 74 (-41%) | 74 (-41%) | 74 | 74 | 74 |
+| plain decode with the stack | 125 | 126 | 125 | 125 | 125 | 125 |
+| **now: bare launch (MTP depth 3, floor 0.85)** | **138 (+10%)** | **151 (+21%)** | **130 (+3.5%)** | 127 (+1%) | 149 (+19%) | 123 (-1.5%) |
+| conservative row `mtp:n_max=1,p_min=0.0` | 134 (+7%) | 148 (+18%) | 132 (+5%) | 126 (0%) | 138 (+10%) | 124 (-1%) |
+| old recipe row `mtp:n_max=4,p_min=0.5` + cutoff 0.5 | 127 (+1.5%) | 152 (+21%) | 122 (-3%) | 120 (-4%) | 142 (+14%) | 117 (-7%) |
+
+Depth 3 without the floor (the explicit `--spec-type mtp` row this replaces) reads -5 / +16 / -15% greedy: the verify of k tokens routes to about k times the
+experts, so a drafted token costs 3-5 ms and pays back only where the head is nearly always right. The floor keeps the chain at one token elsewhere.
+
+**Switches.** `PXA_AUTO_P60=0` stands the whole stack pick down (plain decode falls back to 73 t/s); any single `PXA_*` lever named in the environment is kept as
+named. `PXA_SPEC_AUTO_MOE_MTP=0` restores the n-gram chain; `--spec-type mtp:n_max=1,p_min=0.0` (or any explicit `--spec-type`) names the chain yourself and still
+gets the stack. `PXA_REFERENCE=1` or `PXA_ENHANCE=0` turn both picks off. The file `presets/pxa-p100-moe35b-mtp.env` carries the same levers for an older binary.
+The picks apply only to this cell: arch `qwen35moe`, PXQN4 tier, exactly two sm_60 cards, layer split.
+
+**Identity.** The stack is not bit-identical to the plain kernels at decode and verify widths, and is correct: determinism 12/12 on a short prompt and at 8k
+tokens (prose 12/12, code 6/6), needle at 28k passes twice, perplexity unchanged (ratio 1.0012 +- 0.0016). Against the stack off, mean KL divergence is 2.5e-3 at
+decode width and 2.4e-3 at the 2-token verify width (top-1 agreement 98.35% / 98.16%), the engine's own width noise with the stack off being 1.8e-3 (98.43%); the
+prefill path is bit-identical (KLD 0).
+
+| lever | acts at | what it does |
+|---|---|---|
+| `PXA_P60_MEGA` | decode (1 token) | persistent single-token layer halves (delta-net and MoE) |
+| `PXA_P60_MEGA_PXQN_T` | verify (2-6 tokens) | the multi-token PXQN4 MoE half (experts of the token set read once) |
+| `PXA_KQMMV_VW` | verify (2-5 columns) | verify-width Q8_0 GEMV |
+| `PXA_PXQN_VW` | verify (2-6 columns) | verify-width PXQN4 dense GEMV |
+| `PXA_P60_PRE_VW` | verify (2-5 tokens) | norm + RHT + input projections in one launch |
+| `PXA_PXQN_RBP` | decode (1 column) | persistent row-block PXQN4 GEMVs |
+| `PXA_PXQN_RMS_RHT_GB` | decode width | fused (add+)norm+RHT(+q8) sites, one in-kernel exchange |
+| `PXA_ARGMAX_VAL_MB` | decode and verify | output-head argmax over many blocks |
+| `PXA_DN_CONVFUSE` | decode (1 token) | fused delta-net conv cluster |
+| `PXA_FA_GQA_PACK=0` | decode | no GQA packing in the deep-fill decode attention |
+| `PXA_PXQN_QPN` | sm_70 verify only | inert on a P100 |
+
+The 27B dense file on two P100 (tensor split) keeps its default (depth 3, floor 0.8): re-measured on the same binary it reads +25 / +44 / +17% greedy over plain
+(38 t/s), the best of all depths and floors tried.
+
 ## 1× GTX 1080 Ti 11 GB — PXQ2 + int8 prefill tile
 
 ```bash
@@ -168,7 +213,7 @@ No env, no `-b`/`-ub`, no `--ctx-checkpoints`, no `PXA_AUTO_SPEC=0`. The engine 
 single 1080 Ti and fills `-b 2048 -ub 768 --ctx-checkpoints 0` — the measured cell — and declines
 to auto-arm speculation on this card. Pass any of those flags yourself and yours wins.
 
-⚠ **The auto-spec decline is the thing keeping this card alive, and it is worth knowing why.**
+Warning: **The auto-spec decline is the thing keeping this card alive, and it is worth knowing why.**
 The server auto-arms `--spec-type ngram-mod:n_max=4,n_min=2` for the `qwen35moe` family. That
 drafter's context asks for a 254 MiB per-step checkpoint buffer and falls back to a 62.8 MiB
 shadow, and 11 GiB has no room for it next to 9,907 MiB of weights, 160 MiB of KV and a 733 MiB
@@ -195,7 +240,7 @@ and the flags spelled out by hand.) Against
 a fresh parent-engine IQ2_KS build on the same card that is **+15.4%** cold prefill and
 **+11.1%** chat decode, with chat prefill a tie (see [`bench/fair-battle.md`](../bench/fair-battle.md)).
 
-⚠ **Those numbers depend on the sm_61 int8 prefill tile, which the default ENHANCE level arms
+Warning: **Those numbers depend on the sm_61 int8 prefill tile, which the default ENHANCE level arms
 for you** — there is nothing to export. Without the tile the same build does 573 / 424 t/s, less
 than half. Confirm it fired by looking for these two lines in the server log at startup; if they
 are absent you are not running the configuration these numbers describe:
@@ -209,7 +254,7 @@ PXA_PXQ_I8_BLUT: ON (N14 byte-keyed 2-bit W-decode, bit-identical)
 `PXA_ENHANCE=0`; it is a G3-class lever, see [`docs/lab/LEVERS.md`](lab/LEVERS.md) §4.
 `PXA_PXQ_I8_BLUT` is already on by default and bit-identical — you do not need to set it. Use
 `-ub 768`: a ub2048 compute buffer (~1.9 GiB) cannot allocate next to the resident model on 11 GB.
-⚠ PXQU-12 (11.6 GB) does NOT fit an 11 GB card — it's a 12 GB tier; PXQ2 is the 1080 Ti tier.
+Warning: PXQU-12 (11.6 GB) does NOT fit an 11 GB card — it's a 12 GB tier; PXQ2 is the 1080 Ti tier.
 
 ## stock-gguf-on-pxq-engine — a stock quant on this engine, no PXQ file required
 
@@ -247,8 +292,13 @@ Same command shape as PXQU-16 with `fusion2-35b-U12.gguf`. Measured on the 16 GB
 
 ## 1× P100 — Flash-Next Overdrive
 
-One Tesla P100 16 GB plus system RAM. This preset is for the Flash-Next PXQN file on **one** card.
-Splitting that model across cards did not go faster. Load the preset as the server's environment
+One Tesla P100 16 GB plus system RAM. The preset was measured on **one** card. Whether a second card
+helps depends on how the cards sit on the CPU sockets, so both numbers are here (2026-10-12, one session,
+same file, same switches and argv, prose / code decode t/s, median of 3): one P100 25.18 / 26.08; two
+P100 on the SAME NUMA node (PHB link) 39.22 / 40.48, so two cards were faster there. (The preset's own
+one-card measurement, 2026-10-09 on a quieter box, is 30.70 / 37.96.) Two cards on DIFFERENT sockets (an `SYS` link in
+`nvidia-smi topo -m`) are unmeasured: try one card first. PXA Control applies this preset by itself to
+the Flash-Next file and shows the cards' node and its CPU pool on the plan. Load the preset as the server's environment
 (`docker run --env-file`, or `set -a` and source it). It turns on the switches overdrive adds to the
 expert cache. The preset, and what it is measured at, are in
 [`docs/LEVERS.md`](LEVERS.md) under "Flash-Next Overdrive". Do not retype the switches by hand.
@@ -285,7 +335,7 @@ directory (`$PXA_CACHE_DIR`, else `$XDG_CACHE_HOME/pxa`, else `~/.cache/pxa`). T
 is used when a measurement says it is faster. An explicit `PXA_XCACHE_COUNTS` is never swapped.
 
 Measured 2026-10-09 on the 32 GB file, one P100 16 GB, the command line above, the Overdrive
-environment, adaptation off (`PXA_XCACHE_ADAPT=0`; the preset itself leaves adaptation on), greedy,
+environment, adaptation off (`PXA_XCACHE_ADAPT=0`, which the set the engine applies now uses too), greedy,
 512 tokens, three runs, two fresh boots each way. The one-minute load was under 4 and the card was
 idle at the start of each arm. Each arm named its own map with `PXA_XCACHE_COUNTS`. Pooled means,
 to two decimals: prose 28.50 curated / 32.59 learned, code 31.59 / 35.07.
@@ -315,13 +365,13 @@ The older seat recipe (`-ts 5079,12612,12612,11897 -c 150016`) left card 0 small
 **There is no export block any more.** As of 2026-09-03 the eleven levers this recipe used to
 export are armed by the default ENHANCE level, so the command line above IS the recipe:
 `PXA_FA_GQA_PACK=4` (deep-fill decode) and `PXA_MOE_DEVICE_MAP=1` (the
-device-side expert-routing table) arm on a multi-card sm_60 topology. **⚠ Neither carries a
+device-side expert-routing table) arm on a multi-card sm_60 topology. **Warning: Neither carries a
 verified *effect*:** `PXA_MOE_DEVICE_MAP`'s engagement and correctness ARE verified — its host
 cross-check rebuilds the expert map and compares it element-by-element, reporting 48/48 rows
 identical on the 4× P100 cell — but no A/B is on record for it; and `PXA_FA_GQA_PACK`'s effect
 does not reproduce on the reviewer cell. Do not quote a throughput number for either.
 
-⚠ **`PXA_FA_GQA_PACK` needs one more sentence, because it is the one lever here that is armed by
+Warning: **`PXA_FA_GQA_PACK` needs one more sentence, because it is the one lever here that is armed by
 default and is *not* bit-exact.** Its **engagement is now proven** — a firing counter on the 4× P100
 cell shows the default reaching the packed kernel (5 fires) while the `=0` control fires none. Its
 **fidelity has still never been measured by an instrument that worked**: one perplexity arm never
@@ -501,7 +551,7 @@ common_speculative_init: recurrent checkpoint budget: the chain asks to draft 64
 else. Read it before quoting a number. `PXA_CKPT_BUDGET=0` disables the clamp (and restores the
 out-of-memory); `PXA_CKPT_BUDGET_MARGIN_MB` (default 256) sets the headroom it keeps.
 
-⚠ **Do not reach for `--recurrent-ckpt-mode gpu-fallback` to buy a longer draft.** It avoids the
+Warning: **Do not reach for `--recurrent-ckpt-mode gpu-fallback` to buy a longer draft.** It avoids the
 preallocation and it is a measured loss: control-neutral, **prose halved**, and it **changes the greedy
 output**. See [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md).
 
@@ -551,7 +601,7 @@ Measured against `-sm layer` on the same pair, same window, np1 temperature 0:
 That last row is the interesting one: at a long draft length the PXA attention split produces the highest
 prose figure measured on this box by any of the three engines.
 
-⚠ **It is off by default, and the reason is specific rather than cautionary.** `PXA_ATTN_SPLIT_QWEN38`
+Warning: **It is off by default, and the reason is specific rather than cautionary.** `PXA_ATTN_SPLIT_QWEN38`
 admits `-sm attn` for **exactly one model shape** — `qwen35` carrying the Qwen3.8-27B hparam
 fingerprint. Its verify-batch fidelity **has now been measured** on a purpose-built instrument
 (`llama-perplexity` at the speculative verify width, 12 chunks × 512, stock PXQ4): mean KLD **0.000684**
@@ -563,12 +613,12 @@ opt into**, not a default, and the default waits on an instrument for the reject
 checkpoint-restore path. If the lever is on and your file is not the admitted one, the boot prints the
 fingerprint it observed against the one it wants, field by field, so it never fails silently.
 
-⚠ **`PXA_ALLOW_GRAPH_SPLIT_HYBRID` is not this, and you do not need it here.** It is a blanket bypass
+Warning: **`PXA_ALLOW_GRAPH_SPLIT_HYBRID` is not this, and you do not need it here.** It is a blanket bypass
 that admits four hybrid architectures alike, and its own lever row says it must not serve traffic.
 The arms in the table above were taken with it, because they predate the admission; the admission is
 what replaces it for this one model. `-sm graph` is **not** admitted by either and stays demoted.
 
-⚠ **One honest caveat about the lever itself:** the numbers above were taken through the blanket
+Warning: **One honest caveat about the lever itself:** the numbers above were taken through the blanket
 bypass, so the *admission path* has not yet been exercised end to end on a serving load. If the
 fingerprint were off by a field the lever would be a no-op — which is exactly why it prints the
 observed fingerprint against the wanted one when it declines, and prints the ADMITTED block when it

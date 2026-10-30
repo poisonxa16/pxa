@@ -7,9 +7,9 @@ number here exists without its bracket, and the bracket's drift is printed besid
 the **capture** it came from; the record for that capture holds the arm's command line, both md5s, the
 per-rep values and the drift.
 
-**Colour, and what it now decides.** 🟢 green = this engine holds the best valid cell, in one
-bracket, on stock files, against the competitor's current head. 🔴 red = a competitor's best valid
-cell beats ours. ⚪ grey = not measured, or the competitor has no artifact or cannot boot that
+**Colour, and what it now decides.** **ahead** (green) = this engine holds the best valid cell, in one
+bracket, on stock files, against the competitor's current head. **behind** (red) = a competitor's best valid
+cell beats ours. **n/a** (grey) = not measured, or the competitor has no artifact or cannot boot that
 configuration. A difference inside the noise band is a tie and is never written as a win.
 
 **A red cell is one of two things, and the difference is the whole point of this page.**
@@ -75,10 +75,10 @@ both competitor files on NVMe beside this engine's file.
 
 | class | this engine | mainline | parent engine | delta vs best rival | |
 |---|---|---|---|---|---|
-| prefill, 512 tok | **777.42** | 656.54 | 384.38 | +18.4% | 🟢 |
-| prefill, 3,121 tok | **1,332.21** | 891.87 | 447.29 | +49.4% | 🟢 |
-| prefill, 8,192 tok | **1,013.01** | 982.01 | 421.63 | +3.2% | 🟢 |
-| prefill, 20,801 tok | **946.96** | 929.03 | 371.82 | +1.9% | 🟢 |
+| prefill, 512 tok | **777.42** | 656.54 | 384.38 | +18.4% | ahead |
+| prefill, 3,121 tok | **1,332.21** | 891.87 | 447.29 | +49.4% | ahead |
+| prefill, 8,192 tok | **1,013.01** | 982.01 | 421.63 | +3.2% | ahead |
+| prefill, 20,801 tok | **946.96** | 929.03 | 371.82 | +1.9% | ahead |
 
 **Decode, at this release's new Volta default, same-bracket against the current head** — capture
 `pair-settle`, 2026-09-14, cards 2/4, bracket drift **−0.63%** (control 38.25 open / 38.01 close)
@@ -98,15 +98,15 @@ mark *settling*.
 
 | class | this engine | mainline | delta | |
 |---|---|---|---|---|
-| decode, control (speculation ceiling) | **147.89** | 125.07 | +18.2% | 🟢 |
-| decode, repetition | **76.65** | 60.54 | +26.6% | 🟢 |
-| decode, prose | **141.02** | 83.27 | +69.4% | 🟢 |
+| decode, control (speculation ceiling) | **147.89** | 125.07 | +18.2% | ahead |
+| decode, repetition | **76.65** | 60.54 | +26.6% | ahead |
+| decode, prose | **141.02** | 83.27 | +69.4% | ahead |
 
 Draft/accept per cell (this engine / mainline): control 1453/1453 (1.000) / 1493/1511 (0.988);
 repetition 833/928 (0.898) / 1276/1717 (0.743); prose 1225/1230 (0.996) / 1317/1764 (0.747). **Fidelity
 check**: this engine's greedy-decode sha matches its own **plain** arm (spec off, same bracket) on
 every class, every rep — the drafter is not changing the output, only the rate. The earlier pinned-build
-(`fdb2c11c70`, quadspec-w2) and cross-window current-head readings above are kept as history; this row
+(`fdb2c11c70`, capture A) and cross-window current-head readings above are kept as history; this row
 is now the one of record.
 
 The parent engine on this pair, from `lb-fresh-pair` at the parent engine's own explicit `mtp:n_max=3,p_min=0.0` arm
@@ -114,10 +114,10 @@ The parent engine on this pair, from `lb-fresh-pair` at the parent engine's own 
 43.64, repetition 52.43.
 
 **The new default's numbers survived a correctness fix, which is why they are quoted here rather than
-withdrawn.** The `quadspec-w2` arm was later found to be losing the last verified tokens of a capped
+withdrawn.** The capture A arm was later found to be losing the last verified tokens of a capped
 response — a budget accounting defect, not a wrong-token one. On the fixed build the same three
 classes re-measured at REPS 6 read **149.35 / 78.54 / 141.93** (control / repetition / prose), at or
-above every `quadspec-w2` bar, and the fix's own A-B-A deltas are smaller than the bracket's drift.
+above every capture A bar, and the fix's own A-B-A deltas are smaller than the bracket's drift.
 Nothing was inflating these numbers; tokens were being thrown away at the end.
 
 **Two honest limits on the prefill window.** (1) **The equal-codec neutraliser did not run on this
@@ -137,36 +137,36 @@ numbers is unproven and the direction is mixed; it is noted here rather than cor
 ## 4× P100 (sm_60) — Qwen3.8-27B
 
 **Prefill** — capture `lb4-quad-clean`, 2026-09-13, bracket drift **0.53%**. **Decode** — capture
-`lb-fresh-quad`, 2026-09-13, bracket drift **0.23%**, REPS 5. Cards 0/1/5/6, temp 0,
+capture D, 2026-09-13, bracket drift **0.23%**, REPS 5. Cards 0/1/5/6, temp 0,
 `-ngl 99 -c 32768 -np 1 -t 16 -fa on -ts 1,1,1,1` in both. This engine on the stock PXQ4
 (`11d6dd2a`); both competitors on the stock `UD-Q4_K_S` (`b3853896`), both at their **current heads**
 (mainline `4a899373`, parent engine `3bb386eb`), all three files on NVMe.
 
 | class | this engine | mainline | parent engine | delta vs best rival | |
 |---|---|---|---|---|---|
-| prefill, 3,121 tok | **470.54** | 212.83 | 114.78 | +121.1% | 🟢 |
-| prefill, 20,801 tok | **420.23** | 266.28 | 74.72 | +57.8% | 🟢 |
-| decode, control (speculation ceiling) ¹ | **95.57** | 46.17 | 18.83 | +107.0% | 🟢 |
-| decode, prose ³ | **39.26** | 14.33 | 14.06 | +174.0% | 🟢 |
-| decode, repetition ² | **21.25** | 19.54 | 18.43 | +8.8% | 🟢 |
+| prefill, 3,121 tok | **470.54** | 212.83 | 114.78 | +121.1% | ahead |
+| prefill, 20,801 tok | **420.23** | 266.28 | 74.72 | +57.8% | ahead |
+| decode, control (speculation ceiling) ¹ | **95.57** | 46.17 | 18.83 | +107.0% | ahead |
+| decode, prose ³ | **39.26** | 14.33 | 14.06 | +174.0% | ahead |
+| decode, repetition ² | **21.25** | 19.54 | 18.43 | +8.8% | ahead |
 
 ¹ **Cross-capture, and labelled as such.** This engine's control decode cell comes from capture
-`quad-default-pxq4` (2026-09-13, same four cards, same shape, REPS 3, bracket valid at −0.04% /
-−0.07%), at the arm named below; the competitor column beside it comes from `lb-fresh-quad` /
+capture B (2026-09-13, same four cards, same shape, REPS 3, bracket valid at −0.04% /
+−0.07%), at the arm named below; the competitor column beside it comes from capture D /
 `lb-shake1`. It is not one bracket with those, so the delta is read as direction and magnitude rather
 than to the decimal. The prefill and prose rows are single-bracket.
 
-² **decode, repetition is no longer cross-capture.** Capture `quadrep2-w1` (2026-09-14, same four
+² **decode, repetition is no longer cross-capture.** Capture capture C (2026-09-14, same four
 cards and shape, REPS 6, bracket valid at 0.34% against a 1.50% band) measures this engine's bare-boot
-arm and mainline armed at its own best (`ngram-mod,draft-mtp`, identical to `lb-fresh-quad`'s
+arm and mainline armed at its own best (`ngram-mod,draft-mtp`, identical to capture D's
 `ml-casc-l`) inside one continuous open/close bracket. The parent engine's column is unchanged, from its own separate
 capture.
 
-³ **decode, prose on the shipped default.** Same capture as ² (`quadrep2-w1`, REPS 6, bracket drift
+³ **decode, prose on the shipped default.** Same capture as ² (capture C, REPS 6, bracket drift
 0.34%): this engine 39.26 on the bare boot that arms the n-gram stage alone, mainline 14.33 at its own
-best in the same bracket. The 17.77 against 14.21 it replaces was `lb-fresh-quad`'s reading of the
+best in the same bracket. The 17.77 against 14.21 it replaces was capture D's reading of the
 cascade default this release retired on this card set. The parent-engine column stays from
-`lb-fresh-quad` (cross-capture; the parent engine was not re-run in `quadrep2-w1`).
+capture D (cross-capture; the parent engine was not re-run in capture C).
 
 **Which arm each cell is.** This engine's prefill cells are the **plain** arm — no speculation stage
 armed, `-b 2048 -ub 256` — its fastest valid configuration for that class; booted twice inside the
@@ -180,7 +180,7 @@ cells its bare command line, which beats its own MTP arm at these lengths.
 
 **Mainline is quoted at its best on the control class, which is the reading least flattering to this engine.**
 Its pinned-build cascade read **46.17** (`lb-shake1`); its current-head cascade reads **35.88**
-(`lb-fresh-quad`). The +107.0% above is against 46.17. Against the current head the same cell is
+(capture D). The +107.0% above is against 46.17. Against the current head the same cell is
 +166%. The larger competitor number is the one in the table.
 
 ### The two decode cells that moved, and why
@@ -192,9 +192,9 @@ engine on the same cards reads **95.57**. The MTP stage is also what costs prefi
 cascade reads ~48–50% of the unspeculated prefill ceiling at *both* 3,121 and 20,801 tokens, while an
 n-gram-only chain matches that ceiling almost exactly. One stage, two classes, the same answer.
 
-**decode, repetition is closed green at REPS 6, same bracket.** Capture `quadrep2-w1` (2026-09-14,
+**decode, repetition is closed green at REPS 6, same bracket.** Capture capture C (2026-09-14,
 drift 0.34% against a 1.50% band) re-ran the class at the REPS the class had already been shown to
-need, with mainline armed at its own best (`ngram-mod,draft-mtp`, identical to `lb-fresh-quad`'s
+need, with mainline armed at its own best (`ngram-mod,draft-mtp`, identical to capture D's
 `ml-casc-l`) inside the same open/close bracket as this engine's bare-boot arm: **21.25** against
 mainline's **19.54**, **+8.8%**. The earlier −10.3% at REPS 3 (17.60 vs 19.62) undercounted this
 engine's own rate as much as it overcounted the gap; nothing about the class needed a mechanism, only
@@ -243,7 +243,7 @@ than the one on two V100s. Narrowing it is a kernel question, and it is on the n
 
 Both prefill rows are a clean, same-bracket decomposition from `lb4-quad-clean`: no batch flags on
 either side, so the `-b`/`-ub` confound this page used to carry here is gone. **All three decode rows
-are now a clean, same-bracket decomposition too** — capture `quadrep2-w1` (2026-09-14, REPS 6, drift
+are now a clean, same-bracket decomposition too** — capture capture C (2026-09-14, REPS 6, drift
 0.34%) measured this engine's bare-boot arm (`ours-mlfile`, unforced, auto-arms the n-gram stage alone)
 and mainline's own best cascade (`ml-casc`, `ngram-mod,draft-mtp`) on `Q4_K_S` inside one continuous
 window, closing the same-bracket arm and the missing prose class both owed on the last cut. **This
@@ -303,9 +303,9 @@ repetition `w_code_edit` / `w_quote`, prose `w_prose` / `w_prose2`, control `w_r
 
 | class | this engine (slot0 / slot1 / sum) | mainline (slot0 / slot1 / sum) | delta on the sum | |
 |---|---|---|---|---|
-| decode, control | 104.91 / 117.17 / **222.10** | 90.14 / 88.81 / 178.64 | +24.3% | 🟢 |
-| decode, repetition | 63.84 / 80.43 / **144.17** | 53.91 / 57.92 / 115.55 | +24.8% | 🟢 |
-| decode, prose | 95.65 / 88.60 / **184.33** | 41.41 / 35.97 / 77.38 | +138.2% | 🟢 |
+| decode, control | 104.91 / 117.17 / **222.10** | 90.14 / 88.81 / 178.64 | +24.3% | ahead |
+| decode, repetition | 63.84 / 80.43 / **144.17** | 53.91 / 57.92 / 115.55 | +24.8% | ahead |
+| decode, prose | 95.65 / 88.60 / **184.33** | 41.41 / 35.97 / 77.38 | +138.2% | ahead |
 
 Draft/accept on the sum (this engine / mainline): control 2848/2848 (1.000) / 2993/3013 (0.993); repetition 2350/2644 (0.889) /
 2754/3865 (0.713); prose 2260/2387 (0.947) / 2383/4155 (0.574).
@@ -389,7 +389,7 @@ diagnosis that turned out to be wrong — see the section above), the pair's np1
 control/repetition/prose row against the current head, which was *settling* and is now closed green on
 all three classes in one same-bracket window (see the 2× V100 section above), the four-card decode
 repetition cell (17.60 vs 19.62, −10.3% at REPS 3, red-open on a class already known to need REPS 6 —
-capture `quadrep2-w1` re-ran it at REPS 6, same bracket, drift 0.34%, and it closed green at 21.25 vs
+capture capture C re-ran it at REPS 6, same bracket, drift 0.34%, and it closed green at 21.25 vs
 19.54, +8.8%), and the four-card equal-codec decomposition (was cross-capture with prose unmeasured —
 the same window filled control/repetition/prose same-bracket: this engine leads control and prose,
 trails repetition, and the row still never wins a cell — that owed same-bracket arm is the only thing
@@ -414,7 +414,7 @@ on this list.
   and repetition red), then on the swept checkpoint reserve (capture `np2split-w1`), where this engine
   leads all three np2 classes — control +24.3%, repetition +24.8%, prose +138.2% — and **both np2 open
   red cells are closed**. The `pair-settle` np2 rows are withdrawn — see the two-client section.
-- **Both open-red cells on the four-card quad are closed.** Capture `quadrep2-w1` (2026-09-14, REPS 6,
+- **Both open-red cells on the four-card quad are closed.** Capture capture C (2026-09-14, REPS 6,
   same bracket, drift 0.34%) fixed the armset bug that voided the previous attempt (a bracket control
   must run without speculation, or it logs drafts and the window has zero valid brackets) and re-ran
   decode, repetition at the REPS the class had already been shown to need: **21.25 against mainline's
@@ -451,7 +451,7 @@ on this list.
 - **The equal-codec decomposition is printed beside every headline it exists for**, and on four P100s
   this engine leads mainline at equal codec on two of three decode classes (control, prose) and trails
   on repetition — the row has never won a cell against the PXQ4 headline above and isn't meant to. Both
-  prefill rows and, as of `quadrep2-w1`, all three decode rows are now a clean, same-bracket
+  prefill rows and, as of capture C, all three decode rows are now a clean, same-bracket
   decomposition.
 
 ---

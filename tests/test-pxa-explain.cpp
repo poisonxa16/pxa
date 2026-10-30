@@ -18,6 +18,9 @@
 
 #include "pxa-explain.h"
 #include "pxa-registry.h"
+#ifdef _WIN32
+#include "pxa-win-compat.h"   // setenv, unsetenv
+#endif
 
 #include <cstdio>
 #include <cstdlib>

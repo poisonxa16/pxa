@@ -12,8 +12,15 @@
 //                    by the CUDA backend, compared with the same reference
 // Weights: random Q8_0 (up, gate) and Q4_0 (down), or with --gguf FILE --layer L the first --experts experts of a real file's layer
 // (any type the CPU can read, PXQN included when libggml-pxqn.so is found), so the closed CPU kernels run too.
+// --slow-wait (with --gpu): the card's slow-wait line (PXA_XCACHE_ASYNC_TIMEOUT_S) set to 1 us, so nearly every wait outlasts it: the
+// outputs must still equal the reference byte for byte (a slow host worker changes the time, never the rows; until 2026-10-26 the
+// wait gave up there and wrote zero rows) and the slow waits must be counted.
+// --expect-fatal (N1, no GPU): a death test. A forked child asks the host worker for a width nobody registered; the worker must abort
+// the process (GGML_ABORT, SIGABRT) instead of publishing zero rows as done. Linux/macOS only (fork); skipped on Windows.
+// --gateless: a gate-less stack (Nemotron-H MoE: down(relu(up x)^2), no gate tensor; --relu for down(relu(up x))), the reference
+// being build_experts' gate-less branch (mul_mat_id, relu, sqr, mul_mat_id); with --gguf the file's layer must have no gate tensor.
 //
-// build: tests/run-xcache-async-test.sh [--gpu N] [--gguf FILE --layer L]
+// build: ctest (test-pxa-xcache-async, test-pxa-xcache-async-clamp: host driver) or tests/run-xcache-async-test.sh [--gpu N] [--gguf FILE --layer L] [--clamp L]
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -23,6 +30,18 @@
 #include "ggml-cuda.h"
 #endif
 
+#ifdef _WIN32
+#include <malloc.h>
+// MSVC: no aligned_alloc (its free() cannot release aligned blocks) and no fseeko
+static void * test_aligned_alloc(size_t a, size_t n) { return _aligned_malloc(n, a); }
+static void   test_aligned_free(void * p) { _aligned_free(p); }
+#define fseeko _fseeki64
+typedef long long test_off_t;
+#else
+static void * test_aligned_alloc(size_t a, size_t n) { return aligned_alloc(a, n); }
+static void   test_aligned_free(void * p) { free(p); }
+typedef off_t test_off_t;
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -33,8 +52,18 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifndef _WIN32                                           // --expect-fatal: fork / waitpid / SIGABRT
+#define stack_t pxa_posix_stack_t                         // <signal.h>'s stack_t, renamed: this file has its own stack_t
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
+#undef stack_t
+#endif
 
 static int g_fail = 0;
+static bool g_slow_wait = false;   // --slow-wait
+// --clamp L (PXA_XCACHE_ASYNC_CLAMP): the DeepSeek-V4 / GLM-5.x clamped SwiGLU chain instead of the fused up/gate + SiLU one
+static float g_clamp = 0.0f;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); ++g_fail; } } while (0)
 
 // ---- host slots: plain aligned memory behind the same struct the CUDA backend fills ----------------------------------------------
@@ -43,7 +72,7 @@ static struct ggml_cuda_cold_slot * host_slot_new(int dev, int n_embd, int n_use
     auto up = [&](size_t n) { return (n + line - 1)/line*line; };
     const size_t o_ids = 2*line, o_cur = o_ids + up((size_t) n_used*n_tok_max*4), o_out = o_cur + up((size_t) n_embd*n_tok_max*4);
     const size_t total = o_out + up((size_t) n_embd*n_used*n_tok_max*4);
-    char * h = (char *) aligned_alloc(4096, (total + 4095)/4096*4096);
+    char * h = (char *) test_aligned_alloc(4096, (total + 4095)/4096*4096);
     memset(h, 0, total);
     auto * s = new ggml_cuda_cold_slot();
     memset(s, 0, sizeof(*s));
@@ -55,7 +84,7 @@ static struct ggml_cuda_cold_slot * host_slot_new(int dev, int n_embd, int n_use
     s->h_out = s->d_out = (float *) (h + o_out);
     return s;
 }
-static void host_slot_free(struct ggml_cuda_cold_slot * s) { if (s) { free((void *) s->h_req); delete s; } }
+static void host_slot_free(struct ggml_cuda_cold_slot * s) { if (s) { test_aligned_free((void *) s->h_req); delete s; } }
 
 // ---- the cold stack the CPU reads ---------------------------------------------------------------------------------------------------
 struct stack_t {
@@ -63,6 +92,7 @@ struct stack_t {
     ggml_backend_buffer_t buf = nullptr;
     ggml_tensor *up = nullptr, *gate = nullptr, *down = nullptr, *up_gate = nullptr;
     bool merged = false;   // the layer's up/gate are ONE stack (rows [0, n_ff) gate, [n_ff, 2 n_ff) up): up_gate is used, up / gate are null
+    int gateless = 0;      // 0: gated; PXA_XCA_GATELESS_RELU_SQR / _RELU: no gate stack (gate == nullptr)
     int n_embd = 0, n_ff = 0, n_slots = 0;
 };
 
@@ -82,7 +112,10 @@ static bool make_synthetic_stack(stack_t & st, int n_embd, int n_ff, int n_slots
     st.n_embd = n_embd; st.n_ff = n_ff; st.n_slots = n_slots; st.merged = merged;
     ggml_init_params ip = { 16*ggml_tensor_overhead(), nullptr, true };
     st.ctx = ggml_init(ip);
-    if (merged) {
+    if (st.gateless) {
+        st.up = ggml_new_tensor_3d(st.ctx, GGML_TYPE_Q8_0, n_embd, n_ff, n_slots);
+        ggml_set_name(st.up, "t.ffn_up_exps.xc");
+    } else if (merged) {
         st.up_gate = ggml_new_tensor_3d(st.ctx, GGML_TYPE_Q8_0, n_embd, 2*n_ff, n_slots);
         ggml_set_name(st.up_gate, "t.ffn_up_gate_exps.xc");
     } else {
@@ -94,7 +127,9 @@ static bool make_synthetic_stack(stack_t & st, int n_embd, int n_ff, int n_slots
     ggml_set_name(st.down, "t.ffn_down_exps.xc");
     st.buf = ggml_backend_alloc_ctx_tensors_from_buft(st.ctx, ggml_backend_cpu_buffer_type());
     if (!st.buf) return false;
-    if (merged) {
+    if (st.gateless) {
+        quantize_rows(GGML_TYPE_Q8_0, st.up, rng, 0.05f);
+    } else if (merged) {
         quantize_rows(GGML_TYPE_Q8_0, st.up_gate, rng, 0.05f);
     } else {
         quantize_rows(GGML_TYPE_Q8_0, st.up, rng, 0.05f);
@@ -117,6 +152,10 @@ static bool make_real_stack(stack_t & st, const char * path, int layer, int n_ex
     for (int i = 0; i < 3; ++i) {
         snprintf(nm, sizeof(nm), "blk.%d.%s.weight", layer, kinds[i]);
         m[i] = ggml_get_tensor(meta, nm);
+        if (i == 1 && st.gateless) {
+            if (m[i]) { fprintf(stderr, "--gateless: layer %d has a gate tensor\n", layer); gguf_free(g); return false; }
+            continue;
+        }
         if (!m[i]) { fprintf(stderr, "tensor %s not in the file\n", nm); gguf_free(g); return false; }
         if (m[i]->ne[2] < n_exp) { fprintf(stderr, "%s has %lld experts\n", nm, (long long) m[i]->ne[2]); gguf_free(g); return false; }
     }
@@ -125,6 +164,7 @@ static bool make_real_stack(stack_t & st, const char * path, int layer, int n_ex
     st.ctx = ggml_init(ip);
     ggml_tensor ** dst[3] = { &st.up, &st.gate, &st.down };
     for (int i = 0; i < 3; ++i) {
+        if (!m[i]) continue;
         *dst[i] = ggml_new_tensor_3d(st.ctx, m[i]->type, m[i]->ne[0], m[i]->ne[1], n_exp);
         for (int d = 1; d < 3; ++d) (*dst[i])->nb[d] = m[i]->nb[d];
         snprintf(nm, sizeof(nm), "blk.%d.%s.weight.xc", layer, kinds[i]);
@@ -135,16 +175,17 @@ static bool make_real_stack(stack_t & st, const char * path, int layer, int n_ex
     FILE * f = fopen(path, "rb");
     bool ok = f != nullptr;
     for (int i = 0; ok && i < 3; ++i) {
+        if (!m[i]) continue;
         snprintf(nm, sizeof(nm), "blk.%d.%s.weight", layer, kinds[i]);
         const size_t off = data_off + gguf_get_tensor_offset(g, gguf_find_tensor(g, nm));
         const size_t n = (size_t) m[i]->nb[2]*n_exp;
         std::vector<uint8_t> buf(n);
-        ok = fseeko(f, (off_t) off, SEEK_SET) == 0 && fread(buf.data(), 1, n, f) == n;
+        ok = fseeko(f, (test_off_t) off, SEEK_SET) == 0 && fread(buf.data(), 1, n, f) == n;
         if (ok) ggml_backend_tensor_set(*dst[i], buf.data(), 0, n);
     }
     if (f) fclose(f);
     printf("real stack: layer %d, %d experts, n_embd %d n_ff %d, types up %s gate %s down %s\n", layer, n_exp, st.n_embd, st.n_ff,
-           ggml_type_name(st.up->type), ggml_type_name(st.gate->type), ggml_type_name(st.down->type));
+           ggml_type_name(st.up->type), st.gate ? ggml_type_name(st.gate->type) : "(none)", ggml_type_name(st.down->type));
     gguf_free(g);
     return ok;
 }
@@ -165,7 +206,18 @@ static void make_ref(ref_t & r, const stack_t & st, int n_used, int n_tok, int n
     r.cur = ggml_new_tensor_3d(r.ctx, GGML_TYPE_F32, st.n_embd, 1, n_tok);
     r.ids = ggml_new_tensor_2d(r.ctx, GGML_TYPE_I32, n_used, n_tok);
     ggml_tensor * par = nullptr;
-    if (getenv("XCA_LITERAL") && !st.merged) {
+    if (st.gateless) {
+        // build_experts' gate-less branch (llm_build_moe_ffn): mul_mat_id(up), relu, sqr
+        par = ggml_relu(r.ctx, ggml_mul_mat_id(r.ctx, st.up, r.cur, r.ids));
+        if (st.gateless == PXA_XCA_GATELESS_RELU_SQR) par = ggml_sqr(r.ctx, par);
+    } else if (g_clamp > 0.0f) {
+        // build_experts' dsv4_clamp branch (llama-build-context.cpp), node for node
+        ggml_tensor * up   = ggml_mul_mat_id(r.ctx, st.up,   r.cur, r.ids);
+        ggml_tensor * gate = ggml_mul_mat_id(r.ctx, st.gate, r.cur, r.ids);
+        up   = ggml_clamp(r.ctx, up,   -g_clamp, g_clamp);
+        gate = ggml_clamp(r.ctx, gate, -INFINITY, g_clamp);
+        par  = ggml_swiglu_split(r.ctx, gate, up);
+    } else if (getenv("XCA_LITERAL") && !st.merged) {
         // the literal else-branch of llm_build_moe_ffn's build_experts (separate up / gate / unary nodes), not through ggml_moe_up_gate
         ggml_tensor * up   = ggml_mul_mat_id(r.ctx, st.up,   r.cur, r.ids);
         ggml_tensor * gate = ggml_mul_mat_id(r.ctx, st.gate, r.cur, r.ids);
@@ -207,7 +259,7 @@ static int run_host(pxa_xca_core & core, const stack_t & st, int n_used, int n_c
         CHECK(s != nullptr, "slot %d", l);
         if (!s) return 1;
         slots.push_back(s);
-        for (int w = 1; w <= max_tok; ++w) CHECK(core.add_width(s, w, st.up, st.gate, st.up_gate, st.down, (int) GGML_UNARY_OP_SILU, nth), "add_width %d", w);
+        for (int w = 1; w <= max_tok; ++w) CHECK(core.add_width(s, w, st.up, st.gate, st.up_gate, st.down, st.gateless ? st.gateless : (int) GGML_UNARY_OP_SILU, nth, g_clamp), "add_width %d", w);
         if (l == 0) s0 = s;
     }
     (void) s0;
@@ -240,7 +292,8 @@ static int run_host(pxa_xca_core & core, const stack_t & st, int n_used, int n_c
             std::atomic_thread_fence(std::memory_order_acquire);
             ++n_ran;
         } else { *s->h_done = q; ++n_skipped; continue; }
-        // reference
+        // reference (XCA_NO_REF: timing runs only the worker)
+        if (getenv("XCA_NO_REF")) continue;
         ref_t & r = refs[w];
         memcpy(r.ids->data, ids.data(), ids.size()*4);
         memcpy(r.cur->data, cur.data(), cur.size()*4);
@@ -258,9 +311,61 @@ static int run_host(pxa_xca_core & core, const stack_t & st, int n_used, int n_c
     printf("host driver: %d cases (%d with cold experts, %d without) over %d layers, widths 1..%d, worker %d CPU threads, reference %d: %d mismatching outputs\n",
            n_cases, n_ran, n_skipped, n_layers, max_tok, nth, ref_nth, n_bad);
     printf("  (%zu non-zero output floats compared)\n", n_nonzero);
-    CHECK(n_nonzero > 1000, "the compared outputs are all zero");
+    CHECK(getenv("XCA_NO_REF") || n_nonzero > 1000, "the compared outputs are all zero");
     CHECK(n_bad == 0, "%d outputs differ from the plain CPU graph", n_bad);
     return n_bad;
+}
+
+// ---- --expect-fatal (N1): a request for a width nobody registered must stop the process, never publish zero rows ------------------
+// A forked child registers width 1 only, then submits a width-2 request with cold experts and waits on the done flag. The worker must
+// abort (SIGABRT, GGML_ABORT) before it writes "done"; a child that sees done (zero rows handed to the card) or a timeout exits non-zero
+// by itself. The parent checks the signal and the abort message on the child's stderr.
+static int run_expect_fatal(const stack_t & st, int n_used, int nth) {
+#ifdef _WIN32
+    (void) st; (void) n_used; (void) nth;
+    printf("--expect-fatal: needs fork(), skipped on Windows\n");
+    return 0;
+#else
+    int pfd[2];
+    if (pipe(pfd) != 0) { CHECK(false, "pipe"); return 1; }
+    fflush(stdout); fflush(stderr);
+    const pid_t pid = fork();
+    if (pid < 0) { CHECK(false, "fork"); return 1; }
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], 2);
+        setenv("GGML_NO_BACKTRACE", "1", 1);               // ggml_abort: no gdb fork in the child
+        pxa_xca_core core(host_slot_new, host_slot_free);
+        ggml_cuda_cold_slot * s = core.slot(0, 0, st.n_embd, n_used, 8);
+        if (!s || !core.add_width(s, 1, st.up, st.gate, st.up_gate, st.down, st.gateless ? st.gateless : (int) GGML_UNARY_OP_SILU, nth, g_clamp)) _exit(5);
+        std::mt19937 rng(7);
+        std::vector<int32_t> ids; std::vector<float> cur;
+        make_case(rng, st.n_embd, n_used, 2, st.n_slots, ids, cur, 1.0f);
+        memcpy(s->h_ids, ids.data(), ids.size()*4);
+        memcpy(s->h_cur, cur.data(), cur.size()*4);
+        std::atomic_thread_fence(std::memory_order_release);
+        *s->h_req = (uint64_t) 1 | ((uint64_t) 2 << 32);   // width 2: not registered
+        const auto t0 = std::chrono::steady_clock::now();
+        while (*s->h_done != 1u) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) { fprintf(stderr, "child: no abort and no done in 20 s\n"); _exit(4); }
+        }
+        fprintf(stderr, "child: the worker published done for an unregistered width (zero rows reach the card)\n");
+        _exit(3);
+    }
+    close(pfd[1]);
+    std::string err;
+    char buf[4096];
+    for (ssize_t n; (n = read(pfd[0], buf, sizeof(buf))) > 0; ) err.append(buf, (size_t) n);
+    close(pfd[0]);
+    int wst = 0;
+    waitpid(pid, &wst, 0);
+    printf("--expect-fatal: child %s %d; its stderr:\n%s", WIFSIGNALED(wst) ? "killed by signal" : "exited with code",
+           WIFSIGNALED(wst) ? WTERMSIG(wst) : WEXITSTATUS(wst), err.c_str());
+    const bool aborted = WIFSIGNALED(wst) && WTERMSIG(wst) == SIGABRT;
+    CHECK(aborted, "--expect-fatal: an unregistered width did not abort the process");
+    CHECK(err.find("no cold sub-graph registered for width 2") != std::string::npos, "--expect-fatal: the abort message is missing");
+    return aborted ? 0 : 1;
+#endif
 }
 
 #ifdef GGML_USE_CUDA
@@ -273,7 +378,7 @@ static int run_gpu(pxa_xca_core & core, const stack_t & st, int n_used, int n_ca
     ggml_cuda_cold_slot * slot = core.slot(0, dev, st.n_embd, n_used, max_tok);
     CHECK(slot != nullptr, "cuda slot");
     if (!slot) return 1;
-    for (int w = 1; w <= max_tok; ++w) CHECK(core.add_width(slot, w, st.up, st.gate, st.up_gate, st.down, (int) GGML_UNARY_OP_SILU, nth), "add_width %d", w);
+    for (int w = 1; w <= max_tok; ++w) CHECK(core.add_width(slot, w, st.up, st.gate, st.up_gate, st.down, st.gateless ? st.gateless : (int) GGML_UNARY_OP_SILU, nth, g_clamp), "add_width %d", w);
     std::vector<ref_t> refs(max_tok + 1);
     for (int w = 1; w <= max_tok; ++w) make_ref(refs[w], st, n_used, w, nth);
 
@@ -342,11 +447,13 @@ static int run_gpu(pxa_xca_core & core, const stack_t & st, int n_used, int n_ca
     unsigned long long stt[GGML_CUDA_COLD_STAT_N] = {};
     if (ggml_backend_cuda_cold_slot_stats(slot, stt)) {
         const double khz = ggml_backend_cuda_cold_clock_khz(dev);
-        printf("gpu counters: %llu waits, %llu no-cold submits, %llu timeouts, wait %.1f us avg / %.1f us max\n", stt[GGML_CUDA_COLD_STAT_WAITS],
+        printf("gpu counters: %llu waits, %llu no-cold submits, %llu slow waits, wait %.1f us avg / %.1f us max\n", stt[GGML_CUDA_COLD_STAT_WAITS],
                stt[GGML_CUDA_COLD_STAT_SKIPPED], stt[GGML_CUDA_COLD_STAT_TIMEOUTS],
                stt[GGML_CUDA_COLD_STAT_WAITS] ? (double) stt[GGML_CUDA_COLD_STAT_WAIT_CLK]*1000.0/khz/stt[GGML_CUDA_COLD_STAT_WAITS] : 0.0,
                (double) stt[GGML_CUDA_COLD_STAT_MAX_CLK]*1000.0/khz);
-        CHECK(stt[GGML_CUDA_COLD_STAT_TIMEOUTS] == 0, "wait timeouts");
+        // TIMEOUTS = slow waits (waited out). --slow-wait: the 1 us line makes them happen and the rows above must still be exact
+        if (g_slow_wait) CHECK(stt[GGML_CUDA_COLD_STAT_TIMEOUTS] > 0, "--slow-wait: no wait outlasted the 1 us line (nothing exercised)");
+        else             CHECK(stt[GGML_CUDA_COLD_STAT_TIMEOUTS] == 0, "slow waits (> PXA_XCACHE_ASYNC_TIMEOUT_S) in a unit test");
         CHECK(stt[GGML_CUDA_COLD_STAT_WAITS] == (unsigned long long) n_cases, "wait count %llu != %d", stt[GGML_CUDA_COLD_STAT_WAITS], n_cases);
         CHECK(stt[GGML_CUDA_COLD_STAT_SKIPPED] == (unsigned long long) n_skipped, "skipped %llu != %d", stt[GGML_CUDA_COLD_STAT_SKIPPED], n_skipped);
     }
@@ -359,6 +466,8 @@ static int run_gpu(pxa_xca_core & core, const stack_t & st, int n_used, int n_ca
 
 int main(int argc, char ** argv) {
     bool merged = false;
+    bool expect_fatal = false;   // --expect-fatal (N1)
+    int gateless = 0;
     int ref_nth = 0;
     int gpu = -1, n_cases = 600, nth = 4, n_layers = 3, real_layer = -1, real_experts = 24, n_used = 10;
     const char * gguf_path = nullptr;
@@ -372,24 +481,43 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--experts") && i + 1 < argc) real_experts = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--used") && i + 1 < argc) n_used = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--merged")) merged = true;
+        else if (!strcmp(argv[i], "--clamp") && i + 1 < argc) g_clamp = (float) atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gateless")) gateless = PXA_XCA_GATELESS_RELU_SQR;
+        else if (!strcmp(argv[i], "--relu")) gateless = PXA_XCA_GATELESS_RELU;
         else if (!strcmp(argv[i], "--ref-threads") && i + 1 < argc) ref_nth = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--gpu N] [--cases N] [--threads N] [--layers N] [--gguf FILE --layer L [--experts N] [--used K]] [--merged]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--slow-wait")) g_slow_wait = true;
+        else if (!strcmp(argv[i], "--expect-fatal")) expect_fatal = true;
+        else { fprintf(stderr, "usage: %s [--gpu N] [--cases N] [--threads N] [--layers N] [--gguf FILE --layer L [--experts N] [--used K]] [--merged] [--clamp L] [--gateless|--relu] [--slow-wait] [--expect-fatal]\n", argv[0]); return 2; }
+    }
+    if (g_clamp > 0.0f && merged) { fprintf(stderr, "--clamp needs separate up / gate stacks (no --merged)\n"); return 2; }
+    if (g_clamp > 0.0f && gateless) { fprintf(stderr, "--clamp needs a gate stack (no --gateless / --relu)\n"); return 2; }
+    if (g_slow_wait) {                                    // read once, at the first wait launch
+#ifdef _WIN32
+        _putenv_s("PXA_XCACHE_ASYNC_TIMEOUT_S", "0.000001");
+#else
+        setenv("PXA_XCACHE_ASYNC_TIMEOUT_S", "0.000001", 1);
+#endif
     }
     std::mt19937 rng(42);
     stack_t st;
+    st.gateless = gateless;
     if (gguf_path) {
         if (!make_real_stack(st, gguf_path, real_layer < 0 ? 3 : real_layer, real_experts)) { fprintf(stderr, "real stack failed\n"); return 1; }
         n_used = std::min(n_used, st.n_slots);
     } else if (!make_synthetic_stack(st, 512, 256, 64, rng, merged)) { fprintf(stderr, "stack alloc failed\n"); return 1; }
     int rc = 0;
-    if (gpu < 0) {
+    if (expect_fatal) {
+        rc = run_expect_fatal(st, n_used, nth);
+    } else if (gpu < 0) {
         pxa_xca_core core(host_slot_new, host_slot_free);
         rc = run_host(core, st, n_used, n_cases, nth, n_layers, ref_nth > 0 ? ref_nth : nth);
         core.stop();
         const pxa_xca_totals t = core.totals(false);
-        printf("worker: %llu requests, %.0f us avg per request, %llu us max, %llu errors\n", (unsigned long long) t.requests,
-               (double) t.compute_us/std::max<uint64_t>(1, t.requests), (unsigned long long) t.max_us, (unsigned long long) t.errors);
+        printf("worker: %llu requests (%llu on the lean pool), %.0f us avg per request, %llu us max, %llu errors\n", (unsigned long long) t.requests,
+               (unsigned long long) t.lean, (double) t.compute_us/std::max<uint64_t>(1, t.requests), (unsigned long long) t.max_us, (unsigned long long) t.errors);
         CHECK(t.errors == 0, "worker errors");
+        if (getenv("XCA_EXPECT_LEAN")) CHECK(t.lean == t.requests && t.requests > 0, "XCA_EXPECT_LEAN: %llu of %llu requests on the lean pool",
+                                             (unsigned long long) t.lean, (unsigned long long) t.requests);
     } else {
 #ifdef GGML_USE_CUDA
         pxa_xca_core core(ggml_backend_cuda_cold_slot_new, ggml_backend_cuda_cold_slot_free, nullptr);

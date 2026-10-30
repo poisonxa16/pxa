@@ -5843,6 +5843,261 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     *s = sumf;
 }
 
+// PXA (2026-10-16): same-order tile of ggml_vec_dot_q8_0_q8_0 for the CPU MUL_MAT_ID.
+// Computes dst[c][r] = vec_dot_q8_0_q8_0(n, x_r, y_c) for r < nr, c < nc, where x_r = vx + r*bx (weight rows) and
+// y_c = vy[c] (quantized activation rows). Each output keeps its own accumulator and sees exactly the vec_dot
+// sequence: per block d = fp32(x.d)*fp32(y.d) (one float multiply), q = cvt(madd(maddubs(|x|, sign(y,x)), 1)),
+// acc = fma(d, q, acc), then the same hsum_float_8. The integer lane sums are exact (no int16 saturation for
+// q8_0 values in [-127,127]), so every output is bitwise equal to the per-pair vec_dot. Only loads, the |x| sign
+// and the scale conversions are shared across the tile. Non-AVX2 builds fall back to the per-pair vec_dot.
+#if defined(__AVX2__)
+#define PXA_Q8T_KERNEL(R, C) \
+static void pxa_q8_0_tile_##R##x##C(int nb, const block_q8_0 * restrict const * xr, const block_q8_0 * restrict const * yc, \
+                                     float * restrict const * dst, int r0) { \
+    __m256 acc[R][C]; \
+    for (int r = 0; r < R; ++r) for (int c = 0; c < C; ++c) acc[r][c] = _mm256_setzero_ps(); \
+    for (int ib = 0; ib < nb; ++ib) { \
+        float dy[C]; \
+        for (int c = 0; c < C; ++c) dy[c] = GGML_FP16_TO_FP32(yc[c][ib].d); \
+        for (int r = 0; r < R; ++r) { \
+            const float dx = GGML_FP16_TO_FP32(xr[r][ib].d); \
+            const __m256i qx = _mm256_loadu_si256((const __m256i *) xr[r][ib].qs); \
+            const __m256i ax = _mm256_sign_epi8(qx, qx); \
+            for (int c = 0; c < C; ++c) { \
+                const __m256 d  = _mm256_set1_ps(dx * dy[c]); \
+                const __m256i qy = _mm256_loadu_si256((const __m256i *) yc[c][ib].qs); \
+                const __m256i sy = _mm256_sign_epi8(qy, qx); \
+                const __m256 q  = mul_sum_us8_pairs_float(ax, sy); \
+                acc[r][c] = _mm256_fmadd_ps(d, q, acc[r][c]); \
+            } \
+        } \
+    } \
+    for (int c = 0; c < C; ++c) for (int r = 0; r < R; ++r) dst[c][r0 + r] = hsum_float_8(acc[r][c]); \
+}
+PXA_Q8T_KERNEL(2, 4)
+PXA_Q8T_KERNEL(2, 3)
+PXA_Q8T_KERNEL(2, 2)
+PXA_Q8T_KERNEL(2, 1)
+PXA_Q8T_KERNEL(1, 4)
+PXA_Q8T_KERNEL(1, 3)
+PXA_Q8T_KERNEL(1, 2)
+PXA_Q8T_KERNEL(1, 1)
+#undef PXA_Q8T_KERNEL
+#endif
+
+void ggml_pxa_vec_dot_q8_0_q8_0_tile(int n, int nr, int nc, const void * restrict vx, size_t bx,
+                                     const void * restrict const * vy, float * restrict const * dst, int r0) {
+    assert(n % QK8_0 == 0);
+    assert(nr >= 1 && nr <= 2 && nc >= 1 && nc <= 4);
+#if defined(__AVX2__)
+    const int nb = n / QK8_0;
+    const block_q8_0 * xr[2] = { (const block_q8_0 *) vx, (const block_q8_0 *) ((const char *) vx + (nr > 1 ? bx : 0)) };
+    const block_q8_0 * yc[4];
+    for (int c = 0; c < 4; ++c) yc[c] = (const block_q8_0 *) vy[c < nc ? c : 0];
+    if (nr == 2) {
+        switch (nc) {
+            case 4: pxa_q8_0_tile_2x4(nb, xr, yc, dst, r0); break;
+            case 3: pxa_q8_0_tile_2x3(nb, xr, yc, dst, r0); break;
+            case 2: pxa_q8_0_tile_2x2(nb, xr, yc, dst, r0); break;
+            default: pxa_q8_0_tile_2x1(nb, xr, yc, dst, r0); break;
+        }
+    } else {
+        switch (nc) {
+            case 4: pxa_q8_0_tile_1x4(nb, xr, yc, dst, r0); break;
+            case 3: pxa_q8_0_tile_1x3(nb, xr, yc, dst, r0); break;
+            case 2: pxa_q8_0_tile_1x2(nb, xr, yc, dst, r0); break;
+            default: pxa_q8_0_tile_1x1(nb, xr, yc, dst, r0); break;
+        }
+    }
+#else
+    for (int c = 0; c < nc; ++c) {
+        for (int r = 0; r < nr; ++r) {
+            ggml_vec_dot_q8_0_q8_0(n, &dst[c][r0 + r], 0, (const char *) vx + r*bx, 0, vy[c], 0, 1);
+        }
+    }
+#endif
+}
+
+int ggml_pxa_vec_dot_q8_0_q8_0_tile_native(void) {
+#if defined(__AVX2__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+// PXA (2026-10-16): same-order column tiles of ggml_vec_dot_q4_K_q8_K and ggml_vec_dot_q6_K_q8_K
+// (AVX2) for the CPU MUL_MAT_ID. One weight row against up to 4 activation columns: the row's nibble unpack, 6-bit
+// scale/min unpack and scale shuffles are done once per block and shared; every column keeps its own accumulators
+// and gets exactly the vec_dot sequence (per block: the same float d / dmin products, the same int32 lane sums --
+// exact, no int16 saturation for these value ranges -- the same fma into acc / acc_m in block order, the same final
+// reductions). Every output is bitwise equal to the per-pair vec_dot. Non-AVX2 builds call the vec_dot per pair.
+#if defined(__AVX2__)
+#define PXA_Q4KT_KERNEL(C) \
+static void pxa_q4_K_tile_1x##C(int nb, const block_q4_K * restrict x, const block_q8_K * restrict const * yc, \
+                                 float * restrict const * dst, int r) { \
+    const uint32_t km1 = 0x3f3f3f3f, km2 = 0x0f0f0f0f, km3 = 0x03030303; \
+    const __m256i m4 = _mm256_set1_epi8(0xF); \
+    __m256 acc[C]; __m128 acc_m[C]; \
+    for (int c = 0; c < C; ++c) { acc[c] = _mm256_setzero_ps(); acc_m[c] = _mm_setzero_ps(); } \
+    uint32_t utmp[4]; \
+    for (int i = 0; i < nb; ++i) { \
+        const float xd    = GGML_FP16_TO_FP32(x[i].d); \
+        const float xdmin = GGML_FP16_TO_FP32(x[i].dmin); \
+        memcpy(utmp, x[i].scales, 12); \
+        utmp[3] = ((utmp[2] >> 4) & km2) | (((utmp[1] >> 6) & km3) << 4); \
+        const uint32_t uaux = utmp[1] & km1; \
+        utmp[1] = (utmp[2] & km2) | (((utmp[0] >> 6) & km3) << 4); \
+        utmp[2] = uaux; \
+        utmp[0] &= km1; \
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0])); \
+        const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1); \
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0); \
+        const __m256i scales = MM256_SET_M128I(sc128, sc128); \
+        float dc[C]; \
+        for (int c = 0; c < C; ++c) { \
+            dc[c] = yc[c][i].d * xd; \
+            const float dmin = -yc[c][i].d * xdmin; \
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i *) yc[c][i].bsums); \
+            const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1)); \
+            const __m128i prod = _mm_madd_epi16(mins, q8s); \
+            acc_m[c] = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m[c]); \
+        } \
+        __m256i sumi[C]; \
+        for (int c = 0; c < C; ++c) sumi[c] = _mm256_setzero_si256(); \
+        for (int j = 0; j < QK_K/64; ++j) { \
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0)); \
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1)); \
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i *) (x[i].qs + 32*j)); \
+            const __m256i q4l = _mm256_and_si256(q4bits, m4); \
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4); \
+            for (int c = 0; c < C; ++c) { \
+                const __m256i q8l = _mm256_loadu_si256((const __m256i *) (yc[c][i].qs + 64*j)); \
+                const __m256i q8h = _mm256_loadu_si256((const __m256i *) (yc[c][i].qs + 64*j + 32)); \
+                const __m256i p16l = _mm256_madd_epi16(scale_l, _mm256_maddubs_epi16(q4l, q8l)); \
+                const __m256i p16h = _mm256_madd_epi16(scale_h, _mm256_maddubs_epi16(q4h, q8h)); \
+                sumi[c] = _mm256_add_epi32(sumi[c], _mm256_add_epi32(p16l, p16h)); \
+            } \
+        } \
+        for (int c = 0; c < C; ++c) acc[c] = _mm256_fmadd_ps(_mm256_set1_ps(dc[c]), _mm256_cvtepi32_ps(sumi[c]), acc[c]); \
+    } \
+    for (int c = 0; c < C; ++c) { \
+        __m128 am = acc_m[c]; \
+        am = _mm_add_ps(am, _mm_movehl_ps(am, am)); \
+        am = _mm_add_ss(am, _mm_movehdup_ps(am)); \
+        dst[c][r] = hsum_float_8(acc[c]) + _mm_cvtss_f32(am); \
+    } \
+}
+PXA_Q4KT_KERNEL(4)
+PXA_Q4KT_KERNEL(3)
+PXA_Q4KT_KERNEL(2)
+PXA_Q4KT_KERNEL(1)
+#undef PXA_Q4KT_KERNEL
+
+#define PXA_Q6KT_KERNEL(C) \
+static void pxa_q6_K_tile_1x##C(int nb, const block_q6_K * restrict x, const block_q8_K * restrict const * yc, \
+                                 float * restrict const * dst, int r) { \
+    const __m256i m4 = _mm256_set1_epi8(0xF); \
+    const __m256i m2 = _mm256_set1_epi8(3); \
+    const __m256i m32s = _mm256_set1_epi8(32); \
+    __m256 acc[C]; \
+    for (int c = 0; c < C; ++c) acc[c] = _mm256_setzero_ps(); \
+    for (int i = 0; i < nb; ++i) { \
+        const float xd = GGML_FP16_TO_FP32(x[i].d); \
+        float dc[C]; \
+        for (int c = 0; c < C; ++c) dc[c] = yc[c][i].d * xd; \
+        const __m128i scales = _mm_loadu_si128((const __m128i *) x[i].scales); \
+        __m256i sumi[C]; \
+        for (int c = 0; c < C; ++c) sumi[c] = _mm256_setzero_si256(); \
+        for (int j = 0; j < QK_K/128; ++j) { \
+            const int is = 4*j; \
+            const __m256i sc0 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(is + 0))); \
+            const __m256i sc1 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(is + 1))); \
+            const __m256i sc2 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(is + 2))); \
+            const __m256i sc3 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(is + 3))); \
+            const __m256i q4bits1 = _mm256_loadu_si256((const __m256i *) (x[i].ql + 64*j)); \
+            const __m256i q4bits2 = _mm256_loadu_si256((const __m256i *) (x[i].ql + 64*j + 32)); \
+            const __m256i q4bitsH = _mm256_loadu_si256((const __m256i *) (x[i].qh + 32*j)); \
+            const __m256i q4h_0 = _mm256_slli_epi16(_mm256_and_si256(q4bitsH, m2), 4); \
+            const __m256i q4h_1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bitsH, 2), m2), 4); \
+            const __m256i q4h_2 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bitsH, 4), m2), 4); \
+            const __m256i q4h_3 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bitsH, 6), m2), 4); \
+            const __m256i q4_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q4h_0); \
+            const __m256i q4_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q4h_1); \
+            const __m256i q4_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q4h_2); \
+            const __m256i q4_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q4h_3); \
+            for (int c = 0; c < C; ++c) { \
+                const int8_t * restrict q8 = yc[c][i].qs + 128*j; \
+                const __m256i q8_0 = _mm256_loadu_si256((const __m256i *) (q8 +  0)); \
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *) (q8 + 32)); \
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *) (q8 + 64)); \
+                const __m256i q8_3 = _mm256_loadu_si256((const __m256i *) (q8 + 96)); \
+                const __m256i p16_0 = _mm256_madd_epi16(sc0, _mm256_sub_epi16(_mm256_maddubs_epi16(q4_0, q8_0), _mm256_maddubs_epi16(m32s, q8_0))); \
+                const __m256i p16_1 = _mm256_madd_epi16(sc1, _mm256_sub_epi16(_mm256_maddubs_epi16(q4_1, q8_1), _mm256_maddubs_epi16(m32s, q8_1))); \
+                const __m256i p16_2 = _mm256_madd_epi16(sc2, _mm256_sub_epi16(_mm256_maddubs_epi16(q4_2, q8_2), _mm256_maddubs_epi16(m32s, q8_2))); \
+                const __m256i p16_3 = _mm256_madd_epi16(sc3, _mm256_sub_epi16(_mm256_maddubs_epi16(q4_3, q8_3), _mm256_maddubs_epi16(m32s, q8_3))); \
+                sumi[c] = _mm256_add_epi32(sumi[c], _mm256_add_epi32(p16_0, p16_1)); \
+                sumi[c] = _mm256_add_epi32(sumi[c], _mm256_add_epi32(p16_2, p16_3)); \
+            } \
+        } \
+        for (int c = 0; c < C; ++c) acc[c] = _mm256_fmadd_ps(_mm256_set1_ps(dc[c]), _mm256_cvtepi32_ps(sumi[c]), acc[c]); \
+    } \
+    for (int c = 0; c < C; ++c) dst[c][r] = hsum_float_8(acc[c]); \
+}
+PXA_Q6KT_KERNEL(4)
+PXA_Q6KT_KERNEL(3)
+PXA_Q6KT_KERNEL(2)
+PXA_Q6KT_KERNEL(1)
+#undef PXA_Q6KT_KERNEL
+#endif
+
+// tile entry points: dst[c][r0 + r] = vec_dot(n, vx + r*bx, vy[c]) for r < nr (any), c < nc (<= 4)
+void ggml_pxa_vec_dot_q4_K_q8_K_tile(int n, int nr, int nc, const void * restrict vx, size_t bx,
+                                     const void * restrict const * vy, float * restrict const * dst, int r0) {
+    assert(n % QK_K == 0);
+    assert(nc >= 1 && nc <= 4);
+#if defined(__AVX2__)
+    const int nb = n / QK_K;
+    const block_q8_K * yc[4];
+    for (int c = 0; c < 4; ++c) yc[c] = (const block_q8_K *) vy[c < nc ? c : 0];
+    for (int r = 0; r < nr; ++r) {
+        const block_q4_K * x = (const block_q4_K *) ((const char *) vx + r*bx);
+        switch (nc) {
+            case 4: pxa_q4_K_tile_1x4(nb, x, yc, dst, r0 + r); break;
+            case 3: pxa_q4_K_tile_1x3(nb, x, yc, dst, r0 + r); break;
+            case 2: pxa_q4_K_tile_1x2(nb, x, yc, dst, r0 + r); break;
+            default: pxa_q4_K_tile_1x1(nb, x, yc, dst, r0 + r); break;
+        }
+    }
+#else
+    for (int c = 0; c < nc; ++c) for (int r = 0; r < nr; ++r)
+        ggml_vec_dot_q4_K_q8_K(n, &dst[c][r0 + r], 0, (const char *) vx + r*bx, 0, vy[c], 0, 1);
+#endif
+}
+
+void ggml_pxa_vec_dot_q6_K_q8_K_tile(int n, int nr, int nc, const void * restrict vx, size_t bx,
+                                     const void * restrict const * vy, float * restrict const * dst, int r0) {
+    assert(n % QK_K == 0);
+    assert(nc >= 1 && nc <= 4);
+#if defined(__AVX2__)
+    const int nb = n / QK_K;
+    const block_q8_K * yc[4];
+    for (int c = 0; c < 4; ++c) yc[c] = (const block_q8_K *) vy[c < nc ? c : 0];
+    for (int r = 0; r < nr; ++r) {
+        const block_q6_K * x = (const block_q6_K *) ((const char *) vx + r*bx);
+        switch (nc) {
+            case 4: pxa_q6_K_tile_1x4(nb, x, yc, dst, r0 + r); break;
+            case 3: pxa_q6_K_tile_1x3(nb, x, yc, dst, r0 + r); break;
+            case 2: pxa_q6_K_tile_1x2(nb, x, yc, dst, r0 + r); break;
+            default: pxa_q6_K_tile_1x1(nb, x, yc, dst, r0 + r); break;
+        }
+    }
+#else
+    for (int c = 0; c < nc; ++c) for (int r = 0; r < nr; ++r)
+        ggml_vec_dot_q6_K_q8_K(n, &dst[c][r0 + r], 0, (const char *) vx + r*bx, 0, vy[c], 0, 1);
+#endif
+}
+
 void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

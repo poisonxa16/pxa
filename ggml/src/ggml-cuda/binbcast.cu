@@ -341,7 +341,7 @@ static __global__ void k_add_same(int64_t nelem, const data_t * x, const data_t 
         return;
     }
     if constexpr (std::is_same_v<data_t, nv_bfloat16>) {
-#if __CUDA_ARCH__ >= CC_AMPERE
+#if __CUDA_ARCH__ >= PXA_CC_AMPERE
         z[i] = x[i] + y[i];
 #else
         z[i] = __float2bfloat16((float)x[i] + (float)y[i]);

@@ -54,6 +54,7 @@ static bool llama_spec_prepare_hidden_feature_view(
     }
 
     llama_synchronize(ctx);
+    llama_pxa_embd_resolve(*ctx);   // PXA_SPEC_LAZY_HIDDEN: a one-token decode's row is fetched on first read
 
     if (ctx->embd == nullptr) {
         return false;

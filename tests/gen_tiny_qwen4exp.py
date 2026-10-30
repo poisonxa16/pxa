@@ -143,7 +143,7 @@ class Writer:
 
 # --- the model ------------------------------------------------------------------------
 
-def build(path, seed, ple=False, mtp=False):
+def build(path, seed, ple=False, mtp=False, state=32):
     rng = np.random.default_rng(seed)
 
     ARCH     = "qwen4exp"
@@ -169,7 +169,7 @@ def build(path, seed, ple=False, mtp=False):
 
     # Gated DeltaNet. ssm_d_inner MUST equal ssm_d_state * ssm_dt_rank (the loader checks it).
     D_CONV   = 4
-    D_STATE  = 32                                  # head_k_dim == head_v_dim
+    D_STATE  = state                               # head_k_dim == head_v_dim; 32 by default, --state 64 = a CUDA-kernel width (bug #342)
     DT_RANK  = 4                                   # n_v_heads
     N_GROUP  = 2                                   # n_k_heads
     D_INNER  = D_STATE * DT_RANK                   # 128
@@ -404,8 +404,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--ple", action="store_true", help="add the PLE side path on layer 1")
     ap.add_argument("--mtp", action="store_true", help="add ONE grafted NextN/MTP tail layer (nextn_predict_layers = 1)")
+    ap.add_argument("--state", type=int, default=32, help="DeltaNet head dim (ssm.state_size); 64/128 are the widths the CUDA kernel runs")
     a = ap.parse_args()
-    build(a.out, a.seed, a.ple, a.mtp)
+    build(a.out, a.seed, a.ple, a.mtp, a.state)
     return 0
 
 

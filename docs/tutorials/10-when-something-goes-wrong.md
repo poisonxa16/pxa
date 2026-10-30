@@ -247,6 +247,8 @@ made and why — it is the most useful thing you can send me.
 
 ## How to ask for help
 
+On 4.0 beta 2, use Control's **Report a problem**, or write in Discord **#support** and say **beta** and **4.0-beta.2**. Name the card, the model file, and the command, or just send the Control report. The steps are in [Report a problem](../user/REPORT-A-PROBLEM.md).
+
 Come to Discord: **<https://discord.pxanetwork.com>**
 
 Paste these five things. It is two minutes of your time and it usually turns a week of

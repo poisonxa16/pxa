@@ -9,6 +9,79 @@
 #include "pxa/core/levers.cuh"
 #include "dequantize.cuh"
 
+// TYPE-PRESERVING ROW GATHER (ggml_get_rows_typed). The kernels below widen to F32.
+// A same-type gather is a row copy: int4 when the row and every stride are 16-byte aligned,
+// bytes otherwise. An index outside [0, ne01) zeroes the destination row.
+template <typename vec_t>
+static __global__ void k_get_rows_raw(
+            const char * __restrict__ src0, const int32_t * __restrict__ src1, char * __restrict__ dst,
+            const int64_t nvec, const int64_t ne01, const int64_t ne12,
+            const size_t nb01, const size_t nb02, const size_t nb03,
+            const size_t nb1,  const size_t nb2,  const size_t nb3,
+            const size_t s10,  const size_t s11,  const size_t s12) {
+
+    const int64_t iv  = (int64_t) blockIdx.y*blockDim.x + threadIdx.x;
+    const int     i10 =  blockIdx.x;
+    const int     i11 =  blockIdx.z/ne12;
+    const int     i12 =  blockIdx.z%ne12;
+
+    if (iv >= nvec) {
+        return;
+    }
+
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+    vec_t * dst_row = (vec_t *)(dst + i10*nb1 + i11*nb2 + i12*nb3);
+
+    if (i01 >= 0 && i01 < ne01) {
+        const vec_t * src0_row = (const vec_t *)(src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        dst_row[iv] = src0_row[iv];
+    } else {
+        char * z = (char *) &dst_row[iv];
+#pragma unroll
+        for (int b = 0; b < (int) sizeof(vec_t); ++b) {
+            z[b] = 0;
+        }
+    }
+}
+
+static void get_rows_cuda_raw(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                              const char * src0_dd, const int32_t * src1_dd, char * dst_dd, cudaStream_t stream) {
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(dst->type == src0->type);
+    const size_t row_bytes = ggml_row_size(src0->type, ne00);
+    GGML_ASSERT(row_bytes == ggml_row_size(dst->type, ne0));
+    GGML_ASSERT(ne11*ne12 < 65536);
+
+    const size_t s10 = nb10 / ggml_element_size(src1);
+    const size_t s11 = nb11 / ggml_element_size(src1);
+    const size_t s12 = nb12 / ggml_element_size(src1);
+
+    const bool v16 = (row_bytes % sizeof(int4) == 0)
+        && (nb01 % sizeof(int4) == 0) && (nb02 % sizeof(int4) == 0) && (nb03 % sizeof(int4) == 0)
+        && (nb1  % sizeof(int4) == 0) && (nb2  % sizeof(int4) == 0) && (nb3  % sizeof(int4) == 0)
+        && (((uintptr_t) src0_dd) % sizeof(int4) == 0)
+        && (((uintptr_t) dst_dd)  % sizeof(int4) == 0);
+
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+
+    if (v16) {
+        const int64_t nvec = (int64_t) (row_bytes / sizeof(int4));
+        const dim3 block_nums(ne10, (nvec + CUDA_GET_ROWS_BLOCK_SIZE - 1)/CUDA_GET_ROWS_BLOCK_SIZE, ne11*ne12);
+        k_get_rows_raw<int4><<<block_nums, block_dims, 0, stream>>>(
+                src0_dd, src1_dd, dst_dd, nvec, ne01, ne12,
+                nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12);
+    } else {
+        const int64_t nvec = (int64_t) row_bytes;
+        const dim3 block_nums(ne10, (nvec + CUDA_GET_ROWS_BLOCK_SIZE - 1)/CUDA_GET_ROWS_BLOCK_SIZE, ne11*ne12);
+        k_get_rows_raw<char><<<block_nums, block_dims, 0, stream>>>(
+                src0_dd, src1_dd, dst_dd, nvec, ne01, ne12,
+                nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12);
+    }
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
             const void * src0, const int32_t * src1, dst_t * dst,
@@ -223,6 +296,13 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (src0->type == GGML_TYPE_I32) {
         GGML_ASSERT(dst->type == GGML_TYPE_I32);
         get_rows_cuda_float(src0, src1, dst, src0_d, src1_i32, dst_d, stream);
+        return;
+    }
+
+    // ggml_get_rows_typed: dst keeps src0's type, so the gather is a row copy. F32 and I32
+    // already have their own branches above.
+    if (dst->type == src0->type && src0->type != GGML_TYPE_F32) {
+        get_rows_cuda_raw(src0, src1, dst, (const char *) src0->data, src1_i32, (char *) dst->data, stream);
         return;
     }
 

@@ -16,15 +16,27 @@
 #include <vector>
 
 
-static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
-    // static RNG initialization (revisit if n_threads stops being constant)
-    static const size_t n_threads = std::thread::hardware_concurrency();
-    static std::vector<std::default_random_engine> generators = []() {
+// PXA: deterministic test data. The inputs used to come from std::random_device, so every run drew new
+// data and cases whose NMSE sits near max_nmse_err (e.g. MUL_MAT q4_1 m16 n1 k32: a single 32-wide block, 16 outputs)
+// failed a fraction of runs on every backend (upstream too: 3/1000 on sm_86). Default seed 1234; GGML_TEST_SEED=<n>
+// picks another seed, GGML_TEST_SEED=random restores the old nondeterministic draw.
+static uint32_t test_seed(uint32_t salt) {
+    static const bool     use_random = [] { const char * s = getenv("GGML_TEST_SEED"); return s && strcmp(s, "random") == 0; }();
+    static const uint32_t base       = [] { const char * s = getenv("GGML_TEST_SEED"); return (s && strcmp(s, "random") != 0) ? (uint32_t) strtoul(s, nullptr, 10) : 1234u; }();
+    if (use_random) {
         std::random_device rd;
+        return rd();
+    }
+    return base + salt;
+}
+
+static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+    // static RNG initialization; a fixed chunk count keeps the data independent of the host's core count
+    static const size_t n_threads = 64;
+    static std::vector<std::default_random_engine> generators = []() {
         std::vector<std::default_random_engine> vec;
         vec.reserve(n_threads);
-        //for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(1234 + i); } // fixed seed
-        for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(rd()); }
+        for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(test_seed((uint32_t) i)); }
         return vec;
     }();
 
@@ -314,6 +326,11 @@ struct test_case {
         return 1e-7;
     }
 
+    // integer outputs that must match bit for bit (a copy op); checked on the raw bytes
+    virtual bool exact_int_output() {
+        return false;
+    }
+
     virtual void initialize_tensors(ggml_context * ctx) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             init_tensor_uniform(t);
@@ -451,13 +468,15 @@ struct test_case {
             double max_err;
             ggml_backend_t backend1;
             ggml_backend_t backend2;
+            bool   exact_int;
         };
 
         callback_userdata ud {
             true,
             max_nmse_err(),
             backend1,
-            backend2
+            backend2,
+            exact_int_output()
         };
 
         auto callback = [](int index, ggml_tensor * t1, ggml_tensor * t2, void * user_data) -> bool {
@@ -477,6 +496,19 @@ struct test_case {
                     ud->ok = false;
                     return true;
                 }
+            }
+
+            if (ud->exact_int && t1->op != GGML_OP_NONE && t1->type == GGML_TYPE_I32 &&
+                ggml_is_contiguous(t1) && ggml_is_contiguous(t2)) {
+                std::vector<uint8_t> b1(ggml_nbytes(t1));
+                std::vector<uint8_t> b2(ggml_nbytes(t2));
+                ggml_backend_tensor_get(t1, b1.data(), 0, b1.size());
+                ggml_backend_tensor_get(t2, b2.data(), 0, b2.size());
+                if (b1.size() != b2.size() || memcmp(b1.data(), b2.data(), b1.size()) != 0) {
+                    printf("[%s] I32 output not bit-identical ", ggml_op_desc(t1));
+                    ud->ok = false;
+                }
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
@@ -671,7 +703,16 @@ struct test_unary : public test_case {
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         }
-        ggml_tensor * out = ggml_unary(ctx, a, op);
+        // bug #335 (b): SWIGLU / SWIGLU_OAI are UNARY ops here but halve ne[0]; the generic ggml_unary() keeps a's
+        // shape, which no backend can compute. Build them with their own constructors so the kernels get tested.
+        ggml_tensor * out;
+        if (op == GGML_UNARY_OP_SWIGLU) {
+            out = ggml_swiglu(ctx, a);
+        } else if (op == GGML_UNARY_OP_SWIGLU_OAI) {
+            out = ggml_swiglu_oai(ctx, a, nullptr, 1.702f, 7.0f);
+        } else {
+            out = ggml_unary(ctx, a, op);
+        }
         return out;
     }
 
@@ -795,6 +836,19 @@ struct test_cpy : public test_case {
     }
 
     double max_nmse_err() override {
+        // bug #335 (d): the CUDA f32->q4_0 / f32->iq4_nl copies (the KV-cache quantizers) are valid quantizations but
+        // not the CPU's bytes: q4_0 refits each block scale by x^2-weighted least squares over the max-scale indices
+        // (the CPU keeps max/-8), iq4_nl does that one refit without the CPU's index-refinement loop. Simulated on this
+        // test's U(-1,1) data, 4096 values, 80 draws: NMSE(CPU,CUDA) q4_0 mean 3.0e-4 max 4.2e-4, iq4_nl mean 1.2e-3
+        // max 1.7e-3 (rig sm_86 and V100: 2.6e-4..3.0e-4 and 1.2e-3..1.4e-3). Error vs the f32 source: CUDA q4_0 2.8%
+        // lower than the CPU, CUDA iq4_nl 1-2% higher. The bounds are ~2.4x the simulated max, well under a one-step
+        // error on every value (~5e-2). Every other pair stays exact.
+        if (type_src == GGML_TYPE_F32 && type_dst == GGML_TYPE_Q4_0) {
+            return 1e-3;
+        }
+        if (type_src == GGML_TYPE_F32 && type_dst == GGML_TYPE_IQ4_NL) {
+            return 4e-3;
+        }
         return 1e-6;
     }
 
@@ -1040,8 +1094,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        std::default_random_engine rng(test_seed(1000u));
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
@@ -1052,6 +1105,48 @@ struct test_mul_mat_id : public test_case {
                         data[i] = i % n_mats;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_MUL_MAT_ID with skipped slots (bug #345): id -1 is the SER convention and what the PXA_XCACHE split
+// (GGML_OP_MOE_SPLIT_IDS) writes on each side for the experts that live on the other side. Every backend must skip
+// such a slot (output row 0) and compute the others exactly. skip_every = k: slot (token r, used i) is -1 when
+// (r*n_used + i) % k == 0, and every 4th token has all its slots -1. n_used = 9 takes the generic ids helper of the
+// CUDA MMQ id path, n_used = 8 the specialized one; b = false with n_used > 8 reaches MMQ id even at one token.
+struct test_mul_mat_id_skip : public test_mul_mat_id {
+    const int skip_every;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, skip_every);
+    }
+
+    test_mul_mat_id_skip(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k, int skip_every)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k), skip_every(skip_every) {
+        GGML_ASSERT(skip_every >= 2);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(test_seed(1001u));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i % n_mats;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    for (int i = 0; i < n_used && i < t->ne[0]; i++) {
+                        if (r % 4 == 3 || (r*n_used + i) % skip_every == 0) {
+                            data[i] = -1;
+                        }
+                    }
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
                 }
             } else {
@@ -1388,6 +1483,11 @@ struct test_concat : public test_case {
         ggml_tensor * out = ggml_concat(ctx, a, b, dim);
         return out;
     }
+
+    // a concat is a copy: an I32 result must match the CPU bit for bit (PXA_GLM_CONCAT_I32_CUDA)
+    bool exact_int_output() override {
+        return type == GGML_TYPE_I32;
+    }
 };
 
 // GGML_OP_ARGSORT
@@ -1412,8 +1512,7 @@ struct test_argsort : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        std::default_random_engine rng(test_seed(1002u));
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 // indices
@@ -2326,6 +2425,20 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         }
     }
 
+    // bug #345: skipped (-1) expert slots, as the PXA_XCACHE hot/cold split writes them, on the quantized id paths
+    // (MMVQ id at one token, MMQ id from two tokens / more than 8 used experts per token)
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n_used : {8, 9}) {
+            for (bool b : {false, true}) {
+                for (int n : {1, 2, 5, 32}) {
+                    for (int skip_every : {2, 3}) {
+                        test_cases.emplace_back(new test_mul_mat_id_skip(type_a, 16, n_used, b, 512, n, 256, skip_every));
+                    }
+                }
+            }
+        }
+    }
+
     // Gemma 4 26B-A4B routed-expert shapes at prompt widths (128 experts, top-8): gate+up (k = 2816, m = 1408,
     // broadcast activations) and down (k = 704, m = 2816). Opt-in (PXA_BO_MOE_SHAPES=1): the CPU reference for
     // these is slow and the default suite should stay fast. Used for the sm_70 indexed-MMQ tile/occupancy work.
@@ -2451,6 +2564,12 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    // glm5next DSA indexer tail append: I32 [kpool*n_top, n_tokens] ++ [n_tail, n_tokens] on dim 0
+    // (decode and a prefill ubatch). CUDA serves these only with PXA_GLM_CONCAT_I32_CUDA=1.
+    for (int64_t nt : { 1, 128 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {2048, nt, 1, 1}, 3, 0, 0));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {32, nt, 1, 1}, 3, 0, 0));
+    }
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {8, 1, 1, 1}, order));
@@ -2491,6 +2610,15 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     }
 
     // run tests
+    if (getenv("PXA_BO_TURING_MATMUL")) {
+        test_cases.clear();
+        for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            for (int n : {1, 32, 63, 64, 65, 127, 128, 129, 255, 256, 257, 512}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, n, 512, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     if (mode == MODE_TEST) {
         ggml_backend_t backend_cpu = ggml_backend_cpu_init();
 

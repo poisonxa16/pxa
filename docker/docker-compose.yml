@@ -33,7 +33,7 @@ services:
   # otherwise.
   # ---------------------------------------------------------------------------
   pxa:
-    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v3}
+    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v4.0}
     container_name: pxa
     restart: unless-stopped
     ports:
@@ -164,7 +164,7 @@ services:
   # ---------------------------------------------------------------------------
   launcher:
     profiles: ["tools"]
-    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v3}
+    image: ghcr.io/poisonxa16/pxa:${PXA_VERSION:-v4.0}
     entrypoint: ["/opt/pxa/dist/pxa-launch"]
     volumes:
       - ${MODELS_DIR:?set MODELS_DIR in .env}:/models:ro

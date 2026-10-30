@@ -13,10 +13,13 @@
 #   deep   (D=256, 2 KV heads, n_kv 69632 -> 136 MiB), width 1 and 4, PXA_FA_DEEP_QKV_TILE=2 (the
 #          unconditional 128 MiB rule): vec-f16, never wmma-f16 (on a tree without the fix: FAIL)
 #   deep, width 1, default env (AUTO, memory-aware since ws6-fix, R9): the route the engine announces --
-#          "AUTO keeps the release route" (the whole staging fits with a 256 MiB margin) -> wmma-f16,
-#          "engaged ... does not fit" -> vec-f16 (rel-integrate3: the old rows assumed the fixed rule)
-#   deep, PXA_FA_DEEP_QKV_TILE=0: wmma-f16                      (the revert switch works)
-#   shallow (n_kv 1024), width 1, default env: wmma-f16         (the measured-faster route is kept)
+#          "AUTO keeps the release route" (the whole staging fits with a 256 MiB margin) -> the release
+#          route, "engaged ... does not fit" -> vec-f16 (rel-integrate3: the old rows assumed the fixed rule)
+#   deep, PXA_FA_DEEP_QKV_TILE=0: the release route             (the revert switch works)
+#   shallow (n_kv 1024), width 1, default env: the release route
+# The release route for a narrow D=256 q4_0/q8_0 node on sm_70 is qkv-direct since PXA_FA_QKV_DIRECT_VOLTA
+# (ec2ecd7aec, default on at ENHANCE: reads the quantized cache in place);
+# with PXA_FA_QKV_DIRECT_VOLTA=0 it is wmma-f16 again, and every release-route row runs both ways.
 #
 # Usage: test-fa-route-qkv-volta.sh [path/to/test-fa-route-qkv]. Exit 0 pass, 1 fail, 77 skip.
 set -u
@@ -31,8 +34,9 @@ check() { # label want forbid env... -- args
     out=$(env PXA_CORE_ROUTES=1 "${envs[@]}" "$BIN" "$@" 2>&1); rc=$?
     if ! grep -q "cc 700" <<<"$out"; then echo "SKIP: device 0 is not a V100 (cc 700)"; exit 77; fi
     routes=$(grep -E "PXA_CORE_ROUTES: +device 0 " <<<"$out" | grep -v TOTAL | awk '{print $4}' | tr '\n' ' ')
-    if [ "$want" = auto ]; then                  # AUTO: the engine's own banner says which route it chose
-        if grep -q "AUTO keeps the release route" <<<"$out"; then want=wmma-f16; forbid=vec-f16
+    if [ "$want" = auto ] || [ "$want" = auto-wmma ]; then  # AUTO: the engine's own banner says which route it chose
+        local rel=qkv-direct; [ "$want" = auto-wmma ] && rel=wmma-f16
+        if grep -q "AUTO keeps the release route" <<<"$out"; then want=$rel; forbid=vec-f16
         elif grep -q "PXA_FA_DEEP_QKV_TILE: engaged" <<<"$out"; then want=vec-f16; forbid=wmma-f16
         else want="(no AUTO banner)"; fi
     fi
@@ -48,8 +52,11 @@ for t in q4_0 q8_0; do
         check "D=256 $t width $w n_kv $DEEP PXA_FA_DEEP_QKV_TILE=2" vec-f16 wmma-f16 PXA_FA_DEEP_QKV_TILE=2 -- 256 "$t" "$w" "$DEEP"
     done
     check "D=256 $t width 1 n_kv $DEEP default (AUTO)" auto "" -- 256 "$t" 1 "$DEEP"
-    check "D=256 $t width 1 n_kv $DEEP PXA_FA_DEEP_QKV_TILE=0" wmma-f16 "" PXA_FA_DEEP_QKV_TILE=0 -- 256 "$t" 1 "$DEEP"
-    check "D=256 $t width 1 n_kv 1024 default" wmma-f16 "" -- 256 "$t" 1 1024
+    check "D=256 $t width 1 n_kv $DEEP PXA_FA_DEEP_QKV_TILE=0" qkv-direct "" PXA_FA_DEEP_QKV_TILE=0 -- 256 "$t" 1 "$DEEP"
+    check "D=256 $t width 1 n_kv 1024 default" qkv-direct "" -- 256 "$t" 1 1024
+    check "D=256 $t width 1 n_kv $DEEP AUTO, PXA_FA_QKV_DIRECT_VOLTA=0" auto-wmma "" PXA_FA_QKV_DIRECT_VOLTA=0 -- 256 "$t" 1 "$DEEP"
+    check "D=256 $t width 1 n_kv $DEEP PXA_FA_DEEP_QKV_TILE=0 PXA_FA_QKV_DIRECT_VOLTA=0" wmma-f16 "" PXA_FA_DEEP_QKV_TILE=0 PXA_FA_QKV_DIRECT_VOLTA=0 -- 256 "$t" 1 "$DEEP"
+    check "D=256 $t width 1 n_kv 1024 PXA_FA_QKV_DIRECT_VOLTA=0" wmma-f16 "" PXA_FA_QKV_DIRECT_VOLTA=0 -- 256 "$t" 1 1024
 done
 [ $fail = 0 ] && echo PASSED || echo FAILED
 exit $fail

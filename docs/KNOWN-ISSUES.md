@@ -1,6 +1,18 @@
 # Known issues
 
-## PXA v3: what to know first
+## PXA 4.0: what to know first
+
+- **Texts can differ from 3.1 at near-ties.** The order in which numbers are added changed in some kernels, so a greedy answer can go another way when two words are almost tied. Identical text across restarts needs the determinism setup. The 4.0 release notes list the cells where the text is not bit-identical to the earlier build. If you keep output hashes, make new ones.
+- **Nemotron.** The MTP draft head is not supported yet; leave MTP off for every Nemotron file. Image input (Super-VL, Bolt) is not in 4.0: both run as text models. Super ships as a PXQN2 file only. Nemotron 3 Nano 4B in PXQ4 is smaller than Q4_K_M but measures worse in KLD; the PXQN file measures better.
+- **Nemotron Bolt:** NVIDIA's own NVFP4 GGUF does not load yet. Convert the BF16 checkpoint with the bundled converter instead.
+- **GLM-5.3-Flash.** The release notes say whether it is supported or still experimental. A short-prompt failure (a NaN) on multi-device execution is narrowed but still open.
+- **Gemma 4 26B-A4B on one V100, PXQN4 file.** Prompt processing at a 64k prompt is slower than mainline llama.cpp's q4_0 file; the release notes' Known limits give the figures.
+- **Qwen3.8 27B on one V100 at 32k context** may decode without speculation when the draft context cannot fit. The launch no longer exits.
+- **Windows and macOS builds are unsigned** (SmartScreen and Gatekeeper ask once; see [`install.md`](install.md)). The Windows PXQN library has no fast CPU math, no locked models and no expert-cache CPU pool. The Mac download is a client only. An Android client is in testing and is not a 4.0 download.
+- **Flash-Next on four P100 with speculation:** greedy text is not stable across server starts; see the v3 entry below for the way to get repeatable text.
+
+Carried over from v3 (not re-checked one by one for 4.0):
+
 
 - **Texts differ from v2026.10.2.** The v3 kernels add up numbers in a different order, so near-ties can flip and a greedy answer can go another way. In the quality test (assistant tokens against Q8_0) the PXQN4 file scored the same on both versions and a PXQN2 file slightly better. If you keep output hashes, make new ones.
 - **Locked Pro files need v3 or newer.** v2026.10.2 and older stop at load with an error. v3 without a key refuses a locked file with a message that says where to put the key (PXA Control, Encode tab, or `PXA_LICENCE_KEY`).
@@ -9,7 +21,8 @@
 - **Speculative output is not byte-identical to plain output.** The engine keeps the model's own choice, but the arithmetic differs, so a near-tie can flip.
 - **The P40** is recognised as its own card class, but we have not measured it.
 - **Opt-in settings** `PXA_SPEC_SELECT=1` and `PXA_XCACHE_ADAPT=1` are off by default. The second one makes output depend on earlier requests.
-- **V100: logits depend slightly on the KV cell a request starts at.** With other requests resident in the shared cache, a request whose cells start at an offset that is not a multiple of 4 gets logits that differ by up to about 0.013 (tokens unchanged in our tests); offsets 0, 100, 256 and 384 are identical. Pascal is not affected. v2026.10.2 behaves the same (test-kv-band-align on sm_70); a fix is planned for a library update.- **Flash-Next 64 GB on four P100 with speculation: greedy text is not stable across server starts.** The release gate saw three different texts for the same prompt on three boots of the same build (one equal to the speculation-off text); inside one boot the 12/12 determinism check passes. v2026.10.2 ran this file without speculation, so it did not show this. For output that repeats across restarts, pass `--spec-type none`.
+- **V100: logits depended slightly on the KV cell a request starts at (fixed).** On V100 and newer cards, a request whose cells started at an offset that is not a multiple of 4 got logits up to about 0.013 apart (tokens unchanged in our tests). The attention now starts each request's sums at its own first cell, so the start cell no longer matters (test-kv-band-align passes on sm_70). Two side effects: (1) on every card, Pascal included, a layer kept in system memory by a partial offload (`-ngl` below the layer count) now decodes with CPU flash attention instead of the unfused attention chain, so its output is correct but not byte-identical to earlier builds (layers on a card and `-nkvo` are unchanged); (2) on the unfused path a layer whose V cache is above 64 MiB keeps the old behaviour (`PXA_KV_BAND_MAX_MIB`): roughly 16k cells for a 27B with 16 KV heads, 32k with 8 KV heads, 8k for a model without grouped KV heads. `PXA_KV_BAND_EXACT=0` turns the fix off.
+- **Flash-Next 64 GB on four P100 with speculation: greedy text is not stable across server starts.** The release gate saw three different texts for the same prompt on three boots of the same build (one equal to the speculation-off text); inside one boot the 12/12 determinism check passes. v2026.10.2 ran this file without speculation, so it did not show this. For output that repeats across restarts, pass `--spec-type none`.
 The older entries below are kept for reference.
 
 ## Garbage output on multi-GPU only?
@@ -862,7 +875,12 @@ Counted over a whole boot including prefill, reserve calls / coverage failures /
 were **242 / 174 / 176**; they are now **7 / 5 / 11**. The fix (`PXA_MTP_STABLE_OUT_IDS`, default on)
 builds the slice unconditionally — at one row out of one the slice is the identity, so no value
 changes — and a thrash guard (`PXA_RESERVE_GUARD`, cap `PXA_RESERVE_MAX`, default 24) latches the
-mechanism off per context if it ever does start churning again.
+mechanism off per context if it ever does start churning again. Since 2026-10-17 (issue #11) the cap
+counts re-reserves **in a row** that each replaced a plan before 4 ubatches of that context ran
+(graph-slot ubatches included, so speculative decoding with short prompts amortizes too), not
+the context's lifetime total: a long-lived server re-reserves once for the prefill and once for the
+decode of every request, and the lifetime cap latched it off after about 12 requests, after which
+every prefill re-planned per ubatch. `PXA_RESERVE_LIFETIME=1` restores the lifetime cap.
 
 - **Status:** fixed, default on, and the output is unchanged: greedy probe hash, draft counters and
   the full 512-token control generation are identical to the pre-fix arm. `PXA_MTP_STABLE_OUT_IDS=0`

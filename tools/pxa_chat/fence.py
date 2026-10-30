@@ -1,7 +1,7 @@
 """Folder fence for the chat agent's file tools.
 
-Python port of the owner's hive sandbox (PXACLAW tools/local-lane/harness/sandbox.mjs resolveInside, ls, read,
-write; tools2.mjs readRange, grep, append). The rule that matters: resolve the deepest part of the path that
+Python port of an earlier JavaScript sandbox (resolveInside, ls, read, write, readRange, grep,
+append). The rule that matters: resolve the deepest part of the path that
 EXISTS, so a file about to be created is fine but a symlink anywhere above it that points outside is not.
 Absolute paths and '..' escapes are refused.
 """

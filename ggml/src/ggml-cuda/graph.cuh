@@ -44,6 +44,8 @@ struct ggml_cuda_graph {
     // steady-state replay for the rest of the session. While cooldown_remaining > 0 the key runs
     // eager; at 0 it re-arms (consecutive-update counter reset).
     int cooldown_remaining = 0;
+    // PXA_CUDA_GRAPH_REARM_LEGACY: how many times this key has been put into a cooldown (the cooldown doubles each time)
+    int rearm_count = 0;
     // Pool generation at last property store; a bump (real cudaFree of pool memory) forces recapture
     // so a replay can never dereference baked pool pointers that were returned to the driver.
     uint64_t pool_generation = 0;

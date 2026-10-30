@@ -120,6 +120,7 @@ class Keys:
         REL_BUCKETS_COUNT = "{arch}.attention.relative_buckets_count"
         SLIDING_WINDOW    = "{arch}.attention.sliding_window"
         SLIDING_WINDOW_PATTERN = "{arch}.attention.sliding_window_pattern"
+        ROPE_PATTERN      = "{arch}.attention.rope_pattern"
         SHARED_KV_LAYERS  = "{arch}.attention.shared_kv_layers"
         OUTPUT_SCALE                 = "{arch}.attention.output_scale"
         TEMPERATURE_LENGTH           = "{arch}.attention.temperature_length"
@@ -166,6 +167,8 @@ class Keys:
         INNER_SIZE     = "{arch}.ssm.inner_size"
         STATE_SIZE     = "{arch}.ssm.state_size"
         TIME_STEP_RANK = "{arch}.ssm.time_step_rank"
+        GROUP_COUNT    = "{arch}.ssm.group_count"   # PXA Nemotron port (Mamba-2 B/C groups)
+        GROUP_COUNT    = "{arch}.ssm.group_count"   # PXA Nemotron port (Mamba-2 B/C groups)
 
     class Tokenizer:
         MODEL                = "tokenizer.ggml.model"
@@ -187,6 +190,7 @@ class Keys:
         ADD_SEP              = "tokenizer.ggml.add_sep_token"
         ADD_PREFIX           = "tokenizer.ggml.add_space_prefix"
         REMOVE_EXTRA_WS      = "tokenizer.ggml.remove_extra_whitespaces"
+        METASPACE_PREPEND    = "tokenizer.ggml.metaspace.prepend_scheme"
         PRECOMPILED_CHARSMAP = "tokenizer.ggml.precompiled_charsmap"
         HF_JSON              = "tokenizer.huggingface.json"
         RWKV                 = "tokenizer.rwkv.world"
@@ -288,7 +292,11 @@ class MODEL_ARCH(IntEnum):
     SMOLLM3      = auto()
     SEED_OSS     = auto()
     LAGUNA       = auto()
+    FLINT        = auto()  # PXA_FLINT (upstream PR 30928)
     DEEPSEEK4    = auto()
+    NEMOTRON     = auto()  # PXA Nemotron port
+    NEMOTRON_H   = auto()  # PXA Nemotron port
+    NEMOTRON_H_MOE = auto()  # PXA Nemotron port
 
 class MODEL_TENSOR(IntEnum):
     TOKEN_EMBD           = auto()
@@ -349,6 +357,7 @@ class MODEL_TENSOR(IntEnum):
     SSM_A                = auto()
     SSM_D                = auto()
     SSM_OUT              = auto()
+    SSM_NORM             = auto()  # PXA Nemotron port (Mamba-2 grouped norm)
     ATTN_Q_A             = auto()
     ATTN_Q_B             = auto()
     ATTN_KV_A_MQA        = auto()
@@ -487,7 +496,11 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.SMOLLM3:        "smollm3",
     MODEL_ARCH.SEED_OSS:       "seed_oss",
     MODEL_ARCH.LAGUNA:         "laguna",
+    MODEL_ARCH.FLINT:          "flint",
     MODEL_ARCH.DEEPSEEK4:      "deepseek4",
+    MODEL_ARCH.NEMOTRON:       "nemotron",
+    MODEL_ARCH.NEMOTRON_H:     "nemotron_h",
+    MODEL_ARCH.NEMOTRON_H_MOE: "nemotron_h_moe",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -549,6 +562,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_A:                "blk.{bid}.ssm_a",
     MODEL_TENSOR.SSM_D:                "blk.{bid}.ssm_d",
     MODEL_TENSOR.SSM_OUT:              "blk.{bid}.ssm_out",
+    MODEL_TENSOR.SSM_NORM:             "blk.{bid}.ssm_norm",
     MODEL_TENSOR.ATTN_Q_A:             "blk.{bid}.attn_q_a",
     MODEL_TENSOR.ATTN_Q_B:             "blk.{bid}.attn_q_b",
     MODEL_TENSOR.ATTN_KV_A_MQA:        "blk.{bid}.attn_kv_a_mqa",
@@ -1646,6 +1660,32 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,
     ],
+    MODEL_ARCH.FLINT: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
     MODEL_ARCH.LAGUNA: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -1670,6 +1710,71 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
+    ],
+    MODEL_ARCH.NEMOTRON: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_ROT_EMBD,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.NEMOTRON_H: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.SSM_IN,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_D,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+    ],
+    MODEL_ARCH.NEMOTRON_H_MOE: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.SSM_IN,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_D,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
     ],
     MODEL_ARCH.DEEPSEEK4: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -1834,14 +1939,14 @@ class GGMLQuantizationType(IntEnum):
     PXQ3      = 255   # 3-bit LM8, bit-plane packed, x E16-row scales
     PXQ6      = 256   # 5-bit LM32 x E16-row scales — the quality tier (~5.27 bpw)
     PXQ1      = 248   # 1-bit sign x E16-row scales — the sub-2-bit PXQ-UNIVERSAL tier (~1.26 bpw)
-    # PXQN (PXQ-Next revision 1), decoded by the closed libggml-pxqn
-    PXQN3     = 257   # PXQN, 3.25 + 16/K bpw
-    PXQN3S8   = 258   # PXQN, 3.50 + 16/K bpw
-    PXQN4     = 259   # PXQN, 4.25 + 16/K bpw
-    PXQN2     = 260   # PXQN, 2.25 + 16/K bpw
-    PXQN1     = 261   # PXQN, 1.25 + 16/K bpw
-    PXQN4S8   = 262   # PXQN, 4.50 + 16/K bpw
-    PXQN5     = 263   # PXQN, 5.25 + 16/K bpw
+    # PXQ-Next revision 1 (working name PXQN; ggml-pxqn.h): 64-row panels, 128 B anchor header
+    PXQN3     = 257   # N3 int book x SUB16/16, 128-K slabs (3.25 + 16/K bpw)
+    PXQN3S8   = 258   # N3 int book x SUB16/8, 128-K slabs (3.50 + 16/K bpw)
+    PXQN4     = 259   # N4 int book in PXQ4's slab order (4.25 + 16/K bpw)
+    PXQN2     = 260   # ladder: N2 int book x SUB16/16, 128-K slabs (2.25 + 16/K bpw)
+    PXQN1     = 261   # ladder: sign book x SUB16/16, 128-K slabs (1.25 + 16/K bpw)
+    PXQN4S8   = 262   # ladder: N4 int book x SUB16/8, PXQ4-HQ slab order (4.50 + 16/K bpw)
+    PXQN5     = 263   # ladder: 5-bit uniform x SUB16/16, 128-K slabs (5.25 + 16/K bpw)
     PXA4      = 264   # PXA subscriber flagship tier (~5.06 bpw)
     Q8_0_X4   =  97
     Q8_1_X4   =  98

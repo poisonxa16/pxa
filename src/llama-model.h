@@ -8,9 +8,16 @@
 
 #include "ggml-backend.h"
 
+#include <memory>
+#include <atomic>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #include <set>
+
+struct pxa_cold_guard_rt;   // llama-pxa-cold-auto.h
+
+namespace pxa_ple_direct { class reader; } // PXA_PLE_DIRECT (src/llama-pxa-ple-direct.h)
 
 // available llama models
 enum e_model {
@@ -347,6 +354,8 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_latent_down = nullptr; // PXA: Nemotron latent MoE, n_embd -> moe_latent_size (routed experts' input)
+    struct ggml_tensor * ffn_latent_up   = nullptr; // PXA: Nemotron latent MoE, moe_latent_size -> n_embd (routed experts' output)
 
     llama_split_tensor split_ffn_gate_b;
     llama_split_tensor split_ffn_down_b;
@@ -469,6 +478,13 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_norm   = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid    = nullptr; // I32 hash routing table
 
+    // DeepSeek-V4.1 Engram (only on hparams.dsv41_is_engram layers). engram_embd is the
+    // row table from the "deepseek41-engram" sidecar; null until the sidecar is bound.
+    struct ggml_tensor * engram_q            = nullptr;
+    struct ggml_tensor * engram_k            = nullptr;
+    struct ggml_tensor * engram_wkv          = nullptr;
+    struct ggml_tensor * engram_embd         = nullptr;
+
     // DSpark drafter, per stage. Only stage 0 carries main_proj/main_norm and only
     // the last stage carries norm / hc_head_* / markov_* / conf_proj - the rest are
     // null and the graph must not dereference them off-stage.
@@ -545,6 +561,11 @@ struct llama_model {
     struct ggml_tensor * tok_norm_b;
 
     struct ggml_tensor * tok_embd_per_layer = nullptr;
+    // PXA_PLE_DIRECT (lever, default off): when set, the qwen4exp PLE
+    // gather fetches its rows from the GGUF file with O_DIRECT preads into a per-ubatch staging
+    // input (llama_context::inp_ple_stage) and tok_embd_per_layer's file mapping is never read.
+    // shared_ptr so the reader type can stay incomplete here.
+    std::shared_ptr<pxa_ple_direct::reader> pxa_ple_direct;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm = nullptr;
 
@@ -570,6 +591,13 @@ struct llama_model {
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
 
+    // DeepSeek-V4.1 Engram hash tables (model level; token-id -> compressed id map and the
+    // per-(ngram, head) prime/offset/multiplier constants of the n-gram hash)
+    struct ggml_tensor * engram_token_map   = nullptr;
+    struct ggml_tensor * engram_primes      = nullptr;
+    struct ggml_tensor * engram_offsets     = nullptr;
+    struct ggml_tensor * engram_multipliers = nullptr;
+
     std::unique_ptr<ggml_tensor> output_mtp_ptr;
 
     // PXA_MTP_SHORTLIST: a shortlisted draft head. output_mtp_shortlist holds the
@@ -586,6 +614,22 @@ struct llama_model {
     std::unique_ptr<ggml_tensor> mtp_shortlist_lo_ptr;
     ggml_split_tensor_t          mtp_shortlist_split = {};
     ggml_tensor *                mtp_shortlist_splits[2] = { nullptr, nullptr };
+    // PXA_HEAD_DUAL_LAYER: the LM head cut over the two cards of a '-sm layer' pair (slice 0 = rows [0,h) copied to the
+    // first card, slice 1 = a window onto rows [h,N) of the loaded head on the last layer's card); output points at head
+    bool                         head_dual_layer = false;
+    std::unique_ptr<ggml_tensor> head_dual_ptr;
+    std::unique_ptr<ggml_tensor> head_dual_hi_ptr;
+    ggml_split_tensor_t          head_dual_split = {};
+    ggml_tensor *                head_dual_splits[2] = { nullptr, nullptr };
+    ggml_tensor *                head_dual_whole = nullptr;   // the loaded head, whole, on the last layer's card (PXA_HEAD_DUAL_PF_WHOLE)
+    // and the shortlisted MTP draft head cut the same way (slice 0 = rows [0,n/2) on the first card, a window onto the
+    // copied rows when the draft head is a window onto the LM head, else its own copy; slice 1 = rows [n/2,n) in place)
+    bool                         mtp_dual_layer = false;
+    std::unique_ptr<ggml_tensor> mtp_dual_ptr;
+    std::unique_ptr<ggml_tensor> mtp_dual_lo_ptr;
+    std::unique_ptr<ggml_tensor> mtp_dual_hi_ptr;
+    ggml_split_tensor_t          mtp_dual_split = {};
+    ggml_tensor *                mtp_dual_splits[2] = { nullptr, nullptr };
 
     // DSpark drafter -> its target. Non-owning; set by llama_dspark_bind_target().
     const llama_model * dspark_target = nullptr;
@@ -639,6 +683,16 @@ struct llama_model {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // PXA_PLE_MMAP=2: the gather tables' page ranges to prefetch (MADV_WILLNEED). Done on a background thread once the load
+    // is finished (beta 2, 2026-10-19: issued inside the load, the 51 GB Flash-Next table was read before the server could
+    // answer: +5 min on a spinning disk). The destructor stops and joins the thread before the mappings go.
+    std::vector<std::pair<void *, size_t>> pxa_ple_prefetch;
+    std::thread                            pxa_ple_prefetch_thr;
+    std::shared_ptr<std::atomic<bool>>     pxa_ple_prefetch_stop;
+    // PXA_PLE_PREFETCH_PACE: llama_decode writes INT64_MAX here while it runs and the end time (ggml_time_us) after; the
+    // prefetch thread pauses while a decode runs or ended < 500 ms ago, so a request's own row reads never queue behind it
+    std::shared_ptr<std::atomic<int64_t>>  pxa_busy_us;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -683,6 +737,21 @@ struct llama_model {
     int pxa_stream_zc_moe       = 0;    // expert graphs no wider than this skip the alias and read the
                                         // pinned experts in place on the GPU (zero-copy, CUDA graphs on)
     bool pxa_stream_cold_zc     = false; // planner: streamed experts take the zero-copy cold path (no CPU alias)
+    bool pxa_ring_lent          = false; // PXA_XCACHE_RING_LEND: the cold stacks' ring is lent to resident experts (on demand in the backend)
+    // CUDA stream buffers of THIS model: graphs whose consumers of a streamed weight are no wider than this read it in
+    // place (zero-copy); handed to each buffer after the load (ggml_backend_cuda_stream_buffer_set_zc_ny), never through
+    // the environment, so it cannot reach another model, a later load or a child process. An exported PXA_STREAM_ZC_NY wins.
+    int64_t pxa_stream_zc_ny    = 0;
+    // CPU threads the expert-cache cold path will run on (llama_model_params::pxa_cold_threads; <= 0 = unknown)
+    int32_t pxa_cold_threads    = 0;
+    // llama_model_params::pxa_all_outputs (bug #339): the planner reserved the full logits + the head's wide GEMM for this load's
+    // all-outputs contexts; pxa_place_all_outputs = it did so (the guard is on and the head's device is known)
+    bool    pxa_all_outputs       = false;
+    bool    pxa_place_all_outputs = false;
+    // Nemotron-H expert split, auto cold path = cpu: the runtime guard (llama-pxa-cold-auto.h) that moves narrow graphs to the
+    // zero-copy read while this process's threads wait for CPUs, and the move count every context compares its reused graph with
+    std::shared_ptr<pxa_cold_guard_rt> pxa_cold_guard;
+    int  pxa_cold_epoch         = 0;
     size_t pxa_stream_bytes = 0;        // total pinned stream bytes (placement report)
     // PXA_STREAM_WEIGHTS=auto planner decision (src/llama-pxa-place.h): tensors that leave VRAM
     std::set<std::string> pxa_place_names;
@@ -700,7 +769,11 @@ struct llama_model {
     // moments between those two copies. The file's n_expert = the entries >= 0 of both lists.
     struct pxa_xc_layer { std::vector<int32_t> hot, cold; };
     std::vector<pxa_xc_layer> pxa_xc;
-    struct pxa_xc_fill { ggml_tensor * hot; ggml_tensor * cold; std::string src; int il; int dev; };
+    bool        pxa_xc_ot = false;                // PXA_XCACHE_OT: the split was planned under a user -ot placement (llama-pxa-xcache-ot.h)
+    // file_off / file_fd (PXA_XCACHE_EVICT_FILE): where the source tensor's expert 0 sits in the model file and a descriptor that
+    // stays open after the load (pxa_xc_file_fds owns them); -1 = not recorded
+    struct pxa_xc_fill { ggml_tensor * hot; ggml_tensor * cold; std::string src; int il; int dev; size_t file_off = 0; int file_fd = -1; };
+    std::vector<int> pxa_xc_file_fds;
     std::vector<pxa_xc_fill> pxa_xc_fills;       // one per split expert tensor
     std::vector<std::pair<ggml_tensor *, int>> pxa_xc_maps;   // (map tensor, layer)
     size_t      pxa_xc_ring = 0;                  // ring bytes the split needs (per device of the layer)
@@ -724,7 +797,7 @@ struct llama_model {
         // the same token-scaled bound - the flat 65536 below aborts mid-build at ub2048.
         // Mirrors upstream llama_context::graph_max_nodes() (llama-context.cpp:2349).
         if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35 ||
-            arch == LLM_ARCH_QWEN4EXP  || arch == LLM_ARCH_DEEPSEEK4) {
+            arch == LLM_ARCH_QWEN4EXP  || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) {
             return std::max<size_t>(n_tokens * 40, 32u * n_tensors);
         }
         //return std::max<size_t>(1024, 8*n_tensors);

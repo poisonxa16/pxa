@@ -151,7 +151,9 @@ def _http_error(code, msg):
         return PackageError("The licence server does not recognise this key." + tail + " Check the key you pasted, or get a fresh one "
                             "from the PXA Network Discord (use /encoder).", "bad_key")
     if code == 403 and re.search(r"beta", msg or "", re.I):
-        return PackageError("The beta library channel is for Valued Supporters. Nothing was changed; the stable channel is unaffected.", "not_valued")
+        e = PackageError("The beta library channel is for Valued Supporters. Nothing was changed; the stable channel is unaffected.", "not_valued")
+        e.server_msg = msg or ""        # licd's own reason (the engine updater words a links-hosted beta and a non-Valued key apart)
+        return e
     if code == 403:
         return PackageError("Updates are paused: the licence server refused this key - it is revoked, expired or suspended." + tail
                             + " The library already installed keeps working; nothing was changed.", "revoked")

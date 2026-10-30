@@ -314,8 +314,10 @@ int main(int argc, char ** argv) {
     const bool      ref_f16  = reff != nullptr && atoi(reff) != 0;
     const ggml_type ref_vtyp = ref_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    printf("test-fa-tile-big-dev: PXA_FA_TILE_512=%s, PXA_FA_TILE_512_FP32=%s, device 0 = %s\n",
-           lever ? lever : "(unset)", prec ? prec : "(unset)", ggml_backend_name(cuda));
+    // "(cc N)" is read by test-fa-tile-big-dev.sh: the lever is an sm_60 / sm_70 kernel, and on any other card
+    // the driver checks a different contract (no abort, every engaged case within the bar) and then SKIPs.
+    printf("test-fa-tile-big-dev: PXA_FA_TILE_512=%s, PXA_FA_TILE_512_FP32=%s, device 0 = %s (cc %d)\n",
+           lever ? lever : "(unset)", prec ? prec : "(unset)", ggml_backend_name(cuda), ggml_backend_cuda_get_device_cc(0));
     printf("reference: same graph on the CPU backend with a %s V (%s)\n",
            ref_f16 ? "F16" : "F32",
            ref_f16 ? "fp16 VKQ16 accumulator -- POSITIVE CONTROL, the deep cases are EXPECTED to fail"
@@ -324,8 +326,23 @@ int main(int argc, char ** argv) {
     int rc       = 0;
     int engaged  = 0;
     int declined = 0;
+    int skipped  = 0;
+
+    // The 576/512 MLA cases build V as its own tensor, which is what the sm_60 / sm_70 tile kernel reads. The
+    // sm_75+ new-mma kernel has the MLA contract of the real graphs instead: V is the last DV columns of each K
+    // row (fattn-new-mma.cu: V_h2 = K_h2 + (DKQ/2 - DV/2)), so on those cards these cases are not a real MLA
+    // shape and are skipped here (RTX 3080 Ti sm_86: nmse ~2 against the separate V). test-fa-wide-batch
+    // runs 576/512 with V as that view of K on sm_75+.
+    const int  dev_cc     = ggml_backend_cuda_get_device_cc(0);
+    const bool mla_view_v = dev_cc >= 750 && dev_cc < 1000000;
 
     for (const fa_case & c : cases) {
+        if (mla_view_v && c.DK == 576) {
+            printf("  %-30s SKIPPED (cc %d: new-mma MLA reads V from the tail of K; test-fa-wide-batch covers it)\n",
+                   c.name, dev_cc);
+            skipped++;
+            continue;
+        }
         std::vector<float> got;
         std::vector<float> ref;
         bool cuda_declined = false;
@@ -404,6 +421,9 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (skipped) {
+        printf("skipped %d MLA 576/512 case(s) with a separate V (cc %d)\n", skipped, dev_cc);
+    }
     printf("engaged %d, declined %d, of %d cases\n", engaged, declined, (int) (sizeof(cases)/sizeof(cases[0])));
 
     ggml_backend_free(cpu);

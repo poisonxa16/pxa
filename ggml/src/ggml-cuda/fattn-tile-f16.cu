@@ -20,7 +20,11 @@
 // bounded slice of the key range and fold the slices together itself. Only ever instantiated at
 // parallel_blocks == 1, where the dst/dst_meta layout is one partial per (query column, head) --
 // exactly what the fold kernel reads. See the block comment on pxa_fa_f16_kv_chunk().
-template<int D, int ncols, int nwarps, int parallel_blocks, bool use_softcap, bool pxa_mask_skip, bool pxa_f32acc, bool pxa_chunk = false> // D == head size
+// pxa_h2c (PXA_FA_TILE_H2CHUNK, 2026-10-15; f32acc only, default OFF): the V*P products are summed in half2
+// over 8 keys (HFMA2, the fast sm_60 pipe) and each 8-key partial is added into the fp32 VKQ accumulator, instead of
+// converting every V and P value to fp32 and using FFMA (3.5x the instructions). kqmax/kqsum, the rescale and the
+// KQ scores are unchanged. Not bit-identical to the f32acc path (fp16 rounding inside each 8-key partial).
+template<int D, int ncols, int nwarps, int parallel_blocks, bool use_softcap, bool pxa_mask_skip, bool pxa_f32acc, bool pxa_chunk = false, bool pxa_h2c = false> // D == head size
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 __launch_bounds__(nwarps*WARP_SIZE, 1)
 #endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
@@ -307,6 +311,53 @@ static __global__ void flash_attn_tile_ext_f16(
 
         __syncthreads();
 
+        if constexpr (pxa_f32acc && pxa_h2c) {
+            constexpr int H2C = 4;                          // key pairs per half2 partial (8 keys)
+#pragma unroll
+            for (int kc = 0; kc < FATTN_KQ_STRIDE_TILE_F16; kc += 2*H2C) {
+                half2 part[ncols/nwarps][(D/2)/WARP_SIZE];
+#pragma unroll
+                for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+#pragma unroll
+                    for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+                        part[j0/nwarps][i0/WARP_SIZE] = make_half2(0.0f, 0.0f);
+                    }
+                }
+#pragma unroll
+                for (int k0 = kc; k0 < kc + 2*H2C; k0 += 2) {
+                    half2  V_k[(D/2)/WARP_SIZE][2];
+                    half2 KQ_k[ncols/nwarps];
+#pragma unroll
+                    for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+                        const int i = i0 + threadIdx.x;
+                        V_k[i0/WARP_SIZE][0] = KV_tmp[k0 + 0][i];
+                        V_k[i0/WARP_SIZE][1] = KV_tmp[k0 + 1][i];
+                    }
+#pragma unroll
+                    for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                        const int j = j0 + threadIdx.y;
+                        KQ_k[j0/nwarps] = KQ2[j*(FATTN_KQ_STRIDE_TILE_F16/2) + k0/2];
+                    }
+#pragma unroll
+                    for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+#pragma unroll
+                        for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                            part[j0/nwarps][i0/WARP_SIZE] += V_k[i0/WARP_SIZE][0]* __low2half2(KQ_k[j0/nwarps]);
+                            part[j0/nwarps][i0/WARP_SIZE] += V_k[i0/WARP_SIZE][1]*__high2half2(KQ_k[j0/nwarps]);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+#pragma unroll
+                    for (int i0 = 0; i0 < D/2; i0 += WARP_SIZE) {
+                        const float2 pf = __half22float2(part[j0/nwarps][i0/WARP_SIZE]);
+                        VKQ[j0/nwarps][i0/WARP_SIZE].x += pf.x;
+                        VKQ[j0/nwarps][i0/WARP_SIZE].y += pf.y;
+                    }
+                }
+            }
+        } else {
 #pragma unroll
         for (int k0 = 0; k0 < FATTN_KQ_STRIDE_TILE_F16; k0 += 2) {
             half2  V_k[(D/2)/WARP_SIZE][2];
@@ -345,6 +396,7 @@ static __global__ void flash_attn_tile_ext_f16(
             }
         }
 
+        }
         __syncthreads();
     }
 
@@ -439,33 +491,33 @@ static __global__ void flash_attn_tile_ext_f16(
 // apply. Only parallel_blocks == 1 has the one-partial-per-(column, head) dst layout the fold
 // kernel reads, and only an armed lever is worth the extra instantiation, so both are checked
 // here rather than inside the launcher.
-template <int D, int cols_per_block, int nwarps, int parallel_blocks, bool use_softcap, bool pxa_mask_skip, bool pxa_f32acc>
+template <int D, int cols_per_block, int nwarps, int parallel_blocks, bool use_softcap, bool pxa_mask_skip, bool pxa_f32acc, bool pxa_h2c = false>
 static fattn_kernel_t pxa_tile_f16_chunked_kernel() {
     if constexpr (parallel_blocks == 1) {
         if (pxa_fa_f16_kv_chunk() != 0) { // armed (>0) or AUTO (-1, unset)
-            return flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, true>;
+            return flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, true, pxa_h2c>;
         }
     }
     return nullptr;
 }
 
-template <int cols_per_block, int parallel_blocks, bool use_softcap, bool pxa_mask_skip, bool pxa_f32acc>
+template <int cols_per_block, int parallel_blocks, bool use_softcap, bool pxa_mask_skip, bool pxa_f32acc, bool pxa_h2c = false>
 void launch_fattn_tile_f16_64_128(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     switch (Q->ne[0]) {
         case  64: {
             constexpr int      D = 64;
             constexpr int nwarps = 8;
-            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc>;
+            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, false, pxa_h2c>;
             launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true,
-                pxa_tile_f16_chunked_kernel<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc>());
+                pxa_tile_f16_chunked_kernel<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, pxa_h2c>());
         } break;
         case 128: {
             constexpr int      D = 128;
             constexpr int nwarps = 8;
-            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc>;
+            fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, false, pxa_h2c>;
             launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true,
-                pxa_tile_f16_chunked_kernel<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc>());
+                pxa_tile_f16_chunked_kernel<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, pxa_h2c>());
         } break;
         case 256: {
             // PXA_FA_TILE256 (2026-08-03): D=256 prefill tile for pre-Volta (no fp16 mma). Static
@@ -476,9 +528,9 @@ void launch_fattn_tile_f16_64_128(ggml_backend_cuda_context & ctx, ggml_tensor *
             if constexpr (cols_per_block <= 16) {
                 constexpr int      D = 256;
                 constexpr int nwarps = 8;
-                fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc>;
+                fattn_kernel_t fattn_kernel = flash_attn_tile_ext_f16<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, false, pxa_h2c>;
                 launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true,
-                    pxa_tile_f16_chunked_kernel<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc>());
+                    pxa_tile_f16_chunked_kernel<D, cols_per_block, nwarps, parallel_blocks, use_softcap, pxa_mask_skip, pxa_f32acc, pxa_h2c>());
             } else {
                 GGML_ABORT("tile-f16 D=256 requires cols_per_block <= 16 (48KB static smem)");
             }
@@ -499,6 +551,17 @@ static void launch_fattn_tile_f16_skip_dispatch(ggml_backend_cuda_context & ctx,
         if (!pxa_f32acc_logged) {
             pxa_f32acc_logged = true;
             fprintf(stderr, "PXA_FA_TILE_F32ACC: ENGAGED (tile-f16 FA, fp32 kqmax/kqsum/VKQ accumulators, smem staging unchanged)\n");
+        }
+        if constexpr (parallel_blocks == 1) {
+            static const bool pxa_h2c_on = [](){ const char * e = getenv("PXA_FA_TILE_H2CHUNK"); return e && atoi(e) != 0; }();
+            if (pxa_h2c_on) {
+                if (skip) {
+                    launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, use_softcap, true,  true, true>(ctx, dst);
+                } else {
+                    launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, use_softcap, false, true, true>(ctx, dst);
+                }
+                return;
+            }
         }
         if (skip) {
             launch_fattn_tile_f16_64_128<cols_per_block, parallel_blocks, use_softcap, true,  true>(ctx, dst);

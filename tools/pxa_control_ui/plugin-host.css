@@ -1,0 +1,46 @@
+/* plugin-host.css: "On this computer" in the Plugins tab (plugin-host.js). Tokens only: the same colours and spacing as the rest of Control. */
+#ph-root>.alert{margin:0 0 var(--s4)}
+#ph-root .sect:first-child{margin-top:0}
+.pcard.ph.bad{border-color:color-mix(in srgb,var(--bad) 45%,var(--line))}
+.ph .phrows{display:grid;gap:2px;border-top:1px solid var(--line);padding-top:6px}
+.ph .phrows .kv{align-items:flex-start;padding:5px 0}
+.ph .phrows .kv>span:first-child{flex:0 0 auto;color:var(--dim)}
+.ph .phrows .v{display:grid;justify-items:end;gap:3px;min-width:0;text-align:right}
+.ph .phrows .v small{font-size:var(--fs-0);color:var(--dim);overflow-wrap:anywhere;max-width:30ch}
+.ph .acts .b{min-height:36px}
+.consent .cg{margin:14px 0 4px;font-size:var(--fs-1);color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+.consent .cg:first-of-type{margin-top:10px}
+.consent li.care{border-color:color-mix(in srgb,var(--warn) 40%,var(--line))}
+.consent li .pk{display:flex;align-items:center;gap:8px;margin:0;cursor:pointer}
+.consent li .pk input{width:20px;height:20px;margin:0;accent-color:var(--accent-2);flex:0 0 auto}
+.consent li div span{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:2px}
+/* "Speech on this computer" (plugin-host.js speechPanel): the card look, without .pcard (the plugin list's own selector) */
+.phspeech{display:grid;gap:10px;align-content:start;max-width:760px;margin:var(--s4) 0 0;background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:var(--s4);box-shadow:var(--shadow);min-width:0}
+.phspeech[data-state="ready"]{border-color:color-mix(in srgb,var(--ok) 45%,var(--line))}
+.phspeech[data-state="unsupported"]{border-style:dashed}
+.phspeech .top{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:start}
+.phspeech .pi{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;background:var(--accent-bg);color:var(--accent-text)}
+.phspeech .pi svg{width:22px;height:22px}
+.phspeech h4{margin:0;font-size:var(--fs-3);font-weight:650}
+.phspeech .by{font-size:var(--fs-0);color:var(--dim);margin-top:2px;overflow-wrap:anywhere}
+.phspeech p{margin:0;color:var(--dim);font-size:var(--fs-1);max-width:65ch}
+.phspeech .alert{margin:0}
+.phspeech .alert span{overflow-wrap:anywhere}
+.phspeech .acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.phspeech .acts .b{min-height:36px}
+.phpanel{margin:0 0 var(--s5);border:1px solid var(--line);border-radius:var(--r2);background:var(--surface);overflow:hidden;box-shadow:var(--shadow)}
+.phbar{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;padding:10px var(--s4);border-bottom:1px solid var(--line);background:var(--surface-2)}
+.phbar .sp{flex:1}
+.phframe{display:block;width:100%;height:min(60vh,460px);min-height:280px;border:0;background:var(--surface)}
+/* a plugin's own tab (ui.tab.nav): its bar, then the sealed frame filling the rest of the window */
+.ptbar{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;margin:0 0 var(--s3)}
+.ptbar h2{margin:0;font-size:var(--fs-4,20px)}
+.ptbar .sp{flex:1}
+.ptframe{height:calc(100vh - var(--header) - 120px);min-height:520px;border:1px solid var(--line);border-radius:var(--r2)}
+.ptoff{display:grid;justify-items:start;gap:var(--s3);padding:var(--s5);border:1px dashed var(--line);border-radius:var(--r2);background:var(--surface)}
+@media (max-width:820px){
+  .ptframe{height:calc(100vh - var(--header) - 150px);min-height:460px;border-radius:var(--r1)}
+  .ptbar .tiny{flex-basis:100%;order:3}
+  .ph .phrows .v small{max-width:24ch}
+  .phbar .tiny{flex-basis:100%;order:3}
+}

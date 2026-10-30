@@ -60,7 +60,7 @@ paths on vs all off, on sm_60 (P100), sm_61 (1080 Ti) and sm_70 (V100).
 
 ## G3 — the non-bit-exact paths (declared, gated differently)
 
-- **CPU↔CUDA dequant:** top-20 logprob parity + identical temp-0 generation at `-ngl 0` vs
+- **CPU<->CUDA dequant:** top-20 logprob parity + identical temp-0 generation at `-ngl 0` vs
   `-ngl 99` (bit-exactness across backends is not claimed — parity of outcomes is).
 - **`PXA_PXQ6_WMMA` (experimental V100 tensor-core prefill):** deterministic but NOT bit-exact
   (~1e-6 output deltas by design). It stays default-OFF and is ppl-regated separately before

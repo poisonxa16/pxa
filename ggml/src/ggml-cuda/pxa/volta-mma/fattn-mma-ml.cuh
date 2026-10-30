@@ -19,9 +19,18 @@
 #include "launch-ml.cuh"
 #include "swizzle-ml.cuh"
 
-namespace pxa_volta_fa {
+// PXA: PXA_VOLTA_FA_NS lets one TU compile a second copy of this family under another namespace with a
+// different 512/512 64-column config row (PXA_VOLTA_D512_C64_*; fattn-volta-mma-inst-d512-kv{128,64}.cu, lever
+// PXA_FA_D512_KVSTEP). Every other TU leaves both unset and gets exactly the code below in pxa_volta_fa.
+#ifndef PXA_VOLTA_FA_NS
+#define PXA_VOLTA_FA_NS pxa_volta_fa
+#endif
+namespace PXA_VOLTA_FA_NS {
 
 using namespace pxa_volta_mma;
+#ifdef PXA_VOLTA_FA_ALT
+using namespace pxa_volta_fa; // launch_fattn and the fixup/combine kernels of launch-ml.cuh
+#endif
 
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
@@ -131,7 +140,14 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128,  64, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 256, 1,  32, 128, 128,  64, 1, false);
+    // PXA: the 64-column row's KV staging is a macro so the PXA_FA_D512_KVSTEP TU can compile 128/32/32 or 64/64/64
+    // (keys per softmax step / K and V half2 per load) next to this default 32/128/128.
+#ifndef PXA_VOLTA_D512_C64_FA
+#define PXA_VOLTA_D512_C64_FA  32
+#define PXA_VOLTA_D512_C64_K2 128
+#define PXA_VOLTA_D512_C64_V2 128
+#endif
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 256, 1, PXA_VOLTA_D512_C64_FA, PXA_VOLTA_D512_C64_K2, PXA_VOLTA_D512_C64_V2, 64, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 4,  32, 288, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16,  64, 4,  32, 288, 256,  64, 1, false);
@@ -140,8 +156,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     // PXA: head-256 sm_70 prompt-tile configs (Q kept in shared memory instead of registers, narrower V staging /
     // combine buffers: more resident warps, less shared-memory pressure). Performance-only -- the same MMA
-    // arithmetic in the same order as the generic table below. Values from Jirka Svitil's (mistrjirka) V100 fork,
-    // commit 0471a98 "perf: add V100 optimized runtime stack" (2026-08-30), reproduced here with his authorship.
+    // arithmetic in the same order as the generic table below. These two rows are third-party MIT code: see NOTICE.
     // Gemma 4 sliding-window layers (head 256, ncols1 32 x ncols2 2 = 64 columns) take this route at prefill.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2, 32, 128, 128, 64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2, 32, 128,  64, 128, 2, false);
@@ -1782,8 +1797,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
-           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
+    return pxa_fattn_mma_shapes::may_use_sparse(DKQ, DV, ncols1, // PXA: the shape table lives in
+                                                ncols2);     // fattn-mma-shapes.h
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
@@ -1822,29 +1837,29 @@ static __global__ void flash_attn_ext_f16(
     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
 
-    // Skip unused kernel variants for faster compilation:
-    if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
+    // Skip unused kernel variants for faster compilation (PXA: conditions in fattn-mma-shapes.h, shared with the sm_70 dispatcher and tests/test-fa-volta-mma-shapes.cpp; bug #22738):
+    if (!pxa_fattn_mma_shapes::softcap_has_code(DKQ, use_logit_softcap)) {
         NO_DEVICE_CODE;
         return;
     }
-    if (DKQ == 192 && ncols2 != 8 && ncols2 != 16) {
+    if (!pxa_fattn_mma_shapes::d192_has_code(DKQ, ncols2)) {
         NO_DEVICE_CODE;
         return;
     }
 
-    if (!ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2) && use_sparse) {
+    if (!pxa_fattn_mma_shapes::sparse_has_code(DKQ, DV, ncols1, ncols2, use_sparse)) {
         NO_DEVICE_CODE;
         return;
     }
 #ifdef VOLTA_MMA_AVAILABLE
-    if (ncols1*ncols2 < 32) {
+    if (!pxa_fattn_mma_shapes::volta_cols_have_code(ncols1*ncols2)) {
         NO_DEVICE_CODE;
         return;
     }
 #endif // VOLTA_MMA_AVAILABLE
 
 #if __CUDA_ARCH__ == GGML_CUDA_CC_TURING
-    if (ncols1*ncols2 > 32) {
+    if (!pxa_fattn_mma_shapes::turing_cols_have_code(ncols1*ncols2)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -2183,4 +2198,4 @@ extern DECL_FATTN_MMA_F16_CASE(576, 512, 16,  4);
 extern DECL_FATTN_MMA_F16_CASE(576, 512,  1, 32);
 extern DECL_FATTN_MMA_F16_CASE(576, 512,  2, 32);
 
-} // namespace pxa_volta_fa
+} // namespace PXA_VOLTA_FA_NS

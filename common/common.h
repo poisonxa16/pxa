@@ -228,6 +228,10 @@ struct common_params_speculative {
     // Recurrent-model checkpoint strategy for speculative decoding.
     int recurrent_ckpt_mode = LLAMA_SPEC_CKPT_AUTO;
 
+    // PXA_SPEC_MTP_NGRAM auto rule put the n-gram stage in front of a lone MTP stage (server); common_speculative_init
+    // drops it again when the checkpoint budget holds the table no deeper than the head (PXA_SPEC_MTP_NGRAM_SHALLOW_v1)
+    bool pxa_ngram_auto_front = false;
+
     std::string devices;
     std::string params;
     int32_t n_threads = -1;
@@ -308,6 +312,13 @@ struct common_params_speculative {
 };
 
 bool common_speculative_validate_chain(const common_params_speculative & params, std::string * error = nullptr);
+// PXA_SPEC_STAGE_ORDER_v1: self-spec (table / suffix) stages in front of model drafters, whatever order they were
+// typed in; PXA_SPEC_STAGE_ORDER=0 keeps the typed order. -> true when it reordered.
+bool common_speculative_canonicalize_stage_order(common_params_speculative & spec);
+// PXA_SPEC_MTP_NGRAM_SHALLOW_v1: when spec.pxa_ngram_auto_front is set (the auto rule put an n-gram stage in front of a lone MTP
+// stage) and the table's effective n_max is no deeper than the head's, drop the table again (it cannot add a token, it only costs
+// its per-step lookup); PXA_SPEC_MTP_NGRAM_SHALLOW=1 keeps it. Clears the flag. Returns true when the table was dropped.
+bool common_speculative_drop_shallow_ngram_front(common_params_speculative & spec, int * table_n_max = nullptr, int * head_n_max = nullptr);
 std::string common_speculative_stage_chain_to_str(const common_params_speculative & params);
 
 struct gpt_params {
@@ -322,8 +333,11 @@ struct gpt_params {
     int32_t n_ubatch              =     512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     // PXA (bug #207 follow-up): where n_ubatch came from, for llama_init_from_gpt_params' fit check --
     // pxa_ub_origin in common/pxa-registry.h. 0 = the user's -ub or a measured cell (never touched);
-    // 1 = a registry RULE, 2 = the VRAM ladder (the engine picked it, so it may step it down to fit).
+    // 1 = a registry RULE, 2 = the VRAM ladder (the engine picked it, so it may step it down to fit),
+    // 3 = a registry FIT rule (n_ubatch is a ceiling, walked down to pxa_ub_fit_floor at load).
     int32_t pxa_ub_origin         =       0;
+    int32_t pxa_ub_fit_floor      =       0; // PXA_UB_FIT: the measured cell's -ub (the last rung, loads as before)
+    bool    pxa_ub_stream         =   false; // PXA_AUTO_UB_STREAM picked n_ubatch: PXA_STREAM_UB_CKPT may step it down at load
     int32_t n_keep                =       0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =      -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =       1; // number of parallel sequences to decode
@@ -448,6 +462,9 @@ struct gpt_params {
     bool   kl_divergence    = false; // compute KL divergence
 
     bool usage             = false; // print usage
+    std::string              pxa_argv0;      // PXA: argv[0] (gpt_params_parse): the tool kind, pxa_tool_kind_of
+    std::vector<std::string> pxa_argv_flags; // PXA: the '-' tokens of argv (gpt_params_parse), so common init knows
+                                             // which flags the user gave (pxa_registry_apply_tool, same rule as the server)
     bool use_color         = false; // use color to distinguish generations and inputs
     bool special           = false; // enable special token output
     bool interactive       = false; // interactive mode
@@ -581,6 +598,7 @@ struct gpt_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    std::string pxa_dump_mtp_embd; // PXA_DUMP_MTP_EMBD_v1: server writes the MTP conditioning rows of every prompt here (examples/server/pxa-mtp-dump.h)
     std::string sql_save_file;
     std::string sqlite_zstd_ext_file;
 
@@ -752,6 +770,34 @@ struct llama_init_result {
 
 struct llama_init_result    llama_init_from_gpt_params(gpt_params & params);
 
+// PXA registry for every tool (order #22136, 2026-10-16). llama-server resolves the
+// autoconfig registry (common/pxa-registry.cpp) after the GGUF header and before the model load; until
+// now llama-cli, llama-bench and the other common tools never did, so a bare llama-cli ran without the
+// measured lever stack (2x P100 MoE 35B PXQN4: 74.3 vs 125.8 t/s, #22118). These apply the SAME
+// resolve with the same rules (explicit flags win, lever env set only if unset), once per process:
+//   pxa_registry_apply_tool     - common tools; called by llama_init_from_gpt_params before the load
+//                                 (-sm / -ts even / -ngl / -c / KV picks + lever env, as the server)
+//   pxa_registry_apply_env_only - llama-bench: lever env only (its -sm/-ngl/-b/-ub/-fa are the
+//                                 measurement axes), resolved for the first test's model and -sm
+//   pxa_registry_mark_applied   - llama-server: its own block ran (keeps a draft model from re-resolving)
+// #22182 (2026-10-16): the first model of a process writes the lever env, a later one (a draft) only WARNs on
+// picks that differ (PXA_HS_ENV_UNION=1 = old union); an empty PXA_X= counts as unset; llama-perplexity and
+// llama-imatrix (the gate instruments) get the lever env only; a -c pick never shrinks a tool's trained window;
+// llama-bench resolves every test instance and applies only the shared picks.
+// Off switch: PXA_AUTOCONFIG=0 (the whole resolve, every tool, server included).
+void pxa_registry_apply_tool(gpt_params & params);
+void pxa_registry_apply_env_only(const std::string & model_path, int split_mode, bool ts_given, const char * tool);
+// llama-bench (F3(c), #22182): one entry per test instance; each resolves for its own model / -sm / -ts / KV and
+// only the picks every instance shares are applied (the reads latch once per process), the others are named.
+struct pxa_registry_instance {
+    std::string model;
+    int         split_mode = 1;
+    bool        ts_given   = false;
+    bool        kv_q8      = false;
+};
+void pxa_registry_apply_env_instances(const std::vector<pxa_registry_instance> & inst, const char * tool);
+void pxa_registry_mark_applied();
+
 struct llama_model_params   common_model_params_to_llama  (const gpt_params & params);
 struct llama_context_params common_context_params_to_llama(const gpt_params & params);
 
@@ -795,6 +841,11 @@ std::vector<llama_token> common_tokenize(
     const std::string& text,
     bool   add_special,
     bool   parse_special = false);
+
+// every end-of-generation token of the vocab (llama_token_is_eog), ascending. Generation stops on ANY of them, so a
+// request that asks to ignore EOS has to ban them all, not only llama_token_eos (#361/#362: a Qwen chat model with
+// ignore_eos still stopped on <|endoftext|> when only its EOS <|im_end|> was banned).
+std::vector<llama_token> common_eog_tokens(const struct llama_model * model);
 
 std::vector<llama_token> llama_tokenize(
     const struct llama_vocab * vocab,

@@ -59,19 +59,19 @@ cudaError_t pxa_cuda_set_device_tracked(int device);
 #define CUDART_HMAX   11070 // CUDA 11.7, min. ver. for which __hmax and __hmax2 are known to work (may be higher than needed)
 #define CUDART_HMASK  12000 // CUDA 12.0, min. ver. for half2 -> uint mask comparisons
 
-#define CC_PASCAL     600
+#define PXA_CC_PASCAL     600
 #define MIN_CC_DP4A   610 // minimum compute capability for __dp4a, an intrinsic for byte-wise dot products
-#define CC_VOLTA      700
-#define CC_TURING     750
-#define CC_AMPERE     800
-#define CC_ADA_LOVELACE 890
-#define CC_OFFSET_AMD 1000000
-#define CC_OFFSET_MTHREADS 0x0100000
-#define CC_RDNA1      (CC_OFFSET_AMD + 1010)
-#define CC_RDNA2      (CC_OFFSET_AMD + 1030)
-#define CC_RDNA3      (CC_OFFSET_AMD + 1100)
-#define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < CC_OFFSET_MTHREADS)
-#define GGML_CUDA_CC_IS_AMD(cc)   (cc >= CC_OFFSET_AMD)
+#define PXA_CC_VOLTA      700
+#define PXA_CC_TURING     750
+#define PXA_CC_AMPERE     800
+#define PXA_CC_ADA_LOVELACE 890
+#define PXA_CC_OFFSET_AMD 1000000
+#define PXA_CC_OFFSET_MTHREADS 0x0100000
+#define PXA_CC_RDNA1      (PXA_CC_OFFSET_AMD + 1010)
+#define PXA_CC_RDNA2      (PXA_CC_OFFSET_AMD + 1030)
+#define PXA_CC_RDNA3      (PXA_CC_OFFSET_AMD + 1100)
+#define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < PXA_CC_OFFSET_MTHREADS)
+#define GGML_CUDA_CC_IS_AMD(cc)   (cc >= PXA_CC_OFFSET_AMD)
 
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
 
@@ -168,25 +168,25 @@ typedef float dfloat; // dequantize float
 typedef float2 dfloat2;
 #endif // GGML_CUDA_F16
 
-#if (defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) || __CUDA_ARCH__ >= CC_PASCAL
+#if (defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) || __CUDA_ARCH__ >= PXA_CC_PASCAL
 #define FP16_AVAILABLE
-#endif // (defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) || __CUDA_ARCH__ >= CC_PASCAL
+#endif // (defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) || __CUDA_ARCH__ >= PXA_CC_PASCAL
 
 #if defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610
 #define FAST_FP16_AVAILABLE
 #endif // defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610
 
-#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_VOLTA
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= PXA_CC_VOLTA
 #define FP16_MMA_AVAILABLE
-#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_VOLTA
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= PXA_CC_VOLTA
 
-#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_TURING
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= PXA_CC_TURING
 #define INT8_MMA_AVAILABLE
-#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_TURING
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= PXA_CC_TURING
 
-#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_AMPERE
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= PXA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
-#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_AMPERE
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= PXA_CC_AMPERE
 
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
@@ -228,24 +228,33 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 #endif // __CUDA_ARCH_LIST__
 
 static constexpr bool fast_fp16_available(const int cc) {
-    return cc >= CC_PASCAL && cc != 610;
+    return cc >= PXA_CC_PASCAL && cc != 610;
 }
 
-static constexpr bool fp16_mma_available(const int cc) {
-    return cc < CC_OFFSET_AMD && cc >= CC_VOLTA;
+// The two answers below decide HOST-side layouts and routes (MMQ x-tile layout, shared-memory size and
+// granularity in mmq.cuh; the WMMA/MMA FA routes in fa-route.cu), so they must describe the DEVICE code
+// the card will run, not the card: a binary whose highest arch at or below this card's cc lacks the
+// matrix instructions (a "60;61;70" build JIT-ing compute_70 on a Turing/Ampere card, a Pascal-only
+// build on a V100) runs the device variant compiled for THAT arch. Same rule as new_mma_available()
+// and mmq_id_common.cuh's turing_mma_available(). The raw-cc test stays first, so a card below the
+// threshold never reaches ggml_cuda_highest_compiled_arch() (which aborts when no compiled arch <= cc).
+// On a card whose own arch is compiled (every release card: 60;61;70;75;80;86;89 + PTX 89, and sm_90+
+// whose highest is 890) the answer equals the raw-cc one.
+static bool fp16_mma_available(const int cc) {
+    return cc < PXA_CC_OFFSET_AMD && cc >= PXA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) >= PXA_CC_VOLTA;
 }
 
-static constexpr bool int8_mma_available(const int cc) {
-    return cc < CC_OFFSET_AMD && cc >= CC_TURING;
+static bool int8_mma_available(const int cc) {
+    return cc < PXA_CC_OFFSET_AMD && cc >= PXA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) >= PXA_CC_TURING;
 }
 
 // Volta technically had FP16 tensor cores but they work very differently compared to Turing and later.
 static bool new_mma_available(const int cc) {
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= CC_TURING;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= PXA_CC_TURING;
 }
 
 static bool cp_async_available(const int cc) {
-    return cc < CC_OFFSET_AMD && ggml_cuda_highest_compiled_arch(cc) >= CC_AMPERE;
+    return cc < PXA_CC_OFFSET_AMD && ggml_cuda_highest_compiled_arch(cc) >= PXA_CC_AMPERE;
 }
 
 [[noreturn]]
@@ -357,7 +366,7 @@ static __device__ __forceinline__ half2 ggml_cuda_hmax2(const half2 a, const hal
 }
 
 static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
-#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_PASCAL
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= PXA_CC_PASCAL
 #pragma unroll
    for (int mask = 16; mask > 0; mask >>= 1) {
        x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xffffffff, x, mask, 32));
@@ -366,7 +375,7 @@ static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
 #else
    GGML_UNUSED(x);
    NO_DEVICE_CODE;
-#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_PASCAL
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= PXA_CC_PASCAL
 }
 
 #if CUDART_VERSION < CUDART_HMASK

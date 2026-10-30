@@ -11,6 +11,7 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
+#include "reasoning-budget.h" // common_reasoning_budget_fit_ctx (PXA_RBUDGET_FIT_CTX)
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -23,10 +24,12 @@
 #include "pxa-stats.h"         // PXA_SPEED_STATS_v1
 #include "pxa-spec-fixed-width.h"
 #include "pxa-shift-keep.h"
+#include "pxa-wedge-policy.h"   // PXA_JIT_WEDGE_v1
 
 #include <algorithm> // PXA_KV_UNIFIED_v1: std::sort over reclaim victims
+#include <cstdlib>
 #include <cstring>
-#include <unistd.h>
+#include "pxa-unistd.h"
 #include <sys/stat.h> // PXA_CACHE_DISK_v1: the weight file's size and mtime go into the fingerprint
 #include <fstream>
 #include <iostream>
@@ -257,6 +260,18 @@ static bool server_speculative_needs_draft_model(const common_params_speculative
     return spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT);
 }
 
+// Bug #344: may an MTP-only chain whose context cannot be built fall back to plain decoding? An auto-armed chain
+// (PXA_SPEC_AUTO_ARMED) keeps its own switch PXA_SPEC_AUTO_FALLBACK=0; PXA_MTP_INIT_FATAL=1 makes every MTP init
+// failure an error again (the pre-#344 behaviour of --spec-type mtp).
+static bool server_mtp_init_falls_back(void) {
+    if (const char * e = getenv("PXA_MTP_INIT_FATAL"); e && atoi(e) != 0) return false;
+    if (getenv("PXA_SPEC_AUTO_ARMED") != nullptr) {
+        const char * e = getenv("PXA_SPEC_AUTO_FALLBACK");
+        return !(e && atoi(e) == 0);
+    }
+    return true;
+}
+
 static bool server_speculative_has_mtp(const common_params_speculative & spec) {
     return spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
 }
@@ -345,17 +360,33 @@ static common_speculative_stage_params server_parse_speculative_stage_json(const
 }
 
 server_context::~server_context() {
-    if (ctx) {
-        llama_free(ctx);
-        ctx = nullptr;
+    // Teardown order: everything that points INTO a model goes before that model. The slots' MTP
+    // companion contexts (ctx_mtp inside slot.spec) and draft contexts reference the main / draft
+    // model, and llama_free() reads ctx->model; freeing the models first was a use-after-free at
+    // every server exit with MTP or a draft model (ASan heap-use-after-free in llama_free from
+    // ~common_speculative_state_mtp, after llama_free_model in this destructor).
+
+    // Clear any sampling context
+    for (server_slot& slot : slots) {
+        if (slot.ctx_sampling != nullptr) {
+            common_sampler_free(slot.ctx_sampling);
+            slot.ctx_sampling = nullptr;
+        }
+        slot.spec_ckpt.clear();
+        // PXA_SHARED_MTP_v1: a non-owning alias of the shared MTP companion must NOT be freed here
+        // (it would double-free the single shared ctx_mtp). Only the owning slot (slot 0 for MTP, or
+        // any per-slot non-MTP spec) frees its spec. Null the alias first so nothing dangles.
+        if (slot.owns_spec) {
+            common_speculative_free(slot.spec);
+        }
+        slot.spec = nullptr;
+        if (slot.ctx_dft) {
+            llama_free(slot.ctx_dft);
+            slot.ctx_dft = nullptr;
+        }
+        llama_batch_free(slot.batch_spec);
     }
 
-    if (model) {
-        llama_free_model(model);
-        model = nullptr;
-    }
-    // Free multimodal
-    mtmd_free(mctx);
     // Free draft model and context if they exist
     if (ctx_draft) {
         llama_free(ctx_draft);
@@ -366,23 +397,18 @@ server_context::~server_context() {
         model_draft = nullptr;
     }
 
-    // Clear any sampling context
-    for (server_slot& slot : slots) {
-        if (slot.ctx_sampling != nullptr) {
-            common_sampler_free(slot.ctx_sampling);
-        }
-        slot.spec_ckpt.clear();
-        if (slot.ctx_dft) {
-            llama_free(slot.ctx_dft);
-        }
-        // PXA_SHARED_MTP_v1: a non-owning alias of the shared MTP companion must NOT be freed here
-        // (it would double-free the single shared ctx_mtp). Only the owning slot (slot 0 for MTP, or
-        // any per-slot non-MTP spec) frees its spec. Null the alias first so nothing dangles.
-        if (slot.owns_spec) {
-            common_speculative_free(slot.spec);
-        }
-        slot.spec = nullptr;
-        llama_batch_free(slot.batch_spec);
+    // Free multimodal
+    mtmd_free(mctx);
+    mctx = nullptr;
+
+    if (ctx) {
+        llama_free(ctx);
+        ctx = nullptr;
+    }
+
+    if (model) {
+        llama_free_model(model);
+        model = nullptr;
     }
 
     llama_batch_free(batch);
@@ -464,6 +490,7 @@ static void pxa_exec_self() {
     }
     av.push_back(nullptr);
     setenv("PXA_XCACHE_BOOTSTRAPPED", "1", 1);
+    llama_pxa_mark_engine_env();   // bug #324: the fresh image must not count our own defaults as user-set lab knobs
     fflush(nullptr);
     execv("/proc/self/exe", av.data());   // returns only on failure
 }
@@ -476,6 +503,19 @@ bool server_context::load_model(const gpt_params& params_) {
         params_base.cb_eval           = pxa_expert_log_cb;
         params_base.cb_eval_user_data = nullptr;
         fprintf(stderr, "PXA_EXPERT_LOG: enabled, dir=%s (np1 only!)\n", getenv("PXA_EXPERT_LOG"));
+    }
+
+    // Gemma 4 + images (2026-10-17): the sliding-window KV cache (PXA_GEMMA4_ISWA, default ON for
+    // Gemma 4) has no path for the non-causal attention mask an image batch needs; decoding the first image
+    // aborts with GGML_ASSERT(!lctx.swa_kv_active). With a projector loaded the unified cache is used instead
+    // (identical text output inside the window; the ring only saves memory). An explicit PXA_GEMMA4_ISWA wins;
+    // PXA_MMPROJ_KEEP_ISWA=1 skips this default.
+    if (!params_base.mmproj.path.empty() && !params_base.no_mmproj) {
+        const char * keep = getenv("PXA_MMPROJ_KEEP_ISWA");
+        if ((!keep || atoi(keep) == 0) && !getenv("PXA_GEMMA4_ISWA")) {
+            setenv("PXA_GEMMA4_ISWA", "0", 0);
+            fprintf(stderr, "mmproj loaded: Gemma 4 sliding-window KV cache off (images need a non-causal mask); PXA_MMPROJ_KEEP_ISWA=1 keeps it\n");
+        }
     }
 
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
@@ -523,6 +563,7 @@ bool server_context::load_model(const gpt_params& params_) {
 
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
+    eog_tokens = common_eog_tokens(model);
 
     if (false /*PXA: MTP np>1 gate stripped for test*/ && params_base.n_parallel > 1 && server_speculative_has_mtp(params_base.speculative)) {
         LOG_WARNING("MTP is not supported with parallel slots yet, removing the MTP stage to avoid cross-slot corruption.\n", {
@@ -638,7 +679,9 @@ bool server_context::load_model(const gpt_params& params_) {
 
         llama_model_params mparams_dft = common_model_params_to_llama(params_dft);
 
+        llama_pxa_set_loading_draft(true);    // PXA_PROFILE_KEEP_TARGET=2: this load keeps the target's PXA model profile
         llama_model * model_dft = llama_model_load_from_file(params_dft.model.c_str(), mparams_dft);
+        llama_pxa_set_loading_draft(false);
         if (model_dft == nullptr) {
             LOG_ERROR("failed to load draft model", { {"model", params_base.speculative.model} });
             return false;
@@ -676,6 +719,21 @@ static int32_t pxa_interleave_decode_ms() {
 static bool pxa_ckpt_prompt_end(); // PXA_CKPT_PROMPT_END: defined with the checkpoint code below
 
 void server_context::init() {
+    // PXA_DUMP_MTP_EMBD_v1: the dump directory must exist; the rows exist only with the MTP head armed
+    if (!params_base.pxa_dump_mtp_embd.empty()) {
+        const std::string cmd = "mkdir -p '" + params_base.pxa_dump_mtp_embd + "'";
+        if (system(cmd.c_str()) != 0) {
+            LOG_ERROR("PXA_DUMP_MTP_EMBD: cannot create the dump directory", {{"dir", params_base.pxa_dump_mtp_embd}});
+        }
+        const char * lz = getenv("PXA_MTP_LAZY_WARMUP");
+        LOG_INFO("PXA_DUMP_MTP_EMBD: writing the MTP conditioning rows of every prompt", {
+            {"dir", params_base.pxa_dump_mtp_embd},
+            {"mtp_armed", server_speculative_has_mtp(params_base.speculative)},
+            {"PXA_MTP_LAZY_WARMUP", lz ? lz : "(unset)"}});
+        if (!server_speculative_has_mtp(params_base.speculative)) {
+            LOG_ERROR("PXA_DUMP_MTP_EMBD: no MTP stage armed (--spec-type mtp:...) -- no rows will be written", {});
+        }
+    }
     // PXA_KV_UNIFIED_v1: the ONE line of server arithmetic that statically partitions an already
     // shared, seq-tagged attention-KV ring. With the lever off this is bit-for-bit the historical
     // expression; with it on, every slot may address the full ring and admission control (see
@@ -763,6 +821,14 @@ void server_context::init() {
         slot.ga_n = ga_n;
         slot.ga_w = ga_w;
 
+        // PXA_SPEC_MTP_NGRAM_SHALLOW_v1: a shallow auto table falls back to MTP alone HERE, before the MTP setup below
+        // reads the chain (composite vs MTP-only spec object, the companion's ubatch, batch_spec); deciding it later in
+        // common_speculative_init left a lone MTP stage on the composite setup (measured: prose still -1.7% on one V100 W3)
+        if (params_base.speculative.pxa_ngram_auto_front && !params_base.dry_run) {
+            if (common_speculative_pxa_drop_shallow_front(params_base.speculative, ctx)) {
+                params_base.has_mtp = params_base.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+            }
+        }
         slot.params.speculative = params_base.speculative;
         slot.sparams = params_base.sparams;
 
@@ -884,6 +950,39 @@ void server_context::init() {
                     return;
                 }
                 SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+            } else if (slot.id == 0 && slot.mtp_stage_armed && server_mtp_init_falls_back() && [&]() {
+                           auto rest = params_base.speculative;
+                           server_remove_speculative_stage(rest, COMMON_SPECULATIVE_TYPE_MTP);
+                           return rest.get_resolved_stages().empty(); }()) {
+                // PXA_SPEC_AUTO_FALLBACK (2026-10-16): the MTP chain was auto-armed (no --spec-type / -md /
+                // PXA_AUTO_SPEC=1) and its context could not be built on this card -- measured: 27B PXQN4 on one V100-16GB at
+                // -c 32768, the MTP context's GEMM pool left 121.5 MiB under the 128 MiB floor and the server exited. A default the
+                // user never asked for must not turn a launch that decodes plain into one that does not start: drop the stage and
+                // decode plain, as a launch without the stage would. PXA_SPEC_AUTO_FALLBACK=0 restores the error.
+                // Bug #344 (PXA_MTP_INIT_FATAL, 2026-10-21): an EXPLICIT MTP-only chain (--spec-type mtp, PXA_AUTO_SPEC=1) falls back
+                // the same way. Measured: Qwen3.6-35B-A3B MTP PXQN4 on one V100-16GB at -ngl 30 -c 4096 -fa 1, the companion left
+                // 99.5 MiB under the 128 MiB floor and the server exited; a launch that would decode plain must not fail to start
+                // because an optional draft stage does not fit. One warning, with the refusal's numbers when the context said them.
+                // PXA_MTP_INIT_FATAL=1 restores the error (for scripts that must not run without MTP).
+                const char * why = llama_context_creation_failed_detail();
+                if (getenv("PXA_SPEC_AUTO_ARMED") != nullptr) {
+                    SRV_WRN("PXA_AUTO: the auto-armed MTP chain could not be built on this card at this context (%s); "
+                            "decoding plain. A smaller -c or -ub leaves room for it; PXA_SPEC_AUTO_FALLBACK=0 or "
+                            "PXA_MTP_INIT_FATAL=1 restores the error\n", why && *why ? why : "see the lines above");
+                } else {
+                    SRV_WRN("--spec-type mtp: the MTP draft context could not be built (%s); the server runs WITHOUT speculation "
+                            "(plain decoding, no draft stage). To fit MTP: a lower -ngl or -c, "
+                            "a quantized KV cache (-ctk/-ctv q8_0), or a smaller -ub, and leave PXA_MTP_POOL_SHARE unset (the draft then "
+                            "shares the target's GEMM pool). PXA_MTP_INIT_FATAL=1 makes this an error again\n",
+                            why && *why ? why : "see the lines above");
+                }
+                params_base.has_mtp = false;
+                server_remove_speculative_stage(params_base.speculative, COMMON_SPECULATIVE_TYPE_MTP);
+                slot.params.speculative = params_base.speculative;
+                slot.has_mtp         = false;
+                slot.mtp_stage_armed = false;
+                llama_batch_free(slot.batch_spec);   // the plain slot never drafts: give back the draft batch (review-kernels L5)
+                slot.batch_spec = {};                // zeroed, so the destructor's free is a no-op
             } else {
                 if (llama_model_has_recurrent(model)) {
                     SRV_ERR("%s", "failed to initialize recurrent speculative context\n");
@@ -901,6 +1000,20 @@ void server_context::init() {
         slot.reset();
 
         slots.push_back(std::move(slot));
+    }
+
+    // bug #348: speculation verifies 2..n_max+1 tokens at a time and each verify width gets its own graph slot. Reserve
+    // those now, before any prompt grows the CUDA pool, and only where they fit under the VRAM margin (the rest verify
+    // on the main graph, same output). Not while an MTP companion is still deferred: its first use must find its memory.
+    {
+        bool any_spec = false, mtp_deferred = false;
+        for (const auto & s : slots) {
+            any_spec     = any_spec || s.spec != nullptr;
+            mtp_deferred = mtp_deferred || (s.mtp_stage_armed && !s.has_mtp);
+        }
+        if (any_spec && !mtp_deferred) {
+            llama_pxa_verify_slots_reserve(ctx, std::max(params_base.speculative.n_max, 1) + 1);
+        }
     }
 
     default_generation_settings_for_props = get_formated_generation(slots.front());
@@ -1049,12 +1162,12 @@ void server_context::init() {
 //
 // With this lever the parked entry also carries the companion sequence state and the carry, and a
 // restore puts them back beside the target state. Default OFF: it changes what a restore installs
-// into the drafter, and this project measures a change to speculative state before it ships one.
-// =0 (or unset) leaves both payloads empty and every path byte-identical to before.
+// into the drafter; it is DEFAULT ON since the 4.0 defaults pass (measured +31.6% switch-turn decode on the 27B MTP
+// pair), and PXA_CACHE_PARK_SPEC=0 leaves both payloads empty and every path byte-identical to before.
 static bool pxa_cache_park_spec() {
     static const bool v = []() {
         const char * e = getenv("PXA_CACHE_PARK_SPEC");
-        return e != nullptr && atoi(e) != 0;
+        return (e != nullptr && *e) ? atoi(e) != 0 : true;   // default ON; =0 off. Inert without an armed drafter (spec == nullptr) or without the prompt cache
     }();
     return v;
 }
@@ -2070,6 +2183,15 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     auto stream_opt = json_value(data, "stream_options", json::object());
     slot.params.include_usage = json_value(stream_opt, "include_usage", false);
     slot.params.cache_prompt = json_value(data, "cache_prompt", true);
+    // PXA_DUMP_MTP_EMBD_v1: file stem for --dump-mtp-embd (sanitised to [A-Za-z0-9._-])
+    {
+        std::string tag = json_value(data, "dump_tag", std::string());
+        for (auto & c : tag) {
+            if (!(isalnum((unsigned char) c) || c == '.' || c == '_' || c == '-')) c = '_';
+        }
+        slot.params.dump_tag = tag;
+        slot.mtp_dump.clear();
+    }
     slot.params.n_predict = json_value(data, "n_predict", json_value(data, "max_tokens", defaults.n_predict));
     slot.saturate_predict = json_value(data, "saturate_predict", false);
     slot.sparams.top_k = json_value(data, "top_k", default_sparams.top_k);
@@ -2457,7 +2579,22 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         const auto start_tag = json_value(data, "reasoning_budget_start_tag", std::string());
         const auto end_tag = json_value(data, "reasoning_budget_end_tag", std::string());
         const auto message = json_value(data, "reasoning_budget_message", std::string());
-        slot.sparams.reasoning_budget_tokens = budget;
+        // PXA 2026-10-26 (#361/#362): a budget the slot has no room for never fires; fit it to the room after the
+        // prompt (reasoning-budget.h). Budgets that fit, and unlimited (-1), are unchanged. PXA_RBUDGET_FIT_CTX=0: off.
+        static const bool fit_ctx_on = [] {
+            const char * e = getenv("PXA_RBUDGET_FIT_CTX");
+            return !(e && atoi(e) == 0);
+        }();
+        int32_t budget_fit = budget;
+        if (fit_ctx_on && !end_tag.empty()) {
+            budget_fit = common_reasoning_budget_fit_ctx(budget, slot.n_ctx, (int32_t) slot.prompt_tokens.size());
+            if (budget_fit != budget) {
+                SLT_INF(slot, "reasoning budget %d does not fit the slot (n_ctx %d, prompt %d tokens): the thought "
+                        "closes after %d tokens (PXA_RBUDGET_FIT_CTX=0: off)\n",
+                        budget, slot.n_ctx, (int) slot.prompt_tokens.size(), budget_fit);
+            }
+        }
+        slot.sparams.reasoning_budget_tokens = budget_fit;
 
         if (!start_tag.empty()) {
             slot.sparams.reasoning_budget_start = common_tokenize(vocab, start_tag, false, true);
@@ -2475,9 +2612,14 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     }
 
     {  // apply logit bias
+        // Every request starts from the server's own defaults (--logit-bias / --ignore-eos on the command
+        // line). The slot keeps its sparams across requests, so without this reset a previous request's
+        // logit_bias and its ignore_eos (EOS = -inf) leaked into every later request on the same slot
+        // that did not set them: EOS stayed suppressed and replies ran to the token limit (public pxa #9).
+        slot.sparams.logit_bias = default_sparams.logit_bias;
         const auto& logit_bias = data.find("logit_bias");
         if (logit_bias != data.end() && (logit_bias->is_object() || logit_bias->is_array())) {
-            slot.sparams.logit_bias.clear(); // only clear if user sets it
+            slot.sparams.logit_bias.clear(); // a request's own logit_bias replaces the defaults
         }
         if (logit_bias != data.end() && logit_bias->is_array()) {
             const int n_vocab = llama_n_vocab(model);
@@ -2542,7 +2684,13 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
             }
         }
         if (json_value(data, "ignore_eos", false) && has_eos_token) {
+            // ban EVERY end-of-generation token: the slot stops on any llama_token_is_eog token, so banning only
+            // llama_token_eos let a Qwen chat model end an ignore_eos request on <|endoftext|> after one token
+            // (#361/#362, the bench's 'edit' retry). The vocab EOS stays first, as before.
             slot.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
+            for (const llama_token t : eog_tokens) {
+                slot.sparams.logit_bias[t] = -INFINITY;
+            }
         }
 
     }
@@ -4819,7 +4967,15 @@ void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_sl
         common_speculative_context_shift(slot.spec, slot.id, kv_keep, kv_discard, kv_past);
     }
     if (slot.params.cache_prompt) {
-        slot.cache_tokens.discard_n_tokens(n_keep, n_discard);
+        const int32_t n_tok = (int32_t) slot.cache_tokens.n_tokens();
+        // discard_n_tokens refuses a discard that reaches the last token, so the
+        // KV range above would be gone while cache_tokens still listed it. The
+        // shift kept n_keep; the token book has to say the same thing.
+        if (n_discard > 0 && n_keep >= 0 && n_keep < n_tok && n_keep + n_discard >= n_tok) {
+            slot.cache_tokens.keep_first((size_t) n_keep);
+        } else {
+            slot.cache_tokens.discard_n_tokens(n_keep, n_discard);
+        }
     }
     // PXA_HYBRID_CTX_SHIFT_v1: the shift moves every position after kv_keep down by kv_discard.
     // Prompt checkpoints capture recurrent state keyed by pos ranges in the OLD position space;
@@ -5572,6 +5728,7 @@ void server_context::add_sampled_tokens() {
         bool          do_spec   = false;  // n_draft_max_pre > 0 (this slot drafted)
         llama_tokens  draft;              // the generated (and n_draft_max-capped) draft
         int           min_usable = 0;     // this slot's min usable draft length
+        int           nmin_len  = 0;      // PXA_SPEC_EXACT_NMIN_v1: the length the n_min floor compares (pxa_spec_nmin_len)
         int32_t       batch_req = -1;     // PXA_MTP_BATCH_SLOTS: index into pxa_draft_reqs
     };
     std::vector<pxa_pending_slot> pending;
@@ -5728,7 +5885,9 @@ void server_context::add_sampled_tokens() {
             auto & params_spec = slot.params.speculative;
             const llama_pos draft_base_pos = slot.has_mtp ? slot.cache_tokens.pos_next() : -1;
 
-            if (slot.has_mtp) {
+            // PXA_SPEC_LAZY_HIDDEN: the selector's MTP pick fetches the row inside the draft call instead (a plain
+            // round reads nothing); the batched-slot drafts still take it here
+            if (slot.has_mtp && !(common_speculative_lazy_hidden(slot.spec) && !pxa_mtp_batch_slots_enabled())) {
                 if (!common_speculative_ensure_sequence_hidden(slot.spec, ctx, slot.id, draft_base_pos - 1)) {
                     LOG_ERROR("MTP hidden state is empty during speculation", {});
                 }
@@ -5816,6 +5975,11 @@ void server_context::add_sampled_tokens() {
                 }
 
                 ps.draft = std::move(draft);
+                // PXA_SPEC_EXACT_NMIN_v1: a sampled draft's n_min floor looks at its pre-draw bound (capped
+                // like the draft), never at its drawn length; an argmax draft keeps its length.
+                const int pxa_pre_len = common_speculative_draft_pre_len(slot.spec, slot.id);
+                ps.nmin_len = pxa_spec_nmin_len((int) ps.draft.size(),
+                        pxa_pre_len >= 0 ? std::min(pxa_pre_len, n_draft_max) : -1);
             }
 
             ps.do_spec    = true;
@@ -5869,6 +6033,9 @@ void server_context::add_sampled_tokens() {
             }
 
             ps.draft = std::move(draft);
+            const int pxa_pre_len = common_speculative_draft_pre_len(slot.spec, slot.id);   // PXA_SPEC_EXACT_NMIN_v1
+            ps.nmin_len = pxa_spec_nmin_len((int) ps.draft.size(),
+                    pxa_pre_len >= 0 ? std::min(pxa_pre_len, n_draft_max) : -1);
         }
     }
 
@@ -5881,11 +6048,13 @@ void server_context::add_sampled_tokens() {
         size_t n_spec_slots = 0;
         size_t min_draft    = SIZE_MAX;
         int    max_min_usable = 0;
+        int    min_nmin_len   = INT_MAX;   // PXA_SPEC_EXACT_NMIN_v1: == min_draft unless a sampled draft is in the batch
         for (auto & ps : pending) {
             if (ps.do_spec) {
                 ++n_spec_slots;
                 min_draft = std::min(min_draft, ps.draft.size());
                 max_min_usable = std::max(max_min_usable, ps.min_usable);
+                min_nmin_len = std::min(min_nmin_len, ps.nmin_len);
             }
         }
         // A non-drafting slot contributes exactly 1 token (just slot.sampled). To keep the WHOLE batch
@@ -5898,7 +6067,9 @@ void server_context::add_sampled_tokens() {
                 pxa_common_draft_len = 0;
             } else {
                 pxa_common_draft_len = (min_draft == SIZE_MAX) ? 0 : min_draft;
-                if ((int)pxa_common_draft_len < max_min_usable) {
+                // PXA_SPEC_EXACT_NMIN_v1: the floor reads the pre-draw bounds (a sampled slot's drawn
+                // length depends on its drawn tokens); every slot still gets the same length.
+                if (min_nmin_len < max_min_usable) {
                     pxa_common_draft_len = 0;
                 }
             }
@@ -5917,9 +6088,19 @@ void server_context::add_sampled_tokens() {
             draft.resize(pxa_common_draft_len);
         }
 
+        // PXA_SPEC_EXACT_NMIN_v1: n_min compares ps.nmin_len (== the draft length for an argmax draft;
+        // the pre-draw bound for a sampled one). Equalized slots all pass or the common length is 0.
+        const int  pxa_n_min = slot.params.speculative.get_min_usable_stage_n_min();
         const bool emit_spec = ps.do_spec
-            && (int)draft.size() >= slot.params.speculative.get_min_usable_stage_n_min()
-            && !draft.empty();
+            && pxa_spec_nmin_keep((int) draft.size(), ps.nmin_len, pxa_n_min);
+        if (emit_spec && (int) draft.size() < pxa_n_min) {
+            static std::atomic<bool> pxa_nmin_logged{false};
+            if (!pxa_nmin_logged.exchange(true)) {
+                SLT_INF(slot, "n_min %d with sampled drafts: a short draft (%d) is verified, not dropped "
+                        "(the floor is decided before the draft is drawn; PXA_SPEC_EXACT=0 restores the drop)\n",
+                        pxa_n_min, (int) draft.size());
+            }
+        }
 
         if (emit_spec) {
             pxa_sptr.tick_spec = true; // PXA_SPEC_TRACE: this tick verifies a draft
@@ -5978,7 +6159,7 @@ void server_context::add_sampled_tokens() {
             }
         } else if (ps.do_spec) {
             // drafted, but the (possibly capped) draft is too small to be worth verifying -> normal decode.
-            SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int)draft.size(), slot.params.speculative.get_min_usable_stage_n_min());
+            SLT_DBG(slot, "ignoring small draft: %d (floor length %d) < %d\n", (int)draft.size(), ps.nmin_len, slot.params.speculative.get_min_usable_stage_n_min());
             slot.i_batch = batch.n_tokens;
             common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
             slot.cache_tokens.push_back(slot.sampled);
@@ -6066,6 +6247,11 @@ void server_context::apply_checkpoint(server_slot & slot) {
         const bool      is_hybrid = llama_model_is_hybrid(llama_get_model(slot.ctx));
         const llama_pos state_pos = is_hybrid ? llama_kv_cache_seq_pos_max(slot.ctx, slot.id) : -1;
 
+        // pos_min is the smallest position still in the cache, including when a
+        // ring has stored a newer token at a lower cell index than an older one.
+        // Treating the lowest index as that minimum made a Gemma continuation
+        // (1039 of 1058 tokens still cached) look like a missing prefix and
+        // re-prefilled the whole history.
         const bool need_rewind = (pos_min >= pos_min_thold) || (is_hybrid && state_pos > pos_min_thold);
 
         if (need_rewind) {
@@ -6774,7 +6960,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                     int p0 = system_tokens.size() + slot.cache_tokens.pos_next();
                     // PXA_MTP_LAZY_PROMPT_FLAGS: see comment above server_slot::need_embd()
-                    const bool pxa_tok_embd = pxa_mtp_lazy_prompt_flags() ? slot.embedding : slot.need_embd();
+                    // PXA_DUMP_MTP_EMBD_v1: the dump needs every prompt row (hidden + logits)
+                    const bool pxa_tok_embd = !params_base.pxa_dump_mtp_embd.empty() ? true :
+                                              (pxa_mtp_lazy_prompt_flags() ? slot.embedding : slot.need_embd());
                     common_batch_add(batch, cur_tok, p0, { slot.id }, pxa_tok_embd);
 
                     slot.cache_tokens.push_back(cur_tok);
@@ -7210,8 +7398,17 @@ void server_context::speculative_decoding_accept() {
 
         // for recurrent/hybrid models: if any drafts were rejected, restore recurrent state
         const int64_t pxa_sptr_cm0 = pxa_sptr.on ? ggml_time_us() : 0; // PXA_SPEC_TRACE
-        if (any_rejected && slot.spec_ckpt.valid) {
-            if (!restore_speculative_checkpoint(slot, ctx, model, spec_type_used, sampled_before, ids, n_draft, mtp_hidden_state_pre, mtp_n_past_base)) {
+        // review (2026-10-16): on a recurrent/hybrid model a rejected draft with NO valid checkpoint (the
+        // pre-verify save failed: "failed to save spec checkpoint", e.g. a per-batch capacity refusal or a failed
+        // per-seq CPU save) used to fall through to the commit branch below, so the DeltaNet state kept the rejected
+        // drafts and every later token of the request was computed from it, silently. It now takes the bug #242
+        // fail-closed path, exactly as a failed restore does.
+        const bool pxa_ckpt_lost = any_rejected && !slot.spec_ckpt.valid && llama_model_has_recurrent(model);
+        if (pxa_ckpt_lost) {
+            SLT_WRN(slot, "%s", "rejected draft on a recurrent model without a valid checkpoint: failing the request\n");
+        }
+        if ((any_rejected && slot.spec_ckpt.valid) || pxa_ckpt_lost) {
+            if (pxa_ckpt_lost || !restore_speculative_checkpoint(slot, ctx, model, spec_type_used, sampled_before, ids, n_draft, mtp_hidden_state_pre, mtp_n_past_base)) {
                 // bug #242: the sequence's recurrent state is lost -- drop it and fail the request
                 // rather than emit tokens computed from a state that still holds rejected drafts.
                 llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
@@ -7640,6 +7837,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // PXA_VERIFY_ARGMAX: a batch made only of pure-greedy speculative verify rows needs the head's
         // argmax per row, not the logit rows; ask the decode for argmax-only (it ignores the request
         // when the context's graph has no argmax nodes, and the accept path then samples the logits).
+        bool pxa_amax_tick = false;   // PXA_SAMPLED_TOPW: this tick asked for argmax-only
         if (i == 0 && n_tokens == batch.n_tokens && llama_argmax_available(ctx)) {
             bool pxa_amax = batch.n_tokens > 0;
             std::unordered_map<llama_seq_id, int> pxa_rows;
@@ -7660,14 +7858,67 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 apply_server_biases(*sl);
                 pxa_amax = common_sampler_pure_greedy(sl->ctx_sampling);
             }
+            // A plain greedy step (empty i_batch_dft) used to miss this and copy the whole vocab.
+            // Same predicate as the verify path. The device argmax keeps the lowest id on a tie.
+            // Fold stays off: that pass is the verify's MTP update, not a one-token draw.
+            const bool pxa_spec_amax = pxa_amax;
+            // Merge note: the plain-greedy device argmax (od-w2) stays behind PXA_PLAIN_GREEDY_AMAX=1 (default off:
+            // is implemented-unmeasured, so the default decode path is unchanged).
+            static const bool pxa_plain_amax_on = [] {
+                const char * e = getenv("PXA_PLAIN_GREEDY_AMAX");
+                return e && atoi(e) != 0;
+            }();
+            if (!pxa_amax && pxa_plain_amax_on) {
+                pxa_amax = batch.n_tokens > 0;
+                for (int32_t k = 0; k < batch.n_tokens && pxa_amax; ++k) {
+                    if (batch.logits && batch.logits[k] == 0) {
+                        continue;
+                    }
+                    if (batch.n_seq_id[k] != 1) { pxa_amax = false; break; }
+                    server_slot * sl = nullptr;
+                    for (auto & slot : slots) if (slot.id == batch.seq_id[k][0]) { sl = &slot; break; }
+                    if (sl == nullptr || sl->state != SLOT_STATE_PROCESSING || sl->embedding ||
+                            sl->ctx_sampling == nullptr || !sl->i_batch_dft.empty() ||
+                            sl->sparams.n_probs > 0) {
+                        pxa_amax = false;
+                        break;
+                    }
+                    apply_server_biases(*sl);
+                    pxa_amax = common_sampler_pure_greedy(sl->ctx_sampling);
+                }
+            }
             llama_set_argmax_only(ctx, pxa_amax);
+            pxa_amax_tick = pxa_amax;
             // PXA_MTP_FOLD: a one-slot pure-greedy verify can take the MTP update pass inside it (the
             // decode ignores this when no companion is attached)
-            llama_set_mtp_fold_request(ctx, pxa_amax && pxa_rows.size() == 1);
+            llama_set_mtp_fold_request(ctx, pxa_spec_amax && pxa_rows.size() == 1);
+        }
+        // PXA_SAMPLED_TOPW: a plain sampled step whose every output row draws from a top-k window the
+        // graph's device top-W node covers copies that window back instead of the logits rows (common_sampler_topw_ok)
+        static const bool pxa_topw_on = [] { const char * e = getenv("PXA_SAMPLED_TOPW"); return e && *e && atoi(e) != 0; }();
+        if (i == 0 && n_tokens == batch.n_tokens && !pxa_amax_tick && pxa_topw_on && llama_topw_width(ctx) > 0) {
+            bool tw = batch.n_tokens > 0;
+            for (int32_t k = 0; k < batch.n_tokens && tw; ++k) {
+                if (batch.logits && batch.logits[k] == 0) {
+                    continue;
+                }
+                if (batch.n_seq_id[k] != 1) { tw = false; break; }
+                server_slot * sl = nullptr;
+                for (auto & slot : slots) if (slot.id == batch.seq_id[k][0]) { sl = &slot; break; }
+                if (sl == nullptr || sl->state != SLOT_STATE_PROCESSING || sl->embedding ||
+                        sl->ctx_sampling == nullptr || !sl->i_batch_dft.empty() || sl->sparams.n_probs > 0) {
+                    tw = false;
+                    break;
+                }
+                apply_server_biases(*sl);
+                tw = common_sampler_topw_ok(sl->ctx_sampling, ctx);
+            }
+            llama_set_topw_only(ctx, tw);
         }
         last_decode_start_us.store(ggml_time_us(), std::memory_order_relaxed);
         const int ret = llama_decode(ctx, batch_view);
         last_decode_done_us.store(ggml_time_us(), std::memory_order_relaxed);
+        pxa_decodes_done.fetch_add(1, std::memory_order_relaxed);   // PXA_JIT_WEDGE_v1
         // PXA_SPEC_TRACE: the target verify/generation decode wall of this tick
         if (pxa_sptr.on) {
             pxa_sptr.tk[PXA_SPTR_VERIFY] +=
@@ -7791,6 +8042,38 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             continue; // continue loop of n_batch
         }
+
+    // PXA_DUMP_MTP_EMBD_v1: collect every prompt slot's conditioning rows of this batch; flush when its prompt is done
+    if (!params_base.pxa_dump_mtp_embd.empty()) {
+        const int32_t pxa_nv = llama_n_vocab(model);
+        for (auto & slot : slots) {
+            const bool in_prompt = (slot.state == SLOT_STATE_PROCESSING && slot.n_decoded == 0) ||
+                                   (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT);
+            if (!in_prompt) {
+                continue;
+            }
+            if (slot.mtp_dump.tag.empty()) {
+                slot.mtp_dump.tag = slot.params.dump_tag.empty() ? ("t" + std::to_string(slot.id_task)) : slot.params.dump_tag;
+            }
+            const int32_t got = pxa_mtp_dump_collect(ctx, batch_view, slot.id, slot.mtp_dump, pxa_nv);
+            if (got < 0) {
+                LOG_ERROR("PXA_DUMP_MTP_EMBD: rows of this prompt are not contiguous or the width changed -- dropped", {
+                    {"id_slot", slot.id}, {"id_task", slot.id_task}, {"tag", slot.mtp_dump.tag}});
+                slot.mtp_dump.clear();
+                slot.mtp_dump.tag = "DROPPED";
+                continue;
+            }
+            const bool done = slot.state == SLOT_STATE_PROCESSING && slot.n_decoded == 0 &&
+                              slot.i_batch >= (int) i && slot.i_batch < (int) (i + n_tokens);
+            if (done && slot.mtp_dump.tag != "DROPPED") {
+                if (!pxa_mtp_dump_flush(params_base.pxa_dump_mtp_embd, slot.mtp_dump, slot.id_task, slot.id)) {
+                    LOG_ERROR("PXA_DUMP_MTP_EMBD: write failed", {{"id_slot", slot.id}, {"id_task", slot.id_task}});
+                }
+            } else if (done) {
+                slot.mtp_dump.clear();
+            }
+        }
+    }
 
     if (server_speculative_has_mtp(params_base.speculative)) {
         const int64_t pxa_wm0 = getenv("PXA_DECODE_WALL_DBG") ? ggml_time_us() : 0;
@@ -7933,14 +8216,37 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 }
             } else if (slot.has_mtp && (slot.n_decoded == 0 || slot.spec_adaptive_tier == 0 ||
                                         common_speculative_select_no_draft(slot.spec, slot.id))) {   // PXA_SPEC_SELECT: a round with no draft
-                (void) common_speculative_capture_output_hidden(slot.spec, ctx, tok_idx, slot.id, slot.n_past);
+                // PXA_SPEC_LAZY_HIDDEN: a selector plain round leaves the row on the device and marks the stored one
+                // stale; the next MTP pick reads this decode's row (nothing decodes on ctx before it)
+                if (slot.n_decoded > 0 && slot.spec_adaptive_tier != 0 && common_speculative_lazy_hidden(slot.spec) &&
+                        !pxa_mtp_batch_slots_enabled() && common_speculative_select_no_draft(slot.spec, slot.id)) {
+                    common_speculative_mark_hidden_stale(slot.spec, slot.id);
+                } else {
+                    (void) common_speculative_capture_output_hidden(slot.spec, ctx, tok_idx, slot.id, slot.n_past);
+                }
             }
 
             apply_server_biases(slot);
 
-            llama_token id;
+            llama_token id = -1;
+            bool pxa_amax_sf = false;
+            // Device argmax when this decode was asked for it. Otherwise the logit row is there
+            // and the sampler runs as before. Tie-break is the lowest id on both paths.
+            if (common_sampler_pure_greedy(slot.ctx_sampling)) {
+                id = llama_get_argmax_ith(ctx, tok_idx, nullptr);
+                // L4: a row with no finite maximum (all NaN / -inf) returns the device sentinel. The logits of an
+                // argmax-only decode were not copied, so a host draw would read a stale row: take the greedy
+                // fallback token 0 (the host greedy's pick on such a row) and count the step as a softfail.
+                pxa_amax_sf = llama_get_argmax_softfailed(ctx);
+                if (pxa_amax_sf && id < 0) {
+                    id = 0;
+                }
+            }
+            const bool pxa_used_amax = id >= 0;
             try {
-                id = common_sampler_sample(slot.ctx_sampling, ctx, tok_idx);
+                if (!pxa_used_amax) {
+                    id = common_sampler_sample(slot.ctx_sampling, ctx, tok_idx);
+                }
                 common_sampler_accept(slot.ctx_sampling, ctx, id, true);
                 if (pxa_np_mtp_sync) {
                     // bug #234: see above. PXA_SPEC_SAMPLED: this commit draws the next step's first
@@ -7961,7 +8267,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 // that fills the context, holds the slot, and under -sm layer starves every
                 // co-resident generation (the "healthy /health, HTTP=000" outage). Count consecutive
                 // fallbacks per slot; process_token stops the slot once the cap is reached.
-                if (llama_get_last_sample_softfailed(ctx)) {
+                if (pxa_used_amax ? pxa_amax_sf : llama_get_last_sample_softfailed(ctx)) {
                     slot.n_softfail_consecutive++;
                 } else {
                     slot.n_softfail_consecutive = 0;
@@ -8061,6 +8367,18 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             if (pxa_ac0) fprintf(stderr, "PXA_ACCEPT_BLK: %lldus\n", (long long) (ggml_time_us() - pxa_ac0));
         }
     }
+}
+
+// PXA_JIT_WEDGE_v1: the process-wide policy, set once by main() after the backends are up
+// (pxa_wedge_policy_set); until then jit=false, i.e. exactly the old limits.
+static pxa_wedge_policy g_pxa_wedge_policy;
+
+void pxa_wedge_policy_set(const pxa_wedge_policy & p) {
+    g_pxa_wedge_policy = p;
+}
+
+int64_t server_context::pxa_wedge_limit_ms(int64_t base) const {
+    return ::pxa_wedge_limit_ms(g_pxa_wedge_policy, base, pxa_decodes_done.load(std::memory_order_relaxed));
 }
 
 bool server_context::pxa_decode_wedged(int64_t stall_ms) const {
@@ -8325,6 +8643,10 @@ bool server_context::pxa_hs_park(std::string & err, llama_pxa_residency * next) 
     if (st.verify_bad) {
         LLAMA_LOG_WARN("hot swap: PXA_SWAP_VERIFY: %llu weight bytes of '%s' changed since they were mirrored\n",
                        (unsigned long long) st.verify_bad, pxa_hs_name.c_str());
+    } else if (std::getenv("PXA_SWAP_VERIFY") != nullptr) {
+        // Diagnostic only. Silent when the env is unset, including a clean park.
+        LLAMA_LOG_INFO("hot swap: PXA_SWAP_VERIFY: 0 weight bytes of '%s' differ from the mirror\n",
+                       pxa_hs_name.c_str());
     }
     return true;
 }

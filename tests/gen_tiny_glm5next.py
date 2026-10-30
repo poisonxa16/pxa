@@ -18,11 +18,19 @@ Everything the real model has, in miniature:
   * the KDA gate pair, the short causal conv on each of q/k/v, and a FINITE
     kda.gate_lower_bound so the bounded-sigmoid gate is the one exercised
 
+With `--nextn` the file gets one more block, the NextN/MTP draft head, shaped exactly like
+block 45 of the released weights: an MLA+DSA block with a MoE feed forward, NO hc_* mixers
+(it is spliced into an already-collapsed hidden, so there are no residual streams to mix),
+and the nextn.{eh_proj, enorm, hnorm, shared_head_norm} quartet. It carries no
+nextn.embed_tokens and no nextn.shared_head_head either, so the head shares token_embd and
+output.weight with the trunk -- which is what the real file does and what the graph expects.
+nextn_predict_layers goes to 1, so the block is loaded only when the run asks for MTP.
+
 The GGUF is written by hand (struct + numpy) rather than through gguf-py so the generator does
 not depend on which tree's gguf-py is importable, and so the ggml `ne` order of every tensor is
 explicit at the call site rather than implied by a numpy transpose.
 
-Usage:  python3 tests/gen_tiny_glm5next.py out.gguf [--seed 1234]
+Usage:  python3 tests/gen_tiny_glm5next.py out.gguf [--seed 1234] [--nextn]
 """
 
 import argparse
@@ -120,11 +128,12 @@ class Writer:
 
 # --- the model ------------------------------------------------------------------------
 
-def build(path, seed, idx_topk=8):
+def build(path, seed, idx_topk=8, nextn=0):
     rng = np.random.default_rng(seed)
 
     ARCH   = "glm5next"
-    N_LAYER = 8
+    N_TRUNK = 8
+    N_LAYER = N_TRUNK + nextn   # the NextN head is the LAST block, as it is in the real file
     MLA_AT  = {3, 7}            # attention.head_count_kv == 1 there, 0 (KDA) elsewhere
     N_EMBD  = 256
     N_HEAD  = 4
@@ -173,11 +182,12 @@ def build(path, seed, idx_topk=8):
     w.u32(f"{ARCH}.feed_forward_length", N_FF)
     w.u32(f"{ARCH}.attention.head_count", N_HEAD)
     # 0 = KDA (recurrent), 1 = MLA. This per-layer array IS the layer-regime table.
-    w.arr_u32(f"{ARCH}.attention.head_count_kv", [1 if i in MLA_AT else 0 for i in range(N_LAYER)])
+    w.arr_u32(f"{ARCH}.attention.head_count_kv",
+              [1 if (i in MLA_AT or i >= N_TRUNK) else 0 for i in range(N_LAYER)])
     w.f32(f"{ARCH}.attention.layer_norm_rms_epsilon", 1e-5)
     w.f32(f"{ARCH}.attention.layer_norm_epsilon", 1e-5)
     w.u32(f"{ARCH}.vocab_size", N_VOCAB)
-    w.u32(f"{ARCH}.nextn_predict_layers", 0)
+    w.u32(f"{ARCH}.nextn_predict_layers", nextn)
 
     # NoPE: there is no rope half at all
     w.u32(f"{ARCH}.rope.dimension_count", 0)
@@ -261,16 +271,17 @@ def build(path, seed, idx_topk=8):
 
     for il in range(N_LAYER):
         p = f"blk.{il}."
+        is_mtp = il >= N_TRUNK
         w.tensor(p + "attn_norm.weight", [N_EMBD], ONES(N_EMBD))
         w.tensor(p + "ffn_norm.weight",  [N_EMBD], ONES(N_EMBD))
 
-        # mHC mixers
-        for tag in ("attn", "ffn"):
+        # mHC mixers -- absent on the NextN block, exactly as in the released weights
+        for tag in () if is_mtp else ("attn", "ffn"):
             w.tensor(p + f"hc_{tag}_fn.weight",    [HC * N_EMBD, HC_MIX], R(HC * N_EMBD, HC_MIX, s=0.02))
             w.tensor(p + f"hc_{tag}_base.weight",  [HC_MIX], R(HC_MIX, s=0.1))
             w.tensor(p + f"hc_{tag}_scale.weight", [3], np.array([1.0, 1.0, 1.0], dtype=np.float32))
 
-        if il in MLA_AT:
+        if il in MLA_AT or is_mtp:
             w.tensor(p + "attn_q_a_norm.weight",  [Q_LORA],  ONES(Q_LORA))
             w.tensor(p + "attn_kv_a_norm.weight", [KV_LORA], ONES(KV_LORA))
             w.tensor(p + "attn_q_a.weight",       [N_EMBD, Q_LORA],            R(N_EMBD, Q_LORA))
@@ -320,6 +331,15 @@ def build(path, seed, idx_topk=8):
             w.tensor(p + "ffn_up_shexp.weight",   [N_EMBD, N_FF_EXP * N_SHARED], R(N_EMBD, N_FF_EXP * N_SHARED))
             w.tensor(p + "ffn_down_shexp.weight", [N_FF_EXP * N_SHARED, N_EMBD], R(N_FF_EXP * N_SHARED, N_EMBD))
 
+        if is_mtp:
+            # h = eh_proj( RMSNorm(embd(tok), enorm) || RMSNorm(prev_hidden, hnorm) ), then the
+            # block above, then shared_head_norm into the TRUNK's output.weight. eh_proj is the
+            # only wide tensor: [2*n_embd, n_embd].
+            w.tensor(p + "nextn.eh_proj.weight", [2 * N_EMBD, N_EMBD], R(2 * N_EMBD, N_EMBD))
+            w.tensor(p + "nextn.enorm.weight",   [N_EMBD], ONES(N_EMBD))
+            w.tensor(p + "nextn.hnorm.weight",   [N_EMBD], ONES(N_EMBD))
+            w.tensor(p + "nextn.shared_head_norm.weight", [N_EMBD], ONES(N_EMBD))
+
     n = w.write(path)
     print(f"wrote {path}: {len(w.tensors)} tensors, {len(w.kv)} kv, {n/1e6:.2f} MB")
 
@@ -332,8 +352,12 @@ def main():
     # n_top saturate at the 64-pool pad floor and n_sel = 259 -- so every short context
     # takes the SCATTER branch. The default 8 keeps the original identity-gate artifact.
     ap.add_argument("--top-k", type=int, default=8, dest="top_k")
+    # The released checkpoint carries nextn_predict_layers = 1 and a 46th block; the default
+    # artifact keeps 0 so every existing gate reads the same file it always did.
+    ap.add_argument("--nextn", action="store_const", const=1, default=0,
+                    help="append the NextN/MTP draft head as one extra block")
     a = ap.parse_args()
-    build(a.out, a.seed, a.top_k)
+    build(a.out, a.seed, a.top_k, a.nextn)
     return 0
 
 

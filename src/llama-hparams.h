@@ -66,6 +66,13 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
 
+    // PXA: per-layer routed-expert shape. Nemotron 3.5 Bolt (Puzzle) writes expert_used_count and
+    // expert_feed_forward_length as per-layer arrays (0 on the non-MoE layers); a scalar key fills every layer.
+    // The scalars n_expert_used / n_ff_exp keep the max over the layers for every caller that wants one number.
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_expert_used_arr = {};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_exp_arr      = {};
+    uint32_t moe_latent_size = 0; // Nemotron latent MoE: routed experts run at this width (0 = n_embd)
+
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
@@ -110,6 +117,9 @@ struct llama_hparams {
     std::array<int, 4> rope_sections;
     std::array<float,    LLAMA_MAX_LAYERS> rope_freq_base_per_layer;
     std::array<uint32_t, LLAMA_MAX_LAYERS> rope_dim_per_layer;
+    // PXA_FLINT: 1 = this layer applies no RoPE (NoPE). Read from "%s.attention.rope_pattern"
+    // (Flint: the full-attention layers). Zero everywhere for every other arch.
+    std::array<uint32_t, LLAMA_MAX_LAYERS> nope_layers = {};
 
     // for State Space Models
     uint32_t ssm_d_conv  = 0;
@@ -117,6 +127,9 @@ struct llama_hparams {
     uint32_t ssm_d_state = 0;
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
+    // PXA Nemotron port: Mamba-2 layers (Nemotron-H). The state row is the conv window over
+    // x|B|C plus the {d_state, d_inner} scan state, not the DeltaNet {head_v, head_v, n_v} matrix.
+    bool     ssm_mamba2  = false;
 
     // PXQN revision 1 (ggml-pxqn.h): the rotation contract of the file, from pxa.pxqn.*.
     // pxqn_rev 0 = not a PXQN file (no key); pxqn_rot_sites = OR of PXQN_SITE_BIT(site) of the
@@ -188,6 +201,33 @@ struct llama_hparams {
     float    dsv4_hc_eps             = 0.0f;
     // per-layer attention regime: 0 = raw SWA, 4 = CSA + lightning indexer, 128 = HCA
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
+
+    // DeepSeek-V4.1 (deepseek41). dsv4_compress_ratios above holds the V4.1 schedule too
+    // (0 = raw SWA, 2 = CSA2 encoder layers, 1 = decoder layers reading the source KV).
+    // Source sets are per-layer flags; the *_layers arrays keep the GGUF order.
+    static constexpr uint32_t DSV41_MAX_SRC = 16;
+    uint32_t dsv41_n_kv_source      = 0;
+    uint32_t dsv41_n_index_source   = 0;
+    uint32_t dsv41_n_dspark_targets = 0;
+    uint32_t dsv41_n_engram         = 0;
+    std::array<uint32_t, DSV41_MAX_SRC> dsv41_kv_source_layers     = {};
+    std::array<uint32_t, DSV41_MAX_SRC> dsv41_index_source_layers  = {};
+    std::array<uint32_t, DSV41_MAX_SRC> dsv41_dspark_target_layers = {};
+    std::array<uint32_t, DSV41_MAX_SRC> dsv41_engram_layers        = {};
+    std::array<uint64_t, DSV41_MAX_SRC> dsv41_engram_rows          = {};
+    std::array<bool, LLAMA_MAX_LAYERS> dsv41_is_kv_source    = {};
+    std::array<bool, LLAMA_MAX_LAYERS> dsv41_is_index_source = {};
+    std::array<bool, LLAMA_MAX_LAYERS> dsv41_is_engram       = {};
+    uint32_t dsv41_cand_block_size   = 0;  // attention.candidate_block_size (8)
+    uint32_t dsv41_cand_topk_blocks  = 0;  // attention.candidate_topk_blocks (2048)
+    uint32_t dsv41_cand_source_layer = 0;  // attention.candidate_source_layer_id (20)
+    bool     dsv41_engram_present    = false;
+    uint32_t dsv41_engram_head_dim   = 0;
+    uint32_t dsv41_engram_n_heads    = 0;
+    uint32_t dsv41_engram_max_ngram  = 0;
+    uint32_t dsv41_engram_vocab      = 0;
+    uint32_t dsv41_engram_cvocab     = 0;
+    uint32_t dsv41_engram_pad_id     = 0;
 
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
@@ -287,6 +327,7 @@ struct llama_hparams {
         if (this->ssm_d_state != other.ssm_d_state) return true;
         if (this->ssm_dt_rank != other.ssm_dt_rank) return true;
         if (this->ssm_n_group != other.ssm_n_group) return true;
+        if (this->ssm_mamba2  != other.ssm_mamba2)  return true;
         if (this->recurrent_layer_arr != other.recurrent_layer_arr) return true;
 
         if (this->dec_start_token_id != other.dec_start_token_id) return true;
@@ -380,6 +421,12 @@ struct llama_hparams {
     }
 
     uint32_t n_embd_v_s() const { // dimension of the recurrent state embeddings
+        if (ssm_mamba2) {
+            // PXA Nemotron port: Mamba-2 row = conv state (d_conv - 1) * (d_inner + 2*n_group*d_state)
+            //                     + scan state d_state * d_inner (head_dim * n_head == d_inner)
+            const uint32_t conv_dim = ssm_d_inner + 2 * ssm_n_group * ssm_d_state;
+            return (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * conv_dim + ssm_d_state * ssm_d_inner;
+        }
         if (ssm_n_group > 0) {
             // qwen3next recurrent state packs:
             // 1) conv state: (d_conv - 1) * (2 * key_dim + value_dim)

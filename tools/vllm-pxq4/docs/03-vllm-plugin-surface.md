@@ -271,7 +271,7 @@ FACT `qwen3_5.py:127-157`: `_uses_split_gdn_input_projections(quant_config)` col
 ```python
 self.ignored_layers = ["linear_attn.in_proj_b", "linear_attn.in_proj_a"]
 ```
-Effect (`qwen3_5.py:207-244`): `in_proj_qkvz` becomes `output_sizes=[key_dim,key_dim,value_dim,value_dim]` (2048/2048/6144/6144 → 512/512/1536/1536 at TP=4, all multiples of 64 ✓) and `in_proj_ba` becomes a separate `MergedColumnParallelLinear(output_sizes=[48,48])` for which `get_quant_method` returns `UnquantizedLinearMethod()`. Without this the fused layer carries two 48-row shards (12 rows/rank at TP=4) and PXQ4 panel sharding is impossible for it.
+Effect (`qwen3_5.py:207-244`): `in_proj_qkvz` becomes `output_sizes=[key_dim,key_dim,value_dim,value_dim]` (2048/2048/6144/6144 → 512/512/1536/1536 at TP=4, all multiples of 64 ok) and `in_proj_ba` becomes a separate `MergedColumnParallelLinear(output_sizes=[48,48])` for which `get_quant_method` returns `UnquantizedLinearMethod()`. Without this the fused layer carries two 48-row shards (12 rows/rank at TP=4) and PXQ4 panel sharding is impossible for it.
 `packed_modules_mapping` for checkpoint naming is at `qwen3_5.py:665-675` / `823-826`: `qkv_proj←[q_proj,k_proj,v_proj]`, `gate_up_proj←[gate_proj,up_proj]`, `in_proj_qkvz←[in_proj_qkv,in_proj_z]`, `in_proj_ba←[in_proj_b,in_proj_a]` — the offline converter must emit the *unfused* names.
 
 ### 6.4 Things that will silently break us

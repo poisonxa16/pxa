@@ -72,6 +72,11 @@ unchanged. The reply carries `X-PXA-Thinking` (family, notes) so you can see wha
   answer follows. Per request: `thinking_budget_tokens`; per server: `--reasoning-budget`. It only
   arms when the engine's chat handler knows the thinking tags of that template (the generic
   `<think>` parser, Gemma 4, Ministral/Magistral, Kimi, DeepSeek V3.2, Cohere2 MoE, LFM2).
+  A budget larger than the slot's room after the prompt is fitted to that room minus an answer
+  reserve of min(1024, room/4) tokens: with `-c 4096` and `--reasoning-budget 128000` the thought
+  closes after about 3,000 tokens instead of running into the context end, where a context shift
+  drops the question and the reply ends with no answer (bug #361/#362). Budgets that fit, and -1,
+  are unchanged; the server logs the fit per request. Off switch: `PXA_RBUDGET_FIT_CTX=0`.
 - **template**: the model's own budget kwarg (Seed-OSS `thinking_budget`).
 - **guard**: nothing can stop the thinking early (gpt-oss and Muse-Glimmer: the engine's handler
   has no thinking tags; Granite, Hermes, Nemotron v1). PXA Control caps `max_tokens` at
@@ -140,7 +145,7 @@ Notes:
 | GLM-5.3-Flash-PXQU-pxq2 | `glm5-effort` | effort | 8192 | engine |
 | Muse-Glimmer-30B-Abliterated-PXQ4, Muse-Glimmer-30B-Abliterated-Q8_0, Muse-Glimmer-30B-PXQ3, Muse-Glimmer-30B-PXQ4, Muse-Glimmer-30B-UD-Q4_K_XL | `muse-glimmer` | effort | 4096 | guard |
 | dflash-kquant | `muse-glimmer` | effort | 2048 | guard |
-| Llama-3.1-Nemotron-Nano-8B-v1-BF16, Llama-3.1-Nemotron-Nano-8B-v1-Q8_0, Llama-3.1-Nemotron-Nano-8B-v1-pxqn4-ladder-ldlq, Llama-3.1-Nemotron-Nano-8B-v1-pxqn4-ladder.skel | `nemotron-detailed` | system | 2048 | guard |
+| Llama-3.1-Nemotron-Nano-8B-v1-BF16, Llama-3.1-Nemotron-Nano-8B-v1-Q8_0, Llama-3.1-Nemotron-Nano-8B-v1-pxqn4-ladder.skel | `nemotron-detailed` | system | 2048 | guard |
 | Fusion-Coder-80-PXQ6-P100-262k, Huihui-Qwen3-Coder-30B-A3B-Instruct-abliterated.i1-Q3_K_M, Huihui-Qwen3-Coder-Next-abliterated.i1-Q5_K_M, Qwen2.5-VL-7B-Instruct-Q4_K_M, Qwen3-30B-A3B-Instruct-2507-abliterated-Q3_K_M, Qwen3-4B-Instruct-2507-Q4_K_M … (+12) | `none` | none | — | none |
 | OrionLLM.GRM-3.2-Sky.Q8_0.mtp, PXA-Coder-35B-recovered-f16, PXA-Coder-35B-v2-PXQ4, PXA-Coder-35B-v2-f16 | `pxa-froggeric` | kwarg | 4096 | engine |
 | PXA-Agent-9B-PXQ4, PXA-Agent-9B-f16, cliff9b-recovered-q8 | `pxa-froggeric` | kwarg | 2048 | engine |

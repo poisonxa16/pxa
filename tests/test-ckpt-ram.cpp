@@ -22,6 +22,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#ifdef _WIN32
+#include "pxa-win-compat.h"   // setenv, unsetenv
+#endif
 
 static int fails = 0;
 

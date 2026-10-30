@@ -332,7 +332,7 @@ pxa-update rollback   # switch back to the previous version
 
 `apply` unpacks into a new folder and then switches the `current` link. The previous folder stays. `rollback` only moves that link. Stop any server started from this install first.
 
-Models, Control settings, and `*.expert-counts.csv` are not inside the folder that gets switched, and the updater refuses a download that contains them. There is no beta channel in v3.1. That comes later.
+Models, Control settings, and `*.expert-counts.csv` are not inside the folder that gets switched, and the updater refuses a download that contains them. Valued Supporters can opt in to a beta channel from the update window (Control, **Help**, **Update**) or with `pxa-update channel beta`, and go back with `pxa-update channel stable` followed by `pxa-update apply`; see [Beta channel](user/BETA-4.0.md).
 
 ### PXA Control opens by itself
 
@@ -358,7 +358,7 @@ it always has. `--control-port N` picks the port. It keeps three small things in
 so a reused process id is never mistaken for one), and `control.log` (what the background Control
 printed). A Control never starts another Control, and `pxa --bench` boots its test server without one.
 
-![PXA Control, Launch tab](assets/pxa-control-launch-dark.png)
+![PXA Control, Launch page (sample data)](assets/pxa-control-launch-dark.png)
 
 It needs Python 3 and nothing else: a standard-library HTTP server
 (`tools/pxa_control.py`) and one self-contained page (`tools/pxa_control_ui/`), with no
@@ -371,10 +371,12 @@ passes them to the launcher's own parser and `plan_and_build()`, the same code `
 and the terminal UI use. The Launch tab therefore shows the same evidence, refusals and command,
 and prints the `pxa-launch ...` line that would do the same thing from a shell.
 
+The pages of 4.0 (Home, Chat, Launch, Servers, Models, Encode, Benchmarks, GPU profiles, Live, Rig, Plugins, Store, in a side menu) are described one by one in [PXA Control 4.0](user/CONTROL-GUIDE-4.0.md). The table below is the reference for what each page collects and which launcher feature it drives. **Speed** is now called **Benchmarks**, and the lever list of the **Advanced** row is the **Advanced settings** section of Launch.
+
 | Tab | What it shows |
 |---|---|
 | **Servers** | The opening page: every llama-server on the machine, one card each. The servers this GUI manages (as many as you like, each with its own name, cards, model, port, levers and extra args, kept in `control.json`), plus the docker containers and bare processes started some other way (found from `docker ps`, the process table and `nvidia-smi`'s compute apps). Each card shows the state (loading, serving, stopped, exit code, "no output for N s" while loading), port, cards, VRAM per card, decode/prefill medians and requests from `/pxa/stats`, and its actions: Start, Stop, Restart, Log (live, with search and problems-only), Edit, Chat, Speed. A strip of the cards shows which server holds how much of each. Discovered servers are read-only. **Adopt** gives one a name; with *allow control* on, Stop/Start/Restart become available for that container, and each asks you to type the container's name. |
-| **Live** | What the servers and the cards are doing right now, with a history (5 min, 15 min or 1 h). One tile per server: state (idle, reading the prompt, writing), decode speed now (or of the last request when idle), prefill speed, busy slots with a progress bar for each, KV-cache fill, speculative draft acceptance and expert-cache hit rate when the server uses them. Charts, one line per server in the server's own colour (the same colour as on the Servers tab): decode speed, prefill speed per request, draft acceptance, expert-cache hit rate. A request timeline: one bar per request in a lane per server slot, the pale part is the prompt being read and the solid part the answer being written; hover a bar for prompt tokens (and how many were reused), prefill and decode speed and draft acceptance. A strip per card with memory, load, temperature (a line marks 80 °C) and power, and a chip for a power or thermal cap. Hover any chart for the exact values at that time; each chart has a table view. Axes start at zero or a fixed range, never auto-zoomed, one y axis per chart. Numbers come from `nvidia-smi` (one call per sample) and from each server's own `/slots`, `/props` and `/pxa/stats`; with `--metrics` on the server the speeds are exact engine counters, without it they are counted from slot progress. The sampler runs every 2 s with this tab open and every 10 s otherwise. Since v3.1 PXA Control also keeps the numbers on disk, page open or not (see *History on disk* below), and the 6 h, 24 h, 7 d, 30 d and 90 d buttons draw from that store, with CSV links for the shown range; without it (history off) the sampler runs only while PXA Control has a viewer, stops after 10 idle minutes and keeps 3 h in memory. A request's prompt text, which `/slots` carries, is dropped before it reaches the page and is never stored. |
+| **Live** | What the servers and the cards are doing right now, with a history (5 min, 15 min or 1 h, and longer ranges when older history exists). One tile per server: state (idle, reading the prompt, writing), decode speed now (or of the last request when idle), prefill speed, busy slots with a progress bar for each, KV-cache fill, speculative draft acceptance and expert-cache hit rate when the server uses them. Charts, one line per server in the server's own colour (the same colour as on the Servers tab): decode speed, prefill speed per request, draft acceptance, expert-cache hit rate. A request timeline: one bar per request in a lane per server slot, the pale part is the prompt being read and the solid part the answer being written; hover a bar for prompt tokens (and how many were reused), prefill and decode speed and draft acceptance. A strip per card with memory, load, temperature (a line marks 80 °C) and power, and a chip for a power or thermal cap. Hover any chart for the exact values at that time; each chart has a table view. Axes start at zero or a fixed range, never auto-zoomed, one y axis per chart. Numbers come from `nvidia-smi` (one call per sample) and from each server's own `/slots`, `/props` and `/pxa/stats`; with `--metrics` on the server the speeds are exact engine counters, without it they are counted from slot progress. The sampler runs every 2 s with this tab open and every 10 s otherwise. Since v3.1 PXA Control also keeps the numbers on disk, page open or not (see *History on disk* below), and the 6 h, 24 h, 7 d, 30 d and 90 d buttons draw from that store, with CSV links for the shown range; without it (history off) the sampler runs only while PXA Control has a viewer, stops after 10 idle minutes and keeps 3 h in memory. A request's prompt text, which `/slots` carries, is dropped before it reaches the page and is never stored. |
 | **Rig** | Every card: name, VRAM used/total, temperature, power, utilisation, PCIe link generation and width (a narrow link is flagged), and the processes resident on it. Also the driver and CUDA version, `/dev/shm` and the container kind, the engine build it found, and the `--doctor` findings in colour (red stops a launch, amber is a warning). Refreshed every 3 s. |
 | **Models** | The folders you add, remembered in `~/.config/pxa/control.json` (or `$XDG_CONFIG_HOME/pxa/`; `--models-dir` and `PXA_MODELS_DIR` add to it). One row per `.gguf` with the codec (PXQ / PXQN / other), the type (the PXQ tier from the tensor directory, else the dominant ggml type), parameters, size, family and arch, all read from the file's header the way the launcher reads it. **Fits on** badges come from the launcher's own VRAM check (`vram_check`: weights plus the KV estimate at one 4096-token slot, on idle cards) for your current pick, one card of each kind, and all cards of each kind. Click a row to use it. |
 | **Launch** | Cards, model, context, parallel slots, KV cache type, MTP on/off (`--spec mtp`), split mode auto/layer/tensor, flash attention auto/on/off (on = the chat/serve regime, off = long documents, which is how the launcher expresses it), port, serve on the network, `--accept-unmeasured`, `--allow-busy`. **Show plan** runs the decision and starts nothing. **Start / Restart / Stop** run the planned command the way the CLI does (the same environment, `CUDA_DEVICE_ORDER` pinned next to the card list); Stop sends SIGTERM to that PID, then kills it. The log streams live (server-sent events, falling back to polling), and the header shows the health (`/health`: loading, ok, down). **Presets** save the whole form by name into `control.json`. A **server** selector at the top picks which managed server the form edits (New, Save, Rename, Delete). The plan shows a fit verdict for the cards as they are now, any clash with another server's port or cards (refused before anything is spawned), lever warnings, and copy buttons for the exact shell line and the `pxa-launch` line. **Extra args** appends llama-server flags from an allow-list (`--alias`, `-t`, `-ot`, `--temp`, `--metrics` ...); flags that read or write files or change who can reach the server (`--path`, `--log-file`, `--host`, `--api-key`, `-m` ...) are refused. **Engine build** picks one of the llama-server builds found (`PXA_ENGINE_DIR`, `./build*/bin`, the checkout's `build*/bin`, the image's). |
@@ -383,12 +385,12 @@ and prints the `pxa-launch ...` line that would do the same thing from a shell.
 
 **Community high-score board.** After a benchmark, **Check the community high-score board** asks the PXA board (`bugs.pxanetwork.com`, through Cloudflare) for the record on your setup (card model, card count, model file, mode). Nothing is sent until you press it, and a score is only submitted on a second click, showing you the exact JSON first. Your **name** for the board is asked once; after the first submit it is kept in `~/.config/pxa/control.json` (`user_name`) and in the page's localStorage and pre-filled next time. Type another name to change it, clear the box to forget it. Each submitted score carries the numbers **and the settings that produced them**: card names and VRAM, card count, driver, engine version and commit, model file name, size, codec and tier, context, KV types, split mode, MTP on/off and `n_max`, batch and ubatch, flash attention, prompt class, reps, the greedy-512 hash and a timestamp. Never a file path, host name, address, API key or token: the board refuses a submission that contains anything shaped like one. Click a score in the "Community scores for this setup" table to see its settings. Scores are self-reported and not verified; implausible ones are rejected or held for review.
 | **Chat** | A prompt box that streams from the server's `/v1/chat/completions`: system prompt, temperature, max tokens, and a thinking toggle (`chat_template_kwargs.enable_thinking`). Replies are rendered as Markdown by a small built-in renderer (code, lists, bold, links). Each reply shows decode and prefill t/s from the server's own timings. A *Talk to* selector picks any server on the Servers page (it defaults to the first one that is serving). **Attach** points Chat and Speed at a server you started some other way, on a local port. |
-| **Encode** | A wizard that turns a Hugging Face model (or a local folder, or a BF16 / F16 / Q8_0 GGUF) into a PXQ or PXQN file: **Source** (size, architecture, whether PXA supports it, the model's licence), **Target** (which cards will run it; the tiers that fit with their measured quality class, file size, context and, where PXA has a measurement, decode speed), **Checks** (disk, RAM, graphics card, tools, licence key, a time estimate; a refusal is one plain sentence), **Run** (download, convert, quantize, then for PXQN: reference copy, skeleton, activation dump, Hessians, encode; a bar per stage, ETA, log, pause, cancel, resume after a crash or reboot) and **Done** (path, sha256, **Test it** in this GUI's server + benchmark, **Share your score**). See *The Encode tab* below. |
+| **Encode** | A wizard that turns a Hugging Face model (or a local folder, or a BF16 / F16 / Q8_0 GGUF) into a PXQ or PXQN file: **Source** (size, architecture, whether PXA supports it, the model's licence), **Target** (which cards will run it; the tiers that fit with their measured quality class, file size, context and, where PXA has a measurement, decode speed), **Checks** (disk, RAM, graphics card, tools, licence key, a time estimate; a refusal is one plain sentence), **Run** (download, convert, quantize, then for PXQN: reference copy, skeleton, activation dump, calibration statistics, encode; a bar per stage, ETA, log, pause, cancel, resume after a crash or reboot) and **Done** (path, sha256, **Test it** in this GUI's server + benchmark, **Share your score**). See *The Encode tab* below. |
 
 Dark theme by default, light on the sun button (remembered per browser). The layout works at
-phone width, with the tabs moving to a bottom bar.
+phone width, where the pages stack.
 
-![Chat on a phone, light theme](assets/pxa-control-chat-phone-light.png)
+![Chat on a phone, light theme (sample data)](assets/pxa-control-chat-phone-light.png)
 
 ### The Encode tab
 
@@ -492,7 +494,7 @@ server, real Hugging Face, one encode; not in CTest).
 - **No nvidia-smi** (a container with the compute driver only): the card list comes from NVML,
   else the CUDA driver API, in a child process.
 - The launcher's refusals are shown as they are. A busy card is refused (R-20) unless you tick
-  *Allow busy cards*, and an UNMEASURED branch unless you tick *Accept UNMEASURED*.
+  *Allow busy cards* (the desktop on a card that drives your display does not make it busy), and an UNMEASURED branch unless you tick *Accept UNMEASURED*.
 
 ### Thinking on/off
 
@@ -1310,9 +1312,10 @@ host and are bind-mounted at run time — `pip list` inside it shows pip and not
 else. Every number attributed to such a tag was really produced by the image
 **plus** those host paths.
 
-Those paths are site-local, so **none are hardcoded**. Declare them in a JSON
-descriptor and point `PXA_VLLM_HOST_ENV` at it. The paths in the example below are
-placeholders — use your own:
+Those paths are site-local. The launcher keeps this record, for the one tag it has
+measurements for, in its own image table, rooted at `PXA_HOST_ROOT` (default: the
+directory you run it from); it does not read a descriptor file named by an environment
+variable. The example below shows the shape of that record, with placeholder paths:
 
 ```json
 {"pxa-sm60-dev": {
@@ -1388,6 +1391,19 @@ engine removes that: those seats now run the measured card cell or the VRAM ladd
 P2P, the model file (size, arch, tier, KV heads, `pxa.*` provenance keys, sha256,
 checked against a `.sha256` file next to it when there is one) and the defaults the
 engine would pick with the reason for each. It starts nothing. `--no-sha` skips the hash.
+
+**Where the model sits (storage guard).** `--doctor` prints a `storage` row (the disk chain the model file is on and what
+the kernel says about it), and a model with a host-side per-layer table (Flash-Next: `per_layer_token_embd`, 51 GiB at Q8_0,
+33 GiB at Q5_0) gets a `DECISION !! ple-storage` line when that disk spins: the table is gathered row by row, every token reads
+~16 hashed rows, and a row outside the page cache is a seek - an early comparison on a spinning disk ran about 5x slower for exactly this.
+The disk is found from `/proc/self/mountinfo` (major:minor, or the `/dev/...` / `/dev/mapper/...` source for btrfs / LVM / LUKS),
+`/sys/dev/block/<maj:min>` and `queue/rotational` (a partition by its disk; md / LVM / dm-crypt by the disks under `slaves/`; a loop
+device by its backing file). In Docker the bind mount names the host disk; an overlay root cannot (the line says "cannot tell" and
+how to bind-mount); an Unraid user share is resolved to the disk or pool path that holds the file. Virtual disks often report
+rotational: `PXA_STORAGE_KIND=ssd` overrides, `hdd` forces the warning. Only a table of 4 GiB or more is concerned (smaller ones
+live in the page cache after one read). The bug report carries a `storage` field (device kind and chain, never a path). The fix is
+to move the file to an SSD / NVMe; an O_DIRECT row tier (`PXA_PLE_IO`) that needs no move is planned. `PXA_LAUNCH_FAKE_STORAGE=hdd|ssd|nvme`
+names a disk for fixtures and dry runs.
 
 ### 5b. Which split mode, and who chooses
 
@@ -1729,7 +1745,7 @@ Everything else warns:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--mmproj PATH` | auto | Vision projector. Auto-resolves **only** if the model carries vision tensors and exactly one candidate sits beside it; two or more is R-24. |
+| `--mmproj PATH` | auto | Vision projector. A model that carries vision tensors takes the one candidate beside it (two or more is R-24). A text GGUF (e.g. Gemma 4) takes a projector whose file name carries the model's name (`mmproj-<model>-f16.gguf` beside `<model>-<quant>.gguf`), or the only projector beside the only model file; several matches or no name match are never guessed (listed, not attached). An explicit `--mmproj` wins; `--no-mmproj` turns auto-find off. |
 | `--no-mmproj` | off | Suppress projector resolution. The launcher still lists what it *would* have found and states the instance is text-only. |
 
 ### Speculation
@@ -1798,7 +1814,7 @@ than enforced, because this process `exec`s the server and cannot observe it.
 | id | Refuses |
 |---|---|
 | **R-07** | Forced `--engine vllm` with **no eligible card**. Not a warning: with no eligible card the parallel degree collapses to 1, `CUDA_VISIBLE_DEVICES` is never set, and the server inherits **every GPU on the host**. |
-| **R-20** | A card with a resident process, or >512 MiB resident with no compute app listed. This may be a shared, live box. Escape: `--allow-busy`. |
+| **R-20** | A card another program is using: a compute program is running on it, or more than 512 MiB is in use with no program listed. On a card that drives a display (every Windows desktop card; on Linux when the driver reports an active display) the desktop's share, at most 1.5 GiB, is allowed on top of the 512 MiB: the graphics programs' own memory where the driver reports it, else what is in use (so such a card is refused above 2 GiB in use). A program that computes on the card is refused and named, including a graphics program that also computes with more than 512 MiB of its own. A seat restart script (the frozen command the launcher writes) is stricter on such a card: it stops when nvidia-smi lists any compute program with a memory number there, even a small one the launcher counts as part of the desktop; close that program, or start the seat from PXA Control with *Allow busy cards* ticked. The plan then sizes the model from the memory that is actually free. To start anyway: tick *Allow busy cards* in PXA Control, or `--allow-busy`. |
 | **R-29** | A PXQ4-converted vLLM directory when llama.cpp wins the instance — llama.cpp cannot read safetensors. Names *why* llama.cpp won. |
 
 ### Parameters that do not translate
@@ -1812,7 +1828,8 @@ than enforced, because this process `exec`s the server and cannot observe it.
 | **R-13V** | `--ctk`/`--ctv` with vLLM — no equivalent, would be silently dropped. |
 | **R-14** | `--spec mtp` with vLLM. No MTP drafter there, and ngram will **not** be substituted: on this model class the two have opposite verdicts (ngram +23.0% code; MTP −8.6%). Substituting a lever's meaning is worse than dropping it. |
 | **R-15A** | `mtp:n_max≥2` — a measured loss on both architectures. |
-| **R-15B** | `--spec mtp` on a file with **no** nextn/mtp tensors. Two shipped f16 files declare `nextn_predict_layers=1` with zero such tensors — the head was dropped in the pipeline and the flag survived. |
+| ~~R-15B~~ | (since 4.0 a note, not a refusal) `--spec mtp` on a file with **no** nextn/mtp tensors and no `nextn_predict_layers` in its header: the file was made without a draft head. The flag is dropped, one line says so (`MTP off: ...`), and the launch goes on as if `--spec` had not been given. |
+| ~~R-15C~~ | (since 4.0 a note, not a refusal) `--spec mtp` on a file whose header declares `nextn_predict_layers` but which has zero nextn/mtp tensors (the head was dropped when the file was made and the flag survived; some older releases). Same: the flag is dropped with one line, get the current file for MTP. |
 | **R-25** | `--draft-model` other than the Gemma 4 assistant file next to its target. That one case is measured (159-167 t/s on one V100, 85 of 104 drafts accepted). Every other file has zero coverage. Escape for those: `--accept-unmeasured` (llama.cpp only; no vLLM draft path is emitted at all). |
 
 ### Configuration and envelope
@@ -2204,9 +2221,9 @@ card count, and a table of medians per model and prompt size (<1k, 1-4k, 4-16k, 
 
 | Variable | Effect |
 |---|---|
-| `PXA_ENGINE_DIR` (alias `PXQ_ENGINE_DIR`) | Directory containing `bin/llama-server`. Wins over auto-detection — and if that build will not start, that is **reported**, never quietly stepped over. |
+| `PXA_ENGINE_DIR` | Directory containing `bin/llama-server`. Wins over auto-detection — and if that build will not start, that is **reported**, never quietly stepped over. |
 | `PXA_VLLM_IMAGE` | Same as `--vllm-image`. |
-| `PXA_VLLM_HOST_ENV` | Path to the JSON descriptor of site-local host runtimes. Unreadable or non-object content is reported and treated as **absent**, which refuses rather than proceeding on a half-read file. |
+| `PXA_HOST_ROOT` | The host directory the sidecar image's host runtime is bind-mounted from (the `requires` paths are checked under it). Default: the current directory. |
 | `PXA_PXQ4_LIB` | Bare-metal fallback probe; the `libpxq4_sm<cc>_v<n>.so` name supplies the arch set. |
 | `PXA_MODELS_DIR` | `:`-separated list of directories to search for models. Same as repeating `--models-dir`. |
 | `PXA_LAUNCH_STATE` | Where the launcher remembers the directory of your last launch and the last command. Default `~/.cache/pxa-launch`. Losing it costs you nothing but a re-typed `--models-dir`. |
@@ -2342,3 +2359,9 @@ If PXA Control sees a SearXNG on ports 8080 or 8888, or crawl4ai on 11235 or 808
 The same panel has a switch for this chat: turn web search off and the assistant neither searches nor opens pages.
 
 Privacy: your search words go to the provider you chose (DuckDuckGo or Bing for the built-in one, otherwise your SearXNG, Brave or Tavily), and a page you ask it to open is fetched from that site. Nothing is sent to PXA. Pages on your own network are only opened if you approve it.
+
+
+### Is the draft head really in the file? (`tools/pxa-mtp-audit.py`)
+
+Read-only audit of the GGUF header (KV block and tensor directory; nothing else is read) of local files, split files, or published files by HTTP range requests:
+`python3 tools/pxa-mtp-audit.py MODEL.gguf DIR/ ...`, `--url URL`, `--hf <account>`, `--manifest LIST.md`. It reports, per file, the architecture, `nextn_predict_layers`, and the number of nextn/mtp tensors, and flags: a header that declares a head the file does not carry (error), a file name, model card line or launcher preset that implies MTP while the file has no head (error), head tensors with no `nextn_predict_layers` (warning), and a name or card that says "no MTP" for a file that carries one (warning). Exit code 1 on any error (`--strict`: on warnings too). Gated repositories need `--hf-token-file`; the token is read from that path, sent to huggingface.co only, and never printed.

@@ -17,6 +17,9 @@
 #   DOCKERFILE   Dockerfile to build BUILD_IMAGE from if it does not exist locally (default:
 #                docker/Dockerfile.release-build next to this script's repo root).
 #   OUT_DIR      where the .tar.gz and .sha256 land (default: ./release-assets)
+#   ARCH_TAG     the "-sm..." part of the asset name. Unset = derived from CUDA_ARCHS (the manifest's cuda_archs_built,
+#                SASS entries): the arch-true name, plus a legacy "-sm60_61_70" alias with the same bytes and its own
+#                .sha256 when the list covers 60;61;70. Set = that name only, as given.
 #   TAG          version tag baked into the filename and VERSION file (default: git describe of REF)
 #   DEV_IMAGE    the container to run ldd/strip/objdump/patchelf inside for POST-PROCESSING the
 #                already-built binaries (default: BUILD_IMAGE if this run just self-built with
@@ -54,6 +57,9 @@
 #   llama-quantize llama-gguf-split                       shipped when they build
 #   three self-test binaries                              required
 # What lands next to bin/ and lib/:
+#   modulefiles/pxa/<ver>   `module use <package>/modulefiles; module load pxa/<ver>` (Environment Modules and Lmod;
+#                           packaging/modulefiles/pxa.tcl, self-locating). <ver> = TAG without a leading "v" (MODULE_VERSION
+#                           overrides).
 #   lib-compat/libggml.so   the compatibility build of libggml (see COMPAT_BUILD_DIR); lib-compat/libggml-pxqn.so is a hard link
 #                           to lib/'s (that library is plain x86-64 with a run-time AVX2 choice, so one file serves both)
 #   tools/convert_hf_to_gguf.py + tools/gguf-py/   the Hugging Face -> GGUF converter and the gguf python package of THIS
@@ -63,8 +69,8 @@
 #
 # Dry run: `scripts/make-release-tarball.sh --list-targets` prints the build targets and the bin
 # lists and exits, touching no git, no docker and no build directory.
-# `scripts/make-release-tarball.sh --selftest` checks the finished-tarball membership test on a
-# small archive. It does not compile, and it does not need docker.
+# `scripts/make-release-tarball.sh --selftest` checks the finished-tarball membership test and the
+# asset name (arch tag + legacy alias) on a small archive. It does not compile, and it does not need docker.
 #
 # Idempotent: reruns overwrite the same-named output tar/sha in OUT_DIR, and skip the build step
 # entirely once BUILD_DIR/bin/llama-server exists. Safe with NVIDIA_VISIBLE_DEVICES=none —
@@ -86,8 +92,15 @@ BUILD_IMAGE=${BUILD_IMAGE:-}
 OUT_DIR=${OUT_DIR:-./release-assets}
 DEV_IMAGE=${DEV_IMAGE:-}
 CUDA_MAJOR_MINOR=${CUDA_MAJOR_MINOR:-}
-ARCH_TAG=${ARCH_TAG:-sm60_61_70}
-CUDA_ARCHS=${CUDA_ARCHS:-60;61;70}
+# ARCH_TAG (asset name only; the real list is cuda_archs_built in the manifest). Unset = derived from CUDA_ARCHS, the list the
+# manifest writes as cuda_archs_built: the SASS entries (every one but NN-virtual), numeric, sorted, "_"-joined ->
+# "sm60_61_70_75_80_86_89". A release then ships under that arch-true name (pxa-update from RC2.3 on prefers it when the list
+# covers the local card) PLUS the legacy "-sm60_61_70" alias (same bytes, its own .sha256) for installed pxa-update copies
+# before RC2.3, which accept only the old name; the alias is written only when the list covers the 60;61;70 floor, and is
+# dropped in the release after RC2.3. An explicit ARCH_TAG (e.g. "sm60_61_70-ubuntu22.04") is used as given, with no alias.
+LEGACY_ARCH_TAG=sm60_61_70
+ARCH_TAG_EXPLICIT=${ARCH_TAG:+1}
+CUDA_ARCHS=${CUDA_ARCHS:-60-real;61-real;70-real;75-real;80-real;86-real;89}   # 10-20: SASS sm 60;61;70;75;80;86;89 (release floor = 60;61;70;75; RTX 30/40 load native code, no first-start JIT) + PTX only for compute_89 so newer cards still JIT
 COMPAT_BUILD_DIR=${COMPAT_BUILD_DIR:-${BUILD_DIR%/}-compat}
 SKIP_COMPAT=${SKIP_COMPAT:-}
 CCACHE_HOST_DIR=${CCACHE_HOST_DIR:-}
@@ -99,7 +112,7 @@ JOBS=${JOBS:-6}
 # THE RELEASE RECIPE, in one place: the fast build and the lib-compat build differ ONLY in the CPU flags. GGML_NATIVE=OFF is
 # not optional: ggml's default is -march=native of the machine that compiles, which puts that machine's AVX-512 (or anything
 # else) into a package other people run. The stubs link flags let a container without a driver link the CUDA driver symbols.
-RECIPE_COMMON="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHS\" -DCMAKE_BUILD_TYPE=Release -DGGML_SCHED_MAX_COPIES=2 -DPXA_PXQN_ENCODER=OFF -DPXA_LOCK_PUBKEYS=pxl-2026-10:e0cd04be16b884fabac90f4843d4a0590f3962b0b1d13d96aa5df70b9a160cb1 -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DCMAKE_EXE_LINKER_FLAGS=\"-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs\" -DCMAKE_SHARED_LINKER_FLAGS=\"-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs\""
+RECIPE_COMMON="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHS\" -DCMAKE_BUILD_TYPE=Release -DGGML_SCHED_MAX_COPIES=2 -DPXA_PXQN_ENCODER=OFF -DPXA_LOCK_PUBKEYS=pxl-2026-10:e0cd04be16b884fabac90f4843d4a0590f3962b0b1d13d96aa5df70b9a160cb1 -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DPXA_RELEASE_BUILD=ON -DCMAKE_EXE_LINKER_FLAGS=\"-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs\" -DCMAKE_SHARED_LINKER_FLAGS=\"-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs\""
 RECIPE_FAST="$RECIPE_COMMON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
 RECIPE_COMPAT="$RECIPE_COMMON -DPXA_X86_COMPAT=ON"
 BUILD_TARGETS="llama-server llama-cli llama-bench llama-perplexity llama-quantize llama-pxq-export llama-imatrix llama-gguf-split test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
@@ -140,10 +153,55 @@ tar_has_member() {
   return "$rc"
 }
 
+# The arch-true asset tag for a CMAKE_CUDA_ARCHITECTURES list: SASS entries only (NN-real and plain NN; NN-virtual is PTX
+# only, no SASS), numbers sorted and de-duplicated, "_"-joined. "60-real;61-real;70-real;75-real;80-real;86-real;89" ->
+# "sm60_61_70_75_80_86_89". Fails (prints nothing) on an entry that is not two digits: pxa-update reads two-digit sms only,
+# so such a list needs an explicit ARCH_TAG.
+arch_tag_from_cuda_archs() {
+  local e n nums=()
+  local IFS=';'
+  for e in $1; do
+    e=${e// /}
+    [ -n "$e" ] || continue
+    case "$e" in *-virtual) continue ;; esac
+    n=${e%-real}
+    [[ "$n" =~ ^[0-9][0-9]$ ]] || { err "CUDA_ARCHS entry '$e' is not a two-digit sm: set ARCH_TAG explicitly"; return 1; }
+    nums+=("$n")
+  done
+  [ ${#nums[@]} -gt 0 ] || { err "CUDA_ARCHS '$1' has no SASS entry: set ARCH_TAG explicitly"; return 1; }
+  printf 'sm%s\n' "$(printf '%s\n' "${nums[@]}" | sort -n -u | paste -sd_)"
+}
+
+# True when a derived tag covers the legacy floor (60, 61 and 70) and is not the legacy tag itself: only then is the
+# legacy "-sm60_61_70" alias an honest name for the same bytes, and only then is it a second file.
+arch_tag_wants_alias() {
+  [ "$1" != "$LEGACY_ARCH_TAG" ] || return 1
+  case "_${1#sm}_" in *_60_*) ;; *) return 1 ;; esac
+  case "_${1#sm}_" in *_61_*) ;; *) return 1 ;; esac
+  case "_${1#sm}_" in *_70_*) ;; *) return 1 ;; esac
+}
+
+# Write OUT/ALIAS as a byte copy of OUT/NAME, with its own ALIAS.sha256 naming ALIAS. Refuses a copy that differs.
+write_legacy_alias() {
+  local out=$1 name=$2 alias=$3
+  [ -f "$out/$name" ] || { err "alias: $out/$name is missing"; return 1; }
+  rm -f "$out/$alias.partial"
+  cp -f -- "$out/$name" "$out/$alias.partial" || return 1
+  cmp -s -- "$out/$name" "$out/$alias.partial" || { err "alias: copy of $name differs"; rm -f "$out/$alias.partial"; return 1; }
+  mv -f -- "$out/$alias.partial" "$out/$alias" || return 1
+  ( cd "$out" && sha256sum "$alias" > "$alias.sha256" ) || return 1
+}
+
 # ---------------------------------------------------------------------------------------------
 # arguments. This script is configured by environment variables (above); the only flags it takes
 # are informational ones that run nothing.
 # ---------------------------------------------------------------------------------------------
+if [ -z "$ARCH_TAG_EXPLICIT" ]; then
+  ARCH_TAG=$(arch_tag_from_cuda_archs "$CUDA_ARCHS") || die "cannot name the asset from CUDA_ARCHS ($CUDA_ARCHS)"
+fi
+ALIAS_TAG=
+[ -z "$ARCH_TAG_EXPLICIT" ] && arch_tag_wants_alias "$ARCH_TAG" && ALIAS_TAG=$LEGACY_ARCH_TAG
+
 case "${1:-}" in
   --list-targets)
     echo "BUILD_TARGETS:          $BUILD_TARGETS"
@@ -152,10 +210,11 @@ case "${1:-}" in
     echo "bin/ self-tests:        $TEST_BIN"
     echo "bin/ optional:          $OPTIONAL_BIN"
     echo "CUDA archs:             $CUDA_ARCHS"
+    echo "asset arch tag:         $ARCH_TAG$([ -n "$ARCH_TAG_EXPLICIT" ] && echo " (explicit ARCH_TAG)")${ALIAS_TAG:+ + alias -$ALIAS_TAG (same bytes)}"
     echo "fast recipe:            $RECIPE_FAST"
     echo "lib-compat recipe:      $RECIPE_COMPAT (target ggml)"
     echo "lib-compat build dir:   $COMPAT_BUILD_DIR (built here if absent)"
-    echo "also staged:            tools/convert_hf_to_gguf.py tools/gguf-py/ tools/requirements-convert.txt tools/pxa-cpu-check.sh"
+    echo "also staged:            tools/convert_hf_to_gguf.py tools/gguf-py/ tools/requirements-convert.txt tools/pxa-cpu-check.sh modulefiles/pxa/<ver>"
     exit 0
     ;;
   --selftest)
@@ -191,13 +250,44 @@ PY
     if grep -nE 'tar -tzf[^|#]*\|[[:space:]]*grep -q' "$0" >/dev/null; then
       die "selftest: a tar listing is still judged with grep -q under pipefail"
     fi
+    # the asset name: derived from CUDA_ARCHS (the manifest's cuda_archs_built), alias only over the 60;61;70 floor
+    nt() { local got; got=$(arch_tag_from_cuda_archs "$1" 2>/dev/null) || got=FAIL; [ "$got" = "$2" ] || die "selftest: arch tag of '$1' is '$got', want '$2'"; }
+    nt "60-real;61-real;70-real;75-real;80-real;86-real;89" sm60_61_70_75_80_86_89
+    nt "89;86-real;60-real;70-real;61-real;75-real;80-real" sm60_61_70_75_80_86_89
+    nt "60-real;61-real;70-real" sm60_61_70
+    nt "60;61;70;70-real" sm60_61_70
+    nt "60-real;61-real;70-real;75-real;89-virtual" sm60_61_70_75
+    nt "86-real;89" sm86_89
+    nt "100-real;60-real" FAIL
+    nt "89-virtual" FAIL
+    nt "" FAIL
+    arch_tag_wants_alias sm60_61_70_75_80_86_89 || die "selftest: the 7-arch tag must get the legacy alias"
+    arch_tag_wants_alias sm60_61_70_75 || die "selftest: sm60_61_70_75 must get the legacy alias"
+    if arch_tag_wants_alias sm60_61_70; then die "selftest: the legacy tag must not alias itself"; fi
+    if arch_tag_wants_alias sm61_70_75; then die "selftest: a list without 60 must not get the legacy alias"; fi
+    if arch_tag_wants_alias sm60_70_75; then die "selftest: a list without 61 must not get the legacy alias"; fi
+    if arch_tag_wants_alias sm86_89; then die "selftest: a list without the floor must not get the legacy alias"; fi
+    if arch_tag_wants_alias sm60_61_700; then die "selftest: 700 is not 70"; fi
+    mkdir -p "$st/out"
+    true_name="pxa-vT-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz"
+    alias_name="pxa-vT-linux-x86_64-cuda12.8-sm60_61_70.tar.gz"
+    cp "$st/pkg.tar.gz" "$st/out/$true_name"
+    ( cd "$st/out" && sha256sum "$true_name" > "$true_name.sha256" )
+    write_legacy_alias "$st/out" "$true_name" "$alias_name" || die "selftest: alias write failed"
+    cmp -s "$st/out/$true_name" "$st/out/$alias_name" || die "selftest: alias bytes differ"
+    ( cd "$st/out" && sha256sum -c --quiet "$alias_name.sha256" && sha256sum -c --quiet "$true_name.sha256" ) \
+      || die "selftest: a .sha256 does not verify"
+    [ "$(cut -d' ' -f1 "$st/out/$alias_name.sha256")" = "$(cut -d' ' -f1 "$st/out/$true_name.sha256")" ] \
+      || die "selftest: alias and arch-true sha differ"
+    grep -q " $alias_name\$" "$st/out/$alias_name.sha256" || die "selftest: the alias .sha256 does not name the alias"
+    if write_legacy_alias "$st/out" "no-such.tar.gz" "x.tar.gz" 2>/dev/null; then die "selftest: alias of a missing file succeeded"; fi
     info "selftest ok"
     exit 0
     ;;
   -h|--help)
     sed -n '2,/^set -u$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
     echo "flags: --list-targets   print the build targets and the bin/ manifest, then exit"
-    echo "       --selftest       check tarball membership on a small archive, then exit"
+    echo "       --selftest       check tarball membership and the asset name / legacy alias on a small archive, then exit"
     exit 0
     ;;
   "") ;;
@@ -342,7 +432,7 @@ info "DEV_IMAGE (post-processing) = $DEV_IMAGE"
 # library loads, on ANY CPU without AVX2, for every binary. Built from REF in DEV_IMAGE: the compat library has to be the
 # same commit and the same compiler as the fast one, or the symbol-table check below refuses it.
 #
-# ccache + nvcc (impl ccache-nvcc-host-flags-key): ccache's key for an nvcc compile does not see the host flags that arrive
+# ccache + nvcc: ccache's key for an nvcc compile does not see the host flags that arrive
 # through -Xcompiler, so a compat CUDA object would be served the fast build's AVX2 object out of a shared cache. The cmake
 # option puts a marker header into every compat CUDA translation unit (ggml/src/pxa-x86-compat.h); the objdump scan below is
 # the proof that it worked, and the reason a cache can never smuggle an AVX2 object into lib-compat/.
@@ -388,6 +478,7 @@ git -C "$REPO_ROOT" archive "$COMMIT" | tar -x -C "$EXPORT"
 req() { [ -e "$EXPORT/$1" ] || die "REF $REF is missing required path: $1"; }
 req tools/pxa-launch.py
 req tools/pxa-cpu-check.sh
+req packaging/modulefiles/pxa.tcl
 req scripts/pxa-isa-scan.py
 req scripts/make-convert-requirements.sh
 req convert_hf_to_gguf.py
@@ -405,7 +496,10 @@ req LICENSE
 req LICENSING.md
 req README.md
 
-if [ -f "$EXPORT/RELEASE-NOTES-v3.1.md" ]; then
+if [ -f "$EXPORT/RELEASE-NOTES-v4.0.md" ]; then     # 4.0 ships its own notes (the licd beta publish refuses a v3.x-only package)
+  RELNOTES=$EXPORT/RELEASE-NOTES-v4.0.md
+  [ -f "$EXPORT/RELEASE-NOTES-v3.1.md" ] && keep_v31=1    # README and the docs still link the v3.1 notes
+elif [ -f "$EXPORT/RELEASE-NOTES-v3.1.md" ]; then
   RELNOTES=$EXPORT/RELEASE-NOTES-v3.1.md
 else
   RELNOTES=$(ls "$EXPORT"/RELEASE-NOTES-*.md 2>/dev/null | sort | tail -1)
@@ -448,8 +542,8 @@ done
 # The binary is not committed; the source is tools/pxa-update.c.
 [ -f "$EXPORT/tools/pxa-update.c" ] || die "tools/pxa-update.c is missing; bin/pxa-update must be in every release tarball"
 info "building pxa-update"
-docker run --rm --name "pxq-pkg-update-$$" -v "$EXPORT":/src -v "$STAGE":/stage "$DEV_IMAGE" \
-  gcc -O2 -o /stage/bin/pxa-update /src/tools/pxa-update.c \
+docker run --rm --name "pxq-pkg-update-$$" --entrypoint gcc -v "$EXPORT":/src -v "$STAGE":/stage "$DEV_IMAGE" \
+  -O2 -o /stage/bin/pxa-update /src/tools/pxa-update.c \
   || die "could not build pxa-update"
 [ -x "$STAGE/bin/pxa-update" ] || die "bin/pxa-update was not staged"
 
@@ -480,6 +574,10 @@ fi
 if grep -q '^PXA_PXQN_CLOSED_SRC:BOOL=ON' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null; then
   [ -f "$STAGE/lib/libggml-pxqn.so" ] || die "PXA_PXQN_CLOSED_SRC=ON build but no ggml/src/libggml-pxqn.so to ship (build target ggml-pxqn)"
   info "shipping lib/libggml-pxqn.so (closed PXQN library, loaded by libggml from lib/)"
+  # its terms travel with it (the licence allows copies only together with this file), next to LICENSE as in the
+  # Windows zip; LICENSING.md links docs/LICENSE-ggml-pxqn.txt, staged below by keep_doc (2026-10-19)
+  [ -f "$EXPORT/docs/LICENSE-ggml-pxqn.txt" ] || die "libggml-pxqn.so ships but docs/LICENSE-ggml-pxqn.txt is absent from REF $REF"
+  cp -a "$EXPORT/docs/LICENSE-ggml-pxqn.txt" "$STAGE/LICENSE-ggml-pxqn.txt"
 fi
 
 LDD_SCRIPT='
@@ -679,7 +777,9 @@ if [ -r "$HERE/tools/pxa-cpu-check.sh" ]; then
   . "$HERE/tools/pxa-cpu-check.sh"
   pxa_cpu_pick "$HERE/lib-compat" || exit 1
 fi
-exec python3 "$HERE/tools/pxa-launch.py" "$@"
+# No __pycache__ inside the package (review N3): PXA Control and its python children write no bytecode next to tools/.
+export PYTHONDONTWRITEBYTECODE=1
+exec python3 -B "$HERE/tools/pxa-launch.py" "$@"
 WRAP
 chmod +x "$STAGE/pxa-launch"
 
@@ -714,7 +814,7 @@ if [ "$pxa_control" = 0 ]; then
 fi
 if [ "$pxa_control" = 1 ] && [ "${PXA_CONTROL:-}" != "0" ] && [ -f "$HERE/tools/pxa-launch.py" ] \
    && command -v python3 >/dev/null 2>&1; then
-  PXA_ENGINE_DIR="${PXA_ENGINE_DIR:-$HERE}" python3 "$HERE/tools/pxa-launch.py" --control-for-pid $$ || true
+  PXA_ENGINE_DIR="${PXA_ENGINE_DIR:-$HERE}" PYTHONDONTWRITEBYTECODE=1 python3 -B "$HERE/tools/pxa-launch.py" --control-for-pid $$ || true
 fi
 exec "$HERE/bin/llama-server" "$@"
 WRAP
@@ -722,6 +822,13 @@ chmod +x "$STAGE/run-server.sh"
 # `pxa` is the short name of pxa-launch: with no arguments at a terminal it opens PXA Control in the
 # browser (the text menu is `pxa --tui`); with a model and cards it starts that server.
 ln -sf pxa-launch "$STAGE/pxa"
+
+# `module load pxa/<ver>` on clusters (Environment Modules / Lmod): one self-locating Tcl modulefile, the same for every
+# version; the file NAME is the version it reports. It finds this package from its own path (tests/test-modulefile.sh).
+MODULE_VERSION=${MODULE_VERSION:-${TAG#v}}
+mkdir -p "$STAGE/modulefiles/pxa"
+cp "$EXPORT/packaging/modulefiles/pxa.tcl" "$STAGE/modulefiles/pxa/$MODULE_VERSION"
+chmod 644 "$STAGE/modulefiles/pxa/$MODULE_VERSION"
 
 mkdir -p "$STAGE/tools"
 cp -a "$EXPORT/tools/pxa-launch.py" "$STAGE/tools/pxa-launch.py"
@@ -758,7 +865,7 @@ sh "$EXPORT/scripts/make-convert-requirements.sh" "$EXPORT/requirements" > "$STA
   || die "could not render tools/requirements-convert.txt (scripts/make-convert-requirements.sh)"
 # PXA Control (pxa-launch --gui): the web front end, its page, the bench prompts it reuses and the
 # lever catalog its Advanced panel validates against (found at tools/../common/ by pxa_control.py).
-for f in pxa_control.py pxa_telemetry.py pxa_mqtt.py pxa-bench.py pxa_explain_footer.py pxa_thinking.py pxa_thinking_profiles.json pxa_encode.py pxa_encode_adapter.py pxa_encode_pkg.py pxa_encode_plan.py pxa_encode_cells.json; do
+for f in pxa_control.py pxa_hf.py pxa_telemetry.py pxa_mqtt.py pxa-bench.py pxa_explain_footer.py pxa_thinking.py pxa_thinking_profiles.json pxa_encode.py pxa_encode_adapter.py pxa_encode_pkg.py pxa_encode_plan.py pxa_encode_cells.json; do
   if [ -f "$EXPORT/tools/$f" ]; then cp -a "$EXPORT/tools/$f" "$STAGE/tools/$f"; fi
 done
 # `pxa-update lib check|apply|rollback` hands over to tools/pxa_lib_update.py, which verifies the signed library release
@@ -774,13 +881,24 @@ done
 # tools/pxa_mqtt.py is the Home Assistant publisher PXA Control imports (guarded, so the module may be
 # absent, but every release carries it: the HA settings panel is part of the shipped page -- main's rule
 # is that a new tools file is named in BOTH lists, this fatal one and the loop above).
-for f in pxa_expert_map.py pxa_mqtt.py pxa_lib_update.py pxa_encode_pkg.py; do
+# tools/pxa_engine_update.py is the engine beta channel (`pxa-update --channel beta`, Valued Supporters): same rule.
+for f in pxa_expert_map.py pxa_mqtt.py pxa_lib_update.py pxa_engine_update.py pxa_encode_pkg.py; do
   cp -a "$EXPORT/tools/$f" "$STAGE/tools/$f" || die "tools/$f is missing from the build tree; a shipped tool imports it"
 done
 [ -s "$STAGE/tools/pxa_lib_update.py" ] && [ -s "$STAGE/tools/pxa_encode_pkg.py" ] || die "the library updater did not survive staging"
+[ -s "$STAGE/tools/pxa_engine_update.py" ] || die "the engine channel updater did not survive staging"
 if [ -d "$EXPORT/tools/pxa_control_ui" ]; then
   cp -a "$EXPORT/tools/pxa_control_ui" "$STAGE/tools/pxa_control_ui"
 fi
+# PXA Control is a package since the Control hardening pass (tools/pxa_control/: core, auth, bridge, routes, server, desktop,
+# plugins/, store/); tools/pxa_control.py above is its compatibility shim. Fatal: the launcher imports the package.
+mkdir -p "$STAGE/tools/pxa_control" && cp -a "$EXPORT/tools/pxa_control" "$STAGE/tools/" \
+  || die "tools/pxa_control/ (the PXA Control package) is missing from the build tree"
+find "$STAGE/tools/pxa_control" -name __pycache__ -prune -exec rm -rf {} +
+[ -s "$STAGE/tools/pxa_control/core.py" ] || die "the PXA Control package did not survive staging"
+# Plugins never ship in the package (security review F4b, plugins plan S9; owner 2026-10-21: no plugin in any package,
+# Anibal included): they reach a computer only as a signed .pxp through the grant-bound Store download. The guard runs
+# on the finished stage, right before the clean-package gate below (plugin_leak_guard).
 if [ -d "$EXPORT/tools/pxa_ctl" ]; then        # the Profiles tab's backend package
   mkdir -p "$STAGE/tools/pxa_ctl" && cp -a "$EXPORT/tools/pxa_ctl/"*.py "$STAGE/tools/pxa_ctl/"
 fi
@@ -839,9 +957,9 @@ cp -a "$EXPORT/bench/fair/." "$STAGE/bench/fair/"
 # it -- and it was absent from the Sep-9 package only because that run had not happened yet. The
 # scan result is the provenance: Sep-9 hits=0, Sep-11 hits=11, same script, different file.
 #
-# Sanitizing the file would be the wrong fix -- it is rewritten by every gate run, so the leak
-# returns with the next one. Withholding it is durable. A package's gate result still reaches
-# users through START-HERE.md and the manifest.
+# run-gate.sh now redacts /mnt, /root, /home, /boot and the hostname as it writes
+# LAST-RUN.md, so a later sed is not required and the next run does not put the paths
+# back. Ship a record when the tree has one, and refuse one that is still dirty.
 # keep() asserts the OUTCOME, not the command. As first written it checked that the file existed at
 # REF and then ran `cp -a` without ever looking at the result -- and that copy failed for all three
 # prompts, because the mkdir near the top of this script creates bench/gate/ but NOT
@@ -861,12 +979,21 @@ keep bench/gate/run-gate.sh
 keep bench/gate/prompts/coherence.txt
 keep bench/gate/prompts/needle20801.txt
 keep bench/gate/prompts/needle3121.txt
+# Written redacted by run-gate.sh. Absent is fine (no gate has been recorded on this
+# tree). Present and dirty is a failed package: the runner did not redact at write time.
+for _lastrun in bench/gate/LAST-RUN.md bench/gate/LAST-RUN-pascal.md; do
+  [ -e "$EXPORT/$_lastrun" ] || continue
+  if grep -aE '/mnt/|/root(/|$)|/home/|/boot(/|$)' "$EXPORT/$_lastrun" >/dev/null; then
+    die "$_lastrun still has a build-machine path; run-gate.sh must redact it as it writes"
+  fi
+  keep "$_lastrun"
+done
 
 # The Overdrive preset (main #16694, 2026-10-09).  docs/COOKBOOK.md's "1x P100 -- Flash-Next Overdrive"
 # recipe tells the user to load this file as the server environment, so a package without it ships a
-# recipe whose first line names nothing.  Kept by EXACT PATH, not by a presets/* glob: the file names the
-# closed PXQN levers verbatim, and the gates that sweep shipped text for those names
-# (post-build-gates.sh gate 6, check-public-tree-v31.sh rule f) allow this one path and nothing else.
+# recipe whose first line names nothing.  Kept by EXACT PATH, not by a presets/* glob.  Since pass 8h
+# (2026-10-18) it no longer names the closed PXQN levers: PXA_OVERDRIVE_LIB=1 has the engine set
+# them, and the text closed-lever guard below refuses any shipped text file that names one.
 # The public TREE omits it (PUBLIC-OMIT-v31.txt); the package is where a user needs it.
 keep presets/pxa-overdrive-flashnext-pxqn2-1xp100.env
 
@@ -917,12 +1044,20 @@ keep_doc docs/DEFAULTS.md
 keep_doc docs/THINKING.md
 # Named by the README (v3.1): the Home Assistant REST sensors and the MQTT page.
 keep_doc docs/HOME-ASSISTANT.md
+# 4.0 beta 2 user pages. The Control guide links the other three; guide 10 links the report page.
+keep_doc docs/user/CONTROL-GUIDE-4.0.md
+keep_doc docs/user/BETA-4.0.md
+keep_doc docs/user/REPORT-A-PROBLEM.md
+keep_doc docs/user/MODEL-QUICKSTART-4.0.md
+keep_doc docs/install.md          # README and the Control guide link it: Linux, Docker, Windows and Mac install steps
 # PXQN ships compiled-only: the shipped lever docs are the public page, never the lab table
 python3 "$EXPORT/scripts/pxa-thin-pxqn-docs.py" "$STAGE" --allow-missing || die "PXQN doc thinning failed (scripts/pxa-thin-pxqn-docs.py)"
 keep_doc docs/QUANTIZING.md
 keep_doc docs/PXQU-CONVERT.md
 keep_doc docs/PXA-SM70-SERVING.md
+keep_doc docs/SM75.md            # Turing (sm_75) notes, linked from BUILD-FROM-SOURCE.md
 keep_doc BUILD-FROM-SOURCE.md
+keep_doc BUILD-CONTROL.md          # the compiled PXA Control builds (README links it)
 keep_doc bench/README.md
 keep_doc RELEASE-NOTES-2026-09-02.md
 keep_doc RELEASE-NOTES-2026-09-07.md
@@ -968,10 +1103,17 @@ keep_doc bench/fair-battle.svg
 # linked from any shipped doc, so it stays out, and a lone README with its siblings absent is the
 # smaller cost than a dead link in a shipped table.
 keep_doc docs/VLLM.md
+# Named by the dead-link guard (pass 5, 2026-10-17): docs/LEVERS.md and docs/lab/LEVERS.md point at docs/speculative.md
+# (already public). The V100 SXM2 TP4 field report is not published yet: its VLLM.md table row ships as plain text.
+keep_doc docs/speculative.md
+# docs/LEVERS.md is a dereferenced copy of docs/lab/LEVERS.md: the lab copy sits one level down
+sed -i -E 's#\]\(speculative\.md#](../speculative.md#g' "$STAGE/docs/lab/LEVERS.md"
+sed -i -E 's#\[`docs/FIELD-REPORT-V100-SXM2-TP4\.md`\]\(FIELD-REPORT-V100-SXM2-TP4\.md\)#`docs/FIELD-REPORT-V100-SXM2-TP4.md` (not in this package)#g' "$STAGE/docs/VLLM.md"
 keep_doc docs/PXA-SM60-SERVING.md
 keep_doc docs/QWEN4EXP-PXQ4.md
 keep_doc tools/vllm-pxq4/README.md
-keep_doc docs/PXQ4-KERNELS.md   # was pxa/pxq4/README.md: a pxa/ directory in the tarball would collide with the ./pxa launcher
+keep_doc tools/vllm-pxq4/LICENSE-NOTICE.md   # the Apache-2.0 notice LICENSING.md points to (shipped vllm-sidecar code)
+# docs/PXQ4-KERNELS.md (the kernel-library build notes) stays in git: kernel sources and their build notes do not ship.
 
 # Added 2026-09-27, named by the dead-link guard on
 # the v2026.10 docs pass: README.md picked up five new cross-references (MODELS.md,
@@ -984,11 +1126,14 @@ keep_doc docs/PXQ4-KERNELS.md   # was pxa/pxq4/README.md: a pxa/ directory in th
 # v2026.09.20) with only the version-pinned image tag bumped (v2026.09.20-rc4 -> v2026.10) --
 # not re-verified against v2026.10 line by line, since the last release already vetted them.
 keep_doc NOTICE
+# LICENSING.md's PXQN library row links it (2026-10-19)
+keep_doc docs/LICENSE-ggml-pxqn.txt
 keep_doc MODELS.md
 keep_doc RELEASE-NOTES-2026-09-20.md
 # Named by the dead-link guard (2026-10-08): README.md still links the v3 notes,
 # and the v3.1 picker no longer auto-stages RELEASE-NOTES-v3.md.
 keep_doc RELEASE-NOTES-v3.md
+[ -z "${keep_v31:-}" ] || keep_doc RELEASE-NOTES-v3.1.md
 keep_doc docker/COMPOSE.md
 keep_doc docker/docker-compose.yml
 keep_doc docker/.env.example
@@ -1020,6 +1165,7 @@ for f in "$STAGE/docs/README.md" "$STAGE/docs/$(basename "$RELNOTES")"; do
     -e 's#\]\(bench/#](../bench/#g' \
     -e 's#\]\(RELEASE-NOTES-#](../RELEASE-NOTES-#g' \
     -e 's#\]\(BUILD-FROM-SOURCE\.md\)#](../BUILD-FROM-SOURCE.md)#g' \
+    -e 's#\]\(BUILD-CONTROL\.md\)#](../BUILD-CONTROL.md)#g' \
     -e 's#\]\(docker/#](../docker/#g' \
     -e 's#\]\(MODELS\.md\)#](../MODELS.md)#g' \
     -e 's#\]\(NOTICE\)#](../NOTICE)#g' \
@@ -1043,13 +1189,12 @@ done
 #  (2) PATHS. 09-07 names the absolute path of the profiler output behind the PASCAL-DECODE-GAP
 #      numbers, and the leak guard below refuses to tar any stage carrying /mnt -- correctly.
 #
-# Sanitizing is the WRONG fix for a file a gate run rewrites (see the LAST-RUN.md note above): the
-# leak returns with the next run. These three are frozen history that no run regenerates, so the
-# prefix is the only thing that has to go and the reference keeps its meaning without it.
+# These three notes are frozen history that no gate run regenerates, so a build-machine
+# prefix in them is replaced here and the reference keeps its meaning without it.
 #
-# LAST-RUN.md is deliberately NOT repointed at some other file: this script withholds it on purpose
-# (build-machine paths + internal model filenames), so the sentence that names it is DE-LINKED and
-# left as prose, which is what it is -- a pointer to an artifact that is not ours to publish.
+# LAST-RUN.md is written redacted by run-gate.sh and is shipped (see the keep above), so a
+# root note's ../bench/gate/LAST-RUN.md link is repointed at bench/gate/LAST-RUN.md inside
+# the package instead of being stripped.
 for f in "$STAGE"/RELEASE-NOTES-*.md; do
   [ -f "$f" ] || continue
   grep -q -e '/mnt/' -e '/boot/' -e '](COOKBOOK.md)' -e '](KNOWN-ISSUES.md)' -e '](VLLM.md)' \
@@ -1058,7 +1203,7 @@ for f in "$STAGE"/RELEASE-NOTES-*.md; do
     -e 's#\]\(COOKBOOK\.md\)#](docs/COOKBOOK.md)#g' \
     -e 's#\]\(KNOWN-ISSUES\.md\)#](docs/KNOWN-ISSUES.md)#g' \
     -e 's#\]\(VLLM\.md\)#](docs/VLLM.md)#g' \
-    -e 's#\[`bench/gate/LAST-RUN\.md`\]\(\.\./bench/gate/LAST-RUN\.md\)#`bench/gate/LAST-RUN.md`#g' \
+    -e 's#\[`bench/gate/LAST-RUN\.md`\]\(\.\./bench/gate/LAST-RUN\.md\)#[`bench/gate/LAST-RUN.md`](bench/gate/LAST-RUN.md)#g' \
     -e 's#/mnt/[^ ,)]*#<build-machine path>#g' \
     -e 's#/boot/[^ ,)]*#<build-machine path>#g' \
     "$f"
@@ -1086,7 +1231,8 @@ CUDA_MAJOR_MINOR=${CUDA_MAJOR_MINOR:-unknown}
 CUOBJDUMP_ARCHES=$(dimg -v "$BUILD_DIR:/build:ro" -- \
   "cuobjdump --list-elf /build/ggml/src/libggml.so 2>/dev/null | grep -oE 'sm_[0-9]+' | sort -u -V" \
   2>/dev/null | tr '\n' ' ')
-CUOBJDUMP_ARCHES=${CUOBJDUMP_ARCHES:-"(cuobjdump unavailable or reported nothing; built for sm_${CUDA_ARCHS//;/, sm_}) "}
+_ARCHS_NUM=${CUDA_ARCHS//-real/}; _ARCHS_NUM=${_ARCHS_NUM//-virtual/}
+CUOBJDUMP_ARCHES=${CUOBJDUMP_ARCHES:-"(cuobjdump unavailable or reported nothing; built for sm_${_ARCHS_NUM//;/, sm_}) "}
 
 # The real minimum-OS requirement is a glibc/libstdc++ floor, NOT "any Linux x86_64" -- found the
 # hard way, packaging this very script: DEV_IMAGE's own base distro sets this floor (whatever
@@ -1109,11 +1255,10 @@ info "minimum libc floor: $GLIBC_FLOOR / $GLIBCXX_FLOOR"
 # VERSION ships to users, so it carries no path from the machine that built it: the build
 # directory is NAMED, not located, plus whether this script built it or was handed it.
 # Through rc1 this field was the absolute $BUILD_DIR, which told a reader nothing and named
-# a directory on my box.
+# a directory on my box. The ref (a branch name) is not written either: the commit names the source.
 cat > "$STAGE/VERSION" <<EOF
 tag:              $TAG
 commit:           $COMMIT
-ref:              $REF
 build_dir:        $(basename "$BUILD_DIR")$([ "$SELF_BUILT" = 1 ] && echo " (self-built by this script)" || echo " (supplied)")
 packaged:         $(date -u +%Y-%m-%dT%H:%M:%SZ)
 cuda_runtime:     $CUDA_MAJOR_MINOR
@@ -1223,6 +1368,35 @@ if [ -f "$EXPORT/docker/Dockerfile" ]; then
 fi
 
 # ---------------------------------------------------------------------------------------------
+# vLLM sidecar sources (added 2026-10-14, owner order "take ownership and update docs")
+# ---------------------------------------------------------------------------------------------
+# The sidecar is documented as runnable without Docker (docs/VLLM.md "Running the sidecar without
+# Docker"), but the plugin tree, the converter and the kernel build scripts used to live only in git.
+# They ship under vllm-sidecar/ -- NOT pxa/pxq4/ as in the repo: a pxa/ directory would collide
+# with the ./pxa launcher. Mapping:
+#   pxa/pxq4/sidecar/      -> vllm-sidecar/sidecar/       (site-union = sm_70, site-sm60)
+# Left out on purpose (clean-package rule 2026-10-17): the kernel sources, build scripts and converter
+# (pxa/pxq4/kernels-src: they ship only inside the docker images), the box records MANIFEST.md and
+# BOX-ENV.md, superseded *.v1 copies, prebuilt .so, models, any file over 1 MB, caches, and every
+# path in scripts/pxa-closed-files.txt (the closed encoder shim).
+if [ -d "$EXPORT/pxa/pxq4/sidecar" ]; then
+  SC="$STAGE/vllm-sidecar"
+  mkdir -p "$SC"
+  ( cd "$EXPORT/pxa/pxq4" && tar -c \
+      --exclude='__pycache__' --exclude='*.pyc' --exclude='*.so' --exclude='*.o' --exclude='*.v1' \
+      --exclude='*.gguf' --exclude='*.safetensors' --exclude='*.bin' sidecar ) | tar -x -C "$SC"
+  if [ -f "$EXPORT/scripts/pxa-closed-files.txt" ]; then
+    while IFS= read -r cf; do
+      case "$cf" in ''|'#'*) continue ;; pxa/pxq4/*) rm -rf "$SC/${cf#pxa/pxq4/}" ;; esac
+    done < "$EXPORT/scripts/pxa-closed-files.txt"
+  fi
+  find "$SC" -type f -size +1M -print -delete | sed 's/^/  dropped (>1 MB): /'
+  [ -f "$SC/sidecar/site-union/sitecustomize.py" ] && [ -f "$SC/sidecar/site-sm60/sitecustomize.py" ] \
+    || die "vllm-sidecar/ did not survive staging"
+  [ ! -e "$SC/kernels-src" ] || die "kernel sources reached the package (vllm-sidecar/kernels-src)"
+fi
+
+# ---------------------------------------------------------------------------------------------
 # leak guard -- refuse to TAR a package that carries build-machine paths
 # ---------------------------------------------------------------------------------------------
 # The staging rules in this script have now twice been the difference between a clean package and
@@ -1236,16 +1410,75 @@ fi
 # `-I` skips binaries, so the .so/.elf payload is not read; two of the three build-machine roots
 # are enough to catch the class; a fuller scan lives outside the repo and remains the full
 # scan (attribution, host names, private branches) run against the finished artifact.
-LEAK=$(grep -rIl -e '/mnt/' -e '/boot/' "$STAGE" 2>/dev/null || true)
-if [ -n "$LEAK" ]; then
+# The generic Unraid forms the launcher documents and resolves (/mnt/user, /mnt/<disk|pool>, /mnt/*, /mnt/diskN) are not
+# build-machine paths: they are stripped before the check (pass 5, 2026-10-17); any other /mnt/ or /boot/ still refuses.
+LEAK_LINES=$(grep -rIn -e '/mnt/' -e '/boot/' "$STAGE" 2>/dev/null | sed -E 's#/mnt/(user|<[^>]*>|\*|diskN)([^A-Za-z0-9_/]|$)#\2#g' \
+  | grep -e '/mnt/' -e '/boot/' || true)
+if [ -n "$LEAK_LINES" ]; then
   die "staged package leaks build-machine paths -- refusing to tar:
-$LEAK
-$(grep -rIn -e '/mnt/' -e '/boot/' "$STAGE" 2>/dev/null | head -20)"
+$(printf '%s\n' "$LEAK_LINES" | cut -d: -f1 | sort -u)
+$(printf '%s\n' "$LEAK_LINES" | head -20)"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# closed-lever guard, TEXT files -- refuse to TAR a package whose shipped text names a closed lever
+# ---------------------------------------------------------------------------------------------
+# The guard above (after the catalog filter) reads the catalog copy and the ELF files. The closed
+# switch names never ship anywhere (owner 2026-10-08: no closed rows in what ships; 2026-10-18:
+# the launcher, the Overdrive preset and the docs are shipped text too), so every
+# text file of the finished stage (grep -I: presets, .py, .json, .md, .sh, the wrappers this script
+# writes) is checked against the same list: a closed LEVER name anywhere; a .txt/.inc file also any
+# dropped closed name or closed path, as the catalog rule reads them.
+if [ -f "$WORK/pxqn-closed-levers.inc" ]; then
+  TEXT_FILES=()
+  while IFS= read -r -d '' f; do TEXT_FILES+=("$f"); done < <(grep -rIlZ '' "$STAGE" 2>/dev/null)
+  info "closed-lever guard: ${#TEXT_FILES[@]} shipped text file(s)"
+  python3 "$EXPORT/scripts/pxa-lever-catalog.py" --assert-clean "$WORK/pxqn-closed-levers.inc" "${TEXT_FILES[@]}" \
+    || die "closed lever names in the package's text files (above): no tarball"
 fi
 
 # ---------------------------------------------------------------------------------------------
 # archive
 # ---------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
+# clean-package gate (owner rule 2026-10-17: nothing is uploaded or handed out until it passes on
+# the exact files). scripts/release-scan.py: the block list (PXA_RELEASE_BLOCKLIST, kept outside
+# this repository; unset or unreadable = refuse), secret literals reported by file name only, and
+# the printable strings of every ELF file. Run on the stage here and on the finished tarball below.
+# ---------------------------------------------------------------------------------------------
+# Plugin payloads: any package (*.pxp), any plugin manifest (plugin.json, plugin.src.json, free or supporter), the
+# private plugin tree, Anibal, the Vigil plugin and the plugin framework (tools/anibal, tools/vigil, tools/pxa_plugins),
+# an Anibal / framework Python package anywhere, and a zip of any name that carries a plugin manifest. release-scan.py
+# repeats the same rule (built in, category plugin-payload) on the stage and on the tarball.
+plugin_leak_guard() {
+  local st="$1" leak
+  leak=$( { find "$st" \( -iname plugin.src.json -o -iname plugin.json -o -iname '*.pxp' \
+              -o -ipath "$st/tools/pxa-private" -o -ipath "$st/tools/anibal" -o -ipath "$st/tools/vigil" \
+              -o -ipath "$st/tools/pxa_plugins" -o -ipath '*/anibal/__init__.py' -o -ipath '*/pxa_plugins/__init__.py' \) -print
+            find "$st" -type f -size +21c -print0 | xargs -0 -r python3 -I -c '
+import sys, zipfile
+for p in sys.argv[1:]:
+    try:
+        with open(p, "rb") as f:
+            if f.read(4) != b"PK\x03\x04":
+                continue
+        with zipfile.ZipFile(p) as z:
+            if any(n.rsplit("/", 1)[-1].lower() in ("plugin.json", "plugin.src.json") for n in z.namelist()):
+                print(p)
+    except Exception:
+        pass' ; } | sort -u)
+  [ -z "$leak" ] || die "plugin files reached the package (plugins ship only as signed .pxp Store downloads):
+$leak"
+}
+plugin_leak_guard "$STAGE"
+
+RELEASE_SCAN="$(dirname "$(readlink -f "$0")")/release-scan.py"
+[ -f "$RELEASE_SCAN" ] || die "the clean-package gate is missing ($RELEASE_SCAN)"
+mkdir -p "$WORK/release-scan"
+info "clean-package gate: the stage"
+python3 "$RELEASE_SCAN" --work "$WORK/release-scan" "$STAGE" \
+  || die "clean-package gate FAILED on the stage (above): no tarball"
+
 mkdir -p "$OUT_DIR"
 TARNAME="pxa-${TAG}-linux-x86_64-cuda${CUDA_MAJOR_MINOR}-${ARCH_TAG}.tar.gz"
 TARPATH="$OUT_DIR/$TARNAME"
@@ -1260,9 +1493,24 @@ tar_has_member "$TARPATH" "pxa-${TAG}/bin/pxa-update" \
   || die "tarball $TARNAME is missing bin/pxa-update"
 tar_has_member "$TARPATH" "pxa-${TAG}/tools/pxa_lib_update.py" \
   || die "tarball $TARNAME is missing tools/pxa_lib_update.py (pxa-update lib)"
+tar_has_member "$TARPATH" "pxa-${TAG}/tools/pxa_engine_update.py" \
+  || die "tarball $TARNAME is missing tools/pxa_engine_update.py (pxa-update --channel beta)"
 tar_has_member "$TARPATH" "pxa-${TAG}/docs/grafana/pxa-control.json" \
   || die "tarball $TARNAME is missing docs/grafana/pxa-control.json"
+tar_has_member "$TARPATH" "pxa-${TAG}/modulefiles/pxa/${MODULE_VERSION}" \
+  || die "tarball $TARNAME is missing modulefiles/pxa/${MODULE_VERSION}"
+info "clean-package gate: the tarball"
+if ! python3 "$RELEASE_SCAN" --work "$WORK/release-scan" "$TARPATH"; then
+  mv -f "$TARPATH" "$TARPATH.rejected"
+  die "clean-package gate FAILED on $TARNAME (above): renamed to $TARNAME.rejected, not for upload"
+fi
 ( cd "$OUT_DIR" && sha256sum "$TARNAME" > "$TARNAME.sha256" )
+# The legacy-name alias for installed pxa-update copies: the same bytes the gate just passed (cmp-checked), its own .sha256.
+ALIAS_NAME=
+if [ -n "$ALIAS_TAG" ]; then
+  ALIAS_NAME="pxa-${TAG}-linux-x86_64-cuda${CUDA_MAJOR_MINOR}-${ALIAS_TAG}.tar.gz"
+  write_legacy_alias "$OUT_DIR" "$TARNAME" "$ALIAS_NAME" || die "could not write the legacy alias $ALIAS_NAME"
+fi
 
 TARSIZE=$(du -h "$TARPATH" | awk '{print $1}')
 TARSIZE_BYTES=$(du -b "$TARPATH" | awk '{print $1}')
@@ -1270,5 +1518,6 @@ TARSIZE_BYTES=$(du -b "$TARPATH" | awk '{print $1}')
 info "DONE"
 info "tarball:  $TARPATH ($TARSIZE, $TARSIZE_BYTES bytes)"
 info "sha256:   $(cat "$OUT_DIR/$TARNAME.sha256")"
+[ -z "$ALIAS_NAME" ] || info "alias:    $OUT_DIR/$ALIAS_NAME (same bytes; $(cut -d' ' -f1 "$OUT_DIR/$ALIAS_NAME.sha256"))"
 info "contents (full listing):"
 tar -tzf "$TARPATH" | sed 's/^/  /'

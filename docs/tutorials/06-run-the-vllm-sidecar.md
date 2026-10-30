@@ -7,6 +7,8 @@ The sidecar is the second server. Use it when several people are talking to the 
 > what the shipping start-up scripts contain. The easiest and safest way to start it is
 > [guide 07](07-docker-compose.md), which is one command and has been brought up end to end.
 
+No Docker? The plugin, converter and kernel build scripts live in the git repo, not the release tarball: see [VLLM.md, Running the sidecar without Docker](../VLLM.md#running-the-sidecar-without-docker).
+
 Before this page you need a **converted checkpoint folder** — see
 [guide 05](05-quantize-for-vllm.md). The sidecar cannot read a `.gguf`.
 

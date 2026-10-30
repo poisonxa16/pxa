@@ -3,6 +3,8 @@
 #include "ggml.h"
 
 #include <cstdio>
+#include <cmath>
+#include <algorithm>
 #include <cstring>
 #include <random>
 #include <string>
@@ -155,6 +157,22 @@ static bool ggml_debug(struct ggml_tensor * t, bool ask, void * user_data) {
             const float * f = (const float *) data;
             for (size_t i = 0; i < nb_/4; ++i) sum += f[i];
         }
+        // PXA_CB_AMAX=1 (diagnostic, default off = the line above unchanged): append the finite absmax and the
+        // non-finite count of an F32 node, to find the first op whose values leave the f16 range or turn inf/NaN.
+        static const bool cb_amax = getenv("PXA_CB_AMAX") != nullptr;
+        if (cb_amax && t->type == GGML_TYPE_F32) {
+            const float * f = (const float *) data;
+            double amax = 0.0; long long nonfin = 0;
+            for (size_t i = 0; i < nb_/4; ++i) {
+                if (!std::isfinite(f[i])) { ++nonfin; continue; }
+                amax = std::max(amax, (double) std::fabs(f[i]));
+            }
+            printf("CB %6lld %-28s %-14s ne=%lld,%lld,%lld,%lld h=%016llx sum=%.9g amax=%.6g nonfinite=%lld\n",
+                   seq++, t->name, ggml_op_desc(t),
+                   (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                   (unsigned long long)h, sum, amax, nonfin);
+            return true;
+        }
         printf("CB %6lld %-28s %-14s ne=%lld,%lld,%lld,%lld h=%016llx sum=%.9g\n",
                seq++, t->name, ggml_op_desc(t),
                (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
@@ -173,7 +191,9 @@ static bool ggml_debug(struct ggml_tensor * t, bool ask, void * user_data) {
 static bool run(llama_context * ctx, const gpt_params & params) {
     const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
 
-    std::vector<llama_token> tokens = ::common_tokenize(ctx, params.prompt, add_bos);
+    // PXA_CB_SPECIAL=1 (diagnostic, default off): parse special tokens in the prompt (chat-template text such as <|user|>)
+    static const bool cb_special = getenv("PXA_CB_SPECIAL") != nullptr;
+    std::vector<llama_token> tokens = ::common_tokenize(ctx, params.prompt, add_bos, cb_special);
 
     if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size(), 0, 0))) {
         fprintf(stderr, "%s : failed to eval\n", __func__);

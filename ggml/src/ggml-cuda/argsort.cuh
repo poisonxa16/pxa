@@ -22,6 +22,11 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               cudaStream_t     stream);
 #endif // GGML_CUDA_USE_CUB
 
+// PXA_FLINT_GATE_FUSE: sigmoid -> argsort DESC -> top-k gather -> sum_rows/div in one launch (argsort.cu); false = declined,
+// nothing launched.
+bool ggml_cuda_sigmoid_topk_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * logits, ggml_tensor * probs, ggml_tensor * ids,
+        ggml_tensor * w, ggml_tensor * wsum, ggml_tensor * wn, int k);
+
 void ggml_cuda_op_argsort_thresh(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_grouped_topk(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

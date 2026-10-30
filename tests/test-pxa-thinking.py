@@ -655,8 +655,9 @@ class ControlWiring(unittest.TestCase):
 
     def call(self, path, method="GET", body=None):
         data = json.dumps(body).encode() if body is not None else None
-        r = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
-                                   headers={"Content-Type": "application/json"} if data else {})
+        h = {"Content-Type": "application/json"} if data else {}
+        h["X-PXA-Token"] = self.app.token           # H1 (the Control hardening pass): every API call carries the token
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method, headers=h)
         try:
             with urllib.request.urlopen(r, timeout=30) as resp:
                 return resp.status, dict(resp.headers), resp.read()
@@ -825,6 +826,64 @@ class ControlWiring(unittest.TestCase):
             self.app._prof_cache.clear()
 
 
+    # ---- #365 (beta 6): the thinking budget must leave room for the answer ------------------------
+    def test_build_fits_the_budget_below_the_planned_context(self):
+        """A beta 5 report: -c 4096 and a remembered budget of 128000 with thinking on auto; the thinking ate
+        the whole context and the answers came out empty. Control caps the budget it passes below the context."""
+        self.app.set_thinking_override(self.qwen, None)       # another test remembers "off" for this model
+        def build(ctx, thinking, extra=""):
+            class Cap(object):
+                def run(self_, fn, a, rows):
+                    self_.code, self_.text = 0, ""
+                    self_.value = (None, ["llama-server", "-m", "x"], {}, "0", None, ctx)
+                    return self_
+            orig = self.L._Capture
+            self.L._Capture = Cap
+            try:
+                req = self.app.validate({"gpus": [0], "model": self.qwen, "thinking": thinking, "extra_args": extra},
+                                        resolve_port=False)
+                return self.app._build(req, False)
+            finally:
+                self.L._Capture = orig
+        cap = build(4096, {"mode": "auto", "budget": 128000})
+        self.assertEqual(cap.value[1], ["llama-server", "-m", "x", "--reasoning-budget", "2048"])
+        self.assertTrue(any("raise the context" in n for n in cap.thinking["notes"]), cap.thinking["notes"])
+        cap = build(4096, {"mode": "auto"})                    # no budget: still capped below a small context
+        self.assertEqual(cap.value[1][-2:], ["--reasoning-budget", "2048"])
+        cap = build(65536, {"mode": "on", "budget": 8192})     # a budget that fits is passed as it was
+        self.assertEqual(cap.value[1], ["llama-server", "-m", "x", "--reasoning", "on", "--reasoning-budget", "8192"])
+        self.assertFalse(any("raise the context" in n for n in cap.thinking["notes"]), cap.thinking["notes"])
+        cap = build(4096, {"mode": "off"})                     # thinking off: nothing to fit
+        self.assertEqual(cap.value[1], ["llama-server", "-m", "x", "--reasoning", "off"])
+
+    def test_proxy_fits_the_budget_below_the_served_context(self):
+        StubEngine.props = {"chat_template": tpl("Qwen-Qwen3-0.6B.jinja"), "model_path": self.qwen,
+                            "default_generation_settings": {"n_ctx": 4096}, "total_slots": 1}
+        self.app._prof_cache.clear()
+        self.app.set_attach_port(self.stub.server_address[1])
+        url = "/api/engine/v1/chat/completions"
+        msg = [{"role": "user", "content": "hi"}]
+        try:
+            # a client's reasoning_effort medium = 4096 tokens of thinking: the whole 4K context
+            self.call(url, "POST", {"messages": msg, "reasoning_effort": "medium"})
+            sent = StubEngine.seen[-1]
+            self.assertEqual(sent.get("thinking_budget_tokens"), 2048, sent)
+            self.assertLessEqual(sent.get("max_tokens", 0), 4096)
+            # the Control chat's own budget, unlimited (-1) and 128000, is fitted too; max_tokens never above the context
+            for b in (-1, 128000):
+                code, h, _ = self.call(url, "POST", {"messages": msg, "max_tokens": 512,
+                                                     "pxa_thinking": {"mode": "on", "budget": b}})
+                sent = StubEngine.seen[-1]
+                self.assertEqual((code, sent.get("thinking_budget_tokens")), (200, 2048), sent)
+                self.assertLessEqual(sent["max_tokens"], 4096)
+                self.assertTrue(any("context" in n for n in json.loads(h.get("X-PXA-Thinking"))["notes"]))
+            # a budget that fits is sent as it was
+            self.call(url, "POST", {"messages": msg, "pxa_thinking": {"mode": "on", "budget": 1000}})
+            self.assertEqual(StubEngine.seen[-1]["thinking_budget_tokens"], 1000)
+        finally:
+            self.app._prof_cache.clear()
+
+
 class EffortSelector(unittest.TestCase):
     def setUp(self):
         self.p = TH.detect(arch="qwen3", name="Qwen3-32B")
@@ -887,6 +946,66 @@ class ClientEffort(unittest.TestCase):
         b, n = TH.map_client_effort({"messages": [], "reasoning_effort": "weird"}, p)
         self.assertIn("not mapped", n[0])
         self.assertEqual(TH.map_client_effort({"messages": []}, p), ({"messages": []}, []))
+
+
+class BudgetFitsContext(unittest.TestCase):
+    """#365 (beta 6): Control never sets a thinking budget that leaves no room for the answer."""
+
+    def test_fit_budget(self):
+        self.assertEqual(TH.fit_budget(128000, 4096)[0], 2048)
+        self.assertEqual(TH.fit_budget(-1, 4096)[0], 2048)          # unlimited thinking would fill the context too
+        self.assertEqual(TH.fit_budget(None, 4096)[0], None)        # nothing set: the caller decides
+        self.assertEqual(TH.fit_budget(2048, 4096), (2048, []))     # fits: unchanged, no note
+        self.assertEqual(TH.fit_budget(0, 4096), (0, []))
+        self.assertEqual(TH.fit_budget(128000, None), (128000, []))  # context unknown: unchanged
+        self.assertEqual(TH.fit_budget(8192, 32768), (8192, []))
+        self.assertEqual(TH.fit_budget(10 ** 6, 131072)[0], 131072 - 1024 - 8192)
+        b, notes = TH.fit_budget(128000, 4096)
+        self.assertTrue(any("4096" in n and "raise the context" in n for n in notes), notes)
+        self.assertEqual(TH.answer_room(4096), (2048, 1024, 1024))   # (thinking cap, answer, prompt)
+        os.environ["PXA_CONTROL_THINK_FIT"] = "0"                    # the off switch: as before
+        try:
+            self.assertEqual(TH.fit_budget(128000, 4096), (128000, []))
+            p = TH.detect(arch="qwen4exp", name="Qwen3.8 Flash Next")
+            self.assertEqual(TH.launch_args(p, {"mode": "auto"}, ctx=4096)[0], [])
+        finally:
+            os.environ.pop("PXA_CONTROL_THINK_FIT", None)
+
+    def test_launch_args_fit(self):
+        p = TH.detect(arch="qwen4exp", name="Qwen3.8 Flash Next")
+        self.assertEqual(TH.launch_args(p, {"mode": "auto", "budget": 128000}, ctx=4096)[0], ["--reasoning-budget", "2048"])
+        self.assertEqual(TH.launch_args(p, {"mode": "auto"}, ctx=4096)[0], ["--reasoning-budget", "2048"])
+        self.assertEqual(TH.launch_args(p, {"mode": "auto"})[0], [])                  # no context known: as before
+        self.assertEqual(TH.launch_args(p, {"mode": "auto", "budget": 128000})[0], ["--reasoning-budget", "128000"])
+        self.assertEqual(TH.launch_args(p, {"mode": "auto", "budget": 128000}, ctx=8192, np=2)[0],
+                         ["--reasoning-budget", "2048"])                              # per slot: 8192 / 2
+        self.assertEqual(TH.launch_args(p, {"mode": "off"}, ctx=4096)[0], ["--reasoning", "off"])
+        q = TH.detect(arch="qwen3", name="Qwen3-8B")
+        self.assertEqual(TH.launch_args(q, {"mode": "on", "budget": 2048}, ctx=4096)[0],
+                         ["--reasoning", "on", "--reasoning-budget", "2048"])
+        s = TH.detect(arch="seed_oss", name="Seed-OSS-36B")                         # the model's own budget kwarg
+        self.assertEqual(TH.launch_args(s, {"mode": "on", "budget": 100000}, ctx=4096)[0],
+                         ["--chat-template-kwargs", '{"thinking_budget":2048}'])
+        g = TH.detect(arch="gpt-oss", name="gpt-oss-20b")                            # guard only: a note, no flag
+        args, notes = TH.launch_args(g, {"mode": "on", "budget": 100000}, ctx=4096)
+        self.assertEqual(args, [])
+        self.assertTrue(any("2048" in n for n in notes), notes)
+
+    def test_request_fit(self):
+        p = TH.detect(arch="qwen3", name="Qwen3-32B")
+        b, notes = TH.apply_request({"messages": [], "max_tokens": 512}, p, "on", budget=128000, ctx=4096)
+        self.assertEqual((b["thinking_budget_tokens"], b["max_tokens"]), (2048, 2048 + 1024))
+        b, _ = TH.apply_request({"messages": []}, p, "on", budget=-1, ctx=4096)
+        self.assertEqual(b["thinking_budget_tokens"], 2048)
+        b, _ = TH.apply_request({"messages": [], "max_tokens": 512}, p, "on", budget=2048, ctx=None)
+        self.assertEqual((b["thinking_budget_tokens"], b["max_tokens"]), (2048, 3072))     # unknown context: as before
+        b, _ = TH.map_client_effort({"messages": [], "reasoning_effort": "medium"}, p, ctx=4096)
+        self.assertEqual(b["thinking_budget_tokens"], 2048)
+        b, _ = TH.apply_effort({"messages": []}, p, {"effort": "high"}, ctx=4096)
+        self.assertEqual(b["thinking_budget_tokens"], 2048)
+        g = TH.detect(arch="gpt-oss", name="gpt-oss-20b")
+        b, _ = TH.apply_request({"messages": []}, g, "on", budget=100000, ctx=4096)
+        self.assertLessEqual(b["max_tokens"], 4096)
 
 
 if __name__ == "__main__":

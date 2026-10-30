@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "ggml-cuda-xcache.h"
 #include "ggml-pxa-lean.h"
+#include "llama-pxa-xcache-async.h"   // PXA_XCA_GATELESS_*
 
 #include <atomic>
 #include <cstdint>
@@ -30,10 +31,10 @@ struct pxa_xca_totals {
     uint64_t requests = 0;       // requests the worker served (each one a layer of a token with at least one cold slot)
     uint64_t compute_us = 0;     // wall time of the CPU sub-graphs
     uint64_t max_us = 0;         // the longest one
-    uint64_t errors = 0;         // sub-graph missing / failed: those layers' rows are zero (must stay 0)
+    uint64_t errors = 0;         // always 0 since N1: a missing / failed sub-graph aborts the process (never zero rows)
     uint64_t lean = 0;           // PXA_XCACHE_LEAN: requests served by the lean executor (the rest ran the ggml sub-graph)
     // GPU side, summed over the slots (needs the stats callback)
-    uint64_t gpu_waits = 0, gpu_skipped = 0, gpu_timeouts = 0;
+    uint64_t gpu_waits = 0, gpu_skipped = 0, gpu_timeouts = 0;   // gpu_timeouts = slow waits (> PXA_XCACHE_ASYNC_TIMEOUT_S), waited out
     double   gpu_wait_us = 0, gpu_wait_max_us = 0;
     // PXA_XCACHE_ASYNC_CHECK: rows compared against the scheduler split, rows with a differing bit, largest |difference|, layers with a difference
     uint64_t chk_rows = 0, chk_bad = 0; float chk_maxd = 0; int chk_layers_bad = 0; int chk_first_bad_il = -1; std::string chk_bad_layers;
@@ -48,9 +49,12 @@ struct pxa_xca_core {
     // the layer's slot, created on first use (nullptr when the factory fails); starts the worker with the first slot
     struct ggml_cuda_cold_slot * slot(int il, int device, int n_embd, int n_used, int n_tok_max);
     // build (once) and register the CPU sub-graph of this slot for a graph of n_tok tokens. up / gate (or up_gate) / down are the
-    // layer's cold stacks as the CPU reads them. False when the stacks cannot take the path (shape, type): the caller keeps the split.
+    // layer's cold stacks as the CPU reads them; a gate-less chain passes up and down only, with unary_op PXA_XCA_GATELESS_*.
+    // False when the stacks cannot take the path (shape, type): the caller keeps the split.
+    // clamp_limit > 0 (PXA_XCACHE_ASYNC_CLAMP, DeepSeek-V4 / GLM-5.x): the clamped SwiGLU chain of llm_build_moe_ffn's dsv4_clamp
+    // branch instead of the fused up/gate + unary chain (separate up and gate stacks only).
     bool add_width(struct ggml_cuda_cold_slot * slot, int n_tok, struct ggml_tensor * up, struct ggml_tensor * gate,
-                   struct ggml_tensor * up_gate, struct ggml_tensor * down, int unary_op, int n_threads);
+                   struct ggml_tensor * up_gate, struct ggml_tensor * down, int unary_op, int n_threads, float clamp_limit = 0.0f);
 
     // stop and join the worker (idempotent); the summary is only complete after this
     void stop();
@@ -83,6 +87,8 @@ private:
     std::thread           dump_th_;
     int                   spin_us_ = 3000;
     int                   cpu_ = -1;
+    // PXA_THREAD_PLACE: the pool's thread count once the pool exists (0 = not yet); the host thread pins itself for it from its own loop
+    std::atomic<int>      pool_n_{0};
     // PXA_XCACHE_CPUPOOL=1 (default off). Absent library: off.
     void *                lean_ = nullptr;
     uint64_t              n_lean_ = 0;       // worker only

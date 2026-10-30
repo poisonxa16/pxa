@@ -32,6 +32,15 @@ def active_env_levers():
     return sorted(k for k in os.environ if k.startswith("PXA_") or k.startswith("PXQ_"))
 
 
+# a variable whose name says it holds a credential (PXA_BUS_TOKEN, a store key, a password) is named, never printed:
+# --explain output gets pasted into Discord and bug reports
+SECRET_NAME = re.compile(r"TOKEN|KEY|SECRET|PASS|CRED|AUTH", re.I)
+
+
+def shown_value(k):
+    return "<set, hidden>" if SECRET_NAME.search(k) else os.environ[k]
+
+
 def print_footer(a, gpus):
     """Print the mirror block. `a` is pxa-launch.py's parsed argparse namespace (only .gpus is
     read); `gpus` is its gpu_table() result. Never raises past this function in normal use -- the
@@ -52,7 +61,7 @@ def print_footer(a, gpus):
     if envs:
         print("   active levers (set in your environment):")
         for k in envs:
-            print("      %s=%s" % (k, os.environ[k]))
+            print("      %s=%s" % (k, shown_value(k)))
     else:
         print("   active levers: none set in your environment (every PXA_*/PXQ_* lever is at its "
               "shipped default -- the engine's own -sm/-b/-ub/-fa picks above still apply).")

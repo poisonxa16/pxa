@@ -27,6 +27,8 @@
 #include "ggml.h"
 #include "llama.h"
 #include "common.h"
+#include "pxa-registry.h"
+#include "pxa-stdout-guard.h"
 #include "ggml-cuda.h"
 #include "ggml-sycl.h"
 
@@ -280,6 +282,8 @@ struct cmd_params {
     int  fit_margin = 0;
     output_formats output_format;
     output_formats output_format_stderr;
+    bool pxa_ub_given = false;   // -ub / -b on the command line (PXA_AUTO_UB_DENSE_2048 walks -ub only when neither is)
+    bool pxa_b_given  = false;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -926,6 +930,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_gen.empty())        { params.n_gen = cmd_params_defaults.n_gen; }
     if (params.n_pg.empty())         { params.n_pg = cmd_params_defaults.n_pg; }
     if (params.n_gp.empty())         { params.n_gp = cmd_params_defaults.n_gp; }
+    params.pxa_b_given  = !params.n_batch.empty();
+    params.pxa_ub_given = !params.n_ubatch.empty();
     if (params.n_batch.empty())      { params.n_batch = cmd_params_defaults.n_batch; }
     if (params.n_ubatch.empty())     { params.n_ubatch = cmd_params_defaults.n_ubatch; }
     if (params.type_k.empty())       { params.type_k = cmd_params_defaults.type_k; }
@@ -2189,6 +2195,10 @@ int main(int argc, char ** argv) {
 
     cmd_params params = parse_cmd_params(argc, argv);
 
+    // the results printer's stdout is data (json/csv/md/sql): from here on every other stdout write
+    // (backends, the PXQN library, PXA status lines) goes to stderr. PXA_BENCH_SHARED_STDOUT=1 = off.
+    FILE * pxa_data_out = params.output_format != NONE ? pxa_stdout_guard_take() : stdout;
+
     // initialize llama.cpp
     if (!params.verbose) {
         llama_log_set(llama_null_log_callback, NULL);
@@ -2201,7 +2211,7 @@ int main(int argc, char ** argv) {
     std::unique_ptr<printer> p_err = create_printer(params.output_format_stderr);
 
     if (p) {
-        p->fout = stdout;
+        p->fout = pxa_data_out;
         p->print_header(params);
     }
 
@@ -2211,6 +2221,32 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
+
+    // PXA registry (orders #22136 + #22182 F3(c)): llama-bench gets the lever env llama-server's
+    // autoconfig picks, resolved for EVERY test instance (model x -sm x -ts x KV); the reads latch once per
+    // process, so only the picks all instances share are applied and the others are named in a warning (a
+    // sweep across -sm never runs instance 2 on instance 1's picks). Its own -sm / -ngl / -b / -ub / -fa values
+    // are kept. PXA_AUTOCONFIG=0 = off.
+    {
+        std::vector<pxa_registry_instance> inst;
+        for (const auto & in : params_instances) {
+            pxa_registry_instance r;
+            r.model      = in.model;
+            r.split_mode = (int) in.split_mode;
+            for (float f : in.tensor_split) {
+                r.ts_given = r.ts_given || f != 0.0f;
+            }
+            r.kv_q8 = in.type_k == GGML_TYPE_Q8_0 && in.type_v == GGML_TYPE_Q8_0;
+            bool dup = false;
+            for (const auto & o : inst) {
+                dup = dup || (o.model == r.model && o.split_mode == r.split_mode && o.ts_given == r.ts_given && o.kv_q8 == r.kv_q8);
+            }
+            if (!dup) {
+                inst.push_back(r);
+            }
+        }
+        pxa_registry_apply_env_instances(inst, "llama-bench");
+    }
 
     llama_model * lmodel = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
@@ -2230,14 +2266,80 @@ int main(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
-        llama_context * ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
+        // PXA_AUTO_UB_DENSE_2048 (2026-10-18, pxa-registry.h): the 27B dense PXQN4 file on one V100 or one P100 (#23320), f16 KV,
+        // -ub and -b both unset: -ub 2048 is a ceiling, walked down 1024 / 768 to the stock -ub as the floor; each rung
+        // above the floor must allocate beside the weights + KV at this test's context and leave PXA_AUTO_UB_RESERVE_MB
+        // free. The floor is built exactly as without the rule. The row reports the -ub / -b the context runs.
+        cmd_params_instance run = inst;
+        llama_context * ctx = nullptr;
+        int pxa_fit = 0;
+        const char * pxa_fit_why = nullptr;
+        if (!params.pxa_ub_given && !params.pxa_b_given && !pxa_autoconfig_off()) {
+            static std::string           pxa_fit_model;
+            static pxa_model_info        pxa_fit_info;
+            static const pxa_topology    pxa_fit_topo = pxa_topology_detect("", 0, false);
+            if (pxa_fit_model != inst.model) {
+                pxa_fit_model = inst.model;
+                pxa_fit_info  = pxa_model_probe(inst.model);
+            }
+            pxa_fit = pxa_registry_ub_fit_dense(pxa_fit_topo, pxa_fit_info, ggml_pxa_config_level(),
+                                                inst.type_k != GGML_TYPE_F16 || inst.type_v != GGML_TYPE_F16, &pxa_fit_why);
+        }
+        if (pxa_fit > inst.n_ubatch) {
+            llama_context_params cp = inst.to_llama_cparams();
+            const int    floor_ub = inst.n_ubatch;
+            // llama-bench holds ONE context: no draft model, no slots, no later allocation the server's 512 MiB
+            // reserve is sized for; the GEMM temporary pool is pre-grown inside context creation, so the free memory
+            // read after it is the run's headroom. 256 MiB here (measured 2026-10-18, 1x V100 pp16384: -ub 1024 left
+            // 385 MiB, ran, 874.8 -> 982.6 t/s); PXA_AUTO_UB_RESERVE_MB still sets it when given.
+            const char * pxa_rv   = getenv("PXA_AUTO_UB_RESERVE_MB");
+            const size_t reserve  = (pxa_rv != nullptr && *pxa_rv != '\0') ? pxa_registry_ub_reserve_bytes() : ((size_t) 256 << 20);
+            size_t kept_free = 0;
+            int    kept_dev  = -1;
+            std::string trail;
+            auto build = [&](int ub) {
+                pxa_ub_attempt a;
+                cp.n_ubatch = (uint32_t) ub;
+                cp.n_batch  = (uint32_t) std::max(inst.n_batch, ub);
+                ctx = llama_init_from_model(lmodel, cp);
+                if (ctx == nullptr) {
+                    a.alloc_failure = llama_context_creation_failed_on_alloc();
+                    return a;
+                }
+                a.allocated = true;
+                a.free_min  = SIZE_MAX;
+                pxa_registry_cuda_free_min("", -1, &a.free_min, &a.worst_dev);
+                kept_free = a.free_min;
+                kept_dev  = a.worst_dev;
+                return a;
+            };
+            auto discard = [&]() {
+                llama_free(ctx);
+                ctx = nullptr;
+            };
+            const int ub = pxa_registry_ub_walk(pxa_fit, PXA_UB_FIT, reserve, build, discard, &trail, floor_ub);
+            if (ub > 0 && ctx != nullptr) {
+                if (ub != floor_ub) {   // the floor is the stock context: its row stays as it was
+                    run.n_ubatch = (int) llama_n_ubatch(ctx);
+                    run.n_batch  = std::max(inst.n_batch, (int) llama_n_ubatch(ctx));
+                }
+                fprintf(stderr, "PXA_AUTO: UB=%d (runs -ub %u -b %u; fit walk from -ub %d down to the stock -ub %d at -c %d: the "
+                                "largest that allocates and leaves %zu MiB free; %zu MiB free on CUDA%d; PXA_AUTO_UB_DENSE_2048=0 "
+                                "for the stock -ub)%s%s\n",
+                        ub, llama_n_ubatch(ctx), llama_n_batch(ctx), pxa_fit, floor_ub, inst.n_prompt + inst.n_gen,
+                        reserve >> 20, kept_free == SIZE_MAX ? (size_t) 0 : kept_free >> 20, kept_dev,
+                        trail.empty() ? "" : ": ", trail.c_str());
+            }
+        } else {
+            ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
+        }
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_free_model(lmodel);
             return 1;
         }
 
-        test t(inst, lmodel, ctx);
+        test t(run, lmodel, ctx);
 
         llama_kv_cache_clear(ctx);
 
@@ -2302,6 +2404,11 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_free();
+
+    if (p) {
+        p->fout = nullptr;
+    }
+    pxa_stdout_guard_release(pxa_data_out);
 
     return 0;
 }

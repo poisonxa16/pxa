@@ -2193,7 +2193,7 @@ static void test_hunyuan_v3_tagged_args(testing & t) {
 
     // (1) the separator must survive derivation, or the model is fought by its own grammar
     t.test("separator is derived", [&](testing & t) {
-        autoparser::autoparser ap;
+        ::autoparser::autoparser ap;
         common_chat_template raw_tmpl(src, "<s>", "</s>");
         ap.analyze_template(raw_tmpl);
         t.assert_equal("function.name_suffix carries <tool_sep...>",

@@ -1,11 +1,11 @@
 """Memory across chats: short facts about the user that every chat (on any server) can recall.
 
 Ported from our own memory code (read-only sources):
-  - recall ranking: /usr/local/bin/pxa-mythos-factrecall.mjs (keywordScore + rankOwnerFacts keyword-only leg:
+  - recall ranking: our in-house fact recall (keywordScore + rankOwnerFacts keyword-only leg:
     0.75 * keyword overlap + 0.25 * prior, a relevance floor of one real word hit), here with idf weights so
     rare words count more (BM25-ish) and recency as the prior;
   - the block format + "possibly out of date" framing: factrecall formatFactLines / digestTruncationNote;
-  - secret refusal: /usr/local/bin/pxa-mythos-guards.mjs SECRET_WHOLE / SECRET_PREFIXED (redactSecrets);
+  - secret refusal: our in-house guards' SECRET_WHOLE / SECRET_PREFIXED (redactSecrets);
   - reply-style gate (PXA_MEMGATE_v1): "keep answers short"
     style prescriptions wedge models when injected into every prompt, so they are refused, not stored;
   - dedupe-on-write: pxa-web/lib/record-fact.mjs (update the existing row instead of adding a twin).
@@ -25,7 +25,7 @@ DEFAULT_K = 8
 DEFAULT_BUDGET = 400          # tokens (~4 chars each) for the recalled block
 _lock = threading.Lock()
 
-# ---- secrets (pxa-mythos-guards.mjs SECRET_WHOLE / SECRET_PREFIXED, plus a few obvious shapes) ----------
+# ---- secrets (the in-house guards' SECRET_WHOLE / SECRET_PREFIXED, plus a few obvious shapes) -----------
 SECRET_RES = [
     (re.compile(r"\btskey-[A-Za-z0-9_-]{10,}"), "a Tailscale key"),
     (re.compile(r"\bhf_[A-Za-z0-9]{10,}"), "a Hugging Face token"),
@@ -108,6 +108,11 @@ def screen(text):
         if rx.search(t):
             return ("that is a rule about how to reply, not a fact about the user; reply-style rules are not saved "
                     "(they make every later answer worse)")
+    from . import guards
+    if guards.injection_hit(t) or guards.neutralize_ctrl(t)[1]:
+        # a fetched page that asks the model to "remember" an instruction would be recalled into every later
+        # chat's system prompt: instruction-shaped text is never a fact about the user [SEC1]
+        return "it reads like an instruction, not a fact about the user; instructions are never saved to memory"
     return None
 
 
@@ -311,7 +316,7 @@ class Store(object):
     def recall(self, query, k=None, budget=None):
         """-> the facts to show the model, within the token budget: pinned first, then the top-k by idf-weighted
         keyword overlap with the query (factrecall's relevance floor: at least one real word hit), then -- while
-        slots remain -- the most recently saved facts (the owner-memory digest leg of our mythos agent), so a
+        slots remain -- the most recently saved facts (the memory digest leg of our in-house agent), so a
         preference with no shared word ("vegetarian" for "what's for dinner?") still reaches the model."""
         d = self.load()
         k = d["k"] if k is None else k

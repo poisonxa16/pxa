@@ -73,6 +73,11 @@ float pxa_pxq_dot_q8_ref(enum ggml_type type, const void * base, int64_t row, in
                          const struct pxa_pxq_q8 * y);
 float pxa_pxq_dot_q8    (enum ggml_type type, const void * base, int64_t row, int64_t k,
                          const struct pxa_pxq_q8 * y);
+// rows row0..row0+7 against one activation row: out[j] bit-identical to pxa_pxq_dot_q8(row0 + j) (any row0; the eight-row
+// kernel runs for PXQ4 when row0 % 8 == 0). pxa_pxq_dot_x8_on(type): that kernel exists for type and PXA_PXQ_DOT_X8 is not 0.
+void  pxa_pxq_dot_q8_x8 (enum ggml_type type, const void * base, int64_t row0, int64_t k,
+                         const struct pxa_pxq_q8 * y, float out[8]);
+bool  pxa_pxq_dot_x8_on(enum ggml_type type);
 
 // true when the plain entry point above is the AVX2 arm and not a redirect to _ref.
 bool pxa_pxq_dot_has_simd(void);

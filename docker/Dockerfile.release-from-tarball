@@ -1,0 +1,41 @@
+# Engine image assembled from the release TARBALL (nothing is compiled here): the binaries in the image are byte-identical to the ones the
+# tarball ships, and the tarball already bundles its own CUDA runtime, so the base is a plain Ubuntu. Used by scripts/package-rc2.sh.
+#   docker build -f docker/Dockerfile.release-from-tarball --build-arg DIST=pxa-v4.0-rc2 --build-arg VERSION=v4.0-rc2 \
+#     --build-arg GIT_SHA=<sha> --build-arg TARBALL_SHA256=<sha256> -t <image> <dir that holds the unpacked tarball folder>
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+ARG DIST
+ARG VERSION=dev
+ARG GIT_SHA=unknown
+ARG TARBALL_SHA256=unknown
+LABEL org.opencontainers.image.source="https://github.com/poisonxa16/pxa" \
+      org.opencontainers.image.title="PXA" \
+      org.opencontainers.image.description="Pascal/Volta 4-bit codec + kernel pack for llama.cpp. Assembled from the release tarball: the binaries in this image are byte-identical to the ones the tarball ships." \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.pxa.release.tarball.sha256="${TARBALL_SHA256}"
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends curl ca-certificates libgomp1 python3 && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -r pxq && useradd -r -g pxq -d /work -m pxq
+COPY ${DIST} /opt/pxa/dist
+ENV LLAMA_ARG_HOST=0.0.0.0 NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility PXA_HOME=/opt/pxa/dist LD_LIBRARY_PATH=/opt/pxa/dist/lib
+RUN set -e; \
+    for b in llama-server llama-cli llama-bench llama-quantize llama-perplexity llama-pxq-export llama-gguf-split; do \
+        ln -sf "/opt/pxa/dist/bin/$b" "/usr/local/bin/$b"; \
+    done; \
+    for t in server bench quantize perplexity cli; do \
+        [ -e "/opt/pxa/dist/bin/llama-$t" ] && ln -sf "/opt/pxa/dist/bin/llama-$t" "/usr/local/bin/pxa-$t"; \
+    done; \
+    ln -sf /opt/pxa/dist/run-server.sh /usr/local/bin/run-server.sh; \
+    if [ -x /opt/pxa/dist/pxa-entrypoint ]; then ln -sf /opt/pxa/dist/pxa-entrypoint /usr/local/bin/pxa-entrypoint; \
+    else ln -sf /opt/pxa/dist/run-server.sh /usr/local/bin/pxa-entrypoint; fi; \
+    ln -sf /opt/pxa/dist/pxa-launch /usr/local/bin/pxa-launch; \
+    mkdir -p /opt/pxa/bin; ln -sf /usr/local/bin/llama-server /opt/pxa/bin/llama-server; \
+    mkdir -p /models /work && chown pxq:pxq /models /work
+WORKDIR /work
+USER pxq
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 CMD curl -f "http://127.0.0.1:${LLAMA_ARG_PORT:-8080}/health" || exit 1
+ENTRYPOINT ["/usr/local/bin/pxa-entrypoint"]

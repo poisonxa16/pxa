@@ -21,6 +21,8 @@
 # Anything that starts with '-' is an engine argument. Nothing is added to or removed from it.
 
 set -e
+# No __pycache__ next to the image's PXA sources (review N3): PXA Control and every python step below write no bytecode.
+export PYTHONDONTWRITEBYTECODE=1
 
 # A named volume is created root:root and hides the chown in the image.
 # Start as root, and chown the cache only when it is empty and owned by uid 0
@@ -144,7 +146,7 @@ engine() {
     cache_check
     shm_check
     if control_wanted && command -v python3 >/dev/null 2>&1; then
-        LP=$(launcher_py) && python3 "$LP" --control-for-pid $$ --lan || true
+        LP=$(launcher_py) && python3 -B "$LP" --control-for-pid $$ --lan || true
     fi
     if [ -x "$PXA_HOME/run-server.sh" ]; then
         exec "$PXA_HOME/run-server.sh" "$@"
@@ -163,7 +165,7 @@ launcher() {
     L=$(find_bin pxa-launch) || L=""
     if [ -n "$L" ]; then exec "$L" "$@"; fi
     for p in "$PXA_HOME/tools/pxa-launch.py" "$HERE/pxa-launch.py"; do
-        if [ -f "$p" ]; then exec python3 "$p" "$@"; fi
+        if [ -f "$p" ]; then exec python3 -B "$p" "$@"; fi
     done
     echo "pxa-entrypoint: pxa-launch is not in this image; passing to the engine instead" >&2
     engine "$@"

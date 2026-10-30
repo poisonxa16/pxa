@@ -21,6 +21,7 @@
 #include "dsv4.cuh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -69,18 +70,38 @@ struct ggml_cuda_kargs_dsv4_hc_weighted_sum {
     uint64_t nb1;
 };
 
+// Sinkhorn de-spill (todo glm-sinkhorn-despill, SQUEEZE row 3).
+//
+// One templated body serves both paths. HC_T == 0 is the generic kernel: HC comes from args.n_hc
+// at run time, the comb lives in c[16*16] indexed at run time, which nvcc puts in a 1 KiB local
+// (stack) frame -> every Sinkhorn step is local-memory traffic (99 us x 90 calls/token on P100).
+// HC_T > 0 makes HC a compile-time constant: c[] is HC_T*HC_T floats and every HC loop has a
+// constant trip count that nvcc unrolls, so all indices are constants and c[] is promoted to
+// registers (0 B stack, 0 B spill for HC_T == 4 on sm_60/sm_70, checked by
+// scripts/glm-sinkhorn/ptxas-check.sh). No unroll pragmas on purpose: with none, the HC_T == 0
+// instantiation compiles to PTX identical to the pre-template kernel (pragmas would add
+// nounroll hints to the generic path). The float expressions and their evaluation order are
+// the SAME source text in both instantiations (same sequential row/column sums, same reciprocal
+// multiplies, same eps placement), so the result is bit-identical by construction; only storage
+// and loop control change. tests/test-dsv4-sinkhorn-despill.cpp checks the host-side model of
+// both orders bitwise, scripts/glm-sinkhorn/microbench.sh checks it on a GPU.
+// PXA_DSV4_SINKHORN_HC4=1 selects the hc=4 kernel (default off until measured; =0/unset = the generic kernel).
+template <int HC_T>
 static __global__ void kernel_dsv4_hc_split_sinkhorn(
         const ggml_cuda_kargs_dsv4_hc_split_sinkhorn args,
         const float * mixes,
         const float * scale,
         const float * base,
         float * dst) {
+    static_assert(HC_T >= 0 && HC_T <= DSV4_HC_MAX, "HC_T out of range");
+    constexpr int C_N = HC_T > 0 ? HC_T * HC_T : DSV4_HC_MAX * DSV4_HC_MAX;
+
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if ((int64_t) tid >= args.n_rows) {
         return;
     }
 
-    const int HC = args.n_hc;
+    const int HC = HC_T > 0 ? HC_T : args.n_hc;
     if (HC <= 0 || HC > DSV4_HC_MAX) {
         return;
     }
@@ -104,7 +125,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         out[off] = 2.0f / (1.0f + expf(-z));
     }
 
-    float c[DSV4_HC_MAX * DSV4_HC_MAX];
+    float c[C_N];
 
     for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
         float row_max = -INFINITY;
@@ -275,7 +296,21 @@ void ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_t
 
     const cudaStream_t stream = ctx.stream();
 
-    kernel_dsv4_hc_split_sinkhorn<<<n_tg, nth, 0, stream>>>(args, mixes_d, scale_d, base_d, dst_d);
+    // PXA_DSV4_SINKHORN_HC4 (default ON since 10-24; =0 = the generic kernel): hc=4
+    // (DeepSeek-V4 / GLM-5.x hc_mult) takes the register-resident specialization; any other hc, or the switch =0, takes the
+    // generic kernel (same arithmetic, see above; bit-identical on V100, greedy sha equal on GLM-5.3-Flash).
+    static const bool use_hc4 = [] {
+        const char * e = getenv("PXA_DSV4_SINKHORN_HC4");
+        const bool v = e == nullptr || atoi(e) != 0;
+        if (v && e) fprintf(stderr, "PXA_DSV4_SINKHORN_HC4=%s: hc=4 Sinkhorn in registers (bit-identical de-spill)\n", e);
+        if (!v) fprintf(stderr, "PXA_DSV4_SINKHORN_HC4=0: generic Sinkhorn kernel (off switch)\n");
+        return v;
+    }();
+    if (n_hc == 4 && use_hc4) {
+        kernel_dsv4_hc_split_sinkhorn<4><<<n_tg, nth, 0, stream>>>(args, mixes_d, scale_d, base_d, dst_d);
+    } else {
+        kernel_dsv4_hc_split_sinkhorn<0><<<n_tg, nth, 0, stream>>>(args, mixes_d, scale_d, base_d, dst_d);
+    }
 }
 
 void ggml_cuda_op_dsv4_hc_expand(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

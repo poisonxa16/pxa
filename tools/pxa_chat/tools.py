@@ -1,14 +1,18 @@
-"""The chat agent's tools: OpenAI tool schemas (descriptions adapted from the Mythos agent's tool table),
+"""The chat agent's tools: OpenAI tool schemas (descriptions adapted from our in-house agent's tool table),
 plain-words lines for beginners, the approval policy, and the executors. Files are fenced to the chat's sandbox
 folder (fence.py), web fetch refuses private addresses unless approved, web search exists only when an in-house
 SearXNG endpoint is configured, shell is Advanced-only with an approval for every call."""
 import ast
 import html
+import http.client
 import json
+import logging
 import operator
 import os
 import re
 import shlex
+import signal
+import socket
 import subprocess
 import threading
 import time
@@ -18,7 +22,10 @@ import urllib.request
 
 from . import fence, guards, oai, picker, search, sessions
 
+_log = logging.getLogger("pxa_control.chat")
 MAX_OUT = 12000
+MAX_OUT_HARD = 48000        # the most one tool result may put in front of the model, whatever the window
+OUT_SHARE = 0.25            # ... and at most this share of the per-request window (chars ~ 4 x tokens)
 
 
 def _fn(name, desc, props, req):
@@ -141,6 +148,125 @@ LABELS = {
 }
 
 
+# Tools whose output carries text from outside this chat (files, pages, programs, other models, older chats):
+# fenced before the model sees it (guards.fence_tool_output). calculate and the memory writes return our own words.
+UNTRUSTED = {"list_files", "read_file", "search_files", "web_fetch", "web_search", "ask_server", "spawn_agent",
+             "note_read", "run_command", "host_run", "host_read", "memory_search", "chat_search", "chat_read"}
+# a required argument may arrive under another name the executor also reads
+ALIASES = {"memory_save": {"text": ("fact",)}, "chat_read": {"session_id": ("id",)},
+           "forget": {"fact": ("fact_or_id", "id")}}
+
+
+def example(name):
+    """the argument shape of a tool, for an error the model can act on: {"path": "<string>", ...}."""
+    spec = (SPECS.get(name) or {}).get("function") or {}
+    props = (spec.get("parameters") or {}).get("properties") or {}
+    req = set((spec.get("parameters") or {}).get("required") or [])
+    shape = {}
+    for k, v in props.items():
+        if k in req or len(shape) < 2:
+            t = (v or {}).get("type") or "value"
+            shape[k] = ["<string>"] if t == "array" else "<%s>" % t
+    return json.dumps(shape)
+
+
+def missing_args(name, a):
+    spec = (SPECS.get(name) or {}).get("function") or {}
+    req = (spec.get("parameters") or {}).get("required") or []
+    alias = ALIASES.get(name) or {}
+    out = []
+    for k in req:
+        keys = (k,) + tuple(alias.get(k) or ())
+        if not any(isinstance(a, dict) and a.get(x) not in (None, "", [], {}) for x in keys):
+            out.append(k)
+    return out
+
+
+def missing_message(name, missing):
+    return (f"{name} needs {', '.join(repr(k) for k in missing)}. Call it again with one JSON object like "
+            f"{example(name)}.")
+
+
+def bad_args_message(name, why):
+    return (f"the arguments for {name} were not a valid JSON object ({str(why)[:120]}). Call it again with one JSON "
+            f"object like {example(name)}.")
+
+
+def cut_message(name, max_tokens=None):
+    lim = f" ({max_tokens} tokens)" if max_tokens else ""
+    return (f"your call to {name} was cut off because the reply reached its length limit{lim}, so its arguments are "
+            "incomplete. Send a shorter call: for long content, write a first part, then add the rest with "
+            "append:true.")
+
+
+def deadline_for(name, a, default, ctx=None):
+    """seconds this call may take before the harness stops it. A tool with its own time limit gets that plus a margin."""
+    a = a if isinstance(a, dict) else {}
+
+    def num(v, d):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return d
+    if name == "run_command":
+        return max(1.0, min(num(a.get("timeout"), 60), 300)) + 15
+    if name == "host_run":
+        return max(1.0, min(num(a.get("timeout"), 30), HOST_TIMEOUT_MAX)) + 15
+    if name == "ask_server":
+        return max(default, 300.0)
+    if name == "spawn_agent":
+        return max(default, float(getattr(ctx, "sub_seconds", 60) or 60) + 30)
+    return float(default)
+
+
+def on_interrupt(ctx, fn):
+    """register a way to stop the running tool (kill its process, shut its socket)."""
+    lst = getattr(ctx, "interrupts", None)
+    if isinstance(lst, list):
+        lst.append(fn)
+
+
+def interrupt(ctx):
+    """Stop or the deadline: run every registered stopper. Never raises."""
+    ctx.interrupted = True
+    for fn in list(getattr(ctx, "interrupts", None) or []):
+        try:
+            fn()
+        except Exception:                    # noqa: BLE001
+            pass
+
+
+def _kill_tree(p):
+    """the process and everything it started (it runs in its own session)."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(p.pid, signal.SIGKILL)
+        else:
+            p.kill()
+    except (OSError, ProcessLookupError):
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+def _run_proc(argv, cwd, env, timeout, ctx):
+    """-> (returncode, stdout bytes, stderr bytes) or raises subprocess.TimeoutExpired. Stop kills the whole tree."""
+    p = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         stdin=subprocess.DEVNULL, shell=False, start_new_session=hasattr(os, "killpg"))
+    on_interrupt(ctx, lambda: _kill_tree(p))
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(p)
+        try:
+            p.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        raise
+    return p.returncode, out, err
+
+
 class Ctx(object):
     def __init__(self, sandbox, chat_id="", run_id="", advanced=False, app=None, current_key=None,
                  search_url=None, cancel_ev=None, approved_private=False, memory=None, sessions=None,
@@ -157,6 +283,9 @@ class Ctx(object):
         self.host_allow = host_allow or {"commands": [], "read_paths": []}
         self.host_audit = host_audit    # callable(record) or None; every host call writes exactly one record
         self.host_note = None           # what the last host call did, for the UI's activity row
+        self.interrupts = []            # stoppers the running tool registered (harness Stop / deadline)
+        self.interrupted = False
+        self.resolver = None            # test hook: the one name lookup web_fetch makes per hop (default: getaddrinfo)
 
 
 def available(search_url=None, advanced=False, host=False):
@@ -551,15 +680,145 @@ def _clip(s, n=MAX_OUT):
 
 
 class _Redirects(urllib.request.HTTPRedirectHandler):
-    def __init__(self, allow_private):
+    def __init__(self, allow_private, resolver=None):
         self.allow_private = allow_private
+        self.resolver = resolver
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if not newurl.startswith(("http://", "https://")):
             raise urllib.error.URLError("redirect to a non-web address refused")
-        if not self.allow_private and guards.private_host(_host(newurl)):
+        if not self.allow_private and guards.private_host(_host(newurl), self.resolver):
             raise urllib.error.URLError("the page redirected to your own network; refused (approve it to allow)")
         return urllib.request.HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, headers, newurl)
+
+
+def _plain(conn_cls, on_conn=None):
+    """the stock connection class, with the connection handed to on_conn (the proxied case: the proxy resolves the name)."""
+    def make(host, **kw):
+        conn = conn_cls(host, **kw)
+        if on_conn is not None:
+            on_conn(conn)
+        return conn
+    return make
+
+
+def _pinned(conn_cls, allow_private, resolver, on_conn=None):
+    """a connection factory for urllib's do_open: the name is resolved ONCE per hop, every answer is judged, and the
+    socket goes to the checked address; conn.host stays the NAME so the Host header, the TLS SNI and the certificate
+    check are on the name (harness SEC3, DNS rebinding). on_conn(conn) sees every connection, so a Stop or the fetch
+    deadline can shut its socket (review 10-18 night: a trickling server could hold the worker for hours)."""
+    def make(host, **kw):
+        conn = conn_cls(host, **kw)
+        if on_conn is not None:
+            on_conn(conn)
+        real = conn._create_connection
+
+        def create(addr, timeout=None, source_address=None, *a, **k):
+            name, port = addr[0], addr[1]
+            ips = guards.pinned_addresses(name, port, resolver, allow_private)
+            last = None
+            for ip in ips:
+                try:
+                    return real((ip, port), timeout, source_address, *a, **k)
+                except OSError as e:
+                    last = e
+            raise last or OSError(f"could not connect to {name}")
+        conn._create_connection = create
+        return conn
+    return make
+
+
+def _proxied(req):
+    """an environment proxy resolves the target itself; the connection then goes to the proxy, not the page."""
+    return bool(getattr(req, "_tunnel_host", None)) or str(getattr(req, "selector", "")).startswith(("http://", "https://"))
+
+
+class _PinnedHTTP(urllib.request.HTTPHandler):
+    def __init__(self, allow_private, resolver, on_conn=None):
+        urllib.request.HTTPHandler.__init__(self)
+        self.f = _pinned(http.client.HTTPConnection, allow_private, resolver, on_conn)
+        self.plain = _plain(http.client.HTTPConnection, on_conn)
+
+    def http_open(self, req):
+        return self.do_open(self.plain if _proxied(req) else self.f, req)
+
+
+class _PinnedHTTPS(urllib.request.HTTPSHandler):
+    def __init__(self, allow_private, resolver, on_conn=None):
+        urllib.request.HTTPSHandler.__init__(self)
+        self.f = _pinned(http.client.HTTPSConnection, allow_private, resolver, on_conn)
+        self.plain = _plain(http.client.HTTPSConnection, on_conn)
+
+    def https_open(self, req):
+        return self.do_open(self.plain if _proxied(req) else self.f, req)
+
+
+def fetch_opener(allow_private, resolver=None, on_conn=None):
+    """the web_fetch opener: pinned connections + redirects re-checked, hop by hop, the same way."""
+    return urllib.request.build_opener(_Redirects(allow_private, resolver), _PinnedHTTP(allow_private, resolver, on_conn),
+                                       _PinnedHTTPS(allow_private, resolver, on_conn))
+
+
+FETCH_TOTAL_S = 45           # wall clock for one page, connect to last byte: a server that trickles bytes cannot hold a worker
+FETCH_MAX_BYTES = 2 << 20
+FETCH_CHUNK = 65536
+
+
+def _shut_sock(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except (OSError, AttributeError):
+        pass
+
+
+def _response_sock(r):
+    """the socket under an HTTPResponse (urllib closes the connection's own handle once the headers are in)."""
+    return getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)
+
+
+def _fetch_body(req, ctx, total_s=None):
+    """open the page and read up to FETCH_MAX_BYTES under ONE deadline for the whole fetch -> (content type, bytes).
+    Stop (tools.interrupt) and the deadline shut the live socket, so neither a dripping header phase nor a dripping
+    body can outlive them (before: timeout=20 was per recv, and web_fetch had no stopper)."""
+    total_s = FETCH_TOTAL_S if total_s is None else total_s
+    live = []                                   # the connection(s) of this fetch, then the response's socket
+    cut = {"why": None}
+
+    def stop(why="stopped"):
+        cut["why"] = cut["why"] or why
+        for x in list(live):
+            _shut_sock(x.sock if isinstance(x, http.client.HTTPConnection) else x)
+    on_interrupt(ctx, stop)
+    op = fetch_opener(getattr(ctx, "approved_private", False), getattr(ctx, "resolver", None), live.append)
+    deadline = time.time() + total_s
+    timer = threading.Timer(total_s, stop, ("deadline",))
+    timer.daemon = True
+    timer.start()
+    try:
+        with op.open(req, timeout=20) as r:
+            sock = _response_sock(r)
+            if sock is not None:
+                live.append(sock)
+            raw = b""
+            while len(raw) < FETCH_MAX_BYTES and not cut["why"] and not getattr(ctx, "interrupted", False):
+                if time.time() > deadline:
+                    stop("deadline")
+                    break
+                chunk = r.read(min(FETCH_CHUNK, FETCH_MAX_BYTES - len(raw)))
+                if not chunk:
+                    break
+                raw += chunk
+            ctype = r.headers.get("Content-Type") or ""
+    except (OSError, urllib.error.URLError) as e:
+        if not cut["why"] and not getattr(ctx, "interrupted", False):
+            raise e
+    finally:
+        timer.cancel()
+    if cut["why"] == "deadline":
+        raise ValueError(f"the page took longer than {int(total_s)} s to arrive; it was not read")
+    if cut["why"] or getattr(ctx, "interrupted", False):
+        raise ValueError("the fetch was stopped")
+    return ctype, raw
 
 
 def html_text(raw):
@@ -582,11 +841,8 @@ def web_fetch(a, ctx):
         md = search.reader_markdown(url, ctx.search_cfg)
         if md:
             return guards.screen_injected(_clip("Source: " + url + "\n\n" + md, mx))
-    op = urllib.request.build_opener(_Redirects(ctx.approved_private))
     req = urllib.request.Request(url, headers={"User-Agent": "PXA-Control-Chat/1", "Accept": "text/html,text/plain,*/*"})
-    with op.open(req, timeout=20) as r:
-        ctype = r.headers.get("Content-Type") or ""
-        raw = r.read(2 << 20)
+    ctype, raw = _fetch_body(req, ctx, getattr(ctx, "fetch_total_s", None))
     text = raw.decode("utf-8", "replace")
     if "html" in ctype or text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
         text = html_text(text)
@@ -683,7 +939,11 @@ def ask_server(a, ctx, get=None, post=None):
                 "messages": [{"role": "system", "content": SUB_SYSTEM.format(name=t["name"])},
                              {"role": "user", "content": user}]}
         t0 = time.time()
-        r = (post or oai.post_json)(t["base_url"], "/v1/chat/completions", body, 300.0)
+        if post is None:
+            r = oai.post_json(t["base_url"], "/v1/chat/completions", body, 300.0,
+                              on_conn=lambda c, alive: alive and on_interrupt(ctx, lambda: oai.shutdown_conn(c)))
+        else:
+            r = post(t["base_url"], "/v1/chat/completions", body, 300.0)
         msg = ((r.get("choices") or [{}])[0]).get("message") or {}
         ans = (msg.get("content") or "").strip()
         if not ans:
@@ -715,15 +975,24 @@ def run_command(a, ctx):
     os.makedirs(os.path.dirname(ctx.sandbox), mode=0o700, exist_ok=True)   # the chat's files: owner-only, like the sessions
     os.makedirs(ctx.sandbox, mode=0o700, exist_ok=True)
     try:
-        p = subprocess.run(argv, cwd=ctx.sandbox, env=dict(SAFE_ENV, HOME=ctx.sandbox), capture_output=True,
-                           timeout=to, stdin=subprocess.DEVNULL, shell=False)
+        code, so, se = _run_proc(argv, ctx.sandbox, dict(SAFE_ENV, HOME=ctx.sandbox), to, ctx)
     except FileNotFoundError:
         return f"error: program {argv[0]!r} not found"
     except subprocess.TimeoutExpired:
         return f"error: the command ran longer than {to} s and was stopped"
-    out = p.stdout.decode("utf-8", "replace")
-    err = p.stderr.decode("utf-8", "replace")
-    return _clip(f"exit code {p.returncode}\n--- stdout ---\n{out[-8000:]}\n--- stderr ---\n{err[-3000:]}")
+    if getattr(ctx, "interrupted", False):
+        return "error: the command was stopped"
+    out = so.decode("utf-8", "replace")
+    err = se.decode("utf-8", "replace")
+    sb = getattr(ctx, "sandbox", "") or ""
+    if sb and (sb in out or sb in err or os.path.realpath(sb) in out or os.path.realpath(sb) in err):
+        # the output carried the sandbox's absolute path: the model gets the relative form. The log says THAT it happened,
+        # never the text: a script's output (a traceback names the path on every failure) can hold whatever the script
+        # read or the user pasted, and control.log is what people attach to bug reports (review 10-18 night)
+        _log.warning("chat %s run_command output carried the sandbox path %s: shown to the model relative (%d+%d chars)",
+                     getattr(ctx, "chat_id", ""), os.path.realpath(sb), len(out), len(err))
+    out, err = _scrub(out, ctx), _scrub(err, ctx)
+    return _clip(f"exit code {code}\n--- stdout ---\n{out[-8000:]}\n--- stderr ---\n{err[-3000:]}")
 
 
 # ---- host access (opt-in per session; every call is allowlist-checked and audited) -----------------
@@ -769,8 +1038,8 @@ def host_run(a, ctx):
         to = 30
     t0 = time.time()
     try:
-        p = subprocess.run(val, cwd="/", env=guards.host_env(), capture_output=True, timeout=to,
-                           stdin=subprocess.DEVNULL, shell=False)
+        rc, so, se = _run_proc(val, "/", guards.host_env(), to, ctx)
+        p = subprocess.CompletedProcess(val, rc, so, se)
     except FileNotFoundError:
         _host_audit(ctx, _host_rec("host_run", ctx, decision="error", argv=val, why="not found", secs=time.time() - t0))
         return f"error: program {val[0]!r} not found on this machine"
@@ -877,6 +1146,33 @@ def _chat_tools(name, a, ctx):
     return ok, _clip(text)
 
 
+def _scrub(text, ctx):
+    """what the model sees never carries the sandbox's absolute path (harness pathleak): the chat's folder shows
+    as '.', a path under it as the relative one. The absolute text goes to the server log only."""
+    text = str(text)
+    sb = getattr(ctx, "sandbox", "") or ""
+    if not sb:
+        return text
+    for root in sorted({os.path.realpath(sb), os.path.abspath(sb), sb}, key=len, reverse=True):
+        if root and root != os.sep:
+            text = text.replace(root + os.sep, "").replace(root, "<sandbox>")
+    return text
+
+
+def _os_error(e, ctx):
+    """-> the model-facing line for an OSError: the reason in words and the sandbox-relative name, no absolute path."""
+    _log.warning("chat %s tool file error (not shown to the model): %s: %s", getattr(ctx, "chat_id", ""),
+                 e.__class__.__name__, e)
+    why = getattr(e, "reason", None) or getattr(e, "strerror", None) or e.__class__.__name__
+    fn = getattr(e, "filename", None)
+    if fn:
+        sb = os.path.realpath(ctx.sandbox) if getattr(ctx, "sandbox", "") else ""
+        f = os.path.realpath(str(fn)) if sb else str(fn)
+        f = os.path.relpath(f, sb) if sb and (f == sb or f.startswith(sb + os.sep)) else os.path.basename(str(fn))
+        return f"error: {_scrub(why, ctx)}: {f}"
+    return f"error: {_scrub(why, ctx)}"
+
+
 def execute(name, a, ctx):
     """-> (ok, text). Never raises."""
     try:
@@ -921,17 +1217,19 @@ def execute(name, a, ctx):
             return not r.startswith(("error:", "refused:")), r
         return False, f"error: there is no tool called {name!r}"
     except fence.Outside as e:
-        return False, f"error: {e}"
+        return False, f"error: {_scrub(e, ctx)}"
     except (ValueError, TypeError, ZeroDivisionError, OverflowError, SyntaxError) as e:
-        return False, f"error: {e}"
+        return False, f"error: {_scrub(e, ctx)}"
     except urllib.error.HTTPError as e:
         return False, f"error: the page answered HTTP {e.code}"
     except (urllib.error.URLError, OSError) as e:
-        return False, f"error: {getattr(e, 'reason', None) or e}"
+        if isinstance(e, urllib.error.URLError) and not isinstance(getattr(e, "reason", None), OSError):
+            return False, f"error: {_scrub(getattr(e, 'reason', None) or e, ctx)}"
+        return False, _os_error(e if not isinstance(e, urllib.error.URLError) else e.reason, ctx)
     except oai.OAIError as e:
-        return False, f"error: {e}"
+        return False, f"error: {_scrub(e, ctx)}"
     except Exception as e:           # noqa: BLE001
-        return False, f"error: {e.__class__.__name__}: {e}"
+        return False, f"error: {e.__class__.__name__}: {_scrub(e, ctx)}"
 
 
 def text_protocol_prompt(names):

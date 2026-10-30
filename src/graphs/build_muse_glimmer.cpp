@@ -101,7 +101,7 @@ ggml_cgraph * llm_build_context::build_muse_glimmer() {
             // Suppress the hint when the layer is served by the sliding cache. Nothing is lost
             // correctness-wise (the mask still carries the window) and little is lost in work,
             // because that cache IS the window: there is no long tail left to skip.
-            // 2026-08-17 (fable10): the hint is passed again for sliding-cache layers. The reason
+            // 2026-08-17: the hint is passed again for sliding-cache layers. The reason
             // it was suppressed -- the CPU iqk path slicing K/V/mask by INDEX -- is gone: that
             // slice is now mask-driven (PXA_NANFIX_SWA_SLICE_CPU in iqk_flash_attn.cpp) and is
             // correct for a floating/wrapping band. Passing it again restores the CUDA

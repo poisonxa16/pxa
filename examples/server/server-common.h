@@ -3,7 +3,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
-#include <src/llama-impl.h>
+#include "llama-impl.h"   // src/ (llama's public include dir)
 #include "chat.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -532,3 +532,9 @@ bool prompt_cache_equal(llama_context* ctx, const server_tokens& cache_tokens,
     const server_tokens& prompt_tokens, size_t start, const common_prefix& prefix);
 
 std::string safe_json_to_str(const json& data);
+
+// Windows (MSVC) only: the POSIX names the PXA server files use (setenv, mkdir, fsync, ...); empty on POSIX.
+#include "pxa-win-compat.h"
+#ifndef PXA_PATH_CSTR
+#define PXA_PATH_CSTR(p) (p).c_str()   // std::filesystem::path -> const char * (Windows: via string(), see pxa-win-compat.h)
+#endif

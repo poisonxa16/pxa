@@ -26,6 +26,12 @@
 struct llama_model;
 struct ggml_tensor;
 
+// unary_op of a GATE-LESS chain (no gate stack: Nemotron-H MoE, down(relu(up x)^2) or down(relu(up x))), in place of a ggml_unary_op.
+// relu and the square are exact in float on every backend, so the all-CPU chain equals the scheduler split's whatever device the
+// split ran the activation on (2026-10-19).
+constexpr int PXA_XCA_GATELESS_RELU     = -1;
+constexpr int PXA_XCA_GATELESS_RELU_SQR = -2;
+
 // PXA_XCACHE_ASYNC=1
 bool llama_pxa_xcache_async_wanted(void);
 // widest graph (tokens) that takes the async path: PXA_XCACHE_ASYNC_MAXTOK, default 8 (a decode, an MTP / n-gram verify batch)
@@ -34,7 +40,8 @@ int  llama_pxa_xcache_async_max_tokens(void);
 // The rendezvous handle of layer `il` for a graph of n_tokens tokens (an opaque struct ggml_cuda_cold_slot *), creating the layer's
 // slot, the (layer, width) CPU sub-graph and the worker thread on first use; nullptr when this layer cannot take the async path
 // (the caller then builds the scheduler path). up / gate (or up_gate) / down are the layer's COLD stacks as the CPU sees them (the
-// aliases of the pinned bytes); unary_op is a ggml_unary_op (SILU or GELU).
+// aliases of the pinned bytes); unary_op is a ggml_unary_op (SILU or GELU), or PXA_XCA_GATELESS_* for a gate-less chain (gate and
+// up_gate null: Nemotron-H MoE).
 //
 // fused_chain: the split path builds this layer's cold chain through ggml_moe_up_gate (merged up/gate stack, or a pair of one fusable type), which the
 // scheduler keeps whole on the CPU. A layer built the other way (separate named up / gate / unary nodes, e.g. an up stack of one type and a gate stack
@@ -43,7 +50,15 @@ int  llama_pxa_xcache_async_max_tokens(void);
 // Flash-Next 32GB: 4 of 31 cold layers, |diff| up to 2.4e-4). Such a layer stays on the split path (bit-identical output) unless
 // PXA_XCACHE_ASYNC_MIXED=1 asks for the all-CPU chain anyway.
 void * llama_pxa_xcache_async_slot(const llama_model & model, int il, int n_tokens, int n_embd, int n_used,
-        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * up_gate, ggml_tensor * down, int unary_op, int n_threads, bool fused_chain);
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * up_gate, ggml_tensor * down, int unary_op, int n_threads, bool fused_chain,
+        float clamp_limit = 0.0f);
+
+// PXA_XCACHE_ASYNC_CLAMP=1 (default OFF; the GLM-5.x work, mechanism M1): let the async cold path serve the DeepSeek-V4 / GLM-5.x clamped
+// SwiGLU (llm_build_moe_ffn's dsv4_clamp branch; without it those layers keep the scheduler split). The worker then runs the clamped
+// chain (up / gate mul_mat_id, the two clamps, swiglu_split, down) on the CPU, byte-identical to the same nodes as a plain CPU graph
+// (tests/test-pxa-xcache-async.cpp --clamp). Versus the scheduler split it equals the split path only where the scheduler also keeps
+// the clamp / swiglu nodes on the CPU; PXA_XCACHE_ASYNC_CHECK compares the two on a card. Not with PXA_FMOE_CLAMP (fused clamp node).
+bool llama_pxa_xcache_async_clamp_wanted(void);
 
 // stop the worker, print the summary, free the slots (the model destructor)
 void llama_pxa_xcache_async_free(llama_model & model);

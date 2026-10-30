@@ -288,7 +288,7 @@ bool ggml_cuda_dsa_attn_supported(const ggml_tensor * dst, int cc) {
     if (!pxa_dsa_attn_enabled()) return false;
 
     // Untestable here; do not claim it.
-    if (cc >= CC_OFFSET_AMD) return false;
+    if (cc >= PXA_CC_OFFSET_AMD) return false;
 
     const ggml_tensor * Q       = dst->src[0];
     const ggml_tensor * K       = dst->src[1];

@@ -48,6 +48,7 @@ SUBJECTS_STAGE = [
     "pxa_encode.py",      # the encoder front end
     "pxa_encode_pkg.py",  # the encoder's package/verifier
     "pxa_lib_update.py",  # the updater (pxa-update lib)
+    "pxa_engine_update.py",  # the engine channel updater (pxa-update --channel beta)
 ]
 SUBJECTS_IMAGE = [
     "pxa-launch.py",

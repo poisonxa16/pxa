@@ -27,6 +27,7 @@ bool ggml_cuda_mmvq_type_supported(ggml_type src0_type);
 // True when the type has a grouped launcher and it ran; false = launch the matrices one by one.
 struct mmvq_group_args;
 bool ggml_cuda_mmvq_group(ggml_type type, mmvq_group_args & g, cudaStream_t stream);
+bool ggml_cuda_mmvq_group_mix(ggml_type ta, ggml_type tb, mmvq_group_args & ga, mmvq_group_args & gb, cudaStream_t stream);
 
 void ggml_cuda_op_mul_mat_vec_q_3D(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

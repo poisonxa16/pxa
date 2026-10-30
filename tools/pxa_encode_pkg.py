@@ -24,6 +24,7 @@ SAFETY (this code downloads something Control will later run, so it is strict on
 import base64
 import binascii
 import hashlib
+import http.client
 import json
 import os
 import platform as _platform
@@ -527,6 +528,8 @@ def download(url, dest, size=None, progress=None, cancelled=None):
             r = None
         elif e.code == 410:
             raise _http_error(410, "")
+        elif e.code in (429, 502, 503, 504):     # busy server or a proxy/tunnel hiccup: transient, the .part stays and a retry resumes
+            raise PackageError("The server is busy right now (%d). Try again in a minute: it resumes where it stopped." % e.code, "offline")
         else:
             raise PackageError("The download failed (the server said %d)." % e.code, "download")
     except (urllib.error.URLError, OSError, TimeoutError):
@@ -551,7 +554,10 @@ def download(url, dest, size=None, progress=None, cancelled=None):
                     done += len(b)
                     if progress:
                         progress(done, size or (total + (have if mode == "ab" else 0)) or None)
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+        except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as e:
+            raise PackageError("The download was interrupted. Try again (it resumes where it stopped).", "offline")
+        if total and done - (have if mode == "ab" else 0) < total:
+            # the connection closed before Content-Length bytes arrived (a proxy or tunnel drop): keep the .part to resume
             raise PackageError("The download was interrupted. Try again (it resumes where it stopped).", "offline")
     os.replace(part, dest)
     return dest

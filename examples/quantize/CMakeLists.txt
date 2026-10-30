@@ -29,3 +29,14 @@ if (PXA_PXQ_ENCODER)
 endif()
 
 pxa_add_alias(${TARGET} pxa-quantize)
+
+# pxa-dsv41-convert (PRIVATE: tools/dsv41-convert is a closed path, it links the PXQN codec): DeepSeek-V4.1
+# safetensors (MXFP4 experts, FP8 32x32 dense) -> PXQN GGUF, streamed one matrix at a time (no F32 file).
+if (PXA_PXQN_ENCODER AND EXISTS ${CMAKE_SOURCE_DIR}/tools/dsv41-convert/dsv41-convert.cpp)
+    add_executable(pxa-dsv41-convert ${CMAKE_SOURCE_DIR}/tools/dsv41-convert/dsv41-convert.cpp
+                                     ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c)
+    target_link_libraries(pxa-dsv41-convert PRIVATE llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    target_include_directories(pxa-dsv41-convert PRIVATE ${CMAKE_SOURCE_DIR}/vendor ${CMAKE_SOURCE_DIR}/ggml/include
+                                                      ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps)
+    target_compile_features(pxa-dsv41-convert PRIVATE cxx_std_17)
+endif()

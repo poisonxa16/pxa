@@ -83,7 +83,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4: case GGML_TYPE_PXQ4:   // PXQ4: pxa/pxq4-mmq80.cu (sm_80+ only); one line keeps __LINE__ of the stock code
             return MMQ_Q8_1_DS_LAYOUT_D4;
         default:
             fprintf(stderr, "Unhandled type %s (%d)\n", ggml_type_name(type_x), type_x);
@@ -98,7 +98,7 @@ struct tile_x_sizes {
     int sc;
 };
 
-static constexpr int get_mmq_x_max_host(const int cc) {
+static int get_mmq_x_max_host(const int cc) {
     // On NVIDIA Volta the device-side MMQ kernels are only instantiated up to
     // MMQ_DP4A_MAX_BATCH_SIZE when GGML_CUDA_FORCE_MMQ is defined (see
     // get_mmq_x_max_device() below). If the host dispatch picks a larger tile,
@@ -107,7 +107,7 @@ static constexpr int get_mmq_x_max_host(const int cc) {
     // larger batches. Either way the bound on Volta is the same, so collapse
     // the two paths and document the constraint.
     return int8_mma_available(cc) ? 128 :
-        cc >= CC_VOLTA && cc < CC_OFFSET_AMD ? MMQ_DP4A_MAX_BATCH_SIZE : 64;
+        cc >= PXA_CC_VOLTA && cc < PXA_CC_OFFSET_AMD ? MMQ_DP4A_MAX_BATCH_SIZE : 64;
 }
 
 static constexpr __device__ int get_mmq_x_max_device() {
@@ -119,23 +119,23 @@ static constexpr __device__ int get_mmq_x_max_device() {
     return 128;
 #else // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 
-#if __CUDA_ARCH__ >= CC_VOLTA
+#if __CUDA_ARCH__ >= PXA_CC_VOLTA
 #ifdef GGML_CUDA_FORCE_MMQ
     return MMQ_DP4A_MAX_BATCH_SIZE;
 #else // GGML_CUDA_FORCE_MMQ
     return 128;
 #endif // GGML_CUDA_FORCE_MMQ
-#else // __CUDA_ARCH__ >= CC_VOLTA
+#else // __CUDA_ARCH__ >= PXA_CC_VOLTA
 
     return 64;
-#endif // __CUDA_ARCH__ >= CC_VOLTA
+#endif // __CUDA_ARCH__ >= PXA_CC_VOLTA
 
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 #endif // INT8_MMA_AVAILABLE
 }
 
 static constexpr int get_mmq_y_host(const int cc) {
-    return cc >= CC_OFFSET_AMD ? (cc == CC_RDNA1 ? 64 : 128) : (cc >= CC_VOLTA ? 128 : 64);
+    return cc >= PXA_CC_OFFSET_AMD ? (cc == PXA_CC_RDNA1 ? 64 : 128) : (cc >= PXA_CC_VOLTA ? 128 : 64);
 }
 
 static constexpr __device__ int get_mmq_y_device() {
@@ -146,11 +146,11 @@ static constexpr __device__ int get_mmq_y_device() {
     return 128;
 #endif // defined RDNA1
 #else
-#if __CUDA_ARCH__ >= CC_VOLTA
+#if __CUDA_ARCH__ >= PXA_CC_VOLTA
     return 128;
 #else
     return 64;
-#endif // __CUDA_ARCH__ >= CC_VOLTA
+#endif // __CUDA_ARCH__ >= PXA_CC_VOLTA
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 }
 
@@ -186,7 +186,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_IQ1_S   : return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_XS  : return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_NL  : return MMQ_DP4A_TXS_Q8_0;
-        case GGML_TYPE_MXFP4   : return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_MXFP4   : return MMQ_DP4A_TXS_Q8_0;    case GGML_TYPE_PXQ4: return MMQ_DP4A_TXS_Q8_0_16;   // PXQ4: pxa/pxq4-mmq80.cu, sizes only
         default                : return tile_x_sizes{0, 0, 0};
     }
 }
@@ -224,7 +224,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_IQ1_S   : return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_XS  : return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_NL  : return MMQ_MMA_TILE_X_K_Q8_0;
-        case GGML_TYPE_MXFP4   : return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_MXFP4   : return MMQ_MMA_TILE_X_K_Q8_0; case GGML_TYPE_PXQ4: return MMQ_MMA_TILE_X_K_Q3_K;  // PXQ4: pxa/pxq4-mmq80.cu
         default                : return 0;
     }
 }
@@ -3598,11 +3598,11 @@ template <ggml_type type, int mmq_x, int nwarps, bool need_check>
     __launch_bounds__(WARP_SIZE*nwarps, 2)
 #endif // defined(RDNA3) || defined(RDNA2)
 #else
-#if __CUDA_ARCH__ >= CC_VOLTA
+#if __CUDA_ARCH__ >= PXA_CC_VOLTA
     __launch_bounds__(WARP_SIZE*nwarps, 1)
 #else
     __launch_bounds__(WARP_SIZE*nwarps, 2)
-#endif // __CUDA_ARCH__ >= CC_VOLTA
+#endif // __CUDA_ARCH__ >= PXA_CC_VOLTA
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 static __global__ void mul_mat_q(
     const char * __restrict__ x, const char * __restrict__ yc, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -3618,7 +3618,7 @@ static __global__ void mul_mat_q(
     constexpr int mmq_y = get_mmq_y_device();
 
     // On AMD or old CUDA the performance with stream-k was worse, use conventional tiling instead:
-#if (defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) || __CUDA_ARCH__ < CC_VOLTA
+#if (defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) || __CUDA_ARCH__ < PXA_CC_VOLTA
     {
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, nwarps, need_check, fixup>
@@ -3626,7 +3626,7 @@ static __global__ void mul_mat_q(
                 blockIdx.x, blockIdx.y, 0, ne00/qk);
         return;
     }
-#endif // (defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) || __CUDA_ARCH__ < CC_VOLTA
+#endif // (defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) || __CUDA_ARCH__ < PXA_CC_VOLTA
 
     const     int64_t blocks_per_ne00 = ne00 / qk;
     constexpr int     blocks_per_iter = MMQ_ITER_K / qk;
@@ -3801,7 +3801,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntx = (args.ne11 + mmq_x - 1) / mmq_x;
     const dim3 block_nums_xy_tiling(nty, ntx, 1);
 
-    const bool use_stream_k = cc >= CC_VOLTA && cc < CC_OFFSET_AMD;
+    const bool use_stream_k = cc >= PXA_CC_VOLTA && cc < PXA_CC_OFFSET_AMD;
     if (!use_stream_k) {
         if (args.ne01 % mmq_y == 0) {
             constexpr bool need_check = false;
@@ -3851,7 +3851,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
     const int block_num_y = (args.ne01 + mmq_y - 1) / mmq_y;
-    const bool use_stream_k = cc >= CC_VOLTA && cc < CC_OFFSET_AMD;
+    const bool use_stream_k = cc >= PXA_CC_VOLTA && cc < PXA_CC_OFFSET_AMD;
 
     int mmq_x_best  = 0;
     int nparts_best = INT_MAX;
@@ -3962,3 +3962,4 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11);
+bool ggml_cuda_should_use_mmq_dense(enum ggml_type type, int cc, int64_t ne11);

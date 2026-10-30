@@ -35,6 +35,9 @@ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
 struct llama_layer;
 
+// PXA_NEMOTRON_MTP: PXA_MTP_HEAD_FILE (an external NextN head GGUF to attach), nullptr when unset
+const char * llama_pxa_mtp_head_file(void);
+
 struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
@@ -193,6 +196,9 @@ struct llama_model_loader {
     // from a private read-only file mapping (their bytes ARE the file). Both load paths skip
     // them; their size is counted into size_done when they are mapped.
     std::unordered_set<const struct ggml_tensor *> pxa_premapped;
+    // PXA_PLE_LAZY: the model mapping was created without MAP_POPULATE; bulk copies at load read with pread (big sequential
+    // reads) instead of faulting the mapping page by page (28 MB/s on a spinning disk, measured 10-19)
+    bool pxa_lazy_mapping = false;
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(

@@ -52,8 +52,6 @@ queue behind one another — which is the whole shape of the crossover in §3.
 | `scripts/pxa-serve-sm60.sh` | P100-class serving launcher, measured defaults |
 | `tools/pxa-launch.py` | picks the engine, prints the evidence and the command |
 
-`pxa/pxq4/MANIFEST.md` lists every shipped binary with size and md5.
-
 ---
 
 ## 2. Quant tier support — the truth table
@@ -658,9 +656,9 @@ run on an architecture it was not built for.
 
 | library | arch | ops added | status |
 |---|---|---|---|
-| `libpxq_sm70_v13.so` | sm_70 | `pxq2_*` / `pxq3_*` (`dequant_out`, `mmv_out`, `linear_out`, `moe_mmv_out`), `pxq_selftest`, `pxq_set_book`, `pxq_set_sub`, `pxq_supported` | **required for any PXQ2/PXQ3 checkpoint** on sm_70. A superset of v12b: the PXQ4 kernels in it are the v12b sources, unmodified. Built from `kernels-src/build_pxq_v13.sh`. |
+| `libpxq_sm70_v13.so` | sm_70 | `pxq2_*` / `pxq3_*` (`dequant_out`, `mmv_out`, `linear_out`, `moe_mmv_out`), `pxq_selftest`, `pxq_set_book`, `pxq_set_sub`, `pxq_supported` | **required for any PXQ2/PXQ3 checkpoint** on sm_70. A superset of v12b: the PXQ4 kernels in it are the v12b sources, unmodified. |
 | `libpxq_sm60_v13.so` | sm_60 (+sm_70 cubin) | same | **required for any PXQ2/PXQ3 checkpoint** on sm_60 |
-| `libpxq4_sm70_v12b.so` | sm_70 | `f16_mmv_out`, `mma_out` | **current** for sm_70 — the tensor-core decode path, armed at batch >= 5 by `PXQ4_MMV_MMA=1`. Built from `pxa/pxq4/kernels-src/build_v12b.sh`; see `pxa/pxq4/MANIFEST.md`. This is the library the 2xV100 recipe in `docs/COOKBOOK.md` names. |
+| `libpxq4_sm70_v12b.so` | sm_70 | `f16_mmv_out`, `mma_out` | **current** for sm_70 — the tensor-core decode path, armed at batch >= 5 by `PXQ4_MMV_MMA=1`. This is the library the 2xV100 recipe in `docs/COOKBOOK.md` names. |
 | `libpxq4_sm70_v10.so` | sm_70 | `f16_mmv_out` | shipped for sm_70; superseded by v12b |
 | `libpxq4_sm60_v10.so` | sm_60 | `f16_mmv_out` | **shipped** for sm_60 |
 | `libpxq4_sm60_v11.so` | sm_60 | `gemm2d_out` | ~+34% prefill behind `PXQ4_GEMM2D`, **default off** — failed first-token quality at 87.5%. Do not enable without re-gating quality. |
@@ -697,9 +695,7 @@ run: before loading a model, `torch.ops.pxq4.pxq_selftest(254)` decodes a determ
 synthetic panel set with a host oracle written from the format spec and requires the device
 kernels to agree **bit-exactly** — dequant against the oracle, and the decode GEMV against a
 host replay of the kernel's own canonical-chunk fold. Tier `252` additionally checks the
-templated PXQ4 instantiation against the shipped PXQ4 kernel, which is the transcription gate
-for the whole header family. `kernels-src/tests_pxq23/gpu_selftest.py` wraps all of that plus
-a real-tensor check and an expert-indexing check; run it first in any window.
+PXQ4 path the same way. Run it first in any window.
 
 ---
 
@@ -865,6 +861,62 @@ Two optional operator guards, both unset by default: `PXA_REQUIRE_HOST` refuses 
 unless `hostname` matches, and `PXA_RESERVED_CARDS` (sm_60 script) refuses if `CARDS`
 intersects a list of indices you have reserved for other workloads.
 
+### Running the sidecar without Docker
+
+The launchers above run the prebuilt images. You can run the same sidecar on a host
+Python, but two gates decide whether that works, and you need to know what you were
+actually given.
+
+**What ships where.**
+
+- The release tarball ships the plugin tree under `vllm-sidecar/sidecar/`: `site-union`
+  (sm_70) and `site-sm60` (sm_60). Read `pxa/pxq4/sidecar/...` in this section as
+  `vllm-sidecar/sidecar/...` there.
+- The converter and the prebuilt kernel libraries ship **only inside the docker images**,
+  not in the tarball. The supported route is the images (the launchers above); a host
+  Python needs a kernel library built for its own torch (gate 2).
+
+**Gate 1: the attention backend.** `FLASH_ATTN_V100` (sm_70) and `PASCAL_SDPA` (sm_60)
+exist only in the Volta vLLM port. Stock vLLM has neither and does not compile for
+sm_60 or sm_70. Without the port there is nothing to point `--attention-backend` at;
+use the engine instead.
+
+**Gate 2: the torch ABI.** The shipped sm_70 libraries are built against torch
+2.10.0+cu128 and the sm_60 libraries against torch 2.7.1+cu126. A library loaded into a
+different torch does not fail cleanly; it dies part-way through model load with
+`undefined symbol: _ZNK3c1010TensorImpl15incref_pyobjectEv`. Serve with the torch the
+library was built for, which is what the images do.
+
+**Convert** inside the image (see [section 5](#5-converting-a-pxq4-model-for-vllm)).
+
+**Serve, V100** (same values as the container line in the exact container lines below):
+
+```bash
+export PYTHONPATH=$PWD/pxa/pxq4/sidecar/site-union
+export PXQ4_LIB=/abs/path/libpxq4_sm70_v12b.so     # always set explicitly
+export PXQ4_MMV_MMA=1 PXQ4_MMV_SPLIT_MAX_BLOCKS=300
+export VLLM_SM70_QUANT_BACKEND=marlin VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=0
+python -m vllm.entrypoints.openai.api_server --model /path/model-PXQ4-vllm \
+  --quantization pxq4 --attention-backend FLASH_ATTN_V100 --dtype float16 \
+  --tensor-parallel-size 2 --block-size 256 --trust-remote-code \
+  --compilation-config '{"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,16]}'
+```
+
+**Serve, P100: three swaps** to the V100 recipe, plus the Pascal-only environment:
+
+1. `PYTHONPATH` to `pxa/pxq4/sidecar/site-sm60`.
+2. `PXQ4_LIB` to your sm_60 library (`libpxq4_sm60_v10.so` equivalent, or the v13 build).
+3. `--attention-backend PASCAL_SDPA`, with `TORCHDYNAMO_DISABLE=1` and
+   `VLLM_USE_BREAKABLE_CUDAGRAPH=1` in the environment, and drop the sm_70-only
+   `PXQ4_MMV_MMA` and Marlin variables. Use `"cudagraph_mode":"FULL_DECODE_ONLY"` in the
+   compilation config, as in the exact container lines.
+
+For a MoE model add `--disable-custom-all-reduce` on either arch.
+
+**Check it took.** The server log must contain `fp16 mmv fast path armed` (see
+[section 9](#9-after-the-server-is-up)); a missing line means the plugin or library did
+not load and you are on the slow path.
+
 ### The underlying command
 
 ```
@@ -892,8 +944,8 @@ kernel library for the card.
 python, torch and vLLM live on the host and are bind-mounted in — `vllm` is not on
 `PATH` there, and the command must be
 `<host python> -m vllm.entrypoints.openai.api_server --model ...` instead.
-`pxa-launch.py` handles that distinction from a site-local JSON descriptor named by
-`PXA_VLLM_HOST_ENV`; nothing site-specific is hardcoded.
+`pxa-launch.py` handles that distinction from the host-runtime record it keeps for that
+image, rooted at `PXA_HOST_ROOT`.
 
 ### The exact container lines
 
@@ -1242,6 +1294,24 @@ whole correctness argument.
 
 ---
 
+## Opt-in field patches (default off)
+
+Three patches from the V100 SXM2 field report are applied in the `:v32-field` test images
+(`tools/vllm-pxq4/deploy/Dockerfile.field`). A boot that does not set the variables matches
+this build's scheduler, block pool and rejection sampler.
+
+| lever | unset | set |
+|---|---|---|
+| `PXA_LPT_SOLO` | `--long-prefill-token-threshold` always applies | `1` ignores that cap while the engine has at most one request |
+| `PXA_SWA_KEEP_HASHED` | freed KV blocks stay in caller order | `1` puts hashed blocks on the LRU end of the free queue |
+| `PXA_LENIENT_LOGR` | exact rejection sampling | a log-ratio (for example `-1.6`) also accepts a draft token close to the target's top logit. This changes greedy output. The field report measured HumanEval 91.5% to 84.1% at `-1.6` |
+
+Details and the measured TP4 numbers are in `docs/FIELD-REPORT-V100-SXM2-TP4.md` and `tools/vllm-pxq4/patches/README.md`.
+
+## Credits
+
+Jozkah measured the V100 SXM2 TP4 field report and contributed the DFlash2 drafter tools and the solo-prefill, keep-hashed and lenient-acceptance patches.
+
 ## Further reading
 
 | document | what it covers |
@@ -1249,9 +1319,9 @@ whole correctness argument.
 | [`tools/vllm-pxq4/README.md`](../tools/vllm-pxq4/README.md) | the package itself, attribution, build and test |
 | [`docs/PXA-SM70-SERVING.md`](PXA-SM70-SERVING.md) | the full V100 sweep and every trap |
 | [`docs/PXA-SM60-SERVING.md`](PXA-SM60-SERVING.md) | the full P100 sweep and every trap |
+| `docs/FIELD-REPORT-V100-SXM2-TP4.md` (source tree only; not in release packages yet) | field report: 32 GB SXM2 V100, TP4, DFlash2 fine-tunes, agent workload, traps and negative results |
 | [`docs/LAUNCHER.md`](LAUNCHER.md) | `pxa-launch.py`: the decision table, refusals and evidence |
 | [`docs/lab/LEVERS.md`](lab/LEVERS.md) | the `PXA_*` levers on the llama.cpp engine |
-| [`docs/PXQ4-KERNELS.md`](PXQ4-KERNELS.md) | kernel libraries, the `PXQ4_LIB` rule, rebuilding |
 | `tools/vllm-pxq4/docs/01-pxq4-format-spec.md` | the PXQ4 on-disk format |
 | `tools/vllm-pxq4/docs/09-chosen-design.md` | the design that was built, and its gates |
 

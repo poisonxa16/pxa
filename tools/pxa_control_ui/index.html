@@ -11,7 +11,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>PXA Control</title>
 <link rel="icon" href="/favicon.png">
-<link rel="manifest" href="/agent-manifest.json">
+<meta name="theme-color" content="#0F1012">
+<script>/* the theme before first paint: ?theme=, else the saved choice, else the OS (prefers-color-scheme) */
+(function () { var v = null; try { v = JSON.parse(localStorage.getItem("pxa-control.theme") || "null"); } catch (e) { v = null; }
+  try { var q = new URLSearchParams(location.search).get("theme"); if (q === "light" || q === "dark") v = q; } catch (e) { /* old browser */ }
+  if (v !== "light" && v !== "dark") { try { v = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"; } catch (e) { v = "dark"; } }
+  document.documentElement.dataset.theme = v; })();</script>
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<script src="/pwa.js" defer></script>
+<link rel="stylesheet" href="/wallet.css">
+<link rel="stylesheet" href="/plugin-host.css">
 <link rel="stylesheet" href="/encode.css">
 <link rel="stylesheet" href="/live.css">
 <link rel="stylesheet" href="/profiles.css">
@@ -35,66 +45,121 @@
 <link rel="stylesheet" href="/chat-context.css">
 <link rel="stylesheet" href="/chat-ux.css">
 <style>
+/* ======================================================================================================
+   PXA Control design system (2026-10 revamp). One file of tokens + components; encode.css, live.css,
+   profiles.css and the Assistant's agent*.css read the same tokens, so a value changed here changes them too.
+   Colour tokens = the PXA family theme ("theme v2" of tools/pxa_chat/ui/theme.css on anibal/f-control): one cool
+   accent in both themes, amber only for warnings, so a primary button never reads as a warning. The orange->blue
+   gradient of the mark (--brand-grad) is the brand signature and is used for the mark and wordmark only.
+   Dark is the default; [data-theme=light] is the light theme. The page sets data-theme from the saved choice or,
+   with no choice saved, from the OS (prefers-color-scheme), before first paint (the inline script in <head>).
+   ====================================================================================================== */
 :root{
   color-scheme:dark;
   --bg:#0F1012;--surface:#16171A;--surface-2:#1C1E22;--surface-3:#25272C;
-  --line:#24262B;--line-2:#34373E;--text:#ECEDEF;--dim:#9DA2AB;--faint:#6E737C;--on-accent:#141414;
-  --accent:#E08A3C;--accent-hover:#EC9A50;--accent-2:#2E9ACB;--accent-text:#F0A050;--link:#5AB8E0;
+  --line:#26282E;--line-2:#363940;--text:#ECEDEF;--dim:#A1A6AF;--faint:#868B95;--on-accent:#0B1220;
+  --accent:#6B9BF2;--accent-hover:#86AEF5;--accent-2:#5C8DEB;--accent-text:#9DBCF7;--link:#9DBCF7;
   --grad:linear-gradient(90deg,var(--accent),var(--accent-2));
-  --ok:#3DD39F;--warn:#F5A623;--bad:#FF6464;--neutral:#8B94A5;
-  --ok-bg:rgba(61,211,159,.10);--warn-bg:rgba(245,166,35,.10);--bad-bg:rgba(255,100,100,.10);
+  --brand-a:#E08A3C;--brand-b:#2E9ACB;--brand-grad:linear-gradient(90deg,var(--brand-a),var(--brand-b));
+  --ok:#3DD39F;--warn:#F2B33D;--bad:#FF6B6B;--neutral:#8B94A5;
+  --ok-bg:rgba(61,211,159,.10);--warn-bg:rgba(242,179,61,.10);--bad-bg:rgba(255,107,107,.10);--accent-bg:rgba(107,155,242,.12);
+  /* supporter / locked: its own hue (not the accent, not a warning) so "you can unlock this" never reads as an error */
+  --sup:#B4A9FA;--sup-bg:rgba(142,134,240,.13);--sup-line:rgba(142,134,240,.45);
+  --scrim:rgba(0,0,0,.6);--tint:rgba(255,255,255,.07);--tint-2:rgba(0,0,0,.25);
   /* categorical chart palette: validated for colour-vision safety and 3:1 contrast on both the dark and the light card surface; same values in both themes */
   --series-1:#3987E5;--series-2:#D95926;--series-3:#199E70;--series-4:#C98500;--series-5:#D55181;--series-6:#008300;--series-7:#9085E9;--series-8:#E66767;
-  --chart-grid:#25272C;--chart-text:#9DA2AB;
+  --chart-grid:#25272C;--chart-text:#A1A6AF;
   --shadow:0 1px 2px rgba(0,0,0,.35),0 8px 24px rgba(0,0,0,.18);
+  --shadow-2:0 2px 6px rgba(0,0,0,.4),0 18px 48px rgba(0,0,0,.35);
   --focus:0 0 0 2px var(--bg),0 0 0 4px var(--accent-2);
   --font:"IBM Plex Sans","Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  --fs-0:12px;--fs-1:13px;--fs-2:14.5px;--fs-3:17px;--fs-4:21px;--fs-5:28px;
-  --s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:24px;--s6:32px;
-  --r1:8px;--r2:14px;--pill:999px;--header:60px;--safe:env(safe-area-inset-bottom,0px);
+  /* type: 12 / 13 / 14.5 / 17 / 21 / 28 / 34 */
+  --fs-0:12px;--fs-1:13px;--fs-2:14.5px;--fs-3:17px;--fs-4:21px;--fs-5:28px;--fs-6:34px;
+  /* space: a 4-px grid */
+  --s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:24px;--s6:32px;--s7:48px;
+  --r1:8px;--r2:14px;--r3:20px;--pill:999px;
+  --ease:cubic-bezier(.2,.7,.2,1);--dur:.16s;
+  --header:60px;--side:224px;--safe:env(safe-area-inset-bottom,0px);
 }
 [data-theme=light]{
   color-scheme:light;
-  --bg:#F4F5F7;--surface:#FFFFFF;--surface-2:#F3F4F6;--surface-3:#E7E9ED;--line:#E3E5E9;--line-2:#CBCFD6;
-  --text:#141821;--dim:#566070;--faint:#8A93A1;--accent-text:#9A520F;--link:#17698A;
-  --ok:#11795A;--warn:#8F5B00;--bad:#B3261E;--ok-bg:#E6F6F0;--warn-bg:#FDF3E1;--bad-bg:#FCEAEA;
+  --bg:#F6F7F9;--surface:#FFFFFF;--surface-2:#F2F4F7;--surface-3:#E7EAEF;--line:#E2E5EA;--line-2:#CDD2DA;
+  --text:#12161F;--dim:#4F5867;--faint:#636B7A;--on-accent:#FFFFFF;
+  --accent:#2F5FD0;--accent-hover:#2550B8;--accent-2:#3D6FE0;--accent-text:#2550B8;--link:#2550B8;
+  --ok:#0F7A55;--warn:#995700;--bad:#B3261E;--ok-bg:#E8F6F0;--warn-bg:#FFF4E2;--bad-bg:#FCEBEA;--accent-bg:#EAF0FC;
+  --sup:#5B4FD6;--sup-bg:#EFEDFC;--sup-line:#C9C3F4;
+  --scrim:rgba(16,24,40,.35);--tint:rgba(16,24,40,.06);--tint-2:rgba(16,24,40,.05);
   --chart-grid:#E3E6EB;--chart-text:#566070;
   --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 18px rgba(16,24,40,.06);
+  --shadow-2:0 2px 6px rgba(16,24,40,.08),0 18px 40px rgba(16,24,40,.14);
 }
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:var(--fs-2)/1.5 var(--font);min-height:100vh;-webkit-font-smoothing:antialiased}
-a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+a{color:var(--link);text-decoration:none;text-underline-offset:2px}a:hover{text-decoration:underline}
 button,input,select,textarea{font:inherit;color:inherit}
 :focus-visible{outline:none;box-shadow:var(--focus);border-radius:var(--r1)}
 [hidden]{display:none!important}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-/* header */
-.hd{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:var(--s4);height:var(--header);padding:0 var(--s5);background:color-mix(in srgb,var(--surface) 88%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
-.brand{display:flex;align-items:center;gap:10px;flex:none}
-.brand img{height:34px;width:34px;object-fit:contain}
+.skip{position:fixed;left:8px;top:-60px;z-index:100;padding:8px 14px;border-radius:var(--r1);background:var(--accent);color:var(--on-accent);font-weight:700}
+.skip:focus{top:8px}
+svg.i{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+
+/* ---------- header: brand, every running server, the status pill, help, theme ---------- */
+.hd{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:var(--s3);height:var(--header);padding:0 var(--s5) 0 var(--s4);background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;flex:none;color:inherit;text-decoration:none!important;border-radius:var(--r1)}
+.brand img{height:32px;width:32px;object-fit:contain}
 .brand h1{margin:0;font-size:var(--fs-3);font-weight:700;letter-spacing:.2px;white-space:nowrap;line-height:1.1}
-.brand h1 span:not(.ctl){background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand h1 span:not(.ctl){background:var(--brand-grad);-webkit-background-clip:text;background-clip:text;color:transparent}
 .brand small{display:block;font-size:11px;color:var(--faint);font-weight:500;letter-spacing:.3px}
 .hd .sp{flex:1}
-.hd .ext{white-space:nowrap}
 @media (max-width:1400px){.brand small{display:none}}
 #htext{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hd .b{white-space:nowrap}
-@media (max-width:1440px){#rp-open .lbl,.hd .ext .lbl{display:none}nav.tabs button{padding:6px 8px}.hd{gap:var(--s3)}}
-@media (max-width:1100px){.brand .ctl{display:none}nav.tabs button svg{display:none}}
-@media (max-width:520px){.brand .ctl{display:none}}
-nav.tabs{display:flex;gap:4px;padding:4px;background:var(--surface-2);border:1px solid var(--line);border-radius:12px}
-nav.tabs button{display:inline-flex;align-items:center;gap:6px;border:0;background:none;color:var(--dim);font-weight:600;padding:6px 11px;border-radius:9px;cursor:pointer;font-size:var(--fs-1)}
-nav.tabs button svg{width:16px;height:16px;flex:none}
-nav.tabs button:hover{color:var(--text)}
-nav.tabs button[aria-selected=true]{color:var(--text);background:var(--surface);box-shadow:var(--shadow)}
+/* a cramped header has ~100px of slack and the chip row and the pill want the same hundred. The chips win:
+   they name every server and carry its state, which is what the pill was saying. renderChips measures, puts
+   this on only when it is what makes the row fit, and takes it off again when even that is not enough. */
+.hd.chipspill .pill{display:none}
 .pill{display:inline-flex;align-items:center;gap:8px;height:32px;min-width:0;padding:0 var(--s3);background:var(--surface-2);border:1px solid var(--line);border-radius:var(--pill);font-size:var(--fs-1);font-weight:600;white-space:nowrap;max-width:40vw;overflow:hidden;text-overflow:ellipsis}
+button.pill{cursor:pointer}button.pill:hover{border-color:var(--line-2)}
 .dirpill{overflow:visible;max-width:100%;padding-right:4px}.dirpill .mono{min-width:0;white-space:nowrap}
-.icon{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border:1px solid var(--line);border-radius:var(--r1);background:var(--surface-2);color:var(--dim);cursor:pointer;flex:none}
+/* header: one compact chip per RUNNING server (every one, not only the last started). The left edge wears the
+   server's own colour, the same one its card and its line on the Live tab wear, so a chip and a chart point at
+   the same machine. Every chip writes its state out in words: the colour never carries the state alone. */
+.fchips{display:flex;align-items:center;gap:6px;min-width:0;max-width:56vw;flex:0 1 auto;position:relative}
+.fchip{flex:none;display:inline-flex;align-items:center;gap:6px;height:32px;max-width:210px;min-width:0;padding:0 10px;background:var(--surface-2);border:1px solid var(--line);border-left:3px solid var(--line-2);border-radius:var(--pill);color:var(--text);font-size:var(--fs-1);font-weight:600;cursor:pointer;white-space:nowrap}
+.fchip:hover{border-color:var(--line-2);background:var(--surface-3)}
+.fchip:focus-visible{box-shadow:var(--focus)}
+.fchip[aria-current=true]{border-color:var(--accent-2)}
+.fchip .fname{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.fchip .fport,.fchip .fst{color:var(--dim);font-weight:500;flex:none}
+/* while the chips are up, the pill's model name is a second copy of what a chip already says: the pill gives
+   that room back (its state word, dot and title stay) and the chips get it */
+.hd:has(#fchips .fchip) .pill{max-width:150px}
+.fmore{max-width:none}
+.fmore .fcaret{color:var(--dim);font-size:10px}
+.fmenu{position:absolute;right:0;top:calc(100% + 6px);width:min(320px,86vw);max-height:min(62vh,440px);overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-2);padding:6px;display:flex;flex-direction:column;gap:2px;z-index:41}
+.fmenu .fchip{width:100%;max-width:none;height:36px;border-radius:var(--r1);justify-content:flex-start}
+.fmenu .fname{flex:1;text-align:left}
+/* the card of the server a chip pointed at, so a click that lands on the Servers tab is never a guess */
+.card.flash{animation:flashcard 1.6s ease-out}
+@keyframes flashcard{0%,100%{box-shadow:var(--shadow)}25%,60%{box-shadow:0 0 0 3px var(--accent-2)}}
+.icon{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid var(--line);border-radius:var(--r1);background:var(--surface-2);color:var(--dim);cursor:pointer;flex:none;transition:color var(--dur),border-color var(--dur),background var(--dur)}
 .icon:hover{color:var(--text);border-color:var(--line-2)}
 .icon svg{width:17px;height:17px}
+/* the Help menu: report a problem, community, support, theme, version. One button instead of four. */
+.menuw{position:relative;flex:none}
+#help-btn{width:auto;padding:0 10px;gap:6px;font-weight:600;font-size:var(--fs-1)}
+@media (max-width:1100px){#help-btn .hl{display:none}#help-btn{width:36px;padding:0}}
+.menu{position:absolute;right:0;top:calc(100% + 8px);width:min(300px,92vw);background:var(--surface);border:1px solid var(--line-2);border-radius:12px;box-shadow:var(--shadow-2);padding:6px;z-index:45;display:grid;gap:2px}
+.menu .mi{display:flex;align-items:center;gap:10px;width:100%;min-height:40px;padding:8px 10px;border:0;border-radius:var(--r1);background:none;color:var(--text);font-weight:600;font-size:var(--fs-1);text-align:left;cursor:pointer;text-decoration:none!important}
+.menu .mi:hover,.menu .mi:focus-visible{background:var(--surface-2)}
+.menu .mi svg{width:17px;height:17px;color:var(--dim)}
+.menu .mi small{display:block;color:var(--dim);font-weight:500;font-size:var(--fs-0)}
+.menu hr{border:0;border-top:1px solid var(--line);margin:4px 2px}
+.menu .mrow{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;font-size:var(--fs-1);color:var(--dim)}
+.menu .seg button{padding:5px 10px}
 /* status marks: shape + colour + word, never colour alone */
 .dot{width:10px;height:10px;border-radius:50%;background:var(--faint);flex:none;display:inline-block}
 .dot.ok{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
@@ -102,23 +167,45 @@ nav.tabs button[aria-selected=true]{color:var(--text);background:var(--surface);
 .dot.bad{background:var(--bad);border-radius:2px}
 .dot.pulse{animation:pulse 1.4s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.35}}
-main{max-width:1280px;margin:0 auto;padding:var(--s5) var(--s5) calc(90px + var(--safe))}
-.ph{display:flex;align-items:flex-end;gap:var(--s3);flex-wrap:wrap;margin:0 0 var(--s4)}
+
+/* ---------- shell: grouped sidebar (desktop) / bottom bar (phone) + the page ---------- */
+.shell{display:grid;grid-template-columns:var(--side) minmax(0,1fr);align-items:start;min-height:calc(100vh - var(--header))}
+nav.tabs{position:sticky;top:var(--header);height:calc(100vh - var(--header));overflow-y:auto;display:flex;flex-direction:column;gap:2px;padding:var(--s4) var(--s3) var(--s5);border-right:1px solid var(--line);background:var(--surface)}
+nav.tabs .navlbl{display:block;padding:var(--s4) 10px 6px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+nav.tabs .navlbl:first-child{padding-top:2px}
+nav.tabs button{position:relative;display:flex;align-items:center;gap:10px;width:100%;min-height:38px;border:0;background:none;color:var(--dim);font-weight:600;padding:7px 10px;border-radius:9px;cursor:pointer;font-size:var(--fs-1);text-align:left;transition:background var(--dur),color var(--dur)}
+nav.tabs button svg{width:18px;height:18px;flex:none}
+nav.tabs button:hover{color:var(--text);background:var(--surface-2)}
+nav.tabs button[aria-selected=true]{color:var(--text);background:var(--accent-bg)}
+nav.tabs button[aria-selected=true]::before{content:"";position:absolute;left:-12px;top:8px;bottom:8px;width:3px;border-radius:0 3px 3px 0;background:var(--accent)}
+nav.tabs button[aria-selected=true] svg{color:var(--accent-text)}
+nav.tabs .nbadge{margin-left:auto;font-size:11px;font-weight:700;padding:0 7px;line-height:18px;border-radius:var(--pill);background:var(--surface-3);color:var(--dim)}
+nav.tabs .nbadge.sup{background:var(--sup-bg);color:var(--sup)}
+nav.tabs .navfoot{margin-top:auto;padding:var(--s4) 10px 0;font-size:var(--fs-0);color:var(--faint);display:grid;gap:4px}
+/* the sidebar's column is painted on the shell, so a long page never shows the column end under the sticky list */
+.shell{background:linear-gradient(90deg,var(--surface) 0 calc(var(--side) - 1px),var(--line) calc(var(--side) - 1px) var(--side),transparent var(--side))}
+#st-root>.alert,#pl-root>.alert{margin:0 0 var(--s4)}
+main{min-width:0;max-width:1240px;width:100%;margin:0 auto;padding:var(--s5) var(--s6) calc(90px + var(--safe))}
+
+/* ---------- page header + layout primitives ---------- */
+.ph{display:flex;align-items:flex-end;gap:var(--s3);flex-wrap:wrap;margin:0 0 var(--s5)}
 .ph h2{margin:0;font-size:var(--fs-4);font-weight:700;letter-spacing:-.2px}
-.ph p{margin:2px 0 0;color:var(--dim);font-size:var(--fs-1)}
+.ph p{margin:4px 0 0;color:var(--dim);font-size:var(--fs-1);max-width:78ch}
 .ph .sp{flex:1}
 h3{margin:0 0 var(--s3);font-size:var(--fs-2);font-weight:650;display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
 h3 .sp{flex:1}
+.sect{margin:var(--s6) 0 var(--s3);font-size:var(--fs-3)}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:var(--s4) var(--s4);margin-bottom:var(--s4);min-width:0;box-shadow:var(--shadow)}
 .grid{display:grid;gap:var(--s4);grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
 .grid>.card{margin:0}
 .cols>*,.step>*{min-width:0}
 select{max-width:100%;text-overflow:ellipsis}
-html,body{overflow-x:hidden}
+/* clip, not hidden, on body: overflow-x:hidden makes body a scroll box, and the sticky header and sidebar then scroll away with the page */
+html{overflow-x:hidden}body{overflow-x:clip}
 .cols{display:grid;gap:var(--s4);grid-template-columns:minmax(0,5fr) minmax(0,7fr);align-items:start}
 .cols>.card{margin:0}
 .cols.even{grid-template-columns:1fr 1fr}.cols.chat{grid-template-columns:minmax(0,4fr) minmax(0,8fr)}
-@media (max-width:980px){.cols,.cols.even,.cols.chat{grid-template-columns:1fr}.chat-set{order:2}}
+@media (max-width:1180px){.cols,.cols.even,.cols.chat{grid-template-columns:1fr}.chat-set{order:2}}
 .row{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
 .kv{display:flex;justify-content:space-between;gap:var(--s3);font-size:var(--fs-1);color:var(--dim);padding:3px 0}
 .kv b{color:var(--text);font-weight:600;text-align:right;min-width:0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
@@ -127,25 +214,51 @@ html,body{overflow-x:hidden}
 .mono{font-family:var(--mono);font-size:var(--fs-1)}
 .bar{height:8px;border-radius:5px;background:var(--surface-3);overflow:hidden;margin:8px 0 6px}
 .bar>i{display:block;height:100%;background:var(--grad);border-radius:5px;transition:width .4s}
+.hfprog{margin:8px 0;padding:8px 10px;border:1px solid var(--line-2);border-radius:var(--r2);background:var(--surface-2)}
+
+/* ---------- chips: status, codec, tier, supporter ---------- */
 .chip{display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border-radius:var(--pill);font-size:11px;font-weight:700;border:1px solid var(--line-2);color:var(--dim);white-space:nowrap;line-height:18px}
 .chip.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 55%,transparent);background:var(--ok-bg)}
 .chip.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 55%,transparent);background:var(--warn-bg)}
 .chip.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent);background:var(--bad-bg)}
-.chip.pxq{color:var(--accent-text);border-color:var(--accent)}.chip.pxqn{color:var(--link);border-color:var(--accent-2)}
+.chip.pxq{color:var(--accent-text);border-color:color-mix(in srgb,var(--accent) 55%,transparent)}.chip.pxqn{color:var(--sup);border-color:var(--sup-line)}
+.chip.sup{color:var(--sup);border-color:var(--sup-line);background:var(--sup-bg)}
+a.chip.sup:hover{text-decoration:none;border-color:var(--sup)}
+.chip svg{width:12px;height:12px}
+/* the tier of a quant, everywhere a quant is named: Free PXQ / Supporter PXQN (owner, 2026-10-14) */
+.tier{display:inline-flex;align-items:center;gap:5px;padding:1px 8px 1px 6px;border-radius:var(--pill);font-size:11px;font-weight:700;line-height:18px;white-space:nowrap;border:1px solid}
+.tier.free{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 50%,transparent);background:var(--ok-bg)}
+.tier.sup{color:var(--sup);border-color:var(--sup-line);background:var(--sup-bg)}
+.tier.std{color:var(--dim);border-color:var(--line-2)}
+.tier svg{width:12px;height:12px}
 .find{display:flex;gap:var(--s3);align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--line);font-size:var(--fs-1)}
 .find:last-child{border-bottom:0}
 .find .chip{margin-top:1px;min-width:44px;justify-content:center}
-button.b{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 16px;border-radius:var(--r1);border:1px solid var(--line-2);background:var(--surface-2);font-weight:600;cursor:pointer;font-size:var(--fs-1);transition:background .15s,border-color .15s}
-button.b:hover{border-color:var(--dim)}
-button.b.pri{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
-button.b.pri:hover{background:var(--accent-hover)}
-button.b.big{height:48px;font-size:var(--fs-3);padding:0 28px;border-radius:12px;flex:1}
-button.b.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent)}
-button.b:disabled{opacity:.45;cursor:not-allowed}
+
+/* ---------- buttons: primary (one per view), secondary, ghost, danger ---------- */
+.b{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 16px;border-radius:var(--r1);border:1px solid var(--line-2);background:var(--surface-2);color:var(--text);font-weight:600;cursor:pointer;font-size:var(--fs-1);text-decoration:none!important;transition:background var(--dur),border-color var(--dur),color var(--dur)}
+.b:hover{border-color:var(--dim)}
+.b svg{width:16px;height:16px}
+.b.pri{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.b.pri:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+.b.ghost{background:transparent;border-color:transparent;color:var(--dim)}
+.b.ghost:hover{background:var(--tint);color:var(--text)}
+.b.sup{background:var(--sup-bg);border-color:var(--sup-line);color:var(--sup)}
+.b.sup:hover{border-color:var(--sup)}
+.b.big{height:48px;font-size:var(--fs-3);padding:0 28px;border-radius:12px;flex:1}
+.b.lg{height:44px;font-size:var(--fs-2);padding:0 22px;border-radius:10px}
+.b.sm{height:30px;padding:0 10px}
+.b.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent)}
+.b.danger:hover{background:var(--bad-bg)}
+.b:disabled{opacity:.45;cursor:not-allowed}
 button.link{border:0;background:none;color:var(--link);cursor:pointer;padding:0;font-weight:600;font-size:var(--fs-1)}
-input[type=text],input[type=number],select,textarea{background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--r1);padding:8px 10px;min-width:0;height:38px}
+button.link:hover{text-decoration:underline}
+
+/* ---------- inputs ---------- */
+input[type=text],input[type=number],input[type=password],input[type=search],select,textarea{background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--r1);padding:8px 10px;min-width:0;height:38px;transition:border-color var(--dur)}
 textarea{width:100%;resize:vertical;height:auto}
 input:hover,select:hover,textarea:hover{border-color:var(--dim)}
+input:focus-visible,select:focus-visible,textarea:focus-visible{border-color:var(--accent-2)}
 label.f{display:grid;gap:5px;font-size:var(--fs-0);color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 label.f>input,label.f>select,label.f>textarea{width:100%;color:var(--text);font-weight:400;text-transform:none;letter-spacing:0;font-size:var(--fs-2)}
 .form{display:grid;gap:var(--s3);grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
@@ -155,13 +268,37 @@ label.f>input,label.f>select,label.f>textarea{width:100%;color:var(--text);font-
 .seg button[aria-pressed=true]{background:var(--accent);color:var(--on-accent)}
 .check{display:flex;align-items:center;gap:10px;font-size:var(--fs-1);cursor:pointer}
 .check input{width:17px;height:17px;accent-color:var(--accent);flex:none}
+/* a switch: a checkbox drawn as a toggle (Plugins enable/disable) */
+.sw{position:relative;display:inline-flex;align-items:center;gap:10px;cursor:pointer;font-size:var(--fs-1);font-weight:600}
+.sw input{appearance:none;-webkit-appearance:none;width:40px;height:24px;margin:0;border-radius:var(--pill);background:var(--surface-3);border:1px solid var(--line-2);position:relative;cursor:pointer;flex:none;transition:background var(--dur),border-color var(--dur)}
+.sw input::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:var(--dim);transition:transform var(--dur) var(--ease),background var(--dur)}
+.sw input:checked{background:var(--accent);border-color:var(--accent)}
+.sw input:checked::after{transform:translateX(16px);background:var(--on-accent)}
+.sw input:focus-visible{box-shadow:var(--focus)}
+.sw input:disabled{opacity:.5;cursor:not-allowed}
+
+/* ---------- tables, logs, code ---------- */
 table{width:100%;border-collapse:collapse;font-size:var(--fs-1)}
 th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
 td{font-variant-numeric:tabular-nums}
 th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em;position:sticky;top:0;background:var(--surface)}
-tr.sel td{background:color-mix(in srgb,var(--accent) 9%,transparent)}
+tr.sel td{background:var(--accent-bg)}
 tbody tr.click{cursor:pointer}tbody tr.click:hover td{background:var(--surface-2)}
 .tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table.hist td,table.hist th{white-space:nowrap}
+table.hist td,table.hist th{padding-left:7px;padding-right:7px}
+table.hist th{letter-spacing:.03em}
+table.hist td:nth-child(2){max-width:190px;overflow:hidden;text-overflow:ellipsis}
+.srvstrip{padding:10px var(--s3);margin-bottom:var(--s3)}
+.srvstrip .row{gap:var(--s2)}
+.srvstrip .ss-info{overflow-wrap:anywhere;min-width:0}
+.srvstrip .ss-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:var(--s3);margin-top:10px;padding-top:10px;border-top:1px solid var(--line-2)}
+.srvstrip .ss-model{flex:1 1 260px;min-width:0}.srvstrip .ss-model select{width:100%}
+.srvstrip .ss-note{flex:1 1 100%;margin:0}
+.bnbar #bn-q{flex:1 1 220px;max-width:340px}
+.bnbar .pager{display:inline-flex;align-items:center;gap:var(--s2)}
+.bnbar .pager .b{padding:0 12px}
+.bnbar .pager .b[disabled]{opacity:.45;cursor:default}
 pre.log{margin:0;background:var(--bg);border:1px solid var(--line);border-radius:var(--r1);padding:var(--s2) var(--s3);height:340px;overflow:auto;font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all;color:var(--dim)}
 pre.out{margin:0;background:var(--bg);border:1px solid var(--line);border-radius:var(--r1);padding:var(--s2) var(--s3);max-height:420px;overflow:auto;font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-word}
 .cmd{background:var(--bg);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:var(--r1);padding:var(--s2) var(--s3);font:12.5px/1.55 var(--mono);word-break:break-all}
@@ -169,6 +306,7 @@ details>summary{cursor:pointer;color:var(--dim);font-weight:600;font-size:var(--
 details>summary::-webkit-details-marker{display:none}
 details>summary::before{content:"";width:7px;height:7px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(-45deg);transition:transform .15s;margin-right:4px}
 details[open]>summary::before{transform:rotate(45deg)}
+details>summary:hover{color:var(--text)}
 .lever{display:grid;grid-template-columns:minmax(0,1fr) 160px;gap:var(--s3);padding:10px 0;border-bottom:1px solid var(--line)}
 .lever .n{font:600 12.5px var(--mono);overflow-wrap:anywhere}
 .lever .r{font-size:var(--fs-0);color:var(--dim)}
@@ -177,10 +315,13 @@ details[open]>summary::before{transform:rotate(45deg)}
 .levers{max-height:460px;overflow:auto;padding-right:4px}
 .chartbox{position:relative}
 canvas.chart{width:100%;height:260px;display:block}
+canvas.chart.short{height:150px}
 .legend{display:flex;gap:var(--s3);flex-wrap:wrap;font-size:var(--fs-0);color:var(--dim);margin-top:8px}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
 .stat{display:grid;gap:2px}.stat .v{font-size:var(--fs-5);font-weight:700;letter-spacing:-.5px;font-variant-numeric:tabular-nums;line-height:1.15}.stat .v small{font-size:var(--fs-2);color:var(--dim);font-weight:600;margin-left:4px}
 .stat .l{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+
+/* ---------- chat (Classic view) ---------- */
 .msgs{display:flex;flex-direction:column;gap:var(--s3);min-height:320px;max-height:62vh;overflow:auto;padding:var(--s2) 2px}
 .msg{max-width:88%;padding:10px 14px;border-radius:var(--r2);border:1px solid var(--line);background:var(--surface-2);overflow-wrap:anywhere}
 .msg.user{align-self:flex-end;background:color-mix(in srgb,var(--accent) 14%,var(--surface-2));border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
@@ -192,21 +333,45 @@ canvas.chart{width:100%;height:260px;display:block}
 .msg h1,.msg h2,.msg h3,.msg h4{font-size:var(--fs-2);margin:.5em 0 .2em}
 .msg ul,.msg ol{margin:.3em 0;padding-left:1.4em}
 .msg .think{border-left:2px solid var(--line-2);padding-left:8px;color:var(--dim);font-size:var(--fs-1);white-space:pre-wrap;margin-bottom:6px;max-height:220px;overflow:auto}
-.toast{position:fixed;left:50%;bottom:calc(28px + var(--safe));transform:translateX(-50%);background:var(--surface-3);border:1px solid var(--line-2);padding:10px 16px;border-radius:10px;font-size:var(--fs-1);z-index:50;max-width:92vw;box-shadow:var(--shadow);display:flex;gap:8px;align-items:center}
+
+/* ---------- feedback: toast, empty / loading / error states, alerts ---------- */
+.toast{position:fixed;left:50%;bottom:calc(28px + var(--safe));transform:translateX(-50%);background:var(--surface-3);border:1px solid var(--line-2);padding:10px 16px;border-radius:10px;font-size:var(--fs-1);z-index:50;max-width:92vw;box-shadow:var(--shadow-2);display:flex;gap:8px;align-items:center}
 .toast.bad{border-color:var(--bad);color:var(--bad)}
+.toast[popover]{inset:auto;left:50%;bottom:calc(28px + var(--safe));margin:0;overflow:visible;color:var(--text)}
+.toast[popover].bad{color:var(--bad)}
 .empty{color:var(--dim);font-size:var(--fs-1);padding:var(--s4) 0;display:flex;gap:10px;align-items:center}
 .empty.center{justify-content:center;flex-direction:column;text-align:center;padding:var(--s6) var(--s4)}
 .empty.center b{color:var(--text);font-size:var(--fs-2)}
+/* a state that has a next step: what happened, in plain words, and the button that does the next thing */
+.state{display:grid;justify-items:center;text-align:center;gap:8px;padding:var(--s6) var(--s4);color:var(--dim);font-size:var(--fs-1)}
+.state .ico{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;background:var(--surface-2);border:1px solid var(--line);color:var(--dim)}
+.state .ico svg{width:22px;height:22px}
+.state.bad .ico{color:var(--bad);background:var(--bad-bg);border-color:color-mix(in srgb,var(--bad) 40%,transparent)}
+.state.lock .ico{color:var(--sup);background:var(--sup-bg);border-color:var(--sup-line)}
+.state b{color:var(--text);font-size:var(--fs-2);font-weight:650}
+.state p{margin:0;max-width:60ch}
+.state .row{justify-content:center;margin-top:4px}
+td .state{padding:var(--s5) var(--s3)}
 .spin{width:16px;height:16px;border-radius:50%;border:2px solid var(--line-2);border-top-color:var(--accent);animation:spin .8s linear infinite;flex:none}
 @keyframes spin{to{transform:rotate(360deg)}}
 .skel{background:linear-gradient(90deg,var(--surface-2),var(--surface-3),var(--surface-2));background-size:200% 100%;animation:sh 1.3s linear infinite;border-radius:var(--r2);min-height:150px;border:1px solid var(--line)}
 @keyframes sh{to{background-position:-200% 0}}
-.alert{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:var(--r1);border:1px solid;font-size:var(--fs-1);margin-top:var(--s3)}
+.alert{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;padding:10px 12px;border-radius:var(--r1);border:1px solid;font-size:var(--fs-1);margin-top:var(--s3)}
 .alert.bad{border-color:color-mix(in srgb,var(--bad) 50%,transparent);background:var(--bad-bg)}
 .alert.ok{border-color:color-mix(in srgb,var(--ok) 50%,transparent);background:var(--ok-bg)}
 .alert.warn{border-color:color-mix(in srgb,var(--warn) 50%,transparent);background:var(--warn-bg)}
 .alert.info{border-color:var(--line-2);background:var(--surface-2);color:var(--text)}
-/* quick start */
+.alert.sup{border-color:var(--sup-line);background:var(--sup-bg)}
+.alert .acts{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
+/* locked: why it is locked, and the way to unlock it (never a dead control) */
+.lockbox{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;align-items:start;padding:12px 14px;border:1px solid var(--sup-line);border-radius:var(--r2);background:var(--sup-bg)}
+.lockbox>.li{grid-row:span 3;width:32px;height:32px;border-radius:9px;display:grid;place-items:center;background:var(--surface);color:var(--sup);border:1px solid var(--sup-line)}
+.lockbox>.li svg{width:17px;height:17px}
+.lockbox b{font-size:var(--fs-2)}
+.lockbox p{margin:0;color:var(--dim);font-size:var(--fs-1)}
+.lockbox .row{margin-top:6px}
+
+/* ---------- Launch: quick start ---------- */
 .qs{border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
 .step{display:grid;grid-template-columns:28px minmax(0,1fr);gap:var(--s3);padding:var(--s3) 0}
 .step+.step{border-top:1px solid var(--line)}
@@ -235,26 +400,130 @@ canvas.chart{width:100%;height:260px;display:block}
 #l-think.note-only #l-think-info,#c-think.note-only #c-think-info{margin:0;min-height:0;border:0;padding:0}
 .heatwarn{margin:6px 0;padding:6px 8px;border:1px solid var(--bad);border-radius:6px;font-size:var(--fs-1);font-weight:600}
 .auto-note{font-size:var(--fs-0);color:var(--dim);margin-top:10px;line-height:1.5}
+
+/* ---------- Home: onboarding, run, serving ---------- */
+.hero{position:relative;overflow:hidden;padding:var(--s5);border-radius:var(--r3)}
+.hero::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:var(--brand-grad)}
+.hero h2{margin:0;font-size:var(--fs-5);letter-spacing:-.4px;line-height:1.15}
+.hero .lead{margin:6px 0 0;color:var(--dim);font-size:var(--fs-2);max-width:70ch}
+.rigline{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px;font-size:var(--fs-1);color:var(--dim)}
+.rigline b{color:var(--text);font-weight:600}
+.hsteps{display:grid;gap:0;margin-top:var(--s5);counter-reset:hs}
+.hstep{display:grid;grid-template-columns:36px minmax(0,1fr);gap:var(--s4);padding:var(--s4) 0;border-top:1px solid var(--line)}
+.hstep .num{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-weight:700;background:var(--surface-3);color:var(--dim);font-size:var(--fs-2)}
+.hstep.done .num{background:var(--ok-bg);color:var(--ok);border:1px solid color-mix(in srgb,var(--ok) 50%,transparent)}
+.hstep.now .num{background:var(--accent);color:var(--on-accent)}
+.hstep h4{margin:6px 0 2px;font-size:var(--fs-3);font-weight:650;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.hstep .sub{margin:0 0 var(--s3);color:var(--dim);font-size:var(--fs-1)}
+.hstep.later{opacity:.62}
+.hstep.later .body{display:none}
+.hstep.done .body{display:none}
+.hopts{display:grid;gap:var(--s3);grid-template-columns:minmax(0,3fr) minmax(0,2fr)}
+.hopt{border:1px solid var(--line);border-radius:var(--r2);padding:var(--s3) var(--s4);background:var(--surface-2);min-width:0}
+.hopt h5{margin:0 0 4px;font-size:var(--fs-2);font-weight:650;display:flex;gap:8px;align-items:center}
+.hopt p{margin:0 0 var(--s3);color:var(--dim);font-size:var(--fs-1)}
+.rec{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
+.rec:first-of-type{border-top:0}
+.rec .nm{font-weight:650;overflow-wrap:anywhere}
+.rec .meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:var(--fs-0);color:var(--dim)}
+.runbox{display:grid;gap:var(--s3);grid-template-columns:minmax(0,1fr) auto;align-items:end}
+.runbox select{width:100%;height:44px;font-size:var(--fs-2)}
+.cardsum{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:var(--fs-1);color:var(--dim)}
+.cardsum .chip{font-size:11.5px}
+.serving{display:grid;gap:var(--s3)}
+.srvrow{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:var(--s3);align-items:center;padding:var(--s3) var(--s4);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:var(--r2);background:var(--surface-2)}
+.srvrow .nm{font-weight:650;overflow-wrap:anywhere}
+.srvrow .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.next{display:grid;gap:var(--s3);grid-template-columns:repeat(auto-fill,minmax(220px,1fr));margin-top:var(--s3)}
+.ntile{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;align-items:start;padding:var(--s4);border:1px solid var(--line);border-radius:var(--r2);background:var(--surface);color:inherit;text-align:left;cursor:pointer;box-shadow:var(--shadow);transition:border-color var(--dur),transform var(--dur) var(--ease)}
+.ntile:hover{border-color:var(--line-2);transform:translateY(-1px)}
+.ntile .ni{grid-row:span 2;width:36px;height:36px;border-radius:10px;display:grid;place-items:center;background:var(--accent-bg);color:var(--accent-text)}
+.ntile .ni.sup{background:var(--sup-bg);color:var(--sup)}
+.ntile b{font-size:var(--fs-2)}
+.ntile span{font-size:var(--fs-1);color:var(--dim)}
+
+/* ---------- Plugins + Store ---------- */
+.pgrid{display:grid;gap:var(--s4);grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
+.pcard{display:grid;gap:10px;align-content:start;background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:var(--s4);box-shadow:var(--shadow);min-width:0}
+.pcard.active{border-color:color-mix(in srgb,var(--ok) 45%,var(--line))}
+.pcard.locked{border-style:dashed}
+.pcard.flash,.phero.flash{animation:flashcard 1.6s ease-out}
+.pcard .top{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:start}
+.pcard .pi{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;background:var(--accent-bg);color:var(--accent-text)}
+.pcard .pi svg{width:22px;height:22px}
+.pcard .pi.sup{background:var(--sup-bg);color:var(--sup)}
+.pcard h4{margin:0;font-size:var(--fs-3);font-weight:650;overflow-wrap:anywhere}
+.pcard .by{font-size:var(--fs-0);color:var(--dim);display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:2px}
+.pcard p{margin:0;color:var(--dim);font-size:var(--fs-1)}
+.pcard .perm{display:flex;flex-wrap:wrap;gap:4px}
+.pcard .acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:2px}
+.pcard .acts .sp{flex:1}
+.phero{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:var(--s5);padding:var(--s5);border-radius:var(--r3);background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 16%,var(--surface)),var(--surface) 60%);border:1px solid color-mix(in srgb,var(--accent) 30%,var(--line));box-shadow:var(--shadow);margin-bottom:var(--s5)}
+.phero h3{font-size:var(--fs-5);margin:4px 0 6px;letter-spacing:-.4px}
+.phero .kicker{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent-text)}
+.phero p{margin:0 0 var(--s3);color:var(--dim);max-width:60ch}
+.phero ul{margin:0 0 var(--s4);padding-left:1.2em;color:var(--text);font-size:var(--fs-1);display:grid;gap:4px}
+.phero .art{display:grid;place-items:center;border-radius:var(--r2);background:var(--surface-2);border:1px solid var(--line);min-height:180px;position:relative;overflow:hidden}
+.orb{width:120px;height:120px;border-radius:50%;background:radial-gradient(circle at 35% 30%,color-mix(in srgb,var(--accent) 70%,#fff),var(--accent-2) 55%,color-mix(in srgb,var(--accent-2) 40%,var(--bg)));box-shadow:0 0 0 10px var(--accent-bg),0 0 60px color-mix(in srgb,var(--accent) 45%,transparent);animation:breathe 4s ease-in-out infinite}
+@keyframes breathe{50%{transform:scale(1.05)}}
+.wave{position:absolute;bottom:18px;left:0;right:0;display:flex;gap:4px;justify-content:center;align-items:flex-end;height:28px}
+.wave i{width:4px;border-radius:2px;background:var(--accent-text);opacity:.6}
+.credits{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s4);padding:var(--s4) var(--s5);border-radius:var(--r3);border:1px solid var(--sup-line);background:var(--sup-bg);margin-bottom:var(--s5)}
+.credits .bal{font-size:var(--fs-6);font-weight:750;line-height:1;letter-spacing:-.6px;font-variant-numeric:tabular-nums;color:var(--text)}
+.credits .bal small{font-size:var(--fs-2);font-weight:600;color:var(--dim);margin-left:6px;letter-spacing:0}
+.credits p{margin:0;color:var(--dim);font-size:var(--fs-1);max-width:56ch}
+.credits .acts{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+.price{font-weight:700;font-variant-numeric:tabular-nums}
+.price small{color:var(--dim);font-weight:600}
+.kfilter{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:var(--s4)}
+.kfilter button{height:32px;padding:0 12px;border-radius:var(--pill);border:1px solid var(--line-2);background:var(--surface);color:var(--dim);font-weight:600;font-size:var(--fs-1);cursor:pointer}
+.kfilter button[aria-pressed=true]{background:var(--text);border-color:var(--text);color:var(--bg)}
+.consent ul{margin:8px 0;padding:0;list-style:none;display:grid;gap:8px}
+.consent li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;align-items:start;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r1);background:var(--surface-2)}
+.consent li svg{width:18px;height:18px;color:var(--accent-text);margin-top:2px}
+.consent li b{display:block;font-size:var(--fs-1)}
+.consent li span{font-size:var(--fs-0);color:var(--dim)}
+
+@media (max-width:1100px){
+  :root{--side:200px}
+  main{padding:var(--s5) var(--s5) calc(90px + var(--safe))}
+  .hopts,.phero{grid-template-columns:1fr}
+}
 @media (max-width:820px){
   /* no backdrop-filter here: it makes the header the containing block of the fixed bottom tab bar,
      which then sat ON the header and hid the status pill and the Report button on phones */
   .hd{gap:var(--s2);padding:0 var(--s3);height:56px;backdrop-filter:none;-webkit-backdrop-filter:none;background:var(--surface)}
-  .brand small{display:none}
+  .brand small,.brand .ctl{display:none}
   .brand img{height:30px;width:30px}
-  nav.tabs{position:fixed;left:0;right:0;bottom:0;border-radius:0;border:0;border-top:1px solid var(--line);background:var(--surface);padding:6px 6px calc(6px + var(--safe));justify-content:space-around;z-index:40;gap:2px}
-  nav.tabs button{flex:1;flex-direction:column;gap:2px;padding:6px 2px;font-size:11px}
-  nav.tabs button svg{width:20px;height:20px}
-  nav.tabs button[aria-selected=true]{box-shadow:none;background:var(--surface-3);color:var(--accent-text)}
+  /* the phone's bottom bar: the first five are the main jobs and fit the screen; the rest are a swipe away */
+  .shell{display:block;background:none}
+  nav.tabs{position:fixed;left:0;right:0;bottom:0;top:auto;height:auto;flex-direction:row;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x proximity;border-right:0;border-top:1px solid var(--line);background:var(--surface);padding:4px 4px calc(4px + var(--safe));gap:0;z-index:40;scrollbar-width:none;
+    -webkit-mask-image:linear-gradient(90deg,#000 88%,transparent);mask-image:linear-gradient(90deg,#000 88%,transparent)}
+  nav.tabs::-webkit-scrollbar{display:none}
+  nav.tabs .navlbl,nav.tabs .navfoot{display:none}
+  nav.tabs button{flex:0 0 20%;min-width:66px;flex-direction:column;justify-content:center;gap:2px;padding:5px 2px;font-size:11px;text-align:center;scroll-snap-align:start;min-height:48px}
+  /* what scrolls into view (focus, anchors, a jump to a card) stops above the bottom bar, not under it */
+  html{scroll-padding-bottom:calc(76px + var(--safe));scroll-padding-top:64px}
+  nav.tabs button svg{width:21px;height:21px}
+  nav.tabs button[aria-selected=true]{background:none;color:var(--accent-text)}
+  nav.tabs button[aria-selected=true]::before{left:22%;right:22%;top:0;bottom:auto;width:auto;height:3px;border-radius:0 0 3px 3px}
+  nav.tabs .nbadge{position:absolute;top:2px;right:8px;margin:0;padding:0 5px;line-height:15px;font-size:10px}
   .pill{height:30px;flex:1 1 auto;min-width:0;max-width:none}
   #htext{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .hd .sp{display:none}
+  .fchips{flex:none;max-width:46vw}          /* a phone shows one summary chip ("3 servers"), the list opens under it */
+  /* a phone's header has no room to hang a list off a chip, and the chip is not near a screen edge to hang it
+     from: the list opens as a sheet the width of the screen, right under the sticky header (no backdrop-filter
+     on the header here, so a fixed box is the screen's, not the header's) */
+  .fmenu{position:fixed;left:8px;right:8px;top:60px;width:auto;max-height:min(62vh,440px)}
+  .menu{position:fixed;left:8px;right:8px;top:60px;width:auto}
   .brand{flex:none}
-  main{padding:var(--s4) var(--s3) calc(96px + var(--safe))}
+  main{padding:var(--s4) var(--s4) calc(104px + var(--safe))}
   .lever{grid-template-columns:1fr}
   .card{padding:var(--s3) var(--s3)}
   .stat .v{font-size:var(--fs-4)}
   .msg{max-width:96%}
-  .toast{bottom:calc(84px + var(--safe))}
+  .toast,.toast[popover]{bottom:calc(84px + var(--safe))}
   canvas.chart{height:220px}
   /* the model table becomes one card per model on a phone */
   table.resp thead{display:none}
@@ -269,10 +538,21 @@ canvas.chart{width:100%;height:260px;display:block}
   .step .num{width:24px;height:24px}
   .tile{padding:9px 10px}
   .dirpill{max-width:100%}
+  .hero{padding:var(--s4)}
+  .hero h2{font-size:var(--fs-4)}
+  .hstep{grid-template-columns:28px minmax(0,1fr);gap:var(--s3)}
+  .hstep .num{width:28px;height:28px;font-size:var(--fs-1)}
+  .runbox{grid-template-columns:1fr}
+  .srvrow{grid-template-columns:auto minmax(0,1fr)}
+  .srvrow .acts{grid-column:1/-1;justify-content:flex-start}
+  .phero{padding:var(--s4)}
+  .phero .art{min-height:120px}
+  .credits{padding:var(--s4)}
+  .credits .acts{margin-left:0}
 }
-@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
-.rpd{width:min(860px,94vw);max-height:92vh;border:1px solid var(--line-2);border-radius:14px;background:var(--surface);color:var(--text);padding:var(--s5);box-shadow:var(--shadow)}
-.rpd::backdrop{background:rgba(0,0,0,.55)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+.rpd{width:min(860px,94vw);max-height:92vh;border:1px solid var(--line-2);border-radius:14px;background:var(--surface);color:var(--text);padding:var(--s5);box-shadow:var(--shadow-2)}
+.rpd::backdrop{background:var(--scrim)}
 .rpd h2{margin:0 0 6px}.rpd p{margin:0 0 var(--s3);color:var(--dim);font-size:var(--fs-1)}
 .rpd textarea{width:100%;min-height:300px;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:10px;resize:vertical;box-sizing:border-box;white-space:pre}
 .rpd input{width:100%;box-sizing:border-box;height:36px;background:var(--surface-2);border:1px solid var(--line-2);border-radius:8px;padding:0 10px;margin:4px 0 var(--s3)}
@@ -282,7 +562,7 @@ canvas.chart{width:100%;height:260px;display:block}
 .srv{display:grid;gap:8px}
 .srv h3{margin:0}
 .srv .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
-.srv .acts button.b{height:34px;padding:0 12px}
+.srv .acts .b{height:34px;padding:0 12px}
 .metric{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
 .metric div{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r1);padding:6px 8px;min-width:0}
 .metric b{display:block;font-size:var(--fs-3);font-variant-numeric:tabular-nums;line-height:1.2}
@@ -308,12 +588,17 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
 .lv-def.off{color:var(--faint)}
 .setchips{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0}
 .setchips .chip{cursor:pointer}
-.dlg{width:min(900px,96vw);max-height:92vh;border:1px solid var(--line-2);border-radius:14px;background:var(--surface);color:var(--text);padding:var(--s4);box-shadow:var(--shadow)}
-.dlg::backdrop{background:rgba(0,0,0,.55)}
+.dlg{width:min(900px,96vw);max-height:92vh;border:1px solid var(--line-2);border-radius:14px;background:var(--surface);color:var(--text);padding:var(--s4) var(--s5);box-shadow:var(--shadow-2)}
+.dlg::backdrop{position:fixed;inset:0;background:var(--scrim)}
 .dlg h2{margin:0 0 8px;font-size:var(--fs-3)}
+.dlg .acts{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:var(--s4)}
 
 .up-track{position:relative;height:52px;margin-top:12px;border:1px solid var(--line);border-radius:var(--r2);background:var(--surface-2);overflow:hidden;touch-action:none;user-select:none}
 .up-track.is-blocked{opacity:.55}
+.bcard{border:1px solid var(--line);border-radius:var(--r2);background:var(--surface-2);padding:10px 12px;margin:8px 0}
+.bcard .bc-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.bcard .bc-bal{font-variant-numeric:tabular-nums}
+.bcard .row{gap:8px;flex-wrap:wrap;margin-top:8px}
 .up-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--grad);opacity:.45;pointer-events:none}
 .up-label{position:absolute;inset:0;display:grid;place-items:center;color:var(--dim);font-size:var(--fs-1);font-weight:600;pointer-events:none}
 .up-thumb{position:absolute;top:5px;left:5px;width:42px;height:42px;border-radius:var(--r1);border:1px solid var(--line-2);background:var(--surface);color:var(--text);box-shadow:var(--shadow);display:grid;place-items:center;cursor:grab;padding:0}
@@ -322,57 +607,79 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
 .dlg pre.log{height:min(60vh,520px)}
 .target{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .target select{min-width:180px;flex:1}
-.foot{margin:var(--s6) 0 0;display:flex;gap:var(--s3);flex-wrap:wrap;justify-content:center;font-size:var(--fs-1);color:var(--faint)}
+.foot{margin:var(--s6) 0 0;display:flex;gap:var(--s3);flex-wrap:wrap;justify-content:center;align-items:center;font-size:var(--fs-1);color:var(--faint)}
 @media (max-width:820px){
-  .hd .ext{display:none}
-  #rp-open .lbl{display:none}
-  #rp-open{padding:0 10px}
   .metric b{font-size:var(--fs-2)}
-  .srv .acts button.b{flex:1 1 auto}
+  .srv .acts .b{flex:1 1 auto}
   .dlg{padding:var(--s3);width:100vw;max-width:100vw;max-height:100vh;height:100vh;border-radius:0;margin:0}
   .dlg pre.log{height:calc(100vh - 230px)}
   .gstrip{grid-template-columns:1fr 1fr}
-  input[type=text],input[type=number],select,textarea{font-size:16px}  /* no zoom-on-focus on phones */
+  input[type=text],input[type=number],input[type=password],select,textarea{font-size:16px}  /* no zoom-on-focus on phones */
 }
 </style>
 </head>
 <body>
+<a class="skip" href="#main">Skip to the page</a>
 <header class="hd">
-  <div class="brand"><img src="/mark.png" alt="" width="34" height="34"><h1><span>PXA</span><span class="ctl"> Control</span><small>your rig, one click from serving</small></h1></div>
-  <nav class="tabs" role="tablist" id="tabs" aria-label="sections">
-    <button role="tab" data-tab="servers" aria-selected="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>Servers</button>
-    <button role="tab" data-tab="live"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Live</button>
-    <button role="tab" data-tab="rig"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h4v4H7zM15 10h2M15 14h2M6 18v2M18 18v2"/></svg>Rig</button>
-    <button role="tab" data-tab="models"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Models</button>
-    <button role="tab" data-tab="launch"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg>Launch</button>
-    <button role="tab" data-tab="speed"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 20h18M6 16l4-5 3 3 5-7"/></svg>Speed</button>
-    <button role="tab" data-tab="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg>Chat</button>
-    <button role="tab" data-tab="encode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h13l-3-3M20 17H7l3 3"/></svg>Encode</button>
-    <button role="tab" data-tab="profiles"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Profiles</button>
-  </nav>
+  <a class="brand" href="#home" title="PXA Control home"><img src="/mark.png" alt="" width="32" height="32"><h1><span>PXA</span><span class="ctl"> Control</span><small>your rig, one click from serving</small></h1></a>
   <span class="sp"></span>
-  <span class="pill" id="health" title="server health" role="status" aria-live="polite"><span class="dot" id="hdot"></span><span id="htext">no server</span></span>
-  <a class="b ext" href="https://discord.pxanetwork.com" target="_blank" rel="noopener" title="PXA Network Discord: help, news, benchmarks" style="text-decoration:none">Discord</a>
-  <a class="b ext" href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener" title="support PXA development on Ko-fi" style="text-decoration:none">&#9829;<span class="lbl"> Support PXA</span></a>
-  <button class="b" id="rp-open" title="send a bug report to the PXA team (you review it first)" aria-label="Report a problem"><span aria-hidden="true">&#9888;</span><span class="lbl">Report a problem</span></button>
-  <button class="icon" id="theme" title="switch light / dark" aria-label="switch light or dark theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>
+  <span class="fchips" id="fchips" role="group" aria-label="running servers" hidden></span>
+  <span class="pill" id="health" title="server health" role="status" aria-live="polite" hidden><span class="dot" id="hdot"></span><span id="htext">no servers</span></span>
+  <div class="menuw">
+    <button class="icon" id="help-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="help-menu" title="Help, community and settings" aria-label="Help, community and settings"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 1-1 1.7v.5M12 17h.01"/></svg><span class="hl">Help</span></button>
+    <div class="menu" id="help-menu" hidden>
+      <button class="mi" id="rp-open" type="button" title="send a bug report to the PXA team (you review it first)"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17h.01"/></svg><span>Report a problem<small>You see exactly what is sent, and nothing goes until you press Send.</small></span></button>
+      <a class="mi" href="https://discord.pxanetwork.com" target="_blank" rel="noopener"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg><span>PXA Network Discord<small>Help, news, benchmarks, plugin requests</small></span></a>
+      <a class="mi" href="/share.html" id="share-open" title="a free image of your rig's measured speed to post anywhere"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v7h16v-7M12 3v12M7 8l5-5 5 5"/></svg><span>Share your rig's speed<small>Free: a one-click image of a benchmark run, ready for Discord</small></span></a>
+      <a class="mi" href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/></svg><span>Support PXA on Ko-fi<small>Donations become supporter coins for the Store</small></span></a>
+      <hr>
+      <div class="mrow"><span>Theme</span><span class="seg" id="theme-pref" data-v="system" aria-label="theme: follow the system, light or dark"><button type="button" data-v="system">System</button><button type="button" data-v="light">Light</button><button type="button" data-v="dark">Dark</button></span></div>
+      <hr>
+      <div class="mrow"><span id="hm-ver">PXA Control</span><button class="b sm" id="hm-up" type="button" hidden>Update</button></div>
+    </div>
+  </div>
+  <button class="icon" id="theme" type="button" title="switch light / dark" aria-label="switch light or dark theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>
 </header>
-<main>
+<div class="shell">
+  <nav class="tabs" role="tablist" id="tabs" aria-label="sections" aria-orientation="vertical">
+    <span class="navlbl" aria-hidden="true">Run</span>
+    <button role="tab" data-tab="home" aria-selected="true"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h5v-6h4v6h5V10"/></svg><span class="nl">Home</span></button>
+    <button role="tab" data-tab="chat" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg><span class="nl">Chat</span></button>
+    <button role="tab" data-tab="launch" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg><span class="nl">Launch</span></button>
+    <button role="tab" data-tab="servers" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg><span class="nl">Servers</span></button>
+    <button role="tab" data-tab="models" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span class="nl">Models</span></button>
+    <span class="navlbl" aria-hidden="true">Make and tune</span>
+    <button role="tab" data-tab="encode" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h13l-3-3M20 17H7l3 3"/></svg><span class="nl">Encode</span></button>
+    <button role="tab" data-tab="speed" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20h18M6 16l4-5 3 3 5-7"/></svg><span class="nl">Benchmarks</span></button>
+    <button role="tab" data-tab="profiles" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span class="nl">GPU profiles</span></button>
+    <span class="navlbl" aria-hidden="true">Watch</span>
+    <button role="tab" data-tab="live" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span class="nl">Live</span></button>
+    <button role="tab" data-tab="rig" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h4v4H7zM15 10h2M15 14h2M6 18v2M18 18v2"/></svg><span class="nl">Rig</span></button>
+    <span class="navlbl" aria-hidden="true">Extend</span>
+    <button role="tab" data-tab="plugins" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6v4a2 2 0 1 0 4 0h2v6h-2a2 2 0 1 0 0 4h2v4h-6v-2a2 2 0 1 0-4 0v2H5v-6h2a2 2 0 1 0 0-4H5V7h4z"/></svg><span class="nl">Plugins</span> <span class="nbadge" id="nav-plug-upd" aria-hidden="true" hidden></span><span class="sr" id="nav-plug-upd-sr"></span></button>
+    <button role="tab" data-tab="store" aria-selected="false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16l-1 12H5z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg><span class="nl">Store</span> <span class="nbadge sup" id="nav-credits" hidden></span></button>
+  </nav>
+<main id="main" tabindex="-1">
 
 <!-- ============================== SERVERS ============================== -->
-<section id="p-servers" data-page="servers">
+<!-- ============================== HOME ============================== -->
+<section id="p-home" data-page="home">
+  <div id="home-root" aria-live="polite"><div class="skel" style="min-height:320px"></div></div>
+</section>
+
+<section id="p-servers" data-page="servers" hidden>
   <div class="ph"><div><h2>Servers</h2><p>Every llama-server on this machine: the ones started here, the ones you started from a terminal with pxa or run-server.sh (adopted, with Stop), and containers or processes started elsewhere (monitored read-only unless you adopt one and allow control).</p></div><span class="sp"></span>
     <button class="b pri" id="sv-new">New server</button><button class="b" id="sv-refresh">Refresh</button></div>
   <div class="tiny" id="sv-note" style="margin-bottom:8px"></div>
   <div class="grid" id="sv-list"><div class="skel"></div><div class="skel"></div></div>
   <h3 style="margin-top:var(--s5)">Cards <span class="tiny">who holds what, live</span></h3>
   <div class="gstrip" id="sv-cards"></div>
-  <div class="foot"><a href="https://discord.pxanetwork.com" target="_blank" rel="noopener">PXA Network Discord</a><a href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener">&#9829; Support PXA</a><span id="sv-ver"></span><button class="b" id="sv-up" type="button" hidden>Update</button></div>
 </section>
 
 <!-- ============================== LIVE ============================== -->
 <section id="p-live" data-page="live" hidden>
   <div class="ph"><div><h2>Live</h2><p id="lv-sub">Reading the first sample ...</p></div><span class="sp"></span>
+    <label class="sw" id="lv-running-wrap" title="hide servers that have stopped: they fold into one line you can open"><input type="checkbox" id="lv-running" checked> Running only</label>
     <span class="seg" id="lv-range" data-v="900" aria-label="time range"><button data-v="300">5 min</button><button data-v="900">15 min</button><button data-v="3600">1 h</button><button data-v="21600" class="lv-long" hidden>6 h</button><button data-v="86400" class="lv-long" hidden>24 h</button><button data-v="604800" class="lv-long" hidden>7 d</button><button data-v="2592000" class="lv-long" hidden>30 d</button><button data-v="7776000" class="lv-long" hidden>90 d</button></span></div>
   <div id="lv-root"><div class="skel"></div></div>
 </section>
@@ -393,7 +700,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
 <!-- ============================== MODELS ============================== -->
 <section id="p-models" data-page="models" hidden>
   <div class="ph"><div><h2>Models</h2><p>Every .gguf under the folders you name. Click a model to launch it.</p></div></div>
-  <div class="card">
+  <div class="card" id="folders-card">
     <h3>Model folders <span class="tiny">remembered in <span id="cfg-path" class="mono"></span></span></h3>
     <div id="dirs" class="row" style="gap:6px"></div>
     <div class="row" style="margin-top:10px">
@@ -402,6 +709,36 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
       <button class="b" id="models-rescan">Rescan</button>
     </div>
     <div class="tiny" id="models-notes" style="margin-top:6px"></div>
+  </div>
+  <div class="card">
+    <h3>Library <span class="tiny" id="models-count"></span></h3>
+    <div class="tiny" style="margin-bottom:8px">"Fits on" is the launcher's own VRAM check (weights + KV estimate at one 4096-token slot) on idle cards: <span class="chip ok">&#10003; fits</span> <span class="chip warn">! tight</span> <span class="chip bad">&#10005; no</span></div>
+    <div class="tw"><table class="resp"><thead><tr><th>Model</th><th>Codec</th><th>Type</th><th>Params</th><th>Size</th><th>Family</th><th>Thinking</th><th>Fits on</th></tr></thead><tbody id="models-body"><tr><td colspan="8"><div class="empty"><span class="spin"></span>Reading model headers ... the first scan of a big library on a spinning disk can take half a minute.</div></td></tr></tbody></table></div>
+  </div>
+  <div class="card" id="hf-card">
+    <h3>Available from PXA <span class="tiny" id="hf-sub"></span></h3>
+    <p class="tiny">Published at <a href="https://huggingface.co/poisonxa" target="_blank" rel="noopener">huggingface.co/poisonxa</a>. A download goes straight into the first model folder above: it picks up where it stopped, keeps only a file whose sha256 matches the one the repository publishes, fetches every part of a split model, and puts the <span class="mono">.expert-counts.csv</span> next to the gguf. The model file is not otherwise touched.</p>
+    <div id="hf-progress" class="hfprog" hidden>
+      <div class="row" style="justify-content:space-between;gap:10px"><span id="hf-p-label" class="tiny"></span><button class="icon" id="hf-p-cancel" title="cancel this download" aria-label="cancel this download">&#10005;</button></div>
+      <div class="bar"><i id="hf-p-fill"></i></div>
+      <div class="tiny" id="hf-p-sub" style="margin-top:4px"></div>
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <button class="b" id="hf-refresh" title="ask huggingface.co what is published now">Check PXA models</button>
+      <span class="tiny" id="hf-checked" aria-live="polite" style="margin-right:12px"></span>
+      <span class="tiny" id="hf-token-line"></span>
+    </div>
+    <details id="hf-token-box">
+      <summary>Supporter models: your Hugging Face key</summary>
+      <p class="tiny" style="margin-top:6px">Models the community supports live in a repository that only a key can read. Paste a Hugging Face token with access to it. It is kept on this machine beside the other Control settings (readable by your user alone) and sent to huggingface.co and nowhere else; it never comes back to this page and is never written to a log.</p>
+      <div class="row">
+        <input type="password" id="hf-token" placeholder="hf_..." aria-label="Hugging Face token" autocomplete="off" style="flex:1;min-width:200px">
+        <button class="b" id="hf-token-save">Save key</button>
+        <button class="b" id="hf-token-clear">Forget</button>
+      </div>
+    </details>
+    <div class="kfilter" id="hf-filter" role="group" aria-label="show which models"></div>
+    <div class="tw"><table class="resp"><thead><tr><th>Model</th><th>Repository</th><th>Size</th><th></th></tr></thead><tbody id="hf-body"><tr><td colspan="4"><div class="empty">Open the models tab to see what is published.</div></td></tr></tbody></table></div>
   </div>
   <div class="card" id="emap">
     <h3>Expert map</h3>
@@ -415,11 +752,6 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
       <button class="b" id="emap-rebuild" type="button">Rebuild</button>
       <button class="b" id="emap-reset" type="button">Reset learned</button>
     </div>
-  </div>
-  <div class="card">
-    <h3>Library <span class="tiny" id="models-count"></span></h3>
-    <div class="tiny" style="margin-bottom:8px">"Fits on" is the launcher's own VRAM check (weights + KV estimate at one 4096-token slot) on idle cards: <span class="chip ok">&#10003; fits</span> <span class="chip warn">! tight</span> <span class="chip bad">&#10005; no</span></div>
-    <div class="tw"><table class="resp"><thead><tr><th>Model</th><th>Codec</th><th>Type</th><th>Params</th><th>Size</th><th>Family</th><th>Thinking</th><th>Fits on</th></tr></thead><tbody id="models-body"><tr><td colspan="8"><div class="empty"><span class="spin"></span>Reading model headers ... the first scan of a big library on a spinning disk can take half a minute.</div></td></tr></tbody></table></div>
   </div>
 </section>
 
@@ -473,6 +805,8 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
             <div class="row"><span class="tiny" style="width:120px">Split mode</span><span class="seg" id="l-sm" data-v="auto"><button data-v="auto">auto</button><button data-v="layer">layer</button><button data-v="tensor">tensor</button></span></div>
             <div class="row"><span class="tiny" style="width:120px">Flash attention</span><span class="seg" id="l-fa" data-v="auto"><button data-v="auto">auto</button><button data-v="on">on</button><button data-v="off">off</button></span></div>
             <label class="check"><input type="checkbox" id="l-mtp"> MTP speculation (--spec mtp, needs MTP tensors in the file)</label>
+            <div class="tiny" id="l-mtp-note"></div>
+            <div class="row"><span class="tiny" style="width:120px">N-gram drafting</span><span class="seg" id="l-ngram" data-v="auto" aria-label="n-gram drafting next to MTP: auto, on or off"><button data-v="auto" title="the engine's default: on where it was measured faster">auto</button><button data-v="on">on</button><button data-v="off" title="MTP alone">off</button></span><span class="tiny">guesses ahead from words already in the chat, before MTP</span></div>
             <label class="f" id="l-draft-wrap" hidden>Gemma 4 drafter<select id="l-draft"><option value="">none</option></select><span class="tiny">The measured assistant file next to this model (159-167 t/s on one V100). The engine also finds it if you leave this on none.</span></label>
             <label class="f" id="l-hot-wrap" hidden>Also keep loaded<select id="l-hot" multiple size="4" aria-label="other models on this server"></select><span class="tiny">Registered with --hot-model. The model above is the one on the cards when the server opens. Shown only when every selected card reports CUDA virtual memory, and not on Pascal.</span></label>
             <label class="check"><input type="checkbox" id="l-expose"> Serve on the network (--host 0.0.0.0)</label>
@@ -533,7 +867,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
           <button class="b" id="b-plan">Show plan</button>
           <button class="b" id="b-restart">Restart</button>
         </div>
-        <div class="tiny" id="s-info" style="margin-top:8px"></div>
+        <div class="tiny" id="s-info" style="margin-top:8px;white-space:pre-line"></div>
         <div class="kv" id="s-ctx" hidden></div>
         <div id="s-alert"></div>
       </div>
@@ -544,6 +878,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
           <div id="plan-fit" style="margin-bottom:8px"></div>
           <div class="tiny">command (exact environment + argv; paste into a shell)</div><div class="copyrow"><div class="cmd" id="plan-cmd"></div><button class="b" data-copy="plan-cmd">Copy</button></div>
           <div class="tiny" style="margin-top:8px">same thing as a launcher command line</div><div class="copyrow"><div class="cmd" id="plan-cli"></div><button class="b" data-copy="plan-cli">Copy</button></div>
+          <div id="plan-od" style="margin-top:8px" hidden></div>
           <div id="plan-notes" style="margin-top:8px"></div>
           <details><summary>the launcher's full report</summary><pre class="out" id="plan-text"></pre></details>
         </div>
@@ -559,7 +894,21 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
 
 <!-- ============================== SPEED ============================== -->
 <section id="p-speed" data-page="speed" hidden>
-  <div class="ph"><div><h2>Speed</h2><p id="sp-src">&nbsp;</p></div><span class="sp"></span><span class="target"><select id="sp-target" aria-label="server to measure"></select></span><span class="seg" id="sp-range" data-v="3600" aria-label="time range"><button data-v="3600">1 h</button><button data-v="86400">24 h</button><button data-v="604800">7 d</button></span></div>
+  <div class="ph"><div><h2>Benchmarks</h2><p id="sp-src">&nbsp;</p></div><span class="sp"></span><span class="target"><select id="sp-target" aria-label="server to measure"></select></span><span class="seg" id="sp-range" data-v="3600" aria-label="time range"><button data-v="3600">1 h</button><button data-v="86400">24 h</button><button data-v="604800">7 d</button></span></div>
+  <div class="card srvstrip" id="sp-strip" hidden>
+    <div class="row">
+      <span class="dot" id="ss-dot"></span><strong id="ss-name"></strong><span class="chip" id="ss-state" role="status" aria-live="polite"></span>
+      <span class="tiny ss-info" id="ss-info"></span><span class="sp"></span>
+      <button class="b pri" id="ss-start" hidden>Start</button><button class="b danger" id="ss-stop" hidden>Stop</button><button class="b" id="ss-edit" hidden aria-expanded="false" aria-controls="ss-form">Edit</button>
+    </div>
+    <div id="ss-form" class="ss-form" hidden>
+      <label class="f ss-model">Model<select id="ss-model" aria-label="model"></select></label>
+      <label class="check"><input type="checkbox" id="ss-mtp"> MTP</label>
+      <span class="row" style="gap:6px"><span class="tiny">Split</span><span class="seg" id="ss-sm" data-v="auto" aria-label="split mode"><button data-v="auto">auto</button><button data-v="layer">layer</button><button data-v="tensor">tensor</button></span></span>
+      <span class="row" style="gap:6px"><button class="b pri" id="ss-apply">Save</button><button class="b" id="ss-cancel">Cancel</button></span>
+      <p class="tiny ss-note" id="ss-note"></p>
+    </div>
+  </div>
   <div class="grid" id="sp-stats"></div>
   <div class="cols even" style="margin-top:var(--s4)">
     <div class="card"><h3>Decode speed <span class="tiny">tokens per second, per request</span></h3><div class="chartbox"><canvas class="chart" id="ch-dec" role="img" aria-label="decode tokens per second over time"></canvas></div><div class="legend" id="lg-dec"></div></div>
@@ -571,14 +920,18 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
   </div>
   <div class="card">
     <h3>Benchmark my rig <span class="tiny">pxa-bench prompts: prose / edit / long, greedy512 sha</span></h3>
+    <p class="tiny" style="margin:0 0 8px">Every run starts from a server told to forget its earlier replies (no prompt cache, no remembered drafts), so a repeat run cannot replay an earlier answer. Run 1 (the first pass) is shown next to the mean of the later runs.</p>
     <div class="row" style="align-items:flex-end">
       <label class="f" style="width:120px">Warm-up (s)<input type="number" id="bn-warm" min="0" max="120" value="10"></label>
       <label class="f" style="width:100px">Reps<input type="number" id="bn-reps" min="1" max="6" value="3"></label>
+      <label class="f" style="width:170px" title="the KV cache type the benchmark runs with. As served = the server exactly as it runs now. Another type restarts a server PXA Control started with that type (it keeps it); a server started by hand keeps its own.">KV cache<select id="bn-kv" aria-label="KV cache type for the benchmark"><option value="">as served</option><option value="f16">f16</option><option value="q8_0">q8_0</option><option value="q4_0">q4_0</option></select></label>
       <button class="b pri" id="bn-run">Run benchmark</button>
       <a id="sp-link" href="/api/engine/pxa/speed" target="_blank" rel="noopener" style="margin-left:auto;font-size:var(--fs-1)">server's own /pxa/speed page &#8599;</a>
     </div>
     <pre class="out" id="bn-lines" style="margin-top:10px;max-height:160px" hidden></pre>
+    <div id="bn-honest" style="margin-top:10px"></div>
     <div id="bn-tel" style="margin-top:10px"></div>
+    <div id="bn-watt-now" class="tiny" style="margin-top:6px"></div>
     <button class="b" id="hs-check" hidden title="asks the PXA community board for the record on your setup (card type, count, model, mode); nothing is sent until you press this">Check the community high-score board</button>
     <div id="hs" hidden style="margin-top:10px;padding:12px;border:1px solid var(--line-2);border-radius:10px">
       <strong id="hs-title">New high score!</strong>
@@ -594,7 +947,17 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
       <div class="tw"><table><thead><tr><th>#</th><th>Name</th><th>Decode t/s</th><th>Prefill t/s</th><th>Settings</th></tr></thead><tbody id="hs-top"></tbody></table></div>
       <div id="hs-detail" class="tiny" hidden style="margin-top:8px;padding:10px;border:1px solid var(--line-2);border-radius:10px"></div>
     </div>
-    <div class="tw" style="margin-top:10px"><table><thead><tr><th>When</th><th>Model</th><th>Cards</th><th>prose dec t/s</th><th>edit dec t/s</th><th>long dec t/s</th><th>long prefill t/s</th><th>greedy512</th></tr></thead><tbody id="bn-hist"></tbody></table></div>
+    <div class="row bnbar" id="bn-bar" style="margin-top:10px" hidden>
+      <input type="search" id="bn-q" placeholder="search model, cards, sha, date" aria-label="search the benchmark history" autocomplete="off" spellcheck="false">
+      <span class="sp"></span>
+      <span class="pager"><button class="b" id="bn-prev" aria-label="previous page">&#8249; Prev</button><span id="bn-page" class="tiny" role="status" aria-live="polite">page 1 of 1</span><button class="b" id="bn-next" aria-label="next page">Next &#8250;</button></span>
+    </div>
+    <div class="tw" id="bn-tw" style="margin-top:10px"><table class="hist"><thead><tr><th>When</th><th>Model</th><th>Cards</th><th>MTP</th><th>Split</th><th title="the KV cache type the run used (K/V when they differ)">KV</th><th title="prose decode, tokens per second">prose dec</th><th title="edit decode, tokens per second">edit dec</th><th title="long decode, tokens per second">long dec</th><th title="long prompt prefill, tokens per second">long prefill</th><th>greedy512</th><th title="average watts the cards drew during the run (sum of the cards in the run)">avg W</th><th title="highest one-second total in the run">peak W</th><th title="prose decode tokens per second divided by the average watts">tok/s per W</th></tr></thead><tbody id="bn-hist"></tbody></table></div>
+    <div style="margin-top:14px">
+      <h3>Tokens per watt <span class="tiny">prose decode divided by the average watts the cards drew during that run. A run with no power reading shows a dash.</span></h3>
+      <div class="chartbox"><canvas class="chart short" id="ch-watt" role="img" aria-label="tokens per second per watt across benchmark runs"></canvas></div>
+      <div class="legend" id="lg-watt"></div>
+    </div>
   </div>
 </section>
 
@@ -626,7 +989,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
       <div class="row" style="margin-top:6px"><input type="number" id="c-attach" min="0" max="65535" placeholder="port" aria-label="port to attach to" style="width:120px"><button class="b" id="c-attach-b">Attach</button></div>
     </div>
     <div class="card chat-main">
-      <div class="msgs" id="msgs" aria-live="polite"><div class="empty center" id="msgs-empty"><b>No conversation yet</b><span>Start a server on the Launch tab, then say something.</span></div></div>
+      <div class="msgs" id="msgs" aria-live="polite"><div class="empty center" id="msgs-empty"><b>No conversation yet</b><span>Start a model on Home (or Launch), then say something.</span></div></div>
       <div class="row chat-tools" id="chat-composer-tools" style="margin-top:12px"></div>
       <div class="row chat-composer" style="margin-top:12px;align-items:flex-end;flex-wrap:nowrap">
         <textarea id="c-in" rows="3" placeholder="Write a prompt. Enter sends, Shift+Enter is a new line." aria-label="prompt" style="flex:1;min-width:0"></textarea>
@@ -639,7 +1002,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
 
 <!-- ============================== PROFILES ============================== -->
 <section id="p-profiles" data-page="profiles" hidden>
-  <div class="ph"><div><h2>Profiles</h2><p>Make your cards quieter, cooler or faster with one click, and pick which servers start on them. Every change shows you what will happen first, and you can undo it anytime.</p></div><span class="sp"></span>
+  <div class="ph"><div><h2>GPU profiles</h2><p>Make your cards quieter, cooler or faster with one click, and pick which servers start on them. Every change shows you what will happen first, and you can undo it anytime.</p></div><span class="sp"></span>
     <button class="b" id="pf-quiet" title="for a fair speed test: keep the test cards free, pause auto-starts, slow the other cards down">Benchmark mode</button>
     <button class="b" id="pf-export">Export</button><button class="b" id="pf-import">Import</button><button class="b pri" id="pf-new">New profile</button></div>
   <div class="pf-banner" id="pf-banner"></div>
@@ -660,12 +1023,32 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
   <div class="ph"><div><h2>Encode</h2><p>Turn a Hugging Face model into a PXQ / PXQN file for your cards, in a few clicks. Pick the model and the cards; the rest is automatic.</p></div></div>
   <div id="en-root"><div class="skel"></div></div>
 </section>
+<!-- ============================== PLUGINS ============================== -->
+<section id="p-plugins" data-page="plugins" hidden>
+  <div class="ph"><div><h2>Plugins</h2><p>Made by the PXA team from what people ask for on Discord. Every plugin says what it can reach before you turn it on, and you can turn it off at any time.</p></div><span class="sp"></span>
+    <a class="b" href="https://discord.pxanetwork.com" target="_blank" rel="noopener">Request a plugin</a></div>
+  <div id="ph-root"></div>
+  <div id="ph-page"></div>
+  <div id="pl-root"><div class="skel"></div></div>
+</section>
+
+<!-- ============================== STORE ============================== -->
+<section id="p-store" data-page="store" hidden>
+  <div class="ph"><div><h2>Store</h2><p>Supporter coins unlock plugins and extras. Coins come from donations and from helping PXA. PXA Control and the PXQ quants stay free.</p></div></div>
+  <div id="wl-root"></div>
+  <div id="st-root"><div class="skel"></div></div>
+</section>
+<!-- the app footer: one for every page (it used to sit on Servers only); plugin pages are added before it -->
+<footer class="foot" id="app-foot"><a href="https://discord.pxanetwork.com" target="_blank" rel="noopener">PXA Network Discord</a><a href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener">&#9829; Support PXA</a><span id="sv-ver"></span><button class="b" id="sv-up" type="button" hidden>Update</button></footer>
 </main>
+</div>
+<dialog class="dlg" id="sd" aria-labelledby="sd-h" style="width:min(560px,96vw)"><h2 id="sd-h"></h2><div id="sd-body"></div><div class="acts" id="sd-acts"></div></dialog>
 <dialog class="rpd" id="rp" aria-labelledby="rp-h">
   <h2 id="rp-h">Report a problem</h2>
   <p>This is exactly what will be sent to the PXA team, and nothing else. Home paths, host names, IPs, user names and anything that looks like a key were already removed. You can edit it. Nothing is sent until you press Send.</p>
   <label class="tiny" for="rp-sid">About which server</label>
   <select id="rp-sid" aria-label="which server the report is about" style="display:block;width:100%;margin-bottom:8px"></select>
+  <div class="row" id="rp-addr-row" hidden style="gap:6px;margin-bottom:8px"><input id="rp-addr" style="flex:1" maxlength="80" autocomplete="off" spellcheck="false" placeholder="port, host:port or URL, e.g. 8080 or http://127.0.0.1:8080" aria-label="the address of a server started by hand"><button class="b" id="rp-addr-go" type="button">Use it</button></div>
   <label class="tiny" for="rp-contact">Contact, optional (your Discord name, so we can ask you a question)</label>
   <input id="rp-contact" maxlength="100" autocomplete="off" placeholder="e.g. name#1234 or @name">
   <label class="tiny" for="rp-body">Report (JSON, editable)</label>
@@ -698,6 +1081,20 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
   <h2 id="up-h">Install update</h2>
   <p class="tiny" id="up-sub"></p>
   <p id="up-body">PXA will not restart a running server.</p>
+  <div class="row" id="up-ch" hidden style="gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0">
+    <span class="tiny" id="up-ch-now">Engine channel: Stable</span>
+    <button class="b sm" id="up-beta" type="button" hidden>Join the beta channel</button>
+    <button class="b sm" id="up-stable" type="button" hidden>Back to stable</button>
+    <button class="b sm" id="up-notes-btn" type="button" hidden>Release notes</button>
+  </div>
+  <div class="bcard" id="up-bcard" hidden>
+    <div class="bc-top"><strong id="bc-rel">Beta</strong><span class="tiny bc-bal" id="bc-bal"></span></div>
+    <p class="tiny" id="bc-msg" style="margin:6px 0 0"></p>
+    <div class="row"><button class="b pri sm" id="bc-go" type="button" hidden>Install the beta</button><button class="b sm" id="bc-docker" type="button" hidden>Docker image archive</button></div>
+    <p class="tiny" id="bc-dl" hidden style="margin:6px 0 0;overflow-wrap:anywhere"></p>
+    <p class="tiny muted" id="bc-v31" style="margin:6px 0 0">v3.1 / beta 1 users: run /beta in Discord.</p>
+  </div>
+  <pre class="tiny" id="up-notes" hidden style="max-height:40vh;overflow:auto;white-space:pre-wrap;margin:6px 0"></pre>
   <div class="up-track" id="up-track">
     <div class="up-fill" id="up-fill"></div>
     <div class="up-label" id="up-label">Slide fully, then hold 5 seconds</div>
@@ -733,7 +1130,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
   <label class="check" style="margin-top:8px"><input type="checkbox" id="pf-imp-replace"> Replace all profiles and schedules</label>
   <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="b" id="pf-imp-cancel">Cancel</button><button class="b pri" id="pf-imp-ok">Import</button></div>
 </dialog>
-<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<div class="toast" id="toast" role="status" aria-live="polite" popover="manual" hidden></div>
 
 <script>
 "use strict";
@@ -753,8 +1150,57 @@ function el(tag, attrs, ...kids) {
 }
 function toast(msg, bad) {
   const t = $("#toast"); t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); t.hidden = false;
-  clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, bad ? 6000 : 2600);
+  // a popover lives in the top layer: shown again on every toast, it stacks ABOVE an open modal dialog (z-index never could)
+  try { if (t.showPopover) { if (t.matches(":popover-open")) t.hidePopover(); t.showPopover(); } } catch (e) { /* no popover support: the z-index below still applies */ }
+  clearTimeout(toast._t); toast._t = setTimeout(() => { t.hidden = true; try { if (t.hidePopover && t.matches(":popover-open")) t.hidePopover(); } catch (e) { /* closed */ } }, bad ? 6000 : 2600);
 }
+// ---------------- keeping the reader's place when a panel redraws itself ----------------
+// A few panels rebuild their own DOM on a timer (Profiles every 3 s; the Live tab avoids this by building its
+// skeleton once). An open <details>, the scroll offset and the focused field live only in the DOM, so a rebuild
+// used to shut an expander a few seconds after it was opened, throw the scroll back to the top and drop the
+// caret while someone was typing. uiSnap takes a small picture of that state before the redraw; uiRestore puts
+// it back on the new DOM. An element is matched by its data-ui key when it has one (survives being reordered),
+// otherwise by its position in the tree (best effort: a miss is a no-op, never a wrong element - the restore
+// only ever opens a <details>, it never closes one).
+function uiKeyPath(node, root) {
+  const out = [];
+  for (let n = node; n && n !== root; n = n.parentElement) {
+    if (n.dataset && n.dataset.ui) { out.unshift("@" + n.dataset.ui); break; }
+    if (!n.parentElement) break;
+    out.unshift(Array.prototype.indexOf.call(n.parentElement.children, n));
+  }
+  return out.join("/");
+}
+function uiFind(root, key) {
+  if (!key) return null;
+  if (key.charAt(0) === "@") return root.querySelector('[data-ui="' + key.slice(1) + '"]');
+  let n = root;
+  for (const i of key.split("/")) { n = n && n.children[+i]; if (!n) return null; }
+  return n === root ? null : n;
+}
+function uiSnap(root) {
+  if (!root) return null;
+  const d = {open: [], scroll: [], focus: null};
+  for (const n of root.querySelectorAll("details")) if (n.open) d.open.push(uiKeyPath(n, root));
+  for (const n of root.querySelectorAll("*")) if (n.scrollTop || n.scrollLeft) d.scroll.push([uiKeyPath(n, root), n.scrollTop, n.scrollLeft]);
+  const a = document.activeElement;
+  if (a && a !== root && root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) {
+    let start = null, end = null;
+    try { start = a.selectionStart; end = a.selectionEnd; } catch (e) { /* number and range inputs have none */ }
+    d.focus = {key: uiKeyPath(a, root), start, end};
+  }
+  return d;
+}
+function uiRestore(root, d) {
+  if (!root || !d) return;
+  for (const k of d.open) { const n = uiFind(root, k); if (n && n.tagName === "DETAILS") n.open = true; }
+  for (const [k, top, left] of d.scroll) { const n = uiFind(root, k); if (n) { n.scrollTop = top; n.scrollLeft = left; } }
+  if (d.focus) {
+    const n = uiFind(root, d.focus.key);
+    if (n && n.focus) { try { n.focus({preventScroll: true}); if (d.focus.start != null) n.setSelectionRange(d.focus.start, d.focus.end); } catch (e) { /* gone or not selectable */ } }
+  }
+}
+function uiKeep(root, redraw) { const d = uiSnap(root); redraw(); uiRestore(root, d); }
 async function api(path, opts) {
   // every call has a deadline: a request that never returns used to leave a button disabled for good
   opts = opts || {};
@@ -767,7 +1213,7 @@ async function api(path, opts) {
   finally { clearTimeout(t); }
   let j = null; try { j = await r.json(); } catch (e) { /* non-JSON */ }
   if (r.status === 401) throw new Error("not signed in: open the GUI's address with ?token=... again");
-  if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+  if (!r.ok) throw Object.assign(new Error((j && j.error) || ("HTTP " + r.status)), {status: r.status, code: j && j.code});   // .code: a caller can tell bad_image from the rest
   return j;
 }
 window.addEventListener("unhandledrejection", e => { const m = e.reason && e.reason.message; if (m) toast(m, true); });
@@ -820,6 +1266,8 @@ const store = {
 };
 const fmtNum = (v, d) => (v == null || isNaN(v)) ? "-" : Number(v).toFixed(d == null ? 1 : d);
 function fmtParams(n) { if (!n) return "-"; if (n >= 1e9) return (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + "B"; if (n >= 1e6) return (n / 1e6).toFixed(0) + "M"; return String(n); }
+// seconds with no log output AND no read progress (the server says; older servers only give the log age)
+function quietFor(x) { return x.silent_age != null ? x.silent_age : x.last_line_age; }
 function fmtDur(s) { s = Math.max(0, Math.round(s)); return s < 90 ? s + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h"; }
 function fmtAgo(ts) { const s = Date.now() / 1000 - ts; if (s < 90) return Math.round(s) + " s ago"; if (s < 5400) return Math.round(s / 60) + " min ago"; if (s < 172800) return Math.round(s / 3600) + " h ago"; return Math.round(s / 86400) + " d ago"; }
 function segInit(seg, onchange) {
@@ -841,23 +1289,43 @@ function segInit(seg, onchange) {
     try { const o = JSON.parse(body.value); o.contact = contact.value.trim(); body.value = JSON.stringify(o, null, 2); } catch (e) { /* user is mid-edit */ }
   }
   contact.addEventListener("change", refreshBody);
-  const pick = $("#rp-sid");
+  const pick = $("#rp-sid"), addrRow = $("#rp-addr-row"), addr = $("#rp-addr");
   function reportSid() {
     // the server the user is looking at, unless it is stopped and another one of ours is running
     const mine = (S.fleet ? S.fleet.instances : []).filter(x => x.kind === "managed");
     pick.replaceChildren(...(mine.length ? mine : [{sid: S.sid, name: currentServer().name || S.sid}]).map(x =>
-      el("option", {value: x.sid, text: `${x.name}${x.running ? " (" + (x.phase || "running") + ")" : x.attached ? " (attached)" : " (stopped)"}`})));
+      el("option", {value: "sid:" + x.sid, text: `${x.name}${x.running ? " (" + (x.phase || "running") + ")" : x.attached ? " (attached)" : " (stopped)"}`})));
+    pick.append(el("option", {value: "addr", text: "Another server: type its address ..."}));
     const cur = mine.find(x => x.sid === S.sid);
     const live = x => x && (x.running || x.attached);
     const sid = live(cur) ? S.sid : ((mine.find(live) || cur || {sid: S.sid}).sid);
-    pick.value = sid; return sid;
+    pick.value = "sid:" + sid; return "sid:" + sid;
   }
-  pick.addEventListener("change", () => build(pick.value));
-  $("#rp-open").addEventListener("click", () => { send.textContent = "Send"; dlg.showModal(); build(reportSid()); });
+  // beta 2: servers started by hand (the Servers list's processes and containers, and llama-servers answering on a port of this
+  // computer) join the list; anything else is reported by its address
+  async function moreServers() {
+    try {
+      const d = await api("/api/report/servers", {timeout: 15000}), keep = pick.value;
+      const ours = new Set([...pick.options].map(o => o.value));
+      const extra = (d.servers || []).filter(x => x.kind !== "managed" && !ours.has(x.id));
+      if (!extra.length) return;
+      const tail = pick.querySelector('option[value="addr"]');
+      for (const x of extra) pick.insertBefore(el("option", {value: x.id, text: x.label}), tail);
+      pick.value = keep;
+    } catch (e) { /* the list of our own servers still works */ }
+  }
+  pick.addEventListener("change", () => { addrRow.hidden = pick.value !== "addr"; if (pick.value === "addr") { addr.focus(); return; } build(pick.value); });
+  $("#rp-addr-go").addEventListener("click", () => { if (addr.value.trim()) build("url:" + addr.value.trim()); });
+  addr.addEventListener("keydown", e => { if (e.key === "Enter" && addr.value.trim()) build("url:" + addr.value.trim()); });
+  $("#rp-open").addEventListener("click", () => { send.textContent = "Send"; addrRow.hidden = true; dlg.showModal(); build(reportSid()); moreServers(); });
+  function bundleQuery(id) {
+    const i = id.indexOf(":"), kind = id.slice(0, i), v = id.slice(i + 1);
+    return kind === "key" ? "key=" + encodeURIComponent(v) : kind === "url" ? "url=" + encodeURIComponent(v) : "sid=" + encodeURIComponent(v);
+  }
   async function build(sid) {
     say("Building the report...", ""); body.value = ""; send.disabled = true;
     try {
-      const b = await api("/api/report/bundle?sid=" + encodeURIComponent(sid), {timeout: 30000});
+      const b = await api("/api/report/bundle?" + bundleQuery(sid), {timeout: 30000});
       body.value = JSON.stringify(b, null, 2); say("Review it, then press Send.", ""); send.disabled = false;
     } catch (e) {
       // the rig may be stuck: still give the user something to send, built from what this page already has
@@ -888,35 +1356,124 @@ function segInit(seg, onchange) {
 })();
 
 // ---------------- theme ----------------
-function applyTheme(t, keep) { document.documentElement.dataset.theme = t; if (keep) store.set("theme", t); if (S.speedData) drawSpeed(); }
+// Three choices: System (nothing saved: follow the OS, live), Light, Dark. The sun button flips light / dark in one
+// click and saves it; the Help menu offers all three. The <head> script already applied it before the first paint.
+function applyTheme(t, keep) { document.documentElement.dataset.theme = t; if (keep) store.set("theme", t); if (S.speedData) drawSpeed(); paintThemePref(); }
 $("#theme").addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true));
 function defaultTheme() { try { return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"; } catch (e) { return "dark"; } }
+function themePref() { const v = store.get("theme", null); return v === "light" || v === "dark" ? v : "system"; }
+function paintThemePref() {
+  const seg = $("#theme-pref"); if (seg && seg.setv) seg.setv(themePref());
+  const m = $('meta[name="theme-color"]'); if (m) m.content = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#0F1012";
+}
+segInit($("#theme-pref"), v => { if (v === "system") { store.set("theme", null); applyTheme(defaultTheme()); } else applyTheme(v, true); });
+try { matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { if (themePref() === "system" && !new URLSearchParams(location.search).get("theme")) applyTheme(defaultTheme()); }); }
+catch (e) { /* an old browser: the button still works */ }
+
+// ---------------- Help menu + keyboard navigation of the sections ----------------
+(function () {
+  const btn = $("#help-btn"), menu = $("#help-menu");
+  const close = () => { if (menu.hidden) return; menu.hidden = true; btn.setAttribute("aria-expanded", "false"); };
+  btn.addEventListener("click", ev => { ev.stopPropagation(); const open = menu.hidden; menu.hidden = !open; btn.setAttribute("aria-expanded", String(open)); if (open) { const f = $(".mi", menu); if (f) f.focus(); } });
+  menu.addEventListener("click", ev => { ev.stopPropagation(); if (ev.target.closest(".mi")) close(); });
+  document.addEventListener("click", close);
+  document.addEventListener("keydown", ev => { if (ev.key === "Escape" && !menu.hidden) { close(); btn.focus(); } });
+  // the section list is one tab stop: arrows move between sections, Home / End jump to the ends
+  $("#tabs").addEventListener("keydown", ev => {
+    const bs = $$("#tabs button[role=tab]"), i = bs.indexOf(document.activeElement); if (i < 0) return;
+    const k = ev.key, n = k === "ArrowDown" || k === "ArrowRight" ? i + 1 : k === "ArrowUp" || k === "ArrowLeft" ? i - 1 : k === "Home" ? 0 : k === "End" ? bs.length - 1 : null;
+    if (n == null) return;
+    ev.preventDefault(); const b = bs[(n + bs.length) % bs.length]; b.focus(); b.click();
+  });
+})();
 
 // ---------------- state + tabs ----------------
-const S = {tab: "servers", rig: null, models: null, levers: [], leverVals: store.get("levers", {}), gpus: [],
+const S = {tab: "home", rig: null, models: null, levers: [], leverVals: store.get("levers", {}), gpus: [],
            status: null, logSeq: 0, es: null, speedData: null, chat: [], abort: null, info: null,
            sid: store.get("sid", "main"), servers: [], fleet: null, logLines: [], target: store.get("target", null)};
 function showTab(t) {
   S.tab = t; store.set("tab", t);
-  $$("#tabs button").forEach(b => b.setAttribute("aria-selected", b.dataset.tab === t));
+  $$("#tabs button").forEach(b => { b.setAttribute("aria-selected", b.dataset.tab === t); b.tabIndex = b.dataset.tab === t ? 0 : -1; });
+  const nb = $(`#tabs button[data-tab="${t}"]`);     // the phone's bottom bar scrolls: keep the open section in sight
+  if (nb && matchMedia("(max-width:820px)").matches) nb.scrollIntoView({block: "nearest", inline: "nearest"});
   $$("main>section").forEach(s => s.hidden = s.dataset.page !== t);
   if (t === "live") { if (window.liveOpen) liveOpen(); } else if (window.liveClose) liveClose();
   if (t === "servers") loadFleet();
   if (t === "rig") loadRig();
-  if (t === "models") loadModels();
+  if (t === "models") modelsVisit();
   if (t === "launch") { loadModels(); renderLaunchCards(); loadFleet().then(() => { if (S.tab === "launch") renderLaunchCards(); }); }
-  if (t === "speed") { fillTargets(); loadSpeed(); }
+  if (t === "speed") { fillTargets().then(renderStrip); loadFleet(); loadSpeed(); }
   if (t === "chat") { fillTargets().then(loadThinkChat); if (!matchMedia("(max-width: 820px)").matches) $("#c-in").focus(); }
   if (t === "encode" && window.encodeOpen) encodeOpen();
   if (t === "profiles") { if (window.profilesOpen) profilesOpen(); } else if (window.profilesClose) profilesClose();
+  if (t === "home" && window.homeOpen) homeOpen();
+  if (t === "plugins" && window.pluginsOpen) pluginsOpen();
+  if (t.startsWith("plug-") && window.pluginTabOpen) pluginTabOpen(t.slice(5));    // a plugin's own tab (plugin-host.js draws it)
+  if (t === "store" && window.storeOpen) storeOpen();
   if (location.hash !== "#" + t) history.replaceState(null, "", "#" + t);
 }
 $$("#tabs button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
-const TABS = ["servers", "live", "rig", "models", "launch", "speed", "chat", "encode", "profiles"];
+const TABS = ["home", "servers", "live", "rig", "models", "launch", "speed", "chat", "encode", "profiles", "plugins", "store"];
 // a typed or bookmarked #tab (and Back/Forward) switches the page; it used to leave the old tab showing
-window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (TABS.includes(t) && t !== S.tab) showTab(t); });
+// a plugin's own tab ("plug-<id>") counts once plugin-host.js has put its button in the bar
+const isTab = t => TABS.includes(t) || (/^plug-[a-z0-9][a-z0-9-]{0,40}$/.test(t) && !!document.querySelector(`#tabs button[data-tab="${t}"]`));
+window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (isTab(t) && t !== S.tab) showTab(t); });
 const MARK = {ok: "\u2713", warn: "!", bad: "\u2715"};
 function badge(level, text) { return el("span", {class: "chip " + level}, el("span", {"aria-hidden": "true", text: MARK[level] || ""}), text); }
+// ---------------- shared pieces: icons, a state with a next step, quant tiers, the lock ----------------
+const ICONS = {
+  servers: '<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>',
+  gpu: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h4v4H7zM15 10h2M15 14h2M6 18v2M18 18v2"/>',
+  models: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/>',
+  folder: '<path d="M3 6h6l2 2h10v11H3z"/>',
+  alert: '<path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17h.01"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  unlock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 7.5-2"/>',
+  chat: '<path d="M4 5h16v11H9l-5 4z"/>', play: '<path d="M7 4v16l13-8z"/>', stop: '<rect x="6" y="6" width="12" height="12" rx="1.5"/>',
+  dl: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>', check: '<path d="M5 12l5 5 9-10"/>',
+  plug: '<path d="M9 3h6v4a2 2 0 1 0 4 0h2v6h-2a2 2 0 1 0 0 4h2v4h-6v-2a2 2 0 1 0-4 0v2H5v-6h2a2 2 0 1 0 0-4H5V7h4z"/>',
+  store: '<path d="M4 8h16l-1 12H5z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/>',
+  spark: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M6 18l2.5-2.5M15.5 8.5L18 6"/>',
+  mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8"/>',
+  encode: '<path d="M4 7h13l-3-3M20 17H7l3 3"/>', live: '<path d="M3 12h4l3-8 4 16 3-8h4"/>', speed: '<path d="M3 20h18M6 16l4-5 3 3 5-7"/>',
+  profiles: '<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>',
+  heart: '<path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/>',
+  receipt: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/>', cloud: '<path d="M7 18h10a4 4 0 0 0 .5-8A6 6 0 0 0 6 9a4.5 4.5 0 0 0 1 9z"/>',
+  shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>', file: '<path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>', term: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>',
+  bell: '<path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 20a2 2 0 0 0 4 0"/>', tune: '<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/>',
+};
+function icon(k, cls) {
+  const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  s.setAttribute("viewBox", "0 0 24 24"); s.setAttribute("class", "i" + (cls ? " " + cls : "")); s.setAttribute("aria-hidden", "true");
+  s.innerHTML = ICONS[k] || ICONS.spark;           // static path data from the table above, never page data
+  return s;
+}
+// an empty, failed or locked state: what happened in plain words, and the button that does the next thing
+function stateBox(ico, title, text, actions, kind) {
+  return el("div", {class: "state" + (kind ? " " + kind : ""), role: kind === "bad" ? "alert" : null},
+    el("span", {class: "ico"}, icon(ico)), el("b", {text: title}), text ? el("p", {text}) : null,
+    actions && actions.length ? el("div", {class: "row"}, ...actions) : null);
+}
+// Free PXQ / Supporter PXQN: the quant's tier, wherever a quant is named (owner, 2026-10-14)
+function quantTier(s) { s = String(s || ""); return /pxqn/i.test(s) ? "sup" : /pxq/i.test(s) ? "free" : null; }
+function pxqnUnlocked() { return !!(window.PXAStore && PXAStore.entitled("pxqn")); }
+// locked: this copy is out of reach until it is unlocked (a padlock); otherwise the badge names the tier only
+function tierBadge(s, locked) {
+  const t = quantTier(s); if (!t) return null;
+  return el("span", {class: "tier " + t, title: t === "free" ? "PXQ: free for everyone" : locked ? "PXQN: a supporter quant, the same size as PXQ with much lower error. Supporters unlock PXQN quants with coins in the Store." :
+      pxqnUnlocked() ? "PXQN: unlocked by your supporter grant" : "PXQN: the supporter tier, the same size as PXQ with much lower error"},
+    icon(locked ? "lock" : t === "sup" && pxqnUnlocked() ? "unlock" : "check"), t === "sup" ? "Supporter PXQN" : "Free PXQ");
+}
+// the way out of a lock: the Store (coins) first, then where coins come from
+function unlockActions(item, label) {
+  return [el("button", {class: "b sup sm", type: "button", onclick: () => { showTab("store"); if (window.storeFocus) storeFocus(item); }}, icon("unlock"), label || "Unlock in the Store"),
+          el("a", {class: "b ghost sm", href: "https://ko-fi.com/shatteredrealms1", target: "_blank", rel: "noopener", text: "Support on Ko-fi"})];
+}
+function lockBox(title, why, actions) {
+  return el("div", {class: "lockbox"}, el("span", {class: "li"}, icon("lock")), el("b", {text: title}), el("p", {text: why}),
+    el("div", {class: "row"}, ...(actions || [])));
+}
 function quantNotice(text) {
   if (!text) return null;
   const href = "https://huggingface.co/poisonxa";
@@ -938,10 +1495,23 @@ function stdBadge(notice) {
 const KIND = {managed: "this GUI", docker: "docker", process: "process"};
 function healthLevel(x) { return !x.running ? (x.exit_code ? "bad" : "") : x.health === "ok" ? "ok" : (x.health === "loading" || /starting|loading|weights|listening/.test(x.phase || "")) ? "warn pulse" : "bad"; }
 function seriesColor(i) { return seriesColors()[i % 8]; }
+// One word for what a server is doing. The card, the header chip and the Live tile all read it from here, so
+// "busy" in the header is the same state as "busy" on the card.
+function srvPhase(x) {
+  return !x.running ? (x.kind === "managed" ? (x.exit_code ? `exited (${x.exit_code})` : "stopped") : (x.status || "stopped"))
+    : x.health === "ok" ? (x.slots_processing ? "busy" : "serving") : (x.phase && x.kind === "managed" ? x.phase : x.health || "starting");
+}
+// The server's colour is the same one the Live tab draws it in, so a chip and a chart point at one machine.
+function fleetColors(f) { const c = {}; f.instances.forEach((x, i) => c[x.key] = seriesColor(x.slot != null ? x.slot : i)); return c; }
 async function loadFleet(force) {
   try {
-    const f = await api("/api/fleet" + (force ? "?force=1" : ""), {timeout: 30000}); S.fleet = f; renderFleet();
-  } catch (e) { $("#sv-note").textContent = "could not read the servers: " + e.message; }
+    const f = await api("/api/fleet" + (force ? "?force=1" : ""), {timeout: 30000});
+    S.fleet = f; S.fleetRead = true;
+    renderChips();                                                     // the header is on every tab
+    if (S.tab === "servers" || S.tab === "launch") renderFleet();       // the cards are only on those two
+    if (S.tab === "home" && window.homeRender) homeRender();
+    if (S.tab === "speed") renderStrip();
+  } catch (e) { $("#sv-note").textContent = "could not read the servers: " + e.message; S.fleetRead = true; renderChips(); }
 }
 function upFor(x) {
   if (x.started_epoch) return fmtDur(Date.now() / 1000 - x.started_epoch);
@@ -950,12 +1520,17 @@ function upFor(x) {
 }
 function renderFleet() {
   const f = S.fleet; if (!f) return;
-  const keyColor = {}; f.instances.forEach((x, i) => keyColor[x.key] = seriesColor(x.slot != null ? x.slot : i));       // the server's colour is the same one the Live tab draws it in
+  const keyColor = fleetColors(f);
   const live = f.instances.filter(x => x.running).length, srv = f.instances.filter(x => x.health === "ok").length;
   $("#sv-note").textContent = `${f.instances.length} server(s), ${live} running, ${srv} serving` + (f.docker ? "" : " · docker CLI not available: containers are not listed") +
     (f.errors.length ? " · " + f.errors.join(" · ") : "") + " · updated " + new Date(f.ts * 1000).toLocaleTimeString() +
     (S.info && S.info.companion ? ` · this PXA Control opened with a server and closes itself ${Math.round((S.info.idle_exit_s || 600) / 60)} min after the last server stops and no page is open` : "");
-  $("#sv-list").replaceChildren(...(f.instances.length ? f.instances.map(x => fleetCard(x, keyColor[x.key])) : [el("div", {class: "empty", text: "No servers yet: New server sets one up."})]));
+  $("#sv-list").replaceChildren(...(f.instances.length ? f.instances.map(x => fleetCard(x, keyColor[x.key])) : [stateBox("servers", "No servers yet", "A server is one model on one or more of your cards. Home gets the first one running in three steps.",
+      [el("button", {class: "b pri", text: "Run a model", onclick: () => showTab("home")}), el("button", {class: "b", text: "Set one up by hand", onclick: () => newServer()})])]));
+  if (S.flashKey && Date.now() < S.flashUntil) {                     // the card a chip just opened stays marked through this re-draw
+    const c = Array.prototype.find.call(document.querySelectorAll("#sv-list .card"), c => c.dataset.key === S.flashKey);
+    if (c) { c.classList.add("flash"); setTimeout(() => c.classList.remove("flash"), Math.max(0, S.flashUntil - Date.now())); }
+  }
   $("#sv-cards").replaceChildren(...f.cards.map(c => {
     const segs = c.users.map(u => el("i", {style: `width:${100 * u.mib / c.mem_total_mib}%;background:${keyColor[u.key]}`, title: `${u.name} ${u.mib} MiB`}));
     if (c.other_mib) segs.push(el("i", {style: `width:${100 * c.other_mib / c.mem_total_mib}%;background:var(--neutral)`, title: (c.other_names || []).join(", ")}));
@@ -968,10 +1543,121 @@ function renderFleet() {
         !c.users.length && !c.other_mib ? el("span", {text: "free"}) : null));
   }));
 }
+// ---------------- the header: every running server, not only the last one started ----------------
+// One chip per running server: its colour, its short name, its port and its state in words. Clicking one opens
+// that server on the Servers tab and marks its card, so the header is a way in, not just a status line. When
+// the chips do not fit (a narrow window loses them, a phone never shows them) they collapse into one chip that
+// says how many there are and opens the list.
+const FCHIPS = {fit: null, open: false, sig: ""};
+function chipServers() {
+  const f = S.fleet;
+  if (!f || !f.instances) return [];
+  return f.instances.filter(x => x.running).sort((a, b) => ((a.slot != null ? a.slot : 99) - (b.slot != null ? b.slot : 99)) || String(a.key).localeCompare(String(b.key)));
+}
+function chipLabel(x) {                                   // the shortest honest name for a server
+  const base = String(x.alias || x.model_file || x.name || "").trim().split("/").pop().replace(/\.gguf$/i, "");
+  return base || x.name || "server";
+}
+function chipNode(x, color) {
+  const st = srvPhase(x), nm = chipLabel(x);
+  const b = el("button", {class: "fchip", type: "button", style: "border-left-color:" + color,
+    title: `${x.label || x.name || nm} · ${st}${x.port ? " · port " + x.port : ""}`,
+    "aria-label": `${x.name || nm}, ${x.port ? "port " + x.port + ", " : ""}${st}`,
+    onclick: ev => { ev.stopPropagation(); FCHIPS.open = false; renderChips(true); openFleetCard(x); }},
+    el("span", {class: "dot " + healthLevel(x), "aria-hidden": "true"}),
+    el("span", {class: "fname", text: nm}),
+    x.port ? el("span", {class: "fport mono", text: ":" + x.port}) : null,
+    el("span", {class: "fst", text: st}));
+  if (x.kind === "managed" && x.sid === S.sid) b.setAttribute("aria-current", "true");
+  return b;
+}
+// The pill names the server this page is pointed at while that server runs. When it does not, the pill speaks for the
+// whole box: a server still running has its chip, so the pill steps aside, and with nothing running it says "no servers".
+// The pill and the chips are drawn here from one reading, so the header never shows a chip beside "no server". Until the
+// fleet has been read once, the pill waits instead of guessing.
+function renderPill() {
+  const say = S.pill || (S.fleetRead && !chipServers().length ? {text: "no servers", cls: ""} : null);
+  $("#health").hidden = !say;
+  if (say) { $("#htext").textContent = say.text; $("#hdot").className = "dot " + say.cls; }
+  return !!say;
+}
+function renderChips(force) {
+  const box = $("#fchips"); if (!box) return;
+  const pill = renderPill();                              // first: whether the pill is up changes the room the row has
+  if (FCHIPS.pill !== pill) { FCHIPS.pill = pill; FCHIPS.fit = null; }
+  const run = chipServers(), inner = [];
+  if (!run.length) {
+    if (box.hidden && FCHIPS.sig === "") return;
+    FCHIPS.sig = ""; FCHIPS.fit = null; FCHIPS.open = false;
+    box.hidden = true; box.style.display = "none"; box.replaceChildren(); box.style.minWidth = "";
+    return;
+  }
+  const color = S.fleet ? fleetColors(S.fleet) : {};
+  // a phone (tabs move to the bottom bar, the pill takes the room) only ever gets the summary chip; a window
+  // that cannot hold the chips gets it too, and the measurement decides that on the first render, not a guess.
+  const collapsed = matchMedia("(max-width:820px)").matches || FCHIPS.fit === false;
+  const sig = (collapsed ? "1" : "0") + (pill ? "p" : "") + run.map(x => [x.key, chipLabel(x), x.port, srvPhase(x), x.kind === "managed" && x.sid === S.sid ? "*" : ""].join(",")).join("|");
+  if (!force && sig === FCHIPS.sig) return;             // nothing moved: leave the DOM (and an open list) alone
+  FCHIPS.sig = sig;
+  if (!collapsed) run.forEach(x => inner.push(chipNode(x, color[x.key])));
+  else {
+    const summary = el("button", {class: "fchip fmore", type: "button", "aria-expanded": FCHIPS.open ? "true" : "false",
+      "aria-label": `${run.length} running server${run.length === 1 ? "" : "s"}: show them`,
+      onclick: ev => { ev.stopPropagation(); FCHIPS.open = !FCHIPS.open; renderChips(true); }},
+      el("span", {class: "dot " + (run.every(x => x.health === "ok") ? "ok" : "warn"), "aria-hidden": "true"}),
+      el("span", {class: "fname", text: run.length + " server" + (run.length === 1 ? "" : "s")}),
+      el("span", {class: "fcaret", text: "▾"}));
+    inner.push(summary);
+    if (FCHIPS.open) inner.push(el("div", {class: "fmenu", role: "group", "aria-label": "running servers"},
+      ...run.map(x => chipNode(x, color[x.key]))));
+  }
+  box.hidden = false;
+  box.style.display = "";                               // a previous render may have stepped the row aside
+  box.replaceChildren(...inner);
+  if (!collapsed) {                                     // do the chips fit at this width? the measurement decides
+    box.style.minWidth = "";
+    const fits = box.scrollWidth <= box.clientWidth + 1;
+    if (FCHIPS.fit !== fits) { FCHIPS.fit = fits; if (!fits) renderChips(true); }   // one more chip, or a narrower window: collapse
+    return;
+  }
+  // Collapsed: the one summary chip IS the row, so it does not shrink (a flex row with no room left would
+  // crush it to a sliver) and in exchange it may not push the header wider than the header is. Two ways out,
+  // in order: the pill steps aside (it was saying what the chips say), and if the header is still too full the
+  // row stands down altogether -- the pill goes on naming the server it is pointed at, so the chips are only
+  // ever a second reading of a fact, never the only one. With the pill aside (this page's server is not running)
+  // the row is the only reading, so it stays.
+  box.style.minWidth = "fit-content";
+  const hd = box.parentElement;
+  const menu = box.querySelector(".fmenu");               // an open list hangs outside the row: measure the row
+  if (menu) menu.style.display = "none";
+  hd.classList.remove("chipspill");
+  if (hd.scrollWidth > hd.clientWidth + 1) {
+    hd.classList.add("chipspill");
+    if (hd.scrollWidth > hd.clientWidth + 1 && pill) { box.style.display = "none"; hd.classList.remove("chipspill"); }
+  }
+  if (menu) menu.style.display = "";
+}
+// a chip (or a row of the list) opens that server: the Servers tab, that server's card in view and marked, and
+// for a server this GUI started, the page pointed at it (the pill follows, the Launch tab shows its settings)
+function openFleetCard(x) {
+  showTab("servers");
+  if (x.kind === "managed" && x.sid && x.sid !== S.sid) selectServer(x.sid).catch(() => {});
+  const mark = () => {
+    const card = Array.prototype.find.call(document.querySelectorAll("#sv-list .card"), c => c.dataset.key === x.key);
+    if (!card) return false;
+    card.scrollIntoView({block: "center", behavior: "smooth"});
+    card.classList.remove("flash"); void card.offsetWidth; card.classList.add("flash");
+    S.flashKey = x.key; S.flashUntil = Date.now() + 1700;            // a re-draw of the cards inside that time keeps the mark
+    clearTimeout(mark._t); mark._t = setTimeout(() => card.classList.remove("flash"), 1700);
+    return true;
+  };
+  if (!mark()) loadFleet(true).then(mark);
+}
+window.addEventListener("resize", () => { FCHIPS.fit = null; renderChips(true); });
+document.addEventListener("click", () => { if (FCHIPS.open) { FCHIPS.open = false; renderChips(true); } });
 function fleetCard(x, color) {
   const lv = healthLevel(x), m = x.metrics || {};
-  const phase = !x.running ? (x.kind === "managed" ? (x.exit_code ? `exited (${x.exit_code})` : "stopped") : (x.status || "stopped"))
-    : x.health === "ok" ? (x.slots_processing ? "busy" : "serving") : (x.phase && x.kind === "managed" ? x.phase : x.health || "starting");
+  const phase = srvPhase(x);
   const ro = x.kind !== "managed" && !x.control;
   const name = x.label || x.name;
   const btn = (txt, fn, cls) => el("button", {class: "b" + (cls ? " " + cls : ""), onclick: fn, text: txt});
@@ -987,9 +1673,9 @@ function fleetCard(x, color) {
     if (a === "delete") acts.push(btn("Delete", () => deleteServer(x.sid), "danger"));
   }
   if (x.kind === "managed" && x.running) acts.push(btn("Edit", () => editServer(x.sid)));
-  if (x.running && x.health === "ok" && x.port) { acts.push(btn("Chat", () => { setTarget(targetOf(x)); showTab("chat"); })); acts.push(btn("Speed", () => { setTarget(targetOf(x)); showTab("speed"); })); acts.push(btn("Live", () => showTab("live"))); }
+  if (x.running && x.health === "ok" && x.port) { acts.push(btn("Chat", () => { setTarget(targetOf(x)); showTab("chat"); })); acts.push(btn("Benchmarks", () => { setTarget(targetOf(x)); showTab("speed"); })); acts.push(btn("Live", () => showTab("live"))); }
   const vram = Object.entries(x.vram || {}).map(([g, mib]) => `#${g} ${(mib / 1024).toFixed(1)} GiB`).join(" · ");
-  return el("div", {class: "card srv", style: `border-top:3px solid ${color}`},
+  return el("div", {class: "card srv", "data-key": x.key, style: `border-top:3px solid ${color}`},
     el("h3", {}, el("span", {class: "dot " + lv}), el("span", {style: "overflow-wrap:anywhere", text: name}), el("span", {class: "sp"}),
       el("span", {class: "kind", text: x.origin === "launcher" ? "command line" : (KIND[x.kind] || x.kind)}), ro ? badge("", "read-only") : null, x.adopted ? badge("ok", "adopted") : null),
     el("div", {class: "tiny", style: "overflow-wrap:anywhere", text: x.model_file || x.alias || (x.kind === "managed" ? "no model chosen yet" : "")}),
@@ -1004,7 +1690,8 @@ function fleetCard(x, color) {
       el("div", {}, el("span", {text: "decode"}), el("b", {text: m.decode_median ? fmtNum(m.decode_median) : "-"}), el("span", {text: m.decode_last ? "last " + fmtNum(m.decode_last) : "t/s median"})),
       el("div", {}, el("span", {text: "prefill"}), el("b", {text: m.prefill_median ? fmtNum(m.prefill_median, 0) : "-"}), el("span", {text: "t/s median"})),
       el("div", {}, el("span", {text: "requests"}), el("b", {text: m.requests != null ? m.requests : "-"}), el("span", {text: m.src === "/metrics" ? "total" : "last hour"}))) : null,
-    x.last_line_age > 120 && x.running && x.health !== "ok" ? el("div", {class: "alert warn"}, `No log output for ${fmtDur(x.last_line_age)}: the load may be stuck. Report a problem works now; Stop kills it.`) : null,
+    x.running && x.health !== "ok" && x.load_progress && x.load_progress.text ? el("div", {class: "tiny"}, x.load_progress.text) : null,
+    quietFor(x) > 120 && x.running && x.health !== "ok" ? el("div", {class: "alert warn"}, `No log output and no disk reads for ${fmtDur(quietFor(x))}: the load may be stuck. Report a problem works now; Stop kills it.`) : null,
     el("div", {class: "acts"}, ...acts));
 }
 // the context the ENGINE resolved, in plain words: "Auto (picked 65,536 tokens to fit your card)"; the tooltip says how
@@ -1089,7 +1776,7 @@ $("#lg-close").addEventListener("click", () => $("#lg").close());
 $("#lg").addEventListener("close", () => { if (LG.es) { LG.es.close(); LG.es = null; } });
 $("#sv-refresh").addEventListener("click", () => loadFleet(true));
 $("#sv-new").addEventListener("click", () => newServer());
-setInterval(() => { if (!document.hidden && S.tab === "servers") loadFleet(); }, 4000);
+setInterval(() => { if (!document.hidden) loadFleet(); }, 5000);   // the header shows every running server on every tab, so the fleet is read on every tab
 // server profiles (Launch tab)
 async function loadServers(select) {
   try { S.servers = (await api("/api/servers")).servers; } catch (e) { return; }
@@ -1108,11 +1795,14 @@ async function selectServer(sid, keepForm) {
   const sv = currentServer();
   if (!keepForm) applyBody((st && st.running && st.request) || store.get("lastBody." + sid, null) || (sv.settings && sv.settings.model ? sv.settings : null) || {gpus: [], levers: {}});
   $("#plan-box").hidden = true; $("#plan-empty").hidden = false; $("#plan-engine").textContent = "";
+  $("#plan-od").hidden = true; $("#plan-od").replaceChildren();
   pollStatus();
 }
 async function newServer() {
-  const name = (prompt("Name for the new server (e.g. 'Gemma on the V100s')", "Server " + (S.servers.length + 1)) || "").trim(); if (!name) return;
-  try { const d = await api("/api/servers", {body: {name, settings: {}}}); toast(`server '${name}' added: choose its cards and model`); await selectServer(d.sid); applyBody({gpus: [], levers: {}}); showTab("launch"); } catch (e) { toast(e.message, true); }
+  // no name prompt first: the server gets the next free name now, and Rename (on Launch) changes it whenever
+  let n = S.servers.length + 1; while (S.servers.some(s => s.name === "Server " + n)) n++;
+  const name = "Server " + n;
+  try { const d = await api("/api/servers", {body: {name, settings: {}}}); toast(`'${name}' added: choose its cards and model (Rename changes the name)`); await selectServer(d.sid); applyBody({gpus: [], levers: {}}); showTab("launch"); } catch (e) { toast(e.message, true); }
 }
 async function editServer(sid) { showTab("launch"); await selectServer(sid); }
 async function deleteServer(sid) {
@@ -1196,7 +1886,7 @@ function chatQuantNote() {
   paintQuantNote($("#c-qnote"), noteForTarget(S.target));
   paintQuantNote($("#ag-qnote"), noteForTarget(assistantQuantTarget()));
 }
-for (const id of ["#c-target", "#sp-target"]) $(id).addEventListener("change", e => { try { setTarget(JSON.parse(e.target.value)); if (id === "#sp-target") loadSpeed(); else { $("#chat-model").textContent = targetLabel(S.target); loadThinkChat(); } } catch (x) { /* */ } });
+for (const id of ["#c-target", "#sp-target"]) $(id).addEventListener("change", e => { try { setTarget(JSON.parse(e.target.value)); if (id === "#sp-target") { renderStrip(); loadSpeed(); } else { $("#chat-model").textContent = targetLabel(S.target); loadThinkChat(); } } catch (x) { /* */ } });
 
 // ---------------- RIG ----------------
 async function loadRig(force) {
@@ -1221,13 +1911,16 @@ function renderRigStatic(s) {
 }
 function renderRigCards(live) {
   const box = $("#rig-cards");
-  if (!live.cards.length) { box.replaceChildren(el("div", {class: "empty", text: live.error || "no NVIDIA cards visible"})); return; }
+  if (!live.cards.length) { box.replaceChildren(stateBox("gpu", "No NVIDIA cards found", (live.error ? live.error + ". " : "") +
+      "PXA Control reads the cards with nvidia-smi. Check that the NVIDIA driver is installed and that nvidia-smi works in a terminal; inside docker, start the container with --gpus all.",
+      [el("button", {class: "b", text: "Look again", onclick: () => loadRig(true)}), el("button", {class: "b", text: "Run the doctor", onclick: () => loadDoctor(true)})], "bad")); return; }
   box.replaceChildren(...live.cards.map(c => {
     const pct = c.mem_total_mib ? Math.round(100 * c.mem_used_mib / c.mem_total_mib) : 0;
     const link = c.pcie_width ? `x${c.pcie_width} gen${c.pcie_gen}` + ((c.pcie_width_max && (c.pcie_width_max !== c.pcie_width || c.pcie_gen_max !== c.pcie_gen)) ? ` (max x${c.pcie_width_max} gen${c.pcie_gen_max})` : "") : "?";
-    const heavy = c.mem_used_mib > 512, held = (c.procs || []).length;
+    const heavy = c.busy != null ? c.busy : c.mem_used_mib > 512, held = (c.procs || []).length;
     const hot = c.temp_c != null && c.temp_c >= 80;
-    const mark = heavy ? badge("warn", "busy") : held ? badge("warn", "in use") : badge("ok", "idle");
+    const mark = heavy ? badge("warn", "busy") : held ? badge("warn", "in use") : c.desktop_mib ? badge("ok", "idle (desktop)") : badge("ok", "idle");
+    if (heavy && c.busy_why) mark.title = c.busy_why;
     return el("div", {class: "card"},
       el("h3", {}, el("span", {class: "mono", text: "#" + c.index}), c.name, mark),
       el("div", {class: "tiny", text: c.class}),
@@ -1265,7 +1958,8 @@ async function loadModels(force) {
     S.models = await api("/api/models" + (force ? "?force=1" : ""));
     if (!S.gpus.length) { const live = await api("/api/rig/live"); S.gpus = live.cards; }
     renderModels(); loadFits();
-  } catch (e) { toast("models: " + e.message, true); $("#models-body").replaceChildren(el("tr", {}, el("td", {colspan: 7, class: "empty", text: "Could not read the library: " + e.message}))); }
+  } catch (e) { toast("models: " + e.message, true); $("#models-body").replaceChildren(el("tr", {}, el("td", {colspan: 8}, stateBox("alert", "Could not read the model library", e.message + ". Check that the folders below exist and are readable, then try again.",
+      [el("button", {class: "b", text: "Try again", onclick: () => loadModels(true)})], "bad")))); }
 }
 function cardSets() {
   const sets = [], seen = new Set(), add = (ids, label) => { const k = ids.join(","); if (ids.length && !seen.has(k)) { seen.add(k); sets.push({ids, label}); } };
@@ -1297,7 +1991,7 @@ function renderModels() {
     const fits = (S.fits && S.fits[x.path]) || [];
     return el("tr", {class: "click" + (x.path === sel ? " sel" : ""), onclick: () => { $("#l-model").value = x.path; store.set("model", x.path); modelInfo(); showTab("launch"); }},
       el("td", {}, el("div", {style: "font-weight:600;overflow-wrap:anywhere", text: x.file}), el("div", {class: "tiny mono hide-sm", style: "overflow-wrap:anywhere", text: x.path}), stdBadge(x.notice)),
-      el("td", {}, el("span", {class: "chip " + (x.codec === "PXQ" ? "pxq" : x.codec === "PXQN" ? "pxqn" : ""), text: x.codec})),
+      el("td", {}, el("span", {class: "chip " + (x.codec === "PXQ" ? "pxq" : x.codec === "PXQN" ? "pxqn" : ""), text: x.codec}), " ", tierBadge(x.codec || x.file)),
       el("td", {class: "mono", text: x.type || (x.err ? "unreadable" : "-")}),
       el("td", {"data-l": "params", text: x.size_label || fmtParams(x.params)}),
       el("td", {"data-l": "size", text: x.size_h}),
@@ -1305,7 +1999,11 @@ function renderModels() {
       el("td", {"data-l": "thinking", title: x.thinking ? (x.thinking.label || "") + ": " + (x.thinking.summary || "") : ""}, thinkChip(x.thinking)),
       el("td", {style: "min-width:150px"}, ...fits.map((f, i) => { const lv = f.verdict === "fits" || f.verdict === "ram" ? "ok" : f.verdict === "tight" ? "warn" : "bad";
         const b = badge(lv, (S.fitSets[i] ? S.fitSets[i].label : f.cards.join(",")) + (f.verdict === "ram" ? " + RAM" : "")); b.title = f.why || ""; b.style.margin = "1px"; return b; })));
-  }) : [el("tr", {}, el("td", {colspan: 8, class: "empty", text: m.roots.length ? "No .gguf files under these folders." : "Add a model folder above to see your models here."}))]));
+  }) : [el("tr", {}, el("td", {colspan: 8}, m.roots.length
+      ? stateBox("models", "No .gguf files in these folders", "Download one from PXA below, or add the folder that holds your models. Rescan if you just copied files in.",
+          [el("button", {class: "b", text: "Rescan", onclick: () => loadModels(true)}), el("button", {class: "b", text: "Download a model", onclick: () => $("#hf-card").scrollIntoView({behavior: "smooth", block: "start"})})])
+      : stateBox("folder", "No model folder yet", "Add the folder that holds your .gguf files above, or download a model from PXA: it goes into the first folder you add.",
+          [el("button", {class: "b pri", text: "Add a folder", onclick: () => $("#dir-new").focus()})])))]));
   fillModelSelect();
 }
 async function saveDirs(dirs) {
@@ -1315,13 +2013,198 @@ async function saveDirs(dirs) {
 $("#dir-add").addEventListener("click", () => { const v = $("#dir-new").value.trim(); if (!v) return; saveDirs([...(S.models ? S.models.roots : []), v]); $("#dir-new").value = ""; });
 $("#models-rescan").addEventListener("click", () => loadModels(true));
 
+// ---------------- MODELS: what PXA publishes, one-click download ----------------
+// The list comes from the server (it talks to huggingface.co); the page never holds a token and never
+// builds an HF url itself. A download runs on the server and is watched here by polling one small route,
+// so closing the tab does not stop it.
+const KOFI = "https://ko-fi.com/shatteredrealms1";
+const HF = {data: null, timer: null, last: null, sawRun: false};
+async function loadAvailable(force) {
+  if (HF.data && !HF.cached && !force) { renderAvailable(); return; }   // remembered-only data (HF.cached) does not count as read
+  $("#hf-checked").textContent = "";
+  $("#hf-refresh").disabled = true;
+  $("#hf-body").replaceChildren(el("tr", {}, el("td", {colspan: 4}, el("div", {class: "empty"}, el("span", {class: "spin"}), "Reading the PXA repositories on huggingface.co ..."))));
+  try { HF.data = await api("/api/models/available" + (force ? "?force=1" : ""), {timeout: 120000}); HF.cached = false; HF.at = Date.now(); }
+  catch (e) {
+    HF.data = null; HF.err = e.message; $("#hf-sub").textContent = "";
+    $("#hf-body").replaceChildren(el("tr", {}, el("td", {colspan: 4, class: "empty", text: "Could not read the list: " + e.message})));
+    return;
+  } finally { $("#hf-refresh").disabled = false; }
+  HF.err = null; renderAvailable(); pollDownload();
+}
+// A visit to the Models tab asks the server for the REMEMBERED list only (no network), shows it with its age, and
+// reads huggingface.co on its own only when that list is older than a day or this machine has no model yet
+// (the first-run one-click download). Otherwise the "Check PXA models" button does it.
+async function modelsVisit() {
+  const lib = loadModels();
+  let stale = true;                                   // nothing remembered counts as older than a day
+  if (HF.data) { renderAvailable(); stale = hfAgeS() > 24 * 3600; }
+  else {
+    try {
+      const c = await api("/api/models/available?cached=1", {timeout: 15000});
+      if (c.ts) { HF.data = c; HF.cached = true; HF.at = Date.now(); HF.err = null; renderAvailable(); stale = !!c.stale; }
+      else $("#hf-body").replaceChildren(el("tr", {}, el("td", {colspan: 4, class: "empty", text: "Not checked yet. Press Check PXA models to read what is published."})));
+    } catch (e) { /* no remembered list: the button, or the first-run rule below, reads it */ }
+  }
+  await lib;
+  const noModel = !!(S.models && !S.models.models.length);
+  if (HF.data && !HF.cached) return;                  // read in this session already
+  if (stale || noModel) loadAvailable();
+}
+function hfAgeS() {
+  const d = HF.data; if (!d || !d.ts) return Infinity;
+  return Math.max(0, (d.age_s || 0) + (Date.now() - (HF.at || Date.now())) / 1000);
+}
+function hfAgeText() {
+  if (!HF.data || !HF.data.ts) return "";
+  const s = hfAgeS();
+  if (s < 90) return "checked just now";
+  if (s < 5400) return "checked " + Math.round(s / 60) + " min ago";
+  if (s < 172800) return "checked " + Math.round(s / 3600) + " h ago";
+  return "checked " + Math.round(s / 86400) + " days ago";
+}
+setInterval(() => { if (S.tab === "models" && HF.data && HF.data.ts) $("#hf-checked").textContent = hfAgeText(); }, 30000);
+function hfBytes(n) {
+  n = +n || 0;
+  for (const u of ["B", "KiB", "MiB", "GiB", "TiB"]) { if (n < 1024 || u === "TiB") return (u === "B" ? n.toFixed(0) : n.toFixed(1)) + " " + u; n /= 1024; }
+}
+function hfTokenLine(d) {
+  // `supporter` is the server's own probe WITH whatever key is saved, so it says whether the key actually worked
+  const locked = (d.repos || []).filter(r => r.supporter).length;
+  if (d.token_set) return [el("span", {class: "chip ok", text: "key saved"}),
+    el("span", {class: "tiny", text: locked ? " but " + locked + " repository(ies) still refuse it — check the key has access" : " every repository is readable with it"})];
+  return [el("span", {class: "tiny"}, pxqnUnlocked() ? "Your supporter grant unlocks the PXQN downloads. " : "Supporters unlock PXQN quants: coins from a ",
+    el("a", {href: KOFI, target: "_blank", rel: "noopener", text: "donation on Ko-fi"}), pxqnUnlocked() ? "" : " unlock them in the Store, or paste a supporter key below.")];
+}
+function renderAvailable() {
+  const d = HF.data; if (!d) return;
+  const files = d.repos.flatMap(r => r.files);
+  const have = files.filter(f => f.have).length;
+  $("#hf-sub").textContent = files.length + " model file(s) in " + d.repos.length + " repositories"
+    + (have ? " · " + have + " already in your folders" : "")
+    + (d.folders && d.folders.length ? "" : " · add a model folder above first");
+  $("#hf-checked").textContent = hfAgeText();
+  $("#hf-token-line").replaceChildren(...hfTokenLine(d));
+  $("#hf-token").placeholder = d.token_set ? "a key is saved — paste another to replace it" : "hf_...";
+  if (!d.repos.length) {
+    $("#hf-body").replaceChildren(el("tr", {}, el("td", {colspan: 4, class: "empty",
+      text: d.error ? "huggingface.co could not be read: " + d.error : "No model repositories are published under " + d.org + " yet."})));
+    return;
+  }
+  // a long list: show it by tier (Free PXQ / Supporter PXQN / other files), the choice remembered on this machine
+  const tierOf = (r, f) => r.supporter ? "sup" : (quantTier(f.name) || "other");
+  const tally = {all: 0, free: 0, sup: 0, other: 0};
+  for (const r of d.repos) for (const f of (r.files || [])) { tally.all++; tally[tierOf(r, f)]++; }
+  const fl = tally[store.get("hfFilter", "all")] ? store.get("hfFilter", "all") : "all";   // a filter with nothing left in it shows everything
+  $("#hf-filter").replaceChildren(...[["all", "Everything"], ["free", "Free PXQ"], ["sup", "Supporter PXQN"], ["other", "Other files"]].filter(([k]) => k === "all" || tally[k])
+    .map(([k, label]) => el("button", {type: "button", "aria-pressed": String(fl === k), text: label + " " + tally[k], onclick: () => { store.set("hfFilter", k); renderAvailable(); }})));
+  const rows = [];
+  for (const r of d.repos) {
+    if (r.error) { rows.push(el("tr", {}, el("td", {colspan: 4, class: "empty", text: r.repo + ": " + r.error}))); continue; }
+    for (const f of r.files) {
+      if (fl !== "all" && tierOf(r, f) !== fl) continue;
+      const shard = /-(\d{5})-of-(\d{5})\.gguf$/i.test(f.name);
+      const locked = r.supporter;   // the server probed the repository with the saved key: trust its answer
+      const cell = el("td", {style: "white-space:nowrap"});
+      if (f.have) cell.append(el("span", {class: "chip ok", text: "in your folders"}));
+      else if (locked && !pxqnUnlocked()) cell.append(el("button", {class: "b sup sm", type: "button",
+          title: "Supporters unlock PXQN quants: coins from a donation unlock the PXQN tier in the Store",
+          onclick: () => { showTab("store"); if (window.storeFocus) storeFocus("pxqn-tier"); }}, icon("lock"), "Unlock"));
+      else {
+        const b = el("button", {class: "b", type: "button", text: "Download"});
+        b.addEventListener("click", () => startDownload(r.repo, f.path, b));
+        cell.append(b);
+      }
+      rows.push(el("tr", {},
+        el("td", {}, el("div", {style: "font-weight:600;overflow-wrap:anywhere", text: f.name}),
+          el("div", {class: "tiny row", style: "gap:4px;margin-top:3px"}, tierBadge(r.supporter && !quantTier(f.name) ? "pxqn" : f.name, locked && !pxqnUnlocked()), shard ? el("span", {class: "chip", text: "part of a split model"}) : "",
+            f.counts ? el("span", {class: "chip", text: "+ expert-counts.csv"}) : "")),
+        el("td", {class: "mono tiny", style: "overflow-wrap:anywhere"}, r.repo,
+          r.supporter ? el("span", {class: "chip sup", style: "margin-left:6px", title: "this repository holds the supporter models"}, icon(pxqnUnlocked() ? "unlock" : "lock"), "supporters") : ""),
+        el("td", {class: "mono", text: f.size_h}),
+        cell));
+    }
+  }
+  $("#hf-body").replaceChildren(...rows);
+}
+async function startDownload(repo, file, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/api/models/download", {body: {repo, file}});
+    showProgress(r.download); pollDownload();
+  } catch (e) { toast(e.message, true); }
+  finally { if (btn) btn.disabled = false; }
+}
+function stopPoll() { if (HF.timer) { clearInterval(HF.timer); HF.timer = null; } }
+function showProgress(dl) {
+  HF.last = dl;
+  const box = $("#hf-progress");
+  if (!dl) { box.hidden = true; return; }
+  const busy = ["starting", "running", "checking"].includes(dl.state);
+  if (busy) HF.sawRun = true;
+  // a job left finished here from an earlier visit is not news: keep the box for one we watched run
+  if (!busy && !HF.sawRun) { box.hidden = true; return; }
+  box.hidden = false;
+  const total = dl.total || 0, done = dl.done + (dl.file_done || 0);
+  const pct = total ? Math.min(100, 100 * done / total) : 0;
+  const hpct = dl.state === "checking" && dl.hash_total ? Math.min(100, 100 * (dl.hash_done || 0) / dl.hash_total) : null;
+  $("#hf-p-fill").style.width = (hpct != null ? hpct : pct).toFixed(1) + "%";
+  $("#hf-p-label").textContent = dl.state === "done" ? "Finished: " + dl.written.join(", ")
+    : dl.state === "failed" ? "Failed: " + (dl.error || "")
+    : dl.state === "cancelled" ? "Cancelled" : "Downloading " + dl.what
+      + (dl.files > 1 ? " (" + dl.file_index + " of " + dl.files + ")" : "");
+  $("#hf-p-sub").textContent = dl.state === "checking" ? hfHashLine(dl)
+    : dl.state === "running" || dl.state === "starting"
+      ? hfBytes(done) + " of " + hfBytes(total) + (dl.rate ? " at " + hfBytes(dl.rate) + "/s" : "") + "  ·  " + pct.toFixed(0) + "%"
+      : "";
+  $("#hf-p-cancel").hidden = !["starting", "running", "checking"].includes(dl.state);
+  if (S.tab === "home" && window.homeRender) homeRender();
+}
+// the sha256 check (beta 2: it sat on one line for minutes on an 80 GB file): bytes hashed of the total, the rate and the time left
+function hfHashLine(dl) {
+  const what = dl.hash_phase === "resume" ? "checking the part already downloaded (sha256)" : "checking the sha256 the repository publishes";
+  if (!dl.hash_total) return what + " ...";
+  const p = Math.min(100, 100 * (dl.hash_done || 0) / dl.hash_total);
+  const eta = dl.hash_eta_s == null ? "" : dl.hash_eta_s < 1 ? "  \u00b7  almost done" : "  \u00b7  about " + fmtDur(Math.ceil(dl.hash_eta_s)) + " left";
+  return what + ": " + hfBytes(dl.hash_done || 0) + " of " + hfBytes(dl.hash_total) + "  \u00b7  " + p.toFixed(0) + "%"
+    + (dl.hash_rate ? " at " + hfBytes(dl.hash_rate) + "/s" : "") + eta;
+}
+async function pollDownload() {
+  let r;
+  try { r = await api("/api/models/download", {timeout: 15000}); } catch (e) { stopPoll(); return; }
+  showProgress(r.download);
+  const dl = r.download;
+  if (dl && ["starting", "running", "checking"].includes(dl.state)) {
+    if (!HF.timer) HF.timer = setInterval(pollDownload, 1000);   // only a job we watched run is an event: a job
+    return;                                                      // left finished here re-lists nothing
+  }
+  stopPoll();
+  if (HF.sawRun && dl && dl.state === "done") { toast("downloaded " + dl.written.join(", ")); loadModels(true); loadAvailable(true); }
+  else if (HF.sawRun && dl && dl.state === "failed") toast("download failed: " + (dl.error || ""), true);
+  HF.sawRun = false;
+}
+$("#hf-refresh").addEventListener("click", () => loadAvailable(true));
+$("#hf-p-cancel").addEventListener("click", async () => {
+  try { await api("/api/models/download/cancel", {body: {}}); toast("cancelling ..."); pollDownload(); } catch (e) { toast(e.message, true); }
+});
+$("#hf-token-save").addEventListener("click", async () => {
+  const t = $("#hf-token").value.trim(); if (!t) return;
+  try { const r = await api("/api/models/hf-token", {body: {token: t}}); $("#hf-token").value = ""; toast(r.token_set ? "key saved" : "key cleared", !r.token_set); loadAvailable(true); }
+  catch (e) { toast(e.message, true); }
+});
+$("#hf-token-clear").addEventListener("click", async () => {
+  try { await api("/api/models/hf-token", {body: {token: ""}}); $("#hf-token").value = ""; toast("key forgotten"); loadAvailable(true); }
+  catch (e) { toast(e.message, true); }
+});
+
 // ---------------- LAUNCH ----------------
 function selectedCards() { return $$("#l-cards input:checked").map(i => +i.value); }
 function cardBadge(c, holders) {
-  // Above half a GiB the card is busy. A compute process on a quieter card is named, not "busy 0.0 GiB".
+  // Above half a GiB the card is busy (the launcher's R-20 decides: c.busy). A card that drives a display may also
+  // hold the desktop's share (c.desktop_mib) and stay free. A compute process on a quieter card is named, not "busy 0.0 GiB".
   holders = holders || [];
   const procs = c.procs || [];
-  const heavy = c.mem_used_mib > 512;
+  const heavy = c.busy != null ? c.busy : c.mem_used_mib > 512;
   if (holders.length) {
     const b = badge("warn", "used by " + holders.join(", "));
     b.title = holders.concat(procs.map(p => p.name)).join(", ");
@@ -1329,12 +2212,17 @@ function cardBadge(c, holders) {
   }
   if (heavy) {
     const b = badge("warn", "busy " + (c.mem_used_mib / 1024).toFixed(1) + " GiB");
-    if (procs.length) b.title = procs.map(p => p.name).join(", ");
+    b.title = c.busy_why || procs.map(p => p.name).join(", ");
     return b;
   }
   if (procs.length) {
     const b = badge("warn", "in use by another process");
     b.title = procs.map(p => p.name + " " + p.mib + " MiB").join(", ");
+    return b;
+  }
+  if (c.desktop_mib) {
+    const b = badge("ok", "idle");
+    b.title = "this card drives your display; about " + (c.desktop_mib / 1024).toFixed(1) + " GiB is the desktop's share";
     return b;
   }
   return badge("ok", "idle");
@@ -1408,6 +2296,13 @@ function modelInfo() {
   const m = S.models && S.models.models.find(x => x.path === $("#l-model").value);
   if (TK.l.model !== $("#l-model").value) loadThinkModel();
   $("#l-model-info").textContent = m ? `${m.family}, arch ${m.arch || "?"}, ${m.size_label || fmtParams(m.params)} params, trained ctx ${m.n_ctx_train || "?"}${m.vision ? ", vision" : ""}${quantizerText(m.quantizer)}` : "";
+  const mt = $("#l-mtp"), mn = $("#l-mtp-note");     // a file with no MTP head never gets MTP: the box is off and says why
+  if (mt) {
+    const none = !!m && m.mtp_head === false;
+    if (none) mt.checked = false;
+    mt.disabled = none;
+    if (mn) mn.textContent = none ? "This file has no MTP head (no nextn tensors), so MTP stays off for it." : "";
+  }
   const note = $("#l-model-note");
   if (note) {
     if (m && m.notice) note.replaceChildren(quantNotice(m.notice));
@@ -1444,13 +2339,13 @@ async function loadCompanions() {
   hw.hidden = !d.vmm;
   if (!d.vmm) [...hot.options].forEach(o => o.selected = false);
 }
-segInit($("#l-sm")); segInit($("#l-fa"));
+segInit($("#l-sm")); segInit($("#l-fa")); segInit($("#l-ngram"));
 function launchBody() {
   const levers = {};
   for (const [k, v] of Object.entries(S.leverVals)) if (v !== "" && v != null) levers[k] = v;
   return {sid: S.sid, gpus: selectedCards(), model: $("#l-model").value, ctx: +$("#l-ctx").value || 0, np: +$("#l-np").value || 0,
           kv: $("#l-kv").value, port: +$("#l-port").value || 0, sm: $("#l-sm").dataset.v, fa: $("#l-fa").dataset.v,
-          mtp: $("#l-mtp").checked, expose: $("#l-expose").checked, accept_unmeasured: $("#l-unmeasured").checked,
+          mtp: $("#l-mtp").checked && !$("#l-mtp").disabled, ngram: $("#l-ngram").dataset.v, expose: $("#l-expose").checked, accept_unmeasured: $("#l-unmeasured").checked,
           allow_busy: $("#l-busy").checked, levers, extra_args: $("#l-extra").value.trim(),
           draft_model: ($("#l-draft-wrap") && !$("#l-draft-wrap").hidden) ? $("#l-draft").value : "",
           hot_models: ($("#l-hot-wrap") && !$("#l-hot-wrap").hidden) ? [...$("#l-hot").selectedOptions].map(o => o.value) : [],
@@ -1462,7 +2357,7 @@ function applyBody(b) {
   $$("#l-cards input").forEach(i => i.checked = (b.gpus || []).includes(+i.value));
   if (b.model) { $("#l-model").value = b.model; store.set("model", b.model); modelInfo(); }
   $("#l-ctx").value = b.ctx || 0; if (window.ctxManualUi) setTimeout(ctxManualUi, 0); $("#l-np").value = b.np || 0; $("#l-kv").value = b.kv || "auto"; $("#l-port").value = b.port || "";
-  $("#l-sm").setv(b.sm || "auto"); $("#l-fa").setv(b.fa || "auto");
+  $("#l-sm").setv(b.sm || "auto"); $("#l-fa").setv(b.fa || "auto"); $("#l-ngram").setv(b.ngram || "auto");
   $("#l-mtp").checked = !!b.mtp; $("#l-expose").checked = !!b.expose; $("#l-unmeasured").checked = !!b.accept_unmeasured; $("#l-busy").checked = !!b.allow_busy;
   S.pendingDraft = b.draft_model || ""; S.pendingHot = b.hot_models || []; loadCompanions();
   $("#l-extra").value = Array.isArray(b.extra_args) ? b.extra_args.map(a => /^[\w.,:=+\-\/]+$/.test(a) ? a : "'" + a.replace(/'/g, "'\\''") + "'").join(" ") : (b.extra_args || "");
@@ -1488,6 +2383,17 @@ function renderPlan(d) {
   const lw = (d.lever_warnings || []).map(n => el("div", {class: "find"}, el("span", {class: "dot warn"}), el("span", {text: "lever: " + n})));
   if (d.ok) {
     $("#plan-engine").textContent = `engine ${d.engine}, cards ${d.cards}, port ${d.port}, ctx ${d.ctx_auto ? "auto " : ""}${d.ctx}, -sm ${d.sm}`;
+    const od = $("#plan-od");
+    // one line per decision the launcher made about this box (KV type, -b, -c, CPU pool, NUMA node,
+    // expert map, cache volume, heat): what, why, the number behind it, how to override
+    const dec = (d.decisions || []).map(n => el("div", {class: "find"},
+      el("span", {class: "dot " + (n.startsWith("!!") ? "warn" : "ok")}),
+      el("span", {text: n.replace(/^!! /, "")})));
+    if (d.overdrive || dec.length) {
+      od.replaceChildren(...(d.overdrive ? [el("div", {class: "find"}, el("span", {class: "dot ok"}),
+        el("span", {text: d.overdrive + " (every switch is in the command below)"}))] : []), ...dec);
+      od.hidden = false;
+    } else od.hidden = true;
     $("#plan-cmd").textContent = d.shell || d.command;
     $("#plan-notes").replaceChildren(...(d.blockers || []).map(n => el("div", {class: "find"}, el("span", {class: "dot bad"}), el("span", {text: n}))),
       ...(d.notes || []).map(n => el("div", {class: "find"}, el("span", {class: "dot warn"}), el("span", {text: n}))), ...lw);
@@ -1499,6 +2405,7 @@ function renderPlan(d) {
     $("#plan-notes").replaceChildren(...refs.map(n => el("div", {class: "find"}, el("span", {class: "dot bad"}), el("span", {text: n.trim()}))), ...lw);
     $("#plan-box details").open = true;
   }
+  if (!d.ok) $("#plan-od").hidden = true;
 }
 $$("[data-copy]").forEach(b => b.addEventListener("click", () => copyText($("#" + b.dataset.copy).textContent)));
 async function doPlan() {
@@ -1509,13 +2416,14 @@ async function doPlan() {
 async function doStart() {
   $("#b-start").disabled = true;
   try {
-    const d = await api("/api/start", {body: launchBody(), timeout: 180000});
+    const d = await api("/api/start", {body: launchBody(), timeout: 180000}); S.lastStart = d;
     if (!d.ok) { renderPlan(d); toast("the launcher refused; see the plan", true); }
     else { toast("server starting: loading the model can take a minute or two"); S.startedAt = Date.now();
       if (matchMedia("(max-width: 980px)").matches) $("#s-phase").closest(".card").scrollIntoView({behavior: "smooth", block: "start"});
       if (d.plan) renderPlan(d.plan); await openLog(); loadServers(); }
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { toast(e.message, true); S.lastStart = {ok: false, error: e.message}; }
   await pollStatus(); steps();
+  return S.lastStart;
 }
 $("#b-plan").addEventListener("click", doPlan);
 $("#b-start").addEventListener("click", doStart);
@@ -1633,17 +2541,19 @@ async function pollStatus() {
     $("#s-name").textContent = s.name || "";
     const failed = !s.running && s.exit_code != null && s.exit_code !== 0 && /^exited/.test(s.phase || "");
     const cls = h === "ok" ? "ok" : (h === "loading" || (s.running && h !== "ok")) ? "warn pulse" : (run || failed) ? "bad" : "";
-    $("#hdot").className = "dot " + cls; $("#s-dot").className = "dot " + cls;
+    $("#s-dot").className = "dot " + cls;
     const al = $("#s-alert");
     if (failed) { if (!al.firstChild || al.dataset.pid !== String(s.pid)) { al.dataset.pid = s.pid; al.replaceChildren(el("div", {class: "alert bad"}, badge("bad", "stopped"), el("span", {text: `The server exited with code ${s.exit_code} before it was stopped. The last lines of the log below say why.`}))); } }
     else if (s.running && h === "ok" && S.startedAt) { S.startedAt = null; al.dataset.pid = ""; al.replaceChildren(el("div", {class: "alert ok"}, badge("ok", "serving"), el("span", {}, "Ready. Try it on the ", el("button", {class: "link", onclick: () => showTab("chat"), text: "Chat tab"}), " or measure it on the ", el("button", {class: "link", onclick: () => showTab("speed"), text: "Speed tab"}), "."))); }
     else if (!s.running && !failed) { al.replaceChildren(); al.dataset.pid = ""; }
     const name = s.model ? s.model.split("/").pop() : (s.attached ? "attached :" + s.engine_port : "");
-    const others = S.fleet ? S.fleet.instances.filter(x => x.health === "ok" && !(x.kind === "managed" && x.sid === S.sid)).length : 0;
-    $("#htext").textContent = (run ? `${s.name ? s.name + ": " : ""}${h === "ok" ? "serving" : s.phase || h}${name ? " · " + name : ""}` : failed ? `${s.name || "server"} exited` : "no server") + (others ? ` (+${others} serving)` : "");
+    // the pill names the server this page is pointed at while it runs; when it does not, renderPill says what does
+    S.pill = run ? {text: `${s.name ? s.name + ": " : ""}${h === "ok" ? "serving" : s.phase || h}${name ? " · " + name : ""}`, cls} : null;
+    renderChips();                                        // the pill, and the chips with this page's server marked
     if (s.running) {
       $("#s-phase").textContent = h === "ok" ? "serving" : s.phase;
-      $("#s-info").textContent = `pid ${s.pid} · port ${s.port} · cards ${s.gpus} · up ${fmtDur(Date.now() / 1000 - s.started)}`;
+      $("#s-info").textContent = `pid ${s.pid} · port ${s.port} · cards ${s.gpus} · up ${fmtDur(Date.now() / 1000 - s.started)}`
+        + (h !== "ok" && s.load_progress && s.load_progress.text ? `\n${s.load_progress.text}` : "");
     } else if (s.attached) {
       // This page did not start the process. Say so, and do not call a live server "Not running".
       if (h === "ok") {
@@ -1664,7 +2574,8 @@ async function pollStatus() {
     steps();
     $("#chat-model").textContent = S.target ? targetLabel(S.target) : name;
     chatQuantNote();
-  } catch (e) { $("#htext").textContent = "PXA Control unreachable"; $("#hdot").className = "dot bad"; }
+    if (S.tab === "home" && window.homeRender) homeRender();
+  } catch (e) { S.pill = {text: "PXA Control unreachable", cls: "bad"}; renderChips(); }
 }
 function logRender() { renderLogInto($("#log"), S.logLines, $("#log-q").value, $("#log-err").checked, $("#log-follow").checked, $("#log-count")); }
 function logAppend(lines) {
@@ -1727,6 +2638,78 @@ $("#log-dl").addEventListener("click", () => download(`pxa-${S.sid}.log`, S.logL
 setInterval(() => { if (!document.hidden) pollStatus(); }, 3000);
 
 // ---------------- SPEED ----------------
+// ---------------- Benchmarks: the server strip (FR#11). Everything here reuses the Servers / Launch calls: fleetAct (Start / Stop),
+// POST /api/servers (save the profile), /api/stop + /api/start (apply to a running server) and the launcher's refusal plan. ----------------
+const SS = {open: false, busy: false};
+function stripInst() { return fleetInst(S.target); }
+function renderStrip() {
+  const box = $("#sp-strip"); if (!box) return;
+  const x = stripInst();
+  box.hidden = !x;
+  if (!x) return;
+  const phase = srvPhase(x), benchRun = !!S.benchRunning, acts = x.actions || [];
+  $("#ss-dot").className = "dot " + healthLevel(x);
+  $("#ss-name").textContent = x.label || x.name;
+  $("#ss-state").textContent = phase;
+  $("#ss-info").textContent = [x.model_file || x.alias || (x.kind === "managed" ? "no model chosen yet" : ""), x.port ? ":" + x.port : "", (x.gpus && x.gpus.length) ? "cards " + x.gpus.join(",") : ""].filter(Boolean).join(" \u00b7 ");
+  const canStart = acts.includes("start"), canStop = acts.includes("stop"), canEdit = x.kind === "managed" && !x.attached;
+  $("#ss-start").hidden = !canStart; $("#ss-stop").hidden = !canStop; $("#ss-edit").hidden = !canEdit;
+  for (const id of ["#ss-start", "#ss-stop", "#ss-apply"]) $(id).disabled = SS.busy || benchRun;
+  const tip = benchRun ? "a benchmark is running: wait for it to end" : "";
+  for (const id of ["#ss-start", "#ss-stop", "#ss-apply"]) $(id).title = tip;
+  if (!canEdit) SS.open = false;
+  $("#ss-form").hidden = !SS.open; $("#ss-edit").setAttribute("aria-expanded", SS.open);
+  $("#ss-apply").textContent = x.running ? "Save and restart" : "Save";
+  if (SS.open) $("#ss-note").textContent = x.running
+    ? "This server is running: saving stops it and starts it again with the new settings (the same Stop and Start as on the Servers tab). The launcher may refuse a model that does not fit; you then land on Launch with the reason."
+    : "Saves the settings of this server (the same as Launch > Save). Press Start to run it.";
+}
+async function stripAct(action) {
+  const x = stripInst(); if (!x || SS.busy) return;
+  SS.busy = true; renderStrip();
+  try { await fleetAct(x, action); } finally { SS.busy = false; }
+  await loadFleet(true); await fillTargets(); renderStrip(); loadSpeed();
+}
+async function stripOpenEdit() {
+  const x = stripInst(); if (!x) return;
+  if (SS.open) { SS.open = false; renderStrip(); return; }
+  SS.open = true; renderStrip();
+  try {
+    await loadModels();
+    const sv = (await api("/api/servers")).servers.find(s => s.sid === x.sid), st = (sv && sv.settings) || {};
+    const ms = (S.models && S.models.models) || [], cur = st.model || "";
+    const sel = $("#ss-model"); sel.replaceChildren(...ms.map(m => el("option", {value: m.path, text: `${m.file}  (${m.type || m.codec}, ${m.size_h})`})));
+    if (cur && !ms.some(m => m.path === cur)) sel.prepend(el("option", {value: cur, text: cur.split("/").pop()}));
+    sel.value = cur || (ms[0] && ms[0].path) || "";
+    $("#ss-mtp").checked = !!st.mtp; $("#ss-sm").setv(st.sm || "auto");
+  } catch (e) { toast(e.message, true); }
+}
+async function stripApply() {
+  const x = stripInst(); if (!x || SS.busy) return;
+  SS.busy = true; renderStrip();
+  try {
+    const sv = (await api("/api/servers")).servers.find(s => s.sid === x.sid);
+    if (!sv) throw new Error("this server is no longer in the list");
+    const settings = Object.assign({}, sv.settings || {}, {model: $("#ss-model").value, mtp: $("#ss-mtp").checked, sm: $("#ss-sm").dataset.v});
+    await api("/api/servers", {body: {sid: x.sid, name: sv.name, settings}});
+    if (!x.running) { toast("saved: press Start"); }
+    else {
+      await api("/api/stop", {body: {sid: x.sid}, timeout: 60000});
+      const d = await api("/api/start", {body: Object.assign({}, settings, {sid: x.sid}), timeout: 180000});
+      if (!d.ok) { SS.open = false; editServer(x.sid); renderPlan(d); toast("the launcher refused; see the plan", true); } else toast(`${x.label || x.name}: restarting with the new settings`);
+    }
+    SS.open = false;
+  } catch (e) { toast(e.message, true); }
+  SS.busy = false;
+  await loadFleet(true); await fillTargets(); renderStrip(); loadSpeed();
+}
+segInit($("#ss-sm"));
+$("#ss-start").addEventListener("click", () => stripAct("start"));
+$("#ss-stop").addEventListener("click", () => stripAct("stop"));
+$("#ss-edit").addEventListener("click", stripOpenEdit);
+$("#ss-cancel").addEventListener("click", () => { SS.open = false; renderStrip(); });
+$("#ss-apply").addEventListener("click", stripApply);
+
 segInit($("#sp-range"), () => loadSpeed());
 function bucketOf(n) { if (n == null) return "unknown"; if (n < 512) return "< 512"; if (n < 2048) return "512 - 2k"; if (n < 8192) return "2k - 8k"; return "8k +"; }
 function median(xs) { xs = xs.filter(x => x > 0).sort((a, b) => a - b); if (!xs.length) return null; const m = xs.length >> 1; return xs.length % 2 ? xs[m] : (xs[m - 1] + xs[m]) / 2; }
@@ -1736,6 +2719,8 @@ async function loadSpeed() {
   try {
     const tq = qsTarget(S.target);
     if (!tq && S.status && !S.status.engine_port) throw new Error("no server running");
+    const inst = fleetInst(S.target);                              // a server the fleet lists as stopped: no request to a port nobody answers on
+    if (inst && inst.kind === "managed" && !inst.running && !inst.attached) throw new Error("no server running");
     const d = await api(withQ("/api/engine/pxa/stats?since=" + since.toFixed(0), tq));
     recs = (d.records || []).map(r => ({ts: r.ts, model: r.model, n_prompt: r.n_prompt, decode: r.decode_tps, prefill: r.prefill_tps}));
     src = `${targetLabel(S.target)}: from the server's /pxa/stats (${d.count} request(s) in range, ${d.stored} stored${d.persist ? ", persisted" : ", memory only"})`;
@@ -1786,6 +2771,7 @@ function drawSpeed() {
   const d = S.speedData; if (!d || S.tab !== "speed") return;
   drawChart($("#ch-dec"), $("#lg-dec"), d.recs, "decode", d.since, d.range);
   drawChart($("#ch-pre"), $("#lg-pre"), d.recs, "prefill", d.since, d.range);
+  drawWatt();
 }
 window.addEventListener("resize", () => drawSpeed());
 function renderSpeedTables() {
@@ -1804,10 +2790,10 @@ function renderSpeedTables() {
     : [el("tr", {}, el("td", {colspan: 5, class: "empty", text: "nothing measured in this range yet"}))]));
 }
 // community high-score board: never automatic; the record check runs only on a click, and a submit needs a second click
-const HS = {payload: null, shownFor: null};
+const HS = {payload: null, shownFor: null, ts: null};
 async function checkHighScore(ts) {
   if (HS.shownFor === ts) return;
-  HS.shownFor = ts;
+  HS.shownFor = ts; HS.ts = ts;
   try {
     const c = await api("/api/score/check");
     // never vanish silently: say why there is nothing to submit
@@ -1881,26 +2867,156 @@ $("#hs-send").addEventListener("click", async () => {
   const p = Object.assign({}, HS.payload); p.name = $("#hs-name").value.trim();
   $("#hs-send").disabled = true; $("#hs-msg").textContent = "Sending...";
   try {
-    const r = await api("/api/score/send", {body: {payload: p}});
-    if (r.ok) { saveName($("#hs-name").value); $("#hs-msg").textContent = r.status === "flagged" ? "Received. It is held for a quick review before it shows on the board." : "On the board" + (r.rank ? " at rank " + r.rank : "") + "."; return; }
+    const r = await api("/api/score/send", {body: {payload: p, ts: HS.ts}});
+    // FR#13: a sent result closes the frame the way Not now does, and Control remembers it (it never comes back, not after a reload)
+    if (r.ok) { saveName($("#hs-name").value); $("#hs").hidden = true; $("#hs-check").hidden = true; HS.payload = null; toast(r.status === "flagged" ? "Received. It is held for a quick review before it shows on the board." : "On the board" + (r.rank ? " at rank " + r.rank : "") + "."); $("#hs-send").disabled = false; return; }
     $("#hs-msg").textContent = "Could not submit: " + (r.error || "unknown error");
   } catch (e) { $("#hs-msg").textContent = "Could not submit: " + e.message; }
   $("#hs-send").disabled = false;
 });
+// benchmark history: newest first, 20 per page, a search over model / cards / sha / date, MTP and split columns (a row stored before those
+// fields existed shows a dash)
+const BH = {rows: [], page: 0, q: "", per: 20};
+// #366: a class that gave no answer says so instead of a plain speed (an all-thinking class keeps its rate, which
+// counts the thinking tokens; a class that ended at once has no rate)
+function benchTps(c) {
+  if (!c || !c.no_answer) return fmtNum(c && c.decode_tps);
+  return (c.decode_tps ? fmtNum(c.decode_tps) + " (" : "") + "no answer: " + c.no_answer + (c.decode_tps ? ")" : "");
+}
+function benchTpsTip(c) {
+  return c && c.no_answer === "all thinking" ? "every token was thinking, so there was no answer; the speed counts the thinking tokens. Try a larger context or thinking off."
+    : c && c.no_answer ? "the model stopped before it wrote anything, so there is no speed for this class" : "";
+}
+function benchDateText(ts) { const d = new Date(ts * 1000); return d.toISOString().slice(0, 16).replace("T", " ") + " " + d.toLocaleString() + " " + fmtAgo(ts); }
+function benchRowText(r) { return [r.model, (r.cards || []).join(" "), r.greedy512_sha, benchDateText(r.ts), r.split_mode, r.mtp == null ? "" : (r.mtp ? "mtp on" : "mtp off"), r.kv ? "kv " + r.kv : ""].join(" ").toLowerCase(); }
+function renderBenchHist() {
+  const words = BH.q.toLowerCase().split(/\s+/).filter(Boolean);
+  const rows = words.length ? BH.rows.filter(r => { const t = benchRowText(r); return words.every(w => t.includes(w)); }) : BH.rows;
+  const pages = Math.max(1, Math.ceil(rows.length / BH.per));
+  BH.page = Math.min(Math.max(0, BH.page), pages - 1);
+  const c = (r, n) => (r.classes || []).find(x => x.class === n) || {};
+  $("#bn-bar").hidden = !BH.rows.length;
+  $("#bn-hist").replaceChildren(...(rows.length ? rows.slice(BH.page * BH.per, (BH.page + 1) * BH.per).map(r =>
+    el("tr", {}, el("td", {text: fmtAgo(r.ts), title: new Date(r.ts * 1000).toLocaleString()}), el("td", {text: (r.model || "?").split("/").pop(), title: r.model || ""}), el("td", {text: (r.cards || []).join(",")}),
+      el("td", {class: "bn-mtp", text: r.mtp == null ? "\u2014" : (r.mtp ? "on" : "off")}), el("td", {class: "bn-split", text: r.split_mode || "\u2014"}), el("td", {class: "bn-kv mono", text: r.kv || "\u2014"}),
+      ...["prose", "edit", "long"].map(n => el("td", {text: benchTps(c(r, n)), title: benchTpsTip(c(r, n))})),
+      el("td", {text: fmtNum(c(r, "long").prefill_tps)}), el("td", {class: "mono", text: r.greedy512_sha ? r.greedy512_sha.slice(0, 12) : "-"}),
+      ...wattCells(r)))
+    : [el("tr", {}, el("td", {colspan: 14, class: "empty", text: BH.rows.length ? "no benchmark matches that search" : "no benchmark yet"}))]));
+  drawWatt(rows);
+  $("#bn-page").textContent = "page " + (BH.page + 1) + " of " + pages + (words.length ? " (" + rows.length + " of " + BH.rows.length + " runs)" : " (" + rows.length + " runs)");
+  $("#bn-prev").disabled = BH.page <= 0; $("#bn-next").disabled = BH.page >= pages - 1;
+}
+$("#bn-prev").addEventListener("click", () => { BH.page--; renderBenchHist(); });
+$("#bn-next").addEventListener("click", () => { BH.page++; renderBenchHist(); });
+$("#bn-q").addEventListener("input", e => { BH.q = e.target.value; BH.page = 0; renderBenchHist(); });
 async function loadBench() {
   try {
     const d = await api("/api/bench"), j = d.job;
     const box = $("#bn-lines"); box.hidden = !j.lines.length; box.textContent = j.lines.join("\n"); box.scrollTop = box.scrollHeight;
     renderTelemetry(j.result && j.result.telemetry);
+    renderHonest(j.result);
+    renderWattNow(j.result);
+    S.benchRunning = j.running; renderStrip();
     $("#bn-run").disabled = j.running; $("#bn-run").textContent = j.running ? "running ..." : "Run benchmark";
-    $("#bn-hist").replaceChildren(...(d.history.length ? d.history.slice().reverse().map(r => { const c = n => (r.classes || []).find(x => x.class === n) || {};
-      return el("tr", {}, el("td", {text: fmtAgo(r.ts)}), el("td", {text: (r.model || "?").split("/").pop()}), el("td", {text: (r.cards || []).join(",")}),
-        el("td", {text: fmtNum(c("prose").decode_tps)}), el("td", {text: fmtNum(c("edit").decode_tps)}), el("td", {text: fmtNum(c("long").decode_tps)}),
-        el("td", {text: fmtNum(c("long").prefill_tps)}), el("td", {class: "mono", text: r.greedy512_sha ? r.greedy512_sha.slice(0, 12) : "-"})); })
-      : [el("tr", {}, el("td", {colspan: 8, class: "empty", text: "no benchmark yet"}))]));
-    if (j.running) setTimeout(loadBench, 1500); else if (j.error) toast("benchmark: " + j.error, true);
-    else if (j.result && Date.now() / 1000 - j.result.ts < 600 && HS.shownFor !== j.result.ts) { const hb = $("#hs-check"); hb.hidden = false; hb.onclick = () => { hb.hidden = true; checkHighScore(j.result.ts); }; }
+    BH.rows = d.history.slice().reverse(); renderBenchHist();
+    if (j.running) { S.benchSeen = true; setTimeout(loadBench, 1500); }
+    else {
+      // the running -> finished edge: the graphs and the medians are drawn by loadSpeed, which only ran when the tab opened or the range or
+      // server changed, so a finished run left them as they were until a reload. Once per run: loadSpeed calls loadBench, which now sees no edge.
+      const edge = S.benchSeen; S.benchSeen = false;
+      if (edge && !$("#p-speed").hidden) loadSpeed();
+    }
+    // the frame and the Check button belong to one result: a new run hides them, and a result already sent never shows them (FR#13)
+    const jr = j.result;
+    if (j.running || (jr && jr.submitted)) $("#hs-check").hidden = true;
+    if (j.running || (jr && (jr.submitted || (HS.ts !== null && jr.ts !== HS.ts)))) $("#hs").hidden = true;
+    if (j.running) { /* polling */ } else if (j.error) toast("benchmark: " + j.error, true);
+    else if (j.result && !j.result.submitted && Date.now() / 1000 - j.result.ts < 600 && HS.shownFor !== j.result.ts) { const hb = $("#hs-check"); hb.hidden = false; hb.onclick = () => { hb.hidden = true; checkHighScore(j.result.ts); }; }
   } catch (e) { /* optional */ }
+}
+function wattCells(r) {
+  const p = r.power || {}, dash = "\u2014";
+  const tip = (p.cards || []).length
+    ? p.cards.map(c => "#" + c.index + ": avg " + fmtNum(c.avg_w, 0) + " W, peak " + fmtNum(c.peak_w, 0) + " W").join("; ")
+    : "no power reading for this run";
+  return [el("td", {text: p.avg_w == null ? dash : fmtNum(p.avg_w, 0), title: tip}),
+    el("td", {text: p.peak_w == null ? dash : fmtNum(p.peak_w, 0), title: tip}),
+    el("td", {text: p.tps_per_w == null ? dash : fmtNum(p.tps_per_w, 3), title: "prose decode tokens per second, divided by the average watts the cards drew"})];
+}
+function renderWattNow(res) {
+  const box = $("#bn-watt-now"); if (!box) return;
+  const p = res && res.power;
+  if (!p || p.avg_w == null) { box.textContent = ""; return; }
+  box.textContent = "Power during this run: average " + fmtNum(p.avg_w, 0) + " W, peak " + fmtNum(p.peak_w, 0) + " W"
+    + (p.tps_per_w != null ? ", " + fmtNum(p.tps_per_w, 3) + " tokens/s per watt" : "")
+    + " (" + p.samples + " sample" + (p.samples === 1 ? "" : "s") + ").";
+}
+function drawWatt(rows) {
+  if (rows) BH.wattRows = rows;
+  const canvas = $("#ch-watt"), legend = $("#lg-watt");
+  if (!canvas || !legend) return;
+  const cs = getComputedStyle(document.documentElement), dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight; if (!W || !H) return;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const g = canvas.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const pts = (BH.wattRows || []).filter(r => r.power && r.power.tps_per_w > 0)
+    .map(r => ({ts: r.ts, v: r.power.tps_per_w})).sort((a, b) => a.ts - b.ts);
+  const txt = cs.getPropertyValue("--chart-text").trim(), grid = cs.getPropertyValue("--chart-grid").trim();
+  const col = seriesColors()[0] || "#6cf";
+  g.font = "11px " + cs.getPropertyValue("--font"); g.fillStyle = txt; g.strokeStyle = grid; g.lineWidth = 1;
+  if (!pts.length) {
+    g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillText("no power readings in these runs yet", W / 2, H / 2);
+    legend.replaceChildren();
+    return;
+  }
+  const ymax = niceMax(Math.max(...pts.map(p => p.v)) * 1.15) || 1;
+  const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts, span = Math.max(1, t1 - t0);
+  const L = 64, R = 14, T = 12, B = 28;
+  const x = ts => L + (W - L - R) * ((ts - t0) / span);
+  const y = v => T + (H - T - B) * (1 - v / ymax);
+  g.textAlign = "right"; g.textBaseline = "middle";
+  for (let i = 0; i <= 4; i++) {
+    const yy = Math.round(T + (H - T - B) * i / 4) + .5;
+    g.beginPath(); g.moveTo(L, yy); g.lineTo(W - R, yy); g.stroke();
+    g.fillText(fmtNum(ymax * (1 - i / 4), 3), L - 8, yy);
+  }
+  g.save(); g.translate(13, T + (H - T - B) / 2); g.rotate(-Math.PI / 2); g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText("tokens/s per W", 0, 0); g.restore();
+  g.fillStyle = txt; g.textBaseline = "top";
+  for (let i = 0; i < 3; i++) {
+    const ts = t0 + span * i / 2, d = new Date(ts * 1000);
+    const lab = span > 86400 ? (d.getMonth() + 1) + "/" + d.getDate() : d.toTimeString().slice(0, 5);
+    g.textAlign = i === 0 ? "left" : i === 2 ? "right" : "center";
+    g.fillText(lab, Math.min(W - R, Math.max(L, x(ts))), H - B + 6);
+  }
+  g.strokeStyle = col; g.lineWidth = 1.5; g.beginPath();
+  pts.forEach((p, i) => i ? g.lineTo(x(p.ts), y(p.v)) : g.moveTo(x(p.ts), y(p.v)));
+  g.stroke();
+  g.fillStyle = col;
+  pts.forEach(p => { g.beginPath(); g.arc(x(p.ts), y(p.v), 3.2, 0, 7); g.fill(); });
+  const med = median(pts.map(p => p.v));
+  legend.replaceChildren(el("span", {}, el("i", {style: "background:" + col}), "tokens/s per watt",
+    el("b", {style: "margin-left:6px;color:var(--text)", text: med ? fmtNum(med, 3) + " median" : ""})));
+}
+function renderHonest(res) {
+  // FR#12: run 1 (first pass) next to the mean of the later runs, per class; a class whose later runs were replayed is flagged
+  const box = $("#bn-honest"); if (!box) return;
+  const cls = (res && res.classes || []).filter(c => c.first_pass_tps != null);
+  if (!cls.length) { box.replaceChildren(); return; }
+  const dash = "\u2014", pct = c => c.later_mean_tps && c.first_pass_tps ? " (" + (c.later_mean_tps >= c.first_pass_tps ? "+" : "") + fmtNum((c.later_mean_tps / c.first_pass_tps - 1) * 100, 1) + "%)" : "";
+  const flagged = cls.filter(c => c.replay_suspect).map(c => c.class);
+  box.replaceChildren(
+    el("div", {class: "tiny", text: res.first_pass === false
+      ? "This server would not forget its earlier replies, so each run used a fresh prompt instead; its drafts may still remember earlier runs."
+      : "Each run started from a server told to forget its earlier replies."}),
+    el("div", {class: "tw"}, el("table", {}, el("thead", {}, el("tr", {}, ...["Class", "First pass t/s", "Later runs mean t/s", "Decode t/s kept"].map(h => el("th", {text: h})))),
+      el("tbody", {}, ...cls.map(c => el("tr", {}, el("td", {text: c.class}), el("td", {text: fmtNum(c.first_pass_tps)}),
+        el("td", {text: c.later_mean_tps == null ? dash : fmtNum(c.later_mean_tps) + pct(c)}),
+        el("td", {text: benchTps(c) + (c.replay_suspect ? " (first pass)" : ""), title: benchTpsTip(c)})))))),
+    ...(flagged.length ? [el("div", {class: "heatwarn", role: "alert"}, "\u26A0 Later runs were much faster than the first pass for " + flagged.join(", ")
+      + ": the server replayed an earlier answer, so the first pass is the number kept.")] : []));
 }
 function renderTelemetry(t) {
   const box = $("#bn-tel"); if (!t || !t.cards || !t.cards.length) { box.replaceChildren(); return; }
@@ -1913,7 +3029,7 @@ function renderTelemetry(t) {
         el("td", {text: (c.throttle || []).join(", ") || "none"})))))));
 }
 $("#bn-run").addEventListener("click", async () => {
-  try { await api("/api/bench", {body: Object.assign({warmup: +$("#bn-warm").value, reps: +$("#bn-reps").value}, S.target && S.target.sid ? {sid: S.target.sid} : S.target && S.target.port ? {port: S.target.port} : {})}); loadBench(); } catch (e) { toast(e.message, true); }
+  try { const r = await api("/api/bench", {body: Object.assign({warmup: +$("#bn-warm").value, reps: +$("#bn-reps").value, kv: $("#bn-kv").value}, S.target && S.target.sid ? {sid: S.target.sid} : S.target && S.target.port ? {port: S.target.port} : {})}); if (r && r.restart) toast(`restarting the server with KV cache ${r.restart.kv} before the benchmark`); S.benchSeen = true; loadBench(); } catch (e) { toast(e.message, true); }
 });
 
 // ---------------- CHAT: chat.js (window.PXAChat) and its chat-*.js plugins, loaded at the end ----------------
@@ -2018,14 +3134,112 @@ function resetSlide() {
   thumb.style.left = "5px"; fill.style.width = "0";
   label.textContent = $("#up-track").classList.contains("is-blocked") ? "Stop the running servers first" : "Slide fully, then hold 5 seconds";
 }
-function openUpdate() {
+function renderChannel() {   // the Engine channel row: shown to Valued Supporters (beta_allowed) and to an install already on beta
+  const d = S.update || {}, beta = d.channel === "beta";
+  $("#up-ch").hidden = !(d.beta_allowed || beta);
+  $("#up-ch-now").textContent = "Engine channel: " + (beta ? "Beta" : "Stable");
+  $("#up-beta").hidden = beta || !d.beta_allowed;
+  $("#up-stable").hidden = !beta;
+  $("#up-notes-btn").hidden = !beta;
+  const lab = "PXA Control " + ((S.info && S.info.control_version) || "") + (beta ? " (Beta channel)" : "");
+  $("#sv-ver").textContent = $("#hm-ver").textContent = lab;
+}
+function renderBeta() {   // the Beta card: release, its cost in thank-you coins, the wallet balance, one button
+  const B = S.beta || {}, card = $("#up-bcard"), go = $("#bc-go"), dk = $("#bc-docker"), msg = $("#bc-msg"), dl = $("#bc-dl");
+  card.hidden = !B.store;
+  if (!B.store) return;
+  go.hidden = dk.hidden = true; go.disabled = false;
+  $("#bc-rel").textContent = B.release ? "Beta " + B.release : "Beta";
+  $("#bc-bal").textContent = B.wallet ? B.coins + " coins in your wallet" : "";
+  if (B.offline) { msg.textContent = "The store is not reachable right now. Try again in a minute."; return; }
+  if (B.busy && B.wallet === undefined) { msg.textContent = "The store is busy right now; this card fills in by itself in a few minutes."; return; }
+  if (!B.wallet) { msg.textContent = "The beta is a Valued Supporter reward and spends no coins. Run /beta in the PXA Discord: the bot sends you personal download links."; return; }
+  if (!B.release && B.valued_only) { msg.textContent = "The beta channel is for Valued Supporters. If you are one, run /beta in the PXA Discord: the bot sends you personal download links, no coins."; return; }
+  if (!B.release) { msg.textContent = "No beta is out right now. Your coins stay in your wallet."; return; }
+  const onBeta = S.update && S.update.channel === "beta";
+  if (B.access) {
+    msg.textContent = B.how === "valued-supporter" ? "Yours as a Valued Supporter." : "Yours: redeemed. Downloading it again costs nothing.";
+    go.textContent = onBeta && !(S.update && S.update.update) ? "Reinstall check" : "Install the beta";
+    go.hidden = false; dk.hidden = false;
+  } else if (B.short_by > 0) {
+    msg.textContent = `This beta takes ${B.cost} coins. You have ${B.coins}: ${B.short_by} more needed. Each month of support on Ko-fi adds 120 thank-you coins, one-off support adds 10 per $1` + (B.kofi_linked ? "." : "; link your Ko-fi once in Store > Wallet so they land here.");
+  } else {
+    msg.textContent = `Redeem ${B.cost} of your ${B.coins} coins for this beta. It installs in its own folder; Back to stable returns you to the stable release.`;
+    go.textContent = `Redeem ${B.cost} coins and install`;
+    go.hidden = false;
+  }
+  const D = B.docker || {};
+  dl.hidden = !D.state || D.state === "idle";
+  if (D.state === "running") dl.textContent = "Downloading the Docker image archive" + (D.size ? `: ${Math.floor(100 * D.done / D.size)}%` : "...");
+  else if (D.state === "done") dl.textContent = `Saved and checked: ${D.path}. Load it with: docker load -i "${D.path}"`;
+  else if (D.state === "failed") dl.textContent = D.error + " Press the button again to resume.";
+  dk.disabled = D.state === "running";
+}
+async function loadBeta() {   // an error keeps the last good card (a busy store must not hide it)
+  try { S.beta = await api("/api/update/beta", {timeout: 30000}); } catch (e) { S.beta = S.beta || {}; }
+  renderBeta();
+  if (S.beta && S.beta.busy && !S.betaRetry) {   // the store asked us to wait: look once more when the wait is over
+    S.betaRetry = setTimeout(() => { S.betaRetry = null; loadBeta(); }, Math.min(Math.max(+S.beta.retry_in || 300, 5), 3600) * 1000);
+  }
+}
+async function betaGo() {   // redeem (once), record the beta channel, install it with pxa-update
+  const go = $("#bc-go");
+  go.disabled = true;
+  try {
+    if (!(S.beta && S.beta.access)) {
+      $("#bc-msg").textContent = "Redeeming...";
+      S.beta = Object.assign({}, S.beta, await api("/api/update/beta/redeem", {method: "POST", body: {}, timeout: 60000}));
+    }
+    $("#bc-msg").textContent = "Switching this install to the beta channel...";
+    await api("/api/update/channel", {method: "POST", body: {channel: "beta"}, timeout: 70000});
+    await checkUpdate();   // live: which build waits, which servers run now
+    if (S.update && S.update.update && S.update.servers_running) {
+      $("#bc-msg").textContent = "Stop the running servers first. PXA will not restart them.";
+    } else if (S.update && S.update.update) {
+      $("#bc-msg").textContent = "Downloading and installing " + (S.update.latest || "the beta") + ". A broken download resumes on the next press.";
+      await applyUpdate();
+    } else {
+      $("#bc-msg").textContent = "This beta is installed.";
+    }
+  } catch (e) { toast(e.message, true); }
+  go.disabled = false;
+  loadBeta();
+}
+async function betaDocker() {
+  try { await api("/api/update/beta/docker", {method: "POST", body: {}, timeout: 60000}); } catch (e) { toast(e.message, true); return; }
+  // progress comes from this computer (?dl=1: no store call); the wallet is read again once, when the download ends
+  const tick = async () => {
+    try { const r = await api("/api/update/beta?dl=1", {timeout: 15000}); S.beta = Object.assign({}, S.beta, {docker: r.docker || {}}); } catch (e) { /* keep the card */ }
+    renderBeta();
+    if ((S.beta.docker || {}).state === "running") { if ($("#up").open) setTimeout(tick, 2000); } else loadBeta();
+  };
+  tick();
+}
+// FR#14: the dialog asks again on every open (a new build? which servers run now?). The count read at page load went stale once a
+// server stopped, and the stop line showed even with nothing to install. It belongs only to "an update waits AND a server runs".
+function renderUpdate(state) {   // state: "checking" | "done" | "failed"
   const d = S.update || {};
-  const n = d.servers_running || 0;
-  $("#up-sub").textContent = n + " running · " + (d.latest || "update") + " available";
-  $("#up-body").textContent = n ? "Stop the running servers first. PXA will not restart them." : "Install " + (d.latest || "the update") + ". PXA will not restart a running server.";
-  $("#up-track").classList.toggle("is-blocked", n > 0);
+  const checked = state === "done" && !d.error, n = d.servers_running || 0, waits = checked && !!d.update;
+  $("#up-sub").textContent = state === "checking" ? "Checking..." : !checked ? "Not checked" : waits ? (d.latest || "An update") + " available" + (n ? " · " + n + " running" : "") : "Up to date";
+  $("#up-body").textContent = state === "checking" ? "Checking for a new build..."
+    : !checked ? "Could not check for a new build. Try again later."
+    : !waits ? "Up to date. No update to install on this channel."
+    : n ? "Stop the running servers first. PXA will not restart them."
+    : "Install " + (d.latest || "the update") + ". PXA will not restart a running server.";
+  $("#up-track").classList.toggle("is-blocked", waits && n > 0);
+  $("#up-track").hidden = !waits;
+}
+async function openUpdate() {
+  $("#up-notes").hidden = true;
   resetSlide();
-  $("#up").showModal();
+  renderUpdate("checking");
+  if (!$("#up").open) $("#up").showModal();
+  renderChannel();
+  renderBeta();
+  loadBeta();
+  renderUpdate((await checkUpdate()) ? "done" : "failed");
+  renderChannel();
+  renderBeta();
 }
 function armSlide() {
   const track = $("#up-track"), thumb = $("#up-thumb");
@@ -2069,19 +3283,44 @@ function armSlide() {
   thumb.addEventListener("pointerup", cancel);
   thumb.addEventListener("pointercancel", cancel);
   $("#up-cancel").addEventListener("click", () => { resetSlide(); $("#up").close(); });
-  $("#sv-up").addEventListener("click", openUpdate);
+  $("#sv-up").addEventListener("click", openUpdate); $("#hm-up").addEventListener("click", openUpdate);
+  $("#up-beta").addEventListener("click", () => setChannel("beta"));
+  $("#up-stable").addEventListener("click", () => setChannel("stable"));
+  $("#up-notes-btn").addEventListener("click", showNotes);
+  $("#bc-go").addEventListener("click", betaGo);
+  $("#bc-docker").addEventListener("click", betaDocker);
+}
+async function setChannel(ch) {   // records the channel only; the slide below then installs what that channel offers
+  try {
+    await api("/api/update/channel", {method: "POST", body: {channel: ch}, timeout: 70000});
+    await openUpdate();
+    if (ch === "stable") $("#up-body").textContent = (S.update && S.update.update) ? "Back on stable. Slide to install " + (S.update.latest || "the stable release") + "." : "Back on stable.";
+  } catch (e) { toast(e.message, true); }
+}
+async function showNotes() {
+  const box = $("#up-notes");
+  try {
+    const d = await api("/api/update/notes", {timeout: 130000});
+    box.textContent = d.notes || "No notes for this release.";   // text, never HTML
+    box.hidden = false;
+  } catch (e) { toast(e.message, true); }
 }
 async function checkUpdate() {
   try {
-    S.update = await api("/api/update", {timeout: 20000});
-    $("#sv-up").hidden = !(S.update && S.update.update);
+    S.update = await api("/api/update", {timeout: 60000});
+    if (!S.beta) { try { S.beta = await api("/api/update/beta", {timeout: 30000}); } catch (e) { S.beta = {}; } }
+    const u = S.update || {};
+    $("#sv-up").hidden = $("#hm-up").hidden = !(u.update || u.beta_allowed || u.channel === "beta" || (S.beta && S.beta.release));
+    $("#sv-up").textContent = $("#hm-up").textContent = u.update ? "Update" : "Engine";
+    renderChannel();
     armSlide();
-  } catch (e) { /* the rest of Control still works */ }
+    return true;
+  } catch (e) { return false; /* the rest of Control still works */ }
 }
 async function applyUpdate() {
   $("#up-label").textContent = "Installing";
   try {
-    const d = await api("/api/update/apply", {method: "POST", body: {}, timeout: 600000});
+    const d = await api("/api/update/apply", {method: "POST", body: {}, timeout: (S.update && S.update.channel === "beta") ? 2450000 : 600000});
     $("#up-body").textContent = (d && d.output) || "Installed. Open PXA Control again to use the new version.";
     $("#up-label").textContent = "Installed";
     $("#sv-up").hidden = true;
@@ -2137,12 +3376,15 @@ $("#emap-reset").addEventListener("click", async () => {
   const params = new URLSearchParams(location.search);
   applyTheme(params.get("theme") || store.get("theme", null) || defaultTheme());
   try { S.info = await api("/api/info"); $("#l-kv").replaceChildren(...S.info.kv_types.map(k => el("option", {value: k, text: k})));
-    $("#l-extra-help").textContent = "Allowed: " + S.info.extra_flags.join(" "); $("#sv-ver").textContent = "PXA Control " + (S.info.control_version || ""); checkUpdate(); } catch (e) { toast(e.message, true); }
+    $("#l-extra-help").textContent = "Allowed: " + S.info.extra_flags.join(" "); $("#sv-ver").textContent = $("#hm-ver").textContent = "PXA Control " + (S.info.control_version || ""); checkUpdate(); } catch (e) { toast(e.message, true); }
   loadLevers(); loadPresets(); loadEngines();
   await loadServers();
   pollStatus();
-  const tab = (location.hash || "").slice(1) || store.get("tab", "servers");
-  showTab(TABS.includes(tab) ? tab : "servers");
+  loadFleet();                                            // the header names what runs from the first second, not 5 s in
+  // a fresh visit opens Home (it adapts: first run, ready to run, serving); a #section address opens that section
+  const tab = (location.hash || "").slice(1) || "home";
+  showTab(isTab(tab) ? tab : "home");
+  if (!isTab(tab) && /^plug-/.test(tab)) window.pxaWantTab = tab;      // a plugin's tab: opened once its button arrives
   await loadModels();
   emapRefresh();
   // a running server wins over the last form: the Launch tab shows what is actually serving
@@ -2152,6 +3394,11 @@ $("#emap-reset").addEventListener("click", async () => {
   window.addEventListener("beforeunload", () => store.set("lastBody." + S.sid, launchBody()));
 })();
 </script>
+<script src="/store.js"></script>
+<script src="/plugins.js"></script>
+<script src="/plugin-host.js"></script>
+<script src="/wallet.js"></script>
+<script src="/home.js"></script>
 <script src="/encode.js"></script>
 <script src="/live.js"></script>
 <script src="/profiles.js"></script>

@@ -27,6 +27,9 @@ enum ggml_pxqn_spec_kind {
 };
 
 #define GGML_PXQN_SPEC_FLAG_PLAIN_OK 1u   // a round without a draft is a legal choice (nothing to keep in step)
+#define GGML_PXQN_SPEC_FLAG_PLAIN_FIRST 2u // PXA_SPEC_SELECT_PLAIN_FIRST: every request starts in plain until plain is priced at its depth; a moved depth rescales the drafter's cost line and probes it at once, an unmoved one keeps the incumbent (and the long MTP probe gap while plain leads widely); a library without the flag ignores the bit and runs as before
+                                          // MTP probe keeps its long gap while plain leads by a wide margin (a library without
+                                          // the flag ignores the bit and runs as before)
 
 struct ggml_pxqn_spec_cfg {
     int32_t  n_seq_max;
@@ -63,6 +66,17 @@ GGML_API void   ggml_pxqn_spec_observe(void * h, int32_t seq_id, int32_t n_verif
 // one line of what the selector measured, for the end-of-request statistics; returns the length written
 GGML_API int    ggml_pxqn_spec_describe(void * h, char * buf, size_t n);
 
+// Prompt-copy versus MTP for one round. 1 = verify the copy and do not ask MTP.
+// -1 = the copy is shorter than MTP's ceiling; discard it and ask MTP. 0 = no opinion
+// (absent library, or the closed-lib probe is off): the chain keeps today's order.
+GGML_API int ggml_pxqn_spec_copy_wins(int32_t ngram_len, int32_t mtp_n_max);
+
+// 1 when the resident-checkpoint ubatch walk is compiled into the closed library.
+GGML_API int ggml_pxqn_ckpt_ub_armed(void);
+// Next ubatch to try. 0 = keep `ub` (the walk is off, the checkpoint already fits, or the
+// next wave-multiple would fall below 256).
+GGML_API int ggml_pxqn_ckpt_ub_next(int32_t ub, int32_t cap, int32_t want, int32_t nsm);
+
 
 // ---- per-model / per-card speculation defaults ---------------------------------------------------
 // The engine describes the model it loaded and the cards it runs on; the library answers with the speculation
@@ -83,7 +97,7 @@ struct ggml_pxqn_specdef_in {
     char     arch[32];        // general.architecture of the TARGET model ("qwen35", "qwen4exp", "gemma4", ...)
     int32_t  n_dev;           // CUDA devices the model is spread over
     int32_t  cc_min;          // lowest compute capability among them, 100 * major + 10 * minor (600, 610, 700)
-    int32_t  tensor_split;    // 1 = a row-parallel split (-sm tensor / attn / graph), 0 = one card or a layer split
+    int32_t  tensor_split;    // a row-parallel split: 1 = -sm tensor, 2 = -sm attn / graph; 0 = one card or a layer split
     int32_t  has_nextn;       // the file carries MTP layers
     int32_t  has_assistant;   // an assistant drafter (a separate file) is configured
     int32_t  n_expert;        // routed experts per layer (0 = dense)

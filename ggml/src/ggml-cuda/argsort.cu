@@ -5,9 +5,12 @@
 // SPDX-License-Identifier: MIT
 //
 #include "argsort.cuh"
+#include "pxa-env-flag.h"
 #include "sumrows.cuh"
 
 #include <algorithm>
+#include <climits>
+#include <cstdlib>
 
 //
 // ---------------------------------------------------------------------------
@@ -472,6 +475,115 @@ static __global__ void k_apply_mask(float * dst, const int * groups,
     }
 }
 
+// PXA_ARGSORT_SMEM (default ON, =0 off; 2026-10-23, ledger argsort-keys-smem): the same bitonic
+// network as k_argsort_f32_T with each thread holding one (index, key) pair in registers. A stage whose partner distance j
+// is below the warp size swaps through __shfl_xor_sync (no barrier); a wider stage exchanges through shared memory. The
+// swap decision of a pair is the original lower thread's test on (index, key) of the lower and upper slots, computed
+// identically by both threads, and the key a slot carries is always x[its index], so every compare sees the values the
+// global-key kernel compares: same network, same ties, bit-identical indices and values (test-argsort-smem checks a host
+// copy of the network). The global-key kernel spends ~0.4 us per stage on two dependent global loads and a barrier
+// (a 256-wide Flint router sort: 36 stages, 16.9 us per call on a P100, 47 calls per token).
+// The register/shuffle bitonic network shared by k_argsort_f32_T_reg and k_sigmoid_topk_norm_f32: thread col enters with
+// (my_i = col, my_k = x[col] or 0 for a padded slot) and leaves holding the (index, key) of sorted position col.
+// s_xchg = the two exchange buffers ([2][ncols_pad] indices, [2][ncols_pad] keys); every thread of the block must call it.
+template<ggml_sort_order order>
+static __device__ __forceinline__ void argsort_reg_network(const int col, const int ncols, const int ncols_pad,
+        int & my_i, float & my_k, int * s_xchg) {
+    int   * s_i = s_xchg;
+    float * s_k = (float *)(s_xchg + 2*ncols_pad);
+    int pb = 0;                                              // alternating buffers: one barrier per wide stage
+
+    const unsigned mask = ncols_pad >= WARP_SIZE ? 0xffffffffu : ((1u << ncols_pad) - 1u);
+
+    for (int k = 2; k <= ncols_pad; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int   o_i;
+            float o_k;
+            if (j >= WARP_SIZE) {
+                // a thread that reaches the next wide stage has passed this barrier, so every read of the buffer it
+                // then writes (two wide stages back) is done
+                int   * bi = s_i + pb*ncols_pad;
+                float * bk = s_k + pb*ncols_pad;
+                pb ^= 1;
+                bi[col] = my_i;
+                bk[col] = my_k;
+                __syncthreads();
+                o_i = bi[col ^ j];
+                o_k = bk[col ^ j];
+            } else {
+                o_i = __shfl_xor_sync(mask, my_i, j);
+                o_k = __shfl_xor_sync(mask, my_k, j);
+            }
+            const bool  lower = (col & j) == 0;              // this thread holds the pair's lower slot
+            const int   a_i = lower ? my_i : o_i;            // lower slot
+            const float a_k = lower ? my_k : o_k;
+            const int   b_i = lower ? o_i  : my_i;           // upper slot
+            const float b_k = lower ? o_k  : my_k;
+            bool swap;
+            if ((col & k) == 0) {                            // bit k is the same for both slots (j < k)
+                swap = a_i >= ncols || (b_i < ncols && (order == GGML_SORT_ORDER_ASC ? a_k > b_k : a_k < b_k));
+            } else {
+                swap = b_i >= ncols || (a_i < ncols && (order == GGML_SORT_ORDER_ASC ? a_k < b_k : a_k > b_k));
+            }
+            if (swap) {
+                my_i = o_i;
+                my_k = o_k;
+            }
+        }
+    }
+}
+
+template<ggml_sort_order order, typename Store, typename dst_t>
+static __global__ void k_argsort_f32_T_reg(const float * x, dst_t * dst, const int ncols, int ncols_pad, int ntop, Store s) {
+    const int col = threadIdx.x;
+    const int row = blockIdx.x;
+
+    if (col >= ncols_pad) {
+        return;
+    }
+
+    const float * x_row = x + row * ncols;
+    extern __shared__ int s_xchg[];                          // two exchange buffers: [2][ncols_pad] indices, [2][ncols_pad] keys
+
+    int   my_i = col;
+    float my_k = col < ncols ? x_row[col] : 0.0f;            // a padded slot's key is never compared (index test first)
+
+    argsort_reg_network<order>(col, ncols, ncols_pad, my_i, my_k, s_xchg);
+
+    if constexpr (Store::has_thresh) {
+        __shared__ float s_max;                              // the first sorted key == x_row[dst_row[0]]
+        if (col == 0) {
+            s_max = my_k;
+        }
+        __syncthreads();
+        const float max_val = s_max;
+        if (col < ntop) {
+            if constexpr (std::is_same_v<dst_t, int>) {
+                dst[row * ntop + col] = col < s.min_experts || my_k >= s.thresh_experts*max_val ? my_i : -1;
+            } else {
+                dst[row * ntop + col] = col < s.min_experts || my_k >= s.thresh_experts*max_val ? my_k : 0.f;
+            }
+        }
+    } else {
+        if (col < ntop) {
+            if constexpr (std::is_same_v<dst_t, int>) {
+                dst[row * ntop + col] = my_i;
+            } else {
+                dst[row * ntop + col] = my_k;
+            }
+        }
+    }
+}
+
+// PXA_ARGSORT_SMEM: default ON (k_argsort_f32_T_reg); =0 restores the global-key bitonic kernel (read once per process).
+static bool pxa_argsort_smem_on() {
+    static const bool v = [] {
+        const char * e = getenv("PXA_ARGSORT_SMEM");
+        return !pxa_env_value_off(e);
+    }();
+    return v;
+}
+
 static int next_power_of_2(int x) {
     int n = 1;
     while (n < x) {
@@ -491,7 +603,30 @@ static void argsort_f32_T_cuda(const float * x, dst_t * dst, const int ncols, co
     const size_t shared_mem = ncols_pad * sizeof(int);
 
     // FIXME: this limit could be raised by ~2-4x on Ampere or newer
-    GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+    const size_t smpb = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+    GGML_ASSERT(shared_mem <= smpb);
+
+    // PXA_ARGSORT_SMEM: the register/shuffle network when its two index + key exchange buffers fit (bit-identical, see the kernel)
+    const size_t shared_mem_keys = 2 * ncols_pad * (sizeof(int) + sizeof(float));
+    if (pxa_argsort_smem_on() && shared_mem_keys <= smpb) {
+        if (order == GGML_SORT_ORDER_ASC) {
+            if (min_experts >= 0 && min_experts < ncols && thresh_experts > 0) {
+                k_argsort_f32_T_reg<GGML_SORT_ORDER_ASC, store_ser, dst_t><<<block_nums, block_dims, shared_mem_keys, stream>>>(x, dst, ncols, ncols_pad,
+                        ntop, {min_experts, thresh_experts});
+            } else {
+                k_argsort_f32_T_reg<GGML_SORT_ORDER_ASC, store, dst_t><<<block_nums, block_dims, shared_mem_keys, stream>>>(x, dst, ncols, ncols_pad, ntop, {});
+            }
+            return;
+        } else if (order == GGML_SORT_ORDER_DESC) {
+            if (min_experts >= 0 && min_experts < ncols && thresh_experts > 0) {
+                k_argsort_f32_T_reg<GGML_SORT_ORDER_DESC, store_ser, dst_t><<<block_nums, block_dims, shared_mem_keys, stream>>>(x, dst, ncols, ncols_pad,
+                        ntop, {min_experts, thresh_experts});
+            } else {
+                k_argsort_f32_T_reg<GGML_SORT_ORDER_DESC, store, dst_t><<<block_nums, block_dims, shared_mem_keys, stream>>>(x, dst, ncols, ncols_pad, ntop, {});
+            }
+            return;
+        }
+    }
 
     if (order == GGML_SORT_ORDER_ASC) {
         if (min_experts >= 0 && min_experts < ncols && thresh_experts > 0) {
@@ -510,6 +645,136 @@ static void argsort_f32_T_cuda(const float * x, dst_t * dst, const int ncols, co
     } else {
         GGML_ABORT("fatal error");
     }
+}
+
+// PXA_FLINT_GATE_FUSE (default OFF since #354, =1 opt-in; 2026-10-23, ledger flint-gate-fuse): the norm_w sigmoid router
+// tail without a selection bias (Flint: SIGMOID -> ARGSORT DESC -> VIEW top-k -> GET_ROWS -> SUM_ROWS -> DIV) as ONE launch,
+// one block per token row. Every intermediate tensor is still written (probs, the full argsort, the gathered weights, the
+// row sum, the normalized weights), each with the arithmetic of the kernel it replaces: sigmoid_f32's expression, the
+// k_argsort_f32_T_reg network (argsort_reg_network: the key a slot carries is x[its index], so the gathered weight of sorted
+// position j is the key thread j holds = get_rows' copy), and k_sum_rows_div_f32's warp-0 sum (lane j < k adds weight j to
+// 0.0f, warp_reduce_sum, norm = 1/sum or 0, weight * norm). Bit-identical; test-flint-gate-fuse compares it with the op chain.
+// #354 (2026-10-24): the graph allocator lays the chain out for its op order, where probs (and logits)
+// are dead before SUM_ROWS/DIV run, so it may place wsum/wn (or ids/w) inside a buffer the chain already freed. One launch
+// writes them all at once from different blocks, so such a layout is an inter-block race (P100 one-card Flint: block r''
+// writing probs row r'' over the wn rows of a block that already finished; greedy output differed run to run).
+// ggml_cuda_sigmoid_topk_norm checks the byte ranges first: probs shared only with w/wsum/wn -> probs is not written (it is
+// dead); any other sharing except the exact in-place pairs (probs == logits, wn == w; one thread reads then writes the same
+// element) -> the fusion declines and the op chain runs. Every tensor that is live after the tail gets the same bytes.
+static __global__ void k_sigmoid_topk_norm_f32(const float * __restrict__ logits, float * __restrict__ probs, int * __restrict__ ids,
+        float * __restrict__ w, float * __restrict__ wsum, float * __restrict__ wn, const int ncols, const int ncols_pad, const int k) {
+    const int col = threadIdx.x;
+    const int row = blockIdx.x;
+
+    extern __shared__ int s_xchg[];
+
+    int   my_i = col;
+    float my_k = 0.0f;                                       // a padded slot's key is never compared (index test first)
+    if (col < ncols) {
+        const float p = 1.0f / (1.0f + expf(-logits[row * ncols + col]));
+        if (probs) {                                         // nullptr = probs is dead and its buffer holds w/wsum/wn (#354)
+            probs[row * ncols + col] = p;
+        }
+        my_k = p;
+    }
+
+    argsort_reg_network<GGML_SORT_ORDER_DESC>(col, ncols, ncols_pad, my_i, my_k, s_xchg);
+
+    if (col < ncols) {
+        ids[row * ncols + col] = my_i;
+    }
+    if (col < WARP_SIZE) {                                   // warp 0 = k_sum_rows_div_f32's 32-thread block (k <= 32)
+        float sum = 0.0f;
+        if (col < k) {
+            w[row * k + col] = my_k;
+            sum += my_k;
+        }
+        sum = warp_reduce_sum(sum);
+        float norm = sum > 0 ? 1/sum : 0.0f;
+        if (col < k) {
+            wn[row * k + col] = my_k * norm;
+        }
+        if (col == 0) {
+            wsum[row] = sum;
+        }
+    }
+}
+
+// default OFF since 2026-10-24: a measured wash that raced once on the default path (#354);
+// PXA_FLINT_GATE_FUSE=1 opts in (the #354 alias guard below still applies)
+static bool pxa_flint_gate_fuse_on() {
+    static const bool v = pxa_env_flag("PXA_FLINT_GATE_FUSE", 0) != 0;
+    return v;
+}
+
+bool ggml_cuda_sigmoid_topk_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * logits, ggml_tensor * probs, ggml_tensor * ids,
+        ggml_tensor * w, ggml_tensor * wsum, ggml_tensor * wn, int k) {
+    if (!pxa_flint_gate_fuse_on() || !pxa_argsort_smem_on()) {
+        return false;
+    }
+    if (logits->type != GGML_TYPE_F32 || probs->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || w->type != GGML_TYPE_F32 ||
+        wsum->type != GGML_TYPE_F32 || wn->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(logits) || !ggml_is_contiguous(probs) || !ggml_is_contiguous(ids) || !ggml_is_contiguous(w) ||
+        !ggml_is_contiguous(wsum) || !ggml_is_contiguous(wn)) {
+        return false;
+    }
+    const int64_t ncols = probs->ne[0];
+    const int64_t nrows = ggml_nrows(probs);
+    if (!ggml_are_same_shape(logits, probs) || !ggml_are_same_shape(ids, probs) || ncols > 1024 || nrows > INT_MAX ||
+        k < 1 || k > WARP_SIZE || k > ncols || ggml_nelements(w) != (int64_t) k*nrows || ggml_nelements(wn) != (int64_t) k*nrows ||
+        ggml_nelements(wsum) != nrows) {
+        return false;
+    }
+    const int ncols_pad = next_power_of_2((int) ncols);
+    const size_t smpb = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+    const size_t shared_mem_keys = 2 * ncols_pad * (sizeof(int) + sizeof(float));
+    // the reference ARGSORT takes k_argsort_f32_T_reg only in this range (CUB above 1024 columns or past smpb)
+    if (ncols_pad < WARP_SIZE || ncols_pad > 1024 || (size_t) ncols_pad * sizeof(int) > smpb || shared_mem_keys > smpb) {
+        return false;
+    }
+    // #354: buffers the allocator shared inside the chain (see the kernel comment)
+    auto ov = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    const ggml_tensor * late[3] = { w, wsum, wn };
+    bool probs_live = true;
+    bool unsafe = (ov(probs, logits) && probs->data != logits->data) || ov(ids, logits) || ov(ids, probs) ||
+                  ov(w, wsum) || ov(wsum, wn) || (ov(w, wn) && w->data != wn->data);
+    for (const ggml_tensor * t : late) {
+        unsafe = unsafe || ov(t, logits) || ov(t, ids);  // a row another block may still read (logits) or a live output (ids)
+        if (ov(t, probs)) {
+            probs_live = false;                          // probs was freed inside the chain: nothing reads it after the tail
+        }
+    }
+    if (unsafe) {
+        static bool said_decl = false;
+        if (!said_decl) {
+            said_decl = true;
+            fprintf(stderr, "PXA_FLINT_GATE_FUSE: declined where the allocator shares a buffer inside the router tail (op chain runs; #354)\n");
+        }
+        return false;
+    }
+    if (!probs_live) {
+        static bool said_dead = false;
+        if (!said_dead) {
+            said_dead = true;
+            fprintf(stderr, "PXA_FLINT_GATE_FUSE: router probs buffer reused by the tail outputs (dead after it): probs not written (#354)\n");
+        }
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        fprintf(stderr, "PXA_FLINT_GATE_FUSE: ON (opt-in; sigmoid + top-%d + norm_w router tail as one launch, %d experts, bit-identical)\n",
+                k, (int) ncols);
+    }
+    k_sigmoid_topk_norm_f32<<<dim3((unsigned) nrows, 1, 1), dim3(ncols_pad, 1, 1), shared_mem_keys, ctx.stream()>>>(
+            (const float *) logits->data, probs_live ? (float *) probs->data : nullptr, (int *) ids->data, (float *) w->data, (float *) wsum->data,
+            (float *) wn->data, (int) ncols, ncols_pad, k);
+    return true;
 }
 
 static void argsort_f32_u8_cuda(const float * x, uint8_t * dst, const int ncols, const int nrows, int ntop,

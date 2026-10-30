@@ -48,6 +48,10 @@ GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type
 // the first stream buffer of that device is allocated; PXA_STREAM_RING_MB overrides).
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_stream_buffer_type(int device);
 GGML_API GGML_CALL void ggml_backend_cuda_stream_set_ring(int device, size_t bytes);
+// PXA_XCACHE_RING_LEND: the ring of `device` is not allocated at load; a graph that streams takes it from the free VRAM (zero-copy
+// reads when it cannot) and ggml_backend_cuda_stream_ring_return() frees it again (ggml/src/ggml-cuda/pxa/pxa-stream.cuh)
+GGML_API GGML_CALL void ggml_backend_cuda_stream_set_ring_lent(int device, bool lent);
+GGML_API GGML_CALL void ggml_backend_cuda_stream_ring_return(void);
 // true for a CUDA<d>_Stream buffer (pinned host bytes presented as a CUDA buffer)
 GGML_API GGML_CALL bool ggml_backend_cuda_buffer_is_stream(ggml_backend_buffer_t buffer);
 
@@ -65,6 +69,9 @@ GGML_API GGML_CALL void ggml_backend_cuda_get_device_description(int device, cha
 GGML_API GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 // raw compute capability (100*major + 10*minor, e.g. 610 for sm_61); -1 if device is out of range.
 GGML_API GGML_CALL int  ggml_backend_cuda_get_device_cc(int device);
+// PXA_JIT_FIRST_START_v1: true when the driver runs this device on JIT-compiled PTX (no native SASS in
+// this build for its arch, or CUDA_FORCE_PTX_JIT=1): the first use of each kernel module compiles it.
+GGML_API GGML_CALL bool ggml_backend_cuda_device_jit(int device);
 // PCIe link width in lanes (Linux sysfs current_link_width; PXA_PCIE_LINK_WIDTH overrides), 0 = unknown
 GGML_API GGML_CALL int  ggml_backend_cuda_get_device_pcie_width(int device);
 
@@ -85,9 +92,18 @@ GGML_API GGML_CALL const char * ggml_backend_cuda_get_device_pxa_path(int device
 // (the PXQN fused up/gate kernel of libggml-pxqn) actually ran. Call
 // reset() then read the counts after one ggml_backend_graph_compute(): reporting only, decides
 // nothing, and costs one atomic add per real launch (no-op on every other backend/op).
-GGML_API GGML_CALL void     ggml_backend_cuda_pxqn_gu_counters_reset(void);
-GGML_API GGML_CALL uint64_t ggml_backend_cuda_pxqn_gu_decode_count(void);   // dense GU, ny <= 32 (decode GEMV kernel)
-GGML_API GGML_CALL uint64_t ggml_backend_cuda_pxqn_gu_prefill_count(void);  // dense GU, ny > 32 (prefill GEMM kernel)
+// The ggml library exports these. The PXQN library reaches its copies through its API table only, so on Windows
+// ggml-pxqn.dll does not dllexport them: its export list is exactly the names in ggml-pxqn.def. A test build that
+// wants them exported from the DLL too configures with -DPXA_PXQN_EXPORT_TEST_HOOKS=ON (defines
+// GGML_PXQN_EXPORT_TEST_HOOKS). Linux and every other build are unchanged.
+#if defined(_WIN32) && defined(GGML_PXQN_LIBRARY) && !defined(GGML_PXQN_EXPORT_TEST_HOOKS)
+#    define GGML_PXQN_HOOK_API
+#else
+#    define GGML_PXQN_HOOK_API GGML_API
+#endif
+GGML_PXQN_HOOK_API GGML_CALL void     ggml_backend_cuda_pxqn_gu_counters_reset(void);
+GGML_PXQN_HOOK_API GGML_CALL uint64_t ggml_backend_cuda_pxqn_gu_decode_count(void);   // dense GU, ny <= 32 (decode GEMV kernel)
+GGML_PXQN_HOOK_API GGML_CALL uint64_t ggml_backend_cuda_pxqn_gu_prefill_count(void);  // dense GU, ny > 32 (prefill GEMM kernel)
 
 // PXA per-card serve-flag defaults (2026-09-03). Answers "what -b/-ub did this exact card set
 // measure fastest at", for the topologies the campaign actually measured. The caller passes the

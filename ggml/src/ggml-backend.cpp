@@ -1,4 +1,6 @@
+#include "pxa-env-flag.h"
 #include "ggml-backend-impl.h"
+#include "ggml-pxa-kqmask.h" // PXA_KV_BAND_ANCHOR0 proof layout
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
@@ -817,7 +819,8 @@ GGML_CALL static bool ggml_backend_cpu_buffer_cpy_tensor(ggml_backend_buffer_t b
 }
 
 GGML_CALL static void ggml_backend_cpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    memset(buffer->context, value, buffer->size);
+    // buffer->size counts from the aligned base (see ggml_backend_cpu_buffer_type_alloc_buffer)
+    memset(ggml_backend_cpu_buffer_get_base(buffer), value, buffer->size);
 }
 
 static struct ggml_backend_buffer_i cpu_backend_buffer_i = {
@@ -854,10 +857,14 @@ GGML_CALL static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend
 }
 
 GGML_CALL static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    size += TENSOR_ALIGNMENT;   // malloc may return an address that is not aligned
-    void * data = malloc(size); // TODO: use GGML_ALIGNED_MALLOC (move to ggml-impl.h)
+    // malloc may return an address that is not aligned: get_base() rounds it up to TENSOR_ALIGNMENT, so
+    // allocate TENSOR_ALIGNMENT extra bytes but report only the size usable from the aligned base. The
+    // inflated size (size + TENSOR_ALIGNMENT) used to be reported, so with a 16 mod 32 block the last 16
+    // bytes of [base, base + get_size) lay past the block, and ggml_gallocr_reserve_n() kept a buffer for
+    // a re-plan grown by one alignment unit: heap corruption (glm5next MTP n_max=4).
+    void * data = malloc(size + TENSOR_ALIGNMENT); // TODO: use GGML_ALIGNED_MALLOC (move to ggml-impl.h)
     if (data == NULL) {
-        fprintf(stderr, "%s: failed to allocate buffer of size %zu\n", __func__, size);
+        fprintf(stderr, "%s: failed to allocate buffer of size %zu\n", __func__, size + TENSOR_ALIGNMENT);
         return NULL;
     }
 
@@ -1313,6 +1320,10 @@ struct ggml_backend_sched {
 
     size_t max_extra_alloc = 0;
 
+    // bug #348: a failed re-plan returns false to the caller instead of computing through a NULL
+    // buffer (the PXA_ALLOC_FAIL_CLEAN behaviour for this scheduler only; verify graph slots set it)
+    bool pxa_fail_clean = false;
+
     // pipeline parallelism support
     int n_copies;
     int cur_copy;
@@ -1344,10 +1355,12 @@ struct ggml_backend_sched {
     // caller that can rebuild the graph at worst-case sizes uses this to notice that its
     // reserved plan has been replaced by a narrow one and re-reserve.
     int n_replans;
+    bool pxa_prev_async;   // PXA_SCHED_ASYNC_MAX_TOKENS: the last graph of this scheduler ran with async inputs
     bool split_mode_graph;
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
+    uint64_t pxa_split_gen = 0;   // bumped by every split_graph: the split graphs (and their allocation) changed
 
     // PXA_TSPLIT_WORKERS: persistent per-device enqueue workers, created on the first graph that
     // qualifies and torn down with the scheduler. nullptr when the lever is off.
@@ -1390,6 +1403,48 @@ extern "C" GGML_API ggml_backend_sched_t pxa_ggml_backend_sched_clone(ggml_backe
     s->callback_eval           = src->callback_eval;
     s->callback_eval_user_data = src->callback_eval_user_data;
     return s;
+}
+
+// bug #348 (2026-10-23): per-scheduler PXA_ALLOC_FAIL_CLEAN. A verify graph slot's scheduler must never
+// run a graph its arena could not back: with this set a failed re-plan makes ggml_backend_sched_alloc_graph
+// return false (and the next alloc re-plans), so the caller can drop the slot and run the ubatch elsewhere.
+extern "C" void pxa_ggml_gallocr_set_fail_clean(ggml_gallocr_t galloc, bool on);
+extern "C" bool pxa_ggml_gallocr_measure_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes);
+extern "C" GGML_API void pxa_ggml_backend_sched_set_fail_clean(ggml_backend_sched_t sched, bool on);
+extern "C" GGML_API void pxa_ggml_backend_sched_set_fail_clean(ggml_backend_sched_t sched, bool on) {
+    if (!sched) return;
+    sched->pxa_fail_clean = on;
+    pxa_ggml_gallocr_set_fail_clean(sched->galloc, on);
+}
+extern "C" GGML_API bool pxa_ggml_backend_sched_get_fail_clean(ggml_backend_sched_t sched);
+extern "C" GGML_API bool pxa_ggml_backend_sched_get_fail_clean(ggml_backend_sched_t sched) {
+    return sched != nullptr && sched->pxa_fail_clean;
+}
+
+static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+
+// bug #348: the compute-buffer bytes `graph` would need on each of the scheduler's backends, planned
+// exactly as ggml_backend_sched_reserve plans it but with nothing allocated or freed. bufts[i]/sizes[i]
+// for i < return value (= n_backends); a buffer type shared by two backends is counted once. The plan
+// it leaves is not backed by buffers: measure on a scheduler that is freed afterwards (a clone).
+extern "C" GGML_API int pxa_ggml_backend_sched_measure(ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        ggml_backend_buffer_type_t * bufts, size_t * sizes, int n_max);
+extern "C" GGML_API int pxa_ggml_backend_sched_measure(ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        ggml_backend_buffer_type_t * bufts, size_t * sizes, int n_max) {
+    if (!sched || !graph || n_max < sched->n_backends) return -1;
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+    ggml_backend_sched_split_graph(sched, graph);
+    size_t tmp[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    const bool ok = pxa_ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids,
+            sched->leaf_backend_ids, tmp);
+    ggml_backend_sched_reset(sched);
+    if (!ok) return -1;
+    for (int i = 0; i < sched->n_backends; i++) {
+        bufts[i] = sched->bufts[i];
+        sizes[i] = tmp[i];
+    }
+    return sched->n_backends;
 }
 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
@@ -1512,6 +1567,24 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
         SET_CAUSE(tensor, "1.inp");
         return cur_backend_id;
+    }
+
+    // bug #342: DELTA_NET (src[6]) and SSM_CONV (src[4]) WRITE a side-effect capture -- the per-step checkpoint rows
+    // or the replay pack -- into a pre-allocated buffer. They must run on the backend that owns that buffer: on any
+    // other backend the split hands the op a COPY of the capture and the rows land where nobody reads them. Without
+    // this the op has no weight to place it, so in a host-state context (-ngl 0, partial offload) the expansion pass
+    // put it on the GPU next to the matmuls a >= 32-token verify batch offloads, and a per-step rollback 40 deep
+    // restored stale rows. A capture on the device (full offload) names the backend the op already ran on.
+    {
+        const struct ggml_tensor * cap = tensor->op == GGML_OP_DELTA_NET ? tensor->src[6]
+                                       : tensor->op == GGML_OP_SSM_CONV  ? tensor->src[4] : NULL;
+        if (cap != NULL) {
+            cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, cap->view_src ? cap->view_src : cap, tensor);
+            if (cur_backend_id != -1) {
+                SET_CAUSE(tensor, "1.cap");
+                return cur_backend_id;
+            }
+        }
     }
 
     // operations with weights are preferably run on the same backend as the weights
@@ -1684,7 +1757,13 @@ static inline bool pxa_is_inline_container(const struct ggml_tensor * t) {
     return t->op == GGML_OP_REDUCE && t->op_params[3] == 1 && pxa_sched_container_inline();
 }
 
+static void pxa_sched_graph_note(const void * owner, const struct ggml_cgraph * g);   // PXA_DN_CF_DIRECT guard (below)
+
 static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // PXA_TSPLIT_EPI_PLAN_CACHE: a new split = new split graphs; the epilogue plan of the old ones is stale.
+    // Process-wide unique, so a scheduler freed and re-created at the same address never matches an old plan.
+    static std::atomic<uint64_t> pxa_split_gen_next{0};
+    sched->pxa_split_gen = ++pxa_split_gen_next;
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -2204,6 +2283,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
             graph_copy->nodes[graph_copy->n_nodes++] = graph->nodes[j];
         }
     }
+    pxa_sched_graph_note(sched, graph);   // PXA_DN_CF_DIRECT guard: the split views point into graph->nodes
 
     if (sched->n_copies > 1) {
         // add input copies as leafs so that they are allocated first
@@ -2316,7 +2396,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // through it (SIGSEGV at 0x10, Gemma-4 26B -c 32768 f16 KV on one V100). With the lever the
         // failure is returned to the caller, which can refuse the decode with an error.
         static const bool pxa_alloc_fail_clean = [](){ const char * e = getenv("PXA_ALLOC_FAIL_CLEAN"); return e && atoi(e) != 0; }();
-        if (!pxa_reserved && pxa_alloc_fail_clean) {
+        if (!pxa_reserved && (pxa_alloc_fail_clean || sched->pxa_fail_clean)) {
             fprintf(stderr, "%s: PXA_ALLOC_FAIL_CLEAN: re-plan could not reserve the compute buffers (out of device memory)\n", __func__);
             return false;
         }
@@ -2334,7 +2414,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 // The CUDA backend (ggml-cuda.cu) supplies the strong definition; when it is not linked in this
 // weak one answers 0, which keeps every arch-defaulted house lever below at its historical OFF.
 // Both definitions live in the same shared object, so the strong one wins at link time.
+#if defined(_MSC_VER) && defined(GGML_USE_CUDA)
+extern "C" int ggml_pxa_cuda_is_volta_only(void);   // MSVC has no weak symbols: ggml-cuda.cu's definition is the one
+#elif defined(_MSC_VER)
+extern "C" int ggml_pxa_cuda_is_volta_only(void) { return 0; }
+#else
 extern "C" __attribute__((weak)) int ggml_pxa_cuda_is_volta_only(void) { return 0; }
+#endif
 
 // pxa_house_lever(name): the shared shape of a LEVEL-defaulted house lever. An explicit
 // environment setting ALWAYS wins in both directions (so every A/B in the campaign log still
@@ -2425,6 +2511,40 @@ int ggml_backend_pxa_kqmask_mode(void) { return pxa_kqmask_mode_cached(); }
 int64_t ggml_backend_pxa_kqmask_trim_count(void) { return pxa_kqmask_trim_count; }
 int64_t ggml_backend_pxa_kqmask_trim_saved_bytes(void) { return pxa_kqmask_trim_saved; }
 
+// PXA_DN_CF_DIRECT guard (review-kernels L1): every scheduler records the node array of the graph it
+// last split; a split's graph (and a callback chunk of it) is a view into that array. A backend asks whether the view it
+// was handed ends where the whole graph ends: only then can it see every later reader of a tensor it computes. A full
+// graph (size > 0, not a view) is complete; a view no scheduler recorded is unknown and answers false (conservative).
+struct pxa_sched_graph_rec { const void * owner; ggml_tensor * const * begin; ggml_tensor * const * end; };
+static std::mutex          pxa_sched_graph_mx;
+static pxa_sched_graph_rec pxa_sched_graph_tab[32];
+static void pxa_sched_graph_note(const void * owner, const struct ggml_cgraph * g) {
+    std::lock_guard<std::mutex> lk(pxa_sched_graph_mx);
+    pxa_sched_graph_rec * slot = nullptr;
+    for (auto & r : pxa_sched_graph_tab) if (r.owner == owner) { slot = &r; break; }
+    if (!slot) for (auto & r : pxa_sched_graph_tab) if (!r.owner) { slot = &r; break; }
+    if (!slot) return;   // table full: the views of this scheduler stay unknown (false)
+    slot->owner = owner;
+    slot->begin = g->nodes;
+    slot->end   = g->nodes + g->n_nodes;
+}
+static void pxa_sched_graph_forget(const void * owner) {
+    std::lock_guard<std::mutex> lk(pxa_sched_graph_mx);
+    for (auto & r : pxa_sched_graph_tab) if (r.owner == owner) r = {};
+}
+// The prototype stays out of ggml-backend.h (every CUDA unit includes it: a header edit rebuilds the whole backend);
+// its one consumer (ggml-cuda/pxa/pxa-deltanet-fuse.cuh) declares it.
+extern "C" GGML_API bool ggml_backend_pxa_graph_reaches_end(const struct ggml_cgraph * g);
+bool ggml_backend_pxa_graph_reaches_end(const struct ggml_cgraph * g) {
+    if (g == nullptr || g->n_nodes <= 0) return false;
+    if (g->size > 0) return true;
+    std::lock_guard<std::mutex> lk(pxa_sched_graph_mx);
+    for (const auto & r : pxa_sched_graph_tab) {
+        if (r.owner && g->nodes >= r.begin && g->nodes < r.end) return g->nodes + g->n_nodes == r.end;
+    }
+    return false;
+}
+
 // true when `input` is a causal flash-attention KQ mask whose pad rows are provably dead
 static inline bool pxa_kqmask_trimmable(const struct ggml_tensor * input, size_t * live_bytes_out) {
     if (pxa_kqmask_mode_cached() == 0)            return false;
@@ -2479,7 +2599,8 @@ extern "C" void  ggml_cuda_tsg_drop(void * h);
 extern "C" bool  ggml_cuda_tsg_begin_capture(void * h, int chunk);
 extern "C" bool  ggml_cuda_tsg_end_capture(void * h, int chunk);
 extern "C" void  ggml_cuda_tsg_launch(void * h, int chunk, bool is_replay);
-extern "C" void  ggml_cuda_pxa_epi_plan_sched(int n, ggml_backend_t * backends, struct ggml_cgraph ** graphs);
+extern "C" void  ggml_cuda_pxa_epi_plan_sched(int n, ggml_backend_t * backends, struct ggml_cgraph ** graphs,
+                                              const void * key_owner, uint64_t key_gen);
 #endif
 
 // MEASURED UNSAFE AS A DEFAULT, 2026-09-03. It removes the per-split host block, so a
@@ -2545,6 +2666,41 @@ static bool pxa_sched_async_inputs(void) {   // default OFF; PXA_SCHED_ASYNC_INP
     return v;
 }
 
+// PXA_SCHED_ASYNC_MAX_TOKENS (2026-10-19): async split inputs only for decode-sized graphs.
+// At n_copies == 1 the async path drains the previous graph in alloc_graph (and llama drains before rewriting a reused
+// graph's inputs), so a prompt's back-to-back ubatches lose the overlap of the host building the next ubatch's inputs
+// (the 2048 x n_kv KQ mask: ~84 MB at a 20k context) with the device computing the previous one, and the big inputs go
+// through the pinned staging ring as an extra host copy. Measured on one V100 (Swift OneCard 27B, 20.5k-token prompt,
+// card 4, the one-V100 decode stack on): prefill 927/992 t/s with async inputs, 1025/1024 with PXA_SCHED_ASYNC_INPUTS=0.
+// The decode-side reason for the lever (the within-graph split overlap, +0.6% server decode) needs no more than a
+// verify width, so a graph whose ubatch is wider than this many tokens runs the blocking path, which is the engine's
+// path before the lever. Copy scheduling only: bit-identical either way. Default 64; 0 (or < 0) = every graph async
+// (the behaviour before this gate). llama sets the width per ubatch (ggml_backend_sched_set_async_batch).
+static std::atomic<int> g_pxa_async_batch_tokens{0};   // the ubatch width llama is about to run (0 = not told: small)
+static std::atomic<bool> g_pxa_last_graph_async{false}; // the last graph any scheduler ran took the async path
+static int pxa_sched_async_max_tokens(void) {
+    static const int v = [] {
+        const char * e = getenv("PXA_SCHED_ASYNC_MAX_TOKENS");
+        return (e && *e) ? atoi(e) : 64;
+    }();
+    return v;
+}
+// the per-graph answer: armed, and this graph is decode-sized
+static bool pxa_sched_async_now(void) {
+    if (!pxa_sched_async_inputs()) {
+        return false;
+    }
+    const int lim = pxa_sched_async_max_tokens();
+    return lim <= 0 || g_pxa_async_batch_tokens.load(std::memory_order_relaxed) <= lim;
+}
+
+// PXA_SCHED_ASYNC_WAR (2026-10-23, bug #350), default ON: see ggml_backend_sched_copy_inputs. =0 restores the old
+// guard (a probe switch; the old guard returns non-finite logits on long prompts under the tensor split).
+static bool pxa_sched_async_war(void) {
+    static const bool v = [] { const char * e = getenv("PXA_SCHED_ASYNC_WAR"); return e == nullptr || atoi(e) != 0; }();
+    return v;
+}
+
 // stage + enqueue a host->device copy on the split backend's compute stream; false when the
 // caller must fall back to the blocking path.
 // `key` is the SOURCE TENSOR, and it is what the ring dedups on - not the host address.
@@ -2554,7 +2710,10 @@ static bool pxa_sched_async_inputs(void) {   // default OFF; PXA_SCHED_ASYNC_INP
 // the failure class this lever was accused of.
 static bool pxa_sched_stage_h2d(ggml_backend_t split_backend, ggml_tensor * dst, const ggml_tensor * key, const void * src, size_t size) {
 #ifdef GGML_USE_CUDA
-    if (!pxa_sched_async_inputs() || dst == nullptr || src == nullptr) return false;
+    // the per-graph gate (PXA_SCHED_ASYNC_MAX_TOKENS): a wide graph opens no staging generation (compute_splits), so it
+    // must not stage into the previous graph's ring either (that crashed the first 2048-token prompt ubatch: cuBLAS
+    // "internal operation failed" after the staged copy landed in a generation whose event was never recorded)
+    if (!pxa_sched_async_now() || dst == nullptr || src == nullptr) return false;
     if (split_backend->iface.set_tensor_async == nullptr) return false;
     return ggml_cuda_stage_h2d(split_backend, dst, key, src, 0, size);
 #else
@@ -2581,7 +2740,19 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     // copied peer-to-peer, on the host otherwise (user inputs and host-side sources go
     // through synchronous copies that need the host to block anyway). n_copies == 1 has no
     // events and is unaffected.
-    const bool pxa_async_in = pxa_sched_async_inputs();
+    const bool pxa_async_in = pxa_sched_async_now();
+    // PXA_SCHED_ASYNC_WAR (2026-10-23, bug #350). The slot event marks the end of the LAST SPLIT WITH INPUTS on this
+    // backend, and the peer copies of this split run on the SOURCE backend's stream. With async inputs at n_copies == 1
+    // nothing else orders those copies (or a host fallback copy) after the destination's later work - splits without
+    // scheduler inputs, such as tensor-split segments - whose buffers ggml-alloc may hand to this split's input copies:
+    // a write-after-read race, open only while the destination is still busy, i.e. on long contexts. It returned
+    // non-finite logits from c6000 up under -sm tensor. The blocking path host-synchronizes the destination instead.
+    // Re-recording the slot event here, on the destination's own stream, makes every wait on it below (source-stream
+    // waits, host fallbacks) cover all destination work enqueued so far, without a host block. Copy ordering only.
+    if (pxa_async_in && sched->n_copies == 1 && pxa_sched_async_war() &&
+            sched->events[split_backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
+    }
     if ((sched->n_copies > 1 || pxa_async_in) && sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_t slot_event = sched->events[split_backend_id][sched->cur_copy];
         bool host_sync = false;
@@ -2628,6 +2799,14 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
         struct ggml_tensor * input = split->inputs[j];
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+        // PXA_KV_BAND_ANCHOR0: a user input carries llama's per-compute proof about its data in op_params (zero when
+        // there is none, see GGML_PXA_KQMASK_PROOF_MAGIC); the copy a backend op reads gets the same, every compute
+        // (only a proof is carried or cleared: every other input's copy keeps the zero op_params it always had)
+        if ((input->flags & GGML_TENSOR_FLAG_INPUT) && input->op == GGML_OP_NONE && input_cpy != nullptr && input_cpy != input &&
+            (input->op_params[0] == GGML_PXA_KQMASK_PROOF_MAGIC || input_cpy->op_params[0] == GGML_PXA_KQMASK_PROOF_MAGIC)) {
+            memcpy(input_cpy->op_params, input->op_params, sizeof(input->op_params));
+        }
+
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
             // if there are multiple inputs for the split, and we have already synchronized this backend, no need to do it again.
@@ -2647,7 +2826,10 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 // inputs from the user must be copied immediately to prevent the user
                 // overwriting the data before the copy is done
                 ggml_backend_sync_tag_push("copy_inputs:user_input_pre_h2d");
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                // PXA_SCHED_ASYNC_MAX_TOKENS: a blocking-path graph of an async-armed scheduler has the slot events, but they
+                // mark only the last split WITH inputs; without the alloc_graph drain the whole previous graph must be done
+                // (the path the engine takes with the lever off, where the events do not exist)
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL && (sched->n_copies > 1 || pxa_async_in)) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -2687,7 +2869,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             // wait for the split backend to finish using the input before overwriting it
             if (needs_sync[split_backend_id]) {
                 ggml_backend_sync_tag_push("copy_inputs:dev_input_needs_sync");
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL && (sched->n_copies > 1 || pxa_async_in)) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -2762,11 +2944,19 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                         const size_t padding = 512;
                         const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
 
+                        // A strided weight (one half of a merged ffn_gate_up_exps, see
+                        // ggml_split_merged_up_gate) has nb[2] = the MERGED expert stride but
+                        // ends nff rows into its last expert, so a run that ends at the last
+                        // expert would write past the copy and read past the host tensor. Clamp
+                        // to the tensor's extent; a contiguous weight never reaches the clamp
+                        // ((last_id+1)*nb[2] + padding_end <= ne[2]*nb[2] = ggml_nbytes).
+                        const size_t copy_size = std::min<size_t>(expert_size_copy + padding_end,
+                                                                  ggml_nbytes(input) - expert_offset);
                         ggml_backend_tensor_set_async(split_backend,
                                 input_cpy,
                                 (const uint8_t *)input->data + expert_offset, expert_offset,
                                 // copy a bit extra to ensure there are no NaNs in the padding
-                                expert_size_copy + padding_end);
+                                copy_size);
 
                     };
 
@@ -2802,7 +2992,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     ggml_backend_sync_tag_push("copy_inputs:peer_copy_fallback");
                     ggml_backend_synchronize(input_backend);
                     if (needs_sync[split_backend_id] || pxa_async_in) {
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        if (sched->events[split_backend_id][sched->cur_copy] != NULL && (sched->n_copies > 1 || pxa_async_in)) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
@@ -2927,6 +3117,7 @@ struct pxa_stage_graph_scope {
 #include <sys/stat.h>
 #endif
 #include <algorithm>
+#include "pxa-tp-adapt.h"
 
 static const uint8_t PXA_TP_DRIVER = 0xff;
 
@@ -2963,13 +3154,20 @@ static bool pxa_tsplit_is_segment(ggml_backend_sched_t sched, const ggml_backend
     return true;
 }
 
-// 0 = off (default). 1 = workers armed.
+// 0 = off. 1 = workers armed. Unset = AUTO since 2026-10-18 (cell C031): armed on a tensor split
+// over exactly four sm_60 cards (the CUDA backend's registered test, ggml_backend_set_tsplit_workers_auto), where they
+// measured +9.9% decode (4x P100 27B PXQN4 -sm tensor, 36.75 -> 40.38 t/s, greedy output identical); off elsewhere
+// (a V100 pair measured a loss, ledger pxa-tsplit-workers-dispatch). =0 keeps them off on the quad too.
 static int pxa_tsplit_workers_level(void) {
     static const int v = [] {
         const char * e = getenv("PXA_TSPLIT_WORKERS");
-        return (e && *e) ? atoi(e) : 0;
+        return (e && *e) ? atoi(e) : -1;   // -1 = auto (see above)
     }();
     return v;
+}
+static bool (*g_pxa_tsplit_workers_auto)(int n_dev) = nullptr;
+void ggml_backend_set_tsplit_workers_auto(bool (*fn)(int n_dev)) {
+    g_pxa_tsplit_workers_auto = fn;
 }
 
 static inline void pxa_tp_relax(void) {
@@ -2978,6 +3176,34 @@ static inline void pxa_tp_relax(void) {
 #else
     std::this_thread::yield();
 #endif
+}
+
+// PXA_TSPLIT_WORKER_YIELD (2026-10-21, cells C031/C125/C126): a rendezvous needs the driver AND every worker on a cpu
+// at the same time. On a shared node (the RC driver's 36-53 cpuset also carries VMs, builds and other lanes' servers)
+// a pure pause-spin keeps its core for a whole time slice even when the thread it waits for is runnable behind it on
+// the same core, so one oversubscribed core stalls the token for milliseconds at each of ~144 rendezvous a token.
+// After N pure pauses of one wait, every 64th further iteration calls sched_yield(), which hands the core to any
+// runnable thread there and returns at once when there is none. Scheduling only: the launch order on every stream is
+// the same either way (bit-identical). N = PXA_TSPLIT_WORKER_YIELD, 0 = never yield (the 10-18 behaviour).
+static uint64_t pxa_tp_yield_after(void) {
+    static const uint64_t v = [] {
+        const char * e = getenv("PXA_TSPLIT_WORKER_YIELD");
+        const long n = (e && *e) ? atol(e) : 0;
+        return (uint64_t) (n < 0 ? 0 : n);
+    }();
+    return v;
+}
+static inline void pxa_tp_relax_n(uint64_t n) {
+    const uint64_t after = pxa_tp_yield_after();
+    if (after != 0 && n > after && (n & 63) == 0) {
+#if defined(__linux__)
+        sched_yield();
+#else
+        std::this_thread::yield();
+#endif
+        return;
+    }
+    pxa_tp_relax();
 }
 
 // Worker d is pinned so its enqueue is not migrated off a warm cache mid-token. Default is the
@@ -3035,6 +3261,9 @@ static std::atomic<int> pxa_tp_pool_seq{0};
 // driver's own cpu to find its NUMA node, and a freshly spawned worker is placed by the kernel
 // wherever it likes -- on this two-socket host that regularly meant the far socket, i.e. exactly
 // the cross-socket pinning the default exists to avoid, decided by a thread-placement race.
+static std::vector<int> pxa_tp_proc_allowed(void);
+static int pxa_tp_thread_only_cpu(void);
+
 static std::vector<int> pxa_tp_build_cpus(int n_workers, int pool_index, int * driver_cpu, int * driver_node) {
     std::vector<int> v;
     if (driver_cpu)  { *driver_cpu  = -1; }
@@ -3065,24 +3294,107 @@ static std::vector<int> pxa_tp_build_cpus(int n_workers, int pool_index, int * d
     // the CUDA context state for a card hanging off the near socket's root complex was remote
     // too. That is a pinning bug, not a dispatch result, and it is invisible unless you look at
     // /sys: this box is node0 = 0-17,36-53 and node1 = 18-35,54-71.
+    // 2026-10-21 (C031/C125/C126): count down from the top of the node cpus the PROCESS may run on (its cpuset / taskset
+    // mask as taken at load), not the top of the node. Under a container cpuset that stops short of the node's top (36-47 on
+    // node0 36-53) the old pick asked for cpus outside the mask, pthread_setaffinity_np refused, and every worker ran
+    // unpinned. Where the whole node top is allowed (the RC's 36-53) the pick is unchanged. A driver thread pinned to one
+    // cpu keeps that cpu to itself while the mask allows it. Scheduling only. The pick: pxa_tp_pick_cpus (pxa-tp-adapt.h).
     std::vector<int> node_cpus = pxa_tp_node_cpus(node);
     if (node_cpus.empty()) {
         const int n = (int) std::thread::hardware_concurrency();
         for (int i = 0; i < n_workers && n > 0; ++i) { node_cpus.push_back(i % n); }
         std::sort(node_cpus.begin(), node_cpus.end());
+        node_cpus.erase(std::unique(node_cpus.begin(), node_cpus.end()), node_cpus.end());
     }
-    const int skip = pool_index * n_workers;
-    for (int i = (int) node_cpus.size() - 1 - skip; i >= 0 && (int) v.size() < n_workers; --i) {
-        v.push_back(node_cpus[i]);
-    }
+    v = pxa_tp_pick_cpus(node_cpus, pxa_tp_proc_allowed(), pxa_tp_thread_only_cpu(), n_workers, pool_index);
 #else
     GGML_UNUSED(n_workers); GGML_UNUSED(pool_index);
 #endif
     return v;
 }
 
-static void pxa_tp_pin_worker(const std::vector<int> & cpus, int id) {
+// PXA_TSPLIT_WORKER_PIN (2026-10-21, cells C031/C125/C126): how the default (no PXA_TSPLIT_WORKER_CPUS) places a worker.
+// 1 = one core per worker, the top of the driver's NUMA node counting down (the 10-18 behaviour). Under the RC driver's
+// shared 36-53 cpuset that put the four workers on 53..50, the cores other lanes' --cores jobs, VMs and builds also
+// use, and a worker pinned to a busy core cannot move to an idle one: the rendezvous waits out the co-tenant's slice.
+// 2 = the worker may run on any cpu of the driver's NUMA node that the process may use (same socket as before, so no
+// cross-socket access, but the kernel can move it off a busy core). 0 = no pinning at all. Scheduling only.
+// DEFAULT 2 (2026-10-21, P4 q2: quiet undetectable vs 1 at N=2, with a burner on the four top cores 37.05/39.59 vs
+// 24.26/26.35 t/s, RC2.1's fixed pin 1.55/0.87); =1 restores the one-core pin.
+static int pxa_tp_pin_mode(void) {
+    static const int v = [] {
+        const char * e = getenv("PXA_TSPLIT_WORKER_PIN");
+        return (e && *e) ? atoi(e) : 2;
+    }();
+    return v;
+}
+
 #if defined(__linux__)
+static std::vector<int> pxa_tp_mask_cpus(const cpu_set_t & m) {
+    std::vector<int> v;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (CPU_ISSET(c, &m)) { v.push_back(c); }
+    }
+    return v;
+}
+// The process's cpu mask (container cpuset / taskset) as the loading thread had it when this library was loaded: before any
+// placement in the process narrowed a thread. A driver thread that PXA_THREAD_PLACE, a --numa mode or the caller pinned to one
+// core would otherwise hand that one core to worker 0 and leave the rest unpinned (rc2.2 review THIN-3).
+static const std::vector<int> g_pxa_tp_proc_allowed = [] {
+    cpu_set_t m;
+    CPU_ZERO(&m);
+    return sched_getaffinity(0, sizeof(m), &m) == 0 ? pxa_tp_mask_cpus(m) : std::vector<int>();
+}();
+#endif
+
+// ascending; empty = unknown (the pick then takes the whole node)
+static std::vector<int> pxa_tp_proc_allowed(void) {
+#if defined(__linux__)
+    if (!g_pxa_tp_proc_allowed.empty()) { return g_pxa_tp_proc_allowed; }
+    cpu_set_t m;
+    CPU_ZERO(&m);
+    if (sched_getaffinity(0, sizeof(m), &m) == 0) { return pxa_tp_mask_cpus(m); }
+#endif
+    return {};
+}
+
+// the calling thread's cpu when it is pinned to exactly one, else -1
+static int pxa_tp_thread_only_cpu(void) {
+#if defined(__linux__)
+    cpu_set_t m;
+    CPU_ZERO(&m);
+    if (sched_getaffinity(0, sizeof(m), &m) == 0 && CPU_COUNT(&m) == 1) {
+        for (int c = 0; c < CPU_SETSIZE; ++c) {
+            if (CPU_ISSET(c, &m)) { return c; }
+        }
+    }
+#endif
+    return -1;
+}
+
+// The cpus of the driver's node that the process may run on (PXA_TSPLIT_WORKER_PIN=2's node-wide mask). Called on the driver.
+static std::vector<int> pxa_tp_node_allowed(int driver_node) {
+    std::vector<int> out;
+#if defined(__linux__)
+    const std::vector<int> allowed = pxa_tp_proc_allowed();
+    for (int c : pxa_tp_node_cpus(driver_node)) {
+        if (allowed.empty() || std::binary_search(allowed.begin(), allowed.end(), c)) { out.push_back(c); }
+    }
+#else
+    GGML_UNUSED(driver_node);
+#endif
+    return out;
+}
+
+static void pxa_tp_pin_worker(const std::vector<int> & cpus, const std::vector<int> & node_set, int id) {
+#if defined(__linux__)
+    if (!node_set.empty()) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int c : node_set) { CPU_SET(c, &set); }
+        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        return;
+    }
     if (id >= 0 && id < (int) cpus.size() && cpus[id] >= 0) {
         cpu_set_t set;
         CPU_ZERO(&set);
@@ -3090,7 +3402,7 @@ static void pxa_tp_pin_worker(const std::vector<int> & cpus, int id) {
         pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
     }
 #else
-    GGML_UNUSED(cpus); GGML_UNUSED(id);
+    GGML_UNUSED(cpus); GGML_UNUSED(node_set); GGML_UNUSED(id);
 #endif
 }
 
@@ -3107,6 +3419,7 @@ struct pxa_tp_pool {
     // published before `upto` takes the new generation, read after acquiring it
     ggml_backend_sched_split * splits = nullptr;
     const uint8_t *            owner  = nullptr;
+    const uint8_t *            incopy = nullptr;   // 1 = the driver copies this split's inputs, then its worker enqueues it
 
     std::atomic<uint64_t> upto{0};    // (gen << 32) | exclusive split index workers may enqueue to
     std::atomic<int>      quit{0};
@@ -3127,10 +3440,19 @@ struct pxa_tp_pool {
     std::unique_ptr<pxa_tp_slot[]> slot;
     std::vector<std::thread>       th;
     std::vector<int>               cpus;      // resolved on the driver thread in pxa_tp_pool_new
+    std::vector<int>               node_set;  // PXA_TSPLIT_WORKER_PIN=2: the node-wide mask every worker takes (else empty)
+
+    // PXA_TSPLIT_WORKERS_ADAPT state (driver-side only; see pxa_tp_adapt_workers and pxa-tp-adapt.h)
+    pxa_tp_adapt ad;
 
     // driver-side only
     uint32_t             gen = 0;
     std::vector<uint8_t> owner_buf;
+    std::vector<uint8_t> incopy_buf;
+    uint64_t             assign_gen = 0;   // pxa_tp_assign's result is kept for this split generation
+    int                  assign_n   = -1;
+    int                  assign_nw  = 0;
+    int                  assign_ni  = 0;   // of those, splits whose host inputs the driver copies (PXA_TSPLIT_WORKER_INPUT_EVAL)
     bool                 banner_done = false;
     int                  n_driver_splits = 0;
     int                  n_worker_splits = 0;
@@ -3138,8 +3460,71 @@ struct pxa_tp_pool {
     int                  driver_node = -1;
 };
 
+// PXA_TSPLIT_WORKER_INPUT_EVAL (default on, =0 the driver enqueues every split with inputs as before): a compute
+// segment whose inputs all come from the host (the token ids, positions, mask, the CPU embedding row: each device's
+// first segment of the graph) has its inputs copied by the driver, which touches only that device (a host wait on
+// its stream or its slot event, synchronous host-to-device copies), and is then enqueued by that device's worker.
+// The driver waits for that one worker only, so the four devices' first segments are enqueued side by side instead
+// of one after another (~80-126 us of host enqueue each on the 4x P100 27B split). Per-stream order is unchanged:
+// prior work on the device, the copy, the segment, the split event - the same sequence the driver issued.
+static bool pxa_tp_input_eval_on(void) {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_WORKER_INPUT_EVAL"); return !(e && *e && pxa_env_value_off(e)); }();
+    return v;
+}
+// PXA_TSPLIT_ASSIGN_CACHE (default on, =0 assigns every graph): the split owners are a function of the split graphs
+// only, so a reused graph (same split generation) keeps the previous assignment instead of walking every node again.
+static bool pxa_tp_assign_cache_on(void) {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_ASSIGN_CACHE"); return !(e && *e && pxa_env_value_off(e)); }();
+    return v;
+}
+// the event the sequential loop records after a split with inputs (or after every split with more than one copy slot)
+static void pxa_tp_split_event(ggml_backend_sched_t sched, const ggml_backend_sched_split * split) {
+    if (split->n_inputs > 0 || sched->n_copies > 1) {
+        if (sched->events[split->backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->events[split->backend_id][sched->cur_copy]);
+        }
+    }
+}
+// PXA_TSPLIT_INPUT_EVAL_OAE (default on, =0 the old gate: no split goes to a worker with its inputs while the
+// scheduler has only_active_experts set): only_active_experts is set for EVERY model by default (common's
+// --no-offload-only-active-experts turns it off), dense ones included, so the old blanket test kept the lever from
+// ever firing (P4 window 4, HEAD_US: the four first segments stayed on the driver loop). The only copy_inputs path
+// that flag changes is the partial expert copy, and that arm is taken only for an input in a WEIGHTS buffer; a split
+// with such an input stays on the driver below, flag or not.
+static bool pxa_tp_input_eval_oae_on(void) {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_INPUT_EVAL_OAE"); return !(e && *e && pxa_env_value_off(e)); }();
+    return v;
+}
+// every input of the split is host-resident (a user input or a host buffer): copy_inputs then touches the split's own
+// device only. A peer copy runs on the SOURCE device's stream, so a device-sourced input keeps the split on the driver.
+static bool pxa_tp_inputs_host(ggml_backend_sched_t sched, const ggml_backend_sched_split * split) {
+    if (sched->only_active_experts && !pxa_tp_input_eval_oae_on()) {
+        return false;
+    }
+    for (int j = 0; j < split->n_inputs; ++j) {
+        ggml_tensor * input = split->inputs[j];
+        // a weight as a split input (host-offloaded weights; the only_active_experts partial expert copy and the
+        // MoE prefetch read these) keeps the split on the driver
+        if ((input->buffer && ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) ||
+                (input->view_src && input->view_src->buffer &&
+                 ggml_backend_buffer_get_usage(input->view_src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+            return false;
+        }
+        if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            continue;
+        }
+        ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, input);
+        ggml_backend_buffer_t buf = input->view_src ? input->view_src->buffer : input->buffer;
+        if (ib != NULL && buf != NULL && ggml_backend_buffer_is_host(buf) && ggml_backend_is_cpu(ib)) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 static void pxa_tp_worker_main(pxa_tp_pool * p, int id) {
-    pxa_tp_pin_worker(p->cpus, id);
+    pxa_tp_pin_worker(p->cpus, p->node_set, id);
 #if defined(__linux__)
     p->slot[id].cpu.store(sched_getcpu(), std::memory_order_relaxed);
 #endif
@@ -3176,7 +3561,7 @@ static void pxa_tp_worker_main(pxa_tp_pool * p, int id) {
             // same devices, a core taken away from the peer context's enqueue thread). So: spin
             // the budget, then park until the driver publishes again.
             if (++idle <= p->spin_budget) {
-                pxa_tp_relax();
+                pxa_tp_relax_n(idle);
                 continue;
             }
             p->sleepers.fetch_add(1);                       // seq_cst: pairs with the release store
@@ -3206,6 +3591,9 @@ static void pxa_tp_worker_main(pxa_tp_pool * p, int id) {
             if (ec != GGML_STATUS_SUCCESS) {
                 p->slot[id].status.store((int) ec, std::memory_order_relaxed);
             }
+            if (p->incopy[k]) {
+                pxa_tp_split_event(p->sched, s);   // what the driver records after a split with inputs
+            }
         }
         cursor = x;
         p->slot[id].done.store(((uint64_t) my_gen << 32) | (uint32_t) cursor, std::memory_order_release);
@@ -3221,12 +3609,25 @@ static void pxa_tp_wait(pxa_tp_pool * p, int idx) {
     for (int d = 0; d < p->n_workers; ++d) {
         uint64_t spins = 0;
         while (p->slot[d].done.load(std::memory_order_acquire) != want) {
-            pxa_tp_relax();
+            pxa_tp_relax_n(spins + 1);
             if (++spins == (uint64_t) 1 << 32) {
                 fprintf(stderr, "PXA_TSPLIT_WORKERS: worker %d has not reached split %d of graph %u\n",
                         d, idx, p->gen);
                 spins = 0;
             }
+        }
+    }
+}
+
+// one worker only (PXA_TSPLIT_WORKER_INPUT_EVAL): the driver is about to touch that worker's device and nothing else
+static void pxa_tp_wait_one(pxa_tp_pool * p, int d, int idx) {
+    const uint64_t want = ((uint64_t) p->gen << 32) | (uint32_t) idx;
+    uint64_t spins = 0;
+    while (p->slot[d].done.load(std::memory_order_acquire) != want) {
+        pxa_tp_relax_n(spins + 1);
+        if (++spins == (uint64_t) 1 << 32) {
+            fprintf(stderr, "PXA_TSPLIT_WORKERS: worker %d has not reached split %d of graph %u\n", d, idx, p->gen);
+            spins = 0;
         }
     }
 }
@@ -3254,6 +3655,17 @@ static pxa_tp_pool * pxa_tp_pool_new(ggml_backend_sched_t sched, int n_workers) 
     p->gen = 0;
     // resolved HERE, on the driver thread, before a worker exists (see pxa_tp_build_cpus)
     p->cpus = pxa_tp_build_cpus(n_workers, pxa_tp_pool_seq.fetch_add(1), &p->driver_cpu, &p->driver_node);
+    {
+        // PXA_TSPLIT_WORKER_PIN: an explicit PXA_TSPLIT_WORKER_CPUS list always pins one core per worker as asked;
+        // mode 0 drops the default single-core list; mode 2 swaps it for the node-wide allowed mask
+        const char * ec = getenv("PXA_TSPLIT_WORKER_CPUS");
+        const bool explicit_cpus = ec && *ec;
+        if (!explicit_cpus && pxa_tp_pin_mode() == 0) {
+            p->cpus.clear();
+        } else if (!explicit_cpus && pxa_tp_pin_mode() == 2) {
+            p->node_set = pxa_tp_node_allowed(p->driver_node);
+        }
+    }
     p->spin_budget = [] {
         const char * e = getenv("PXA_TSPLIT_WORKER_SPIN");
         const long v = (e && *e) ? atol(e) : 100000;   // ~0.3 ms of pauses on this box
@@ -3280,6 +3692,49 @@ static void pxa_tp_pool_free(pxa_tp_pool * p) {
     delete p;
 }
 
+// PXA_TSPLIT_WORKERS_ADAPT (2026-10-21, cells C031/C125/C126): pick, per decode graph, the enqueue workers or the
+// plain sequential loop, by the measured token period of each. The workers' ~144 rendezvous a token need the driver
+// and every worker on a cpu at once; on a shared node (the RC driver's 36-53 cpuset carries VMs, builds and other
+// lanes' servers) that fails at most rendezvous and the token collapses 3-10x (P01 pair, workers pinned to two busy
+// cores: 38.8 -> 2.5-4.4 t/s; same burners with the plain loop 32-37). The two modes put the same launches on every
+// stream in the same order (see the block above pxa_tsplit_is_segment), so switching between graphs is bit-identical.
+// Policy: a period is the wall time from one graph's entry to the next one's, sampled only between two graphs of the
+// same split count less than a second apart. Start on the plain loop; run the preferred mode; probe the other mode for
+// up to 3 graphs after the first 2 samples and then every `interval` graphs (the first period after a switch is
+// dropped unless it is already twice the preferred median), stopping early when it is clearly (1.5x) slower; take the
+// other mode when its median is >= 3% faster than the preferred one's last 8. A probe that loses grows the interval
+// 2x (4x past 1.5x slower, 8x past 3x; 16 .. 512 graphs); a win resets it. The preferred mode drifting above the value
+// it was chosen at (median 1.25x, or the last two periods 2x: contention arriving) triggers a probe at once.
+// Default 1 (on); =0 = always the workers (the 10-18 rule).
+static int pxa_tp_adapt_level(void) {
+    static const int v = [] {
+        const char * e = getenv("PXA_TSPLIT_WORKERS_ADAPT");
+        return (e && *e) ? atoi(e) : 1;
+    }();
+    return v;
+}
+
+static bool pxa_tp_adapt_log(void) {
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_WORKERS_ADAPT_LOG"); return e && *e && atoi(e) != 0; }();
+    return v;
+}
+
+// true = this graph runs on the workers (the state machine: pxa-tp-adapt.h)
+static bool pxa_tp_adapt_workers(pxa_tp_pool * p, int n_splits) {
+    if (pxa_tp_adapt_level() <= 0) { return true; }
+    // llama states the ubatch width before each graph (0 = not told = small)
+    const int ntok = g_pxa_async_batch_tokens.load(std::memory_order_relaxed);
+    pxa_tp_adapt_decision dec;
+    const int mode = pxa_tp_adapt_step(p->ad, ggml_time_us(), n_splits, ntok, &dec);
+    if (dec.decided && pxa_tp_adapt_log()) {
+        fprintf(stderr, "PXA_TSPLIT_WORKERS_ADAPT: probe %s %.0f us vs %s %.0f us -> %s (interval %d, switches %d, "
+                        "graphs workers %ld plain %ld)\n",
+                dec.probed ? "workers" : "plain", dec.m_probe, dec.kept ? "workers" : "plain", dec.m_kept,
+                p->ad.pref ? "workers" : "plain", p->ad.interval, p->ad.switches, p->ad.graphs[1], p->ad.graphs[0]);
+    }
+    return mode == 1;
+}
+
 // Decide, once per graph, who enqueues each split. The driver keeps a split when it touches more
 // than this backend's stream or needs host work in the middle of the graph:
 //   * any split on a backend with no worker (the CPU backend, or a device beyond the pool);
@@ -3290,7 +3745,13 @@ static void pxa_tp_pool_free(pxa_tp_pool * p) {
 // Returns the number of splits handed to workers.
 static int pxa_tp_assign(ggml_backend_sched_t sched, pxa_tp_pool * p) {
     const int n = sched->n_splits;
+    if (pxa_tp_assign_cache_on() && p->assign_n == n && p->assign_gen == sched->pxa_split_gen &&
+            (int) p->owner_buf.size() == n && (int) p->incopy_buf.size() == n) {
+        return p->assign_nw;
+    }
     p->owner_buf.assign((size_t) n, PXA_TP_DRIVER);
+    p->incopy_buf.assign((size_t) n, 0);
+    const bool input_eval = pxa_tp_input_eval_on();
     int n_worker = 0;
     for (int i = 0; i < n; ++i) {
         const ggml_backend_sched_split * split = &sched->splits[i];
@@ -3298,12 +3759,23 @@ static int pxa_tp_assign(ggml_backend_sched_t sched, pxa_tp_pool * p) {
         if (b < 0 || b >= p->n_workers) {
             continue;
         }
-        if (split->n_inputs > 0 || !pxa_tsplit_is_segment(sched, split)) {
+        if (!pxa_tsplit_is_segment(sched, split)) {
             continue;
+        }
+        if (split->n_inputs > 0) {
+            if (!input_eval || !pxa_tp_inputs_host(sched, split)) {
+                continue;
+            }
+            p->incopy_buf[(size_t) i] = 1;
         }
         p->owner_buf[(size_t) i] = (uint8_t) b;
         n_worker++;
     }
+    p->assign_gen = sched->pxa_split_gen;
+    p->assign_n   = n;
+    p->assign_nw  = n_worker;
+    p->assign_ni  = 0;
+    for (int i = 0; i < n; ++i) p->assign_ni += p->incopy_buf[(size_t) i];
     return n_worker;
 }
 
@@ -3435,7 +3907,7 @@ static bool pxa_tsg_all_input_run(ggml_backend_sched * sched, int from, int to) 
 // graphs, in stream order (their cross-device input copy follows the graph launch on the producer's stream).
 #define PXA_TSG_TAIL_MAX 3
 static bool pxa_tsg_tail_on(void) {
-    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_GRAPH_TAIL"); return !(e && *e && atoi(e) == 0); }();
+    static const bool v = [] { const char * e = getenv("PXA_TSPLIT_GRAPH_TAIL"); return !(e && *e && pxa_env_value_off(e)); }();
     return v;
 }
 static int pxa_tsg_region_start(ggml_backend_sched_t sched, int * r_end) {
@@ -3726,11 +4198,70 @@ static int pxa_tsg_token(ggml_backend_sched_t sched, int r0,
 #endif
 }
 
+// PXA_SCHED_HEAD_US=1 (diagnostic, default off; 2026-10-18): where the host time between entering
+// compute_splits and the first device enqueue goes, on the sequential split loop. Per graph with >= 64 splits:
+// entry->after the epilogue plan, then per split 0..7 the copy_inputs and eval host time; mean per graph every 256.
+static bool pxa_sched_head_on() {
+    static const bool v = [] { const char * e = getenv("PXA_SCHED_HEAD_US"); return e && atoi(e) != 0; }();
+    return v;
+}
+struct pxa_sched_head_acc {
+    int64_t n = 0, plan = 0, pre = 0, cp[8] = {0}, ev[8] = {0}, cn[8] = {0}, tot8 = 0;
+    char    be[8][24] = {{0}};
+    void dump() {
+        if (n == 0) return;
+        fprintf(stderr, "PXA_SCHED_HEAD_US graphs=%lld mean us: plan %.1f | pre-loop %.1f | first 8 splits total %.1f\n",
+                (long long) n, plan / (double) n, pre / (double) n, tot8 / (double) n);
+        // per split over the graphs whose loop ran it (pass 8e review R10: a worker-owned split is not on this loop)
+        for (int i = 0; i < 8; ++i) {
+            if (cn[i] == 0) { fprintf(stderr, "PXA_SCHED_HEAD_US   split %d: never on the sequential loop (worker-owned)\n", i); continue; }
+            fprintf(stderr, "PXA_SCHED_HEAD_US   split %d [%s] copy_inputs %.1f eval %.1f (%lld graphs)\n", i, be[i],
+                    cp[i] / (double) cn[i], ev[i] / (double) cn[i], (long long) cn[i]);
+        }
+        n = plan = pre = tot8 = 0; for (int i = 0; i < 8; ++i) { cp[i] = ev[i] = cn[i] = 0; }
+    }
+};
+static pxa_sched_head_acc g_pxa_sched_head;
+
+// PXA_SCHED_HEAD_US, once (g12 2026-10-22): the first and last six splits of the graph being sampled -- backend, node
+// count, owner (driver / worker / worker after a driver input copy) and every input's source backend and buffer -- so a
+// head segment that waits on a peer copy can be read off the log instead of guessed from a timeline
+static void pxa_sched_head_splits_print(ggml_backend_sched_t sched, const uint8_t * owner, const uint8_t * incopy) {
+    static bool said = false;
+    if (said) return;
+    said = true;
+    const int n = sched->n_splits;
+    for (int i = 0; i < n; ++i) {
+        if (i == 6 && n > 12) { i = n - 6; }
+        const ggml_backend_sched_split * sp = &sched->splits[i];
+        const ggml_tensor * n0 = sp->graph.n_nodes > 0 ? sp->graph.nodes[0] : nullptr;
+        const ggml_tensor * nl = sp->graph.n_nodes > 0 ? sp->graph.nodes[sp->graph.n_nodes - 1] : nullptr;
+        const char * own = "driver";
+        char ownb[24];
+        if (owner && owner[i] != PXA_TP_DRIVER) { snprintf(ownb, sizeof(ownb), "%s%d", incopy && incopy[i] ? "incopy-w" : "w", (int) owner[i]); own = ownb; }
+        fprintf(stderr, "PXA_SCHED_HEAD_US   graph split %d/%d [%s n%d in%d %s] first %s(%s) last %s(%s)\n", i, n,
+                ggml_backend_name(sched->backends[sp->backend_id]), sp->graph.n_nodes, sp->n_inputs, own,
+                n0 ? ggml_op_name(n0->op) : "-", n0 ? n0->name : "-", nl ? ggml_op_name(nl->op) : "-", nl ? nl->name : "-");
+        for (int j = 0; j < sp->n_inputs; ++j) {
+            const ggml_tensor * in = sp->inputs[j];
+            ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, (ggml_tensor *) in);
+            ggml_backend_buffer_t buf = in->view_src ? in->view_src->buffer : in->buffer;
+            fprintf(stderr, "PXA_SCHED_HEAD_US     input %d %s op %s from %s buf %s%s%s\n", j, in->name, ggml_op_name(in->op),
+                    ib ? ggml_backend_name(ib) : "-", buf ? ggml_backend_buffer_name(buf) : "-",
+                    (in->flags & GGML_TENSOR_FLAG_INPUT) ? " INPUT" : "", in->view_src ? " view" : "");
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
 
+    const bool    pxa_hd    = pxa_sched_head_on() && sched->n_splits >= 64;
+    const int64_t pxa_hd_t0 = pxa_hd ? ggml_time_us() : 0;
     // PXA_SCHED_TIMELINE / PXA_SCHED_ASYNC_INPUTS: one epoch per scheduler graph
     // (== one llama_decode at -ub == -b)
-    const bool pxa_async_graph = pxa_sched_async_inputs();
+    const bool pxa_async_graph = pxa_sched_async_now();
+    sched->pxa_prev_async = pxa_async_graph;
+    g_pxa_last_graph_async.store(pxa_async_graph, std::memory_order_relaxed);
     ggml_backend_sync_epoch();
 #ifdef GGML_USE_CUDA
     ggml_cuda_timeline_epoch();
@@ -3742,11 +4273,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             pxa_epi_be[i] = sched->backends[sched->splits[i].backend_id];
             pxa_epi_g[i]  = &sched->splits[i].graph;
         }
-        ggml_cuda_pxa_epi_plan_sched(sched->n_splits, pxa_epi_be.data(), pxa_epi_g.data());
+        ggml_cuda_pxa_epi_plan_sched(sched->n_splits, pxa_epi_be.data(), pxa_epi_g.data(), sched, sched->pxa_split_gen);
     } else {
-        ggml_cuda_pxa_epi_plan_sched(0, nullptr, nullptr);
+        ggml_cuda_pxa_epi_plan_sched(0, nullptr, nullptr, nullptr, 0);
     }
 #endif
+    const int64_t pxa_hd_t1 = pxa_hd ? ggml_time_us() : 0;
+    bool pxa_hd_pre = false, pxa_hd_done = false;   // PXA_SCHED_HEAD_US: first split this loop ran / graph sample taken
     pxa_stage_graph_scope pxa_stage_scope(pxa_async_graph);
 
     for (auto & item : sched->needs_sync) item = true;
@@ -4069,13 +4602,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             "segments only; reduce splits stay eager)\n", pxa_tsplit_replay_level());
         }
     }
-    if (pxa_tsplit_workers_level() > 0 && pxa_tsplit_here && !moe_prefetch) {
+    if (pxa_tsplit_workers_level() != 0 && pxa_tsplit_here && !moe_prefetch) {
         int n_dev = 0;
         for (int b = 0; b < sched->n_backends; ++b) {
             if (ggml_backend_is_cpu(sched->backends[b])) { break; }
             n_dev++;
         }
-        if (n_dev >= 2) {
+        const bool pxa_workers_on = pxa_tsplit_workers_level() > 0 ||
+                                    (g_pxa_tsplit_workers_auto != nullptr && g_pxa_tsplit_workers_auto(n_dev));
+        if (n_dev >= 2 && pxa_workers_on) {
             if (!sched->tp_pool) {
                 sched->tp_pool = pxa_tp_pool_new(sched, n_dev);
             }
@@ -4083,6 +4618,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 tp = sched->tp_pool;
             }
         }
+    }
+    if (tp && !pxa_tp_adapt_workers(tp, sched->n_splits)) {
+        tp = nullptr;                           // PXA_TSPLIT_WORKERS_ADAPT: this graph runs the plain loop
     }
     if (tp) {
         tp->n_worker_splits = pxa_tp_assign(sched, tp);
@@ -4092,6 +4630,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         } else {
             tp->splits = splits;
             tp->owner  = tp->owner_buf.data();
+            tp->incopy = tp->incopy_buf.data();
             for (int d = 0; d < tp->n_workers; ++d) {
                 tp->slot[d].status.store(0, std::memory_order_relaxed);
             }
@@ -4108,10 +4647,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     d ? "," : "", tp->slot[d].cpu.load(std::memory_order_relaxed));
                 }
                 fprintf(stderr, "PXA_TSPLIT_WORKERS: %d persistent enqueue workers on cpus %s "
-                                "(driver cpu %d, numa node %d); %d of %d splits to workers, "
-                                "%d kept by the driver (reduces + inputs)\n",
+                                "(driver cpu %d, numa node %d; pin %s, yield after %llu); %d of %d splits to workers "
+                                "(%d with driver-copied host inputs), %d kept by the driver (reduces + inputs)\n",
                         tp->n_workers, cpus, tp->driver_cpu, tp->driver_node,
-                        tp->n_worker_splits, sched->n_splits, tp->n_driver_splits);
+                        !tp->node_set.empty() ? "node-set" : tp->cpus.empty() ? "none" : "one-core",
+                        (unsigned long long) pxa_tp_yield_after(),
+                        tp->n_worker_splits, sched->n_splits, tp->assign_ni, tp->n_driver_splits);
             }
         }
     }
@@ -4170,7 +4711,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (tp) {
             if (tp->owner[i] != PXA_TP_DRIVER) {
-                continue;                       // a worker owns this split
+                if (!tp->incopy[i]) {
+                    continue;                   // a worker owns this split
+                }
+                // PXA_TSPLIT_WORKER_INPUT_EVAL: once its worker has drained to here, copy the host inputs onto
+                // the split's device (the only stream this touches), then let the worker enqueue the segment
+                pxa_tp_release_to(tp, i);
+                pxa_tp_wait_one(tp, split_backend_id, i);
+                ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+                if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
+                    sched->needs_sync[split_backend_id] = true;
+                } else {
+                    for (int j = 0; j < split->n_inputs; ++j) {
+                        if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
+                            sched->needs_sync[split_backend_id] = true;
+                        }
+                    }
+                }
+                pxa_tp_release_to(tp, i + 1);
+                continue;
             }
             // let the workers run up to here, then wait for them: nothing this thread is about
             // to enqueue may land on a device stream ahead of work that precedes it in the graph
@@ -4194,8 +4753,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // pass 8e review R10: time the splits this loop actually runs (worker-owned ones `continue` above) until the
+        // graph's sample is taken at the first run split >= 7 (or the last split)
+        const bool    pxa_hd_i  = pxa_hd && !pxa_hd_done;
+        const int64_t pxa_hd_c0 = pxa_hd_i ? ggml_time_us() : 0;
+        if (pxa_hd_i && !pxa_hd_pre) { g_pxa_sched_head.pre += pxa_hd_c0 - pxa_hd_t1; pxa_hd_pre = true; }
         // copy the input tensors to the split backend
         ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+        const int64_t pxa_hd_c1 = pxa_hd_i ? ggml_time_us() : 0;
 
         // ids are now final and host-visible; enqueue the selected expert
         // slices of this split's host-computed MoE matmuls (up/gate and down
@@ -4235,6 +4800,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 #ifdef GGML_USE_CUDA
         if (pxa_seg) { ggml_cuda_tsplit_segment_set(0); }
 #endif
+        if (pxa_hd_i) {
+            const int64_t c2 = ggml_time_us();
+            if (i < 8) {
+                g_pxa_sched_head.cp[i] += pxa_hd_c1 - pxa_hd_c0;
+                g_pxa_sched_head.ev[i] += c2 - pxa_hd_c1;
+                g_pxa_sched_head.cn[i] += 1;
+                if (!g_pxa_sched_head.be[i][0]) { snprintf(g_pxa_sched_head.be[i], sizeof(g_pxa_sched_head.be[i]), "%s n%d in%d", ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs); }
+            }
+            if (i >= 7 || i == sched->n_splits - 1) {
+                pxa_hd_done = true;
+                g_pxa_sched_head.tot8 += c2 - pxa_hd_t0;
+                g_pxa_sched_head.plan += pxa_hd_t1 - pxa_hd_t0;
+                if (++g_pxa_sched_head.n == 256) {
+                    g_pxa_sched_head.dump();
+                    pxa_sched_head_splits_print(sched, tp ? tp->owner : nullptr, tp ? tp->incopy : nullptr);
+                }
+            }
+        }
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
         }
@@ -4399,6 +4982,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    pxa_sched_graph_forget(sched);
     // PXA_TSPLIT_WORKERS: the workers are persistent for the life of the scheduler, so this is
     // the only place they are joined. sched->splits is freed below and they hold a pointer to it.
     pxa_tp_pool_free(sched->tp_pool);
@@ -4471,7 +5055,13 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
                 const size_t base = w << BITSET_SHR;
 
                 while (bits != 0) {
+#if defined(_MSC_VER)
+                    unsigned long b_ = 0;
+                    _BitScanForward(&b_, (unsigned long) bits);
+                    const size_t b = (size_t) b_;
+#else
                     const size_t b = (size_t) __builtin_ctz(bits);
+#endif
                     bits &= bits - 1;
 
                     const size_t i = base + b;
@@ -4669,7 +5259,8 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             ggml_backend_sync_tag_pop();
         }
-    } else if (pxa_sched_async_inputs()) {
+    } else if (pxa_sched_async_now() || (sched->pxa_prev_async && pxa_sched_async_inputs())) {
+        // (PXA_SCHED_ASYNC_MAX_TOKENS: also once when a wide graph follows an async one, which may still be running)
         // n_copies == 1 and no host block per split: the previous graph is still running and
         // the caller is about to overwrite the very tensors it is reading, on a stream that
         // orders against nothing (see the root-cause note at pxa_sched_async_inputs). There
@@ -4763,7 +5354,15 @@ int ggml_backend_sched_get_n_replans(ggml_backend_sched_t sched) {
 }
 
 bool ggml_backend_sched_async_inputs(void) {
-    return pxa_sched_async_inputs();
+    // a wide graph right after an async one still drains once (that graph may still be running)
+    return pxa_sched_async_now() || (pxa_sched_async_inputs() && g_pxa_last_graph_async.load(std::memory_order_relaxed));
+}
+
+// PXA_SCHED_ASYNC_MAX_TOKENS: the width of the ubatch about to run (declared at its one caller, src/llama.cpp, so the
+// public header and every backend TU that includes it stay untouched)
+extern "C" GGML_API void ggml_backend_sched_set_async_batch(int n_tokens);
+extern "C" GGML_API void ggml_backend_sched_set_async_batch(int n_tokens) {
+    g_pxa_async_batch_tokens.store(n_tokens, std::memory_order_relaxed);
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

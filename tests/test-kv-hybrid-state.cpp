@@ -282,7 +282,8 @@ void test_gpu_fallback_np2() {
 }
 
 // ---- #214 -------------------------------------------------------------------------------
-void test_ple_spec_rollback(llama_model * model, int mode_req, const char * name, int n_drafts = 3) {
+void test_ple_spec_rollback(llama_model * model, int mode_req, const char * name, int n_drafts = 3,
+                            int want_mode = -2, const char * want_name = nullptr) {
     const int n_p = 10;
     std::vector<tok> prompt;
     for (int i = 0; i < n_p; ++i) prompt.push_back({ T(500 + i), i, 0, false });
@@ -298,10 +299,17 @@ void test_ple_spec_rollback(llama_model * model, int mode_req, const char * name
     llama_context * ctx = make_ctx(model, 256, 64, 64, 1);
     decode(ctx, prompt);
     const int mode = llama_spec_ckpt_init(ctx, mode_req, 1 + n_drafts);
-    if (mode != mode_req) {
-        printf("SKIP   [fa %s] %s (mode %d resolved to %d on this backend)\n", g_fa ? "on " : "off", name, mode_req, mode);
+    if (mode == LLAMA_SPEC_CKPT_NONE) {
+        printf("SKIP   [fa %s] %s (mode %d resolved to none on this backend)\n", g_fa ? "on " : "off", name, mode_req);
         llama_free(ctx);
         return;
+    }
+    if (mode != mode_req) {
+        // bug #342: a mode the backend cannot honour resolves to another one; the rollback must still be exact
+        printf("NOTE   [fa %s] %s: mode %d resolved to %d on this backend\n", g_fa ? "on " : "off", name, mode_req, mode);
+    }
+    if (want_mode >= 0) {
+        verdict(want_name, mode == want_mode, "resolved mode %.0f", (double) mode);
     }
     llama_spec_ckpt_save(ctx, 0);
     // verify t1 plus n_drafts drafts that are all rejected: only t1 is accepted, so the
@@ -409,13 +417,16 @@ void test_decode_refused_whole() {
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s tiny-qwen4exp.gguf [tiny-qwen4exp-ple.gguf]\n", argv[0]);
+        fprintf(stderr, "usage: %s tiny-qwen4exp.gguf [tiny-qwen4exp-ple.gguf [tiny-qwen4exp-ple-s64.gguf]]\n", argv[0]);
         return 2;
     }
     llama_backend_init();
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
+    // bug #341: on a GPU build these layers' caches sit in a pinned host buffer (CUDA_Host), the case the gpu-fallback
+    // save asserted on. KV_HYBRID_NGL=<n> offloads n layers instead (a manual check of the device-resident path).
+    if (const char * e = getenv("KV_HYBRID_NGL")) mp.n_gpu_layers = atoi(e);
     g_model = llama_model_load_from_file(argv[1], mp);
     if (!g_model) { fprintf(stderr, "load failed: %s\n", argv[1]); return 1; }
     g_n_vocab = llama_n_vocab(g_model);
@@ -424,6 +435,11 @@ int main(int argc, char ** argv) {
     if (argc > 2) {
         ple = llama_model_load_from_file(argv[2], mp);
         if (!ple) { fprintf(stderr, "load failed: %s\n", argv[2]); return 1; }
+    }
+    llama_model * ple64 = nullptr;   // bug #342: the PLE fixture at 64-wide DeltaNet heads
+    if (argc > 3) {
+        ple64 = llama_model_load_from_file(argv[3], mp);
+        if (!ple64) { fprintf(stderr, "load failed: %s\n", argv[3]); return 1; }
     }
 
     for (bool fa : { false, true }) {
@@ -445,9 +461,18 @@ int main(int argc, char ** argv) {
             test_ple_spec_rollback(ple, LLAMA_SPEC_CKPT_PER_STEP,     "#214 PLE rollback 40 deep (per-step)", 40);
             test_ple_legacy_blob(ple);
         }
+        if (ple64) {
+            // bug #342: 64-wide heads are a width the CUDA delta-net kernel runs, so per-step must stay per-step
+            // wherever the states live (and roll back exactly); only the 32-wide fixture may be refused it
+            test_ple_spec_rollback(ple64, LLAMA_SPEC_CKPT_GPU_FALLBACK, "#342 64-wide PLE rollback (gpu-fallback)");
+            test_ple_spec_rollback(ple64, LLAMA_SPEC_CKPT_PER_STEP,     "#342 64-wide PLE rollback (per-step)", 3,
+                                   LLAMA_SPEC_CKPT_PER_STEP, "#342 64-wide per-step stays per-step");
+            test_ple_spec_rollback(ple64, LLAMA_SPEC_CKPT_PER_STEP,     "#342 64-wide PLE rollback 40 deep (per-step)", 40);
+        }
     }
 
     if (ple) llama_free_model(ple);
+    if (ple64) llama_free_model(ple64);
     llama_free_model(g_model);
     llama_backend_free();
 

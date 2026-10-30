@@ -253,6 +253,11 @@ struct llama_kpool_inputs {
 // plan a reserve build leaves behind is never filled (llama_kpool_set_inputs refuses it).
 void llama_kpool_build_plan(llama_context & lctx, const llama_batch & batch, bool worst_case);
 
+// Bracket a sizing build of a SYNTHETIC batch (pxa_reserve_real_graph): whatever that build plans,
+// the carried plan is put back afterwards, so the real ubatch's own rebuild finds it as it was.
+void llama_kpool_reserve_begin(llama_context & lctx);
+void llama_kpool_reserve_end  (llama_context & lctx);
+
 // Rebuild the plan for an ubatch whose graph the engine wants to REUSE. Returns true only if
 // every shape the reused graph baked in is unchanged, in which case the plan now describes
 // this ubatch and set_inputs is safe; false means "rebuild the graph".

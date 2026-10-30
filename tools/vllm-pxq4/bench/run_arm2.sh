@@ -5,6 +5,7 @@
 # results -> results/<name>.json, marker results/<name>.DONE (or .FAIL).
 # PXA_MODELS_DIR should be an absolute path: it is bind-mounted into the container below.
 set -u
+_RH=/home/pxq4          # the container's HOME and TMPDIR (a tmpfs; never a host path)
 MODELS_DIR="${PXA_MODELS_DIR:-./models}"
 D=$MODELS_DIR/bench
 NAME=$1; ARM=$2; MODE=$3; shift 3
@@ -41,9 +42,9 @@ fi
 docker run -d --name vllm-bench \
   --gpus '"device=4,5,6,7"' \
   --shm-size 16g \
-  --tmpfs /root/home:exec,size=24g \
+  --tmpfs ${_RH}:exec,size=24g \
   -v "$MODELS_DIR":"$MODELS_DIR" \
-  -e HOME=/root/home -e TMPDIR=/root/home \
+  -e HOME=${_RH} -e TMPDIR=${_RH} \
   -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
   -e VLLM_SM70_FLASH_ATTN_V100=1 \
   -e VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=0 \

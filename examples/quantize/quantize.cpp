@@ -7,6 +7,9 @@
 
 #include "common.h"
 #include "llama.h"
+#ifdef _WIN32
+#include "pxa-win-compat.h"   // setenv
+#endif
 
 #ifndef PXA_PXQ_QUANTIZER_URL
 #define PXA_PXQ_QUANTIZER_URL "<<QUANTIZER-URL>>"

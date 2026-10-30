@@ -557,7 +557,21 @@ void pxa_pxq_mul_mat_cpu(
                 pxa_pxq_quantize_row_q8(pxa_x_row(src1f, nb11, nb12, rows, ne11, iy0 + t),
                                         q8 + t*kb_n, k);
             }
-            for (int64_t ix = first; ix < last; ++ix) {
+            int64_t ix = first;
+            if (pxa_pxq_dot_x8_on(type)) {
+                // eight rows per call where a group of 8 lies inside [first, last) (bit-identical outputs, pxq-dot.c)
+                for (; ix < last && (ix & 7); ++ix) {
+                    for (int64_t t = 0; t < nyt; ++t) pxa_dst_row(dst, nb1, nb2, rows, iy0 + t)[ix] = pxa_pxq_dot_q8(type, a, ix, k, q8 + t*kb_n);
+                }
+                for (; ix + 8 <= last; ix += 8) {
+                    for (int64_t t = 0; t < nyt; ++t) {
+                        float o[8];
+                        pxa_pxq_dot_q8_x8(type, a, ix, k, q8 + t*kb_n, o);
+                        memcpy(pxa_dst_row(dst, nb1, nb2, rows, iy0 + t) + ix, o, sizeof(o));
+                    }
+                }
+            }
+            for (; ix < last; ++ix) {
                 for (int64_t t = 0; t < nyt; ++t) {
                     pxa_dst_row(dst, nb1, nb2, rows, iy0 + t)[ix] =
                         pxa_pxq_dot_q8(type, a, ix, k, q8 + t*kb_n);
@@ -576,6 +590,28 @@ void pxa_pxq_mul_mat_cpu(
             pxa_dst_row(dst, nb1, nb2, rows, iy)[ix] = (float)pxa_dot(w, x, k);
         }
     }
+}
+
+// ---- PXQN split matmul for the CPU MUL_MAT_ID work queue ------------------------------------------------------------
+// the same gate as the fast-matmul branch of pxa_pxq_mul_mat_cpu above (library matmul present, not PXA4, 64-row panels, K a
+// multiple of the tier's slab), plus the split halves: where this is non-zero the old path would have run the library matmul
+size_t pxa_pxqn_q8_col_bytes(enum ggml_type type, int64_t k, int64_t nr0) {
+    if (!pxa_pxq_is_pxqn(type) || type == GGML_TYPE_PXA4) return 0;
+    if (!ggml_pxqn_cpu_mul_mat_get()) return 0;
+    const struct ggml_pxqn_cpu_q8_api * q8 = ggml_pxqn_cpu_q8_api_get();
+    if (!q8) return 0;
+    const int64_t qk = (type == GGML_TYPE_PXQN4 || type == GGML_TYPE_PXQN4S8) ? 32 : 128;
+    if (nr0 <= 0 || nr0 % 64 != 0 || k <= 0 || k % qk != 0) return 0;
+    return q8->q8_col_bytes(type, k);
+}
+
+void pxa_pxqn_q8_col(enum ggml_type type, const float * x, int64_t k, void * q) {
+    ggml_pxqn_cpu_q8_api_get()->q8_col(type, x, k, q);
+}
+
+void pxa_pxqn_mm_q8(enum ggml_type type, const void * a, int64_t k, int64_t r0, int64_t r1,
+                    const void * const * q, float * const * out, int ny) {
+    ggml_pxqn_cpu_q8_api_get()->mm_q8(type, a, k, r0, r1, q, out, ny);
 }
 
 // ---- MXFP4 x q8_0 --------------------------------------------------------------------

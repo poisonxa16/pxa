@@ -65,6 +65,7 @@
 // the file's KV provenance pxa.pxq6.*) — same discipline as PXA_PXQ5_BOOK.
 #pragma once
 
+#include "pxa-env-flag.h"
 #include "pxq4.cuh"              // shared slab macros, tile structs, glu, gather (reused)
 #include "pxa-enhance.cuh"       // PXA_REFERENCE / PXA_ENHANCE master config tiers
 #include "../../../include/ggml-pxq6-tables.h"
@@ -94,7 +95,7 @@ static inline bool pxa_pxq6_env_flag(const char * name, bool dflt, bool * logged
 static inline bool pxa_pxq6_enabled() {
     static const bool on = [](){
         const char * e = getenv("PXA_PXQ6");
-        bool v = !(e && atoi(e) == 0);
+        bool v = !(e && pxa_env_value_off(e));
         if (v) {
             static const float book[16]  = PXQ6_BOOK_INIT;
             static const float sub16[16] = PXQ6_SUB16_INIT;
@@ -165,12 +166,15 @@ PXA_PXQ6_GATE(pxa_g2_cpy2fuse,     "PXA_G2_CPY2FUSE",     true, "G2-F5c CPY + VI
 PXA_PXQ6_GATE(pxa_g2_sumrowsfuse,  "PXA_G2_SUMROWSFUSE",  true, "G2-F5d CONT + SUM_ROWS + TRANSPOSE fusion")
 PXA_PXQ6_GATE(pxa_pxq6_prmt,     "PXA_PXQ6_PRMT",     false, "K2c prmt register-LUT book decode (4-bit tiers, decode mmv), bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_ldcs,     "PXA_PXQ6_LDCS",     false, "K7 streaming (evict-last-priority) weight code loads in decode mmv, bit-exact")
-PXA_PXQ6_GATE(pxa_pxq3_pairlut,  "PXA_PXQ3_PAIRLUT",  false, "K2b3 P3 64-entry bit-plane pair LUT, decode mmv family, bit-exact")
+PXA_PXQ6_GATE(pxa_pxq3_pairlut,  "PXA_PXQ3_PAIRLUT",  false, "P3 table decode, mmv family, bit-exact")
 // Separate from PXA_PXQ3_PAIRLUT above ON PURPOSE. That lever governs the DECODE mmv family; this
 // one governs the PREFILL full-matrix dequant (k_pxq6_dequant_matrix), a different kernel on a
 // different graph shape with a different safety argument. One env var for both would make either
 // A/B unreadable -- the same discipline the G2-F5 fusions are split under.
-PXA_PXQ6_GATE(pxa_pxq3_pairlut_dq, "PXA_PXQ3_PAIRLUT_DQ", false, "P3 64-entry bit-plane pair LUT in the PREFILL full-matrix dequant, bit-exact")
+// DEFAULT ON (2026-10-16, owner order #22126): bit-identical to the incumbent dequant over 1.39M halves (zero
+// mismatches, tests/test-pxq-dq-wide phase 5) and -3.7..-3.9% dequant time on all three timed shapes (ledger pxq3-dequant-pairlut3).
+// PXA_PXQ3_PAIRLUT_DQ=0 puts the bit-plane pair() decode back; PXA_REFERENCE=1 also stands it down (pxa_gate_default).
+PXA_PXQ6_GATE(pxa_pxq3_pairlut_dq, "PXA_PXQ3_PAIRLUT_DQ", true,  "P3 table decode in the prefill full-matrix dequant, bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_shfl,     "PXA_PXQ6_SHFL",     false, "K2d register-book __shfl decode: book gathers ride the shuffle pipe, not the LSU; bit-exact")
 PXA_PXQ6_GATE(pxa_pxq6_rowx2,    "PXA_PXQ6_ROWX2",    false, "R2 two-rows-per-thread 128-thr decode mmv twins (halve warp-uniform x LDS writeback), bit-exact")
 
@@ -226,7 +230,7 @@ static inline void pxa_pxq6_qpf_log(int site, bool engaged) {
 static inline bool pxa_pxq6r_enabled() {
     static const bool on = [](){
         const char * e = getenv("PXA_PXQ6R");
-        bool v = !(e && atoi(e) == 0);
+        bool v = !(e && pxa_env_value_off(e));
         if (v) {
             static const float book[32] = PXQ6_LM32_INIT;
             bool ok = book[16] == 0.0f && book[0] == -1.0f && book[31] > 0.0f;

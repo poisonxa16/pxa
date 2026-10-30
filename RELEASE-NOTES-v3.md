@@ -133,7 +133,7 @@ Both need an NVIDIA driver 570 or newer. They bring their own CUDA 12.8 runtime.
 
 ## Credits
 
-mistrjirka (a developer on the PXA Network Discord and part of the PXA team), quenthalion and thisistimow. Thanks to everyone who tests and reports on the Discord.
+Thanks to quenthalion and thisistimow, and to everyone who tests and reports on the Discord.
 
 ## Community
 

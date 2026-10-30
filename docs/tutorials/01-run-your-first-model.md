@@ -18,9 +18,9 @@ Pick the **tarball** path or the **Docker** path. They end up in the same place.
 
 ```bash
 mkdir -p ~/pxa && cd ~/pxa
-curl -L -O https://github.com/poisonxa16/pxa/releases/download/v3/pxa-v3-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
-tar xzf pxa-v3-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
-cd pxa-v3
+curl -L -O https://github.com/poisonxa16/pxa/releases/download/v4.0/pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+tar xzf pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+cd pxa-v4.0
 ```
 
 You should see a folder with these things in it:
@@ -30,8 +30,8 @@ ls
 ```
 
 ```
-BUILD-FROM-SOURCE.md  LICENSE  README.md  START-HERE.md  VERSION
-bench/  bin/  docs/  lib/  pxa-launch  run-server.sh  tools/
+BUILD-FROM-SOURCE.md  LICENSE  README.md  START-HERE.md  VERSION  ...
+bench/  bin/  docs/  lib/  lib-compat/  pxa  pxa-launch  run-server.sh  tools/  ...
 ```
 
 Check it can actually start:
@@ -51,7 +51,7 @@ The build number and commit will be this release's, not the ones above.
 
 ```bash
 mkdir -p ~/models
-docker pull ghcr.io/poisonxa16/pxa:v3
+docker pull ghcr.io/poisonxa16/pxa:v4.0
 ```
 
 Nothing to unpack. Models live in `~/models` on your machine and the container sees them at
@@ -77,7 +77,7 @@ wrapped around them, which is why it works on distros too old for the tarball.
 Models are not in the release. You download one `.gguf` file and point at it.
 
 ```bash
-cd ~/pxa/pxa-v3     # or: cd ~/models, for the Docker path
+cd ~/pxa/pxa-v4.0     # or: cd ~/models, for the Docker path
 curl -L -O https://huggingface.co/poisonxa/PXA-bench-files-GGUF/resolve/main/fusion2-35b-U16-q8head.gguf
 ```
 
@@ -137,7 +137,7 @@ docker run -d --name pxa \
     --gpus '"device=0"' \
     -p 8080:8080 \
     -v ~/models:/models:ro \
-    ghcr.io/poisonxa16/pxa:v3 \
+    ghcr.io/poisonxa16/pxa:v4.0 \
     -m /models/fusion2-35b-U16-q8head.gguf \
     -ngl 99 -c 8192 -fa on
 ```

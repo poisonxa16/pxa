@@ -31,8 +31,8 @@ static inline bool pxa_tsplit_fallback_to_layer(void) {
 // peer route for the rest of the process (ggml-cuda/reduce.cu, pxa_nccl_route_fail), and the 4-way
 // arms are byte-identical to the NCCL-off route. Measured 2026-09-27 on 4x P100, dense
 // 27B PXQN4, one binary, layer/tensor/layer: tensor decode +4.6..5.6%, prefill @22.6k +95%; dense 27B PXQ4:
-// decode +38.5..41.1%, prefill +95.6% (lane
-// launch-defaults, impl tsplit-4card-default). Set it to 0 to get the old guard back: a request for a
+// decode +38.5..41.1%, prefill +95.6%.
+// Set it to 0 to get the old guard back: a request for a
 // >2-device split (typed or auto-picked) is warned about and runs '-sm layer' instead.
 static inline bool pxa_tsplit_allow_4way(void) {
     return pxa_tsplit_env_flag("PXA_TSPLIT_ALLOW_4WAY", true);

@@ -314,6 +314,14 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     "\\p{N}+",
                 };
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_FLINT:
+                // PXA_FLINT: upstream PR 30928
+                regex_exprs = {
+                    "\\p{N}{1,3}",
+                    "[一-龥぀-ゟ゠-ヿ]+",
+                    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                };
+                break;
             case LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM:
             case LLAMA_VOCAB_PRE_TYPE_HUNYUAN_DENSE:
             case LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM:
@@ -1657,6 +1665,7 @@ struct llama_vocab::impl {
     bool remove_extra_whitespaces   = false;
     bool escape_whitespaces         = true;
     bool treat_whitespace_as_suffix = false;
+    bool spm_prepend_first          = false;  // HF Metaspace prepend_scheme "first": space prefix only at the input start
 
     std::unordered_map<std::string, llama_token> token_to_id;
     std::vector<token_data>                      id_to_token;
@@ -1993,6 +2002,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_CODER;
                 clean_spaces = false;
             } else if (
+                    tokenizer_pre == "flint") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_FLINT;
+                clean_spaces = false;
+            } else if (
                     tokenizer_pre == "deepseek-v3") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM;
                 clean_spaces = false;
@@ -2224,6 +2237,17 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
 
         ml.get_key(LLM_KV_TOKENIZER_ADD_PREFIX,      add_space_prefix,         false);
         ml.get_key(LLM_KV_TOKENIZER_REMOVE_EXTRA_WS, remove_extra_whitespaces, false);
+
+        // HF tokenizer.json Metaspace pre-tokenizer with prepend_scheme "first" (legacy=False; e.g. Nanbeige4.3): the
+        // space prefix goes only on text at the very start of the input, never after a special token, and not when
+        // the text already starts with a space. Older GGUFs have no key and keep the legacy SPM rule.
+        // Off switch: PXA_TOKENIZER_PREPEND_FIRST=0 (legacy rule even when the key says "first").
+        {
+            std::string prepend_scheme;
+            ml.get_key(LLM_KV_TOKENIZER_METASPACE_PREPEND, prepend_scheme, false);
+            const char * off = getenv("PXA_TOKENIZER_PREPEND_FIRST");
+            spm_prepend_first = prepend_scheme == "first" && !(off && off[0] == '0');
+        }
     }
 
     const int token_idx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_LIST).c_str());
@@ -2598,6 +2622,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "[EOT]" // Kimi-K2
                     || t.first == "[EOS]" // Kimi-K2
                     || t.first == "<|end_of_text|>"
+                    || (pre_type == LLAMA_VOCAB_PRE_TYPE_FLINT && (t.first == "<|user|>" || t.first == "<|observation|>" || t.first == "<|developer|>")) // PXA_FLINT: = the GGUF's tokenizer.ggml.eog_token_ids (150001/3/5/18), a key this tree does not read
                     || t.first == "<end_of_utterance>" // smoldocling
                     || t.first == "<eos>"            // gemma4
                     || t.first == "<turn|>"          // gemma4
@@ -3118,10 +3143,19 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                 // tokenizer.encode('', add_special_tokens=False) returns []
 
                 bool is_prev_special = true;  // prefix with space if first token
+                bool is_input_start  = true;  // spm_prepend_first: only the fragment at the start of the input
 
                 if (add_special && add_bos) {
                     GGML_ASSERT(special_bos_id != LLAMA_TOKEN_NULL);
-                    output.push_back(special_bos_id);
+                    // spm_prepend_first vocabs (BOS = the chat start token, e.g. Nanbeige4.3): a prompt that already
+                    // starts with the BOS token keeps that one; the chat path keeps the template's own BOS text so the
+                    // text after it tokenizes as in tokenizer.json (no space prefix after a special token)
+                    const bool has_bos = spm_prepend_first && !fragment_buffer.empty() &&
+                        fragment_buffer.front().type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN &&
+                        fragment_buffer.front().token == special_bos_id;
+                    if (!has_bos) {
+                        output.push_back(special_bos_id);
+                    }
                     is_prev_special = true;
                 }
 
@@ -3129,8 +3163,12 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text;
 
-                        // prefix with space if previous is special
-                        if (add_space_prefix && is_prev_special) {
+                        // prefix with space if previous is special (legacy SPM), or only at the input start and
+                        // when the text does not already start with a space (Metaspace prepend_scheme "first")
+                        const bool want_prefix = spm_prepend_first
+                            ? (is_input_start && !(fragment.length > 0 && fragment.raw_text[fragment.offset] == ' '))
+                            : is_prev_special;
+                        if (add_space_prefix && want_prefix) {
                             text = ' ';
                         }
 
@@ -3147,6 +3185,7 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                         output.push_back(fragment.token);
                         is_prev_special = true;
                     }
+                    is_input_start = false;
                 }
 
                 if (add_special && add_bos && output.size() >= 2 && output[1] == special_bos_id) {

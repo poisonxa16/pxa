@@ -1,4 +1,4 @@
-// agent-params.js: repeat penalty, seed, and system-prompt snippets. Temperature and the other sampling knobs stay in the core.
+// agent-params.js: repeat penalty, seed, stop sequences, JSON schema, grammar (Advanced), and system-prompt snippets. Temperature and the other sampling knobs stay in the core.
 (function () {
   "use strict";
   const G = window.PXAAgent;
@@ -45,10 +45,21 @@
     });
     snips.append(el("button", {type: "button", class: "b", id: "ag-snip-clear", text: "Mode default",
       onclick: clearSnip}));
+    // P08: stop sequences, a JSON schema and a grammar (Advanced mode only; the server checks and size-caps them)
+    function area(id, key, label, ph, rows) {
+      const ta = el("textarea", {id: id, rows: String(rows), placeholder: ph, "aria-label": label, spellcheck: "false",
+        value: String(S.get(key, "") || ""), onchange: function () { S.set(key, ta.value); }});
+      ta.value = String(S.get(key, "") || "");
+      return el("label", {class: "f"}, label, ta);
+    }
     box.append(
       el("div", {class: "ag-grid2"},
         el("label", {class: "f"}, "Repeat penalty", rp),
         el("label", {class: "f"}, "Seed", seed)),
+      el("div", {class: "ag-advonly ag-outcons"},
+        area("ag-stop", "agent.stop", "Stop sequences (one per line, up to 4)", "END", 2),
+        area("ag-jschema", "agent.jsonSchema", "JSON schema for the reply (turns tools off)", '{"type": "object"}', 3),
+        area("ag-grammar", "agent.grammar", "Grammar (GBNF, turns tools off)", 'root ::= "yes" | "no"', 2)),
       el("div", {class: "tiny"}, "Snippets fill the system prompt and are sent with the next message."),
       snips);
   });
@@ -57,6 +68,15 @@
     if (rp != null) body.repeat_penalty = rp;
     const seed = opt(S.get("agent.seed", ""), -1, 2147483647, true);
     if (seed != null) body.seed = seed;
+    const stop = String(S.get("agent.stop", "") || "").split("\n").map(function (x) { return x.replace(/\r$/, ""); }).filter(Boolean);
+    if (stop.length) body.stop = stop.slice(0, 4);
+    const js = String(S.get("agent.jsonSchema", "") || "").trim();
+    if (js) {
+      try { const o = JSON.parse(js); if (o && typeof o === "object" && !Array.isArray(o)) body.json_schema = o; else toast("The JSON schema must be an object; it was not sent."); }
+      catch (e) { toast("The JSON schema is not valid JSON; it was not sent."); }
+    }
+    const gr = String(S.get("agent.grammar", "") || "").trim();
+    if (gr && !body.json_schema) body.grammar = gr;
     if (S.get("agent.snippet", "")) {
       const sys = sysBox();
       if (sys) { body.system = sys.value; body.system_snippet = true; }

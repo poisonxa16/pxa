@@ -21,7 +21,7 @@
 # Build:  docker build -f docker/Dockerfile.release-build -t pxa-release-build:cu128-u2204 .
 # Use:    docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=none \
 #           -v /path/to/repo:/work -w /work pxa-release-build:cu128-u2204 \
-#           bash -c 'cmake -B build-rel -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60;61;70" \
+#           bash -c 'cmake -B build-rel -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;80-real;86-real;89" \
 #                    -DCMAKE_BUILD_TYPE=Release -DGGML_SCHED_MAX_COPIES=2 && \
 #                    cmake --build build-rel -j6 --target llama-server llama-cli llama-bench \
 #                    llama-perplexity llama-quantize llama-gguf-split test-pxq-cpu-dot \
@@ -53,12 +53,23 @@ RUN apt-get update -qq && \
 # build tool's own understanding of newer CUDA/C++ dialects.
 RUN pip3 install --no-cache-dir "cmake>=3.28"
 
+# Test-only python packages (nothing in the build or the release tarball uses them); without them the full CPU
+# ctest reports these tests SKIPPED instead of running them (all three pass with them, 2026-10-18):
+#   jinja2  test-jinja-py cross-checks the C++ chat-template renderer against Python's jinja2 (279 cases)
+#   numpy   test-kv-hybrid-state and test-rep-penalty-window generate their tiny qwen4exp fixtures with it
+RUN pip3 install --no-cache-dir "jinja2==3.1.6" "numpy==1.26.4"
+
 # LLGuidance (common/CMakeLists.txt, LLAMA_LLGUIDANCE) builds a Rust static lib during the
 # engine build. openssl-sys, which that crate pulls in, needs pkg-config and libssl-dev.
 # The release script passes -DLLAMA_LLGUIDANCE=ON only when `cargo` is on PATH,
 # which this image provides. Minimal profile: rustc and cargo, no docs.
+# The toolchain is PINNED (was "stable", i.e. whatever was current the day the image was built), the same
+# version docker/Dockerfile installs; common/CMakeLists.txt no longer builds the workspace's openssl-using
+# member (--package llguidance), so pkg-config/libssl-dev above are no longer needed for it, only harmless.
+ARG RUST_TOOLCHAIN=1.85.1
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
 ENV PATH="/opt/cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" && \
+    cargo --version && rustc --version
 
 WORKDIR /work

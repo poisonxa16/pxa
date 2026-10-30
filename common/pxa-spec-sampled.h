@@ -21,10 +21,12 @@
 // Everything in this header is pure host arithmetic over candidate lists so that the rule can be
 // proven on the CPU without a model: tests/test-spec-sampled.cpp drives it with synthetic p and q.
 
+#include "pxa-env-flag.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 struct pxa_spec_cand {
@@ -133,6 +135,59 @@ inline int32_t pxa_spec_draw(const std::vector<pxa_spec_cand> & c, float u) {
         if ((double) u < cum) return c[i].id;
     }
     return c.back().id;
+}
+
+// PXA_SPEC_SAMPLED_GATE_v1 (review 2026-10-16) -- the probability a sampled draft reports to
+// the draft chain's p_min floor and depth cutoff. The chain DROPS a drawn token whose reported
+// probability fails the floor and ends the draft there, so whatever is reported decides which
+// drawn tokens survive. The rule below is exact only when "position i carries a draft" is decided
+// without looking at the token x_i drawn there: then the token that survives is still a draw from
+// q, and a position without a draft gets the free token from p. Reporting q(x_i) breaks that --
+// x_i survives iff q(x_i) >= p_min, so the surviving proposal is q restricted to {q >= p_min} and
+// renormalised, while the verifier divides by the whole q. Emitted mass at such a position is
+//   min(p,q) on the kept set + (sum_kept max(q-p,0) / TV) * max(p-q,0) + (1 - Q_kept) * p   != p,
+// e.g. q = p with p_top = 0.9 >= p_min: the top token is emitted 0.9 + 0.1 * 0.9 = 0.99 of the time
+// (TV 0.09; the worst case is 0.25 at p_top = 0.5). max_y q(y) is a function of the head's row
+// alone, which is the same quantity a greedy draft reports (its own top probability), so the
+// floor keeps its measured meaning. `gate_drawn` = the old behaviour, for A/B only.
+inline float pxa_spec_draft_gate_prob(const std::vector<pxa_spec_cand> & q, int32_t drawn, bool gate_drawn) {
+    if (gate_drawn) {
+        return pxa_spec_prob_of(q, drawn);
+    }
+    float q_top = 0.0f;
+    for (const auto & e : q) q_top = std::max(q_top, e.p);
+    return q_top;
+}
+
+// PXA_SPEC_EXACT (default on; =0 restores the pre-fix behaviour, for A/B only). One switch for every
+// piece of the sampled chain that must decide "does position i carry a draft" without looking at x_i:
+// the floor/cutoff probability above, the n_min floor below, and the expert-cache draft truncations.
+inline bool pxa_spec_exact_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("PXA_SPEC_EXACT");
+        return !(e && pxa_env_value_off(e));
+    }();
+    return on;
+}
+
+// PXA_SPEC_EXACT_NMIN_v1 (2026-10-17) -- the n_min floor ("a draft shorter than n_min is
+// not worth a verify: decode plainly instead") for a SAMPLED draft. Dropping the whole draft because
+// its DRAWN length L came out under n_min is the same mistake as the old floor one level up: L is set
+// by the gates of rows 1.., and those rows are computed from x_0, x_1, ...; keeping the draft iff
+// L >= n_min keeps x_0 only on the set of values whose continuation was confident, the verifier still
+// divides by the whole q, and the emitted text over-weights those tokens. The decision is exact when it
+// looks only at what was known before x_0 was drawn: `pre_len`, the longest this draft could have been
+// (the n_max / depth / adaptive / server caps, and 1 when the cached row's gate already stopped the
+// chain). A draft whose bound clears n_min is verified at whatever length it came out (a short verify
+// is only a little wasted width; never a wrong token). pre_len < 0 = not a sampled draft (or the rule
+// is off): greedy drafts are verified by exact match, where any keep/drop rule is exact, so they keep
+// today's L >= n_min.
+inline int pxa_spec_nmin_len(int len, int pre_len) {
+    return pre_len >= 0 ? std::max(pre_len, len) : len;
+}
+
+inline bool pxa_spec_nmin_keep(int len, int pre_len, int n_min) {
+    return len > 0 && pxa_spec_nmin_len(len, pre_len) >= n_min;
 }
 
 // The rule itself. `x` was drawn from q. Returns the token to emit and sets `accepted`.

@@ -337,12 +337,21 @@ with one sub-device per GPU:
 |---|---|
 | `PXA <host>` | generation speed, prompt speed, slots busy, slots, KV cache used, expert-cache hit, draft acceptance, model, state |
 | `PXA <host> GPU 0`, `GPU 1`, … | temperature, VRAM used, VRAM total, utilisation, power |
-| `PXA <host>` (diagnostic) | RAM used, CPU used, swap used |
+| `PXA <host>` (diagnostic) | RAM used, RAM used (amount), RAM total, CPU used, swap used, swap used (amount), swap total |
 | `PXA <host>` (expert map) | learned sessions, the map's state (learning / idle) |
+
+Each entity carries the unit its value is really in, and the figures are rounded to one decimal
+place (Home Assistant is told to display one, so a CPU share reads `2.7 %` rather than
+`2.7023645689978726 %`). Memory appears twice on purpose: the **share** as a percentage, which is
+what graphs and automations usually want, and the **amount** in MiB, so nothing has to be converted
+by hand — `RAM used` and `RAM used (amount)`. A share is only published when the machine's total is
+known, because a numerator with no denominator is not a percentage.
 
 They show up without any YAML: Home Assistant reads a retained *discovery* message per entity and
 adds it on its own. If your broker requires the `homeassistant` prefix to be something else, change
 it with `PXA_CONTROL_MQTT_PREFIX`; the entities are then published under that root instead.
+Upgrading PXA Control over an existing setup needs nothing from you: Home Assistant re-reads a
+discovery message every time it arrives, so corrected units land on the entities it already created.
 
 One metric that this build does not report simply produces no entity — a card with no power reading
 gets no power sensor, rather than a sensor frozen at zero.

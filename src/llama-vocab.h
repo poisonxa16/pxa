@@ -61,6 +61,7 @@ enum llama_vocab_pre_type {
     LLAMA_VOCAB_PRE_TYPE_GEMMA4          = 50,
     LLAMA_VOCAB_PRE_TYPE_MELLUM2         = 51,
     LLAMA_VOCAB_PRE_TYPE_LAGUNA          = 52,
+    LLAMA_VOCAB_PRE_TYPE_FLINT           = 53, // PXA_FLINT (upstream numbers it 62; internal enum)
 };
 
 struct LLM_KV;

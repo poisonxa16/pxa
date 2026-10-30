@@ -14,7 +14,10 @@
 //             another model. Weights are immutable after load, so their host mirror is taken once
 //             (prime() at boot, or the first park) and reused; the KV cache and anything else that
 //             is not a compute buffer is copied every time it is unmapped; compute buffers and pools
-//             are dropped (their contents are dead between graph evaluations).
+//             are dropped (their contents are dead between graph evaluations). A compute buffer is
+//             cleared when it is first created. The mapping that replaces it is cleared too:
+//             fresh physical memory is not those zeros, and padding a kernel does not rewrite
+//             then reads as NaNs.
 //   unpark()  re-creates physical memory under the SAME addresses and copies the mirrors back,
 //             one host thread per device so every card loads its own share over its own link at
 //             the same time.
@@ -96,6 +99,10 @@ struct dev_ops {
     // one batch of copies for one device; returns when all of them completed
     virtual bool   d2h(int dev, const std::vector<copy_op> & ops, std::string & err) = 0;
     virtual bool   h2d(int dev, const std::vector<copy_op> & ops, std::string & err) = 0;
+    // Zero [va, va+size). Scratch is not copied across a park. The first
+    // creation of a compute buffer is cleared; a fresh physical mapping is
+    // not, and a kernel that reads padding it does not rewrite then sees NaNs.
+    virtual bool   memset_zero(int dev, uint64_t va, size_t size, std::string & err) = 0;
     // wait for all work queued on the device (any stream) before its memory is copied or unmapped
     virtual bool   sync(int dev, std::string & err) = 0;
     // class of a whole buffer from its owner's usage: CLS_WEIGHTS / CLS_SCRATCH / CLS_STATE
@@ -382,6 +389,7 @@ public:
         std::string err;
         if (!release_locked(want_free, -1, 0, st, err)) return fail(st, st_out, err);
         parked_ = true;
+        trace_mirrors("park");
         finish(st, {}, t0, st_out);
         return true;
     }
@@ -406,7 +414,9 @@ public:
                 dev_plan & dp = plan[r.dev];
                 dp.used = true;
                 dp.maps.push_back({&r, ci});
-                if (class_of(r) != CLS_SCRATCH && c.off < r.size) {
+                if (class_of(r) == CLS_SCRATCH) {
+                    dp.zeros.push_back({r.va + c.off, c.len});
+                } else if (c.off < r.size) {
                     const size_t n = std::min(c.off + c.len, r.size) - c.off;
                     dp.up.push_back({r.va + c.off, (char *) r.mirror + c.off, n});
                 }
@@ -437,6 +447,9 @@ public:
                 dp.pools_done.push_back(p);
             }
             dp.ms_map = ms_since(tm);
+            for (const auto & z : dp.zeros) {
+                if (!ops_->memset_zero(d, z.first, z.second, e)) return false;
+            }
             const auto tc = std::chrono::steady_clock::now();
             if (!dp.up.empty() && !ops_->h2d(d, dp.up, e)) return false;
             dp.ms_copy = ms_since(tc);
@@ -463,8 +476,29 @@ public:
             for (auto & op : dp.up) st.bytes_copied += op.size;
         }
         parked_ = false;
+        trace_mirrors("unpark");
         finish(st, plan, t0, st_out);
         return true;
+    }
+
+    // PXA_SWAP_TRACE=1: one FNV-1a line per buffer of the host mirror. State is
+    // the copy just taken (park) or the copy just written back (unpark). Weights
+    // are the mirror from prime, so a difference means the device changed and
+    // was not the mirror.
+    void trace_mirrors(const char * when) const {
+        if (!env_flag("PXA_SWAP_TRACE")) return;
+        for (const auto & r : recs_) {
+            uint64_t h = 1469598103934665603ull;
+            const size_t n = r.mirror ? std::min(r.mirror_top ? r.mirror_top : r.size, r.mirror_cap) : 0;
+            const auto * b = static_cast<const unsigned char *>(r.mirror);
+            for (size_t i = 0; i < n; ++i) {
+                h ^= b[i];
+                h *= 1099511628211ull;
+            }
+            fprintf(stderr, "pxa-swap-trace %s %s dev%d cls=%s bytes=%zu hashed=%zu %016llx\n",
+                    name_.c_str(), when, r.dev, cls_name(class_of(r)), r.size, n,
+                    (unsigned long long) h);
+        }
     }
 
     // Take `bytes` of physical memory on `dev` back from PARKED groups other than `except`
@@ -538,6 +572,7 @@ private:
     struct dev_plan {
         bool used = false;
         std::vector<copy_op> down, up, verify;
+        std::vector<std::pair<uint64_t, size_t>> zeros;   // scratch ranges to clear after map
         std::vector<void *> verify_ref;
         std::vector<std::pair<size_t *, size_t>> after_top;   // mirror_top updates once the copies landed
         std::vector<map_item> unmaps;                         // chunks to release after the copies

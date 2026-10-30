@@ -143,8 +143,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    llama_free(ctx);          // the context refers to the model: free it first
     llama_free_model(model);
-    llama_free(ctx);
 
     llama_backend_free();
 

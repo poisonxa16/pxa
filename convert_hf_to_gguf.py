@@ -327,6 +327,21 @@ class Model:
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         return ()
 
+    # Output names (suffix match) a model writes with the shape modify_tensors gives them, size-1 dims included
+    # (the Mamba-2 A and D of Nemotron-H are {1, n_head} in the file). Everything else is squeezed as before.
+    _pxa_keep_shape: tuple[str, ...] = ()
+
+    def _pxa_squeeze_for_write(self, new_name: str, d: Tensor) -> Tensor:
+        if self._pxa_keep_shape and new_name.endswith(self._pxa_keep_shape):
+            return d
+        # the element count comes from the SHAPE: d.numel() on a lazy tensor has a non-tensor result, so LazyBase
+        # evaluates the tensor eagerly and memoises it -- every tensor of the model then stayed in RAM as f32 until
+        # the write (a 30B MoE conversion took the box out of memory on 2026-10-15)
+        n = 1
+        for x in d.shape:
+            n *= int(x)
+        return d.squeeze() if n > 1 else d.reshape(1)
+
     def prepare_tensors(self):
         max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
 
@@ -355,7 +370,7 @@ class Model:
             # helper here evaluates the placeholder instead of the data and silently writes
             # zeros -- which is exactly what a first attempt with np.atleast_1d did to every
             # F32 norm in the file.
-            for new_name, data in ((n, (d.squeeze() if d.numel() > 1 else d.reshape(1)).numpy()) for n, d in self.modify_tensors(data_torch, name, bid)):
+            for new_name, data in ((n, self._pxa_squeeze_for_write(n, d).numpy()) for n, d in self.modify_tensors(data_torch, name, bid)):
                 data: np.ndarray  # type hint
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
@@ -533,7 +548,15 @@ class Model:
     @staticmethod
     def load_hparams(dir_model: Path):
         with open(dir_model / "config.json", "r", encoding="utf-8") as f:
-            return json.load(f)
+            hp = json.load(f)
+        # Nemotron Omni (NemotronH_Omni_Reasoning_V3, e.g. Nemotron 3.5 Bolt): the text model is llm_config; the vision /
+        # sound towers convert separately (mmproj), so the text conversion sees the language model's config
+        if hp.get("model_type") == "nemotron_h_omni" and isinstance(hp.get("llm_config"), dict):
+            hp = {**hp["llm_config"], "architectures": hp.get("architectures", hp["llm_config"].get("architectures"))}
+        # Puzzle-style configs (Nemotron 3.5 Bolt's llm_config) carry no layer count: block_configs is the layer list
+        if isinstance(hp.get("block_configs"), list) and hp.get("num_hidden_layers") is None:
+            hp["num_hidden_layers"] = len(hp["block_configs"])
+        return hp
 
     @classmethod
     def register(cls, *names: str) -> Callable[[AnyModel], AnyModel]:
@@ -712,6 +735,9 @@ class Model:
         if chkhsh == "cdf5f35325780597efd76153d4d1c16778f766173908894c04afc20108536267":
             # ref: https://huggingface.co/zai-org/GLM-4.7-Flash
             res = "glm4"
+        if chkhsh == "0e9433cbbb161f89e264eb32e8e64bfe69e834973ffca5d41d3948a604a3e2a3":
+            # ref: https://huggingface.co/mistral-community/pixtral-12b (also the Nemotron-H / Nemotron 3 tokenizer)
+            res = "pixtral"
         if chkhsh == "7fc505bd3104ca1083b150b17d088b59534ede9bde81f0dd2090967d7fe52cee":
             # ref: https://huggingface.co/LumiOpen/Viking-7B
             res = "viking"
@@ -730,6 +756,9 @@ class Model:
         if chkhsh == "877081d19cf6996e2c4ff0e1236341e9b7bde288f5311a56a937f0afbbb3aeb5":
             # ref: https://huggingface.co/deepseek-ai/DeepSeek-V3
             res = "deepseek-v3"
+        if chkhsh == "d5420e601e979078c670bc503d9ac411c311fa76b76a76267c31e0d6ba816637":
+            # ref: https://huggingface.co/RecursiveSI/flint
+            res = "flint"
         if chkhsh == "d5f1dd6f980fec569fb218a81a7658ac45fc56b38c5a0adeb1c232fbe04ef5ec":
             # ref: https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Base
             res = "seed-coder"
@@ -1673,9 +1702,28 @@ class LlamaModel(Model):
                 if "add_prefix_space" in tokenizer_config_json:
                     self.gguf_writer.add_add_space_prefix(tokenizer_config_json["add_prefix_space"])
 
+        # HF Metaspace pre-tokenizer with prepend_scheme "first" (legacy=False SPM-style BPE, e.g. Nanbeige4.3):
+        # the space prefix goes only at the very start of the input, never after a special token. Record it so the
+        # engine's SPM tokenizer matches tokenizer.json.
+        prepend_scheme = self._metaspace_prepend_scheme()
+        if prepend_scheme is not None:
+            self.gguf_writer.add_metaspace_prepend_scheme(prepend_scheme)
+
         # Apply to granite small models only
         if self.hparams.get("vocab_size", 32000) == 49152:
             self.gguf_writer.add_add_bos_token(False)
+
+    def _metaspace_prepend_scheme(self) -> str | None:
+        tokenizer_json_file = self.dir_model / 'tokenizer.json'
+        if not tokenizer_json_file.is_file():
+            return None
+        with open(tokenizer_json_file, "r", encoding="utf-8") as f:
+            pre = json.load(f).get("pre_tokenizer") or {}
+        pres = pre.get("pretokenizers", []) if pre.get("type") == "Sequence" else [pre]
+        for p in pres:
+            if isinstance(p, dict) and p.get("type") == "Metaspace" and isinstance(p.get("prepend_scheme"), str):
+                return p["prepend_scheme"]
+        return None
 
     @staticmethod
     def permute(weights: Tensor, n_head: int, n_head_kv: int | None):
@@ -2349,6 +2397,45 @@ class Qwen3Model(Qwen2Model):
 @Model.register("Qwen3MoeForCausalLM")
 class Qwen3MoeModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3MOE
+
+
+@Model.register("FlintForCausalLM")
+class FlintModel(Qwen2MoeModel):
+    # PXA_FLINT: port of upstream PR 30928 (conversion/flint.py) onto this converter.
+    model_arch = gguf.MODEL_ARCH.FLINT
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hp = self.hparams
+        if (n_used := hp.get("num_experts_per_tok")) is not None:
+            self.gguf_writer.add_expert_used_count(n_used)
+        dense = list(hp.get("mlp_only_layers") or [])   # absent = no leading dense blocks
+        if dense != list(range(len(dense))):
+            raise ValueError("Flint dense layers must precede the MoE layers")
+        self.gguf_writer.add_leading_dense_block_count(len(dense))
+        self.gguf_writer.add_expert_shared_count(hp["shared_expert_intermediate_size"] // hp["moe_intermediate_size"])
+        self.gguf_writer.add_expert_weights_norm(hp["norm_topk_prob"])
+        self.gguf_writer.add_expert_weights_scale(1.0)
+        score = hp.get("router_score_function", "sigmoid")
+        if score == "sigmoid":
+            self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+        elif score == "softmax":
+            self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SOFTMAX)
+        else:
+            raise ValueError(f"Unsupported router_score_function: {score}")
+        self.gguf_writer.add_sliding_window(hp["sliding_window"])
+        self.gguf_writer.add_sliding_window_pattern([kind == "sliding_attention" for kind in hp["layer_types"]])
+        nope = set(hp.get("no_rope_layer_indices", []))
+        self.gguf_writer.add_rope_pattern([i not in nope for i in range(self.block_count)])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith(".softmax_offset"):
+            return [(self.map_tensor_name(name + ".weight"), data_torch)]
+        if name.endswith(".gate.expert_bias"):
+            if not self.hparams.get("router_expert_bias", False):
+                return []
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.FFN_EXP_PROBS_B, bid, ".bias"), data_torch)]
+        return super().modify_tensors(data_torch, name, bid)
 
 
 @Model.register("MellumForCausalLM")
@@ -3996,6 +4083,315 @@ class MambaModel(Model):
             return gguf.GGMLQuantizationType.F32
 
         return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+
+# PXA Nemotron port (2026-10-15): converter classes for Nemotron-4 / Minitron (NemotronForCausalLM)
+# and Nemotron-H / Nemotron 3 hybrids (NemotronHForCausalLM, dense and MoE). Written for this converter from the
+# behaviour of ggml-org/llama.cpp conversion/nemotron.py + mamba.py + granite.py at b76b13379d (MIT, see NOTICE);
+# the hparams are read from config.json directly, so the transformers >= 5 AutoConfig defaults that make the
+# mainline converter mis-classify dense Nemotron-H as MoE never enter.
+@Model.register("NemotronForCausalLM")
+class NemotronModel(Model):
+    model_arch = gguf.MODEL_ARCH.NEMOTRON
+
+    def set_vocab(self):
+        self._set_vocab_sentencepiece()
+        self.gguf_writer.add_pad_token_id(0)
+        self.gguf_writer.add_unk_token_id(1)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+
+        f_norm_eps = self.find_hparam(["layer_norm_eps", "layer_norm_epsilon", "norm_epsilon", "norm_eps"])
+        self.gguf_writer.add_layer_norm_eps(f_norm_eps)
+        if "rms_norm_eps" not in hparams:
+            self.gguf_writer.add_layer_norm_rms_eps(f_norm_eps)
+
+        n_embd = self.find_hparam(["hidden_size", "n_embd"])
+        n_head = self.find_hparam(["num_attention_heads", "n_head"])
+        if (head_dim := hparams.get("head_dim", hparams.get("kv_channels"))) is not None and "head_dim" not in hparams:
+            self.gguf_writer.add_key_length(head_dim)
+            self.gguf_writer.add_value_length(head_dim)
+
+        # partial rotary embedding (NeoX layout in the graph)
+        rot_pct = self.find_hparam(["partial_rotary_factor", "rope_percent", "rope_pct"], optional=True)
+        if rot_pct is None:
+            rot_pct = 0.5
+        self.gguf_writer.add_rope_dimension_count(int(rot_pct * n_embd) // n_head)
+
+        rope_scaling = hparams.get("rope_scaling") or {}
+        factor = hparams.get("factor") or (rope_scaling.get("factor") if isinstance(rope_scaling, dict) else None)
+        if factor is None:
+            self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.NONE)
+        else:
+            self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.LINEAR)
+            self.gguf_writer.add_rope_scaling_factor(factor)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # layernorm1p: the checkpoint stores (gamma - 1); the graph uses a plain LayerNorm
+        if name.endswith("norm.weight"):
+            data_torch = data_torch + 1
+        return [(self.map_tensor_name(name), data_torch)]
+
+
+@Model.register("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM", "NemotronH_Omni_Reasoning_V3")
+class NemotronHModel(Model):
+    """Nemotron-H / Nemotron 3 hybrid: every block is ONE of a Mamba-2 mixer (M), an attention mixer without
+    positional encoding (*), a relu^2 MLP (-) or a sigmoid-routed relu^2 MoE with a shared expert (E)."""
+    model_arch = gguf.MODEL_ARCH.NEMOTRON_H
+    _pxa_keep_shape = (".ssm_a", ".ssm_d")
+
+    _SSM_TYPES  = {"mamba", "linear_attention"}
+    _ATTN_TYPES = {"attention", "full_attention"}
+    _MLP_TYPES  = {"mlp", "moe"}
+
+    def __init__(self, dir_model: Path, *args, **kwargs):
+        raw = Model.load_hparams(dir_model)
+        raw = {**raw, **raw.get("text_config", {})}
+        # Puzzle / Omni (Nemotron 3 Puzzle, Nemotron 3.5 Bolt): block_configs carries the per-block kind and MoE shape and
+        # is the authority on the pattern
+        self.block_configs: list[dict] | None = raw.get("block_configs") or None
+        if self.block_configs:
+            raw["layers_block_type"] = [bc["block_type"] for bc in self.block_configs]
+            raw["num_hidden_layers"] = len(self.block_configs)
+        pattern = raw.get("hybrid_override_pattern") or raw.get("layers_block_type")
+        self.is_moe = (raw.get("n_routed_experts") or 0) > 0 or (isinstance(pattern, str) and "E" in pattern) or \
+                      (pattern is not None and not isinstance(pattern, str) and "moe" in pattern)
+        if self.is_moe:
+            self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
+        if self.block_configs and any((bc.get("n_routed_experts") or 0) > 0 for bc in self.block_configs):
+            self.is_moe = True
+            self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
+        super().__init__(dir_model, *args, **kwargs)
+        self.hparams = {**self.hparams, **self.hparams.get("text_config", {})}
+        if self.block_configs:
+            self.hparams["layers_block_type"] = raw["layers_block_type"]
+            self.hparams["num_hidden_layers"] = raw["num_hidden_layers"]
+            if self.block_count != len(self.block_configs):
+                self.block_count = len(self.block_configs)
+                self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+        if pattern is None:
+            raise ValueError("NemotronH: config.json has no hybrid_override_pattern / layers_block_type")
+        if isinstance(pattern, str):
+            kinds = ["ssm" if c == "M" else "attn" if c == "*" else "mlp" if c in "-E" else "?" for c in pattern]
+        else:
+            kinds = ["ssm" if v in self._SSM_TYPES else "attn" if v in self._ATTN_TYPES else "mlp" if v in self._MLP_TYPES else "?"
+                     for v in pattern]
+        if "?" in kinds:
+            raise ValueError(f"NemotronH: unknown block kind in pattern {pattern!r}")
+        if len(kinds) != self.block_count:
+            if raw.get("layers_block_type") is not None:
+                self.block_count = len(kinds)
+                self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+            else:
+                raise ValueError(f"NemotronH: pattern length {len(kinds)} != num_hidden_layers {self.block_count}")
+        self._ssm_layers  = [i for i, k in enumerate(kinds) if k == "ssm"]
+        self._attn_layers = [i for i, k in enumerate(kinds) if k == "attn"]
+        self._mlp_layers  = [i for i, k in enumerate(kinds) if k == "mlp"]
+
+        self.d_model  = self.find_hparam(["hidden_size", "d_model"])
+        self.n_group  = self.find_hparam(["n_groups", "num_groups", "mamba_n_groups"])
+        self.ssm_head_dim = self.find_hparam(["mamba_head_dim", "mamba_d_head"])
+        self.ssm_n_head   = self.find_hparam(["mamba_num_heads", "mamba_n_heads"])
+        self.d_inner  = self.ssm_n_head * self.ssm_head_dim
+        self.head_dim = self.hparams.get("head_dim", self.hparams.get("attention_head_dim"))
+        if self.head_dim is None:
+            raise ValueError("NemotronH: no attention head_dim in config.json")
+        self._experts: list[dict[str, Tensor]] | None = None
+
+    def set_vocab(self):
+        vocab_size = self.hparams["vocab_size"]
+        pad = 8
+        self.hparams["vocab_size"] = -(vocab_size // -pad) * pad
+        self._set_vocab_gpt2()
+        if self.block_configs:
+            # Nemotron 3.5 Bolt (Omni/Puzzle): the HF tokenizer adds neither BOS nor EOS (ByteLevel post-processor, no
+            # add_*_token in tokenizer_config), but the pixtral pre-tokenizer default in the engine prepends BOS -- write the
+            # HF behaviour explicitly, as the Nemotron 3 Nano files carry it and NVIDIA's own Bolt GGUF does
+            tc_path = self.dir_model / "tokenizer_config.json"
+            tc = json.load(open(tc_path, encoding="utf-8")) if tc_path.is_file() else {}
+            have = {k for kv in self.gguf_writer.kv_data for k in kv}
+            if not isinstance(tc.get("add_bos_token"), bool) and gguf.Keys.Tokenizer.ADD_BOS not in have:
+                self.gguf_writer.add_add_bos_token(False)
+            if not isinstance(tc.get("add_eos_token"), bool) and gguf.Keys.Tokenizer.ADD_EOS not in have:
+                self.gguf_writer.add_add_eos_token(False)
+
+    def set_gguf_parameters(self):
+        hp = self.hparams
+        n_head = self.find_hparam(["num_attention_heads", "n_head"])
+        n_head_kv = self.find_hparam(["num_key_value_heads", "n_head_kv"])
+        rms_eps = self.find_hparam(["rms_norm_eps", "layer_norm_epsilon", "norm_eps"], optional=True) or 1e-5
+
+        self.gguf_writer.add_block_count(self.block_count)
+        self.gguf_writer.add_context_length(2**20)  # no positional encoding: any length the memory allows
+        self.gguf_writer.add_embedding_length(self.d_model)
+        if self.block_configs:
+            ffn_lengths = [int(bc.get("moe_intermediate_size") or 0) for bc in self.block_configs]
+            self.gguf_writer.add_feed_forward_length(ffn_lengths)
+        else:
+            if self.is_moe:
+                n_ff = hp["moe_intermediate_size"]
+            else:
+                n_ff = self.find_hparam(["intermediate_size", "n_inner", "hidden_dim"])
+            self.gguf_writer.add_feed_forward_length([n_ff if i in self._mlp_layers else 0 for i in range(self.block_count)])
+        self.gguf_writer.add_head_count(n_head)
+        self.gguf_writer.add_head_count_kv([n_head_kv if i in self._attn_layers else 0 for i in range(self.block_count)])
+        if (rope_theta := hp.get("rope_theta")) is not None:
+            self.gguf_writer.add_rope_freq_base(rope_theta)
+        self.gguf_writer.add_layer_norm_rms_eps(rms_eps)
+        if (ln_eps := hp.get("layer_norm_epsilon")) is not None:
+            self.gguf_writer.add_layer_norm_eps(ln_eps)
+        self.gguf_writer.add_key_length(self.head_dim)
+        self.gguf_writer.add_value_length(self.head_dim)
+        self.gguf_writer.add_rope_dimension_count(self.d_model // n_head)
+        self.gguf_writer.add_rope_scaling_finetuned(False)
+        self.gguf_writer.add_vocab_size(hp["vocab_size"])
+
+        # Mamba-2 mixer
+        self.gguf_writer.add_ssm_conv_kernel(self.find_hparam(["conv_kernel", "d_conv"]))
+        self.gguf_writer.add_ssm_state_size(self.find_hparam(["ssm_state_size", "state_size", "d_state"]))
+        self.gguf_writer.add_ssm_group_count(self.n_group)
+        self.gguf_writer.add_ssm_inner_size(self.d_inner)
+        self.gguf_writer.add_ssm_time_step_rank(self.ssm_n_head)
+
+        if self.is_moe and self.block_configs:
+            arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+            ffn_lengths = [int(bc.get("moe_intermediate_size") or 0) for bc in self.block_configs]
+            experts_used = [int(bc.get("num_experts_per_tok") or 0) for bc in self.block_configs]
+            n_exp_max = max(int(bc.get("n_routed_experts") or 0) for bc in self.block_configs)
+            self.gguf_writer.add_expert_count(int(hp.get("n_routed_experts") or n_exp_max))
+            self.gguf_writer.add_array(f"{arch}.expert_used_count", experts_used)
+            self.gguf_writer.add_array(f"{arch}.expert_feed_forward_length", ffn_lengths)
+            self.gguf_writer.add_expert_group_count(hp.get("n_group", 1))
+            self.gguf_writer.add_expert_group_used_count(hp.get("topk_group", 1))
+            self.gguf_writer.add_expert_shared_feed_forward_length(hp["moe_shared_expert_intermediate_size"])
+            self.gguf_writer.add_expert_shared_count(hp.get("n_shared_experts", 1))
+            self.gguf_writer.add_expert_weights_norm(bool(hp.get("norm_topk_prob", True)))
+            self.gguf_writer.add_expert_weights_scale(float(hp.get("routed_scaling_factor", 1.0)))
+            self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+            if hp.get("moe_latent_size"):
+                self.gguf_writer.add_uint32(f"{arch}.moe_latent_size", int(hp["moe_latent_size"]))
+        elif self.is_moe:
+            self.gguf_writer.add_expert_count(hp["n_routed_experts"])
+            self.gguf_writer.add_expert_used_count(hp["num_experts_per_tok"])
+            self.gguf_writer.add_expert_group_count(hp.get("n_group", 1))
+            self.gguf_writer.add_expert_group_used_count(hp.get("topk_group", 1))
+            self.gguf_writer.add_expert_feed_forward_length(hp["moe_intermediate_size"])
+            self.gguf_writer.add_expert_shared_feed_forward_length(hp["moe_shared_expert_intermediate_size"])
+            self.gguf_writer.add_expert_shared_count(hp.get("n_shared_experts", 1))
+            self.gguf_writer.add_expert_weights_norm(bool(hp.get("norm_topk_prob", True)))
+            self.gguf_writer.add_expert_weights_scale(float(hp.get("routed_scaling_factor", 1.0)))
+            if hp.get("moe_latent_size"):
+                raise NotImplementedError("NemotronH latent MoE without block_configs is not handled by this converter")
+        self.gguf_writer.add_file_type(self.ftype)
+
+    def _name_for(self, name: str, bid: int | None) -> str:
+        # Nemotron-H checkpoint names -> the gguf names the loader reads (create_nemotron_h_tensors)
+        if name.startswith("language_model."):
+            name = name[len("language_model."):]
+        if name.startswith("model.layers.") and ".mixer." in name:
+            name = name.replace("model.layers.", "backbone.layers.", 1)
+        if self.block_configs and name.startswith("model."):            # Puzzle checkpoints name the trunk model.*
+            name = "backbone." + name[len("model."):]
+        fixed = {
+            "backbone.embeddings.weight": "token_embd.weight",
+            "backbone.embedding.weight":  "token_embd.weight",
+            "backbone.norm_f.weight":     "output_norm.weight",
+            "lm_head.weight":             "output.weight",
+        }
+        if name in fixed:
+            return fixed[name]
+        m = re.match(r"backbone\.layers\.(\d+)\.(.+)$", name)
+        if m is None:
+            raise ValueError(f"NemotronH: unexpected tensor {name}")
+        b, rest = int(m.group(1)), m.group(2)
+        per = {
+            "norm.weight":               "attn_norm.weight",
+            "mixer.in_proj.weight":      "ssm_in.weight",
+            "mixer.conv1d.weight":       "ssm_conv1d.weight",
+            "mixer.conv1d.bias":         "ssm_conv1d.bias",
+            "mixer.dt_bias":             "ssm_dt.bias",
+            "mixer.A_log":               "ssm_a",
+            "mixer.D":                   "ssm_d",
+            "mixer.norm.weight":         "ssm_norm.weight",
+            "mixer.out_proj.weight":     "ssm_out.weight",
+            "mixer.q_proj.weight":       "attn_q.weight",
+            "mixer.k_proj.weight":       "attn_k.weight",
+            "mixer.v_proj.weight":       "attn_v.weight",
+            "mixer.o_proj.weight":       "attn_output.weight",
+            "mixer.up_proj.weight":      "ffn_up.weight",
+            "mixer.down_proj.weight":    "ffn_down.weight",
+            "mixer.gate.weight":         "ffn_gate_inp.weight",
+            "mixer.gate.e_score_correction_bias": "exp_probs_b.bias",
+            "mixer.gate.e_score_correction.bias": "exp_probs_b.bias",
+            "mixer.fc1_latent_proj.weight": "ffn_latent_down.weight",
+            "mixer.fc2_latent_proj.weight": "ffn_latent_up.weight",
+            "mixer.shared_experts.up_proj.weight":   "ffn_up_shexp.weight",
+            "mixer.shared_experts.down_proj.weight": "ffn_down_shexp.weight",
+        }
+        if rest not in per:
+            raise ValueError(f"NemotronH: unexpected tensor {name}")
+        return f"blk.{b}.{per[rest]}"
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("mtp.") or ".mtp." in name:
+            return []   # the MTP head of Nemotron 3 is not wired in this engine yet
+        if name.startswith(("vision_model.", "mlp1.", "sound_encoder.", "sound_projection.", "language_model.mtp.")):
+            return []   # Omni towers / projector: the mmproj conversion, not the text model
+
+        if self.is_moe and ".mixer.experts." in name:
+            n_experts = int(self.block_configs[bid]["n_routed_experts"]) if self.block_configs else self.hparams["n_routed_experts"]
+            assert bid is not None
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+            self._experts[bid][name] = data_torch
+            if len(self._experts[bid]) < n_experts * 2:
+                return []
+            out: list[tuple[str, Tensor]] = []
+            for w_name, g_name in (("down_proj", "ffn_down_exps.weight"), ("up_proj", "ffn_up_exps.weight")):
+                datas: list[Tensor] = []
+                for xid in range(n_experts):
+                    ename = next(k for k in self._experts[bid] if k.endswith(f".mixer.experts.{xid}.{w_name}.weight"))
+                    datas.append(self._experts[bid].pop(ename))
+                out.append((f"blk.{bid}.{g_name}", torch.stack(datas, dim=0)))
+            return out
+
+        new_name = self._name_for(name, bid)
+        # the reference converter permutes Q/K like a llama rope layout (GraniteHybrid undo_permute); Nemotron-H
+        # attention has no positional encoding, so this is a consistent per-head row reorder of Q and K that leaves
+        # q.k unchanged -- kept so the files are byte-identical to the reference ones
+        if new_name.endswith("attn_q.weight"):
+            n_head = self.find_hparam(["num_attention_heads", "n_head"])
+            data_torch = LlamaModel.permute(data_torch, n_head, n_head)
+        elif new_name.endswith("attn_k.weight"):
+            n_head = self.find_hparam(["num_attention_heads", "n_head"])
+            data_torch = LlamaModel.permute(data_torch, n_head, self.find_hparam(["num_key_value_heads", "n_head_kv"]))
+        if new_name.endswith("ssm_conv1d.weight"):
+            data_torch = data_torch.squeeze()
+        elif new_name.endswith(".ssm_a"):
+            data_torch = (-torch.exp(data_torch.float())).squeeze().reshape(-1, 1)
+        elif new_name.endswith(".ssm_d"):
+            data_torch = data_torch.squeeze().reshape(-1, 1)
+        elif new_name.endswith("ssm_norm.weight"):
+            data_torch = data_torch.reshape(self.n_group, -1)
+        return [(new_name, data_torch)]
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        # the mixer's small tensors and the router stay F32 (as the reference files carry them)
+        if new_name.endswith(("ssm_conv1d.weight", "ssm_conv1d.bias", "ssm_dt.bias", ".ssm_a", ".ssm_d", "ssm_norm.weight",
+                              "ffn_gate_inp.weight", "exp_probs_b.bias")):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None:
+            left = [k for d in self._experts for k in d.keys()]
+            if left:
+                raise ValueError(f"NemotronH: unprocessed experts: {left[:4]}")
 
 
 @Model.register("CohereForCausalLM")
@@ -5816,6 +6212,17 @@ class HYV3Model(Model):
             logger.info(f"gguf: rewrote {n} str.format() call(s) in the chat template to jinja "
                         f"concat (minja has no .format; --jinja aborts at init without this)")
 
+    def _ff_widths(self) -> tuple[int, int]:
+        """(routed-expert width, total shared-expert width) from the config; see set_gguf_parameters."""
+        hp = self.hparams
+        routed = int(hp.get("expert_hidden_dim") or hp["moe_intermediate_size"])
+        if hp.get("expert_hidden_dim"):
+            # Hy-Memory-30B-A3B: the shared expert tensors are the SAME width as the routed experts (768, checked
+            # against every layer's shared_mlp shapes in the released shards); moe_intermediate_size (1536) there
+            # is not a tensor width. Tensor shapes are verified in modify_tensors either way.
+            return (routed, routed * int(hp.get("num_shared_experts", 1)))
+        return (routed, int(hp["moe_intermediate_size"]) * int(hp.get("num_shared_experts", 1)))
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
@@ -5824,9 +6231,16 @@ class HYV3Model(Model):
         # num_local_experts, so expert_count would otherwise be omitted entirely.
         self.gguf_writer.add_expert_count(self.find_hparam(["num_local_experts", "num_experts"]))
         self.gguf_writer.add_expert_shared_count(hparams.get("num_shared_experts", 1))
-        self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
-        self.gguf_writer.add_expert_shared_feed_forward_length(
-            hparams["moe_intermediate_size"] * hparams.get("num_shared_experts", 1))
+        # Routed-expert width. The large Hy3 release spells it moe_intermediate_size (1536, and the shared
+        # expert is the same width). The 30B-A3B release (Hy-Memory-30B-A3B) carries TWO widths: expert_hidden_dim
+        # is the routed experts (gate/up [768, 2048], down [2048, 768]) and moe_intermediate_size (1536) is the
+        # shared expert. Taking moe_intermediate_size for the routed experts there writes a GGUF whose expert
+        # stacks do not match the declared width, so prefer expert_hidden_dim when the config declares it. The
+        # tensor shapes are checked against both widths in modify_tensors, so a config that disagrees with the
+        # weights stops the conversion instead of producing a file that fails (or worse, loads) wrongly.
+        n_ff_exp, n_ff_shexp = self._ff_widths()
+        self.gguf_writer.add_expert_feed_forward_length(n_ff_exp)
+        self.gguf_writer.add_expert_shared_feed_forward_length(n_ff_shexp)
 
         # Sigmoid router with a per-expert selection bias, sum-normalised after top-k.
         self.gguf_writer.add_expert_weights_norm(hparams.get("route_norm", True))
@@ -5853,6 +6267,18 @@ class HYV3Model(Model):
 
         # Stack the numbered per-expert weights into the merged 3D expert tensors.
         # mlp.expert_bias (the router bias) is NOT numbered and takes the normal path.
+        # Width check (see set_gguf_parameters): a config that disagrees with the weights must stop here.
+        if name.startswith("model.layers.") and (m := re.search(r"\.mlp\.(experts\.\d+|shared_mlp)\.(gate_proj|up_proj|down_proj)\.weight$", name)):
+            routed = m.group(1).startswith("experts")
+            want = self._ff_widths()[0 if routed else 1]
+            shp = [int(x) for x in data_torch.shape]
+            got = shp[1] if m.group(2) == "down_proj" else shp[0]
+            if got != want:
+                raise ValueError(
+                    f"{name}: tensor shape {shp} has ffn width {got} but the config gives {want} "
+                    f"({'expert_hidden_dim / moe_intermediate_size' if routed else 'moe_intermediate_size x num_shared_experts'}); "
+                    f"weights and config disagree")
+
         if name.startswith("model.layers.") and re.search(r"\.mlp\.experts\.\d+\.", name):
             n_experts = self.find_hparam(["num_local_experts", "num_experts"])
             assert bid is not None

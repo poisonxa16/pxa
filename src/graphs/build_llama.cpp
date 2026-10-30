@@ -210,6 +210,11 @@ ggml_cgraph * llm_build_context::build_llama() {
 
     cb(cur, "result_output", -1);
 
+    // PXA_VERIFY_ARGMAX (arch llama): build_output may attach the head's argmax node; it goes in after
+    // the logits (its source), so the logits are found by name / pxa_res_t, not as the last node
+    if (!lctx.pxa_head_extra.empty()) lctx.pxa_res_t = cur;
+    for (auto * t : lctx.pxa_head_extra) ggml_build_forward_expand(gf, t);
+    lctx.pxa_head_extra.clear();
     ggml_build_forward_expand(gf, cur);
 
     return gf;

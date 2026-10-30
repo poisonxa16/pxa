@@ -1,0 +1,9 @@
+{
+ "GRANT_PUBKEYS": {
+  "ent-2026-10": "58061ebc1e9ef1c68c4021df250eb1297dc9c5082a2cc04752a246e917f0a15f"
+ },
+ "PLUGIN_PUBKEYS": {
+  "plug-2026-10": "b2c3d31d1d635e63170891469ff336fc89928349232271d4b49c1d683f248f71"
+ },
+ "note": "public keys only; PXA Control embeds this file as tools/pxa_control/store/pubkeys.json at release"
+}

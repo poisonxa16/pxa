@@ -9,7 +9,7 @@
    never looks like a spike. One y axis per chart. */
 
 const LV = {
-  range: store.get("lv.range", 900), cards: new Map(), servers: new Map(), ghosts: [], seen: new Set(),
+  range: store.get("lv.range", 900), runOnly: store.get("lv.runOnly", true) !== false, showStopped: false, cards: new Map(), servers: new Map(), ghosts: [], seen: new Set(),
   ci: null, ts: 0, lastT: 0, histFrom: 0, timer: null, busy: false, built: false, err: "", fails: 0, open: false, host: null,
   hist: null, histAt: 0, histRange: 0, tel: null, telAt: 0,
 };
@@ -320,6 +320,7 @@ function lvBuild() {
   root.replaceChildren(
     el("div", {id: "lv-hist", class: "tiny lv-histbar"}),
     el("div", {id: "lv-tiles", class: "lv-tiles"}),
+    el("div", {id: "lv-stopped", class: "lv-stoppedline", hidden: true}),
     el("div", {id: "lv-charts", class: "lv-charts"}, ...LV_CHARTS.map(c =>
       el("div", {class: "card lv-card", id: "lc-" + c.id},
         el("h3", {}, c.title, el("span", {class: "tiny", text: c.sub})),
@@ -339,6 +340,10 @@ function lvBuild() {
     if (LV.range > LV_KEEP) { LV.busy = true; lvHistFetch().then(lvRender, e => { LV.err = e.message; lvStatus(); }).finally(() => { LV.busy = false; }); }
   });
   $("#lv-range").setv(String(LV.range));
+  // "Running only" (default on, remembered on this machine): stopped servers fold into one line instead of one tile each
+  const ro = $("#lv-running");
+  ro.checked = LV.runOnly;
+  ro.addEventListener("change", () => { LV.runOnly = ro.checked; store.set("lv.runOnly", LV.runOnly); LV.showStopped = false; lvRender(); });
   window.addEventListener("resize", () => { if (LV.open) lvRender(); });
 }
 function lvStatus() {
@@ -432,9 +437,19 @@ function lvTileMake() {
     el("div", {class: "lv-big"}, el("div", {class: "stat"}, t.decL, t.decV), el("div", {class: "stat"}, t.preL, t.preV)), t.spark, t.kvs, t.act);
   return t;
 }
-function lvTiles(servers, t0, t1) {
-  const box = $("#lv-tiles");
+function lvTiles(all, t0, t1) {
+  const box = $("#lv-tiles"), fold = $("#lv-stopped");
   LV.tiles = LV.tiles || new Map();
+  const stopped = all.filter(s => !s.meta.up);
+  const folded = LV.runOnly && !LV.showStopped;
+  // running first, then the stopped ones the reader asked to see (a finished run's tile and charts stay reachable)
+  const servers = (folded ? all.filter(s => s.meta.up) : [...all.filter(s => s.meta.up), ...stopped]);
+  if (LV.runOnly && stopped.length) {
+    fold.hidden = false;
+    fold.replaceChildren(el("span", {class: "muted", text: stopped.length + " stopped "}),
+      el("button", {class: "link", type: "button", id: "lv-stopped-btn", "aria-expanded": String(!folded), text: folded ? "(show)" : "(hide)",
+        onclick: () => { LV.showStopped = !LV.showStopped; lvRender(); }}));
+  } else { fold.hidden = true; fold.replaceChildren(); }
   if (!servers.length) {
     LV.tiles.clear();
     box.replaceChildren(el("div", {class: "card lv-emptycard"}, el("b", {text: "No server is running"}),
@@ -442,8 +457,8 @@ function lvTiles(servers, t0, t1) {
       el("div", {}, el("button", {class: "b pri", onclick: () => showTab("launch"), text: "Open Launch"}))));
     return;
   }
-  const keys = servers.map(s => s.meta.key);
-  for (const k of [...LV.tiles.keys()]) if (!keys.includes(k)) LV.tiles.delete(k);
+  const keys = servers.map(s => s.meta.key), have = all.map(s => s.meta.key);
+  for (const k of [...LV.tiles.keys()]) if (!have.includes(k)) LV.tiles.delete(k);
   for (const k of keys) if (!LV.tiles.has(k)) LV.tiles.set(k, lvTileMake());
   const same = box.children.length === keys.length && keys.every((k, i) => box.children[i] === LV.tiles.get(k).root);
   if (!same) box.replaceChildren(...keys.map(k => LV.tiles.get(k).root));

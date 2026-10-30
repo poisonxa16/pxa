@@ -35,6 +35,7 @@ SUBJECTS = {
     "tools/pxa_encode.py": "the encoder front end",
     "tools/pxa_encode_pkg.py": "the encoder's package/verifier",
     "tools/pxa_lib_update.py": "the updater (pxa-update lib)",
+    "tools/pxa_engine_update.py": "the engine channel updater (pxa-update --channel beta)",
 }
 # Third-party / optional imports that no package carries.  vllm_pxq4 is the vLLM sidecar plugin a
 # user installs themselves (tools/vllm-pxq4/) and pxa-launch.py probes it inside a try/except.
@@ -161,8 +162,8 @@ def main():
     for mod, rel in known.items():
         if is_staged(rel):
             carried.add(mod)
-    # package dirs staged whole (tools/pxa_ctl/*.py, tools/pxa_chat, tools/pxa_control_ui)
-    for pkg in ("pxa_ctl", "pxa_chat", "pxa_control_ui"):
+    # package dirs staged whole (tools/pxa_ctl/*.py, tools/pxa_chat, tools/pxa_control_ui, tools/pxa_control)
+    for pkg in ("pxa_ctl", "pxa_chat", "pxa_control_ui", "pxa_control"):
         if any(s.startswith("tools/" + pkg) for s in staged):
             carried.add(pkg)
     n_tools = 0
@@ -182,12 +183,12 @@ def main():
                 fails.append("%s imports %s -- in the tree at %s, staged by neither list"
                              % (rel, name, known[name]))
     # files under a staged package dir count as staged too
-    for pkg in ("pxa_ctl", "pxa_chat", "pxa_control_ui"):
+    for pkg in ("pxa_ctl", "pxa_chat", "pxa_control_ui", "pxa_control"):
         d = os.path.join(tools, pkg)
         if not os.path.isdir(d) or pkg not in carried:
             continue
-        for f in sorted(os.listdir(d)):
-            if f.endswith(".py"):
+        for f in sorted(os.path.relpath(os.path.join(dp, x), d) for dp, _dn, fs in os.walk(d) for x in fs):
+            if f.endswith(".py"):           # subpackages too (pxa_control/plugins, pxa_control/store)
                 n_tools += 1
                 for name in sorted(imports_in(os.path.join(d, f))):
                     if name.startswith("_") or name in EXTERNAL:

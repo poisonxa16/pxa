@@ -66,7 +66,7 @@ Output-identical. Stacked with the host-overhead cuts below, the full shipped se
 **+49% decode at 86,401 tokens, +2.3% at low fill**, over a bracketing control pair, output
 identical in every arm.
 
-> ⚠ **CORRECTED 2026-09-12 — this section's numbers stand as measured, but they are not the last
+> Warning: **CORRECTED 2026-09-12 — this section's numbers stand as measured, but they are not the last
 > word, and neither of the two figures above should be quoted as settled.** The historical text is
 > left intact so the provenance is readable; read it with these three facts.
 >

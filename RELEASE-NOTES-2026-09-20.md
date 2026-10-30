@@ -359,7 +359,7 @@ of the box, the comparison is the plain-decode row.
 | long-context (~15.4k) decode, greedy | 57.70 | 57.26 | level; MTP depth 2 both sides |
 | long-context (~15.4k) prefill | 829 t/s | 593 t/s (+39.8%) | plain, no speculation |
 
-⚠ **The code-edit, temp-1.0, cascade row is marked suspect and is not a number to quote yet.** The
+Warning: **The code-edit, temp-1.0, cascade row is marked suspect and is not a number to quote yet.** The
 review that found the lossless-sampling bugs above also found that a cascade (n-gram in front of
 MTP) with the old sampled-acceptance path could verify an n-gram draft token against a stale
 distribution left over from an earlier MTP draft — exactly the arm that produced this cell, and
@@ -475,4 +475,4 @@ exactly what was and was not measured rather than claiming more.
 
 ## Credits
 
-Thanks to mistrjirka, a developer on the PXA Network Discord, for his help on this release.
+Thanks to the PXA Network Discord for its help on this release.

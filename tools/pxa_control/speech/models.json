@@ -1,0 +1,219 @@
+{
+ "version": 1,
+ "note": "Pinned models for the shared speech service (vendored from Anibal voice models/registry.json). revision = HF commit sha; sha256 = LFS oid. Licences checked against the voice licence memo (2026-10-12).",
+ "models": [
+  {
+   "id": "whisper-tiny.en",
+   "kind": "stt",
+   "engine": "whisper.cpp",
+   "repo": "ggerganov/whisper.cpp",
+   "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+   "licence": "mit",
+   "files": [
+    {
+     "path": "ggml-tiny.en.bin",
+     "sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+     "size": 77704715
+    }
+   ]
+  },
+  {
+   "id": "whisper-base.en",
+   "kind": "stt",
+   "engine": "whisper.cpp",
+   "repo": "ggerganov/whisper.cpp",
+   "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+   "licence": "mit",
+   "files": [
+    {
+     "path": "ggml-base.en.bin",
+     "sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+     "size": 147964211
+    }
+   ]
+  },
+  {
+   "id": "whisper-small.en",
+   "kind": "stt",
+   "engine": "whisper.cpp",
+   "repo": "ggerganov/whisper.cpp",
+   "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+   "licence": "mit",
+   "files": [
+    {
+     "path": "ggml-small.en.bin",
+     "sha256": "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+     "size": 487614201
+    }
+   ]
+  },
+  {
+   "id": "whisper-base",
+   "kind": "stt",
+   "engine": "whisper.cpp",
+   "repo": "ggerganov/whisper.cpp",
+   "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+   "licence": "mit",
+   "files": [
+    {
+     "path": "ggml-base.bin",
+     "sha256": "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+     "size": 147951465
+    }
+   ]
+  },
+  {
+   "id": "whisper-small",
+   "kind": "stt",
+   "engine": "whisper.cpp",
+   "repo": "ggerganov/whisper.cpp",
+   "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+   "licence": "mit",
+   "files": [
+    {
+     "path": "ggml-small.bin",
+     "sha256": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+     "size": 487601967
+    }
+   ]
+  },
+  {
+   "id": "kokoro-82m-onnx-q8",
+   "kind": "tts",
+   "engine": "kokoro-onnx-hf",
+   "repo": "onnx-community/Kokoro-82M-v1.0-ONNX",
+   "revision": "1939ad2a8e416c0acfeecc08a694d14ef25f2231",
+   "licence": "apache-2.0",
+   "files": [
+    {
+     "path": "onnx/model_quantized.onnx",
+     "sha256": "fbae9257e1e05ffc727e951ef9b9c98418e6d79f1c9b6b13bd59f5c9028a1478",
+     "size": 92361116
+    },
+    {
+     "path": "voices/bm_george.bin",
+     "sha256": "c4b235a4c1f2cd3b939fed08b899ce9385638b763f7b73a59616c4fc9bd6c9bc",
+     "size": 522240
+    },
+    {
+     "path": "voices/bf_emma.bin",
+     "sha256": "669fe0647f9dd04fcab92f1439a40eeb4c8b4ab1f82e4996fe3d918ce4a63b73",
+     "size": 522240
+    },
+    {
+     "path": "voices/am_michael.bin",
+     "sha256": "1d1f21dd8da39c30705cd4c75d039d265e9bc4a2a93ed09bc9e1b1225eb95ba1",
+     "size": 522240
+    },
+    {
+     "path": "voices/af_heart.bin",
+     "sha256": "d583ccff3cdca2f7fae535cb998ac07e9fcb90f09737b9a41fa2734ec44a8f0b",
+     "size": 522240
+    },
+    {
+     "path": "voices/ef_dora.bin",
+     "sha256": "f66ec66bd295acb18372e37008533a9a3228483ccd294e7538d5d9294ac9a532",
+     "size": 522240
+    },
+    {
+     "path": "voices/em_alex.bin",
+     "sha256": "27809e9eafdcbcfff90a3016c697568676531de2a2c39cee29c96c7bd6b83e95",
+     "size": 522240
+    },
+    {
+     "path": "voices/ff_siwis.bin",
+     "sha256": "a35f5675ad08948e326ae75fd0ea16ba5d0042e4f76b5f3d1df77d0a48c54861",
+     "size": 522240
+    },
+    {
+     "path": "voices/hf_alpha.bin",
+     "sha256": "040be6a4425411cc01fda5fd06693c76bfa78572632852bc8cda9c99232ffb56",
+     "size": 522240
+    },
+    {
+     "path": "voices/hm_omega.bin",
+     "sha256": "b02d9222d9ed00ce26b302173a862c2c93f96cc40b5c422b8d14910b9ff34137",
+     "size": 522240
+    },
+    {
+     "path": "voices/if_sara.bin",
+     "sha256": "409b69248798fcdc2542330c76953d230710f19b057e59cb82fdc3c4cf71265c",
+     "size": 522240
+    },
+    {
+     "path": "voices/im_nicola.bin",
+     "sha256": "bc578e510d52a96d6940d46f12e96d7b3df00905dbea075113226d100e6e1ab0",
+     "size": 522240
+    },
+    {
+     "path": "voices/jf_alpha.bin",
+     "sha256": "56b479360aad9f367aeb8cef908f9201cf48b4555e488c5f4590c9dfcd978bb6",
+     "size": 522240
+    },
+    {
+     "path": "voices/jm_kumo.bin",
+     "sha256": "09e959d239724c734d65661f06f14cdabcddfd476bfaaad905a937099ae9e64f",
+     "size": 522240
+    },
+    {
+     "path": "voices/pf_dora.bin",
+     "sha256": "3da7b5b2d91847ebf5646f57631af6ececae3c29a89cd300f06edf9aa6cfe9ee",
+     "size": 522240
+    },
+    {
+     "path": "voices/pm_alex.bin",
+     "sha256": "0175c753f59c54e7fd5a995bedef0c5ff2fb67e0043dd3dcb2ae74ec2acbeb2a",
+     "size": 522240
+    },
+    {
+     "path": "voices/zf_xiaoxiao.bin",
+     "sha256": "03adb5d5e3ddd88b047954e974e651cb0a4b524c985057e5d872e962c7be1169",
+     "size": 522240
+    },
+    {
+     "path": "voices/zm_yunxi.bin",
+     "sha256": "7243892fb4e560d47014090ddf010f8b8b790f3c6b029ff82b2ac06aa4e27c8b",
+     "size": 522240
+    }
+   ],
+   "note": "Voices for es/fr/hi/it/ja/pt/zh pinned 2026-10-20 (Interpreter): HF LFS oids at this revision. Credit SIWIS (CC BY 4.0) for ff_siwis and Koniwa/Aozora (CC BY) for jm_kumo (Kokoro training data, per the voice memo)."
+  },
+  {
+   "id": "piper-de-ramona-low",
+   "kind": "tts",
+   "engine": "piper-onnx",
+   "repo": "rhasspy/piper-voices",
+   "revision": "c10ece1aade47bb51c153c893d14e5bf8e5b7117",
+   "licence": "bsd-3-clause",
+   "note": "German voice (Kokoro has none). Repo MIT; MODEL_CARD 2026-10-20: trained from scratch on M-AILABS de_DE (BSD-style licence: any use incl. commercial, keep the copyright notice). Other German Piper voices refused: thorsten (lessac fine-tune, research-only base), kerstin/karlsson (ryan fine-tune, CC BY-NC-SA), pavoque (CC BY-NC-SA).",
+   "files": [
+    {
+     "path": "de/de_DE/ramona/low/de_DE-ramona-low.onnx",
+     "sha256": "a1068592532aad8c49bf3d1a01b8749c11d7dba726689ee28ad64e7b627ae4c5",
+     "size": 63104526
+    },
+    {
+     "path": "de/de_DE/ramona/low/de_DE-ramona-low.onnx.json",
+     "sha256": "64906ab7a050ac685fa3dcea044baa798f67ed77be164f9c668a69298c6487d2",
+     "size": 4157
+    }
+   ]
+  },
+  {
+   "id": "xtts-v2",
+   "kind": "tts",
+   "engine": "coqui",
+   "repo": "coqui/XTTS-v2",
+   "revision": "main",
+   "licence": "coqui-public-model-license",
+   "files": [
+    {
+     "path": "model.pth",
+     "sha256": "",
+     "size": 0
+    }
+   ],
+   "blocked": "licence memo: never XTTS v2 (non-commercial CPML) and pickle checkpoint"
+  }
+ ]
+}

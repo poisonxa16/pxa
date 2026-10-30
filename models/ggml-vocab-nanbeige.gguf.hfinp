@@ -1,0 +1,78 @@
+Hello world
+__ggml_vocab_test__
+ Hello world
+__ggml_vocab_test__
+The quick brown fox jumps over the lazy dog.
+__ggml_vocab_test__
+def fib(n):
+    return n if n < 2 else fib(n-1) + fib(n-2)
+
+__ggml_vocab_test__
+你好，世界！南北阁是一个大语言模型。
+__ggml_vocab_test__
+Mixed 中文 and English, numbers 1234567890 and 3.14159.
+__ggml_vocab_test__
+  leading spaces and    internal   runs
+
+	tabs		end  
+__ggml_vocab_test__
+emoji test 😀🚀 and accents: café naïve Zürich
+__ggml_vocab_test__
+<|im_start|>user
+hi<|im_end|>
+<|im_start|>assistant
+
+__ggml_vocab_test__
+<think>
+reasoning here
+</think>
+
+answer
+__ggml_vocab_test__
+<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</parameter>
+</function>
+</tool_call>
+__ggml_vocab_test__
+URL https://example.com/a?b=c&d=e#frag and path /usr/local/bin
+__ggml_vocab_test__
+
+
+Starts with newlines
+__ggml_vocab_test__
+<|im_start|>system
+You are helpful.<|im_end|>
+<|im_start|>user
+ Leading space after a special<|im_end|>
+
+__ggml_vocab_test__
+Hello world
+__ggml_vocab_test__
+ Hello
+__ggml_vocab_test__
+<|im_start|>system
+hi
+__ggml_vocab_test__
+What is 2+2?
+__ggml_vocab_test__
+Write a haiku about autumn.
+__ggml_vocab_test__
+你好，请介绍一下你自己。
+__ggml_vocab_test__
+ starts with a space
+__ggml_vocab_test__
+What is 2+2?
+__ggml_vocab_test__
+Write a haiku about autumn.
+__ggml_vocab_test__
+你好，请介绍一下你自己。
+__ggml_vocab_test__
+ starts with a space
+__ggml_vocab_test__
+What's the weather in Paris right now?
+__ggml_vocab_test__
+今天北京天气怎么样？
+__ggml_vocab_test__

@@ -38,6 +38,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "pxa-test-portable.h"   // setenv / unsetenv on native Windows too
 
 #define CUCK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     printf("CUDA FAIL %s:%d %s -> %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(2); } } while (0)

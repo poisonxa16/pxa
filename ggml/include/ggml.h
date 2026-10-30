@@ -245,6 +245,14 @@
 #define GGML_MAX_NAME           64
 #endif
 #define GGML_MAX_OP_PARAMS      64
+// Per-model MoE hint carried by the graph builder in op_params[GGML_PXA_MOE_HINT_SLOT] of the routed-expert
+// MUL_MAT_ID / MOE_FUSED_UP_GATE nodes (0 = no hint, the node behaves as before):
+//   bits 0-7  hidden-product scale exponent k for the PXQN tiled prefill GEMM (PXA_PXQN_MOE_HSCALE)
+//   bits 8-15 host-expert offload bar K, tokens per expert, used on sm_70 (PXA_MOE_OFFLOAD_K)
+#define GGML_PXA_MOE_HINT_SLOT  14
+#define GGML_PXA_MOE_HINT(hscale_k, offload_k) ((int32_t)(((hscale_k) & 0xff) | (((offload_k) & 0xff) << 8)))
+#define GGML_PXA_MOE_HINT_HSCALE(t)   ((int)(((t)->op_params[GGML_PXA_MOE_HINT_SLOT]) & 0xff))
+#define GGML_PXA_MOE_HINT_OFFLOAD(t)  ((int)(((t)->op_params[GGML_PXA_MOE_HINT_SLOT] >> 8) & 0xff))
 #define GGML_DEFAULT_N_THREADS  4
 #define GGML_DEFAULT_GRAPH_SIZE 2048
 #if UINTPTR_MAX == 0xFFFFFFFF
@@ -510,13 +518,24 @@ extern "C" {
         // llama.h) is a DIFFERENT namespace — no conflict with this ggml type id.
         GGML_TYPE_PXQ6     = 256,
 
-        // PXQN (PXQ-Next revision 1): PXA's rotated low-bit tiers. Decoded by the closed libggml-pxqn (PXA release
-        // builds); an open build recognises the ids and refuses the files at load. bpw (+16/K for the row anchor):
-        // PXQN3 3.25, PXQN3S8 3.50, PXQN4 4.25.
+        // PXQ-Next revision 1 (working name PXQN; PRIVATE format -- see ggml-pxqn.h and
+        // docs/pxqn-format-spec.md). Integer-exact books x the frozen E16-row scale machinery
+        // (fp16 row anchor via row_meta_size=2 + SUB16 4-bit subs), 64-row panels:
+        //   PXQN3   3-bit N3 book {+-5,16,28,48}/48, SUB16 per 16, 128-K slabs of 3328 B
+        //           (blck 128, type_size 52) -> 3.25 + 16/K bpw
+        //   PXQN3S8 as PXQN3 with SUB16 per 8, 128-K slabs of 3584 B (blck 128, ts 56) -> 3.50 + 16/K
+        //   PXQN4   4-bit N4 = round(PXQ4 book*127)/127 in PXQ4's slab byte order (blck 32, ts 17)
+        //           -> 4.25 + 16/K
+        // Weights of a rotated site are stored as (W*s) @ H128^T per 128-block (GGML_OP_PXQN_RHT
+        // rotates the activation), whatever their type; pxa.pxqn.* GGUF keys carry rev/seed/sites.
         GGML_TYPE_PXQN3    = 257,
         GGML_TYPE_PXQN3S8  = 258,
         GGML_TYPE_PXQN4    = 259,
-        // PXQN2 2.25, PXQN1 1.25, PXQN4S8 4.50, PXQN5 5.25.
+        // PXQN revision-1 LADDER (spec section 8): the same machinery at the byte cost of each old tier
+        //   PXQN2   2-bit N2 book {+-2,+-7}/7, SUB16 per 16, 128-K slabs of 2304 B (blck 128, ts 36) -> 2.25 + 16/K
+        //   PXQN1   1-bit signs x 1/2, SUB16 per 16, 128-K slabs of 1280 B (blck 128, ts 20)      -> 1.25 + 16/K
+        //   PXQN4S8 N4 book, SUB16 per 8, 32-K slabs of 1152 B (blck 32, ts 18)                   -> 4.50 + 16/K
+        //   PXQN5   5-bit uniform (2c-31)/31, SUB16 per 16, 128-K slabs of 5376 B (blck 128, ts 84) -> 5.25 + 16/K
         GGML_TYPE_PXQN2    = 260,
         GGML_TYPE_PXQN1    = 261,
         GGML_TYPE_PXQN4S8  = 262,
@@ -722,12 +741,19 @@ extern "C" {
         // PXA_QSA: the block top-k as a SELECTION rather than a sort
         GGML_OP_QSA_TOPK,
 
-        // PXQN: the rotation of an activation site (closed library)
+        // PXQN: the per-128-block randomized Hadamard rotation of an activation site
+        // (ggml_pxqn_rht; definition in ggml-pxqn.h)
         GGML_OP_PXQN_RHT,
         // PXA expert cache (PXA_XCACHE): route each top-k expert id to the resident (hot) or the
         // streamed (cold) half of a split expert stack, and merge the two halves' outputs back
         GGML_OP_MOE_SPLIT_IDS,
         GGML_OP_MOE_MERGE,
+        // PXA Nemotron-H: Mamba-2 selective scan (scalar decay per head, grouped B/C), ported from mainline
+        GGML_OP_SSM_SCAN2,
+        // PXA Nemotron-H phase 2: the Mamba-2 mixer in two in-place ops (conv window and scan state are read
+        // from and written back to the recurrent state rows directly; see ggml_mamba2_conv / ggml_mamba2_scan)
+        GGML_OP_MAMBA2_CONV,
+        GGML_OP_MAMBA2_SCAN,
 
         GGML_OP_COUNT,
     };
@@ -1155,7 +1181,9 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n);
 
-    // PXQN rotation of an activation site, per 128-block of ne0 (implemented by the closed libggml-pxqn).
+    // PXQN RHT128 of an activation site (ggml-pxqn.h): per 128-block of ne0,
+    //   y = H128 @ (s * x),  H128 = Sylvester Hadamard / sqrt(128),
+    //   s[k] = sign bit (k0 + k) of the (seed, layer, site) stream.
     // a: F32, ne0 % 128 == 0, any ne1..ne3, rows may be strided; result: contiguous F32, same shape.
     // k0 = the GLOBAL K index of element 0 of a's rows (0 unless a is a dim-0 shard of the site;
     // multiple of 128). op_params int32: [0] seed lo, [1] seed hi, [2] layer, [3] site, [4] k0.
@@ -1169,6 +1197,10 @@ extern "C" {
     GGML_API void * ggml_pxqn_lock_open(const char * const * keys, const char * const * vals, int n, char * err, int errlen);
     GGML_API void   ggml_pxqn_lock_decrypt(void * handle, const char * name, uint64_t off, void * buf, size_t n);
     GGML_API void   ggml_pxqn_lock_close(void * handle);
+
+    // Sealed recipes (PXQN revision 2, pxa.pxqn.recipe; ggml-pxqn-api.h): the file names an opaque recipe handle, the closed library maps it to the
+    // rotation seed and the OR of PXQN_SITE_BIT() of the rotated sites. false with ONE plain sentence in err (no libggml-pxqn, one too old, unknown handle).
+    GGML_API bool   ggml_pxqn_recipe_resolve(const char * handle, uint64_t * seed, uint32_t * sites, char * err, int errlen);
 
     GGML_API struct ggml_tensor * ggml_pxqn_rht(
             struct ggml_context * ctx,
@@ -1766,6 +1798,19 @@ extern "C" {
             int64_t               n_embd,
             void                * slot);
 
+    // PXA_XCACHE_SKIP_COLD_RANK (opt-in, changes output): on a split node that writes cold ids (side 1, or the
+    // ggml_moe_split_ids_both node), drop every COLD expert whose best rank over ALL tokens of the node (the
+    // decode / verify window) is `rank` or worse: rank 1 = the token's largest routing weight in `weights`
+    // (F32 [1, n_used, n_tokens] or [n_used, n_tokens], ties broken by slot). A dropped expert's cold id becomes
+    // -1, so no backend computes it and GGML_OP_MOE_MERGE writes 0 for its slots; the other weights are NOT
+    // renormalised. Hot (resident) ids are never touched, and a cold expert some token of the window ranks
+    // better than `rank` is computed for every token that routes to it. rank <= 0 leaves the node as it was.
+    // Sets op_params[3] = rank and src[3] = weights.
+    GGML_API void ggml_moe_split_ids_set_skip_cold(
+            struct ggml_tensor  * split,
+            struct ggml_tensor  * weights,
+            int                   rank);
+
     // In place over `hot` (returns a view of it): every slot whose hot id is -1 takes the cold
     // output (or 0 when the cold id is -1 as well). Slots served by the hot stack are not touched,
     // so the result is, slot for slot, the value the one-stack graph computes for that expert.
@@ -2034,6 +2079,20 @@ extern "C" {
 
     // supports 3D: a->ne[2] == b->ne[1]
     GGML_API struct ggml_tensor * ggml_get_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // Type-preserving row gather: the same op, but the result keeps a's type instead of being
+    // widened to F32. For every fixed-block type this is a pure row COPY on the bits -- no
+    // dequantisation, no arithmetic, nothing that interprets the payload -- so it writes as many
+    // bytes as the rows occupy rather than four per element, and a quantised consumer downstream
+    // can go on consuming quantised data. Out-of-range indices zero the row, exactly as the
+    // widening gather does (a zeroed block of any of these types dequantises to 0.0).
+    //
+    // Requires a row to be a whole number of blocks (a->ne[0] % ggml_blck_size(a->type) == 0),
+    // which every real row layout satisfies.
+    GGML_API struct ggml_tensor * ggml_get_rows_typed(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
@@ -2643,6 +2702,58 @@ extern "C" {
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
             struct ggml_tensor  * sq);
+
+    // PXA Nemotron-H: Mamba-2 scan (mainline ggml_ssm_scan semantics with A = {1, n_head}, K = 1, no ids).
+    // s  {d_state, head_dim, n_head, n_seqs} contiguous (already gathered per sequence, in batch order)
+    // x  {head_dim, n_head, n_seq_tokens, n_seqs}   dt {n_head, n_seq_tokens, n_seqs} contiguous
+    // A  {1, n_head}   B, C {d_state, n_group, n_seq_tokens, n_seqs}
+    // result: 1-d, y (nelements(x), layout {head_dim, n_head, n_seq_tokens, n_seqs}) followed by the final states
+    GGML_API struct ggml_tensor * ggml_ssm_scan2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * B,
+            struct ggml_tensor  * C);
+
+    // PXA Nemotron-H phase 2: the Mamba-2 mixer as two IN-PLACE ops on the recurrent state rows.
+    // rs   {n_embd_rs, n_rows} F32: row r = [conv window {d_conv-1, conv_dim} | scan state {d_state, head_dim, n_head}]
+    // ids  {n_seqs} I32: the state row of each sequence of the batch (tokens of a sequence are contiguous,
+    //      n_tokens = n_seqs * n_seq_tokens);  mask {1, n_seqs} F32 (0 = the sequence starts here: zero state)
+    //
+    // ggml_mamba2_conv: y = silu(conv1d(mask*window | x) + b), {conv_dim, n_tokens} contiguous. Side effect: the
+    //   window of row ids[s] becomes the last d_conv-1 inputs of sequence s. x {conv_dim, n_tokens} (nb0 = 4, any
+    //   row stride), w {d_conv, conv_dim}, b {conv_dim} or NULL. d_conv must be 4.
+    // ggml_mamba2_scan: y = (scan(mask*state, x, dt + dt_b, A, B, C) + D*x) * silu(z), {head_dim*n_head, n_tokens}
+    //   contiguous. Side effect: the scan state of row ids[s] (at float offset s_off of the row) is the final state.
+    //   x, z {head_dim, n_head, n_seq_tokens, n_seqs}; dt {n_head, n_seq_tokens, n_seqs}; B, C {d_state, n_group,
+    //   n_seq_tokens, n_seqs} (nb0 = 4, nb1 = ne0*4 for x, z, B, C; any higher strides); A, D {1, n_head}; dt_b {n_head}.
+    // Both are bit-identical to the unfused graph (get_rows * mask, ssm_conv, add, silu, ssm_scan2, mul, add,
+    // silu, mul, concat, set_rows) on the CUDA backend; the arithmetic order of every value is kept.
+    GGML_API struct ggml_tensor * ggml_mamba2_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rs,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * mask);
+
+    GGML_API struct ggml_tensor * ggml_mamba2_scan(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rs,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * B,
+            struct ggml_tensor  * C,
+            struct ggml_tensor  * dt_b,
+            struct ggml_tensor  * D,
+            struct ggml_tensor  * z,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * mask,
+            int64_t               s_off);
 
     // partition into non-overlapping windows with padding if needed
     // example:

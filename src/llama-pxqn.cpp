@@ -63,11 +63,27 @@ void llama_pxqn_read_keys(const struct gguf_context * ctx, uint32_t & rev, uint6
     if (rev == 0) {
         throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_REV " = 0 -- malformed file (revisions start at 1)");
     }
-    if (rev > PXQN_REV) {
+    if (rev > PXQN_REV_MAX) {
         char buf[256];
         snprintf(buf, sizeof(buf), "PXQN: this file is PXQ-Next revision %u, and this build reads revision %u only. "
-                 "Update the engine to a build that reads revision %u.", rev, PXQN_REV, rev);
+                 "Update the engine to a build that reads revision %u.", rev, PXQN_REV_MAX, rev);
         throw std::runtime_error(buf);
+    }
+    if (rev >= 2) {
+        // revision 2: the rotation is sealed. The file names an opaque recipe handle and carries no seed / site list; a file with both is refused
+        // (it would be ambiguous which one decodes it).
+        const int kh = gguf_find_key(ctx, LLAMA_PXQN_KEY_RECIPE);
+        if (kh < 0 || gguf_get_kv_type(ctx, kh) != GGUF_TYPE_STRING) {
+            throw std::runtime_error("PXQN: revision 2 file without a " LLAMA_PXQN_KEY_RECIPE " string -- malformed file");
+        }
+        if (gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_SEED) >= 0 || gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_SITES) >= 0) {
+            throw std::runtime_error("PXQN: revision 2 file that also carries " LLAMA_PXQN_KEY_ROT_SEED "/" LLAMA_PXQN_KEY_ROT_SITES " -- malformed file");
+        }
+        char err[256] = {0};
+        if (!ggml_pxqn_recipe_resolve(gguf_get_val_str(ctx, kh), &seed, &sites, err, (int) sizeof(err))) {
+            throw std::runtime_error(err[0] ? std::string(err) : std::string("PXQN: cannot resolve the recipe of this revision-2 file"));
+        }
+        return;
     }
     const int ks = gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_SEED);
     if (ks >= 0) {
@@ -182,7 +198,10 @@ uint32_t llama_pxqn_arch_rot_sites(llm_arch arch, bool moe) {
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_MTP:
         case LLM_ARCH_SMOLLM3:
-        case LLM_ARCH_MISTRAL3:   return moe ? ATTN : (ATTN | FFN);
+        case LLM_ARCH_MISTRAL3:
+        // PXA_FLINT: build_std_attention (attn_in) + llm_build_kv/llm_build_kqv (out_in) on every path the
+        // Flint graph takes (sliding/full layers, the window-cache override, sinks); MoE -> attention sites only
+        case LLM_ARCH_FLINT:      return moe ? ATTN : (ATTN | FFN);
         default:                  return 0;
     }
 }

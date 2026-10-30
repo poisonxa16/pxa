@@ -329,7 +329,10 @@ class GGUFReader:
             n_bytes = n_elems * type_size // block_size
             # PXA PXQ E16-row family: add the per-row anchor meta (2 B/row) that gguf's
             # (block,type_size) table omits, else the tensor blob is read truncated.
-            _pxa_rm = {248: 2, 252: 2, 253: 2, 254: 2, 255: 2, 256: 2}.get(int(ggml_type), 0)
+            # PXQ (248, 252-256), PXQN3/3S8/4/2/1/4S8/5 (257-263) and PXA4 (264): +2 B/row fp16 anchor meta
+            # (128 B header per 64-row panel, row_meta_size 2 in ggml.c). Keep in step with quants.py _PXA_ROW_META.
+            _pxa_rm = {248: 2, 252: 2, 253: 2, 254: 2, 255: 2, 256: 2,
+                       257: 2, 258: 2, 259: 2, 260: 2, 261: 2, 262: 2, 263: 2, 264: 2}.get(int(ggml_type), 0)
             if _pxa_rm and int(dims[0]) != 0:
                 n_bytes += (n_elems // int(dims[0])) * _pxa_rm
             data_offs = int(start_offs + offset_tensor[0])

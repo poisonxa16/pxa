@@ -14,3 +14,7 @@ void ggml_cuda_flash_attn_ext_volta_mma(ggml_backend_cuda_context & ctx, ggml_te
 bool ggml_cuda_fattn_volta_mma_d512_supported(const ggml_tensor * dst, int cc);
 void ggml_cuda_flash_attn_ext_volta_mma_d512(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_fattn_volta_mma_d512_arm_report(void);
+// PXA_FA_D512_KVSTEP: the same 512/512 64-column kernel staged 128 or 64 keys per softmax step
+// (fattn-volta-mma-inst-d512-kv128.cu / -kv64.cu); the dispatcher below picks one at prefill widths.
+void ggml_cuda_flash_attn_ext_volta_mma_d512_kv128(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_flash_attn_ext_volta_mma_d512_kv64(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

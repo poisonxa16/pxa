@@ -6,6 +6,7 @@
 //
 
 #pragma once
+#include "pxa-env-flag.h"
 #include "mmvq.cuh"
 #include "vecdotq.cuh"
 #include <type_traits>
@@ -68,6 +69,18 @@ template <ggml_type type, int ncols_y, int ROWS>
 static constexpr int mmvq_rows_per_block = pxq_mmvq_layout<type>
         ? (ROWS < mmvq_rows_cap<ncols_y> ? ROWS : mmvq_rows_cap<ncols_y>)
         : (ROWS > 1 ? ROWS : (ncols_y < 4 ? 1 : 2));   // ROWS > 1 on a stock type: the sm_70 tile, see mmvq_v100_rows
+
+// PXA_PXQN_VERIFY_WIDE (2026-10-14): the PLAIN kernel's ceiling at 5..8 columns is 8, not 4. The 4 above is
+// the up/gate twin's (two staging buffers: 48 KB at ncols_y 8 x ROWS 8); the plain kernel's single buffer at ncols_y 8 x
+// ROWS 8 is (4-1) x 8 x 8 x 32 x 4 B = 24 KB. Only reachable through the PXA_PXQN_VERIFY_WIDE launch (the shipped tile
+// table never asks for more than 4 rows above 4 columns), so every launch that exists today keeps its tile.
+template <int ncols_y>
+static constexpr int mmvq_rows_cap_plain = ncols_y <= 2 ? 16 : 8;
+
+template <ggml_type type, int ncols_y, int ROWS>
+static constexpr int mmvq_rows_per_block_plain = pxq_mmvq_layout<type>
+        ? (ROWS < mmvq_rows_cap_plain<ncols_y> ? ROWS : mmvq_rows_cap_plain<ncols_y>)
+        : mmvq_rows_per_block<type, ncols_y, ROWS>;
 
 // The tier's policy, and the slab stride the panel arithmetic steps by. Both come off the policy
 // so a new tier is one struct in pxq-mmvq.cuh and one arm here, with nothing to keep in sync.
@@ -215,13 +228,13 @@ static __device__ void k_mul_mat_vec_q(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
+    //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < PXA_CC_RDNA2 ?
     //    ncols_y < 4 ? 1 : 2 : 1;
 
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int rows_per_cuda_block = mmvq_rows_per_block<type, ncols_y, ROWS>;
+    constexpr int rows_per_cuda_block = mmvq_rows_per_block_plain<type, ncols_y, ROWS>;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
@@ -277,7 +290,7 @@ static __device__ void k_mul_mat_vec_q(
                 for (int i = 0; i < rows_per_cuda_block; ++i) tmp[j][i] *= rb.anch[i];
             }
         }
-    } else
+    } else { // braces: MSVC-mode nvcc loses the next declaration after an unbraced else-for
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -291,7 +304,7 @@ static __device__ void k_mul_mat_vec_q(
                 tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
             }
         }
-    }
+    }}
 
     // one scalar per thread: every thread only ever wrote and read element threadIdx.x of the
     // old array, and the runtime index was enough to put it in local memory (see pxa_lane_pick).
@@ -345,7 +358,7 @@ static __device__ void k_fused_mul_mat_vec_q(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
+    //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < PXA_CC_RDNA2 ?
     //    ncols_y < 4 ? 1 : 2 : 1;
 
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
@@ -421,7 +434,7 @@ static __device__ void k_fused_mul_mat_vec_q(
                 }
             }
         }
-    } else
+    } else { // braces: see above
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -436,7 +449,7 @@ static __device__ void k_fused_mul_mat_vec_q(
                 tmp_g[j][i] += vec_dot_q_cuda(vgate, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
             }
         }
-    }
+    }}
 
     __shared__ float tmp_shared_u[nwarps-1 > 0 ? nwarps-1 : 1][ncols_y][rows_per_cuda_block][WARP_SIZE];
     __shared__ float tmp_shared_g[nwarps-1 > 0 ? nwarps-1 : 1][ncols_y][rows_per_cuda_block][WARP_SIZE];
@@ -525,6 +538,328 @@ static __global__ void mul_mat_vec_q(
     k_mul_mat_vec_q<type, ncols_y, nwarps, ROWS, VDRP, HOIST, FAST>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
+// PXA_PXQN_VERIFY_WIDE (2026-10-14): mul_mat_vec_q with a MIN-BLOCKS launch bound. The body is the same
+// k_mul_mat_vec_q instantiation (HOIST, not FAST) -- same per-thread k-block set (kbx = tid/(qi/vdr) + j*blocks_per_iter),
+// same per-thread accumulation order, same cross-warp order and butterfly -- so every output is bit-identical to
+// mul_mat_vec_q's; only ptxas's register budget changes. Why it exists: under __launch_bounds__(128, 1) the PXQ verify
+// widths 6..8 take 141/154/163 registers (122 at 5), i.e. 3 blocks of 128 threads per SM instead of 4, and nvprof puts
+// the whole w5 -> w6 verify step there (+27..33% per launch on every 27B shape at 6 columns). MINB 4 caps the kernel at
+// 128 registers so 4 blocks stay resident.
+template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP, int MINB>
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+__launch_bounds__(nwarps*WARP_SIZE, MINB)
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+static __global__ void mul_mat_vec_q_mb(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const char * __restrict__ ids_data, const void * __restrict__ bias,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst,
+    const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0, const int64_t bias_nb1) {
+
+    int i2 = blockIdx.y;
+    char * cdst = (char *)dst + i2*nb2;
+    int i02 = ids_data ? *(const int *)(ids_data + i2*ids_nb0) : i2;
+    if (i02 < 0) {
+        return;
+    }
+    const char * cx = (const char *)vx + i02*nb02;
+    const char * cy = (const char *)vy + i2*nb12;
+    const float * b = (const float *)(bias ? ids_data ? (const char *)bias + i02*bias_nb1 : bias : nullptr);
+    k_mul_mat_vec_q<type, ncols_y, nwarps, ROWS, VDRP, true, false>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+// PXA_PXQN_VERIFY_WIDE (2026-10-14): the PXQ multi-column kernel with two bit-identical rewrites of
+// k_mul_mat_vec_q's HOIST path, each a template switch so the harness can price them one at a time.
+//  I2FX: the dp4a partial s (|s| <= 8*128*128 = 2^17) is converted to float as __int_as_float(s + 0x4B400000) - 1.5*2^23
+//        (IADD + FADD, both full rate) instead of I2F (a quarter-rate conversion on sm_70: 16/clk/SM). Exact for |s| < 2^22,
+//        so the float is the same float and the following FFMA is the same FFMA -- bit-identical.
+//  EPI:  the cross-warp epilogue. k_mul_mat_vec_q hands warps 1..3's partials to warp 0, which alone runs ncols_y x ROWS
+//        (up to 32) chains of 3 adds + a 5-step butterfly while the other warps exit. Here every warp stages its partials
+//        and pair p = j*ROWS + i is finished by warp p % 4 in the SAME order (((w0 + w1) + w2) + w3, then the same xor
+//        butterfly, whose lanes all hold the same sum) -- bit-identical, a quarter of the serial tail.
+// Same lane mapping (kqs, kbx = tid/(qi/vdr) + j*blocks_per_iter), same per-thread k order, same dot arithmetic.
+static __device__ __forceinline__ float pxa_i2f_exact(const int s) {   // == (float) s for |s| < 2^22
+    return __int_as_float(s + 0x4B400000) - 12582912.0f;
+}
+
+template <class POL, int VDR, int ROWS, bool I2FX>
+static __device__ __forceinline__ float pxq_mmvq_dot_frag_vw(
+        const pxq_mmvq_wfrag<POL, VDR, ROWS> & w, const float anch,
+        const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+    const int * q8 = (const int *) bq8_1->qs;
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR; ++l) {
+        const int m = iqs + l;
+        int s = ggml_cuda_dp4a(w.v[l].x, q8[2*m + 0], 0);
+        s     = ggml_cuda_dp4a(w.v[l].y, q8[2*m + 1], s);
+        if constexpr (I2FX) {
+            sum  += w.eff[l] * pxa_i2f_exact(s);
+        } else {
+            sum  += w.eff[l] * (float) s;
+        }
+    }
+    return anch * __low2float(bq8_1->ds) * sum;
+}
+
+template <ggml_type type, int ncols_y, int ROWS, int VDRP, bool I2FX, bool EPI>
+static __device__ void k_mul_mat_vec_q_vw(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    const float * bias, float * __restrict__ dst,
+    const int ncols_x, const int nrows_y, const int nrows_dst) {
+    static_assert(pxq_mmvq_layout<type> && ncols_y > 1, "PXQ multi-column only");
+    constexpr int nwarps = 4;
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = VDRP;
+    constexpr int rows_per_cuda_block = mmvq_rows_per_block_plain<type, ncols_y, ROWS>;
+
+    const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int blocks_per_row_x = ncols_x / qk;
+    const     int blocks_per_col_y = nrows_y / QK8_1;
+    constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
+
+    float tmp[ncols_y][rows_per_cuda_block] = {0.0f};
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    __shared__ float s_sub[16];
+    const float * sub = pxq_mmvq_stage_sub<type>(s_sub, tid);
+    const pxq_mmvq_rowbase<type, rows_per_cuda_block> rb(vx, row0, blocks_per_row_x);
+    const int kqs = vdr * (tid % (qi/vdr));
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const uint8_t * slab = rb.slab(kbx);
+        pxq_mmvq_scales<pxq_mmvq_pol<type>, rows_per_cuda_block> sc; sc.load(slab, rb.r0);
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            pxq_mmvq_frag<type, VDRP, rows_per_cuda_block> w;
+            w.load(slab, rb.r0 + i, i, sub, sc, kqs);
+#pragma unroll
+            for (int j = 0; j < ncols_y; ++j) {
+                tmp[j][i] += pxq_mmvq_dot_frag_vw<pxq_mmvq_pol<type>, VDRP, rows_per_cuda_block, I2FX>(
+                        w, rb.anch[i], &y[j*blocks_per_col_y + kby], kqs);
+            }
+        }
+    }
+
+    if constexpr (EPI) {
+        constexpr int NP = ncols_y*rows_per_cuda_block;
+        __shared__ float part[nwarps][NP][WARP_SIZE];
+#pragma unroll
+        for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                part[threadIdx.y][j*rows_per_cuda_block + i][threadIdx.x] = tmp[j][i];
+            }
+        }
+        __syncthreads();
+        for (int p = threadIdx.y; p < NP; p += nwarps) {
+            float v = part[0][p][threadIdx.x];
+#pragma unroll
+            for (int l = 1; l < nwarps; ++l) {
+                v += part[l][p][threadIdx.x];
+            }
+            v = warp_reduce_sum(v);
+            const int j = p / rows_per_cuda_block, i = p % rows_per_cuda_block;
+            if (threadIdx.x == 0 && row0 + i < nrows_dst) {
+                dst[j*nrows_dst + row0 + i] = v + (bias ? bias[row0 + i] : 0.0f);
+            }
+        }
+    } else {
+        float local_bias = 0.0f;
+        if (bias && threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block && row0 + threadIdx.x < nrows_dst) {
+            local_bias = bias[row0 + threadIdx.x];
+        }
+        __shared__ float tmp_shared[nwarps-1][ncols_y][rows_per_cuda_block][WARP_SIZE];
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.y > 0) {
+            return;
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+                for (int l = 0; l < nwarps-1; ++l) {
+                    tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+                }
+                tmp[j][i] = warp_reduce_sum(tmp[j][i]);
+            }
+            if (threadIdx.x < rows_per_cuda_block && row0 + threadIdx.x < nrows_dst) {
+                dst[j*nrows_dst + row0 + threadIdx.x] = pxa_lane_pick<rows_per_cuda_block>(tmp[j], threadIdx.x) + local_bias;
+            }
+        }
+    }
+}
+
+// PXA_PXQN_VERIFY_WIDE column split (2026-10-14). The block carries TWO full sets of k_mul_mat_vec_q's 128
+// threads (blockDim 32 x 8): warps 0..3 own activation columns [0, NC0), warps 4..7 own [NC0, ncols_y). Inside each set,
+// thread t = 32*(warp & 3) + lane is k_mul_mat_vec_q's thread t EXACTLY -- same k-blocks (kbx = t/(qi/vdr) + j*64), same
+// half (kqs), same per-k-block dot, same accumulation order -- and each set reduces its own columns with k_mul_mat_vec_q's
+// cross-warp order and butterfly, so every output is bit-identical to the one-set kernel (and to the 1-column launch).
+// What changes is the per-thread footprint: a thread carries ROWS x ceil(ncols_y/2) accumulators and activation
+// fragments instead of ROWS x ncols_y (at 8 columns: the 4-column kernel's ~112 registers instead of 163), so the SM
+// keeps 16 warps in flight instead of 12; the activation reads are unchanged (each column read once per block) and the
+// weight fragment is decoded by both sets (the second read is an L1 hit: same block, same addresses).
+template <ggml_type type, int NC, int ROWS, int VDRP>
+static __device__ __forceinline__ void pxq_mmvq_cs_body(
+        const pxq_mmvq_rowbase<type, ROWS> & rb, const float * __restrict__ sub, const block_q8_1 * __restrict__ y,
+        const int blocks_per_row_x, const int blocks_per_col_y, const int t, float (&tmp)[NC][ROWS]) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = VDRP;
+    constexpr int blocks_per_iter = vdr * 4*WARP_SIZE / qi;          // k_mul_mat_vec_q at nwarps 4
+    const int kqs = vdr * (t % (qi/vdr));
+    for (int kbx = t / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const uint8_t * slab = rb.slab(kbx);
+        pxq_mmvq_scales<pxq_mmvq_pol<type>, ROWS> sc; sc.load(slab, rb.r0);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            pxq_mmvq_frag<type, VDRP, ROWS> w;
+            w.load(slab, rb.r0 + i, i, sub, sc, kqs);
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                tmp[j][i] += pxq_mmvq_dot_f<type, VDRP, ROWS>(w, rb.anch[i], &y[j*blocks_per_col_y + kby], kqs);
+            }
+        }
+    }
+}
+
+// every warp stages its partials (no accumulator array lives across the barrier, so a thread's register footprint stays
+// that of ITS column set); after the barrier warp 0 of the set finishes each (column, row) in k_mul_mat_vec_q's order:
+// ((w0 + w1) + w2) + w3, then the same xor butterfly (every lane ends with the same sum).
+template <int NC, int ROWS>
+static __device__ __forceinline__ void pxq_mmvq_cs_stage(const float (&tmp)[NC][ROWS], float (*sh)[NC][ROWS][WARP_SIZE], const int wy) {
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            sh[wy][j][i][threadIdx.x] = tmp[j][i];
+        }
+    }
+}
+template <int NC, int ROWS>
+static __device__ __forceinline__ void pxq_mmvq_cs_reduce(float (*sh)[NC][ROWS][WARP_SIZE], float * __restrict__ dst,
+        const int col0, const int row0, const int nrows_dst, const float local_bias) {
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            float v = sh[0][j][i][threadIdx.x];
+#pragma unroll
+            for (int l = 1; l < 4; ++l) {
+                v += sh[l][j][i][threadIdx.x];
+            }
+            v = warp_reduce_sum(v);
+            if (threadIdx.x == i && row0 + i < nrows_dst) {
+                dst[(col0 + j)*nrows_dst + row0 + i] = v + local_bias;
+            }
+        }
+    }
+}
+
+template <ggml_type type, int ncols_y, int ROWS, int VDRP>
+static __device__ void k_mul_mat_vec_q_cs(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    const float * bias, float * __restrict__ dst,
+    const int ncols_x, const int nrows_y, const int nrows_dst) {
+    static_assert(pxq_mmvq_layout<type> && ncols_y >= 2, "PXQ multi-column only");
+    constexpr int NC0 = (ncols_y + 1)/2, NC1 = ncols_y/2;
+    constexpr int R = ROWS;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+    const int g   = threadIdx.y >> 2;                 // column set
+    const int wy  = threadIdx.y & 3;                  // warp inside the set
+    const int t   = WARP_SIZE*wy + threadIdx.x;       // k_mul_mat_vec_q's thread id
+    const int row0 = R*blockIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    __shared__ float s_sub[16];
+    const float * sub = pxq_mmvq_stage_sub<type>(s_sub, tid);
+    const pxq_mmvq_rowbase<type, R> rb(vx, row0, blocks_per_row_x);
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float local_bias = 0.0f;
+    if (bias && wy == 0 && threadIdx.x < R && row0 + threadIdx.x < nrows_dst) {
+        local_bias = bias[row0 + threadIdx.x];
+    }
+    __shared__ float sh0[4][NC0][R][WARP_SIZE];
+    __shared__ float sh1[4][NC1][R][WARP_SIZE];
+    if (g == 0) {
+        float tmp[NC0][R] = {0.0f};
+        pxq_mmvq_cs_body<type, NC0, R, VDRP>(rb, sub, y, blocks_per_row_x, blocks_per_col_y, t, tmp);
+        pxq_mmvq_cs_stage<NC0, R>(tmp, sh0, wy);
+    } else {
+        float tmp[NC1][R] = {0.0f};
+        pxq_mmvq_cs_body<type, NC1, R, VDRP>(rb, sub, y + NC0*blocks_per_col_y, blocks_per_row_x, blocks_per_col_y, t, tmp);
+        pxq_mmvq_cs_stage<NC1, R>(tmp, sh1, wy);
+    }
+    __syncthreads();
+    if (wy != 0) {
+        return;
+    }
+    if (g == 0) {
+        pxq_mmvq_cs_reduce<NC0, R>(sh0, dst, 0,   row0, nrows_dst, local_bias);
+    } else {
+        pxq_mmvq_cs_reduce<NC1, R>(sh1, dst, NC0, row0, nrows_dst, local_bias);
+    }
+}
+
+template <ggml_type type, int ncols_y, int ROWS, int VDRP, int MINB>
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+__launch_bounds__(8*WARP_SIZE, MINB)
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+static __global__ void mul_mat_vec_q_cs(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const char * __restrict__ ids_data, const void * __restrict__ bias,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst,
+    const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0, const int64_t bias_nb1) {
+    GGML_UNUSED(nrows_x);
+    int i2 = blockIdx.y;
+    char * cdst = (char *)dst + i2*nb2;
+    int i02 = ids_data ? *(const int *)(ids_data + i2*ids_nb0) : i2;
+    if (i02 < 0) {
+        return;
+    }
+    const char * cx = (const char *)vx + i02*nb02;
+    const char * cy = (const char *)vy + i2*nb12;
+    const float * b = (const float *)(bias ? ids_data ? (const char *)bias + i02*bias_nb1 : bias : nullptr);
+    k_mul_mat_vec_q_cs<type, ncols_y, ROWS, VDRP>(cx, cy, b, (float *)cdst, ncols_x, nrows_y, nrows_dst);
+}
+
+template <ggml_type type, int ncols_y, int ROWS, int VDRP, int MINB, bool I2FX, bool EPI>
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+__launch_bounds__(4*WARP_SIZE, MINB)
+#endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+static __global__ void mul_mat_vec_q_vw(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const char * __restrict__ ids_data, const void * __restrict__ bias,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst,
+    const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0, const int64_t bias_nb1) {
+    GGML_UNUSED(nrows_x);
+    int i2 = blockIdx.y;
+    char * cdst = (char *)dst + i2*nb2;
+    int i02 = ids_data ? *(const int *)(ids_data + i2*ids_nb0) : i2;
+    if (i02 < 0) {
+        return;
+    }
+    const char * cx = (const char *)vx + i02*nb02;
+    const char * cy = (const char *)vy + i2*nb12;
+    const float * b = (const float *)(bias ? ids_data ? (const char *)bias + i02*bias_nb1 : bias : nullptr);
+    k_mul_mat_vec_q_vw<type, ncols_y, ROWS, VDRP, I2FX, EPI>(cx, cy, b, (float *)cdst, ncols_x, nrows_y, nrows_dst);
+}
+
 template <ggml_type type, int ncols_y, int nwarps, int ROWS, int VDRP, bool HOIST = true>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
@@ -552,6 +887,79 @@ static __global__ void fused_mul_mat_vec_q(
             unary_op, limit);
 }
 
+// K1 SINGLE-COLUMN PIPELINED PXQ MMVQ (PXA_PXQ_MMVQ_PF, 2026-10-14; see pxa_pxq_mmvq_pf()).
+// The default single-column tile (4 rows, 4 warps, VDR 2) of k_mul_mat_vec_q with the next k-block's code words
+// and scale word issued before this k-block's math, in a lean body (no ids / bias / multi-column plumbing) that
+// the 64-register launch bound (8 blocks/SM) fits without a spill. Lane mapping (kqs, kbx = tid/2 + 64 j), the
+// per-thread k order, the arithmetic (vec_dot_pxq_q8_1_qw, the one body vec_dot_pxq_q8_1 also runs), the
+// cross-warp order and the warp reduction are k_mul_mat_vec_q's: bit-identical to it. PXQ rows come in 64-row
+// panels, so a 4-row block never straddles a matrix end.
+template <ggml_type type>
+static __device__ __forceinline__ void k_pxq_mmvq1_pf(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst, const int ncols_x, const int row0) {
+    static_assert(type == GGML_TYPE_PXQ4 || type == GGML_TYPE_PXQN4, "K1 PF body: the p6 slab tiers only");
+    using POL = pxq_mmvq_pol<type>;
+    constexpr int NW = 4, ROWS = 4, qk = 32, qi = 4, vdr = 2, TPR = qi/vdr, BPI = vdr*NW*WARP_SIZE/qi;
+    const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
+    const int nkb = ncols_x / qk;
+    float tmp[ROWS] = {0.0f};
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    __shared__ float s_sub[16];
+    const float * sub = pxq_mmvq_stage_sub<type>(s_sub, tid);
+    const pxq_mmvq_rowbase<type, ROWS> rb(vx, row0, nkb);
+    const int kqs = vdr * (tid % TPR);
+    int kbx = tid / TPR;
+    uint32_t qw[ROWS][2];
+    pxq_mmvq_scales<POL, ROWS> sc;
+    if (kbx < nkb) {
+        const uint8_t * slab = rb.slab(kbx);
+        sc.load(slab, rb.r0);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) POL::template load_words<2>(slab, rb.r0 + i, kqs, qw[i]);
+    }
+    for (; kbx < nkb; kbx += BPI) {
+        uint32_t qn[ROWS][2];
+        pxq_mmvq_scales<POL, ROWS> scn;
+        const int kn = kbx + BPI;
+        if (kn < nkb) {
+            const uint8_t * slab = rb.slab(kn);
+            scn.load(slab, rb.r0);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) POL::template load_words<2>(slab, rb.r0 + i, kqs, qn[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) tmp[i] += vec_dot_pxq_q8_1_qw<POL, 2, ROWS>(qw[i], i, rb.anch[i], sub, sc, &y[kbx], kqs);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) { qw[i][0] = qn[i][0]; qw[i][1] = qn[i][1]; }
+#pragma unroll
+        for (int w = 0; w < (int) (sizeof(sc.w)/sizeof(sc.w[0])); ++w) sc.w[w] = scn.w[w];
+    }
+    __shared__ float tmp_shared[NW-1][ROWS][WARP_SIZE];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) tmp_shared[threadIdx.y-1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < NW-1; ++l) tmp[i] += tmp_shared[l][i][threadIdx.x];
+        tmp[i] = warp_reduce_sum(tmp[i]);
+    }
+    if (threadIdx.x < ROWS) {
+        dst[row0 + threadIdx.x] = pxa_lane_pick<ROWS>(tmp, threadIdx.x) + 0.0f;   // + the no-bias local_bias
+    }
+}
+
+template <ggml_type type>
+__launch_bounds__(4*WARP_SIZE, 8)
+static __global__ void mul_mat_vec_q_pf1(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst, const int ncols_x) {
+    k_pxq_mmvq1_pf<type>(vx, vy, dst, ncols_x, 4*(int) blockIdx.x);
+}
+
 // GROUPED DECODE GEMV (PXA_MMVQ_GROUP, sm_70). Up to MMVQ_GROUP_MAX matrices of one type that read the
 // same q8_1 activation (the DeltaNet qkv / z / alpha / beta chain, attention q / k / v) in ONE launch: the
 // grid is the concatenation of each matrix's own row blocks and a block runs the unchanged single-matrix
@@ -574,6 +982,24 @@ static __global__ void mul_mat_vec_q_group(const mmvq_group_args g) {
         if (m == i) { vx = g.vx[i]; dst = g.dst[i]; nr = g.nrows[i]; }
     }
     k_mul_mat_vec_q<type, 1, nwarps, ROWS, VDRP, true>(vx, g.vy, nullptr, dst, g.ncols_x, nr, g.nrows_y, nr, b - b0);
+}
+
+// K1 twin of mul_mat_vec_q_group: the same block -> matrix mapping, the pipelined single-column body.
+template <ggml_type type>
+__launch_bounds__(4*WARP_SIZE, 8)
+static __global__ void mul_mat_vec_q_group_pf1(const mmvq_group_args g) {
+    const int b = blockIdx.x;
+    int m = 0, b0 = 0;
+#pragma unroll
+    for (int i = 1; i < MMVQ_GROUP_MAX; ++i) {
+        if (i < g.n && b >= g.blk_end[i-1]) { m = i; b0 = g.blk_end[i-1]; }
+    }
+    const void * vx = g.vx[0]; float * dst = g.dst[0];
+#pragma unroll
+    for (int i = 1; i < MMVQ_GROUP_MAX; ++i) {
+        if (m == i) { vx = g.vx[i]; dst = g.dst[i]; }
+    }
+    k_pxq_mmvq1_pf<type>(vx, g.vy, dst, g.ncols_x, 4*(b - b0));
 }
 
 // SM_70 ROW TILE FOR Q6_K (PXA_MMVQ_V100_ROWS). The single-column Q6_K block is 4 warps on ONE row: each
@@ -615,11 +1041,11 @@ static inline int mmvq_v100_rows(int cc, int ncols_y, int nrows, int ne2, bool f
     if constexpr (type != GGML_TYPE_Q6_K) {
         return 1;
     } else {
-        if (cc == CC_VOLTA && (ncols_y == 2 || ncols_y == 3) && ne2 <= 1 && !fused && nrows >= 65536) {
+        if (cc == PXA_CC_VOLTA && (ncols_y == 2 || ncols_y == 3) && ne2 <= 1 && !fused && nrows >= 65536) {
             const int r = mmvq_v100_rows_ny_env();
             return (r == 2 || r == 4) && nrows % r == 0 ? r : 1;
         }
-        if (cc != CC_VOLTA || ncols_y != 1 || ne2 > 1 || fused) return 1;
+        if (cc != PXA_CC_VOLTA || ncols_y != 1 || ne2 > 1 || fused) return 1;
         const int e = mmvq_v100_rows_env();
         const int r = e >= 0 ? e : (nrows >= 65536 ? 4 : (nrows >= 2048 ? 2 : 1));
         return (r == 2 || r == 4) && nrows % r == 0 ? r : 1;
@@ -651,7 +1077,85 @@ static void mul_mat_vec_q_group_launch(mmvq_group_args & g, cudaStream_t stream)
     int end = 0;
     for (int i = 0; i < g.n; ++i) { end += (g.nrows[i] + R - 1)/R; g.blk_end[i] = end; }
     for (int i = g.n; i < MMVQ_GROUP_MAX; ++i) { g.blk_end[i] = end; }
+    if constexpr ((type == GGML_TYPE_PXQ4 || type == GGML_TYPE_PXQN4) && ROWS == 4 && VDRP == 2) {
+        if (pxa_pxq_mmvq_pf()) {   // K1: the pipelined single-column body (bit-identical; PXQ rows come in 64-row panels)
+            mul_mat_vec_q_group_pf1<type><<<end, dim3(WARP_SIZE, 4, 1), 0, stream>>>(g);
+            return;
+        }
+    }
     mul_mat_vec_q_group<type, 4, ROWS, VDRP><<<end, dim3(WARP_SIZE, 4, 1), 0, stream>>>(g);
+}
+
+// PXA_MMVQ_MIXGRP (2026-10-19): a PXQ-layout group on the pipelined one-column body (ga, blocks
+// [0, ga.blk_end[ga.n-1])) and a stock-type group (gb, the rest: e.g. the Q8_0 DeltaNet alpha/beta that read the same q8_1
+// activation right after the PXQN4 qkv/z) in ONE launch. Each block runs exactly the body and the local block index its own
+// group launch gives it (mul_mat_vec_q_group_pf1 / mul_mat_vec_q_group): bit-identical, minus one launch.
+template <ggml_type TA, ggml_type TB, int ROWSB>
+__launch_bounds__(4*WARP_SIZE, 8)
+static __global__ void mul_mat_vec_q_group_mix(const mmvq_group_args ga, const mmvq_group_args gb) {
+    const int na = ga.blk_end[ga.n - 1];
+    if ((int) blockIdx.x < na) {
+        const int b = blockIdx.x;
+        int m = 0, b0 = 0;
+#pragma unroll
+        for (int i = 1; i < MMVQ_GROUP_MAX; ++i) {
+            if (i < ga.n && b >= ga.blk_end[i-1]) { m = i; b0 = ga.blk_end[i-1]; }
+        }
+        const void * vx = ga.vx[0]; float * dst = ga.dst[0];
+#pragma unroll
+        for (int i = 1; i < MMVQ_GROUP_MAX; ++i) {
+            if (m == i) { vx = ga.vx[i]; dst = ga.dst[i]; }
+        }
+        k_pxq_mmvq1_pf<TA>(vx, ga.vy, dst, ga.ncols_x, 4*(b - b0));
+    } else {
+        const int b = (int) blockIdx.x - na;
+        int m = 0, b0 = 0;
+#pragma unroll
+        for (int i = 1; i < MMVQ_GROUP_MAX; ++i) {
+            if (i < gb.n && b >= gb.blk_end[i-1]) { m = i; b0 = gb.blk_end[i-1]; }
+        }
+        const void * vx = gb.vx[0]; float * dst = gb.dst[0]; int nr = gb.nrows[0];
+#pragma unroll
+        for (int i = 1; i < MMVQ_GROUP_MAX; ++i) {
+            if (m == i) { vx = gb.vx[i]; dst = gb.dst[i]; nr = gb.nrows[i]; }
+        }
+        k_mul_mat_vec_q<TB, 1, 4, ROWSB, 2, true>(vx, gb.vy, nullptr, dst, gb.ncols_x, nr, gb.nrows_y, nr, b - b0);
+    }
+}
+
+// true = ga (a PXQ-layout type TA that would take the pf1 group body) and gb (stock type TB, same q8_1 activation) ran as one launch
+template <ggml_type TA, ggml_type TB>
+static bool mul_mat_vec_q_group_mix_cuda(mmvq_group_args & ga, mmvq_group_args & gb, cudaStream_t stream) {
+    if constexpr (!pxq_mmvq_layout<TA> || pxq_mmvq_layout<TB>) {
+        GGML_UNUSED(ga); GGML_UNUSED(gb); GGML_UNUSED(stream);
+        return false;
+    } else {
+        if (ga.n < 1 || ga.n > MMVQ_GROUP_MAX || gb.n < 1 || gb.n > MMVQ_GROUP_MAX || ga.vy != gb.vy) return false;
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        // ga: only the shape mul_mat_vec_q_group_cuda<TA> launches on the pf1 body
+        if (pxa_pxq_mmvq_vdr() != 2 || pxa_pxq_mmvq_tile(1, false, cc) != 4 || !pxa_pxq_mmvq_pf()) return false;
+        constexpr int RA = mmvq_rows_per_block<TA, 1, 4>;
+        int end = 0;
+        for (int i = 0; i < ga.n; ++i) { end += (ga.nrows[i] + RA - 1)/RA; ga.blk_end[i] = end; }
+        for (int i = ga.n; i < MMVQ_GROUP_MAX; ++i) { ga.blk_end[i] = end; }
+        // gb: the tile mul_mat_vec_q_group_cuda<TB> picks
+        int big = 0;
+        for (int i = 0; i < gb.n; ++i) big = gb.nrows[i] > big ? gb.nrows[i] : big;
+        int r = mmvq_v100_rows<TB>(cc, 1, big, 1, false);
+        for (int i = 0; i < gb.n; ++i) if (gb.nrows[i] % r) r = 1;
+        auto fill_b = [&](int R) {
+            int e = 0;
+            for (int i = 0; i < gb.n; ++i) { e += (gb.nrows[i] + R - 1)/R; gb.blk_end[i] = e; }
+            for (int i = gb.n; i < MMVQ_GROUP_MAX; ++i) { gb.blk_end[i] = e; }
+            return e;
+        };
+        switch (r) {
+            case 4:  { const int eb = fill_b(mmvq_rows_per_block<TB, 1, 4>); mul_mat_vec_q_group_mix<TA, TB, 4><<<end + eb, dim3(WARP_SIZE, 4, 1), 0, stream>>>(ga, gb); break; }
+            case 2:  { const int eb = fill_b(mmvq_rows_per_block<TB, 1, 2>); mul_mat_vec_q_group_mix<TA, TB, 2><<<end + eb, dim3(WARP_SIZE, 4, 1), 0, stream>>>(ga, gb); break; }
+            default: { const int eb = fill_b(mmvq_rows_per_block<TB, 1, 1>); mul_mat_vec_q_group_mix<TA, TB, 1><<<end + eb, dim3(WARP_SIZE, 4, 1), 0, stream>>>(ga, gb); break; }
+        }
+        return true;
+    }
 }
 
 // one launch for g.n matrices at ny = 1 with nwarps 4 (the ny = 1 shape of mul_mat_vec_q_cuda);
@@ -708,10 +1212,11 @@ static void mul_mat_vec_q_cuda_R(const mmvq_args & args, cudaStream_t stream) {
 
     int id = ggml_cuda_get_device();
 
-    int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
+    int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < PXA_CC_RDNA2 ?
         args.ncols_y < 4 ? 1 : 2 : 1;
-    if constexpr (pxq_mmvq_layout<type>) {                  // must match mmvq_rows_per_block
-        const int cap = args.ncols_y <= 2 ? 16 : (args.ncols_y <= 4 ? 8 : 4);
+    if constexpr (pxq_mmvq_layout<type>) {                  // must match mmvq_rows_per_block(_plain)
+        const bool fused_launch = args.vx_u && args.vx_g && args.unary_op != GGML_UNARY_OP_COUNT;
+        const int cap = args.ncols_y <= 2 ? 16 : (args.ncols_y <= 4 || !fused_launch ? 8 : 4);
         rows_per_cuda_block = ROWS < cap ? ROWS : cap;
     }
 
@@ -778,6 +1283,13 @@ static void mul_mat_vec_q_cuda_R(const mmvq_args & args, cudaStream_t stream) {
     } else {
     switch (args.ncols_y) {
         case 1:
+            if constexpr ((type == GGML_TYPE_PXQ4 || type == GGML_TYPE_PXQN4) && nwarps == 4 && ROWS == 4 && VDRP == 2) {
+                // K1: the pipelined single-column body (bit-identical) for the plain one-matrix, no-bias, no-ids launch
+                if (pxa_pxq_mmvq_pf() && args.ne2 == 1 && !args.ids_data && !args.bias_u && args.nrows_x % 64 == 0 && args.nrows_dst >= args.nrows_x) {
+                    mul_mat_vec_q_pf1<type><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ncols_x);
+                    break;
+                }
+            }
             mul_mat_vec_q<type, 1, nwarps, ROWS, VDRP><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
@@ -821,9 +1333,67 @@ static void mul_mat_vec_q_cuda_R(const mmvq_args & args, cudaStream_t stream) {
 // widening the block to R adjacent rows turns both into contiguous runs. R is bounded by the
 // register file (measured: R=16 puts the plain kernel at 231 regs and makes the fused twin spill
 // 384 B/thread, vs MXFP4's 40/59), hence the sweep.
+// PXA_PXQN_VERIFY_WIDE (2026-10-14; unset = ON at sm_70, 0 = off, 1 = on at sm_70): the PXQN4 q8_1 MMVQ at
+// the MTP verify widths where the shipped launch loses occupancy to registers, through mul_mat_vec_q_mb -- the SAME
+// k_mul_mat_vec_q body with a min-blocks launch bound (and, at 6 columns, the plain kernel's 8-row tile), so every
+// output is bit-identical (tests/test-pxqn-verify-wide.cu: 390/390 + 425/425 bitwise vs the shipped launch and vs the
+// 1-column launch). Measured per 27B verify step (sum of the 5 verify GEMV shapes x their per-step counts, V100):
+// 4 cols R4/MB4 -4.5%, 6 cols R8/MB3 -8.1%, 7 cols R4/MB4 -11.6%, 8 cols R4/MB4 -9.9%; 2, 3 and 5 columns keep the
+// shipped launch (every candidate measured slower there). Not taken: ids / batched (ne2 > 1) / fused launches,
+// PXA_SPEC_FAST_VERIFY, VDR 4, any card but sm_70 (the only one measured).
+static inline int pxa_pxqn_verify_wide_env() {
+    static const int v = [](){
+        const char * e = getenv("PXA_PXQN_VERIFY_WIDE");
+        return e ? (atoi(e) != 0 ? 1 : 0) : -1;
+    }();
+    return v;
+}
+template <ggml_type type, int nwarps>
+static bool pxa_pxqn_verify_wide_try(const mmvq_args & args, cudaStream_t stream, const int cc) {
+    if constexpr (type != GGML_TYPE_PXQN4 || nwarps != 4) {
+        GGML_UNUSED(args); GGML_UNUSED(stream); GGML_UNUSED(cc);
+        return false;
+    } else {
+        if (cc != PXA_CC_VOLTA || pxa_pxqn_verify_wide_env() == 0) return false;
+        const int ny = args.ncols_y;
+        if (ny != 4 && ny != 6 && ny != 7 && ny != 8) return false;
+        if (args.ne2 != 1 || args.ids_data || (args.vx_u && args.vx_g && args.unary_op != GGML_UNARY_OP_COUNT)) return false;
+        if (pxa_pxq_mmvq_vdr() != 2 || pxa_spec_fast_verify(cc) || args.nrows_x % 64 != 0) return false;
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            fprintf(stderr, "PXA_PXQN_VERIFY_WIDE: PXQN4 verify GEMVs at 4/6/7/8 columns on the min-blocks launch (bit-identical; =0 restores the old launch)\n");
+        }
+        const dim3 blk(WARP_SIZE, 4, 1);
+#define PXA_VW_L(NY, R, MB) mul_mat_vec_q_mb<type, NY, 4, R, 2, MB><<<dim3((args.nrows_x + R - 1)/R, 1, 1), blk, 0, stream>>>( \
+            args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u, args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, \
+            args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1)
+        switch (ny) {
+            case 4:  PXA_VW_L(4, 4, 4); break;
+            case 6:  PXA_VW_L(6, 8, 3); break;
+            case 7:  PXA_VW_L(7, 4, 4); break;
+            default: PXA_VW_L(8, 4, 4); break;
+        }
+#undef PXA_VW_L
+        return true;
+    }
+}
+
+// PXA_PXQN_VWPF (2026-10-16; unset = ON at sm_70, 0 = off): the PXQN4 q8_1 MMVQ at the verify widths
+// 3/6/7 (where it measured faster) on the K1 pipelined body. Kernel, gate and per-width tile live in pxa/pxq-mmvq-pft.cuh, compiled into the PXQN4
+// instance TU only (pxa/template-instances/mmvq-instance-pxqn4.cu defines this): true = launched there.
+bool pxa_pxqn_vwpf_launch(const mmvq_args & args, cudaStream_t stream);
+
 template <ggml_type type, int nwarps>
 static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
     if constexpr (pxq_mmvq_layout<type>) {
+        if constexpr (type == GGML_TYPE_PXQN4 && nwarps == 4) {
+            if (pxa_pxqn_vwpf_launch(args, stream)) {
+                return;
+            }
+        }
+        if (pxa_pxqn_verify_wide_try<type, nwarps>(args, stream, ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            return;
+        }
         const int r = pxa_pxq_mmvq_tile(args.ncols_y,
                 args.vx_u && args.vx_g && args.unary_op != GGML_UNARY_OP_COUNT,
                 ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
@@ -853,12 +1423,22 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
     mul_mat_vec_q_cuda_R<type, nwarps, 1, 2>(args, stream);
 }
 
+// PXA_MMVQ_NW4 (2026-10-16; unset = ON, 0 = off): 5..8-column launches keep nwarps 4 instead of
+// dropping to 2. nwarps sets the k-stride of every thread and the cross-warp fold of every row, so at 2 a column's
+// sum is a different association than the 1-column launch computes: the 27B's Q8_0 tensors (output head, ssm_alpha /
+// ssm_beta, attn_k / attn_v) made a 5..8-column MTP verify forward differ from one-token decode (pxa-bi-probe K = 5:
+// first divergent node beta-0 = MUL_MAT(blk.0.ssm_beta.weight [Q8_0], ...)). At 4 every width 1..8 shares the
+// 1-column reduction, the contract PXQN already keeps below.
+static inline bool pxa_mmvq_nw4() {
+    static const bool v = [](){ const char * e = getenv("PXA_MMVQ_NW4"); return !(e && pxa_env_value_off(e)); }();
+    return v;
+}
 template <ggml_type type>
 static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
     int nwarps = 1;
     int id = ggml_cuda_get_device();
-    if (args.ne2 < 2 && ggml_cuda_info().devices[id].cc < CC_RDNA2) { // NVIDIA and AMD older than RDNA2
-        nwarps = args.ncols_y <= 4 ? 4 : 2;
+    if (args.ne2 < 2 && ggml_cuda_info().devices[id].cc < PXA_CC_RDNA2) { // NVIDIA and AMD older than RDNA2
+        nwarps = (args.ncols_y <= 4 || pxa_mmvq_nw4()) ? 4 : 2;
         // PXQN keeps ONE reduction shape for every width 1..8, so a column's result does not depend
         // on how many columns ride with it (the PXQN GEMV's batch-invariance contract, 1..8 on this route)
         if constexpr (type == GGML_TYPE_PXQN4 || type == GGML_TYPE_PXQN4S8) nwarps = 4;
@@ -867,7 +1447,7 @@ static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
     // expert dim fills gridDim.y. The nwarps>1 reduction path is ALREADY shipped for the non-MoE case
     // above (same reassociation, ~1e-6 class), so extending it to MoE is low-risk. Env-gated for the A/B;
     // set PXA_MMVQ_MOE_NWARPS=2 or 4 to force it. Prove faster + shadow-clean before defaulting.
-    if (args.ne2 >= 2 && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
+    if (args.ne2 >= 2 && ggml_cuda_info().devices[id].cc < PXA_CC_RDNA2) {
         static const int moe_nwarps = [](){ const char * e = getenv("PXA_MMVQ_MOE_NWARPS"); int w = e ? atoi(e) : 0; return (w == 2 || w == 4) ? w : 0; }();
         if (moe_nwarps) nwarps = moe_nwarps;
     }
@@ -914,4 +1494,5 @@ extern bool mul_mat_vec_q6_K_q8_1_group_cuda(mmvq_group_args & g, cudaStream_t s
 extern bool mul_mat_vec_q8_0_q8_1_group_cuda(mmvq_group_args & g, cudaStream_t stream);
 extern bool mul_mat_vec_pxqn4_q8_1_group_cuda(mmvq_group_args & g, cudaStream_t stream);
 extern bool mul_mat_vec_pxqn4s8_q8_1_group_cuda(mmvq_group_args & g, cudaStream_t stream);
+extern bool mul_mat_vec_pxqn4_q8_1_group_mix_cuda(mmvq_group_args & ga, mmvq_group_args & gb, ggml_type tb, cudaStream_t stream);
 

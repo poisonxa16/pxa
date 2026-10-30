@@ -30,6 +30,12 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // note: clears the memory of the context
 bool common_speculative_is_compat(llama_context * ctx_tgt);
 
+// PXA_SPEC_MTP_NGRAM_SHALLOW_v1: run BEFORE the slot / MTP companion setup (server-context), so a chain that falls back to
+// MTP alone also gets the MTP-only setup (shared spec, batched draft/commit, a 4-token MTP ubatch) and not the composite one.
+// When params.pxa_ngram_auto_front is set, asks the recurrent checkpoint budget of ctx_tgt what the table could draft after
+// common_speculative_init's clamp; drops the auto table when that is no deeper than the head. -> true when dropped.
+bool common_speculative_pxa_drop_shallow_front(common_params_speculative & params, llama_context * ctx_tgt);
+
 // Bug #232 (PXA_SPEC_PERSLOT_v2): the MTP companion context, shareable between several
 // common_speculative objects. A server that gives every slot its OWN speculative object (required
 // whenever the chain has a non-MTP stage: n-gram tables, reset streaks and draft ramps are not
@@ -110,6 +116,12 @@ void common_speculative_set_request_sampler(common_speculative * spec, llama_seq
 bool common_speculative_take_draft_q(common_speculative * spec, llama_seq_id seq_id,
         std::vector<std::vector<pxa_spec_cand>> & out);
 
+// PXA_SPEC_EXACT_NMIN_v1: the longest the sampled draft just produced for `seq_id` could have been
+// before any of its tokens was drawn, or -1 (argmax draft, no draft, PXA_SPEC_EXACT=0). The n_min floor
+// of a sampled draft must be decided on this (pxa_spec_nmin_keep in pxa-spec-sampled.h), never on the
+// drawn length. Read-only.
+int common_speculative_draft_pre_len(common_speculative * spec, llama_seq_id seq_id);
+
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 // seq_id: the sequence whose step was accepted. The chain may be SHARED by several
 // sequences, so per-sequence state must be told which one this is.
@@ -138,6 +150,10 @@ void common_speculative_set_load(common_speculative * spec, int n_active);
 // follows is a plain one, and an MTP head must capture its target hidden row so the next draft does not start from
 // a stale one.
 bool common_speculative_select_no_draft(const common_speculative * spec, llama_seq_id seq_id);
+// PXA_SPEC_LAZY_HIDDEN: true when a plain round should mark the stored hidden stale instead of copying the row
+// (the MTP pick fetches it); see common_speculative_mark_hidden_stale()
+bool common_speculative_lazy_hidden(const common_speculative * spec);
+void common_speculative_mark_hidden_stale(common_speculative * spec, llama_seq_id seq_id);
 
 bool common_speculative_ensure_sequence_hidden(
     common_speculative * spec,

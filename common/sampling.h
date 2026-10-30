@@ -407,6 +407,8 @@ bool common_sampler_dry_active(const struct common_sampler * gsmpl);
 // expiring bias, no reasoning budget still able to force, no probabilities asked for -- so a verify can
 // be decided from the device-side argmax alone (llama_set_argmax_only).
 bool common_sampler_pure_greedy(const struct common_sampler * gsmpl);
+// PXA_SAMPLED_TOPW: this request's next draw can read its window from the decode's device top-W node (ctx has one wide enough)
+bool common_sampler_topw_ok(const struct common_sampler * gsmpl, struct llama_context * ctx);
 // The exact-match verify of common_sampler_sample_and_accept_n for a pure-greedy request whose verify
 // decode was argmax-only: same acceptance, same accept() side effects. Empty result = the argmax rows
 // are not available (the caller falls back; the decode then copied logits and nothing was consumed).
@@ -450,8 +452,10 @@ llama_token common_sampler_draft_greedy_guarded(struct common_sampler * gsmpl, s
 // filtered with this request's sampler parameters, and hand that distribution back in `q_out` so the
 // verifier can run the lossless accept/residual rule on it. Returns the drawn token, or -1 when this
 // request's sampler chain cannot be mirrored onto the draft head (the caller then keeps its greedy
-// draft and the exact rule). `out_prob`, when asked for, is q(drawn token) -- the confidence of the
-// token that was actually proposed, which is the quantity a p_min floor means under this rule.
+// draft and the exact rule). `out_prob`, when asked for, is the drafter's confidence at this position,
+// max_y q(y) -- NOT q(drawn token): the caller's p_min floor and depth cutoff drop a token whose
+// probability fails them, and only a gate that does not look at the drawn token keeps the rule exact
+// (PXA_SPEC_SAMPLED_GATE_v1; PXA_SPEC_EXACT=0 restores the old q(drawn) gate for A/B only).
 llama_token common_sampler_draft_sample_dist(struct common_sampler * gsmpl, struct llama_context * ctx, int idx,
         std::vector<pxa_spec_cand> & q_out, float * out_prob = nullptr);
 

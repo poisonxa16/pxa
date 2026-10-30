@@ -18,10 +18,19 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <deque>
+#include <memory>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "pxa-win-compat.h"
+#else
 #include <unistd.h>
+#endif
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -32,10 +41,13 @@
 
 bool llama_pxa_xcache_residency_blocks(void) { return false; }
 void llama_pxa_xcache_tick(llama_model &, int) {}
+void llama_pxa_xcache_seq_start(llama_model &) {}
 bool llama_pxa_xcache_companion_quiet(void) { return false; }
 void llama_pxa_xcache_note_tokens(llama_model &, int) {}
 void llama_pxa_xcache_adaptor_free(llama_model &) {}
 bool llama_pxa_xcache_stats(const struct llama_model *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *) { return false; }
+bool llama_pxa_xcache_rtier_stats(const llama_model *, uint64_t *, uint64_t *) { return false; }
+bool llama_pxa_xcache_evict_file_stats(const llama_model *, uint64_t *, uint64_t *) { return false; }
 bool llama_pxa_tokmiss_on() { return false; }
 void llama_pxa_tokmiss_note_request(const int32_t *, int, int, uint64_t) {}
 void llama_pxa_tokmiss_note_batch(const llama_token *, int) {}
@@ -128,6 +140,10 @@ struct llama_model::pxa_xc_adaptor {
         std::vector<int32_t> spare;               // free COLD slots (pinned host RAM)
         size_t stage_off = 0;                     // offset (in u32) of this layer's counter block in the pinned staging buffer
         bool dirty = false;                       // map changed this tick, flush to the device
+        // PXA_XCACHE_EVICT_FILE: where each tensor kind's expert 0 sits in the model file (the stacks hold the file's raw slices), so
+        // an evicted expert's bytes are read back from the file instead of copied over the link; empty = this layer evicts by copy
+        std::vector<size_t> foff;
+        std::vector<int> ffd;
     };
     // one swap = evict e_out (hot slot s -> a free cold slot), then admit e_in (its cold slot -> the hot slot s that freed up)
     struct op {
@@ -138,6 +154,7 @@ struct llama_model::pxa_xc_adaptor {
         int phase = 0;         // 0 evict copy in flight (hot -> cold), 1 admit copy in flight (cold -> hot)
         uint64_t due = 0;      // tick at which the current phase's flip is applied (earliest, in non-deterministic mode)
         void * ev = nullptr;
+        std::shared_ptr<std::atomic<int>> fl;   // PXA_XCACHE_EVICT_FILE phase 0: the file read (0 pending, 1 done, -1 failed)
     };
 
     llama_model & model;
@@ -178,6 +195,53 @@ struct llama_model::pxa_xc_adaptor {
     uint64_t tot_hit = 0, tot_miss = 0;               // routings served by the hot stack / that went to the cold stack since the start
     uint64_t win_hit = 0, win_miss = 0;               // the same since the last log line
     std::mutex mu;
+    // PXA_XCACHE_ADAPT_RESET (default on): every sequence that starts at position 0 starts from the planned hot set, a fresh policy
+    // state and zero routing counts, so the same request gives the same answer whatever was served before it (the hot GPU kernel and
+    // the CPU cold path round differently, so WHICH experts are hot changes the floats). =0: the hot set carries across requests.
+    bool reset_on = true;
+    std::vector<op> applied;                          // completed swaps since the last reset, undone in reverse order at the next one
+    std::vector<std::vector<int32_t>> init_map, init_spare, init_hot, init_cold;
+    std::vector<std::vector<uint32_t>> base_cnt;      // per layer: device counters (n_expert + 8) at the last reset
+    std::vector<std::vector<uint32_t>> rel_cnt;       // per layer: counts since the last reset, what the policy observes
+    ggml_pxqn_xc_cfg cfg_saved = {};
+    uint64_t n_resets = 0, n_undone = 0;
+    int64_t  us_reset = 0;
+    // PXA_XCACHE_RTIER (default off): the adaptation off the decode thread. The routing counters are copied
+    // asynchronously at the observation tick and a planner thread runs the policy (observe + plan) while the card runs the next
+    // decodes; its swaps start at a later tick. At most PXA_XCACHE_SWAP_CAP swaps per decode (default 2 here) and the copy-completion
+    // schedule (no decode waits for a copy). Meant for RIX (rank-identical experts: the card and the CPU compute the same bits), where
+    // WHEN an expert moves cannot change an answer; without RIX the answers depend on copy timing and a warning says so.
+    bool rtier = false;
+    int  swap_cap = 0;               // swaps per decode tick (0 = the policy's own budget only)
+    std::thread rt_th;
+    std::mutex rt_mu;
+    std::condition_variable rt_cv;
+    bool rt_stop = false, rt_job = false, rt_done = false;
+    uint32_t * rt_stage[2] = { nullptr, nullptr };
+    int  rt_buf = 0;
+    void * rt_ev = nullptr;
+    uint32_t rt_ntok = 0;
+    std::vector<std::vector<int32_t>> rt_map;         // snapshot of the maps the plan is made against
+    std::vector<std::vector<uint8_t>> rt_busy;
+    std::vector<int32_t> rt_spare;
+    std::vector<ggml_pxqn_xc_view> rt_views;
+    std::vector<ggml_pxqn_xc_swap> rt_out;
+    int32_t rt_nout = 0;
+    uint64_t n_rt_jobs = 0, n_rt_skip = 0, n_rt_stale = 0;
+
+    // ---- PXA_XCACHE_EVICT_FILE: evict = a host read of the expert's bytes from the model file into the free cold slot -------------
+    // (an IO thread; the link carries only the admit). Every slot holds the file's raw bytes (pxa_xc_fill copies slices; swaps copy
+    // whole slots), so the cold slot ends up byte-equal to what the D2H copy would have written.
+    struct io_job { std::vector<int> fd; std::vector<size_t> off, n; std::vector<char *> dst; std::shared_ptr<std::atomic<int>> fl; };
+    bool evict_file = false;
+    std::thread io_th;
+    std::mutex io_mu;
+    std::condition_variable io_cv, io_done_cv;
+    std::deque<io_job> io_q;
+    bool io_stop = false;
+    uint64_t n_ef = 0;
+    std::atomic<uint64_t> n_ef_fail{0}, us_ef{0}, n_ef_done{0};
+    int64_t  us_rt_worker = 0;
     bool learn = false;             // this session writes <model>.expert-counts.learned.csv
     bool learn_saved = false;       // one log line for the periodic save
     bool learn_wait_logged = false;
@@ -187,11 +251,14 @@ struct llama_model::pxa_xc_adaptor {
 
     ~pxa_xc_adaptor() {
         if (trace) fclose(trace);
+        rt_shutdown();
         drain();
+        io_shutdown();
         if (learn) persist_learned(true);
         if (pst && pol) pol->destroy(pst);
         pst = nullptr;
         if (stage) ggml_backend_cuda_xcache_pinned_free(stage);
+        for (auto * b : rt_stage) if (b) ggml_backend_cuda_xcache_pinned_free(b);
     }
 
     bool init() {
@@ -227,8 +294,14 @@ struct llama_model::pxa_xc_adaptor {
                 l.coldT.push_back(f.cold);
                 l.dev = f.dev;
                 l.eb += f.hot->nb[2];
+                l.foff.push_back(f.file_off);
+                l.ffd.push_back(f.file_fd);
             }
+            if (std::find(l.ffd.begin(), l.ffd.end(), -1) != l.ffd.end()) { l.ffd.clear(); l.foff.clear(); }
             if (l.hotT.empty() || l.eb == 0 || l.n_expert <= 1) continue;
+            // a layer whose hot stack stays in host memory (-ot to CPU: the split records dev -1) has no device copies to
+            // schedule; it keeps its planned placement. Passing -1 to the CUDA helpers aborted with "invalid device ordinal".
+            if (l.dev < 0) continue;
             const auto & xl = model.pxa_xc[l.il];
             l.map.assign(l.n_expert, -1);
             l.busy.assign(l.n_expert, 0);
@@ -291,34 +364,54 @@ struct llama_model::pxa_xc_adaptor {
                 }
             }
         }
+        // Probe before the policy is built so a swap can be priced against a measured CPU miss.
+        // Unknown rate (probe failed) leaves cpu_gbs at 0 and the policy keeps the ratio test only.
+        double cpu_gbs = 0;
+        if (!L.empty() && !L[0].coldT.empty() && L[0].coldT[0]->data) {
+            const int nt = env_int("PXA_XCACHE_PROBE_THREADS", 16);
+            cpu_gbs = pxa_xc_probe_cpu_gbs(L[0].coldT[0]->data, ggml_nbytes(L[0].coldT[0]), nt);
+        }
+        // Payback stays off unless asked. The same-binary ABBA (2026-10-10) cut swaps from
+        // about 18k to about 70 and the hit rate from 87% to 83%, with no speed gain.
+        double cpu_use = 0.0;
+        if (const char * pb = getenv("PXA_XCACHE_SWAP_PAYBACK"); pb && pb[0] == '1' && pb[1] == 0 && cpu_gbs > 0.0) cpu_use = 0.65 * cpu_gbs;
         ggml_pxqn_xc_cfg cfg = {};
         cfg.n_layers = (int32_t) L.size();
         cfg.layers   = lcfg.data();
         cfg.n_used   = n_used;
         cfg.pcie_gbs = pcie_gbs;
-        cfg.cpu_gbs  = 0;
+        cfg.cpu_gbs  = cpu_use;
         cfg.flags    = det ? 1u : 0u;
         pst = pol->create(&cfg);
         if (!pst) return false;
-        {   // what one routed expert costs when it misses: on the CPU (cold path) vs read over the measured link (the miss split's prices)
+        cfg_saved = cfg;
+        reset_on = env_int("PXA_XCACHE_ADAPT_RESET", 1) != 0;
+        init_map.resize(L.size()); init_spare.resize(L.size()); init_hot.resize(L.size()); init_cold.resize(L.size());
+        base_cnt.resize(L.size()); rel_cnt.resize(L.size());
+        for (size_t i = 0; i < L.size(); ++i) {
+            init_map[i]   = L[i].map;
+            init_spare[i] = L[i].spare;
+            init_hot[i]   = model.pxa_xc[L[i].il].hot;
+            init_cold[i]  = model.pxa_xc[L[i].il].cold;
+            base_cnt[i].assign((size_t) L[i].n_expert + 8, 0);
+            rel_cnt[i].assign((size_t) L[i].n_expert, 0);
+        }
+        {   // what one routed expert costs when it misses: on the CPU (cold path) vs read over the measured link
             double cpu_us = 0, link_us = 0;
             size_t eb_sum = 0;
             for (const auto & l : L) eb_sum += l.eb;
-            double cpu_gbs = 0;
-            if (!L.empty() && !L[0].coldT.empty() && L[0].coldT[0]->data) {
-                const int nt = env_int("PXA_XCACHE_PROBE_THREADS", 16);
-                cpu_gbs = pxa_xc_probe_cpu_gbs(L[0].coldT[0]->data, ggml_nbytes(L[0].coldT[0]), nt);
-            }
-            // a matvec streams its weights at ~two thirds of what a plain read gets
-            const double cpu_use = cpu_gbs > 0 ? 0.65*cpu_gbs : 20.0;
-            if (pol->miss_cost_us && pcie_gbs > 0 && pol->miss_cost_us(eb_sum/L.size(), pcie_gbs, cpu_use, &cpu_us, &link_us)) {
+            const double cpu_log = cpu_use > 0 ? cpu_use : 20.0;
+            if (pol->miss_cost_us && pcie_gbs > 0 && pol->miss_cost_us(eb_sum/L.size(), pcie_gbs, cpu_log, &cpu_us, &link_us)) {
                 LLAMA_LOG_INFO("PXA_XCACHE: a missed expert (%.2f MiB) costs ~%.0f us on the CPU (cold path, %.1f GB/s streamed from the pinned stack%s) against ~%.0f us over the %.2f GB/s link (zero-copy / DMA): %s\n",
-                        eb_sum/(double)L.size()/1048576.0, cpu_us, cpu_use, cpu_gbs > 0 ? ", measured" : ", assumed", link_us, pcie_gbs,
+                        eb_sum/(double)L.size()/1048576.0, cpu_us, cpu_log, cpu_gbs > 0 ? ", measured" : ", assumed", link_us, pcie_gbs,
                         link_us < cpu_us ? "the link is the cheaper way to serve a miss" : "the CPU serves misses, the link carries the background swaps");
             }
         }
-        LLAMA_LOG_INFO("PXA_XCACHE: online adaptation %s: %zu split layers, %zu free cold slots, re-rank every %d decodes, link %.2f GB/s, %s schedule\n",
-                adapt ? "ON" : "observing only", L.size(), any_spare, obs_every, pcie_gbs, det ? "deterministic" : "copy-completion");
+        if (adapt && env_int("PXA_XCACHE_RTIER", 0) != 0) rt_start();
+        if (adapt && env_int("PXA_XCACHE_EVICT_FILE", 0) != 0) io_start();
+        LLAMA_LOG_INFO("PXA_XCACHE: online adaptation %s: %zu split layers, %zu free cold slots, re-rank every %d decodes, link %.2f GB/s, %s schedule, swap payback %s\n",
+                adapt ? "ON" : "observing only", L.size(), any_spare, obs_every, pcie_gbs, det ? "deterministic" : "copy-completion",
+                cpu_use > 0 ? "on" : "off");
         if (adapt) arm_learn();
         return true;
     }
@@ -345,6 +438,16 @@ struct llama_model::pxa_xc_adaptor {
     }
 
     bool wait_ev(op & o) {
+        if (o.fl) {                    // PXA_XCACHE_EVICT_FILE phase 0: the file read instead of a copy event
+            if (o.fl->load() == 0) {
+                std::unique_lock<std::mutex> lk(io_mu);
+                io_done_cv.wait(lk, [&] { return o.fl->load() != 0; });
+                ++n_waits;
+            }
+            const bool ok = o.fl->load() == 1;
+            o.fl.reset();
+            return ok;
+        }
         if (!o.ev) return false;
         if (ggml_backend_cuda_xcache_event_done(o.ev) != 1) {
             ggml_backend_cuda_xcache_event_sync(o.ev);
@@ -361,7 +464,7 @@ struct llama_model::pxa_xc_adaptor {
         for (size_t i = 0; i < ops.size(); ++i) {
             op o = ops[i];
             bool keep = true;
-            if (tick >= o.due && (det || (o.ev && ggml_backend_cuda_xcache_event_done(o.ev) == 1))) {
+            if (tick >= o.due && (det || (o.fl ? o.fl->load() != 0 : (o.ev && ggml_backend_cuda_xcache_event_done(o.ev) == 1)))) {
                 lay & l = L[o.li];
                 auto & xl = model.pxa_xc[l.il];
                 if (!wait_ev(o)) {
@@ -392,6 +495,7 @@ struct llama_model::pxa_xc_adaptor {
                     l.spare.push_back(o.c_in);
                     l.busy[o.e_in] = l.busy[o.e_out] = 0;
                     ++n_admitted;
+                    if (reset_on) applied.push_back(o);
                     keep = false;
                 }
             }
@@ -420,6 +524,190 @@ struct llama_model::pxa_xc_adaptor {
         }
         for (auto & o : ops) if (o.ev) { ggml_backend_cuda_xcache_event_sync(o.ev); ggml_backend_cuda_xcache_event_free(o.ev); o.ev = nullptr; }
         ops.clear();
+    }
+
+    // ---- PXA_XCACHE_EVICT_FILE --------------------------------------------------------------------------------------------------
+    void io_start() {
+#ifdef _WIN32
+        LLAMA_LOG_INFO("PXA_XCACHE_EVICT_FILE: not on Windows yet; evicts copy over the link\n");
+#else
+        size_t n_file = 0;
+        for (const auto & l : L) if (!l.ffd.empty()) ++n_file;
+        if (n_file == 0) {
+            LLAMA_LOG_INFO("PXA_XCACHE_EVICT_FILE: no split layer has a readable model file (set at load); evicts copy over the link\n");
+            return;
+        }
+        evict_file = true;
+        io_th = std::thread([this] { io_loop(); });
+        LLAMA_LOG_INFO("PXA_XCACHE_EVICT_FILE: on for %zu of %zu split layers: an evicted expert is read back from the model file into its free cold slot (IO thread), the link carries only the admit\n",
+                n_file, L.size());
+#endif
+    }
+
+    void io_loop() {
+#ifndef _WIN32
+        for (;;) {
+            io_job j;
+            {
+                std::unique_lock<std::mutex> lk(io_mu);
+                io_cv.wait(lk, [&] { return io_stop || !io_q.empty(); });
+                if (io_q.empty()) return;          // stopping, nothing left
+                j = std::move(io_q.front());
+                io_q.pop_front();
+            }
+            const int64_t t0 = ggml_time_us();
+            int ok = 1;
+            for (size_t k = 0; k < j.dst.size() && ok == 1; ++k) {
+                size_t got = 0;
+                while (got < j.n[k]) {
+                    const ssize_t r = pread(j.fd[k], j.dst[k] + got, j.n[k] - got, (off_t) (j.off[k] + got));
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r <= 0) { ok = -1; break; }
+                    got += (size_t) r;
+                }
+            }
+            us_ef += (uint64_t) (ggml_time_us() - t0);
+            ++n_ef_done;
+            if (ok != 1) ++n_ef_fail;
+            {
+                std::lock_guard<std::mutex> lk(io_mu);
+                j.fl->store(ok);
+            }
+            io_done_cv.notify_all();
+        }
+#endif
+    }
+
+    void io_shutdown() {
+        if (!io_th.joinable()) return;
+        { std::lock_guard<std::mutex> lk(io_mu); io_stop = true; }
+        io_cv.notify_all();
+        io_th.join();
+    }
+
+    // ---- PXA_XCACHE_RTIER: the policy on a planner thread ------------------------------------------------------------------------
+
+    void rt_start() {
+        for (auto & b : rt_stage) {
+            b = (uint32_t *) ggml_backend_cuda_xcache_pinned_alloc(stage_u32*sizeof(uint32_t));
+            if (!b) { LLAMA_LOG_WARN("PXA_XCACHE_RTIER: no pinned staging; the adaptation stays on the decode thread\n"); return; }
+        }
+        rtier    = true;
+        det      = false;           // copy-completion schedule: a decode never waits for a swap's copy
+        swap_cap = std::max(0, env_int("PXA_XCACHE_SWAP_CAP", 2));
+        reset_on = false;           // the hot set carries across requests (RIX: placement does not change the bits)
+        rt_map.resize(L.size()); rt_busy.resize(L.size()); rt_spare.resize(L.size()); rt_views.resize(L.size());
+        rt_out.resize(plan_out.size());
+        rt_th = std::thread([this]() { rt_loop(); });
+        const bool rix = ggml_pxa_rix_on() != 0;
+        LLAMA_LOG_INFO("PXA_XCACHE_RTIER: planner thread on, <= %d swaps per decode, copy-completion schedule, hot set carried across requests; "
+                "RIX %s%s\n", swap_cap, rix ? "on" : "OFF",
+                rix ? " (an expert's placement does not change the bits)" : ": answers depend on copy timing (PXA_PXQN_RIX=1 or PXA_XCACHE_RTIER=0)");
+    }
+
+    void rt_shutdown() {
+        if (!rt_th.joinable()) return;
+        { std::lock_guard<std::mutex> lk(rt_mu); rt_stop = true; }
+        rt_cv.notify_all();
+        rt_th.join();
+        if (rt_ev) { ggml_backend_cuda_xcache_event_free(rt_ev); rt_ev = nullptr; }
+    }
+
+    // the planner thread: wait for the counters' copy, observe, plan against the snapshot; the decode thread starts the swaps
+    void rt_loop() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(rt_mu);
+                rt_cv.wait(lk, [&]() { return rt_stop || rt_job; });
+                if (rt_stop) return;
+            }
+            const int64_t t0 = ggml_time_us();
+            void * ev = rt_ev;
+            if (ev) ggml_backend_cuda_xcache_event_sync(ev);
+            const uint32_t * st = rt_stage[rt_buf];
+            size_t eb_sum = 0;
+            for (size_t i = 0; i < L.size(); ++i) {
+                const uint32_t * b = st + L[i].stage_off;
+                obs[i].counts = b;
+                obs[i].hits   = b[L[i].n_expert + 0];
+                obs[i].misses = b[L[i].n_expert + 1];
+                const uint32_t dh = obs[i].hits - prev_hit[i], dm = obs[i].misses - prev_miss[i];   // u32 wrap-safe
+                prev_hit[i] = obs[i].hits; prev_miss[i] = obs[i].misses;
+                tot_hit += dh; tot_miss += dm; win_hit += dh; win_miss += dm;
+                lay_hit[i] += dh; lay_miss[i] += dm;
+                rt_views[i].map     = rt_map[i].data();
+                rt_views[i].busy    = rt_busy[i].data();
+                rt_views[i].n_spare = rt_spare[i];
+                eb_sum += L[i].eb;
+            }
+            pol->observe(pst, rt_ntok, obs.data());
+            int32_t n = 0;
+            if (!broken) {
+                int32_t n_budget = pol->swap_budget(pst, rt_ntok);
+                if (swap_cap > 0) n_budget = std::min<int32_t>(n_budget, swap_cap*obs_every);
+                if (n_budget > 0) {
+                    const uint64_t budget_bytes = (uint64_t) n_budget * (eb_sum / L.size());
+                    n = pol->plan(pst, rt_views.data(), budget_bytes, rt_out.data(), (int32_t) rt_out.size());
+                    if (n < 0) n = 0;
+                    if (swap_cap > 0) n = std::min<int32_t>(n, n_budget);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(rt_mu);
+                rt_nout = n;
+                rt_job  = false;
+                rt_done = true;
+                us_rt_worker += ggml_time_us() - t0;
+            }
+        }
+    }
+
+    // decode thread, every tick: start the swaps the planner finished, then hand it the next observation when one is due
+    void rt_tick(uint32_t n_tok_obs, bool due) {
+        bool idle;
+        {
+            std::lock_guard<std::mutex> lk(rt_mu);
+            if (rt_done) {
+                rt_done = false;
+                n_planned += rt_nout > 0 ? rt_nout : 0;
+                ++n_obs;
+                for (int32_t k = 0; k < rt_nout; ++k) {
+                    const size_t before = ops.size();
+                    start_swap(rt_out[k]);
+                    if (ops.size() == before) ++n_rt_stale;       // the map moved since the snapshot: skipped
+                }
+                rt_nout = 0;
+                // the planner is idle here (it only sets rt_done on its way back to waiting): safe to read the policy's stats
+                if (log_every > 0 && n_obs % (uint64_t) log_every == 0) stats_line("");
+            }
+            idle = !rt_job;
+        }
+        if (!due) return;
+        if (!idle) { ++n_rt_skip; return; }              // the planner is still on the last observation: count these tokens next time
+        rt_buf ^= 1;
+        uint32_t * st = rt_stage[rt_buf];
+        bool ok = true;
+        for (auto & l : L) {
+            const size_t off = (size_t) l.n_expert*sizeof(int32_t);
+            if (!ggml_backend_cuda_xcache_copy_async(l.dev, st + l.stage_off, (char *) l.mapT->data + off, ((size_t) l.n_expert + 8)*sizeof(uint32_t), 0)) { ok = false; break; }
+        }
+        if (rt_ev) { ggml_backend_cuda_xcache_event_free(rt_ev); rt_ev = nullptr; }
+        if (ok) rt_ev = ggml_backend_cuda_xcache_event_record(L[0].dev);
+        if (!ok || !rt_ev) { broken = true; return; }
+        for (size_t i = 0; i < L.size(); ++i) {
+            rt_map[i]   = L[i].map;
+            rt_busy[i]  = L[i].busy;
+            rt_spare[i] = (int32_t) L[i].spare.size();
+        }
+        {
+            std::lock_guard<std::mutex> lk(rt_mu);
+            rt_ntok = n_tok_obs;
+            rt_job  = true;
+            ++n_rt_jobs;
+        }
+        rt_cv.notify_one();
+        tokens_since_obs = 0;
+        ticks_since_obs  = 0;
     }
 
     // ---- observation + planning ---------------------------------------------------------------------------------------------
@@ -586,6 +874,14 @@ struct llama_model::pxa_xc_adaptor {
             obs[i].counts = b;
             obs[i].hits   = b[L[i].n_expert + 0];
             obs[i].misses = b[L[i].n_expert + 1];
+            if (reset_on && !base_cnt.empty()) {        // counts since the last reset (u32 wrap-safe); all zero base = the raw counters
+                const auto & bc = base_cnt[i];
+                auto & rc = rel_cnt[i];
+                for (int e = 0; e < L[i].n_expert; ++e) rc[(size_t) e] = b[e] - bc[(size_t) e];
+                obs[i].counts = rc.data();
+                obs[i].hits   = b[L[i].n_expert + 0] - bc[(size_t) L[i].n_expert + 0];
+                obs[i].misses = b[L[i].n_expert + 1] - bc[(size_t) L[i].n_expert + 1];
+            }
             const uint32_t dh = obs[i].hits - prev_hit[i], dm = obs[i].misses - prev_miss[i];   // u32 wrap-safe
             prev_hit[i] = obs[i].hits; prev_miss[i] = obs[i].misses;
             tot_hit += dh; tot_miss += dm; win_hit += dh; win_miss += dm;
@@ -645,9 +941,26 @@ struct llama_model::pxa_xc_adaptor {
         o.c_in   = -2 - l.map[sw.e_in];
         o.s      = l.map[sw.e_out];
         o.c_free = l.spare.back();
-        if (!copy_slot(l, false, o.s, o.c_free)) return;      // evict first: hot slot -> free cold slot
-        o.ev = ggml_backend_cuda_xcache_event_record(l.dev);
-        if (!o.ev) return;
+        if (evict_file && !l.ffd.empty()) {
+            // evict first: the expert's bytes from the model file -> free cold slot (IO thread; nothing on the link)
+            io_job j;
+            for (size_t k = 0; k < l.coldT.size(); ++k) {
+                const size_t nb = l.coldT[k]->nb[2];
+                j.fd.push_back(l.ffd[k]);
+                j.off.push_back(l.foff[k] + (size_t) sw.e_out*nb);
+                j.n.push_back(nb);
+                j.dst.push_back((char *) l.coldT[k]->data + (size_t) o.c_free*nb);
+            }
+            o.fl = std::make_shared<std::atomic<int>>(0);
+            j.fl = o.fl;
+            { std::lock_guard<std::mutex> lk(io_mu); io_q.push_back(std::move(j)); }
+            io_cv.notify_one();
+            ++n_ef;
+        } else {
+            if (!copy_slot(l, false, o.s, o.c_free)) return;      // evict first: hot slot -> free cold slot
+            o.ev = ggml_backend_cuda_xcache_event_record(l.dev);
+            if (!o.ev) return;
+        }
         l.spare.pop_back();
         l.busy[o.e_in] = l.busy[o.e_out] = 1;
         o.phase = 0;
@@ -758,8 +1071,16 @@ struct llama_model::pxa_xc_adaptor {
                 (unsigned long long) n_started, (unsigned long long) n_admitted, (unsigned long long) n_evicted, ops.size(),
                 (unsigned long long) n_waits, (unsigned long long) n_obs,
                 n_ticks ? (double) us_tick/(double) n_ticks : 0.0, n_obs ? (double) us_obs/(double) n_obs : 0.0);
+        if (n_resets) LLAMA_LOG_INFO("PXA_XCACHE%s: %llu sequence starts back to the planned hot set, %llu swaps undone, %.1f ms in total\n",
+                tag, (unsigned long long) n_resets, (unsigned long long) n_undone, us_reset/1000.0);
         if (n_skip_ticks) LLAMA_LOG_INFO("PXA_XCACHE%s: skipped %llu companion ticks (their tokens still count toward the swap budget)\n",
                 tag, (unsigned long long) n_skip_ticks);
+        if (rtier) LLAMA_LOG_INFO("PXA_XCACHE_RTIER%s: %llu planner jobs, %llu observations skipped (planner busy), %llu planned swaps stale at start, "
+                "planner %.0f us per job (off the decode thread), cap %d swaps per decode\n", tag, (unsigned long long) n_rt_jobs,
+                (unsigned long long) n_rt_skip, (unsigned long long) n_rt_stale, n_rt_jobs ? (double) us_rt_worker/(double) n_rt_jobs : 0.0, swap_cap);
+        if (evict_file) LLAMA_LOG_INFO("PXA_XCACHE_EVICT_FILE%s: %llu evicts read from the model file (%llu failed), %.0f us per read (IO thread), 0 evict bytes on the link\n",
+                tag, (unsigned long long) n_ef, (unsigned long long) n_ef_fail.load(),
+                n_ef_done.load() ? (double) us_ef.load()/(double) n_ef_done.load() : 0.0);
         win_hit = win_miss = 0;
         if (tag && *tag && env_int("PXA_XCACHE_SUMMARY_LAYERS", 1)) {      // the summary also names where the misses are
             std::string ln;
@@ -773,6 +1094,70 @@ struct llama_model::pxa_xc_adaptor {
         }
     }
 
+    // back to the state init() left: undo every completed swap in reverse order (each one exactly: e_in back to the cold slot it
+    // came from, e_out back to the hot slot it left), the planned spare order, fresh policy state, counters re-based, tick 0.
+    // Runs between two decodes (no graph reads a map or a slot), all copies on the layer's copy stream, waited before returning.
+    void reset_to_plan() {
+        if (!adapt || !reset_on || init_map.empty()) return;
+        const int64_t t0 = ggml_time_us();
+        drain();
+        bool ok = !broken;
+        const size_t n_undo = applied.size();
+        for (size_t k = applied.size(); ok && k-- > 0; ) {
+            const op & o = applied[k];
+            lay & l = L[o.li];
+            auto & xl = model.pxa_xc[l.il];
+            auto it = std::find(l.spare.begin(), l.spare.end(), (int32_t) o.c_in);
+            if (l.map[o.e_in] != o.s || l.map[o.e_out] != -2 - o.c_free || it == l.spare.end()) { ok = false; break; }
+            // both copies on the layer's copy stream, in order; a copy that cannot be enqueued leaves every expert one valid home
+            if (!copy_slot(l, false, o.s, o.c_in)) { ok = false; break; }      // e_in back into its old cold slot (free: a partial copy is harmless)
+            l.spare.erase(it);
+            l.map[o.e_in] = -2 - o.c_in;  xl.cold[o.c_in] = o.e_in;  xl.hot[o.s] = -1;   // e_in is served cold again, the hot slot is vacant
+            l.dirty = true;
+            if (!copy_slot(l, true, o.s, o.c_free)) { ok = false; break; }     // e_out back into the hot slot it left
+            l.map[o.e_out] = o.s;  xl.hot[o.s] = o.e_out;  xl.cold[o.c_free] = -1;
+            l.spare.push_back(o.c_free);
+        }
+        applied.clear();
+        for (int d : devs) {
+            void * ev = ggml_backend_cuda_xcache_event_record(d);
+            if (!ev) { ok = false; continue; }
+            ggml_backend_cuda_xcache_event_sync(ev);
+            ggml_backend_cuda_xcache_event_free(ev);
+        }
+        for (size_t i = 0; ok && i < L.size(); ++i) {
+            auto sp = L[i].spare, isp = init_spare[i];
+            std::sort(sp.begin(), sp.end()); std::sort(isp.begin(), isp.end());
+            if (L[i].map != init_map[i] || sp != isp || model.pxa_xc[L[i].il].hot != init_hot[i] || model.pxa_xc[L[i].il].cold != init_cold[i]) ok = false;
+            else L[i].spare = init_spare[i];
+        }
+        flush_maps();
+        if (!ok) {
+            if (!broken) LLAMA_LOG_WARN("PXA_XCACHE: the reset to the planned hot set did not complete; the adaptation stops here (the static plan's answers no longer repeat exactly)\n");
+            broken = true;
+            return;
+        }
+        if (read_counters()) {
+            for (size_t i = 0; i < L.size(); ++i) {
+                const uint32_t * b = stage + L[i].stage_off;
+                const size_t n = (size_t) L[i].n_expert;
+                const uint32_t dh = (b[n] - base_cnt[i][n]) - prev_hit[i], dm = (b[n + 1] - base_cnt[i][n + 1]) - prev_miss[i];   // since the last observation
+                tot_hit += dh; tot_miss += dm; win_hit += dh; win_miss += dm; lay_hit[i] += dh; lay_miss[i] += dm;
+                base_cnt[i].assign(b, b + n + 8);
+                prev_hit[i] = 0; prev_miss[i] = 0;
+            }
+        }
+        if (pst && pol) { pol->destroy(pst); pst = pol->create(&cfg_saved); if (!pst) broken = true; }
+        tick = 0; tokens_since_obs = 0; ticks_since_obs = 0;
+        chaos_rng = 0x9e3779b97f4a7c15ull;
+        ++n_resets; n_undone += n_undo;
+        us_reset += ggml_time_us() - t0;
+        if (n_resets == 2 || (log_every > 0 && n_undo > 0)) {
+            LLAMA_LOG_INFO("PXA_XCACHE: sequence start: %zu swaps undone, the planned hot set is back (%.1f ms; PXA_XCACHE_ADAPT_RESET=0 carries it across requests)\n",
+                    n_undo, (ggml_time_us() - t0)/1000.0);
+        }
+    }
+
     void on_tick(int n_tokens) {
         const int64_t t0 = ggml_time_us();
         ++tick;
@@ -780,6 +1165,13 @@ struct llama_model::pxa_xc_adaptor {
         if (adapt) apply_due();
         tokens_since_obs += (uint32_t) std::max(n_tokens, 0);
         ++ticks_since_obs;
+        if (rtier) {
+            const bool due = ticks_since_obs >= obs_every || n_tokens >= 32;
+            rt_tick(tokens_since_obs, due);
+            us_tick += ggml_time_us() - t0;
+            ++n_ticks;
+            return;
+        }
         // a prefill-sized decode is an observation of its own: its routing is the prompt's, which is what the answer will use
         if (ticks_since_obs >= obs_every || n_tokens >= 32) {
             const int64_t t1 = ggml_time_us();
@@ -860,6 +1252,13 @@ void llama_pxa_xcache_tick(llama_model & model, int n_tokens) {
     model.pxa_xc_ad->on_tick(n_tokens);
 }
 
+void llama_pxa_xcache_seq_start(llama_model & model) {
+    if (model.pxa_xc.empty() || !model.pxa_xc_ad) return;     // nothing has run yet: nothing moved
+    std::lock_guard<std::mutex> lock(pxa_xc_tick_mu());
+    if (!model.pxa_xc_ad->active) return;
+    model.pxa_xc_ad->reset_to_plan();
+}
+
 bool llama_pxa_xcache_stats(const struct llama_model * model, uint64_t * hits, uint64_t * misses,
         uint64_t * swaps_started, uint64_t * swaps_admitted, uint64_t * swaps_evicted) {
     if (!model || !model->pxa_xc_ad || !model->pxa_xc_ad->active) return false;
@@ -872,12 +1271,31 @@ bool llama_pxa_xcache_stats(const struct llama_model * model, uint64_t * hits, u
     return true;
 }
 
+bool llama_pxa_xcache_evict_file_stats(const llama_model * model, uint64_t * reads, uint64_t * failed) {
+    if (!model || !model->pxa_xc_ad || !model->pxa_xc_ad->active || !model->pxa_xc_ad->evict_file) return false;
+    auto * a = model->pxa_xc_ad;
+    if (reads)  *reads  = a->n_ef;
+    if (failed) *failed = a->n_ef_fail.load();
+    return true;
+}
+
+bool llama_pxa_xcache_rtier_stats(const llama_model * model, uint64_t * jobs, uint64_t * stale) {
+    if (!model || !model->pxa_xc_ad || !model->pxa_xc_ad->active || !model->pxa_xc_ad->rtier) return false;
+    auto * a = model->pxa_xc_ad;
+    std::lock_guard<std::mutex> lk(a->rt_mu);
+    if (jobs)  *jobs  = a->n_rt_jobs;
+    if (stale) *stale = a->n_rt_stale;
+    return true;
+}
+
 void llama_pxa_xcache_adaptor_free(llama_model & model) {
     if (!model.pxa_xc_ad) return;
     auto * a = model.pxa_xc_ad;
     model.pxa_xc_ad = nullptr;
     if (a->active) {
+        a->rt_shutdown();     // PXA_XCACHE_RTIER: the planner thread stops before the summary reads the policy
         a->drain();
+        a->io_shutdown();     // PXA_XCACHE_EVICT_FILE: after drain (drain waits for the reads in flight)
         if (a->n_obs > 0 && (a->log_every > 0 || getenv("PXA_XCACHE_SUMMARY"))) a->stats_line(" summary");
     }
     delete a;

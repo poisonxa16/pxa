@@ -81,6 +81,63 @@ static void qkvd_launch_g8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, i
 
 template <ggml_type TYPE>
 static void qkvd_launch_type(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int g, int nc) {
+    const int cc_now = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (nc == 1 && qkv_unif_takes1(dst, cc_now)) {   // PXA_FA_QKV_UNIF: the decode on the uniform plan
+        switch (g) {
+            case 4: launch_unif1<256, 4, TYPE>(ctx, dst); return;
+            case 6: launch_unif1<256, 6, TYPE>(ctx, dst); return;
+            case 8: launch_unif1<256, 8, TYPE>(ctx, dst); return;
+            default: break;
+        }
+    }
+    if (nc >= 2 && qkv_unif_enabled() && qkv_ny1_takes(dst, cc_now)) {   // PXA_FA_QKV_UNIF: NY1 columns, shared tile
+        static std::atomic<bool> told_unif{false};
+        if (!told_unif.exchange(true)) {
+            fprintf(stderr, "PXA_FA_QKV_UNIF: engaged (verify width %d n_kv %d: columns = the uniform decode bitwise, one shared "
+                            "K/V tile per block; PXA_FA_QKV_UNIF=0 reverts)\n", nc, (int) dst->src[1]->ne[1]);
+        }
+#define PXA_UNIF_NC(GG) \
+        switch (nc) { \
+            case 2:  launch_ny1<256, GG, TYPE, 2, 0, QKV_UPR>(ctx, dst); return; \
+            case 3:  launch_ny1<256, GG, TYPE, 3, 0, QKV_UPR>(ctx, dst); return; \
+            default: launch_ny1<256, GG, TYPE, 4, 0, QKV_UPR>(ctx, dst); return; \
+        }
+        switch (g) {
+            case 4: PXA_UNIF_NC(4)
+            case 6: PXA_UNIF_NC(6)
+            case 8: PXA_UNIF_NC(8)
+            default: break;
+        }
+#undef PXA_UNIF_NC
+    }
+    if (nc >= 2 && qkv_ny1_takes(dst, cc_now)) {           // PXA_FA_QKV_NY1: verify columns = width-1 decode, bit-identical
+        static std::atomic<bool> told_ny1{false};
+        if (!told_ny1.exchange(true)) {
+            fprintf(stderr, "PXA_FA_QKV_NY1: engaged (verify width %d n_kv %d on the width-1 kernel, own keys + split per "
+                            "column = one-token decode bitwise; PXA_FA_QKV_NY1=0 reverts)\n", nc, (int) dst->src[1]->ne[1]);
+        }
+        if (qkv_ny1_share_cols() > 1) {   // PXA_FA_QKV_NY1_SHARE: two columns per block, bit-identical to the line below
+            switch (g) {
+                case 4: launch_ny1<256, 4, TYPE, 2>(ctx, dst); return;
+                case 6: launch_ny1<256, 6, TYPE, 2>(ctx, dst); return;
+                default: break;   // GQA 8: the UNI pair spills on sm_70 (255 regs + 152-192 B stack): one block per column
+            }
+        }
+        if (qkv_ny1_occ() >= 2) {   // PXA_FA_QKV_NY1_OCC: two blocks per SM, bit-identical to the launch below
+            switch (g) {
+                case 4: launch_ny1<256, 4, TYPE, 1, 2>(ctx, dst); return;
+                case 6: launch_ny1<256, 6, TYPE, 1, 2>(ctx, dst); return;
+                case 8: launch_ny1<256, 8, TYPE, 1, 2>(ctx, dst); return;
+                default: break;
+            }
+        }
+        switch (g) {
+            case 4: launch_ny1<256, 4, TYPE>(ctx, dst); return;
+            case 6: launch_ny1<256, 6, TYPE>(ctx, dst); return;
+            case 8: launch_ny1<256, 8, TYPE>(ctx, dst); return;
+            default: break;
+        }
+    }
     switch (g) {
         case 4: qkvd_launch_g4<TYPE>(ctx, dst, nc); return;
         case 6: qkvd_launch_g6<TYPE>(ctx, dst, nc); return;

@@ -182,7 +182,8 @@ static double rms_pct(const std::vector<float> & a, const std::vector<float> & b
     return 100.0*sqrt(se/n)/sqrt(sr/n);
 }
 
-enum probe_kind { PROBE_OK, PROBE_NO_IDX, PROBE_BAD_WIDTH, PROBE_ALIBI, PROBE_SOFTCAP };
+enum probe_kind { PROBE_OK, PROBE_NO_IDX, PROBE_BAD_WIDTH, PROBE_ALIBI, PROBE_SOFTCAP,
+                  PROBE_NO_IDX_NO_MASK, PROBE_NO_IDX_ALIBI };
 
 static bool gate_probe(ggml_backend_t cuda, int64_t d, probe_kind kind) {
     const int64_t n_tokens = 4, n_head = 8, n_kv = 2048;
@@ -194,12 +195,15 @@ static bool gate_probe(ggml_backend_t cuda, int64_t d, probe_kind kind) {
     ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_tokens, n_head, 1);
     ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_kv, 1, 1);
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, mr, 1, 1);
+    const bool no_idx  = kind == PROBE_NO_IDX || kind == PROBE_NO_IDX_NO_MASK || kind == PROBE_NO_IDX_ALIBI;
+    const bool alibi   = kind == PROBE_ALIBI  || kind == PROBE_NO_IDX_ALIBI;
 
-    ggml_tensor * o = ggml_flash_attn_ext(ctx, q, k, k, mask, 1.0f/sqrtf((float) d),
-                                          kind == PROBE_ALIBI ? 8.0f : 0.0f,
+    ggml_tensor * o = ggml_flash_attn_ext(ctx, q, k, k, kind == PROBE_NO_IDX_NO_MASK ? nullptr : mask,
+                                          1.0f/sqrtf((float) d),
+                                          alibi ? 8.0f : 0.0f,
                                           kind == PROBE_SOFTCAP ? 30.0f : 0.0f);
     ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
-    if (kind != PROBE_NO_IDX) {
+    if (!no_idx) {
         o->src[5] = ggml_mask_to_index(ctx, mask, kind == PROBE_BAD_WIDTH ? 300 : 256);
     }
     const bool sup = ggml_backend_supports_op(cuda, o);
@@ -371,7 +375,26 @@ int main() {
     report(dsa_on ? "head 512 + valid index list -> SUPPORTED (positive)"
                   : "head 512 + valid index list -> rejected (DSA off)",
            gate_probe(cuda, 512, PROBE_OK) == dsa_on);
-    report("head 512, no index list     -> rejected",             gate_probe(cuda, 512, PROBE_NO_IDX) == false);
+    // "No index list -> rejected" holds only where no DENSE head-512 kernel exists (sm_60 / sm_61 / sm_70, the
+    // cards this port was written for). On sm_75+ the new-mma kernel serves 512/512 at GQA 8 -- this probe's
+    // shape -- so the backend accepts the node as an ordinary dense attention and that is correct, not a gate
+    // failure (RTX 3080 Ti, sm_86, 2026-10-21). There the reading is reported, and the two dense-path negatives
+    // below are the controls that must hold on every card.
+    {
+        const int  cc       = ggml_backend_cuda_get_device_cc(0);
+        const bool dense512 = cc >= 750 && cc < 1000000; // NVIDIA Turing+ = new_mma_available(); AMD ids sit above
+        const bool sup      = gate_probe(cuda, 512, PROBE_NO_IDX);
+        if (dense512) {
+            printf("%-56s INFO %s (cc %d has the dense new-mma head-512 kernel; not a DSA gate reading)\n",
+                   "head 512, no index list     -> dense path", sup ? "accepted" : "declined", cc);
+        } else {
+            report("head 512, no index list     -> rejected", sup == false);
+        }
+    }
+    // The dense head-512 kernels need a mask and no ALiBi; such a node must be declined, never accepted and
+    // then aborted (GGML_ASSERT(use_gqa_opt) in ggml_cuda_flash_attn_ext_mma_new, sm_86, before the sm_86 FA fix).
+    report("head 512, no index list, no mask -> rejected",        gate_probe(cuda, 512, PROBE_NO_IDX_NO_MASK) == false);
+    report("head 512, no index list, ALiBi   -> rejected",        gate_probe(cuda, 512, PROBE_NO_IDX_ALIBI) == false);
     report("head 512, index width 300   -> rejected",             gate_probe(cuda, 512, PROBE_BAD_WIDTH) == false);
     report("head 512, ALiBi max_bias!=0 -> rejected",             gate_probe(cuda, 512, PROBE_ALIBI) == false);
     report("head 512, logit softcap!=0  -> rejected",             gate_probe(cuda, 512, PROBE_SOFTCAP) == false);

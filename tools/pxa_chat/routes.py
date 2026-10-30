@@ -1,6 +1,8 @@
 """HTTP routes for the chat agent, registered into PXA Control with one ROUTES.update()/STATIC.update().
 Errors are {"error", "code"} with an HTTP status. Live events go out over SSE (/api/chat/events)."""
+import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -8,7 +10,7 @@ import threading
 import time
 
 from . import approvals as AP
-from . import guards, loop, memory, oai, picker, search, sessions, tools
+from . import compact, guards, loop, memory, oai, picker, search, sessions, tools
 
 STYLE = ("Answer the question directly, in your own words. Match the length and tone of the user's message: "
          "a short question gets a short answer, a casual one a casual reply. Use Markdown (lists, tables, code "
@@ -40,15 +42,17 @@ PRESETS = [
      "temperature": 0.2, "max_steps": 16},
 ]
 PRESET_BY = {p["id"]: p for p in PRESETS}
+_log = logging.getLogger("pxa_control.chat")
 MAX_RUNS = 6
+MAX_RUNS_PER_CLIENT = 3             # one client address may have this many answers running at once (0 = no per-client cap)
 MAX_HISTORY = 80
 HOST_STAR = "*"                     # the switch set before a chat exists: applies to the next chat on this page
 
 
 class ChatError(Exception):
-    def __init__(self, msg, code, status=400):
+    def __init__(self, msg, code, status=400, headers=None):
         Exception.__init__(self, msg)
-        self.code, self.status = code, status
+        self.code, self.status, self.headers = code, status, headers or None
 
 
 class HostPolicy(object):
@@ -73,8 +77,9 @@ class HostPolicy(object):
 class Hub(object):
     """per-Control chat state: runs, approvals, sessions, the remembered server."""
 
-    def __init__(self, cfg_root, load_config=None, host=None):
+    def __init__(self, cfg_root, load_config=None, host=None, who=None):
         self.root = cfg_root
+        self.who = who or (lambda: None)     # -> the asking client's address (set by Control per request), or None
         self.load_config = load_config or (lambda: {})
         self.store = sessions.Ephemeral(sessions.Store(cfg_root))
         self.memory = memory.Store(cfg_root)       # the user's, so shared by every chat on every server
@@ -84,6 +89,26 @@ class Hub(object):
         self.lock = threading.Lock()
         self.host = host or HostPolicy()
         self.host_chats = set()      # chat ids with host access on, plus HOST_STAR; in memory only, never saved
+        self.deleted = set()         # chats deleted while a run was answering: that run must not save them again [ST07]
+
+    def client_cap(self):
+        """runs one client may have going at once: env PXA_CHAT_MAX_RUNS_PER_CLIENT, else the Control config key
+        chat_max_runs_per_client (read every call, so it changes without a restart), else the default; 0 = off [K06]"""
+        v = os.environ.get("PXA_CHAT_MAX_RUNS_PER_CLIENT")
+        if v is None:
+            try:
+                v = (self.load_config() or {}).get("chat_max_runs_per_client")
+            except Exception:             # noqa: BLE001
+                v = None
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return MAX_RUNS_PER_CLIENT
+        return max(0, min(n, 64))
+
+    def client(self):
+        w = str(self.who() or "").strip()
+        return w.split()[-1] if w and w != "api" else None
 
     # ---- remembered state -------------------------------------------------------------------
     def _state_path(self):
@@ -157,6 +182,9 @@ class Hub(object):
 
 
 def _err(reply, e):
+    if getattr(e, "headers", None):
+        return reply(json.dumps({"error": str(e), "code": e.code}), "application/json; charset=utf-8", e.status,
+                     e.headers)
     return reply(json.dumps({"error": str(e), "code": e.code}), "application/json; charset=utf-8", e.status)
 
 
@@ -172,34 +200,92 @@ _IMAGE_CHARS = 1400000
 
 
 def take_images(body):
-    """up to four small images as {media_type, data} base64. Junk is dropped. The bytes are not logged."""
+    """up to four small images as {media_type, data} base64. A bad one is REFUSED with the reason (400 bad_image),
+    never dropped without a word [C14]. The bytes are not logged."""
     raw = body.get("images") if isinstance(body, dict) else None
-    if not isinstance(raw, list):
+    if raw is None or raw == []:
         return []
+    if not isinstance(raw, list):
+        raise ChatError("images must be a list", "bad_image")
+    if len(raw) > _IMAGE_MAX:
+        raise ChatError(f"{len(raw)} images were attached; {_IMAGE_MAX} is the limit for one message.", "bad_image")
     out = []
-    for im in raw:
-        if len(out) >= _IMAGE_MAX:
-            break
+    for n, im in enumerate(raw, 1):
+        who = f"image {n}"
         if not isinstance(im, dict):
-            continue
+            raise ChatError(f"{who} is not an image object", "bad_image")
         mt = str(im.get("media_type") or "").lower()
         data = im.get("data")
-        if not isinstance(data, str):
-            continue
+        if not isinstance(data, str) or not data.strip():
+            raise ChatError(f"{who} has no data", "bad_image")
         data = "".join(data.split())
         if data.startswith("data:"):
             head, _, b64 = data.partition(",")
             if ";base64" not in head.lower() or not b64:
-                continue
+                raise ChatError(f"{who} is not base64 data", "bad_image")
             got = head[5:].split(";", 1)[0].lower()
             if got not in _IMAGE_TYPES:
-                continue
+                raise ChatError(f"{who} is {got or 'of an unknown type'}; use a PNG, JPEG, GIF or WebP image.", "bad_image")
             mt, data = got, b64
-        if mt not in _IMAGE_TYPES or not data or len(data) > _IMAGE_CHARS:
-            continue
+        if mt not in _IMAGE_TYPES:
+            raise ChatError(f"{who} is {mt or 'of an unknown type'}; use a PNG, JPEG, GIF or WebP image.", "bad_image")
+        if len(data) > _IMAGE_CHARS:
+            raise ChatError(f"{who} is over 1 MB; try a smaller one.", "bad_image")
         if not _IMAGE_RE.fullmatch(data):
-            continue
+            raise ChatError(f"{who} is not valid base64 data", "bad_image")
+        try:
+            base64.b64decode(data, validate=True)
+        except (ValueError, TypeError):
+            raise ChatError(f"{who} is not valid base64 data", "bad_image")
         out.append({"media_type": mt, "data": data})
+    return out
+
+
+STOP_MAX, STOP_LEN = 4, 64
+SCHEMA_MAX = 16384                  # bytes of JSON, json_schema / response_format
+GRAMMAR_MAX = 16384                 # characters of GBNF
+
+
+def take_output_constraints(body):
+    """P08 (Advanced only): stop sequences, a JSON schema / response_format, a GBNF grammar, validated and size-capped
+    -> {"stop": [...], "json_schema": {...}, "response_format": {...}, "grammar": "..."} with only the keys given.
+    Anything malformed is a 400 with the reason; nothing is passed to the server unchecked."""
+    out = {}
+    st = body.get("stop")
+    if st not in (None, "", []):
+        if isinstance(st, str):
+            st = [st]
+        if not isinstance(st, list) or not all(isinstance(x, str) and x for x in st):
+            raise ChatError("stop must be a list of non-empty text sequences", "bad_request")
+        if len(st) > STOP_MAX or any(len(x) > STOP_LEN for x in st):
+            raise ChatError(f"stop takes up to {STOP_MAX} sequences of at most {STOP_LEN} characters", "bad_request")
+        out["stop"] = st
+    for key in ("json_schema", "response_format"):
+        v = body.get(key)
+        if v in (None, "", {}):
+            continue
+        if not isinstance(v, dict):
+            raise ChatError(f"{key} must be a JSON object", "bad_request")
+        try:
+            raw = json.dumps(v)
+        except (TypeError, ValueError):
+            raise ChatError(f"{key} is not valid JSON", "bad_request")
+        if len(raw) > SCHEMA_MAX:
+            raise ChatError(f"{key} is over {SCHEMA_MAX // 1024} KB", "bad_request")
+        if key == "response_format" and v.get("type") not in ("json_object", "json_schema", "text"):
+            raise ChatError("response_format.type must be json_object, json_schema or text", "bad_request")
+        out[key] = v
+    g = body.get("grammar")
+    if g not in (None, ""):
+        if not isinstance(g, str) or "\x00" in g:
+            raise ChatError("grammar must be GBNF text", "bad_request")
+        if len(g) > GRAMMAR_MAX:
+            raise ChatError(f"grammar is over {GRAMMAR_MAX // 1024} KB", "bad_request")
+        if "::=" not in g:
+            raise ChatError("grammar does not look like GBNF (no 'name ::= ...' rule)", "bad_request")
+        out["grammar"] = g
+    if sum(1 for k in ("json_schema", "response_format", "grammar") if k in out) > 1:
+        raise ChatError("use only one of json_schema, response_format or grammar", "bad_request")
     return out
 
 
@@ -207,6 +293,8 @@ def _num(body, k, lo, hi, cast=float):
     v = body.get(k)
     if v is None or v == "":
         return None
+    if isinstance(v, bool):                  # JSON true is not the number 1 [P05]
+        raise ChatError(f"{k} must be a number", "bad_request")
     try:
         v = cast(v)
     except (TypeError, ValueError):
@@ -233,6 +321,10 @@ class SSE(object):
         try:
             while True:
                 evs, done = self.run.since(seq, 10.0)
+                if any(e["type"] in loop.TERMINAL for e in evs):
+                    # the closing event goes out only once the turn is on disk, so an export or reload right after
+                    # run.done sees it (a race the harness only won by luck: U09). Bounded: a stuck save cannot hang it.
+                    self.run.saved.wait(3.0)
                 for ev in evs:
                     seq = ev["seq"]
                     h.wfile.write(f"id: {seq}\nevent: {ev['type']}\ndata: {json.dumps(ev)}\n\n".encode())
@@ -355,6 +447,7 @@ def make_routes(hub_getter, reply):
             names = [n for n in preset["tools"] if n in allowed]
         if body.get("web") is False:       # the chat's web switch is off: no search, no page fetching
             names = [n for n in names if n not in ("web_search", "web_fetch")]
+        constrained = False
         settings = {"tools": names, "max_steps": preset["max_steps"], "temperature": preset["temperature"],
                     "system": preset["system"]}
         if preset.get("thinking") in ("on", "off"):     # quick everyday modes skip a reasoning model's long think
@@ -365,14 +458,25 @@ def make_routes(hub_getter, reply):
             for k, lo, hi, cast in (("temperature", 0, 2, float), ("top_p", 0, 1, float), ("top_k", 0, 500, int),
                                     ("min_p", 0, 1, float), ("max_tokens", 1, 262144, int),
                                     ("repeat_penalty", 0.5, 2, float), ("seed", -1, 2 ** 31, int),
-                                    ("max_steps", 1, 40, int), ("step_timeout", 10, 1800, int)):
+                                    ("max_steps", 1, 40, int), ("step_timeout", 10, 1800, int),
+                                    ("first_byte_timeout", 10, 7200, int), ("tool_timeout", 5, 1800, int),
+                                    ("loop_guard", 0, 20, int), ("max_calls_per_step", 1, 64, int),
+                                    ("busy_retries", 0, 10, int)):
                 v = _num(body, k, lo, hi, cast)
                 if v is not None:
                     settings[k] = v
+            cons = take_output_constraints(body)
+            settings.update(cons)
+            if any(k in cons for k in ("json_schema", "response_format", "grammar")):
+                constrained = True
+                names = []                       # a constrained reply cannot also be a tool call: tools are off for this run
+                settings["tools"] = names
             if body.get("thinking") in ("on", "off", "auto"):
                 settings["thinking"] = body["thinking"]
             if body.get("tool_mode") in ("auto", "native", "text"):
                 settings["tool_mode"] = body["tool_mode"]
+            if isinstance(body.get("tool_fence"), bool):
+                settings["tool_fence"] = body["tool_fence"]
         if isinstance(body.get("use_memory"), bool) and sess is not None:
             sess["no_memory"] = not body["use_memory"]
         no_mem = (not body["use_memory"]) if isinstance(body.get("use_memory"), bool) else bool((sess or {}).get("no_memory"))
@@ -422,8 +526,9 @@ def make_routes(hub_getter, reply):
         mem_on = mset["enabled"] and not no_mem
         recalled, chat_hits = [], []
         if mem_on:
-            names = names + [n for n in tools.MEMORY_TOOLS if n not in names]
-            settings["tools"] = names
+            if not constrained:
+                names = names + [n for n in tools.MEMORY_TOOLS if n not in names]
+                settings["tools"] = names
             settings["max_steps"] = max(3, settings["max_steps"])   # room to save a fact and still answer
             prior = [sessions.message_text(m) for m in (sess or {}).get("messages") or [] if m.get("role") == "user"][-1:]
             query = " ".join(prior + [text])
@@ -449,8 +554,14 @@ def make_routes(hub_getter, reply):
             if prev is not None and not prev.done:
                 raise ChatError("This chat is still answering. Wait for it or press Stop.", "busy", 409)
             if sum(1 for r in hub.runs.values() if not r.done) >= MAX_RUNS:
-                raise ChatError("Too many chats are answering at once. Try again in a moment.", "too_many", 429)
+                raise ChatError("Too many chats are answering at once. Try again in a moment.", "too_many", 429,
+                                {"Retry-After": "5"})
+            cap, who = hub.client_cap(), hub.client()
+            if cap and who and sum(1 for x in hub.runs.values() if not x.done and getattr(x, "client", None) == who) >= cap:
+                raise ChatError(f"This device already has {cap} chats answering at once. Wait for one to finish "
+                                f"or press Stop on one.", "too_many_client", 429, {"Retry-After": "5"})
             r = loop.Run(sess["id"])
+            r.client = who
             hub.runs[r.id] = r
             hub.active[sess["id"]] = r.id
         with sessions.mutate_lock:
@@ -472,6 +583,9 @@ def make_routes(hub_getter, reply):
             sess.update(server_key=key, server_name=srv["name"], preset=preset["id"])
             if not sess.get("turns") and not sess.get("titled_by_user"):
                 sess["title"] = sessions.title_from(text)
+            # the user's message is on disk from the start: a Control that stops mid-turn leaves it as an
+            # interrupted turn the page offers to resend, instead of losing it [ST02]
+            sess["pending"] = {"run_id": r.id, "user": text[:20000], "ts": round(time.time(), 3)}
             hub.store.save(sess)
         hub.set_state(last_server=key)
         ctx = tools.Ctx(hub.sandbox(sess["id"]), chat_id=sess["id"], run_id=r.id, advanced=advanced, app=app,
@@ -489,33 +603,42 @@ def make_routes(hub_getter, reply):
         ag = loop.Agent(r, lambda: picker.resolve(app, key), hub.approvals, ctx, history, text, settings)
 
         def work():
-            ag.go()
-            with sessions.mutate_lock:
-                s2 = hub.store.get(sess["id"]) or sess
-                start = len(s2.get("messages") or [])
-                if r.events and r.events[-1]["type"] == "run.done":
-                    fresh = list(r.new_messages)
-                else:
-                    fresh = [m for m in r.new_messages if m["role"] == "user"] + (
-                        [{"role": "assistant", "content": loop.transcript(r)["assistant"] or "(stopped)"}])
-                s2.setdefault("messages", []).extend(tools.redact_note_messages(fresh))
-                s2.setdefault("turns", []).append(dict(loop.transcript(r), msg_start=start))
-                if isinstance(getattr(r, "compact_state", None), dict):
-                    s2["compact"] = {k: r.compact_state.get(k) for k in
-                                     ("summary", "upto", "turns", "method", "estimated", "note")}
-                sessions.commit_forks(s2)
-                try:
+            try:
+                ag.go()
+                if sess["id"] in hub.deleted:        # deleted while answering: stays deleted [ST07]
+                    hub.deleted.discard(sess["id"])
+                    return
+                with sessions.mutate_lock:
+                    s2 = hub.store.get(sess["id"]) or sess
+                    start = len(s2.get("messages") or [])
+                    if r.events and r.events[-1]["type"] == "run.done":
+                        fresh = list(r.new_messages)
+                    else:
+                        fresh = [m for m in r.new_messages if m["role"] == "user"] + (
+                            [{"role": "assistant", "content": loop.transcript(r)["assistant"] or "(stopped)"}])
+                    s2.pop("pending", None)
+                    s2.setdefault("messages", []).extend(tools.redact_note_messages(fresh))
+                    s2.setdefault("turns", []).append(dict(loop.transcript(r), msg_start=start))
+                    if isinstance(getattr(r, "compact_state", None), dict):
+                        s2["compact"] = {k: r.compact_state.get(k) for k in
+                                         ("summary", "upto", "turns", "method", "estimated", "note")}
+                    sessions.commit_forks(s2)
                     hub.store.save(s2)
-                finally:
-                    r.saved.set()
-            hub.gc()
+            except Exception as e:                   # noqa: BLE001 - the save failed: say so, never leave readers waiting
+                _log.warning("chat %s: the turn could not be saved (%s: %s)", sess["id"], e.__class__.__name__, e)
+            finally:
+                # whatever happened above, every waiter (the SSE closing event, the next run, branch) is released:
+                # before, an error in the prologue (a damaged messages field, a fork commit) left `saved` unset and the
+                # SSE waited 3 s, the next run 10 s, branch 30 s then 409 (review 10-18 night)
+                r.saved.set()
+                hub.gc()
         threading.Thread(target=work, daemon=True, name="pxa-chat-" + r.id).start()
         mem_info = {"on": mem_on, "recalled": [f["id"] for f in recalled]}
         if mem_on:
             mem_info["chats"] = [c["id"] for c in chat_hits]
         return {"run_id": r.id, "session_id": sess["id"], "server": srv["name"], "tools": names,
                 "memory": mem_info,
-                "settings": {k: v for k, v in settings.items() if k not in ("other_servers", "memory_block", "ref_block", "images")}}
+                "settings": {k: v for k, v in settings.items() if k not in ("other_servers", "memory_block", "ref_block", "images", "json_schema", "response_format", "grammar")}}
 
     def events(app, hub, body, query):
         rid = _q1(query, "run")
@@ -551,10 +674,16 @@ def make_routes(hub_getter, reply):
     def session_get(app, hub, body, query):
         s = hub.store.get(_q1(query, "id") or "")
         if s is None:
+            if hub.store.raw(_q1(query, "id") or "") is not None:       # there, but damaged [ST06]
+                raise ChatError("This chat's file could not be read (it is damaged). You can export the raw file or "
+                                "delete the chat.", "session_unreadable", 422)
             raise ChatError("that chat no longer exists", "unknown_session", 404)
         rid = hub.active.get(s["id"])
         run = hub.runs.get(rid) if rid else None
-        return sessions.for_client(s, run.id if run and not run.done else None)
+        pend = s.get("pending") if isinstance(s.get("pending"), dict) else None
+        # a pending turn whose run this Control does not know was cut by a stop/restart: interrupted [ST02]
+        lost = pend if pend and pend.get("run_id") not in hub.runs else None
+        return sessions.for_client(s, run.id if run and not run.done else None, interrupted=lost)
 
     def branch(app, hub, body, query):
         sid = str(body.get("session_id") or body.get("id") or "")
@@ -582,7 +711,7 @@ def make_routes(hub_getter, reply):
     def tokenize(app, hub, body, query):
         # A count of the text the page is showing. It is not stored and not logged.
         text = body.get("text") if isinstance(body.get("text"), str) else ""
-        n_est = (len(text) + 3) // 4
+        n_est = compact.text_tokens(text)
         if len(text) > 400000:
             return {"tokens": n_est, "estimated": True}
         key = str(body.get("server") or hub.state().get("last_server") or "")
@@ -602,6 +731,10 @@ def make_routes(hub_getter, reply):
 
     def session_delete(app, hub, body, query):
         sid = str(body.get("id") or "")
+        live = hub.runs.get(hub.active.get(sid) or "")
+        if live is not None and not live.done:
+            hub.deleted.add(sid)                 # the run is stopped and will not write the chat back
+            live.cancel()
         try:
             ok = hub.store.delete(sid)
         except KeyError:
@@ -627,9 +760,14 @@ def make_routes(hub_getter, reply):
 
     def export(app, hub, body, query):
         s = hub.store.get(_q1(query, "id") or "")
-        if s is None:
-            raise ChatError("that chat no longer exists", "unknown_session", 404)
         fmt = _q1(query, "format", "md")
+        if s is None or fmt == "raw":
+            txt = hub.store.raw(_q1(query, "id") or "") if hasattr(hub.store, "raw") else None
+            if txt is None:
+                raise ChatError("that chat no longer exists", "unknown_session", 404)
+            # the file exactly as it is on disk (a damaged chat can still be saved and looked at)
+            return reply(txt, "application/json; charset=utf-8", 200,
+                         {"Content-Disposition": f'attachment; filename="{_q1(query, "id")}.raw.json"'})
         safe = re.sub(r"[^A-Za-z0-9_-]+", "-", s.get("title") or "chat").strip("-")[:40] or "chat"
         if fmt == "json":
             return reply(json.dumps(s, indent=1, ensure_ascii=False), "application/json; charset=utf-8", 200,

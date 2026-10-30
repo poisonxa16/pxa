@@ -42,11 +42,12 @@ www, port, url, u22, side = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/repos/poisonxa16/pxa/releases/latest"):
-            body = json.dumps({"tag_name": "v9.9.1", "assets": [
-                {"browser_download_url": side},
-                {"browser_download_url": url},
-                {"browser_download_url": u22},
-            ]}).encode()
+            assets = [side, url, u22]
+            try:   # the asset-name cases below swap the list in
+                assets = ["http://127.0.0.1:%d/%s" % (port, n) for n in json.load(open(www + "/../assets.json"))]
+            except OSError:
+                pass
+            body = json.dumps({"tag_name": "v9.9.1", "assets": [{"browser_download_url": a} for a in assets]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -54,6 +55,8 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         name = self.path.split("?")[0].lstrip("/")
+        with open(www + "/../requests.log", "a") as f:
+            f.write(name + "\n")
         path = www + "/" + name
         try:
             data = open(path, "rb").read()
@@ -192,4 +195,114 @@ test "$RC" != 0
 test "$(readlink "$INS/current")" = "pxa-v3"
 grep -q "expert counts" "$ROOT/user.err"
 test "$(cat "$INS/models/weights")" = "keep-me"
+# asset names: the legacy "-sm60_61_70" alias, the arch-true "-sm60_61_70_75_80_86_89" name, or both (arch-true wins,
+# only that tarball and its own sidecar are fetched); sidecars and malformed sm lists are never a tarball.
+P=pxa-v9.9.1-linux-x86_64-cuda12.8
+LEG=$P-sm60_61_70.tar.gz
+ART=$P-sm60_61_70_75_80_86_89.tar.gz
+for kind in legacy arch; do
+  mkdir -p "$ROOT/st-$kind/pxa-v9.9.1"
+  echo v9.9.1 > "$ROOT/st-$kind/pxa-v9.9.1/VERSION"
+  echo "$kind" > "$ROOT/st-$kind/pxa-v9.9.1/which"
+done
+tar -czf "$ROOT/www/$LEG" -C "$ROOT/st-legacy" pxa-v9.9.1
+tar -czf "$ROOT/www/$ART" -C "$ROOT/st-arch" pxa-v9.9.1
+cp "$ROOT/www/$LEG" "$ROOT/www/$P-sm60_61_70-ubuntu22.04.tar.gz"
+cp "$ROOT/www/$ART" "$ROOT/www/$P-sm60_61_70_75_80_86_89-ubuntu22.04.tar.gz"
+for n in "$LEG" "$ART" "$P-sm60_61_70-ubuntu22.04.tar.gz" "$P-sm60_61_70_75_80_86_89-ubuntu22.04.tar.gz"; do
+  ( cd "$ROOT/www" && sha256sum "$n" > "$n.sha256" )
+done
+printf '#!/bin/sh\necho glibc 2.35\n' > "$ROOT/fakebin/getconf"
+case_apply() {   # case_apply NAME want(legacy|arch|refuse) [old-glibc] -- asset names...
+  local name=$1 want=$2 env=()
+  shift 2
+  if [ "$1" = old-glibc ]; then env=(PATH="$ROOT/fakebin:$PATH"); shift; fi
+  shift
+  python3 -c 'import json,sys; json.dump(sys.argv[2:], open(sys.argv[1], "w"))' "$ROOT/assets.json" "$@"
+  local d="$ROOT/case-$name"
+  mkdir -p "$d/pxa-v3"
+  echo v3 > "$d/pxa-v3/VERSION"
+  ln -s pxa-v3 "$d/current"
+  : > "$ROOT/requests.log"
+  set +e
+  env "${env[@]}" ${SM:+"PXA_UPDATE_SM=$SM"} "$BIN" apply --dir "$d" --base-url "http://127.0.0.1:$PORT" >"$ROOT/case.out" 2>"$ROOT/case.err"
+  local rc=$?
+  set -e
+  if [ "$want" = refuse ]; then
+    test "$rc" != 0 || { echo "case $name: a non-tarball was installed"; exit 1; }
+    test "$(readlink "$d/current")" = "pxa-v3"
+    grep -q "no engine tarball" "$ROOT/case.err"
+    grep -q . "$ROOT/requests.log" && { echo "case $name: fetched $(cat "$ROOT/requests.log")"; exit 1; }
+  else
+    test "$rc" = 0 || { echo "case $name: rc=$rc $(cat "$ROOT/case.err")"; exit 1; }
+    test "$(readlink "$d/current")" = "pxa-v9.9.1"
+    test "$(cat "$d/current/which")" = "$want" || { echo "case $name: installed $(cat "$d/current/which"), want $want; fetched $(cat "$ROOT/requests.log"); $(ls -la "$d")"; exit 1; }
+    test "$(grep -c '\.tar\.gz$' "$ROOT/requests.log")" = 1 || { echo "case $name: fetched $(cat "$ROOT/requests.log")"; exit 1; }
+  fi
+  echo "case $name ok"
+}
+case_apply legacy-only legacy -- "$LEG.sha256" "$LEG"
+grep -qx "$LEG" "$ROOT/requests.log" && grep -qx "$LEG.sha256" "$ROOT/requests.log"
+case_apply arch-only arch -- "$ART" "$ART.sha256"
+grep -qx "$ART" "$ROOT/requests.log" && grep -qx "$ART.sha256" "$ROOT/requests.log"
+case_apply both-legacy-first arch -- "$LEG.sha256" "$LEG" "$ART.sha256" "$ART" "$P-sm60_61_70-ubuntu22.04.tar.gz"
+grep -qx "$ART.sha256" "$ROOT/requests.log"
+grep -q "^$LEG" "$ROOT/requests.log" && { echo "legacy alias fetched beside the arch-true tarball"; exit 1; }
+case_apply both-arch-first arch -- "$ART" "$ART.sha256" "$LEG" "$LEG.sha256"
+case_apply u22-both arch old-glibc -- "$LEG" "$P-sm60_61_70-ubuntu22.04.tar.gz" "$P-sm60_61_70_75_80_86_89-ubuntu22.04.tar.gz" "$ART"
+grep -qx "$P-sm60_61_70_75_80_86_89-ubuntu22.04.tar.gz" "$ROOT/requests.log"
+case_apply u22-legacy legacy old-glibc -- "$ART" "$P-sm60_61_70-ubuntu22.04.tar.gz"
+case_apply sidecars-only refuse -- "$ART.sha256" "$LEG.sha256" "$ART.sha256.fake" "$ART.sha512" "$P-sm60_61_70_75_80_86_89-ubuntu22.04.tar.gz.sha256"
+case_apply garbage refuse -- "$P-sm6_61.tar.gz" "$P-sm60_61_7.tar.gz" "$P-sm60__61.tar.gz" "$P-sm60_61_70_.tar.gz" \
+  "$P-sm600.tar.gz" "$P-sm60_61_70_100.tar.gz" "$P-smXX.tar.gz" "$P-sm.tar.gz" "$P-sm60_61_70_75.tgz" \
+  "pxa-v9.9.1-linux-aarch64-cuda12.8-sm60_61_70_75.tar.gz" "pxa-v9.9.1-linux-x86_64-cuda12.8_sm60_61_70_75.tar.gz" \
+  "notpxa-v9.9.1-linux-x86_64-cuda12.8-sm60_61_70_75.tar.gz" "libggml-pxqn-v9.9.1-linux-x86_64-sm60_61_70_75.tar.gz"
+# the local card decides (PXA_UPDATE_SM stands in for nvidia-smi; "none" = unknown): an arch-true list outranks the
+# legacy alias only when it runs on every local card (SASS X.y runs on X.z, z >= y), or holds the 60;61;70 floor when
+# the card is unknown; a list built only for newer sms (Ampere-only "-sm86" on a P100/V100) is never installed; a list
+# whose lower sm could only JIT up ranks below the legacy alias.
+AMP=$P-sm86.tar.gz
+P6070=$P-sm60_70.tar.gz
+for kind in amp p6070; do
+  mkdir -p "$ROOT/st-$kind/pxa-v9.9.1"
+  echo v9.9.1 > "$ROOT/st-$kind/pxa-v9.9.1/VERSION"
+  echo "$kind" > "$ROOT/st-$kind/pxa-v9.9.1/which"
+done
+tar -czf "$ROOT/www/$AMP" -C "$ROOT/st-amp" pxa-v9.9.1
+tar -czf "$ROOT/www/$P6070" -C "$ROOT/st-p6070" pxa-v9.9.1
+cp "$ROOT/www/$AMP" "$ROOT/www/$P-sm86-ubuntu22.04.tar.gz"
+for n in "$AMP" "$P6070" "$P-sm86-ubuntu22.04.tar.gz"; do
+  ( cd "$ROOT/www" && sha256sum "$n" > "$n.sha256" )
+done
+for SM in 60 70; do   # P100, V100
+  case_apply "sm$SM-all3" arch -- "$AMP" "$LEG" "$ART"
+  case_apply "sm$SM-amp-leg" legacy -- "$AMP" "$LEG"
+  grep -q "^$AMP" "$ROOT/requests.log" && { echo "sm$SM: the Ampere-only tarball was fetched"; exit 1; }
+  case_apply "sm$SM-amp-only" refuse -- "$AMP" "$AMP.sha256"
+  case_apply "sm$SM-u22-amp-leg" legacy old-glibc -- "$P-sm86-ubuntu22.04.tar.gz" "$P-sm60_61_70-ubuntu22.04.tar.gz"
+done
+SM=86   # RTX 3080
+case_apply sm86-all3 amp -- "$AMP" "$LEG" "$ART"
+case_apply sm86-leg-art arch -- "$LEG" "$ART"
+case_apply sm86-amp-leg amp -- "$LEG" "$AMP"
+case_apply sm86-amp-only amp -- "$AMP"
+case_apply sm86-p6070-leg legacy -- "$P6070" "$LEG"   # 60/70 SASS cannot run on 8.6; PTX at best: below the alias
+case_apply sm86-p6070-only p6070 -- "$P6070"
+SM=none   # nvidia-smi missing or unreadable: the 60;61;70 floor decides
+case_apply unk-all3 arch -- "$AMP" "$LEG" "$ART"
+case_apply unk-amp-leg legacy -- "$AMP" "$LEG"
+case_apply unk-amp-only refuse -- "$AMP"
+case_apply unk-p6070-leg legacy -- "$P6070" "$LEG"
+SM=61   # GTX 10xx: sm_60 SASS runs on 6.1
+case_apply sm61-p6070-leg p6070 -- "$LEG" "$P6070"
+SM=60,86   # mixed host: the list must run on every card
+case_apply mixed-all3 arch -- "$AMP" "$LEG" "$ART"
+case_apply mixed-amp-leg legacy -- "$AMP" "$LEG"
+case_apply mixed-amp-only refuse -- "$AMP"
+SM=90   # newer than every list: SASS for none, PTX may JIT -> below the alias, used when alone
+case_apply sm90-leg-art legacy -- "$ART" "$LEG"
+case_apply sm90-art-only arch -- "$ART"
+SM=garbage
+case_apply bad-sm-is-unknown legacy -- "$AMP" "$LEG"
+unset SM
 echo PASS

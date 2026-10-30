@@ -105,6 +105,6 @@ first published under `poisonxa/PXA-Fusion2-35B-GGUF`, a repository since rename
 `2d7d9e7e5f445b1ea38a5686b8cf9d6bc9aa29df`.
 Verify integrity against `checksums.sha256` in this directory.
 
-⚠ PXQ is a PXA-native format: **mainline llama.cpp cannot read these GGUFs** — build this fork.
-⚠ Never round-trip PXQ tensors through mainline `gguf-py` (its size table silently truncates
+Warning: PXQ is a PXA-native format: **mainline llama.cpp cannot read these GGUFs** — build this fork.
+Warning: Never round-trip PXQ tensors through mainline `gguf-py` (its size table silently truncates
 the E16-row anchors).

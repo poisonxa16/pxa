@@ -9,12 +9,14 @@
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
 
+#include "pxa-env-flag.h"
 #include "common.h"
 #include "pxa-registry.h"
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
 #include "llama-vocab.h"
 #include "llama.h"
+#include "ggml-pxqn-spec.h"
 #include "chat.h"
 #include "json-schema-to-grammar.h"
 #include <algorithm>
@@ -631,6 +633,63 @@ static bool is_autoy(const std::string & value) {
     return value == "auto" || value == "-1";
 }
 
+// PXA_SPEC_MTP_NGRAM_SHALLOW_v1 (2026-10-20): see common.h and common_speculative_init.
+bool common_speculative_drop_shallow_ngram_front(common_params_speculative & spec, int * table_n_max, int * head_n_max) {
+    if (!spec.pxa_ngram_auto_front) {
+        return false;
+    }
+    spec.pxa_ngram_auto_front = false;
+    const char * e = getenv("PXA_SPEC_MTP_NGRAM_SHALLOW");
+    if (e && atoi(e) != 0) {
+        return false;
+    }
+    if (spec.stages.size() != 2 || spec.stages[1].type != COMMON_SPECULATIVE_TYPE_MTP ||
+        spec.stages[0].type == COMMON_SPECULATIVE_TYPE_MTP || spec.stages[0].type == COMMON_SPECULATIVE_TYPE_DRAFT) {
+        return false;
+    }
+    const auto eff = [&spec](const common_speculative_stage_params & st) { return st.has_n_max_override() ? st.n_max : spec.n_max; };
+    const int t = eff(spec.stages[0]);
+    const int h = eff(spec.stages[1]);
+    if (table_n_max) *table_n_max = t;
+    if (head_n_max)  *head_n_max  = h;
+    if (t > h) {
+        return false;
+    }
+    spec.stages.erase(spec.stages.begin());
+    const auto rs = spec.get_resolved_stages();
+    spec.type = rs.empty() ? COMMON_SPECULATIVE_TYPE_NONE : rs.front().type;
+    return true;
+}
+
+// PXA_SPEC_STAGE_ORDER_v1 (2026-10-19): a two-stage chain runs its stages in order and
+// stops at the first one that drafts, and a model-based drafter (MTP head, draft model) drafts on EVERY step,
+// so a table stage written after it would never be asked. The chain validator refused that spelling outright
+// ("requires a self-spec stage first"): a supporter's `--spec-type mtp --spec-type ngram-mod` did not start,
+// while the same two flags the other way round did. The order the user typed carries no meaning the engine can
+// honour, so the self-spec (table / suffix) stages move to the front, each group keeping its own order.
+// PXA_SPEC_STAGE_ORDER=0 keeps the typed order (and the refusal). -> true when the order changed.
+bool common_speculative_canonicalize_stage_order(common_params_speculative & spec) {
+    const char * e = getenv("PXA_SPEC_STAGE_ORDER");
+    if ((e && pxa_env_value_off(e)) || spec.stages.size() < 2) {
+        return false;
+    }
+    auto ordered = spec.stages;
+    std::stable_partition(ordered.begin(), ordered.end(), [](const common_speculative_stage_params & st) {
+        return common_speculative_type_is_self_spec(st.type);
+    });
+    bool changed = false;
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        if (ordered[i].type != spec.stages[i].type) {
+            changed = true;
+        }
+    }
+    if (changed) {
+        spec.stages = ordered;
+        spec.type   = spec.stages.front().type;
+    }
+    return changed;
+}
+
 static void common_speculative_finalize_stages(gpt_params & params) {
     auto & spec = params.speculative;
 
@@ -646,6 +705,11 @@ static void common_speculative_finalize_stages(gpt_params & params) {
     }
 
     if (!spec.stages.empty()) {
+        if (common_speculative_canonicalize_stage_order(spec)) {
+            fprintf(stderr, "PXA_SPEC: stage order -> %s (a table stage drafts only on a match, so it goes in front of the "
+                            "model drafter whatever order it was typed in; PXA_SPEC_STAGE_ORDER=0 keeps the typed order)\n",
+                    common_speculative_stage_chain_to_str(spec).c_str());
+        }
         const auto resolved = spec.get_resolved_stages();
         if (resolved.size() != spec.stages.size()) {
             spec.stages = resolved;
@@ -794,6 +858,14 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
         fprintf(stderr, "%s\n", ex.what());
         params = params_org;
         return false;
+    }
+
+    params.pxa_argv0 = argc > 0 && argv[0] ? argv[0] : "";
+    params.pxa_argv_flags.clear();
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && argv[i][0] == '-') {
+            params.pxa_argv_flags.emplace_back(argv[i]);
+        }
     }
 
     return true;
@@ -1535,9 +1607,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             params.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_GPU_FALLBACK;
         } else if (val == "cpu" || val == "CPU") {
             params.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_CPU;
+        } else if (val == "replay" || val == "REPLAY") {   // PXA_SPEC_CKPT_REPLAY
+            params.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_REPLAY;
         } else {
             throw std::invalid_argument("unknown --recurrent-ckpt-mode value: " + val +
-                "; expected auto, per-step, gpu-fallback, or cpu");
+                "; expected auto, per-step, replay, gpu-fallback, or cpu");
         }
         return true;
     }
@@ -2108,6 +2182,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-cuda" || arg == "--cuda-params") {
         CHECK_ARG
         params.cuda_params = argv[i];
+        return true;
+    }
+    if (arg == "--dump-mtp-embd") { // PXA_DUMP_MTP_EMBD_v1
+        CHECK_ARG
+        params.pxa_dump_mtp_embd = argv[i];
         return true;
     }
     if (arg == "-mtp" || arg == "--multi-token-prediction") {
@@ -4064,7 +4143,7 @@ static llama_context * pxa_auto_ctx_retry(llama_model * model, gpt_params & para
                                           llama_context_params cparams) {
     const int32_t asked = llama_n_ctx_train(model);
 
-    if (const char * e = getenv("PXA_AUTO_CTX"); e && atoi(e) == 0) {
+    if (const char * e = getenv("PXA_AUTO_CTX"); e && pxa_env_value_off(e)) {
         fprintf(stderr,
                 "PXA_AUTO: CTX=off (PXA_AUTO_CTX=0; no -c was given, so the whole %d-token "
                 "trained window was asked for and there was no memory for it - pass '-c N')\n",
@@ -4168,7 +4247,7 @@ static llama_context * pxa_auto_ub_init(llama_model * model, gpt_params & params
         llama_free(lctx);
         lctx = nullptr;
     };
-    const char * who = origin == PXA_UB_RULE ? "a registry rule (PXA_AUTO_UB_VOLTA_Q8)" : "the VRAM ladder";
+    const char * who = origin == PXA_UB_RULE ? "a registry rule" : "the VRAM ladder";
     const int ub = pxa_registry_ub_walk(ub0, origin, reserve, build, discard, &trail);
     if (ub <= 0) {
         if (lctx != nullptr) {   // never expected: the walk keeps no context when it refuses
@@ -4222,11 +4301,27 @@ static int pxa_fastest_ub_ceiling() {
     return v == 1 ? 2048 : std::max(64, v);
 }
 
+// The same walk serves a registry FIT rule (params.pxa_ub_origin == PXA_UB_FIT, pxa_registry_ub_fit_rule: Gemma 4
+// on one 16 GB card, 2026-10-16): the ceiling is the -ub the server set, the floor is the measured cell's -ub, and
+// every rung above the floor must also leave PXA_AUTO_UB_RESERVE_MB (default 512) free on the card once its context
+// exists -- the 128 MiB pool floor alone let c32768 -ub 1024 boot with 147 MiB free and die on the first re-plan.
+// the expert-cache cold path choice (Nemotron-H split: CPU or zero-copy, src/llama-pxa-cold-auto.h) is made while the model loads,
+// before any context exists: common init hands it the CPU threads the cold path will run on (-t) with THIS load's model params
+// (an exported PXA_XCACHE_COLD_THREADS still wins in the engine). Never through the environment: a value written there would
+// reach every later load of the process (a draft model, a reload with another -t) and every child process as if exported.
+static int32_t pxa_cold_threads_of(const gpt_params & params) {
+    return params.n_threads > 0 ? params.n_threads : cpu_get_num_math();
+}
+
 static llama_context * pxa_fastest_ub_init(llama_model * & model, gpt_params & params) {
-    const int ceiling = pxa_fastest_ub_ceiling();
-    const char * em   = getenv("PXA_AUTO_UB_FASTEST_MIN");
-    const int floor_ub = std::min(ceiling, em ? std::max(64, atoi(em)) : 512);
-    const int ub_given = params.n_ubatch, b_given = params.n_batch;
+    const bool fit     = params.pxa_ub_origin == PXA_UB_FIT;
+    const int ceiling  = fit ? (int) params.n_ubatch : pxa_fastest_ub_ceiling();
+    const char * em    = getenv("PXA_AUTO_UB_FASTEST_MIN");
+    const int floor_ub = fit ? std::min(ceiling, std::max(64, (int) params.pxa_ub_fit_floor))
+                             : std::min(ceiling, em ? std::max(64, atoi(em)) : 512);
+    const size_t reserve = fit ? pxa_registry_ub_reserve_bytes() : 0;
+    const int only     = params.split_mode == LLAMA_SPLIT_MODE_NONE ? params.main_gpu : -1;
+    const int ub_given = fit ? (int) params.pxa_ub_fit_floor : params.n_ubatch, b_given = params.n_batch;
     std::string trail;
     for (int ub = ceiling; ub >= floor_ub; ) {
         int next = pxa_registry_ub_next_rung(ub);
@@ -4238,6 +4333,7 @@ static llama_context * pxa_fastest_ub_init(llama_model * & model, gpt_params & p
         }
         if (model == nullptr) {
             auto mparams = common_model_params_to_llama(params);
+            mparams.pxa_cold_threads = pxa_cold_threads_of(params);
             llama_pxa_set_stream_refuse(!last);
             model = llama_model_load_from_file(params.model.c_str(), mparams);
             const bool refused = llama_pxa_load_refused_stream();
@@ -4253,10 +4349,28 @@ static llama_context * pxa_fastest_ub_init(llama_model * & model, gpt_params & p
         }
         auto cparams = common_context_params_to_llama(params);
         llama_context * lctx = llama_init_from_model(model, cparams);
+        if (lctx != nullptr && reserve > 0 && !last) {
+            size_t free_min = SIZE_MAX;
+            int    worst    = -1;
+            if (pxa_registry_cuda_free_min(params.devices, only, &free_min, &worst) && free_min < reserve) {
+                trail += "-ub " + std::to_string(ub) + " left " + std::to_string(free_min >> 20) + " MiB free on CUDA" +
+                         std::to_string(worst) + "; ";
+                llama_free(lctx);
+                ub = next;
+                continue;
+            }
+        }
         if (lctx != nullptr) {
-            fprintf(stderr, "PXA_AUTO_UB_FASTEST: -ub %d -b %d (walked down from -ub %d; given -ub %d -b %d)%s%s\n",
-                    params.n_ubatch, params.n_batch, ceiling, ub_given, b_given,
-                    trail.empty() ? "" : ": ", trail.c_str());
+            if (fit) {
+                fprintf(stderr, "PXA_AUTO: UB=%d -b %d (fit walk from -ub %d down to the measured cell's -ub %d: the largest that "
+                                "loads resident, allocates and leaves %zu MiB free)%s%s\n",
+                        params.n_ubatch, params.n_batch, ceiling, floor_ub, reserve >> 20,
+                        trail.empty() ? "" : ": ", trail.c_str());
+            } else {
+                fprintf(stderr, "PXA_AUTO_UB_FASTEST: -ub %d -b %d (walked down from -ub %d; given -ub %d -b %d)%s%s\n",
+                        params.n_ubatch, params.n_batch, ceiling, ub_given, b_given,
+                        trail.empty() ? "" : ": ", trail.c_str());
+            }
             return lctx;
         }
         if (last || !llama_context_creation_failed_on_alloc()) {
@@ -4268,10 +4382,165 @@ static llama_context * pxa_fastest_ub_init(llama_model * & model, gpt_params & p
     return nullptr;
 }
 
+// ---- PXA registry for every tool (see common.h) ------------------------------------------------
+// The server's own block marks it applied (common init then never resolves: its hot models are the
+// server's business, review 335e08eacc). Every other tool counts its models: the FIRST one is
+// the -m model and writes the lever env; later ones (a draft model) only WARN on picks that differ
+// (orders #22182 F1, 2026-10-16), PXA_HS_ENV_UNION=1 = the old union.
+static bool g_pxa_registry_server = false;
+static int  g_pxa_registry_models = 0;
+
+void pxa_registry_mark_applied() {
+    g_pxa_registry_server = true;
+}
+
+static bool pxa_flags_has(const gpt_params & params, std::initializer_list<const char *> names) {
+    for (const auto & f : params.pxa_argv_flags) {
+        for (const char * n : names) {
+            if (f == n) return true;
+        }
+    }
+    return false;
+}
+
+static int pxa_tool_posture() {
+    const char * m = getenv("PXA_MODE");
+    return (m && (m[0] == 'm' || m[0] == 'M')) ? 1 : 0;
+}
+
+// the lever env of one resolve: the first model of the process writes it, a later one names what differs
+static void pxa_registry_env_for_model(const pxa_autoconfig & ac, const std::string & model_path, bool primary, const char * tool) {
+    std::vector<std::string> differs;
+    pxa_registry_env_apply(ac.env, primary, &differs);
+    for (const auto & d : differs) {
+        fprintf(stderr, "PXA_REGISTRY: WARNING %s: second model '%s': its pick %s is NOT applied (levers are process-wide; "
+                        "the first model's value stays; PXA_HS_ENV_UNION=1 for the old union)\n",
+                tool ? tool : "tool", model_path.c_str(), d.c_str());
+    }
+}
+
+void pxa_registry_apply_tool(gpt_params & params) {
+    if (g_pxa_registry_server || params.model.empty() || !params.hf_repo.empty() || !params.model_url.empty()) {
+        return;
+    }
+    const bool primary = ++g_pxa_registry_models == 1;
+    const int  kind    = pxa_tool_kind_of(params.pxa_argv0.c_str());
+    const char * tool  = kind == PXA_TOOL_GATE ? "gate tool" : "llama tool";
+    const pxa_model_info model = pxa_model_probe(params.model);
+    const int level   = ggml_pxa_config_level();
+    const int posture = level == 0 ? 0 : pxa_tool_posture();
+    if (!primary || kind == PXA_TOOL_GATE || kind == PXA_TOOL_BENCH) {
+        // F3(a): a quality instrument (perplexity / KLD / imatrix) gets the lever env only, never a -c, KV,
+        // batch, split or -ngl pick; a later model of the process (a draft) changes no flag of its own either
+        bool ts_given = false;
+        for (size_t i = 0; i < llama_max_devices(); ++i) ts_given = ts_given || params.tensor_split[i] != 0.0f;
+        const pxa_user_set us = pxa_user_set_lever_only((int) params.split_mode, ts_given,
+                                                         params.cache_type_k == "q8_0" && params.cache_type_v == "q8_0");
+        const pxa_topology   topo = pxa_topology_detect(params.devices, params.max_gpu, false);
+        const pxa_autoconfig ac   = pxa_autoconfig_resolve(topo, model, us, level, posture);
+        pxa_registry_env_for_model(ac, params.model, primary, tool);
+        if (primary) {
+            fprintf(stderr, "PXA_REGISTRY: %s: lever env only (-c / KV / batch / split / -ngl are the command line's own)\n", tool);
+            pxa_registry_banner(stderr, topo, model, ac);
+        }
+        return;
+    }
+    // the user-set rule is the server's (examples/server/server.cpp, PXA REGISTRY block), flag for flag
+    pxa_user_set us;
+    us.sm = pxa_flags_has(params, {"-sm", "--split-mode"});
+    us.sm_value = us.sm ? (int) params.split_mode : -1;
+    us.b  = pxa_flags_has(params, {"-b", "--batch-size"})   || getenv("LLAMA_ARG_BATCH")  != nullptr;
+    us.ub = pxa_flags_has(params, {"-ub", "--ubatch-size"}) || getenv("LLAMA_ARG_UBATCH") != nullptr;
+    us.fa = pxa_flags_has(params, {"-fa", "--flash-attn", "-no-fa", "--no-flash-attn"})
+            || getenv("LLAMA_ARG_FLASH_ATTN") != nullptr;
+    us.ts = pxa_flags_has(params, {"-ts", "--tensor-split"});
+    us.fa_value = params.flash_attn;
+    us.ngl = pxa_flags_has(params, {"-ngl", "--gpu-layers", "--n-gpu-layers"})
+             || getenv("LLAMA_ARG_N_GPU_LAYERS") != nullptr;
+    us.ctx = pxa_flags_has(params, {"-c", "--ctx-size"}) || getenv("LLAMA_ARG_CTX_SIZE") != nullptr
+             || params.n_ctx > 0;
+    us.n_parallel  = params.n_parallel;
+    us.n_ctx_value = params.n_ctx;
+    us.kv = pxa_flags_has(params, {"-ctk", "--cache-type-k", "-ctv", "--cache-type-v"})
+            || getenv("LLAMA_ARG_CACHE_TYPE_K") != nullptr || getenv("LLAMA_ARG_CACHE_TYPE_V") != nullptr;
+    us.kv_q8 = params.cache_type_k == "q8_0" && params.cache_type_v == "q8_0";
+    us.ngl_partial = us.ngl && params.n_gpu_layers >= 0 && model.n_layer > 0 && params.n_gpu_layers <= model.n_layer;
+    const pxa_topology   topo = pxa_topology_detect(params.devices, params.max_gpu, false);
+    const pxa_autoconfig ac   = pxa_autoconfig_resolve(topo, model, us, level, posture);
+    if (ac.split != PXA_SM_KEEP) {
+        params.split_mode = (enum llama_split_mode) ac.split;
+        if (ac.ts_even && params.devices.empty()) {
+            for (int i = 0; i < topo.n_dev && i < (int) llama_max_devices(); ++i) {
+                params.tensor_split[i] = 1.0f;
+            }
+        }
+    }
+    if (ac.n_gpu_layers >= 0) {
+        params.n_gpu_layers = ac.n_gpu_layers;
+    }
+    // F3(a): the server's -c pick (np x 4096 and the cells' own -c) would SHRINK a common tool's default (-c 0 =
+    // the trained window): taken only where the user gave no -c and it does not shrink that window
+    const int ctx_pick = pxa_tool_ctx_pick(ac.n_ctx, us.ctx, model.n_ctx_train);
+    if (ctx_pick > 0) {
+        params.n_ctx = ctx_pick;
+    } else if (ac.n_ctx > 0) {
+        fprintf(stderr, "PXA_REGISTRY: llama tool: -c %d pick not taken (%s; the tool keeps -c %d)\n", ac.n_ctx,
+                us.ctx ? "-c given" : "it would shrink the trained window", params.n_ctx);
+    }
+    if (ac.kv_type != nullptr) {
+        params.cache_type_k = ac.kv_type;
+        params.cache_type_v = ac.kv_type;
+    }
+    pxa_registry_env_for_model(ac, params.model, true, tool);
+    pxa_registry_banner(stderr, topo, model, ac);
+}
+
+void pxa_registry_apply_env_only(const std::string & model_path, int split_mode, bool ts_given, const char * tool) {
+    pxa_registry_apply_env_instances({ { model_path, split_mode, ts_given, false } }, tool);
+}
+
+void pxa_registry_apply_env_instances(const std::vector<pxa_registry_instance> & inst, const char * tool) {
+    if (g_pxa_registry_server || inst.empty()) {
+        return;
+    }
+    g_pxa_registry_models += 1;
+    // F3(c): every instance resolves for its own model / -sm / -ts / KV; the reads latch once per process, so
+    // only the picks all instances share are applied and the others are named
+    const pxa_topology topo  = pxa_topology_detect("", 0, false);
+    const int          level = ggml_pxa_config_level();
+    std::vector<std::vector<std::pair<std::string, std::string>>> per;
+    pxa_autoconfig ac0;
+    pxa_model_info m0;
+    for (size_t i = 0; i < inst.size(); ++i) {
+        const pxa_model_info model = pxa_model_probe(inst[i].model);
+        const pxa_autoconfig ac    = pxa_autoconfig_resolve(topo, model,
+                                         pxa_user_set_lever_only(inst[i].split_mode, inst[i].ts_given, inst[i].kv_q8),
+                                         level, level == 0 ? 0 : pxa_tool_posture());
+        per.push_back(ac.env);
+        if (i == 0) { ac0 = ac; m0 = model; }
+    }
+    std::vector<std::string> dropped;
+    const auto common = pxa_env_common(per, &dropped);
+    pxa_registry_env_apply(common, /*primary =*/ true, nullptr);
+    for (const auto & d : dropped) {
+        fprintf(stderr, "PXA_REGISTRY: WARNING %s: pick %s is NOT applied: the test instances differ on it and the "
+                        "levers are process-wide (run one -m / -sm per invocation for its own picks)\n", tool ? tool : "tool", d.c_str());
+    }
+    fprintf(stderr, "PXA_REGISTRY: %s: lever env resolved per test instance (%zu), %zu shared pick(s) applied; "
+                    "placement/batch flags are the bench's own\n", tool ? tool : "tool", inst.size(), common.size());
+    ac0.env = common;
+    pxa_registry_banner(stderr, topo, m0, ac0);
+}
+
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
 
+    // PXA registry for every tool: the server already resolved it (mark_applied);
+    // every other tool resolves it here, after the GGUF header and before the load. PXA_AUTOCONFIG=0 = off.
+    pxa_registry_apply_tool(params);
+
     auto mparams = common_model_params_to_llama(params);
+    mparams.pxa_cold_threads = pxa_cold_threads_of(params);
 
     llama_model * model = nullptr;
 
@@ -4279,15 +4548,15 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         model = llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
     } else if (!params.model_url.empty()) {
         model = llama_load_model_from_url(params.model_url.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
-    } else if (pxa_fastest_ub_ceiling() > 0) {
-        model = nullptr;   // PXA_AUTO_UB_FASTEST: the walk below loads the model itself
+    } else if (pxa_fastest_ub_ceiling() > 0 || params.pxa_ub_origin == PXA_UB_FIT) {
+        model = nullptr;   // PXA_AUTO_UB_FASTEST / a registry fit rule: the walk below loads the model itself
     } else {
         model = llama_model_load_from_file(params.model.c_str(), mparams);
     }
 
     llama_context * lctx = nullptr;
     const bool pxa_fastest = model == nullptr && params.hf_repo.empty() && params.model_url.empty() &&
-                             pxa_fastest_ub_ceiling() > 0;
+                             (pxa_fastest_ub_ceiling() > 0 || params.pxa_ub_origin == PXA_UB_FIT);
     if (pxa_fastest) {
         lctx = pxa_fastest_ub_init(model, params);
         if (model == NULL) {
@@ -4309,6 +4578,101 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     // when the caller named no context size of their own.
     if (lctx == NULL && params.n_ctx == 0 && llama_context_creation_failed_on_alloc()) {
         lctx = pxa_auto_ctx_retry(model, params, cparams);
+    }
+
+    // Resident 2x sm_70 Flash-Next: if the closed library's probe is on, step the physical
+    // batch down by four SM-waves until a depth-3 checkpoint (4 rows) fits. The last context
+    // that allocated is kept, including the one that still cannot fit.
+    if (lctx != NULL && ggml_pxqn_ckpt_ub_armed() && llama_model_has_recurrent(model)) {
+        const char * arch = llama_model_arch_string(model);
+        const pxa_topology topo = pxa_topology_detect(params.devices, params.max_gpu, false);
+        if (arch && std::strcmp(arch, "qwen4exp") == 0 && topo.n_dev == 2 && topo.same_cc() &&
+            !topo.cc.empty() && topo.cc[0] == 700) {
+            const int want = 4;
+            const int nsm  = 80;   // Tesla V100
+            std::string trail;
+            for (int guard = 0; guard < 8 && lctx != NULL; ++guard) {
+                const int cap  = llama_spec_ckpt_budget_max_tokens(lctx, want);
+                const int next = ggml_pxqn_ckpt_ub_next((int) params.n_ubatch, cap, want, nsm);
+                if (next <= 0) {
+                    if (!trail.empty()) {
+                        fprintf(stderr, "PXA_PXQN: checkpoint ubatch %d (capacity %d of %d)%s\n",
+                                params.n_ubatch, cap, want, trail.c_str());
+                    }
+                    break;
+                }
+                const int prev = (int) params.n_ubatch;
+                trail += " -ub " + std::to_string(prev) + " held " + std::to_string(cap) + ";";
+                llama_free(lctx);
+                lctx = nullptr;
+                params.n_ubatch = (uint32_t) next;
+                if ((int) params.n_batch < next) {
+                    params.n_batch = (uint32_t) next;
+                }
+                auto cparams_try = common_context_params_to_llama(params);
+                lctx = llama_init_from_model(model, cparams_try);
+                if (lctx == nullptr) {
+                    params.n_ubatch = (uint32_t) prev;
+                    if ((int) params.n_batch < prev) {
+                        params.n_batch = (uint32_t) prev;
+                    }
+                    auto cparams_back = common_context_params_to_llama(params);
+                    lctx = llama_init_from_model(model, cparams_back);
+                    fprintf(stderr, "PXA_PXQN: checkpoint ubatch %d did not allocate; restored %d\n", next, prev);
+                    break;
+                }
+            }
+        }
+    }
+
+    // PXA_STREAM_UB_CKPT (default OFF, =1 on; 2026-10-18; pxa-registry.h): the -ub PXA_AUTO_UB_STREAM picked is
+    // a ceiling checked against the speculative chain. One 16 GB V100 + Flash-Next: the 4096 compute buffer (1800 MiB) left the
+    // per-step checkpoint budget 2 of the 4 rows MTP n_max 3 needs (n_max 1, decode 40.9 -> 26.7 t/s). The CONTEXT is rebuilt
+    // 512 tokens narrower at a time (the placement, planned at load, is untouched) until the rows fit; floor 2048 (the ring path,
+    // above the CPU route's 1638-token width). An explicit -ub, a measured cell and the ladder never reach this (pxa_ub_stream).
+    if (lctx != NULL && params.pxa_ub_stream && pxa_registry_stream_ub_ckpt_on() && llama_model_has_recurrent(model) &&
+        (params.speculative.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_AUTO ||
+         params.speculative.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_PER_STEP ||
+         params.speculative.recurrent_ckpt_mode == LLAMA_SPEC_CKPT_REPLAY)) {
+        const int  want  = std::max(1, params.speculative.get_max_stage_n_max() + 1);
+        const char * vw  = getenv("PXA_XCACHE_VERIFY_WIDTH");
+        const int  width = std::max(2, vw && *vw ? atoi(vw) : 4);   // the chain width the expert-cache planner reserved VRAM for
+        const int  target = std::min(want, width);
+        const int  ub0    = (int) params.n_ubatch;
+        const int  cap0   = target >= 2 ? llama_spec_ckpt_budget_max_tokens(lctx, target) : target;
+        if (target >= 2 && cap0 < target && ub0 > 2048) {
+            int built = ub0;
+            auto cap_at = [&](int ub) -> int {
+                llama_free(lctx);
+                lctx = nullptr;
+                params.n_ubatch = (uint32_t) ub;
+                auto cparams_try = common_context_params_to_llama(params);
+                lctx  = llama_init_from_model(model, cparams_try);
+                built = ub;
+                return lctx != nullptr ? llama_spec_ckpt_budget_max_tokens(lctx, target) : 0;
+            };
+            std::string trail;
+            const int pick = pxa_registry_stream_ub_ckpt_walk(ub0, cap0, target, 2048, cap_at, &trail);
+            if (lctx == nullptr || built != pick) {
+                if (lctx != nullptr) {
+                    llama_free(lctx);
+                    lctx = nullptr;
+                }
+                params.n_ubatch = (uint32_t) pick;
+                auto cparams_pick = common_context_params_to_llama(params);
+                lctx = llama_init_from_model(model, cparams_pick);
+                if (lctx == nullptr && pick != ub0) {   // never expected: this rung allocated a moment ago
+                    params.n_ubatch = (uint32_t) ub0;
+                    auto cparams_back = common_context_params_to_llama(params);
+                    lctx = llama_init_from_model(model, cparams_back);
+                }
+            }
+            const int cap = lctx != nullptr ? llama_spec_ckpt_budget_max_tokens(lctx, target) : 0;
+            fprintf(stderr,
+                    "PXA_AUTO: PXA_STREAM_UB_CKPT: the streamed-expert -ub %d left the speculative chain %d of %d checkpoint rows "
+                    "(%s) -> -ub %d, %d rows (the placement is unchanged; unset or PXA_STREAM_UB_CKPT=0 keeps -ub %d)\n",
+                    ub0, cap0, target, trail.c_str(), (int) params.n_ubatch, cap, ub0);
+        }
     }
 
     if (lctx == NULL) {
@@ -4541,6 +4905,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.fit             = params.fit;
     mparams.fit_margin      = params.fit_margin;
     mparams.worst_graph_tokens = params.worst_graph_tokens;
+    mparams.pxa_all_outputs = params.logits_all || params.embedding;   // bug #339: perplexity / KLD / imatrix / embeddings never cap the logits
     mparams.type_k          = kv_cache_type_from_str(params.cache_type_k);
     mparams.type_v          = kv_cache_type_from_str(params.cache_type_v);
     mparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
@@ -5179,6 +5544,17 @@ std::vector<llama_token> common_tokenize(
     bool   parse_special){
 
     return llama_tokenize(vocab, text, add_special, parse_special);
+}
+
+std::vector<llama_token> common_eog_tokens(const struct llama_model * model) {
+    std::vector<llama_token> out;
+    const int32_t n_vocab = llama_n_vocab(model);
+    for (llama_token t = 0; t < n_vocab; ++t) {
+        if (llama_token_is_eog(model, t)) {
+            out.push_back(t);
+        }
+    }
+    return out;
 }
 
 std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
