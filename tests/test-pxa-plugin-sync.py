@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Background grant sync (PLUGINS-PROTOTYPE-PLAN S6, ANIBAL spec B3): 12 h +- 1 h timer, on wake, after a redeem; a 403
+"""Background grant sync: 12 h +- 1 h timer, on wake, after a redeem; a 403
 revoked / not_linked / account_disabled from licd locks every grant at once; offline never locks.
 
     python3 tests/test-pxa-plugin-sync.py

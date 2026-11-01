@@ -55,7 +55,7 @@ def _load_pubkeys():
 GRANT_PUBKEYS.update(_load_pubkeys())
 ENT_KINDS = ("plugin", "quant-tier", "preset", "feature")
 CLOCK_SKEW_S = 300
-HARD_LOCK_CODES = ("revoked", "not_linked", "account_disabled")   # spec s4: the only licd answers (403) that lock everything
+HARD_LOCK_CODES = ("revoked", "not_linked", "account_disabled")   # the only licd answers (403) that lock everything
 LOCAL_LOCK_SLACK_S = 300   # no licd time on a 403: the lock time is the local clock minus 5 minutes (the seen-id rule still holds)
 BODY_DATE_WINDOW_S = 300    # F310: body server_time and Date further apart than this -> the EARLIER one is licd's time
 LOCK_AHEAD_CAP_S = 24 * 3600  # F310: a lock time is never later than this computer's clock + 24 h
@@ -242,7 +242,7 @@ def verify_grant(env, pubkeys=None, now=None, install_pub=None, issued_ref=None)
     """-> (statement, status) with status ok | refresh_due, else GrantError .code in bad_shape, unknown_key,
     bad_signature, bad_issuer, not_yet, expired, wrong_machine, bad_entitlement.
     issued_ref: licd's clock for the not-yet check (server_time in the reply that carried the grant, else its Date
-    header; docs/ANIBAL-HARD-LOCK-SPEC.md s5): a grant licd issued after that + CLOCK_SKEW_S is `not_yet`. None -> the
+    header): a grant licd issued after that + CLOCK_SKEW_S is `not_yet`. None -> the
     local clock `now` (no server time). Expiry and refresh_due stay on the local clock."""
     now = time.time() if now is None else now
     licd_now = now if issued_ref is None else float(issued_ref)
@@ -742,7 +742,7 @@ class EntitlementCache(object):
     def _empty():
         return {"grants": {}, "revoked": [], "newest": {}, "seen": 0, "locks": {}, "hard_locks": {}}
 
-    # ---- the lock journal (F304/F309, = Plugins GrantCache 9351f0a99c..b5507ccf83, DESIGN.md s31.3) ---------------------
+    # ---- the lock journal (F304/F309, = the plugin host's GrantCache) ------------------------------------------------------
     def _journal_paths(self):
         return [os.path.join(self.cfg_dir, j) for j in self.JOURNALS]
 
@@ -1171,7 +1171,7 @@ class EntitlementCache(object):
                 raise rollback                       # nothing newer from licd: no reset, the clock is still behind
             if d.get("hard_lock_at") is not None:
                 # while a 403 (or corruption) hard-lock is in force, only a grant licd issued after it, under a grant id
-                # (and nonce) never seen before it, counts (docs/ANIBAL-HARD-LOCK-SPEC.md): an old grant never unlocks
+                # (and nonce) never seen before it, counts: an old grant never unlocks
                 if not self._fresh(st, d["hard_lock_at"], d.get(J_LOCK_NEWEST), set(d.get("hard_lock_seen") or ())):
                     raise GrantError("a grant from before the account was locked", "pre_lock")
             d["grants"][st["ent_id"]] = env
@@ -1212,7 +1212,7 @@ class EntitlementCache(object):
             d["seen"], d["_seen_reset"] = target, True
 
     def set_locks(self, locks, replace=False):
-        """{item_id: reason} from licd's signed account answer (owned[].status != active, spec s4 hard-lock). A locked item
+        """{item_id: reason} from licd's signed account answer (owned[].status != active: a hard lock). A locked item
         counts for nothing until licd grants it again; the plugin host writes the same "locks" key in this file."""
         now = self.clock()
         with self._locked():
@@ -1230,7 +1230,7 @@ class EntitlementCache(object):
         return sorted(x for x in held | set(d["locks"]) | set(d["hard_locks"]) if isinstance(x, str) and x != "*")
 
     def hard_lock(self, code, items=(), at=None, source=None):
-        """licd answered 403 revoked | not_linked | account_disabled (spec s4, Core's gate b0115812b6, Plugins 03294342ea):
+        """licd answered 403 revoked | not_linked | account_disabled (the same rule as Core's gate and the plugin host):
         every item locks and every grant is dropped. The locks go in "locks" (what Core and the plugin host read) and in
         "hard_locks", which only a fresh grant for that item clears (add()); a later good sync that rewrites "locks" from
         owned[] does not lift them. Revocation and anti-replay records stay, so an old copy of a grant cannot come back.
@@ -1374,9 +1374,9 @@ class EntitlementCache(object):
             return self._load(now)
 
     def account_lock_lifted(self, d, now=None):
-        """review 10-26 L1: True when licd has signed this computer a fresh grant since the 403 / corruption lock
-        in `d` (a record() snapshot) - the evidence v5 already takes to lift an item's lock (add() / _fresh, spec
-        docs/ANIBAL-HARD-LOCK-SPEC.md): verified for this machine with a known key, not revoked by key or signed id,
+        """True when licd has signed this computer a fresh grant since the 403 / corruption lock
+        in `d` (a record() snapshot) - the evidence v5 already takes to lift an item's lock (add() / _fresh):
+        verified for this machine with a known key, not revoked by key or signed id,
         issued after hard_lock_at and a new ent_id or strictly newer than its lock-time newest. Then the account-level
         reason (hard_locked(), sync.locked, the gate's per-item 403 reason) is over: licd serves this computer again.
         Items that got no such grant stay in hard_locks and never run; only the words they get change (gate.state).
@@ -1493,12 +1493,12 @@ CATALOG_PREFIX = b"pxa-store-catalog|"
 STMT_PREFIX = b"pxa-wallet-stmt|"          # licd's signed wallet statement (balance split + owned items)
 DEFAULT_STORE_URL = "https://lic.pxanetwork.com"   # licd is live (2026-10-14); PXA_STORE_URL / control.json store_url override, "" = fixture
 SYNC_EVERY_S = 12 * 3600    # an online Control refreshes its grants twice a day (grants say refresh_after = 24 h)
-SYNC_JITTER_S = 3600        # background sync (plan S6): every 12 h +- 1 h, so a fleet of Controls never hits licd at once
+SYNC_JITTER_S = 3600        # background sync: every 12 h +- 1 h, so a fleet of Controls never hits licd at once
 SYNC_TICK_S = 60            # the background loop looks at the wall clock this often
 WAKE_GAP_S = 300            # a tick that took this much longer than SYNC_TICK_S = the computer slept: sync on wake
 SYNC_RETRY_S = 3600         # offline (network, 5xx, 429): try again in an hour; offline never locks anything
 SYNC_START_S = 120          # first background sync this long after Control starts (a start is a wake too)
-# HARD_LOCK_CODES (licd's refresh answers that lock every item at once) is defined once, at the top (spec s4)
+# HARD_LOCK_CODES (licd's refresh answers that lock every item at once) is defined once, at the top
 _SYNC_LISTENERS = []        # fn(cfg_dir, result) after every sync answer (the plugin host stops what lost its grant)
 _BG = [None]                # the running BackgroundSync (kick() after a redeem whose inline sync failed)
 
@@ -1547,7 +1547,7 @@ MAX_REPLY = 8 << 20                # a licd JSON answer is a few KB; anything th
 
 
 def check_url(url):
-    """spec s2: the store is spoken to over https only; plain http only on loopback (tests, a local licd). The same rule
+    """the store is spoken to over https only; plain http only on loopback (tests, a local licd). The same rule
     as Core's gate (tools/vigil/entitlement._check_url) and the plugin host (pxa_plugins.store_backend.check_url).
     -> the url without a trailing slash; core.Invalid 400 bad_url otherwise."""
     import urllib.parse
@@ -1606,7 +1606,7 @@ def server_time(body, headers):
 
 
 def server_time_checked(body, headers):
-    """F310 (= Plugins b5507ccf83): licd's clock with a cross-check. -> (epoch seconds or None, "body" | "date" | None).
+    """F310 (= the plugin host): licd's clock with a cross-check. -> (epoch seconds or None, "body" | "date" | None).
     The body's server_time wins when the reply's Date agrees within BODY_DATE_WINDOW_S or is missing; when both parse
     and disagree by more, the EARLIER of the two (a body years ahead would otherwise lock for good)."""
     b = server_time(body, {})
@@ -1766,8 +1766,7 @@ class LicdClient(object):
 
     def sync(self, cache):
         """refresh every grant for this computer, apply the signed revocation list, lock what licd's account answer says is
-        no longer active, keep that answer. The spec readings Core's gate and the plugin host share (anibal/a-store-gate
-        fixtures/entitlement/PROVENANCE.md): a reply whose grants is not a list, whose account.owned is not a list, or
+        no longer active, keep that answer. The readings Core's gate and the plugin host share: a reply whose grants is not a list, whose account.owned is not a list, or
         with an owned[] entry without a string item_id AND a string status is MALFORMED: nothing in it is applied (not even
         its revocations) and it raises store_malformed (503, like offline). Only a present status other than "active"
         locks (s4 hard-lock); a lock drops that item's grants until licd grants it again."""
@@ -1851,7 +1850,7 @@ class LicdClient(object):
                 have = 0
             if have == int(tok["size"]):
                 break
-            # a token URL off this store must be https too (spec s2): refused outright, not retried as a cut connection
+            # a token URL off this store must be https too: refused outright, not retried as a cut connection
             url = check_url(tok["url"]) if str(tok.get("url") or "").startswith("http") else "/v1/store/download/" + tok["token"]
             try:
                 r = self._req("GET", url, headers={"Range": "bytes=%d-" % have} if have else None, raw=True)
@@ -1926,7 +1925,7 @@ def kick(reason="redeem"):
 
 
 class BackgroundSync(object):
-    """plan S6 / ANIBAL spec B3: grants refresh on their own, not only when the page asks.
+    """grants refresh on their own, not only when the page asks.
     * timer: every SYNC_EVERY_S +- SYNC_JITTER_S (12 h +- 1 h); any other successful sync (a page refresh, a redeem)
       restarts the count;
     * wake: a loop tick that took WAKE_GAP_S longer than it should = the computer slept -> sync now; a start counts too

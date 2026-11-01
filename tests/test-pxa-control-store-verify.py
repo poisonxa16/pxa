@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""PXA Control's store client (tools/pxa_control/store LicdClient + EntitlementCache) on the spec readings Core's gate
-(anibal/a-store-gate b0115812b6, tools/vigil/entitlement.py) and the plugin host (plugins/v1-store 03294342ea,
-tools/pxa_plugins/store_backend.py) already share (fixtures/entitlement/PROVENANCE.md):
+"""PXA Control's store client (tools/pxa_control/store LicdClient + EntitlementCache) on the readings Core's gate
+(tools/vigil/entitlement.py) and the plugin host (tools/pxa_plugins/store_backend.py) already share:
 
   * https only; plain http only on loopback (the store URL and a download token's URL);
   * a garbled or cut-off HTTP reply (http.client.HTTPException) is OFFLINE; a 2xx that is not one JSON object is
@@ -415,7 +414,7 @@ class OwnedLocks(Base):
 
 # ---------------------------------------------------------------------------------------------------------- (4) 403 hard-lock
 class HardLock403(Base):
-    """licd 403 revoked | not_linked | account_disabled locks everything (Core's gate b0115812b6, Plugins 03294342ea);
+    """licd 403 revoked | not_linked | account_disabled locks everything (the same rule as Core's gate and the plugin host);
     only a fresh grant that verifies unlocks an item; any other refusal or trouble changes nothing."""
 
     def deny(self, code, status=403):
@@ -2370,7 +2369,7 @@ class LicdClockNotYet(Base):
 
 # ------------------------- (F309-P) the lock journal outside grants.json: locks, ids, gen and a high-water time
 class JournalF309(Base):
-    """= Plugins GrantCache (plugins/v1-store-rc36 9351f0a99c / f20def198b, DESIGN.md s31.3): every save bumps `gen` and
+    """= the plugin host's GrantCache: every save bumps `gen` and
     writes <config>/store/grants.journal.json and <config>/plugins/store-lock-journal.json; a corrupt or missing file is
     rebuilt from them; `seen` there is the rollback high-water time."""
 
