@@ -9,7 +9,7 @@ before you use it (`sha256sum -c <file>.sha256` on Linux, `shasum -a 256 <file>`
 | Platform | What you download | Steps |
 |---|---|---|
 | Linux x86_64 | the tarball | [Tarball](#tarball-recommended) |
-| Linux, any distribution with Docker and the NVIDIA runtime | `ghcr.io/poisonxa16/pxa:v4.0` | [Container](#container) |
+| Linux, any distribution with Docker and the NVIDIA runtime | `ghcr.io/poisonxa16/pxa:v4.0.1` | [Container](#container) |
 | Windows x64 | PXA Control and an engine zip (unsigned) | [Windows](#windows) |
 | macOS, Intel and Apple silicon | PXA Control (unsigned, a client only) | [macOS](#macos) |
 | Android | in testing, not a 4.0 download | [Android](#android) |
@@ -18,12 +18,12 @@ before you use it (`sha256sum -c <file>.sha256` on Linux, `shasum -a 256 <file>`
 
 Needs Linux x86-64, glibc 2.35 or newer (Ubuntu 22.04 and newer) and an NVIDIA driver 570 or newer.
 The package carries its own CUDA 12.8 runtime, so the CUDA toolkit is not needed. Download
-`pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` from the
+`pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` from the
 [release page](https://github.com/poisonxa16/pxa/releases/latest). Then:
 
 ```bash
-tar xzf pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
-cd pxa-v4.0
+tar xzf pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+cd pxa-v4.0.1
 ./pxa --doctor                 # checks your cards, driver and CPU; starts nothing
 ./pxa                          # opens PXA Control in your browser
 ```
@@ -65,15 +65,15 @@ Add `-s -- --docker` after `bash` to pull the container image instead.
 
 ## Container
 
-`ghcr.io/poisonxa16/pxa:v4.0` carries the same binaries. Models are not in the image; mount a folder
-at `/models`. The tag `latest` moves only with the public release; `v4.0` stays fixed. The image runs
+`ghcr.io/poisonxa16/pxa:v4.0.1` carries the same binaries. Models are not in the image; mount a folder
+at `/models`. The tag `latest` moves only with the public release; `v4.0.1` stays fixed. The image runs
 as a normal user and answers a health check on port 8080.
 
 ```bash
 docker run -d --name pxa --gpus '"device=0,1"' --shm-size=1g -p 8080:8080 \
     -v /path/to/models:/models:ro \
     -v pxa-cache:/work/.cache/pxa -e PXA_CACHE_DIR=/work/.cache/pxa \
-    ghcr.io/poisonxa16/pxa:v4.0
+    ghcr.io/poisonxa16/pxa:v4.0.1
 ```
 
 The `pxa-cache` volume is where a session's learned expert counts are kept. Without that mount they

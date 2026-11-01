@@ -3,6 +3,7 @@ Errors are {"error", "code"} with an HTTP status. Live events go out over SSE (/
 import base64
 import json
 import logging
+import secrets
 import os
 import re
 import shutil
@@ -53,6 +54,27 @@ class ChatError(Exception):
     def __init__(self, msg, code, status=400, headers=None):
         Exception.__init__(self, msg)
         self.code, self.status, self.headers = code, status, headers or None
+
+
+def _vigil():
+    """the in-house agent binding (vigil_bind, which needs the anibal package), imported on first use, so pxa_chat and
+    plain chat work in a tree without that package (the public source tree, a package without the agent). A
+    /api/chat/vigil/* route answers 503 agent_unavailable there, and only when it is called."""
+    try:
+        from . import vigil_bind
+    except ImportError as e:
+        raise ChatError("the in-house agent is not part of this build (%s)" % (getattr(e, "name", None) or "import failed"),
+                        "agent_unavailable", 503)
+    return vigil_bind
+
+
+def _vigil_features():
+    """(assets, panes) of the agent's queued features for the route table; empty without the agent"""
+    try:
+        vb = _vigil()
+    except ChatError:
+        return (), ()
+    return tuple(vb.FEATURE_ASSETS), tuple(vb.FEATURE_PANES)
 
 
 class HostPolicy(object):
@@ -319,6 +341,14 @@ class SSE(object):
         seq = self.since
         last = time.time()
         try:
+            # the backlog already recorded, then ": caught-up" (a comment, ignored by parsers): what came
+            # before it is a replay, so the UI alerts only on what follows (P137-14)
+            backlog, _ = self.run.since(seq, 0)
+            for ev in backlog:
+                seq = ev["seq"]
+                h.wfile.write(f"id: {seq}\nevent: {ev['type']}\ndata: {json.dumps(ev)}\n\n".encode())
+            h.wfile.write(b": caught-up\n\n")
+            h.wfile.flush()
             while True:
                 evs, done = self.run.since(seq, 10.0)
                 if any(e["type"] in loop.TERMINAL for e in evs):
@@ -658,6 +688,78 @@ def make_routes(hub_getter, reply):
         r.cancel()
         return {"ok": True}
 
+    def vigil_turn(app, hub, body, query):
+        v = _vigil().loop_for(hub)
+        return _vigil().with_card(v, v.turn(str(body.get("chat_id") or body.get("session_id") or ""), body.get("message")))
+
+    def vigil_resume(app, hub, body, query):
+        v = _vigil().loop_for(hub)
+        return _vigil().with_card(v, v.resume(str(body.get("chat_id") or body.get("session_id") or "")))
+
+    def vigil_approve(app, hub, body, query):
+        v = _vigil().loop_for(hub)
+        # F36b: the approval source comes from the credential, never the body. This route sits behind
+        # the Control (UI) token, so it is always the UI click; voice uses its own token on Vigil's server.
+        ok, code = v.approve(str(body.get("id") or body.get("approval_id") or ""), str(body.get("decision") or ""),
+                             source="ui")
+        if not ok:
+            raise ChatError(code, code, 400)
+        return {"ok": True, "code": code}
+
+    def vigil_kill(app, hub, body, query):
+        v = _vigil().loop_for(hub)
+        v.kill()
+        return {"ok": True, "killed": True}
+
+    def vigil_audit(app, hub, body, query):
+        v = _vigil().loop_for(hub)
+        chat = _q1(query, "chat_id") or _q1(query, "session") or None
+        return {"rows": v.audit.list(chat)}
+
+    # ---- Vigil panes inside Control (approvals, audit, memory, jobs, settings, onboarding, start/stop)
+    def vigil_events(app, hub, body, query):
+        # Host + Control token: the dispatcher. Origin + Last-Event-ID: VigilEvents.stream_to.
+        return _vigil().VigilEvents(hub, query)
+
+    def vigil_page(app, hub, body, query):
+        return reply(_vigil().pane_page(), "text/html; charset=utf-8", 200,
+                     {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                      "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
+                      "Content-Security-Policy": _vigil().PANE_CSP})
+
+    def vigil_hud(app, hub, body, query):
+        html, csp = _vigil().hud_page(secrets.token_urlsafe(16))
+        return reply(html, "text/html; charset=utf-8", 200,
+                     {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                      "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
+                      "Content-Security-Policy": csp})
+
+    def vigil_asset(name):
+        def asset(app, hub, body, query):
+            data, ctype = _vigil().pane_asset(name)
+            extra = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+            if name == "sw.js":   # the worker controls the Vigil app under the pane base (never pages or the API)
+                extra["Service-Worker-Allowed"] = _vigil().PANE_BASE + "/"
+            return reply(data, ctype, 200, extra)
+        asset.__name__ = "vigil_asset_" + name.replace(".", "_")
+        return asset
+
+    def vigil_pane(method, name):
+        def pane(app, hub, body, query):
+            try:
+                out = _vigil().control_for(hub).pane(method, name, body, query, local=_vigil().request_local())
+            except PermissionError as e:          # remote-access ops from off this machine
+                raise ChatError(str(e), getattr(e, "code", "forbidden"), 403)
+            except LookupError as e:
+                raise ChatError(str(e).strip("'\""), "not_found", 404)
+            except (ValueError, TypeError) as e:
+                raise ChatError(str(e), "bad_request")
+            if out is None:
+                raise ChatError("not found", "not_found", 404)
+            return out
+        pane.__name__ = "vigil_pane_%s_%s" % (method.lower(), name)
+        return pane
+
     def approve(app, hub, body, query):
         ok, code = hub.approvals.answer(str(body.get("approval_id") or ""), str(body.get("run_id") or ""),
                                         str(body.get("decision") or ""))
@@ -795,7 +897,8 @@ def make_routes(hub_getter, reply):
         fid = str(body.get("id") or "")
         try:
             if op == "add":
-                r = m.add(body.get("text"), source=body.get("source") or "you", pinned=bool(body.get("pinned")))
+                r = m.add(body.get("text"), source=body.get("source") or "you", pinned=bool(body.get("pinned")),
+                          provenance="user_authored")       # typed into the memory pane by the user
                 return {"ok": True, "fact": r["fact"], "status": r["status"]}
             if op in ("update", "pin"):
                 f = m.update(fid, text=body.get("text") if op == "update" else None,
@@ -849,10 +952,30 @@ def make_routes(hub_getter, reply):
              ("POST", "/api/chat/search"): search_post, ("POST", "/api/chat/search/test"): search_test, ("POST", "/api/chat/run"): run,
              ("GET", "/api/chat/events"): events, ("POST", "/api/chat/cancel"): cancel,
              ("POST", "/api/chat/approve"): approve, ("GET", "/api/chat/host"): host_get,
+             ("POST", "/api/chat/vigil/turn"): vigil_turn, ("POST", "/api/chat/vigil/resume"): vigil_resume,
+             ("POST", "/api/chat/vigil/approve"): vigil_approve, ("POST", "/api/chat/vigil/kill"): vigil_kill,
+             ("GET", "/api/chat/vigil/audit"): vigil_audit,
              ("POST", "/api/chat/host"): host_post, ("GET", "/api/chat/sessions"): session_list,
              ("GET", "/api/chat/session"): session_get, ("DELETE", "/api/chat/session"): session_delete,
              ("POST", "/api/chat/rename"): session_rename, ("POST", "/api/chat/branch"): branch,
              ("POST", "/api/chat/tokenize"): tokenize,
              ("GET", "/api/chat/export"): export, ("GET", "/api/chat/memory"): memory_get,
              ("POST", "/api/chat/memory"): memory_post, ("GET", "/api/chat/memory/export"): memory_export}
+    table[("GET", "/api/chat/vigil/events")] = vigil_events
+    table[("GET", "/api/chat/vigil/page")] = vigil_page
+    table[("GET", "/api/chat/vigil/hud")] = vigil_hud
+    _feat_assets, _feat_panes = _vigil_features()     # empty without the agent: its base routes still answer 503
+    for _n in ("control.js", "markdown.js", "control.css", "presence.js", "presence.css", "presence-demo.js", "presence.html",
+               "hud.js", "hud.css", "sounds.js", "cards.js", "theme.css", "diff.js", "palette.js", "labelsafe.js", "screen.js",
+               "qr.js", "remote-pane.js", "pwa.js", "sw.js", "vigil.webmanifest", "icon.svg", "icon-192.png", "icon-512.png",
+               "orb.js", "orb-still.webp", "earcon-caption.js") \
+            + _feat_assets:
+        table[("GET", "/api/chat/vigil/ui/" + _n)] = vigil_asset(_n)
+    for _n in _feat_panes:                           # the queued features (vigil/ui/features.py)
+        table[("GET", "/api/chat/vigil/pane/" + _n)] = vigil_pane("GET", _n)
+        table[("POST", "/api/chat/vigil/pane/" + _n)] = vigil_pane("POST", _n)
+    for _n in ("state", "approvals", "audit", "memory", "jobs", "settings", "onboarding", "hud", "system", "providers", "tasks", "task", "memory_browse", "prefs", "docs", "grants", "usage", "remote", "memory_confirm"):
+        table[("GET", "/api/chat/vigil/pane/" + _n)] = vigil_pane("GET", _n)
+    for _n in ("chat", "resume", "approve", "memory", "jobs", "settings", "onboarding", "start", "stop", "voice", "tasks", "task", "approvals", "prefs", "docs", "memory_settings", "providers", "grants", "remote", "file_view", "memory_confirm"):
+        table[("POST", "/api/chat/vigil/pane/" + _n)] = vigil_pane("POST", _n)
     return {k: wrap(v) for k, v in table.items()}

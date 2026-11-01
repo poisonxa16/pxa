@@ -24,11 +24,45 @@
 // (waiting for its copy when it is not yet done, which at the sizes involved is rare), so the swap schedule is a function of the
 // token stream, not of copy timing. Across requests: every sequence that starts at position 0 starts from the planned state
 // (PXA_XCACHE_ADAPT_RESET, default on), because the hot set changes the floats (GPU kernel vs CPU cold path).
+//
+// Prefill freeze (PXA_XCACHE_PREFILL_FREEZE, 2026-10-29): the adaptation acts only after a decode
+// or an MTP-verify batch (n_tokens <= PXA_XCACHE_DECODE_MAXW, default 16). After a wider batch (a prefill ubatch) it applies no
+// map flip and starts no swap (no evict read, no admit copy), so every ubatch of a prompt runs on the same resident set and the
+// prefill path carries no swap work; the prompt's routing is still observed, and the first decode tick plans from it. A copy in
+// flight when a prefill starts just finishes; its flip waits for the next decode tick (a slot is written only while no map entry
+// points at it, so the wait is safe). Residency only: with RIX on every width (the 1x V100 Overdrive recipe) it cannot change a bit.
+//   PXA_XCACHE_PREFILL_FREEZE  unset = on in the RTIER copy-completion mode (the 1x V100 Overdrive recipe), off in the deterministic
+//                              schedule (its swap schedule, and so its answers, stay what they were measured as); =0 off; =1 on in both
+//   PXA_XCACHE_DECODE_MAXW     widest batch (tokens) that still adapts, default 16 (1..256): two times the widest verify / async
+//                              cold-lane width in use (MTP n_max 3 verifies 4, PLAN_V2 prices 6, the async lane covers 1..8) and half the
+//                              width the adaptor already treats as a prefill-sized observation (32)
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 
 struct llama_model;
+
+struct llama_pxa_xc_freeze {
+    bool on   = false;
+    int  maxw = 16;
+};
+
+// the switch as the adaptor reads it (pure: the two variables' values and the schedule; the unit test drives it directly)
+static inline llama_pxa_xc_freeze llama_pxa_xc_freeze_parse(const char * freeze, const char * maxw, bool rtier) {
+    llama_pxa_xc_freeze f;
+    f.on = freeze && *freeze ? atoi(freeze) != 0 : rtier;
+    if (maxw && *maxw) {
+        const int v = atoi(maxw);
+        f.maxw = v < 1 ? 16 : (v > 256 ? 256 : v);
+    }
+    return f;
+}
+
+// true: the batch that just completed was a prefill ubatch, the adaptation keeps the residency as it is
+static inline bool llama_pxa_xc_frozen(const llama_pxa_xc_freeze & f, int n_tokens) {
+    return f.on && n_tokens > f.maxw;
+}
 
 // true while a hot-swap residency group is active: the adaptation stands down (its weights are mirrored once and restored at unpark)
 bool llama_pxa_xcache_residency_blocks(void);

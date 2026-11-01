@@ -18,9 +18,9 @@ Pick the **tarball** path or the **Docker** path. They end up in the same place.
 
 ```bash
 mkdir -p ~/pxa && cd ~/pxa
-curl -L -O https://github.com/poisonxa16/pxa/releases/download/v4.0/pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
-tar xzf pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
-cd pxa-v4.0
+curl -L -O https://github.com/poisonxa16/pxa/releases/download/v4.0.1/pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+tar xzf pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+cd pxa-v4.0.1
 ```
 
 You should see a folder with these things in it:
@@ -51,7 +51,7 @@ The build number and commit will be this release's, not the ones above.
 
 ```bash
 mkdir -p ~/models
-docker pull ghcr.io/poisonxa16/pxa:v4.0
+docker pull ghcr.io/poisonxa16/pxa:v4.0.1
 ```
 
 Nothing to unpack. Models live in `~/models` on your machine and the container sees them at
@@ -137,7 +137,7 @@ docker run -d --name pxa \
     --gpus '"device=0"' \
     -p 8080:8080 \
     -v ~/models:/models:ro \
-    ghcr.io/poisonxa16/pxa:v4.0 \
+    ghcr.io/poisonxa16/pxa:v4.0.1 \
     -m /models/fusion2-35b-U16-q8head.gguf \
     -ngl 99 -c 8192 -fa on
 ```

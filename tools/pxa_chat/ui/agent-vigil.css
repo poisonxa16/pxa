@@ -1,0 +1,54 @@
+/* Visible kill switch in the Chat header. Uses the same tokens as the rest of Control. */
+.ag-top { flex-wrap: wrap; }
+.ag-vigil-kill {
+  height: 32px;
+  padding: 0 12px;
+  margin-left: auto;
+  flex: 0 0 auto;
+  position: relative;
+  z-index: 50;
+  font-weight: 650;
+  color: var(--bad);
+  background: var(--bad-bg);
+  border: 1px solid color-mix(in srgb, var(--bad) 55%, var(--line));
+  border-radius: var(--r1, 8px);
+}
+.ag-vigil-kill:hover { filter: brightness(1.08); }
+.ag-vigil-audit { max-width: 640px; }
+.ag-vigil-audit pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 13px/1.45 var(--sans, sans-serif);
+  color: var(--text);
+}
+.ag-note.bad { max-width: 100%; }
+.ag-vigil-open { height:32px; display:inline-flex; align-items:center; padding:0 12px; text-decoration:none; }
+.ag-arg { font-family: ui-monospace, monospace; background: var(--tint); border-radius: 3px; padding: 0 3px; }
+
+/* approval card fields (cards.js, QA F19): everything shown, long values scroll with a toggle */
+.ag-fields { margin:6px 0; display:grid; grid-template-columns:max-content 1fr; gap:4px 10px; }
+.ag-fields dt { opacity:.7; } .ag-fields dd { margin:0; min-width:0; overflow-wrap:anywhere; }
+.ag-vals { margin:0; padding-left:16px; }
+.ag-body { white-space:pre-wrap; margin:0; font:12px/1.4 ui-monospace, monospace; }
+.ag-clip { max-height:12em; overflow:auto; }
+.ag-clip.ag-open { max-height:none; }
+.ag-more { background:none; border:0; color:inherit; text-decoration:underline; cursor:pointer; padding:2px 0; }
+.ag-count, .ag-src, .ag-none { opacity:.7; font-size:12px; display:block; }
+.ag-warn { outline:1px dashed var(--warn); }
+
+/* code changes in approval cards (diff.js) */
+.ag-diff { font:12px/1.4 var(--mono, ui-monospace, monospace); }
+.ag-diff-sum { display:flex; gap:8px; opacity:.8; }
+.ag-diff-add { color:var(--ok); } .ag-diff-del { color:var(--bad); }
+.ag-diff-file { border:1px solid var(--line); border-radius:var(--r1, 8px); margin:4px 0; overflow:hidden; }
+.ag-diff-file > summary { display:flex; gap:8px; padding:4px 8px; cursor:pointer; }
+.ag-diff-tag { font-size:11px; opacity:.75; }
+.ag-diff-t { width:100%; border-collapse:collapse; display:block; overflow:auto; max-height:22em; }
+.ag-diff-t td { padding:0 5px; white-space:pre-wrap; vertical-align:top; }
+.ag-diff-n { opacity:.55; text-align:right; user-select:none; }
+.ag-diff-add td { background:var(--ok-bg); } .ag-diff-del td { background:var(--bad-bg); }
+.ag-diff-h td { opacity:.75; } .ag-diff-meta td { opacity:.6; font-style:italic; }
+.ag-diff-bad { color:var(--warn); }

@@ -17,6 +17,8 @@ Manifest (plugin.json, in the plugin's folder):
      "permissions": ["device.mic", "device.speaker", "model.chat", "net.loopback"],   # + "net.internet:<host>" (one host each)
      "listen": [{"port": 10310, "proto": "wyoming", "scope": "lan"}],     # optional: lan (needs net.lan) or loopback, never public
      "overlay": {"page": "overlay/index.html", "scope": "loopback"},      # optional: a read-only page for OBS, 127.0.0.1 only
+     "hook_door": true,                                    # optional: signed calls from programs on this computer through
+                                                           # Control's hook door (plugins/hookdoor.py), once the user turns it on
      "entitlement": null,                                  # or a store item id (kind "plugin") a grant must carry
      "python": {"package": "anibal", "path": "lib"},       # optional: an in-process package (pxp.load), until the host runs it
      "files": {"bin/anibal-plugin": "<sha256>", "ui/index.html": "<sha256>", ...},
@@ -32,6 +34,12 @@ import time
 MANIFEST_VERSION = 1
 MANIFEST_PREFIX = b"pxa-plugin-manifest|"      # = p-platform common.MANIFEST_PREFIX (no cross-domain signature replay)
 PLUGIN_PUBKEYS = {}         # kid -> 64 hex chars: the ONE offline first-party plugin key (filled at release; none here)
+# Key rotation 2026-10b (4.0.1): the plugin key signs code Control RUNS, so a RETIRED plugin key is trusted only for the plugins
+# already published under it. Pinned by the sha256 of the exact signed bytes, MANIFEST_PREFIX + canonical(manifest without its
+# signature), which covers every file's sha256 and can be checked again at every load (only plugin.json is on disk then).
+# Bound to the PUBLIC key, not the kid name. A retired key with no list loaded verifies nothing (fail closed). 4.1 drops it.
+RETIRED_PLUGIN_KEYS = frozenset(("b2c3d31d1d635e63170891469ff336fc89928349232271d4b49c1d683f248f71",))   # plug-2026-10
+PLUGIN_PINNED = {}          # public key hex -> set of signed-manifest sha256 (filled from store/pubkeys.json "PLUGIN_PINNED")
 PUBLISHERS = ("pxa",)       # first-party only (owner, 2026-10-14): no publisher certificates, no third-party path
 EDITIONS = ("free", "supporter")
 # every permission a plugin can ask for and the consent card's words. The first twelve are p-platform's
@@ -142,6 +150,8 @@ def consent_lines(m):
         out.append(("listen:%d" % ln["port"], "accept %s connections from %s on port %d" % (ln["proto"], where, ln["port"])))
     if m.get("overlay"):
         out.append(("overlay", "show a read-only overlay page to programs on this computer (OBS)"))
+    if m.get("hook_door") is True:
+        out.append(("hook_door", "take signed calls from programs on this computer, once you turn that on in its card"))
     return out
 
 
@@ -225,6 +235,8 @@ def validate_manifest(m):
         p.append("permissions: at most %d scoped internet hosts" % MAX_SCOPED_HOSTS)
     p += _listen_problems(m, perms)
     p += _overlay_problems(m)
+    if "hook_door" in m and not isinstance(m["hook_door"], bool):
+        p.append("hook_door: true or false (signed calls from programs on this computer, through Control's hook door)")
     ui = m.get("ui")
     if ui is not None:
         tab = ui.get("tab") if isinstance(ui, dict) else None
@@ -275,9 +287,29 @@ def verify_manifest(m, pubkeys=None):
     except (ValueError, TypeError):
         sig = b""
     import pxa_encode_pkg as PK
-    if len(sig) != 64 or not PK.ed25519_verify(bytes.fromhex(hexkey), MANIFEST_PREFIX + canonical(body), sig):
+    msg = MANIFEST_PREFIX + canonical(body)
+    if len(sig) != 64 or not PK.ed25519_verify(bytes.fromhex(hexkey), msg, sig):
         raise PluginError("the plugin's signature does not verify", "bad_signature")
+    if not pinned_ok(hexkey, msg):
+        raise PluginError("signed with a retired PXA key and not one of the plugins published under it; get the current "
+                          "version from the Store", "retired_key")
     return m
+
+
+def manifest_digest(m):
+    """sha256 hex of the bytes a manifest's signature covers (what PLUGIN_PINNED lists)."""
+    import hashlib
+    return hashlib.sha256(MANIFEST_PREFIX + canonical({k: v for k, v in m.items() if k != "signature"})).hexdigest()
+
+
+def pinned_ok(hexkey, signed_bytes):
+    """False when `hexkey` is a retired plugin key (RETIRED_PLUGIN_KEYS, or any key PLUGIN_PINNED lists) and the signed bytes
+    are not on its pinned list; True for every other key."""
+    import hashlib
+    k = str(hexkey or "").lower()
+    if k not in RETIRED_PLUGIN_KEYS and k not in PLUGIN_PINNED:
+        return True
+    return hashlib.sha256(signed_bytes).hexdigest() in (PLUGIN_PINNED.get(k) or ())
 
 
 def verify_files(m, root):

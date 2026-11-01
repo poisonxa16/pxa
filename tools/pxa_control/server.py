@@ -5,7 +5,17 @@ from .auth import *  # noqa: F401,F403
 from .bridge import *  # noqa: F401,F403
 from .routes import *  # noqa: F401,F403
 import http.client
-import select
+import selectors
+
+
+def _readable(objs, timeout):
+    """The objects in ``objs`` that can be read within ``timeout`` seconds (the readable list select() gave).
+    select() raises ValueError for any file descriptor >= 1024 (FD_SETSIZE), which a busy process reaches;
+    a selector has no such limit. A closed object raises ValueError / OSError, as select() did."""
+    with selectors.DefaultSelector() as sel:
+        for o in objs:
+            sel.register(o, selectors.EVENT_READ)
+        return [key.fileobj for key, ev in sel.select(timeout) if ev & selectors.EVENT_READ]
 
 
 def _tracking_opener(socks):
@@ -152,7 +162,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 + why + "</span>"
                 "<input name=token autocomplete=off style='padding:8px;border-radius:8px;border:1px solid #33363C;"
                 "background:#1D1F23;color:inherit'><button style='padding:8px;border-radius:8px;border:0;"
-                "background:#E08A3C;color:#111214;font-weight:700'>Open</button></form>")
+                "background:#2F5FD0;color:#FFFFFF;font-weight:700'>Open</button></form>")
 
     # ---- routing --------------------------------------------------------------------------
     def do_HEAD(self):
@@ -177,8 +187,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._host_ok():
             return self._send(421, err_body("unexpected Host header", "bad_host", 421))
         if path.startswith("/plugins/"):             # S4: a plugin's OBS overlay; its own key, loopback peers only (plugins/overlay.py)
-            from .plugins import host as _ph, overlay as _pov
-            try:
+            from .plugins import host as _ph, overlay as _pov, hookdoor as _phd
+            hook = _phd.match(path)                  # the hook door: /plugins/<id>/hook/<32 hex>, the trigger's signature is its
+            try:                                     # only credential (plugins/hookdoor.py); never the Origin or token checks below
+                if hook is not None:
+                    return _phd.serve(self, _ph.host_of(self.app), method, *hook)
                 return _pov.serve(self, _ph.host_of(self.app), method, path, query)
             except (BrokenPipeError, ConnectionResetError):
                 return
@@ -311,7 +324,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         conn = self.connection
         while not done.is_set():
             try:
-                ready, _, _ = select.select([conn], [], [], 0.5)
+                ready = _readable([conn], 0.5)
             except (OSError, ValueError):
                 return
             if not ready or done.is_set():
@@ -531,8 +544,8 @@ def open_in_browser(url, wait=False):
 
     def _open():
         try:
-            import webbrowser
-            webbrowser.open(url)
+            from . import childenv      # the system's own libraries for the browser opener (Linux), no console window (Windows)
+            childenv.open_url(url)
         except Exception:       # noqa: BLE001
             pass
     if wait:

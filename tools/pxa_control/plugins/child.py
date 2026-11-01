@@ -12,8 +12,11 @@ Frames: one JSON object per message (multiprocessing.connection length-prefixed 
     {"t": "res", "id": <same>, "status": <http-like int>, ...}
 host -> plugin ops: "health" -> {status 200}; "stop" -> {status 200}, then the plugin exits;
                     "http" {method, path, query, ctype, b64} -> {status, ctype, b64} (a /api/plugins/<id>/* request that
-                    already passed Control's token and Origin checks).
-plugin -> host ops: "hello" {protocol, plugin} (first, within 10 s) -> {status 200, permissions, listen};
+                    already passed Control's token and Origin checks);
+                    "hook" {trigger, ts, sig, ctype, b64} -> {status, ctype, b64} (an outside call from a program on this
+                    computer that passed Control's hook door, POST /plugins/<id>/hook/<trigger>: only the trigger id, the
+                    X-Hive-Time and X-Hive-Sign values and the body cross; the plugin checks the signature, it holds the keys).
+plugin -> host ops: "hello" {protocol, plugin} (first, within 10 s) -> {status 200, permissions, listen, hook_door};
                     "call" {name, args} -> {status 200, result} or {status 403, code permission_denied, error} ...
 Bodies travel as base64 ("b64"). The host never sends Control's token, cookies or other headers.
 """
@@ -162,11 +165,15 @@ class Plugin(object):
             return 200, "application/json", {"ok": True}       # body: dict (JSON), str or bytes
         p = Plugin(handle); p.run()                            # returns when the host says stop or goes away
         p.call("model.chat", {...})                            # from any thread while running -> the host's answer
+
+    on_hook(trigger, ts, sig, ctype, body) -> (status, ctype, body), the same way: one outside call through Control's hook door
+    (only for a plugin whose manifest says hook_door; without on_hook the op answers 404).
     """
 
-    def __init__(self, handler, on_stop=None):
+    def __init__(self, handler, on_stop=None, on_hook=None):
         self.handler = handler
         self.on_stop = on_stop
+        self.on_hook = on_hook
         self.channel = None
         self.hello = None
         self._stop = threading.Event()
@@ -203,4 +210,12 @@ class Plugin(object):
             if isinstance(body, (dict, list)):
                 body, ctype = json.dumps(body).encode("utf-8"), ctype or "application/json"
             return {"status": int(status), "ctype": ctype or "application/octet-stream", "b64": b64e(body)}
+        if op == "hook":
+            if self.on_hook is None:
+                return {"status": 404, "code": "no_hook"}
+            status, ctype, body = self.on_hook(str(msg.get("trigger") or ""), str(msg.get("ts") or ""), str(msg.get("sig") or ""),
+                                               str(msg.get("ctype") or ""), b64d(msg.get("b64")))
+            if isinstance(body, (dict, list)):
+                body, ctype = json.dumps(body).encode("utf-8"), ctype or "application/json"
+            return {"status": int(status), "ctype": ctype or "application/json", "b64": b64e(body)}
         return {"status": 404, "code": "unknown_op"}

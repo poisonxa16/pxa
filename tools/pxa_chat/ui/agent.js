@@ -598,8 +598,8 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
   function stopPoll() { if (A.poll) clearInterval(A.poll); A.poll = null; }
   async function loadServers(force) {
     let d;
-    try { d = await api("/api/chat/servers", {timeout: 15000}); } catch (e) { if (force) toast(e.message, true); return; }
-    A.servers = d.servers; A.search = d.search;
+    try { d = await api("/api/chat/servers", {timeout: 15000}); } catch (e) { if (force) toast(e.message, true); renderServerChip(); return; }
+    A.servers = d.servers || []; A.search = d.search;
     if (d.host) { setHost(d.host); renderHost(); }        // the switch is per chat, so it follows the chat
     if (!A.selected || !A.servers.some(s => s.key === A.selected)) A.selected = d.selected;
     const cur = A.servers.find(s => s.key === A.selected), was = A.lastStatus[A.selected];
@@ -612,7 +612,7 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
   function renderServerChip() {
     const cur = A.servers.find(s => s.key === A.selected);
     R.srv.replaceChildren(el("span", {class: "dot " + (cur ? DOT[cur.status] || "" : "bad")}),
-      el("span", {class: "ag-srv-n", text: cur ? cur.name : (A.servers.length ? "Pick a server" : "No server running")}), ico("down", "ag-caret"));
+      el("span", {class: "ag-srv-n", text: (cur && cur.name) || (A.servers.length ? "Pick a server" : "No server")}), ico("down", "ag-caret"));
     R.srv.title = cur ? `${cur.name} · ${cur.status_words} · ${cur.ctx ? cur.ctx.label : ""}` : "Start a model on the Launch tab";
     sendState();
     const w = $("#ag-welcome-srv"); if (w) w.textContent = cur ? `${preset().name} mode · ${cur.name}` : "No model is running yet";

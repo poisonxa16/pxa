@@ -301,6 +301,15 @@ target_link_libraries(test-kv-mask-parity PRIVATE ggml)
 llama_build(test-pxqn-dump-sat.cpp)
 target_link_libraries(test-pxqn-dump-sat PRIVATE ggml)
 llama_test(test-pxqn-dump-sat)
+# 4.0.1 security (review M2): the PXQN loader never loads a library planted in the current folder (Windows: nor on
+# %PATH%). The stand-in library writes a marker file when loaded; it is built into tests/plant/, never next to libggml.
+add_library(test-pxqn-plant-lib SHARED pxqn-plant-lib.c)
+set_target_properties(test-pxqn-plant-lib PROPERTIES OUTPUT_NAME pxqn-plant
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/plant LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/plant)
+llama_build(test-pxqn-loader-plant.cpp)
+target_link_libraries(test-pxqn-loader-plant PRIVATE ggml)
+add_dependencies(test-pxqn-loader-plant test-pxqn-plant-lib)
+llama_test(test-pxqn-loader-plant ARGS $<TARGET_FILE:test-pxqn-plant-lib>)
 llama_build(test-gallocr-leaf-reuse.cpp)
 target_link_libraries(test-gallocr-leaf-reuse PRIVATE ggml)
 llama_test(test-gallocr-leaf-reuse)
@@ -448,6 +457,9 @@ llama_test(test-mtp-cache-only)
 # watchdog's stretched limit while the driver JIT-compiles kernels. Header-only, no GPU.
 llama_build(test-pxa-jit-wedge.cpp)
 llama_test(test-pxa-jit-wedge)
+# 4.0.1 security (review L13): the startup warning for a non-loopback bind with no API key. Header-only, no network.
+llama_build(test-pxa-lan-nudge.cpp)
+llama_test(test-pxa-lan-nudge)
 # PXA_TOPK_RAW shadow-compare harness (CPU only, takes a tiny gguf)
 llama_build(test-topk-raw-shadow.cpp)
 
@@ -555,6 +567,11 @@ if (PXA_PYTHON3)
                  COMMAND ${CMAKE_COMMAND} -E env PXA_LLAMA_SERVER=$<TARGET_FILE:llama-server> CUDA_VISIBLE_DEVICES=
                          ${PXA_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/mtp-init-fallback-tiny-test.sh 18796)
         set_tests_properties(test-mtp-init-fallback PROPERTIES TIMEOUT 600)
+        # 4.0.1 security (review L1): --dump-mtp-embd creates its directory without a shell
+        add_test(NAME test-mtp-dump-dir-noshell
+                 COMMAND ${CMAKE_COMMAND} -E env PXA_LLAMA_SERVER=$<TARGET_FILE:llama-server> CUDA_VISIBLE_DEVICES=
+                         ${PXA_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/mtp-dump-dir-noshell-test.sh 18797)
+        set_tests_properties(test-mtp-dump-dir-noshell PROPERTIES TIMEOUT 300)
     endif()
     # install.sh step 2: the GPU check accepts every arch the release builds carry (sm_60/61/70/75)
     if (NOT WIN32)
@@ -688,6 +705,10 @@ llama_test(test-pxa-place-ctx-guard)
 llama_build(test-pxa-xcache-ring-lend.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/llama-pxa-place.cpp)
 target_include_directories(test-pxa-xcache-ring-lend PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_test(test-pxa-xcache-ring-lend)
+# PXA_XCACHE_PREFILL_FREEZE: the adaptor's adapt-or-freeze decision per batch width. Pure header: no model, no GPU.
+llama_build(test-pxa-xcache-prefill-freeze.cpp)
+target_include_directories(test-pxa-xcache-prefill-freeze PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+llama_test(test-pxa-xcache-prefill-freeze)
 # R3d PXA_MTP_RESERVE_RECOMPUTE: the MTP chain reserve priced per step (unchanged) and as replay rollback
 llama_build(test-pxa-mtp-reserve-recompute.cpp)
 target_include_directories(test-pxa-mtp-reserve-recompute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -764,6 +785,14 @@ if (PXA_PYTHON3)
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-control-package.py)
 endif()
 
+# 4.0.1: what every program PXA Control starts inherits (tools/pxa_control/childenv.py): no console window on Windows for
+# any child (every spawn site goes through subprocess.Popen), no package libraries on LD_LIBRARY_PATH for system programs
+# on Linux (the browser opener died on GCC 14 distributions); the pxa-launch / run-server.sh wrappers run on a stub package.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-control-childenv
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-control-childenv.py)
+endif()
+
 # PXA Control, bug #373: load progress from the server child's /proc/<pid>/io (bytes, rate, percent/ETA against the device
 # buffer sizes), "silent" = no log output AND no read progress, the slow-disk hint. Fake /proc reader, no GPU.
 if (PXA_PYTHON3)
@@ -818,6 +847,17 @@ if (PXA_PYTHON3)
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-control-store-verify.py)
 endif()
 
+# F223 (RC3.6): the Plugins page folds a hard-locked or corrupt grants cache into the "Finish this yourself" banner
+# (tools/pxa_plugins/ui/store.js lock*, plugins.js lockBanner, GET /api/plugins/entitlements): plain reason, Done / Cancel,
+# a relink line for not_linked, no Open window and no chat link. node + real GrantCache.view() + headless Chromium.
+# EXCLUDED by default (option A): Control's Plugins/Store UI is tools/pxa_control (beta 6); tools/pxa_plugins lands
+# as a library, not wired into Control, so this test's pxa_plugins/ui page is not served. Follow-up: port the F223 lock
+# banner into tools/pxa_control_ui/plugins.js + store.js and re-enable this test against that UI (file kept).
+if (PXA_PYTHON3 AND PXA_TEST_PLUGINS_UI_F223 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-pxa-control-store-ui.py)  # closed test (pxa-closed-files.txt)
+    add_test(NAME test-pxa-control-store-ui
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-control-store-ui.py)
+endif()
+
 # PXA Control's Profiles backend (tools/pxa_ctl): validation, clamping, apply + verify + rollback, undo and the safety
 # watch, the auto-start supervisor, schedules, lock files / reserved cards, Benchmark mode, the /api/gpu routes and the
 # resolved-context helpers. The mock adapter only: no GPU, no nvidia-smi, loopback only.
@@ -860,6 +900,9 @@ endif()
 if (PXA_PYTHON3)
     add_test(NAME test-pxa-chat
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-chat.py)
+    # the chat in a tree without the in-house agent (tools/anibal closed): export-shaped copy of tools/, one turn, 503 agent routes
+    add_test(NAME test-pxa-chat-no-agent
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-chat-no-agent.py)
 endif()
 
 # What a release stages must be import-complete: every sibling module a shipped PXA Control tool imports has to be
@@ -886,6 +929,14 @@ endif()
 if (PXA_PYTHON3)
     add_test(NAME test-pxa-encode
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-encode.py)
+endif()
+
+# 4.0.1 key rotation 2026-10b (tests/test-pxa-dual-trust-kids.py): packages, engine/library updates, beta file lists, plugins and
+# grants trust the old and the new kid; for the two LOADED-code keys (package, plugin) the old key only vouches for the pinned
+# artifacts already published under it; an unknown kid is refused; the shipped lists hold exactly the rotation's public keys.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-dual-trust-kids
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-dual-trust-kids.py)
 endif()
 
 # The licensed PXQN library as its own updatable artifact (tools/pxa_lib_update.py, driven by `pxa-update lib`): the signed
@@ -947,6 +998,20 @@ if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-pxqn-overdrive.cpp AND PXA_PXQN_CLOS
     llama_build(test-pxqn-overdrive.cpp)
     add_dependencies(test-pxqn-overdrive ggml-pxqn)
     llama_test(test-pxqn-overdrive)
+endif()
+
+# 4.0.1 key rotation 2026-10b: the lock library trusts a kid-picked LIST of lock-signing keys (old + new kid): a new-kid token and
+# old-kid data verify, an unknown kid or the other kid's key never does, and both release recipes carry exactly the old + new kid.
+# Includes pxqn-lock.cpp, signs through libcrypto (dlopen; SKIP 77 without it). CPU only, closed tree only.
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-pxqn-lock-kids.cpp AND PXA_PXQN_CLOSED_SRC AND NOT WIN32)
+    find_package(Threads REQUIRED)
+    add_executable(test-pxqn-lock-kids test-pxqn-lock-kids.cpp)
+    target_include_directories(test-pxqn-lock-kids PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_features(test-pxqn-lock-kids PRIVATE cxx_std_17)
+    target_link_libraries(test-pxqn-lock-kids PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+    add_test(NAME test-pxqn-lock-kids COMMAND $<TARGET_FILE:test-pxqn-lock-kids>
+             ${PROJECT_SOURCE_DIR}/scripts/make-release-tarball.sh ${PROJECT_SOURCE_DIR}/scripts/windows/windows-release-build.bat)
+    set_tests_properties(test-pxqn-lock-kids PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # PXA_XCACHE_CPUPOOL_TASK_BARRIER: the cold-expert CPU pool's job/phase scheduler (ggml/src/pxqn-cpupool-sched.h, header-only):
@@ -1040,8 +1105,11 @@ if (PXA_PXQN_CLOSED_SRC AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench-xcache-lane
     add_test(NAME test-xcache-lane-flow-1tok COMMAND bench-xcache-lane -check -rix -t 3 -steps 24 -ntok 1 -distinct 4)
     # a step wider than PXA_PXQN_RIX_MAXW gives the RIX=0 bytes on the pool's threads too (no mixed bits)
     add_test(NAME test-xcache-lane-rix-maxw COMMAND bench-xcache-lane -check-maxw -rix -t 4 -steps 12 -ntok 4 -distinct 7)
+    # PXA_XCACHE_CPUPOOL_NOZERO: the flow step skips the dead non-cold row zero-fills; the cold rows (all the card reads) stay bit-exact
+    add_test(NAME test-xcache-lane-nozero COMMAND bench-xcache-lane -check -rix -t 4 -steps 24 -ntok 4 -distinct 7)
+    set_tests_properties(test-xcache-lane-nozero PROPERTIES ENVIRONMENT "PXA_XCACHE_CPUPOOL_NOZERO=1")
     set_tests_properties(test-xcache-lane-flow test-xcache-lane-flow-rix test-xcache-lane-flow-1tok test-xcache-lane-rix-maxw
-                         PROPERTIES SKIP_RETURN_CODE 77)
+                         test-xcache-lane-nozero PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # PXA_PXQ_MMQ80: the sm_80+ PXQ4 / PXQN4 prefill GEMM route against its own arithmetic contract (CPU double reference,
@@ -1234,6 +1302,8 @@ llama_build(test-dsv41-load.cpp)
 target_include_directories(test-dsv41-load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 if (PXA_PYTHON3 AND _pxa_tiny_np EQUAL 0)
     add_test(NAME test-dsv41-load COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-dsv41-load.sh $<TARGET_FILE:test-dsv41-load>)
+    # 4.0.1 security (review L4): zero / non-dividing Mamba-2 sizes and a wrapped nextn_predict_layers fail the load
+    add_test(NAME test-hparams-hostile COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-hparams-hostile.sh $<TARGET_FILE:test-dsv41-load>)
 endif()
 
 # DeepSeek-V4.1 chat template (todo dsv41-bringup, D2): models/templates/deepseek-ai-DeepSeek-V4.1.jinja must render the
@@ -1825,6 +1895,11 @@ set_tests_properties(test-spec-block-verify PROPERTIES TIMEOUT 1800) # 67-258 s 
 # chain's gating order (TV < 1e-5) and chi-square at N = 1e6, plus the planted old gate. CPU only.
 llama_build(test-spec-sampled-gate.cpp)
 llama_test(test-spec-sampled-gate)
+llama_build(test-pxa-mtp-first-gate.cpp)
+llama_test(test-pxa-mtp-first-gate)
+# PXA_MTP_STREAK (common/pxa-mtp-streak.h, Overdrive 2.0 B8): streak-gated chain extension, pure, no model.
+llama_build(test-pxa-mtp-streak.cpp)
+llama_test(test-pxa-mtp-streak)
 
 # PXA_SPEC_STAGE_ORDER_v1: a table stage typed after the MTP / draft-model stage is moved in front of it (the reverse spelling
 # was refused); =0 keeps the typed order. Parameter logic only, CPU.

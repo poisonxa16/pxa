@@ -13,11 +13,21 @@ Stream rules (edge cases in the harness catalogue, ids in brackets):
 import http.client
 import json
 import re
-import select
+import selectors
 import socket
 import threading
 import time
 import urllib.parse
+
+
+def _readable(objs, timeout):
+    """The objects in ``objs`` that can be read within ``timeout`` seconds (the readable list select() gave).
+    select() raises ValueError for any file descriptor >= 1024 (FD_SETSIZE), which a busy process reaches;
+    a selector has no such limit. A closed object raises ValueError / OSError, as select() did."""
+    with selectors.DefaultSelector() as sel:
+        for o in objs:
+            sel.register(o, selectors.EVENT_READ)
+        return [key.fileobj for key, ev in sel.select(timeout) if ev & selectors.EVENT_READ]
 
 
 class OAIError(Exception):
@@ -159,7 +169,7 @@ class Stream(object):
         last = t0
         while True:
             try:
-                ready, _, _ = select.select([sock], [], [], 0.5)
+                ready = _readable([sock], 0.5)
             except (OSError, ValueError):
                 return                      # socket gone: getresponse() reports it
             if ready or self.cancelled:

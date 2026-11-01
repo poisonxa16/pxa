@@ -22,3 +22,36 @@ compile_commands.json
 Dockerfile
 
 **/*.md
+# plugin platform: DEV-ONLY signing seeds and the licence-server side never ship
+tools/pxa_plugins/keys/*.DEV-ONLY.seed
+tools/pxa_plugins/fake_licd.py
+tools/pxa_plugins/licd_admin.py
+# the Chat tab's in-house agent binding needs PXA Anibal, which never ships; Chat answers 503 agent_unavailable without it
+tools/pxa_chat/vigil_bind.py
+**/__pycache__
+# test code never ships in the runtime image (guard: tools/anibal/test_image_no_tests.py). Scoped to the trees the
+# runtime stage COPYs from the context, so the build stage still sees the rest of the source tree.
+tools/pxa_control_ui/**/test_*.py
+tools/pxa_control/**/test_*.py
+tools/pxa_ctl/**/test_*.py
+tools/pxa_chat/**/test_*.py
+tools/pxa_plugins/**/test_*.py
+gguf-py/gguf/**/test_*.py
+tools/pxa_control_ui/**/*_test.py
+tools/pxa_control/**/*_test.py
+tools/pxa_ctl/**/*_test.py
+tools/pxa_chat/**/*_test.py
+tools/pxa_plugins/**/*_test.py
+gguf-py/gguf/**/*_test.py
+tools/pxa_control_ui/**/conftest.py
+tools/pxa_control/**/conftest.py
+tools/pxa_ctl/**/conftest.py
+tools/pxa_chat/**/conftest.py
+tools/pxa_plugins/**/conftest.py
+gguf-py/gguf/**/conftest.py
+tools/pxa_control_ui/**/tests
+tools/pxa_control/**/tests
+tools/pxa_ctl/**/tests
+tools/pxa_chat/**/tests
+tools/pxa_plugins/**/tests
+gguf-py/gguf/**/tests

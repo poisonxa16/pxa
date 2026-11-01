@@ -62,9 +62,20 @@ static const struct ggml_pxqn_lib_api * pxqn_load(void) {
             h = pxqn_try_open(tried, err);
         }
         if (!h) {
+#if defined(_WIN32)
+            // Windows: never the bare name (LoadLibrary would search the current folder and %PATH%: a planted DLL
+            // runs its DllMain before the ABI check below). Only the executable's own folder, by full path.
+            std::string err2, exe_dir;
+            if (pxa_dl_exe_dir(exe_dir) && exe_dir + "/" GGML_PXQN_LIB_NAME != tried) {
+                tried = exe_dir + "/" GGML_PXQN_LIB_NAME;
+                h = pxqn_try_open(tried, err2);
+                if (!h && err.empty()) err = err2;
+            }
+#else
             std::string err2;
             h = pxqn_try_open(GGML_PXQN_LIB_NAME, err2);
             if (!h && err.empty()) err = err2;
+#endif
         }
     }
     if (!h) {

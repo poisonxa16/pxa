@@ -12,7 +12,7 @@
 </p>
 
 ```bash
-tar xzf pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v4.0    # 1. unpack the release tarball
+tar xzf pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v4.0.1    # 1. unpack the release tarball
 ./pxa                                                                  # 2. PXA Control opens in your browser
 # 3. pick your cards, pick a model, press Start.  No browser? Run ./pxa --tui for the same steps in the terminal.
 ```
@@ -153,8 +153,8 @@ The converter's Python packages are not in the tarball. Install them once:
 
 | Platform | Download | What you get |
 |---|---|---|
-| Linux x86_64 (glibc 2.35+, NVIDIA driver 570+) | the tarball, `pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` | The engine and PXA Control. Steps below. |
-| Docker (Linux, NVIDIA runtime) | `docker pull ghcr.io/poisonxa16/pxa:v4.0` | The same binaries as the tarball. Steps below. |
+| Linux x86_64 (glibc 2.35+, NVIDIA driver 570+) | the tarball, `pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` | The engine and PXA Control. Steps below. |
+| Docker (Linux, NVIDIA runtime) | `docker pull ghcr.io/poisonxa16/pxa:v4.0.1` | The same binaries as the tarball. Steps below. |
 | Windows x64 | `pxa-control-win64.exe` and `pxa-engine-win64-cuda12.zip` (unsigned: SmartScreen asks once) | PXA Control and the engine. [Windows steps](docs/install.md#windows). |
 | macOS (Intel and Apple silicon) | the PXA Control zip (unsigned: Gatekeeper asks once) | PXA Control only, for a rig on your network. [Mac steps](docs/install.md#macos). |
 | Android | in testing, not a 4.0 download | A remote window onto a Control on your network. |
@@ -164,8 +164,8 @@ Check each download against the sha256 on the release page before you use it. Th
 **Tarball.** Download it from the [release page](https://github.com/poisonxa16/pxa/releases/latest). Then:
 
 ```bash
-tar xzf pxa-v4.0-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
-cd pxa-v4.0
+tar xzf pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+cd pxa-v4.0.1
 ./pxa --doctor                 # checks your cards, driver and CPU; starts nothing
 ./pxa                          # opens PXA Control in your browser
 ```
@@ -189,13 +189,13 @@ Add `--host 0.0.0.0` to reach it from another machine. `START-HERE.md` in the ta
 `curl -fsSL https://raw.githubusercontent.com/poisonxa16/pxa/main/install.sh | bash`
 Add `-s -- --docker` after `bash` to pull the container image instead.
 
-**Container.** `ghcr.io/poisonxa16/pxa:v4.0` carries the same binaries. Models are not in the image. Mount a folder at `/models`. The tag `latest` moves only with the public release; `v4.0` stays fixed.
+**Container.** `ghcr.io/poisonxa16/pxa:v4.0.1` carries the same binaries. Models are not in the image. Mount a folder at `/models`. The tag `latest` moves only with the public release; `v4.0.1` stays fixed.
 
 ```bash
 docker run -d --name pxa --gpus '"device=0,1"' --shm-size=1g -p 8080:8080 \
     -v /path/to/models:/models:ro \
     -v pxa-cache:/work/.cache/pxa -e PXA_CACHE_DIR=/work/.cache/pxa \
-    ghcr.io/poisonxa16/pxa:v4.0
+    ghcr.io/poisonxa16/pxa:v4.0.1
 ```
 
 The `pxa-cache` volume is where a session's learned expert counts are kept. Without that mount they are deleted when the container is removed. If the directory is missing or not writable, the server log says so.
@@ -290,7 +290,7 @@ Valued Supporters can also opt in to the beta channel from the update window, to
 
 **Why is my output different from the last version?** The 4.0 kernels add up numbers in a different order in some places. That moves the last digits of the probabilities. When two words are almost tied, the winner can flip, and the text goes another way from there. This is not a quality drop. If you keep hashes of outputs, make new ones. The release notes list where the 4.0 text is not bit-identical to 3.1. Speculation can also change near-ties compared with plain decode. The engine keeps the model's own choice, but the arithmetic is not identical.
 
-**What did the engine pick for my cards?** Run `./pxa --doctor`. It lists your cards, the driver, the model file and the settings the engine would pick, with the reason for each. Starts nothing. In a container: `docker run --rm --gpus all -v /path/to/models:/models:ro ghcr.io/poisonxa16/pxa:v4.0 doctor -m /models/your-model.gguf`.
+**What did the engine pick for my cards?** Run `./pxa --doctor`. It lists your cards, the driver, the model file and the settings the engine would pick, with the reason for each. Starts nothing. In a container: `docker run --rm --gpus all -v /path/to/models:/models:ro ghcr.io/poisonxa16/pxa:v4.0.1 doctor -m /models/your-model.gguf`.
 
 **It says a model is locked.** The file was encoded with Pro and locked. Paste your key into the key field on the Encode tab in PXA Control, or set `PXA_LICENCE_KEY`. Supporters get their key from the PXA Network Discord with `/key` (the same key `/encoder` gives); a [Ko-fi membership](https://ko-fi.com/shatteredrealms1) is what unlocks the Supporter role that comes with it.
 

@@ -3617,6 +3617,9 @@ class ControlFirst(unittest.TestCase):
                      ["--no-control"], ["--no-tui"], ["--port", "8081"], ["--yes"], ["--selftest"]):
             self.assertFalse(bare(*argv), argv)
 
+    @unittest.skipIf(L.container_kind() is not None,
+                     "inside a container the launcher reports 'off (inside a container ...)' before the "
+                     "not-a-terminal rule this test checks; run it on a bare host")
     def test_launcher_decision_and_off_paths(self):
         a = self.ns("--no-control")
         self.assertEqual(L.control_decision(a, tty=True), (False, None))

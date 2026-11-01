@@ -228,6 +228,16 @@ struct llama_model::pxa_xc_adaptor {
     std::vector<ggml_pxqn_xc_swap> rt_out;
     int32_t rt_nout = 0;
     uint64_t n_rt_jobs = 0, n_rt_skip = 0, n_rt_stale = 0;
+    // PXA_XCACHE_SWAP_DUMMY (diagnostic, default off; od-b5 (e) swap-cost split, 2026-10-29): every planned swap moves its
+    // bytes exactly like a real one (the evict: file read or hot -> free cold slot; the admit: that cold slot -> the hot slot over the
+    // link) but the map never flips: the admit writes the evicted expert's own bytes back over themselves, so no routing, map upload
+    // or hit rate changes and the answer stays bit-identical. Real-swap cost = copies (this arm vs SWAP_CAP small) + map flips/routing.
+    // The plan keeps proposing the same swaps (its snapshot never moves), so this is the copy cost at the full cap.
+    bool swap_dummy = env_int("PXA_XCACHE_SWAP_DUMMY", 0) != 0;
+    uint64_t n_dummy = 0;
+    // PXA_XCACHE_PREFILL_FREEZE (llama-pxa-xcache.h): after a batch wider than freeze.maxw no flip and no swap start
+    llama_pxa_xc_freeze freeze;
+    uint64_t n_frozen_ticks = 0, n_frozen_drop = 0;
 
     // ---- PXA_XCACHE_EVICT_FILE: evict = a host read of the expert's bytes from the model file into the free cold slot -------------
     // (an IO thread; the link carries only the admit). Every slot holds the file's raw bytes (pxa_xc_fill copies slices; swaps copy
@@ -409,6 +419,12 @@ struct llama_model::pxa_xc_adaptor {
         }
         if (adapt && env_int("PXA_XCACHE_RTIER", 0) != 0) rt_start();
         if (adapt && env_int("PXA_XCACHE_EVICT_FILE", 0) != 0) io_start();
+        freeze = llama_pxa_xc_freeze_parse(getenv("PXA_XCACHE_PREFILL_FREEZE"), getenv("PXA_XCACHE_DECODE_MAXW"), rtier);
+        if (adapt && freeze.on) {
+            LLAMA_LOG_INFO("PXA_XCACHE: prefill freeze on: only a batch of <= %d tokens (decode, MTP verify) moves experts; after a wider "
+                    "one (a prefill ubatch) no map flips and no swap starts, its routing is only observed (PXA_XCACHE_PREFILL_FREEZE=0 off, "
+                    "PXA_XCACHE_DECODE_MAXW sets the width)\n", freeze.maxw);
+        }
         LLAMA_LOG_INFO("PXA_XCACHE: online adaptation %s: %zu split layers, %zu free cold slots, re-rank every %d decodes, link %.2f GB/s, %s schedule, swap payback %s\n",
                 adapt ? "ON" : "observing only", L.size(), any_spare, obs_every, pcie_gbs, det ? "deterministic" : "copy-completion",
                 cpu_use > 0 ? "on" : "off");
@@ -472,8 +488,17 @@ struct llama_model::pxa_xc_adaptor {
                     // nothing yet; in phase 1 e_out already lives in its cold slot and the hot slot stays vacant, e_in keeps its
                     // cold slot, so every expert still has exactly one valid home
                     broken = true;
-                    if (o.phase == 0) l.spare.push_back(o.c_free);
+                    if (o.phase == 0 || swap_dummy) l.spare.push_back(o.c_free);   // a dummy never moved e_out out of its hot slot
                     l.busy[o.e_in] = l.busy[o.e_out] = 0;
+                    keep = false;
+                } else if (swap_dummy && o.phase == 0) {
+                    o.phase = 1;                           // PXA_XCACHE_SWAP_DUMMY: no map change; the admit copy goes out below
+                    o.due = tick + (det ? delay : 1);
+                    to_issue.push_back(w);
+                } else if (swap_dummy) {
+                    l.spare.push_back(o.c_free);           // the copy of e_out landed on its own hot slot (same bytes): just free up
+                    l.busy[o.e_in] = l.busy[o.e_out] = 0;
+                    ++n_dummy;
                     keep = false;
                 } else if (o.phase == 0) {
                     // the evicted expert's bytes are in the free cold slot: from now on it is served by the cold path and its hot
@@ -506,7 +531,7 @@ struct llama_model::pxa_xc_adaptor {
         for (size_t idx : to_issue) {
             op & o = ops[idx];
             lay & l = L[o.li];
-            if (copy_slot(l, true, o.s, o.c_in)) o.ev = ggml_backend_cuda_xcache_event_record(l.dev);
+            if (copy_slot(l, true, o.s, swap_dummy ? o.c_free : o.c_in)) o.ev = ggml_backend_cuda_xcache_event_record(l.dev);
             else o.ev = nullptr;     // picked up as a failed copy at its due tick
         }
     }
@@ -663,18 +688,24 @@ struct llama_model::pxa_xc_adaptor {
     }
 
     // decode thread, every tick: start the swaps the planner finished, then hand it the next observation when one is due
-    void rt_tick(uint32_t n_tok_obs, bool due) {
+    // frozen (PXA_XCACHE_PREFILL_FREEZE): the batch that just completed was a prefill ubatch: a plan the planner finished is dropped
+    // (nothing starts on the prefill path; the prompt's own observation below re-plans, and the first decode tick starts that plan)
+    void rt_tick(uint32_t n_tok_obs, bool due, bool frozen) {
         bool idle;
         {
             std::lock_guard<std::mutex> lk(rt_mu);
             if (rt_done) {
                 rt_done = false;
-                n_planned += rt_nout > 0 ? rt_nout : 0;
                 ++n_obs;
-                for (int32_t k = 0; k < rt_nout; ++k) {
-                    const size_t before = ops.size();
-                    start_swap(rt_out[k]);
-                    if (ops.size() == before) ++n_rt_stale;       // the map moved since the snapshot: skipped
+                if (frozen) {
+                    n_frozen_drop += rt_nout > 0 ? rt_nout : 0;
+                } else {
+                    n_planned += rt_nout > 0 ? rt_nout : 0;
+                    for (int32_t k = 0; k < rt_nout; ++k) {
+                        const size_t before = ops.size();
+                        start_swap(rt_out[k]);
+                        if (ops.size() == before) ++n_rt_stale;       // the map moved since the snapshot: skipped
+                    }
                 }
                 rt_nout = 0;
                 // the planner is idle here (it only sets rt_done on its way back to waiting): safe to read the policy's stats
@@ -867,7 +898,8 @@ struct llama_model::pxa_xc_adaptor {
         }
     }
 
-    void observe_and_plan() {
+    // plan_ok false (PXA_XCACHE_PREFILL_FREEZE, after a prefill ubatch): the policy observes the routing, nothing is planned or started
+    void observe_and_plan(bool plan_ok = true) {
         if (!read_counters()) return;
         for (size_t i = 0; i < L.size(); ++i) {
             const uint32_t * b = stage + L[i].stage_off;
@@ -893,7 +925,7 @@ struct llama_model::pxa_xc_adaptor {
         ticks_since_obs = 0;
         if (!pst) { maybe_persist(); return; }
         pol->observe(pst, n_tok, obs.data());
-        if (!adapt || broken || held()) { maybe_persist(); return; }
+        if (!adapt || broken || !plan_ok || held()) { maybe_persist(); return; }
         size_t eb_sum = 0;
         for (size_t i = 0; i < L.size(); ++i) {
             views[i].map     = L[i].map.data();
@@ -1075,9 +1107,12 @@ struct llama_model::pxa_xc_adaptor {
                 tag, (unsigned long long) n_resets, (unsigned long long) n_undone, us_reset/1000.0);
         if (n_skip_ticks) LLAMA_LOG_INFO("PXA_XCACHE%s: skipped %llu companion ticks (their tokens still count toward the swap budget)\n",
                 tag, (unsigned long long) n_skip_ticks);
+        if (n_frozen_ticks) LLAMA_LOG_INFO("PXA_XCACHE%s: %llu prefill ubatches (> %d tokens) ran on frozen residency, %llu planned swaps dropped "
+                "there (PXA_XCACHE_PREFILL_FREEZE)\n", tag, (unsigned long long) n_frozen_ticks, freeze.maxw, (unsigned long long) n_frozen_drop);
         if (rtier) LLAMA_LOG_INFO("PXA_XCACHE_RTIER%s: %llu planner jobs, %llu observations skipped (planner busy), %llu planned swaps stale at start, "
                 "planner %.0f us per job (off the decode thread), cap %d swaps per decode\n", tag, (unsigned long long) n_rt_jobs,
                 (unsigned long long) n_rt_skip, (unsigned long long) n_rt_stale, n_rt_jobs ? (double) us_rt_worker/(double) n_rt_jobs : 0.0, swap_cap);
+        if (swap_dummy) LLAMA_LOG_INFO("PXA_XCACHE_SWAP_DUMMY%s: %llu dummy swaps (bytes moved, map never flipped)\n", tag, (unsigned long long) n_dummy);
         if (evict_file) LLAMA_LOG_INFO("PXA_XCACHE_EVICT_FILE%s: %llu evicts read from the model file (%llu failed), %.0f us per read (IO thread), 0 evict bytes on the link\n",
                 tag, (unsigned long long) n_ef, (unsigned long long) n_ef_fail.load(),
                 n_ef_done.load() ? (double) us_ef.load()/(double) n_ef_done.load() : 0.0);
@@ -1162,12 +1197,16 @@ struct llama_model::pxa_xc_adaptor {
         const int64_t t0 = ggml_time_us();
         ++tick;
         if (trace) trace_tick(n_tokens);
-        if (adapt) apply_due();
+        // PXA_XCACHE_PREFILL_FREEZE: after a prefill ubatch the residency stays as it is (no flip, no swap start); a swap in flight
+        // keeps its slots (nothing points at a slot being written) and is applied at the next decode tick
+        const bool frozen = adapt && llama_pxa_xc_frozen(freeze, n_tokens);
+        if (frozen) ++n_frozen_ticks;
+        if (adapt && !frozen) apply_due();
         tokens_since_obs += (uint32_t) std::max(n_tokens, 0);
         ++ticks_since_obs;
         if (rtier) {
             const bool due = ticks_since_obs >= obs_every || n_tokens >= 32;
-            rt_tick(tokens_since_obs, due);
+            rt_tick(tokens_since_obs, due, frozen);
             us_tick += ggml_time_us() - t0;
             ++n_ticks;
             return;
@@ -1175,7 +1214,7 @@ struct llama_model::pxa_xc_adaptor {
         // a prefill-sized decode is an observation of its own: its routing is the prompt's, which is what the answer will use
         if (ticks_since_obs >= obs_every || n_tokens >= 32) {
             const int64_t t1 = ggml_time_us();
-            observe_and_plan();
+            observe_and_plan(!frozen);
             us_obs += ggml_time_us() - t1;
             if (log_every > 0 && n_obs % (uint64_t) log_every == 0) stats_line("");
         }

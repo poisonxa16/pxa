@@ -80,6 +80,8 @@ def lines(m, rec=None):
             g, ic, rc = "Network", "globe", ("out" if " your home network " in " %s " % words else "local")
         elif key == "overlay":
             g, ic, rc = "Your devices", "live", "local"
+        elif key == "hook_door":                    # programs on this computer only (plugins/hookdoor.py), off until the user's switch
+            g, ic, rc = "PXA", "plug", "local"
         else:
             g, ic, rc = "PXA", "shield", "local"
         out.append({"key": key, "words": words, "group": g, "icon": ic, "reach": rc, "tag": REACH_WORDS[rc],
@@ -195,6 +197,8 @@ def cards(h, app, catalog=None, fresh=False):
         row["store"] = _store_row(cat, m, pid in off)
         row["listens"] = bool(m.get("listen"))
         row["keys"] = len(h.keys.names(pid)) if getattr(h, "keys", None) else 0     # S4: how many keys it keeps (a count, never a name or value)
+        if getattr(h, "door", None) is not None:                         # the hook door's switch: {declared, on} (POST .../host/hookdoor)
+            row["hook_door"] = h.hook_door_view(pid, m)
         if {"speech.listen", "speech.speak"} & set(m.get("permissions") or []):
             speech_by.append(row["name"])
         rows.append(row)

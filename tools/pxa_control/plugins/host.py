@@ -25,6 +25,9 @@
   (loopback peers only, the plugin feeds it with overlay.* calls); secrets.* keep a plugin's sign-in keys in Control's key store
   (by name, never in plugin files); `net.internet:<host>` plugins get their own CONNECT-only egress proxy (consented hosts, TLS
   ports, public addresses) and, on Linux when that is their only network, start in a network namespace with no other way out.
+* The hook door (plugins/hookdoor.py): POST /plugins/<id>/hook/<trigger> from a program on this computer reaches a running plugin
+  whose signed manifest says "hook_door": true and whose door the user turned on (default off) as the op "hook" {trigger, ts,
+  sig, ctype, b64} (hook(), next to forward()); the plugin checks the signature. hello says hook_door true only then.
 
 Honest limits (v1): no OS sandbox yet (p-platform's bwrap/landlock ladder, Windows job object): the permissions decide what
 the HOST does for a plugin; first-party signed code is what runs. Windows named-pipe path is written, not yet run on the
@@ -51,6 +54,7 @@ from .. import pyfind
 from . import egress as _egress
 from .keystore import KeyStore, KeyStoreError
 from .overlay import Overlays, OverlayError
+from .hookdoor import Door
 from .child import Channel, ChannelClosed, PROTOCOL, b64d, b64e
 
 HEALTH_S = 15.0
@@ -62,6 +66,8 @@ HELLO_TIMEOUT_S = 10.0
 STOP_GRACE_S = 3.0
 FORWARD_TIMEOUT_S = 60.0
 MAX_RESPONSE = 16 << 20
+HOOK_TIMEOUT_S = 15.0       # the plugin's answer to one outside call (the hook door)
+MAX_HOOK_ANSWER = 64 << 10
 TICK_S = 1.0
 WINDOWS = os.name == "nt"
 TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -228,6 +234,7 @@ class PluginHost(object):
         self.egress_opts = dict(egress_opts or {})     # tests only: resolver / public_only / ports for a loopback stand-in
         self.overlays = Overlays(cfg_dir)
         self.keys = KeyStore(cfg_dir)
+        self.door = Door(cfg_dir)                   # the hook door: the user's switch per plugin and the failure limit
         S.on_sync(self._on_sync)
 
     # ---- turned off by the user (Deactivate): autostart skips it until the user turns it on again ----------------
@@ -262,6 +269,7 @@ class PluginHost(object):
         with self._lock:
             self.runs.pop(pid, None)
         self.set_disabled(pid, True)               # a reinstall stays switched off until the user turns it on (review F2)
+        self.door.set_on(pid, False)               # and its hook door stays shut until the user opens it again
         self.audit(pid, "uninstall", by=by)
         return out
 
@@ -625,6 +633,63 @@ class PluginHost(object):
             raise HostError("%s answered too much" % m["name"], "plugin_too_large", 502)
         return status, _ctype(res.get("ctype")), data
 
+    # ---- the hook door (plugins/hookdoor.py) -------------------------------------------------------------------------
+    def hook_serves(self, pid):
+        """the hook door serves this plugin now: it runs, its signed manifest says hook_door, the user turned the door on, and
+        its consent (and, for a supporter plugin, its grant) is in force. The running manifest is the one verified at start."""
+        r = self.runs.get(pid)
+        m = r.manifest if r is not None else None
+        if m is None or r.state != "running" or not self.door.serves(pid, m):
+            return False
+        if self.consent.state(m)["status"] not in ("granted", "partial"):
+            return False
+        if m["edition"] == "supporter" and not gate.run_allowed(self.cfg_dir, m["entitlement"], "plugin", self.cache):
+            return False
+        return True
+
+    def hook(self, pid, trigger, ts, sig, ctype, body):
+        """an outside call the hook door let through -> (status, content-type, bytes). It goes to the plugin as the op "hook"
+        {trigger, ts, sig, ctype, b64}: never the "http" op, never an /api/plugins route, no other header, and never Control's
+        token. The plugin checks the signature (it holds the keys). A plugin that is not running is not started for it."""
+        r = self.runs.get(pid)
+        if r is None or r.state != "running" or r.channel is None or not self.hook_serves(pid):
+            raise HostError("not found", "not_found", 404)
+        m = r.manifest
+        try:
+            res = r.channel.request({"op": "hook", "trigger": str(trigger), "ts": str(ts), "sig": str(sig),
+                                     "ctype": str(ctype or "")[:200], "b64": b64e(body or b"")}, HOOK_TIMEOUT_S)
+        except (ChannelClosed, TimeoutError, AttributeError):
+            raise HostError("%s did not answer" % m["name"], "plugin_unavailable", 502)
+        status = res.get("status")
+        if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 599 or status in (204, 304):
+            status = 502                                   # always a status that carries the body Control sends
+        data = b64d(res.get("b64"))
+        if len(data) > MAX_HOOK_ANSWER:
+            raise HostError("%s answered too much" % m["name"], "plugin_too_large", 502)
+        return status, _ctype(res.get("ctype")), data
+
+    def hook_door_view(self, pid, m=None):
+        """what the Plugins tab shows: does the plugin ask for the door, did the user turn it on."""
+        if m is None:
+            r = self.runs.get(pid)
+            m = r.manifest if r is not None else None
+        return {"declared": bool(m and m.get("hook_door") is True), "on": self.door.is_on(pid)}
+
+    def set_hook_door(self, pid, on, by="page"):
+        """the user's switch (POST /api/plugins/host/hookdoor; never the plugin). Turning it on needs a signed manifest that asks
+        for the door. A running plugin restarts so its hello says the new state; the door itself follows the switch at once."""
+        m, _d = self.manifest(pid)
+        if on and m.get("hook_door") is not True:
+            raise HostError("%s does not take outside calls" % m["name"], "no_hook_door", 409)
+        changed = self.door.set_on(pid, bool(on))
+        if changed:
+            self.audit(pid, "hook_door", on=bool(on), by=by)
+            r = self.runs.get(pid)
+            if r is not None and r.state == "running":
+                self.stop(pid, "hook_door")
+                self.start(pid, by="hook_door")
+        return {"plugin_id": pid, "hook_door": self.hook_door_view(pid, m), "state": self.status_of(pid)["state"]}
+
     def _from_plugin(self, r, msg):
         op = msg.get("op")
         m = r.manifest
@@ -635,7 +700,8 @@ class PluginHost(object):
             r.hello.set()
             return {"status": 200, "protocol": PROTOCOL, "permissions": perms, "listen": self._binds(m, perms),
                     "host_calls": sorted(HOST_CALLS), "overlay": bool(m.get("overlay")),
-                    "egress": ("sealed" if r.sealed else "proxy") if r.egress is not None else None}
+                    "egress": ("sealed" if r.sealed else "proxy") if r.egress is not None else None,
+                    "hook_door": self.door.serves(r.pid, m)}         # true only when the hook door serves this plugin
         if op != "call":
             return {"status": 404, "code": "unknown_op"}
         name = str(msg.get("name") or "")[:64]
@@ -1370,8 +1436,20 @@ def register(ROUTES):
         h.audit(pid, "keys_forgotten", n=len(names))
         return {"plugin_id": pid, "forgotten": len(names)}
 
+    def r_hookdoor(h, app, body, query):
+        """the user's switch for a plugin's hook door {plugin_id, on}: outside calls from programs on this computer. Off by
+        default. Like consent, on --lan only a page on this computer may turn it on (anyone signed in may turn it off)."""
+        pid = pid_of(body)
+        on = body.get("on")
+        if not isinstance(on, bool):
+            raise HostError("on: true or false", "invalid", 400)
+        if on and getattr(app, "lan", False) and not _who_local():
+            raise HostError("outside calls are turned on at the computer itself", "hook_door_local_only", 403)
+        return h.set_hook_door(pid, on)
+
     ROUTES[("POST", "/api/plugins/host/consent/revoke")] = wrap(r_consent_revoke)
     ROUTES[("POST", "/api/plugins/host/keys/forget")] = wrap(r_keys_forget)
+    ROUTES[("POST", "/api/plugins/host/hookdoor")] = wrap(r_hookdoor)
     ROUTES[("GET", "/api/plugins/host/speech")] = wrap(r_speech)
     ROUTES[("POST", "/api/plugins/host/speech/setup")] = wrap(r_speech_setup)
     from . import ui as _ui                    # the Plugins tab: GET .../cards and the sandboxed page .../frame (S3)

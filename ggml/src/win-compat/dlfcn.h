@@ -14,6 +14,20 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <string>
+
+#ifndef LOAD_LIBRARY_SEARCH_APPLICATION_DIR   // Windows 8+ (and 7 with KB2533623); older SDK headers may lack the names
+#define LOAD_LIBRARY_SEARCH_APPLICATION_DIR 0x00000200
+#endif
+#ifndef LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+#define LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR    0x00000100
+#endif
+#ifndef LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+#define LOAD_LIBRARY_SEARCH_DEFAULT_DIRS    0x00001000
+#endif
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32        0x00000800
+#endif
 
 #define RTLD_NOW   2
 #define RTLD_LAZY  1
@@ -32,9 +46,39 @@ static inline void * dlopen(const char * path, int flags) {
         snprintf(p + n - m, sizeof(p) - (n - m), "%s", "ggml-pxqn.dll");
     }
     for (char * c = p; *c; ++c) if (*c == '/') *c = '\\';
-    HMODULE h = LoadLibraryExA(p, NULL, strchr(p, '\\') ? LOAD_WITH_ALTERED_SEARCH_PATH : 0);
+    HMODULE h = NULL;
+    if (!strchr(p, '\\') && !strchr(p, ':')) {
+        // a bare name: the executable's folder and System32 only, never the current folder or %PATH% (DLL planting)
+        h = LoadLibraryExA(p, NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    } else {
+        // a path: made absolute (a relative one is the caller's explicit choice, e.g. PXA_PXQN_LIB; the flags below
+        // need an absolute path: fail closed when it cannot be made one). Its dependencies come from its own folder,
+        // the executable's folder and System32 only, never the current folder or %PATH% (the shipped
+        // ggml-pxqn.dll imports ggml, cudart, cublas and the MSVC runtime: all ship in bin\ beside the exe)
+        char full[2048];
+        const DWORD nf = GetFullPathNameA(p, (DWORD) sizeof(full), full, NULL);
+        if (nf > 0 && nf < sizeof(full)) {
+            snprintf(p, sizeof(p), "%s", full);
+            h = LoadLibraryExA(p, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        } else {
+            SetLastError(ERROR_BAD_PATHNAME);
+        }
+    }
     if (!h) snprintf(pxa_dl_err, sizeof(pxa_dl_err), "LoadLibrary(%s) failed, error %lu", p, (unsigned long) GetLastError());
     return (void *) h;
+}
+
+// the running executable's folder with '/' separators (the loader's fallback location on Windows); 0 on failure
+static inline int pxa_dl_exe_dir(std::string & out) {
+    char fname[2048];
+    const DWORD n = GetModuleFileNameA(NULL, fname, (DWORD) sizeof(fname));
+    if (n == 0 || n >= sizeof(fname)) return 0;
+    for (char * c = fname; *c; ++c) if (*c == '\\') *c = '/';
+    char * sl = strrchr(fname, '/');
+    if (!sl) return 0;
+    *sl = 0;
+    out = fname;
+    return 1;
 }
 
 static inline void * dlsym(void * h, const char * name) {

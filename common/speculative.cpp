@@ -3,6 +3,8 @@
 #include "pxa-mtp-batch-slots.h"
 #include "pxa-mtp-cache-only.h"
 #include "pxa-mtp-kvpos.h"
+#include "pxa-mtp-first-gate.h"
+#include "pxa-mtp-streak.h"
 #include "pxa-spec-verified.h"
 
 #include "common.h"
@@ -732,7 +734,7 @@ static const pxa_mtp_deep_cfg & pxa_mtp_deep() {
     }();
     return c;
 }
-static bool pxa_mtp_ak_track() { return pxa_mtp_adaptive_k_enabled() || pxa_mtp_deep().on; }
+static bool pxa_mtp_ak_track() { return pxa_mtp_adaptive_k_enabled() || pxa_mtp_deep().on || pxa_mtp_streak().on; }
 // returns the chain depth for this cycle and lowers p_min when the chain runs deep
 static int pxa_mtp_deep_apply(float ema, int n_draft, float & p_min) {
     const auto & d = pxa_mtp_deep();
@@ -768,6 +770,13 @@ struct pxa_mtp_stats_t {
     uint64_t trunc_nmax    = 0;   // ran the full n_max chain
     uint64_t trunc_fail    = 0;   // llama_decode / embeddings failure
     uint64_t since_dump    = 0;
+    // PXA_MTP_FIRST_GATE: the first draft token of each cycle by its reported probability (10 buckets
+    // of 0.1): drafted and accepted (verify kept it), and dropped by the gate (no draft that step).
+    uint64_t fp_drafted[10]  = {0};
+    uint64_t fp_accepted[10] = {0};
+    uint64_t fp_gated[10]    = {0};
+    uint64_t gated           = 0;
+    int      fp_pending      = -1;  // bucket of the first token now under verify (-1: none / no prob)
     pxa_mtp_stats_t() {
         on    = getenv("PXA_MTP_STATS") && atoi(getenv("PXA_MTP_STATS")) != 0;
         every = getenv("PXA_MTP_STATS_EVERY") ? std::max(1, atoi(getenv("PXA_MTP_STATS_EVERY"))) : 200;
@@ -807,6 +816,13 @@ static void pxa_mtp_stats_dump(const char * why) {
             (unsigned long long) st.trunc_cached, (unsigned long long) st.trunc_pmin,
             (unsigned long long) st.trunc_nmax,   (unsigned long long) st.trunc_fail,
             p_mean, p_hi);
+    // PXA_MTP_FIRST_GATE: first-token calibration, bucket b = [b/10, (b+1)/10): drafted/accepted/gated
+    std::string fp;
+    for (int b = 0; b < 10; ++b) {
+        fp += (b ? " " : "") + std::to_string(b) + ":" + std::to_string((unsigned long long) st.fp_drafted[b]) + "/" +
+              std::to_string((unsigned long long) st.fp_accepted[b]) + "/" + std::to_string((unsigned long long) st.fp_gated[b]);
+    }
+    LOG_WRN("PXA_MTP_STATS[%s]: first_p drafted/accepted/gated %s | gated=%llu\n", why, fp.c_str(), (unsigned long long) st.gated);
 }
 
 // PXA_MTP_STATS: close one draft cycle. `stop` is 0 cached-token p_min collapse, 1 in-loop p_min
@@ -824,6 +840,7 @@ static void pxa_mtp_stats_record(pxa_mtp_stats_t & st, int64_t t0, size_t n_draf
         case 0:  st.trunc_cached += 1; break;
         case 1:  st.trunc_pmin   += 1; break;
         case 3:  st.trunc_fail   += 1; break;
+        case 4:  st.gated        += 1; break;   // PXA_MTP_FIRST_GATE: no draft this cycle
         default: st.trunc_nmax   += 1; break;
     }
     if (++st.since_dump >= (uint64_t) st.every) {
@@ -901,6 +918,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     // PXA_MTP_ADAPTIVE_K controller state (inert unless PXA_MTP_ADAPTIVE_K=1).
     float    pxa_ak_ema     = 0.70f; // running acceptance EMA (optimistic cold-start = full-depth drafts)
     uint32_t pxa_ak_drafted = 0;     // draft tokens emitted last cycle (accept() denominator)
+    bool     pxa_streak_full = false; // PXA_MTP_STREAK: the last verified chain reached D and was kept whole
 
     // PXA_SPEC_MTP_LAZY_v1 (2026-09-15): state for a companion that has not been
     // built yet. See the block comment on the promotion path below.
@@ -1224,6 +1242,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
             st.accepted     += n_accepted;
             st.accept_calls += 1;
             st.acc_hist[n_accepted < 8 ? n_accepted : 8] += 1;
+            if (st.fp_pending >= 0) {   // PXA_MTP_FIRST_GATE calibration
+                st.fp_drafted[st.fp_pending]  += 1;
+                st.fp_accepted[st.fp_pending] += n_accepted > 0 ? 1 : 0;
+                st.fp_pending = -1;
+            }
         }
         // PXA_MTP_ADAPTIVE_K: fold the realized accept ratio into the running EMA that drives K.
         if (pxa_mtp_ak_track() && n_tested(pxa_ak_drafted) > 0) {
@@ -1234,8 +1257,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
             }
             if (f > 1.0f) f = 1.0f;
             pxa_ak_ema = 0.85f * pxa_ak_ema + 0.15f * f;
+            // PXA_MTP_STREAK: a chain of at least D drafts that the verifier kept whole opens the next cycle's extension
+            pxa_streak_full = pxa_mtp_streak_full(pxa_mtp_streak(), (int) n_tested(pxa_ak_drafted), (int) n_accepted);
             pxa_ak_drafted = 0;
         } else {
+            pxa_streak_full = false;
             GGML_UNUSED(n_accepted);
         }
     }
@@ -4793,6 +4819,30 @@ void common_speculative_context_shift(
     }
 }
 
+// PXA_MTP_FIRST_GATE (common/pxa-mtp-first-gate.h): armed for this process? Logged once.
+static bool pxa_mtp_first_gate_armed() {
+    static const bool on = [] {
+        const bool v = pxa_mtp_first_gate_env() == 1;
+        if (v) {
+            LOG_INF("PXA_MTP_FIRST_GATE: on -- the first MTP draft token is verified only when its probability clears "
+                    "the stage p_min; under it the step decodes plainly (=0 off)\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
+// PXA_MTP_FIRST_GATE: this cycle carries no draft, so the target runs a plain one-row decode next. The
+// stored target hidden is the row BEFORE that decode; drop it (as common_speculative_mark_hidden_stale
+// does, capacity kept) so the next round's ensure_sequence_hidden() reads the plain decode's own row --
+// the path a selector plain round already takes. The MTP KV row at n_past stays: it is committed history.
+static void pxa_mtp_first_gate_close(common_speculative_state_mtp & state, llama_seq_id seq_id) {
+    auto it = state.target_hidden_by_seq.find(seq_id);
+    if (it != state.target_hidden_by_seq.end()) {
+        it->second.clear();
+    }
+}
+
 std::vector<llama_token> mtp_speculative_gen_draft(
     common_speculative_state_mtp & state,
     struct common_sampler * smpl,
@@ -4846,6 +4896,10 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     if (pxa_mtp_deep().on) {
         n_draft = pxa_mtp_deep_apply(state.pxa_ak_ema, n_draft, p_min);
     }
+    // PXA_MTP_STREAK: past the deep cap D only on a cycle that follows a full one (and only with a probability to gate on)
+    if (pxa_mtp_streak().on) {
+        n_draft = pxa_mtp_streak_depth(pxa_mtp_streak(), n_draft, state.pxa_streak_full && p_min > 0.0f);
+    }
 
     // PXA_SPEC_EXACT_NMIN_v1: the longest this draft can be, known before any of its tokens is drawn.
     // Only the caps above and the gate of the FIRST row (computed from committed text alone) may
@@ -4866,6 +4920,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     // PXA_SPEC_DEPTH_CUTOFF: the cumulative-p stop's floor at this context depth (0 = off).
     const float pxa_dc_floor = pxa_spec_depth_cutoff_floor(n_past);
     float pxa_dc_cum = 1.0f;
+    float pxa_sk_cum = 1.0f;   // PXA_MTP_STREAK: the chain's cumulative probability (gates rows past D)
     // PXA_VERIFY_NO_LOGITS_COPY: the drawn probability only matters to p_min, the depth cutoff and the
     // stats; with all three off the argmax row is the whole answer (also read by the next commit)
     state.pxa_nlc_prob_free = p_min <= 0.0f && pxa_spec_depth_cutoff_floor(1 << 30) <= 0.0f && !pxa_st.on;
@@ -4882,7 +4937,28 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     auto & last = mtp_get_last_embd(state, seq_id);
     int i0 = 0;
+    // PXA_MTP_FIRST_GATE: the cached free token is dropped (no draft this step) when its probability is under p_min
+    if (last.last_id >= 0 && !constant_draft_positions &&
+            pxa_mtp_first_gate_drop(pxa_mtp_first_gate_armed(), p_min, true, last.prob, !last.q.empty(), pxa_spec_exact_on())) {
+        if (pxa_st.on) {
+            pxa_st.fp_gated[pxa_mtp_first_gate_bucket(last.prob)] += 1;
+            pxa_st.fp_pending = -1;
+        }
+        last.last_id = -1;
+        last.q.clear();
+        llama_batch_free(mtp_batch);
+        llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+        pxa_mtp_first_gate_close(state, seq_id);
+        if (pxa_mtp_ak_track()) {
+            state.pxa_ak_drafted = 0;
+        }
+        pxa_mtp_stats_record(pxa_st, pxa_st_t0, 0, 0, 4);
+        return drafts;
+    }
     if (last.last_id >= 0) {
+        if (pxa_st.on) {   // PXA_MTP_FIRST_GATE calibration: this cycle's first token is the cached one
+            pxa_st.fp_pending = pxa_mtp_first_gate_bucket(last.prob);
+        }
         if (last.prob < p_min) {
             n_draft = 1;
             pxa_pre_len = 1; // PXA_SPEC_EXACT_NMIN_v1: the cached row's gate (max q under PXA_SPEC_EXACT)
@@ -4891,6 +4967,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         current_input_id = last.last_id;
         last.last_id = -1;
         pxa_dc_cum = std::max(0.0f, std::min(1.0f, last.prob));   // PXA_SPEC_DEPTH_CUTOFF
+        pxa_sk_cum = pxa_dc_cum;                                    // PXA_MTP_STREAK: the cached token is row 0
         drafts.push_back(current_input_id);
         pxa_qs.push_back(std::move(last.q));   // PXA_SPEC_SAMPLED: the commit drew it; its q travels with it
         last.q.clear();
@@ -4973,12 +5050,35 @@ std::vector<llama_token> mtp_speculative_gen_draft(
             pxa_st_stop = 1;
             break;
         }
+        // PXA_MTP_FIRST_GATE: row 0 of a fresh chain (no cached token) under p_min -> no draft this step. The
+        // row just written at n_past is committed history and survives the tail's seq_rm (it starts at n_past + 1).
+        if (i == 0 && !constant_draft_positions &&
+                pxa_mtp_first_gate_drop(pxa_mtp_first_gate_armed(), p_min, prob_ptr != nullptr, prob, !pxa_q.empty(), pxa_spec_exact_on())) {
+            if (pxa_st.on) {
+                pxa_st.fp_gated[pxa_mtp_first_gate_bucket(prob)] += 1;
+                pxa_st.fp_pending = -1;
+            }
+            pxa_mtp_first_gate_close(state, seq_id);
+            pxa_st_stop = 4;
+            break;
+        }
+        if (i == 0 && pxa_st.on && prob_ptr) {   // PXA_MTP_FIRST_GATE calibration: row 0 is this cycle's first token
+            pxa_st.fp_pending = pxa_mtp_first_gate_bucket(prob);
+        }
 
         // PXA_SPEC_DEPTH_CUTOFF: stop once the chain's cumulative probability falls below the
         // depth-ramped floor. Keeps at least one drafted token (the first is the cheapest).
         if (pxa_dc_floor > 0.0f && prob_ptr) {
             pxa_dc_cum *= prob;
             if (!drafts.empty() && pxa_dc_cum < pxa_dc_floor) {
+                pxa_st_stop = 1;
+                break;
+            }
+        }
+        // PXA_MTP_STREAK: a row past D is kept only while the whole chain's probability clears the floor
+        if (pxa_mtp_streak().on && prob_ptr) {
+            pxa_sk_cum *= std::max(0.0f, std::min(1.0f, prob));
+            if (pxa_mtp_streak_stop(pxa_mtp_streak(), i, pxa_sk_cum)) {
                 pxa_st_stop = 1;
                 break;
             }
@@ -5238,6 +5338,10 @@ bool common_speculative_draft_batched(
         }
         if (pxa_mtp_deep().on) {   // PXA_MTP_DEEP: same rule as the serial drafter (sc.params is this step's copy)
             n_draft = pxa_mtp_deep_apply(mtp_state->pxa_ak_ema, n_draft, sc.params.p_min);
+        }
+        // PXA_MTP_STREAK: the batched drafter has no cumulative stop, so it never runs past D
+        if (pxa_mtp_streak().on) {
+            n_draft = pxa_mtp_streak_depth(pxa_mtp_streak(), n_draft, false);
         }
         sc.state.n_draft = n_draft;
 

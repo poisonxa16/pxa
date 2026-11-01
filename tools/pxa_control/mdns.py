@@ -21,12 +21,23 @@ import ipaddress
 import os
 import random
 import re
-import select
+import selectors
 import socket
 import struct
 import subprocess
 import threading
 import time
+
+
+def _readable(objs, timeout):
+    """The objects in ``objs`` that can be read within ``timeout`` seconds (the readable list select() gave).
+    select() raises ValueError for any file descriptor >= 1024 (FD_SETSIZE), which a busy process reaches;
+    a selector has no such limit. A closed object raises ValueError / OSError, as select() did."""
+    with selectors.DefaultSelector() as sel:
+        for o in objs:
+            sel.register(o, selectors.EVENT_READ)
+        return [key.fileobj for key, ev in sel.select(timeout) if ev & selectors.EVENT_READ]
+
 
 GROUP = "224.0.0.251"
 PORT = 5353
@@ -363,7 +374,7 @@ class Advertiser(object):
         anns = 1
         while not self._stop.is_set():
             try:
-                r, _w, _x = select.select([self.sock], [], [], 0.5)
+                r = _readable([self.sock], 0.5)
             except (OSError, ValueError):
                 return
             if r:
@@ -447,7 +458,7 @@ def browse(timeout=1.5, ifaces=None, environ=None, mport=PORT, group=GROUP, serv
             left = end - time.monotonic()
             if left <= 0:
                 break
-            r, _w, _x = select.select([s], [], [], left)
+            r = _readable([s], left)
             if not r:
                 break
             try:

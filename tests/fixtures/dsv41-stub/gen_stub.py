@@ -20,7 +20,7 @@ except ImportError:  # minimal build containers ship numpy but not PyYAML: the w
 import gguf  # noqa: E402
 
 VARIANTS = ['ok', 'noengram', 'ratio4', 'extra_hchead', 'missing_gate', 'gate_on_ratio1',
-            'kvsrc_ratio0', 'hash', 'qnorm', 'tid2eid', 'cand_not_src']
+            'kvsrc_ratio0', 'hash', 'qnorm', 'tid2eid', 'cand_not_src', 'cand_oob']
 
 A = 'deepseek41'
 N_LAYER, N_EMBD, N_HEAD, HD, ROPE = 6, 64, 4, 32, 16
@@ -48,6 +48,8 @@ def main():
     idx_src = [2, 3, 4, 5]
     eng = [] if v == 'noengram' else [1, 3]
     cand_src = 3 if v == 'cand_not_src' else 4
+    if v == 'cand_oob':  # past LLAMA_MAX_LAYERS (512): a hostile file must not index the flag table with it
+        cand_src = 600
 
     w = gguf.GGUFWriter(a.out, A)
     w.add_block_count(N_LAYER)

@@ -65,6 +65,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <thread>
+#include <cerrno>
+#include <cstring>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // env
@@ -97,6 +105,7 @@ static std::atomic<bool> g_pxa_stream_lent_live{false};                 // some 
 struct pxa_stream_buffer_context : public ggml_backend_cuda_buffer_context {
     void * host_ptr;
     int64_t zc_ny = 0;   // graphs no wider than this read this buffer's weights in place (the owning model's width; 0 = always copy)
+    size_t huge_len = 0; // PXA_STREAM_HUGE: the bytes are our own 2 MiB-aligned anonymous mapping, host-registered (unregister + munmap on free)
     pxa_stream_buffer_context(int device, void * p) : ggml_backend_cuda_buffer_context(device, p), host_ptr(p) {
         // the base class frees dev_ptr with cudaFree in its destructor; ours is host memory,
         // freed by the buffer's free function, so the base must see nullptr.
@@ -108,8 +117,12 @@ static void pxa_stream_ring_ensure(int device);
 GGML_CALL static void pxa_stream_buffer_free(ggml_backend_buffer_t buffer) {
     pxa_stream_buffer_context * ctx = (pxa_stream_buffer_context *)buffer->context;
     void * p = ctx->host_ptr;
+    const size_t huge_len = ctx->huge_len;
     ctx->dev_ptr = nullptr;
     delete ctx;
+#if defined(__linux__)
+    if (p && huge_len) { CUDA_CHECK(cudaHostUnregister(p)); munmap(p, huge_len); return; }
+#endif
     if (p) CUDA_CHECK(cudaFreeHost(p));
 }
 
@@ -170,6 +183,99 @@ static inline bool pxa_stream_buffer_is(const ggml_backend_buffer_t buffer) {
     return buffer && buffer->iface.free_buffer == pxa_stream_buffer_free;
 }
 
+// PXA_STREAM_HUGE (od-b1-hugepage-arena, 2026-10-29; opt-in until measured, =1 on). cudaHostAlloc pins the streamed experts
+// as a SHARED anonymous mapping (/dev/zero, i.e. shmem), and this box runs shmem THP 'never': the 15.8 GiB G30 cold arena sits on 4 KiB
+// pages (smaps: KernelPageSize 4 kB, 0 huge), so the cold lane's CPU workers take a page walk per 4 KiB of a randomly chosen 1 MiB
+// expert. Here the arena is our own PRIVATE anonymous mapping, 2 MiB aligned, bound to the stream node (mbind, the same node
+// pxa_numa_stream_node picks), madvise(MADV_HUGEPAGE) and faulted at once (MADV_POPULATE_WRITE, in parallel chunks, before the weights
+// are read) while the node still has free 2 MiB blocks, then cudaHostRegister'ed portable + mapped: the device reads the same pointer
+// (UVA; checked, else the old allocation is used). Same bytes, same kernels: bit-identical. The boot log line says how much of the
+// arena actually landed on huge pages.
+static bool pxa_stream_huge_on() {
+    static const bool v = [] { const char * e = getenv("PXA_STREAM_HUGE"); return e && *e && atoi(e) != 0; }();
+    return v;
+}
+#if defined(__linux__)
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+// bytes of [p, p + len) the kernel backs with anonymous huge pages (sum over the VMAs that overlap the range, from /proc/self/smaps)
+static size_t pxa_stream_huge_bytes(const void * p, size_t len, size_t * rss_out) {
+    size_t huge = 0, rss = 0;
+    FILE * f = fopen("/proc/self/smaps", "r");
+    if (!f) { if (rss_out) *rss_out = 0; return 0; }
+    char line[512]; bool in = false;
+    const uintptr_t a0 = (uintptr_t) p, a1 = a0 + len;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long lo = 0, hi = 0;
+        if (sscanf(line, "%lx-%lx ", &lo, &hi) == 2 && strchr(line, '-') && line[0] != ' ') { in = lo < a1 && hi > a0; continue; }
+        if (!in) continue;
+        unsigned long v = 0;
+        if (sscanf(line, "AnonHugePages: %lu kB", &v) == 1) huge += (size_t) v*1024;
+        else if (sscanf(line, "Rss: %lu kB", &v) == 1) rss += (size_t) v*1024;
+    }
+    fclose(f);
+    if (rss_out) *rss_out = rss;
+    return huge;
+}
+static void * pxa_stream_huge_alloc(size_t size, int bind_node, size_t * map_len) {
+    const size_t H = (size_t) 2 << 20;
+    const size_t len = (size + H - 1) & ~(H - 1);
+    void * raw = mmap(nullptr, len + H, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) return nullptr;
+    const uintptr_t a = ((uintptr_t) raw + H - 1) & ~(uintptr_t) (H - 1);
+    const size_t head = a - (uintptr_t) raw;
+    if (head) munmap(raw, head);
+    if (H - head) munmap((void *) (a + len), H - head);
+    void * p = (void *) a;
+    if (bind_node >= 0) {
+        unsigned long m[2] = { 0, 0 };
+        m[bind_node / 64] = 1UL << (bind_node % 64);
+        if (syscall(SYS_mbind, p, len, 2 /* MPOL_BIND */, m, (unsigned long) 128, 0U) != 0) {
+            GGML_CUDA_LOG_WARN("PXA_STREAM_HUGE: mbind to node %d refused (%s); the arena is placed unbound\n", bind_node, strerror(errno));
+        }
+    }
+    if (madvise(p, len, MADV_HUGEPAGE) != 0) {
+        GGML_CUDA_LOG_WARN("PXA_STREAM_HUGE: madvise(MADV_HUGEPAGE) refused (%s)\n", strerror(errno));
+    }
+    {   // fault the whole arena now, in parallel chunks of whole huge pages
+        const int nt = (int) std::max<size_t>(1, std::min<size_t>(8, len / ((size_t) 256 << 20)));
+        const size_t chunk = ((len / nt) + H - 1) & ~(H - 1);
+        std::atomic<int> bad{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < nt; ++t) {
+            const size_t o = (size_t) t*chunk;
+            if (o >= len) break;
+            const size_t n = std::min(chunk, len - o);
+            th.emplace_back([p, o, n, &bad] {
+                char * b = (char *) p + o;
+                if (madvise(b, n, MADV_POPULATE_WRITE) != 0) {               // older kernel: touch one byte per 4 KiB
+                    bad.fetch_add(1);
+                    for (size_t i = 0; i < n; i += 4096) ((volatile char *) b)[i] = 0;
+                }
+            });
+        }
+        for (auto & t : th) t.join();
+        if (bad.load()) GGML_CUDA_LOG_WARN("PXA_STREAM_HUGE: MADV_POPULATE_WRITE refused on %d chunk(s); touched page by page\n", bad.load());
+    }
+    if (cudaHostRegister(p, len, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        munmap(p, len);
+        return nullptr;
+    }
+    void * dp = nullptr;
+    if (cudaHostGetDevicePointer(&dp, p, 0) != cudaSuccess || dp != p) {   // the zero-copy paths read the host pointer on the device
+        (void) cudaGetLastError();
+        cudaHostUnregister(p);
+        munmap(p, len);
+        GGML_CUDA_LOG_WARN("PXA_STREAM_HUGE: the registered arena has a different device address; using the pinned allocation\n");
+        return nullptr;
+    }
+    *map_len = len;
+    return p;
+}
+#endif
+
 GGML_CALL static ggml_backend_buffer_t pxa_stream_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
     ggml_cuda_set_device(buft_ctx->device);
@@ -181,9 +287,24 @@ GGML_CALL static ggml_backend_buffer_t pxa_stream_buft_alloc_buffer(ggml_backend
     // NODE THE CARDS HANG OFF -- a hard bind here (reclaiming page cache of that node if it has to), where the process-wide preference alone
     // would let the per-layer-embedding table take that node's free pages first. A failed bound allocation is retried under the old policy.
     cudaError_t err = cudaErrorMemoryAllocation;
+    size_t huge_len = 0;
 #if defined(__linux__)
+    if (pxa_stream_huge_on() && size >= ((size_t) 64 << 20)) {
+        const int node = pxa_numa_stream_node(size);
+        const int64_t t0 = ggml_time_us();
+        p = pxa_stream_huge_alloc(size, node, &huge_len);
+        if (p) {
+            err = cudaSuccess;
+            size_t rss = 0;
+            const size_t huge = pxa_stream_huge_bytes(p, huge_len, &rss);
+            GGML_CUDA_LOG_INFO("PXA_STREAM_HUGE: %.2f GiB arena (node %d): %.2f GiB on 2 MiB pages (%.0f%% of %.2f GiB resident), faulted + registered in %.1f s\n",
+                    huge_len / 1073741824.0, node, huge / 1073741824.0, rss ? 100.0*huge/rss : 0.0, rss / 1073741824.0, (ggml_time_us() - t0)/1e6);
+        } else {
+            GGML_CUDA_LOG_WARN("PXA_STREAM_HUGE: the huge-page arena of %.2f GiB failed; using the pinned allocation\n", size / 1073741824.0);
+        }
+    }
     // PXA_NUMA_HOST_BIND: when the cards' node has no allowed CPU, the node the CPU threads sit on (pxa_numa_stream_node)
-    if (const int bind_node = pxa_numa_stream_node(size); bind_node >= 0) {
+    if (err != cudaSuccess) if (const int bind_node = pxa_numa_stream_node(size); bind_node >= 0) {
         unsigned long m[2] = { 0, 0 };
         m[bind_node / 64] = 1UL << (bind_node % 64);
         const long brc = syscall(SYS_set_mempolicy, 2 /* MPOL_BIND */, m, (unsigned long) 128);
@@ -211,6 +332,7 @@ GGML_CALL static ggml_backend_buffer_t pxa_stream_buft_alloc_buffer(ggml_backend
     GGML_CUDA_LOG_INFO("PXA_STREAM: device %d: %.2f MiB of weights pinned in host RAM (streamed per graph)\n",
             buft_ctx->device, size/1024.0/1024.0);
     auto * ctx = new pxa_stream_buffer_context(buft_ctx->device, p);
+    ctx->huge_len = huge_len;
     return ggml_backend_buffer_init(buft, pxa_stream_buffer_interface, ctx, size);
 }
 

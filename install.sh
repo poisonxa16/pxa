@@ -3,7 +3,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/poisonxa16/pxa/main/install.sh | bash
 #   ... | bash -s -- --docker          pull the container image instead
 #   ... | bash -s -- --dir /opt/pxa    install somewhere else (default ~/.local/share/pxa)
-#   ... | bash -s -- --version v4.0
+#   ... | bash -s -- --version v4.0.1
 set -euo pipefail
 
 REPO=poisonxa16/pxa

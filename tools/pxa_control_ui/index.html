@@ -22,6 +22,7 @@
 <script src="/pwa.js" defer></script>
 <link rel="stylesheet" href="/wallet.css">
 <link rel="stylesheet" href="/plugin-host.css">
+<link rel="stylesheet" href="/theme.css">
 <link rel="stylesheet" href="/encode.css">
 <link rel="stylesheet" href="/live.css">
 <link rel="stylesheet" href="/profiles.css">
@@ -35,6 +36,7 @@
 <link rel="stylesheet" href="/agent-ux.css">
 <link rel="stylesheet" href="/agent-stream.css">
 <link rel="stylesheet" href="/agent-memory.css">
+<link rel="stylesheet" href="/agent-vigil.css">
 <link rel="stylesheet" href="/chat.css">
 <link rel="stylesheet" href="/chat-history.css">
 <link rel="stylesheet" href="/chat-markdown.css">
@@ -55,43 +57,22 @@
    with no choice saved, from the OS (prefers-color-scheme), before first paint (the inline script in <head>).
    ====================================================================================================== */
 :root{
+  /* the shared tokens (colours, chart palette, type, space, radii, shadows) live in /theme.css
+     (tools/pxa_chat/ui/theme.css, linked above); only the tokens this page adds are set here */
   color-scheme:dark;
-  --bg:#0F1012;--surface:#16171A;--surface-2:#1C1E22;--surface-3:#25272C;
-  --line:#26282E;--line-2:#363940;--text:#ECEDEF;--dim:#A1A6AF;--faint:#868B95;--on-accent:#0B1220;
-  --accent:#6B9BF2;--accent-hover:#86AEF5;--accent-2:#5C8DEB;--accent-text:#9DBCF7;--link:#9DBCF7;
-  --grad:linear-gradient(90deg,var(--accent),var(--accent-2));
   --brand-a:#E08A3C;--brand-b:#2E9ACB;--brand-grad:linear-gradient(90deg,var(--brand-a),var(--brand-b));
-  --ok:#3DD39F;--warn:#F2B33D;--bad:#FF6B6B;--neutral:#8B94A5;
-  --ok-bg:rgba(61,211,159,.10);--warn-bg:rgba(242,179,61,.10);--bad-bg:rgba(255,107,107,.10);--accent-bg:rgba(107,155,242,.12);
   /* supporter / locked: its own hue (not the accent, not a warning) so "you can unlock this" never reads as an error */
   --sup:#B4A9FA;--sup-bg:rgba(142,134,240,.13);--sup-line:rgba(142,134,240,.45);
-  --scrim:rgba(0,0,0,.6);--tint:rgba(255,255,255,.07);--tint-2:rgba(0,0,0,.25);
-  /* categorical chart palette: validated for colour-vision safety and 3:1 contrast on both the dark and the light card surface; same values in both themes */
-  --series-1:#3987E5;--series-2:#D95926;--series-3:#199E70;--series-4:#C98500;--series-5:#D55181;--series-6:#008300;--series-7:#9085E9;--series-8:#E66767;
-  --chart-grid:#25272C;--chart-text:#A1A6AF;
-  --shadow:0 1px 2px rgba(0,0,0,.35),0 8px 24px rgba(0,0,0,.18);
   --shadow-2:0 2px 6px rgba(0,0,0,.4),0 18px 48px rgba(0,0,0,.35);
-  --focus:0 0 0 2px var(--bg),0 0 0 4px var(--accent-2);
-  --font:"IBM Plex Sans","Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  /* type: 12 / 13 / 14.5 / 17 / 21 / 28 / 34 */
-  --fs-0:12px;--fs-1:13px;--fs-2:14.5px;--fs-3:17px;--fs-4:21px;--fs-5:28px;--fs-6:34px;
-  /* space: a 4-px grid */
-  --s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:24px;--s6:32px;--s7:48px;
-  --r1:8px;--r2:14px;--r3:20px;--pill:999px;
-  --ease:cubic-bezier(.2,.7,.2,1);--dur:.16s;
-  --header:60px;--side:224px;--safe:env(safe-area-inset-bottom,0px);
+  --fs-6:34px;   /* type: 12 / 13 / 14.5 / 17 / 21 / 28 / 34 */
+  --s7:48px;     /* space: a 4-px grid */
+  --r3:20px;
+  --dur:.16s;
+  --side:224px;
 }
 [data-theme=light]{
   color-scheme:light;
-  --bg:#F6F7F9;--surface:#FFFFFF;--surface-2:#F2F4F7;--surface-3:#E7EAEF;--line:#E2E5EA;--line-2:#CDD2DA;
-  --text:#12161F;--dim:#4F5867;--faint:#636B7A;--on-accent:#FFFFFF;
-  --accent:#2F5FD0;--accent-hover:#2550B8;--accent-2:#3D6FE0;--accent-text:#2550B8;--link:#2550B8;
-  --ok:#0F7A55;--warn:#995700;--bad:#B3261E;--ok-bg:#E8F6F0;--warn-bg:#FFF4E2;--bad-bg:#FCEBEA;--accent-bg:#EAF0FC;
   --sup:#5B4FD6;--sup-bg:#EFEDFC;--sup-line:#C9C3F4;
-  --scrim:rgba(16,24,40,.35);--tint:rgba(16,24,40,.06);--tint-2:rgba(16,24,40,.05);
-  --chart-grid:#E3E6EB;--chart-text:#566070;
-  --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 18px rgba(16,24,40,.06);
   --shadow-2:0 2px 6px rgba(16,24,40,.08),0 18px 40px rgba(16,24,40,.14);
 }
 *,*::before,*::after{box-sizing:border-box}
@@ -1955,8 +1936,9 @@ setInterval(async () => {
 async function loadModels(force) {
   if (S.models && !force) { renderModels(); return; }
   try {
-    S.models = await api("/api/models" + (force ? "?force=1" : ""));
-    if (!S.gpus.length) { const live = await api("/api/rig/live"); S.gpus = live.cards; }
+    const raw = await api("/api/models" + (force ? "?force=1" : "")) || {};
+    S.models = {roots: raw.roots || [], models: raw.models || [], notes: raw.notes || []};
+    if (!S.gpus.length) { try { const live = await api("/api/rig/live"); S.gpus = (live && live.cards) || []; } catch (e) { S.gpus = []; } }
     renderModels(); loadFits();
   } catch (e) { toast("models: " + e.message, true); $("#models-body").replaceChildren(el("tr", {}, el("td", {colspan: 8}, stateBox("alert", "Could not read the model library", e.message + ". Check that the folders below exist and are readable, then try again.",
       [el("button", {class: "b", text: "Try again", onclick: () => loadModels(true)})], "bad")))); }
@@ -1980,6 +1962,8 @@ async function loadFits() {
 }
 function renderModels() {
   const m = S.models; if (!m) return;
+  if (!m.roots) m.roots = [];
+  if (!m.models) m.models = [];
   $("#cfg-path").textContent = (S.info && S.info.config) || "~/.config/pxa/control.json";
   $("#dirs").replaceChildren(...(m.roots.length ? m.roots.map(r => el("span", {class: "pill dirpill", title: r}, el("span", {class: "mono", style: "overflow:hidden;text-overflow:ellipsis", text: r}),
       el("button", {class: "icon", style: "width:22px;height:22px;border:0", title: "remove", "aria-label": "remove " + r, onclick: () => saveDirs(m.roots.filter(x => x !== r))}, "×")))
@@ -3413,6 +3397,7 @@ $("#emap-reset").addEventListener("click", async () => {
 <script src="/agent-ux.js"></script>
 <script src="/agent-stream.js"></script>
 <script src="/agent-memory.js"></script>
+<script src="/agent-vigil.js"></script>
 <script src="/chat.js"></script>
 <script src="/chat-history.js"></script>
 <script src="/chat-markdown.js"></script>

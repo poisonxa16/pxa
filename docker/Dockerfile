@@ -209,6 +209,9 @@ COPY tools/pxa_control /usr/local/bin/pxa_control
 COPY tools/pxa_ctl /usr/local/bin/pxa_ctl
 # the Chat tab's in-house agent (stdlib package; Control runs without it, minus the Assistant view)
 COPY tools/pxa_chat /usr/local/bin/pxa_chat
+# the plugin platform (the Plugins tab; Control runs without it). .dockerignore keeps the DEV-ONLY seeds and the
+# licence-server side out of the build context, so they never reach a layer.
+COPY tools/pxa_plugins /usr/local/bin/pxa_plugins
 COPY --from=build /src/pxa-lever-catalog.inc /usr/local/share/pxa/pxa-lever-catalog.inc
 # The PXA names next to the llama-* ones: one binary behind both.
 RUN set -e; for t in server cli bench quantize perplexity; do \

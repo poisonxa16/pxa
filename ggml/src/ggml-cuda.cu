@@ -13201,6 +13201,17 @@ static bool pxa_cuda_graph_pxqn_id_on() {
         return on; }();
     return v;
 }
+// PXA_CUDA_GRAPH_MAXN (default 0 = no cap): a ggml graph of more than this many nodes is never captured; it runs
+// eager. On G30 the MTP head's draft / update graphs (87-93 nodes) are launch-bound (~5 us of host per node against ~0.4 ms of
+// card work) while the 4,076-node target verify is card-bound and pays a full capture + instantiate every time its KV view crosses
+// a 256-cell step (with PXA_RESERVE_ABSORB the keys are stable and the verify recaptures ~70 times per board window). A cap of e.g.
+// 512 keeps the verify eager and lets the MTP graphs replay. Same kernels in the same order either way: the output is unchanged.
+static int pxa_cuda_graph_maxn() {
+    static const int v = [] { const char * e = getenv("PXA_CUDA_GRAPH_MAXN"); const int n = e ? atoi(e) : 0;
+        if (n > 0) fprintf(stderr, "PXA_CUDA_GRAPH_MAXN: %d (graphs with more nodes run eager)\n", n);
+        return n > 0 ? n : 0; }();
+    return v;
+}
 // Bug #335 (c), 2026-10-22: the default capture gate below admits a MUL_MAT_ID with one token and one routed expert,
 // but only the device-side dispatch paths are capturable. A non-quantized src0 (f32/f16/bf16 experts) and a quantized
 // type that neither the q8_1 id-GEMV (fast TG) nor the MMQ-id GEMM serves fall to the host-grouping loop, whose
@@ -13275,7 +13286,10 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
     const std::string ffn_moe_down_bias_prefix = "ffn_moe_down_biased";
 
     int pxa_refuse_i = -1;   // PXA_CUDA_GRAPH_LOG: the node that made this graph eager
-    for (int i = 0; i < cgraph->n_nodes; i++) {
+    if (use_cuda_graph && pxa_cuda_graph_maxn() > 0 && cgraph->n_nodes > pxa_cuda_graph_maxn()) {
+        use_cuda_graph = false;   // PXA_CUDA_GRAPH_MAXN: a big graph stays eager (no node to name: the size decided)
+    }
+    for (int i = 0; i < cgraph->n_nodes && use_cuda_graph; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         pxa_refuse_i = i;
 

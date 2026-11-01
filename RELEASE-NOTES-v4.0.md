@@ -6,25 +6,44 @@
 <a href="https://ko-fi.com/shatteredrealms1"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-Support%20PXA-FF5E5B?logo=ko-fi&logoColor=white&style=for-the-badge"></a>
 </p>
 
-# PXA 4.0
-
-Released October 30, 2026.
+# PXA 4.0.1
 
 PXA is a free inference engine for older datacenter cards, the Tesla P100 and V100, and for Pascal cards such as the GTX 1080 Ti. In every comparison below, 4.0 is ahead of v3.1 and of mainline llama.cpp on the same machine, on every prompt class we measured. 4.0 adds the Nemotron families and GLM-5.3-Flash, runs the Qwen3.6 35B-A3B mixture-of-experts model with its MTP block, makes Flash-Next with Overdrive several times faster on one V100, rebuilds PXA Control, and adds Docker, Windows and macOS builds. The numbers come first, then what changed.
 
+PXA 4.0.1 is a fix release on top of 4.0. The 4.0.1 changes come first; the 4.0 notes follow them unchanged.
+
+## What is new in 4.0.1
+
+**Fixes**
+- Linux: opening PXA Control in your browser works again on newer distributions such as Debian 13; the libraries that ship with PXA are now used by the engine only.
+- Windows: PXA Control no longer flashes console windows while it runs.
+
+**Security**
+- PXA Control and the engine accept the current and the next PXA signing keys, so PXA can move to new keys without breaking unlocks, Store grants, plugins or downloads; anything signed with a retiring key is accepted only if it was already published.
+- Windows: the engine loads its optional PXQN library only from its own folder, never from the current folder or PATH.
+- A malformed or hostile model file with out-of-range layer or state sizes is refused with a clear message instead of crashing.
+- PXA Control's local health check no longer sends its session token through a configured HTTP proxy.
+- The MTP embedding dump option creates its folder without running a shell command.
+- The server warns at startup when it listens beyond this machine without an API key.
+
+**Engine**
+- Overdrive on one V100 (Flash-Next class): the cold-expert CPU path does less fixed work per layer step, with the same output.
+- Overdrive on one V100 (Flash-Next class): an optional deeper draft chain that only runs right after a fully accepted round and while its confidence holds; same output, off by default.
+- GLM-5.3-Flash MTP with experts in host memory: an optional confidence gate skips the draft when the head is unsure, so those steps decode plainly; off by default.
+
 ## Downloads
 
-| Platform | File | sha256 |
-|---|---|---|
-| Linux x86_64 (CUDA 12.8, native code for sm_60, 61, 70, 75, 80, 86, 89) | `pxa-v4.0.0-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz` | `7134659cf086e1ed7b8c3133fd637185e98e9dbd8231c97c90fa6fbde9c757a0` |
-| Docker image (Linux, NVIDIA runtime) | `docker pull ghcr.io/poisonxa16/pxa:v4.0` | image id `16c998a6784c6d6ac62be3b49c8c50d95d8ba967b629c46b80273d02673a8e8c` |
-| Windows x64: PXA Control (unsigned, see "Windows" below) | `pxa-control-win64.exe` | `bc72dbd029bc7752f60de4d74b119e28ecd277c6591de017d1bca13eac27116e` |
-| Windows x64: the engine (unsigned, see "Windows" below) | `pxa-engine-win64-cuda12.zip` | `f10319975ffd968aa4daa68ed90519f000c23cb5143ae90220fc23cc06911d8f` |
-| macOS: PXA Control, native on Intel and Apple silicon (unsigned, see "macOS" below) | `pxa-control-v4.0.0-macos-universal2.zip` | `5bf889cfe7ed94c710ac95c5a9b3a1f0a15f875e6fb6a3120b5183aa43267311` |
-
-The Docker tag `latest` moves with the public release, as it did for 3.1; `v4.0` is fixed. An Android client app is in testing and is not part of the 4.0 downloads.
+| Platform | File |
+|---|---|
+| Linux x86_64 (CUDA 12.8, native code for sm_60, 61, 70, 75, 80, 86, 89) | `pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz` |
+| Docker image (Linux, NVIDIA runtime) | `ghcr.io/poisonxa16/pxa:v4.0.1` |
+| Windows x64: PXA Control (unsigned, see "Windows" below) | `pxa-control-win64.exe` |
+| Windows x64: the engine (unsigned, see "Windows" below) | `pxa-engine-win64-cuda12.zip` |
+| macOS: PXA Control, native on Intel and Apple silicon (unsigned, see "macOS" below) | `pxa-control-v4.0.1-macos-universal2.zip` |
 
 Check the sha256 before you unpack: `sha256sum -c <file>.sha256` on Linux, the `SHA256SUMS` file next to the Windows downloads, `shasum -a 256 <file>` on macOS. Every release package passes a clean-package scan before it is published.
+
+# PXA 4.0
 
 ## The numbers
 
@@ -219,7 +238,7 @@ Every Nemotron family in this release was tested for 4.0.
 
 ## Windows
 
-Two downloads: PXA Control (a single program file) and the engine zip (CUDA 12 runtime included, the same seven native architectures as Linux, checked on an RTX 3080 Ti). Check both with the `SHA256SUMS` file next to them. The files are not code-signed, so Windows SmartScreen shows "Windows protected your PC" the first time: choose "More info", then "Run anyway". The engine zip needs a current NVIDIA driver; it carries no driver files.
+Two downloads: PXA Control (a single program file) and the engine zip (CUDA 12 runtime included, the same seven native architectures as Linux, checked on an RTX 3080 Ti). Check both with the `SHA256SUMS` file next to them. The files are not code-signed, so Windows SmartScreen can show "Windows protected your PC" when you start them, sometimes more than once: each time, choose "More info", then "Run anyway". The engine zip needs a current NVIDIA driver; it carries no driver files.
 
 ## macOS: PXA Control client
 
@@ -266,7 +285,7 @@ Unpack into a new folder (install.sh does this), or pull the Docker image.
 
 ## How to report problems
 
-Use Control's "Report a problem", or write in the PXA Discord #support channel. Say the card, the model file, the command and the version (4.0).
+Use Control's "Report a problem", or write in the PXA Discord #support channel. Say the card, the model file, the command and the version (4.0.1).
 
 ## Community
 

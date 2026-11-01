@@ -101,6 +101,12 @@ CURATED = {
         "free VRAM the on-demand (lent) ring never takes, for the CUDA pool that grows during the graph"),
     "PXA_XCACHE_RING_LEND_FAIL": ("0 (=1 test hook)", "PXA_XCACHE_RING_LEND=1, tests only", "diagnostic", "",
         "=1: every on-demand allocation of the lent ring fails, so a wide graph takes the zero-copy fallback (tests/run-xcache-ring-lend.sh)"),
+    "PXA_XCACHE_RING_LEND_FLOOR": ("auto: 1 when the ubatch reaches the CPU-alias width (prefill graphs stream), else 0 (=0 lend all, =1 keep one layer, =2 keep the two-layer ring)", "PXA_XCACHE_RING_LEND=1, CPU cold path", "default-on", "",
+        "1: lending keeps a one-layer ring in VRAM (charged, allocated at load) and lends the rest, so a prefill ubatch copies its cold experts through it instead of reading them in place over the link (fully lent, the ring was never there at -ub 4096 on one V100: pp ~105 t/s); 0: the R3a plan exactly (everything lent, on demand)"),
+    "PXA_XCACHE_PREFILL_FREEZE": ("on with PXA_XCACHE_RTIER (the 1x V100 Overdrive Flash-Next class), off in the deterministic schedule (=0 off, =1 on in both)", "PXA_XCACHE_ADAPT=1", "default-on", "",
+        "on: after a batch wider than PXA_XCACHE_DECODE_MAXW (a prefill ubatch) the adaptation applies no map flip and starts no swap; the prompt's routing is still observed and the first decode tick plans from it; residency only (with RIX every width it cannot change a bit); =0: the RC schedule"),
+    "PXA_XCACHE_DECODE_MAXW": ("16 (1..256)", "PXA_XCACHE_PREFILL_FREEZE on", "site", "",
+        "the widest batch (tokens) that still moves experts: decode and MTP verify (n_max 3 verifies 4, PLAN_V2 prices 6, the async lane covers 1..8); wider = a prefill ubatch, frozen"),
     "PXA_MTP_RESERVE_RECOMPUTE": ("0 (=1 on)", "expert cache with MTP (PXA_XCACHE_MTP=1) on a Gated-DeltaNet model, one sequence", "lever-off", "",
         "=1: the planner prices the MTP chain reserve as replay rollback (one start state per recurrent layer + per-token recurrence inputs and conv rows) instead of width-1 per-step state rows, and PXA_SPEC_CKPT_REPLAY is forced on unless set; a rejected tail's state is recomputed by the same kernel (bit-identical to per-step at equal depth), the freed planes keep resident experts; =0: the previous reserve exactly"),
     "PXA_PLACE_CTX_GUARD": ("on (=0 off)", "PXA_STREAM_WEIGHTS=auto planner, any streaming plan; all-outputs loads (perplexity, KLD, imatrix, --embedding)", "default-on",
@@ -651,6 +657,11 @@ CURATED.update({
     "PXA_VFUSE": ("rule: 1 with the PXA_FLASHNEXT_V100_SET set (qwen4exp, all-V100 box, config level >= 2), else off (=1 on, =0 off)", "CUDA; qwen4exp (Flash-Next) verify widths 2..8", "rule", "",
                   "=1: the verify-width small-kernel chains in one launch each, bit-identical (every node still written; the q8_1 handed to the next GEMV through a per-device record): 1 HC lo scale+silu+q8_1, 2 out gate sigmoid+mul+q8_1, 4 shexp sigmoid+mul+add, 8 router f32 GEMV weights in flight, 16 hc_inject f16 GEMV steps in flight, 32 hc gate_mix+q8_1, 64 shexp 1-row gate GEMV folded into the tail, 128 DeltaNet gated norm+sigmoid+mul+q8_1, 256 hc combine_norm values in flight (tests/test-pxa-vfuse-graph.cpp, test-pxa-snf.cu, test-pxa-f16ny.cu, test-pxa-hccn.cu)"),
     "PXA_VFUSE_OFF": ("0", "PXA_VFUSE on", "site", "", "mask of PXA_VFUSE parts left unfused (the bit values of PXA_VFUSE); bit-identical either way"),
+})
+CURATED.update({
+    # ---- MTP first gate (2026-10-29): MTP first-token confidence gate, not bit-identical, default off until its gates run ----
+    "PXA_MTP_FIRST_GATE": ("off (=1 on)", "MTP stage (single-sequence draft path); measured on GLM-5.3-Flash 2x V100 with routed experts in host memory", "lever-off", "",
+                           "=1: a cycle's FIRST MTP draft token (cached free token or fresh row 0) is dropped when its probability is under the stage p_min, so that step decodes plainly; +9.8% vs always drafting (n12 z3.5), parity with no-draft rounds; output not bit-identical (det/needle/KLD owed before default on)"),
 })
 CURATED.update({
     "PXA_GLM_THINK_OFF": ("on", "jinja chat, GLM [gMASK] templates whose generation prompt opens <think> and ignore enable_thinking (GLM-5.3)", "default-on", "",

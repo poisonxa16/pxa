@@ -5110,6 +5110,17 @@ class App(object):
                 return m.group(1).strip()[:80]
         return None
 
+    def _engine_env(self, exe):
+        """the environment an engine program of the build holding exe runs with: engine_ld_path (lib-compat/ first on a
+        CPU without the fast ISA, lib/ for a package built without RUNPATH), never Control's own LD_LIBRARY_PATH."""
+        env = dict(os.environ)
+        try:
+            E = os.path.dirname(os.path.dirname(os.path.realpath(exe)))
+            env["LD_LIBRARY_PATH"], _ = self.L.engine_ld_path(E)
+        except Exception:
+            pass
+        return env
+
     def engine_version_probe(self, sid="main"):
         """the version of the llama-server binary a seat runs (or the detected engine), from `--version`;
         cached per binary and mtime. For reports whose log no longer holds the build line and whose server is
@@ -5132,12 +5143,7 @@ class App(object):
         cache = self.__dict__.setdefault("_engine_ver_cache", {})
         if key in cache:
             return cache[key]
-        env = dict(os.environ)
-        try:
-            E = os.path.dirname(os.path.dirname(os.path.realpath(exe)))
-            env["LD_LIBRARY_PATH"], _ = self.L.engine_ld_path(E)
-        except Exception:
-            pass
+        env = self._engine_env(exe)
         try:
             r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10, env=env,
                                stdin=subprocess.DEVNULL, errors="replace")
@@ -5512,7 +5518,7 @@ class App(object):
             return hit or None
 
         def probe():
-            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=40)
+            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=40, env=self._engine_env(exe))
             blob = (r.stdout or "") + (r.stderr or "")
             m = re.search(r"version:\s*(\S.*)", blob)
             return m.group(1).strip()[:80] if m else ""

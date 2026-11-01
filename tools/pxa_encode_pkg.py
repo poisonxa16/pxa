@@ -42,7 +42,36 @@ from pxa_encode_adapter import AdapterError, install_root, probe
 LICENCE_URL_DEFAULT = "https://lic.pxanetwork.com"
 # The Ed25519 public keys (64 hex chars) packages are signed with, by key id: the trust anchor, shipped inside Control.
 # A package that names a key id not listed here is refused (fail closed).
-PACKAGE_PUBKEYS = {"pkg-2026-10": "de9a21ae8508a373452f422fe110ea08e68ac72569019cb2214442facfdf7af4"}
+# Key rotation 2026-10b (4.0.1): the old and the new kid are both listed, so Control keeps working while the licence server moves
+# its signing to the new kid. The package key signs things Control installs and RUNS, so the OLD key is trusted only for the
+# artifacts already published under it (PACKAGE_PINNED, by sha256): anything new needs the new kid. 4.1 drops the old kid.
+PACKAGE_PUBKEYS = {"pkg-2026-10": "de9a21ae8508a373452f422fe110ea08e68ac72569019cb2214442facfdf7af4",
+                   "pkg-2026-10b": "3e0216325217b7cf25f642ac68af6531af61f046c17b9cda4b456272fe9acbea"}
+# retired package PUBLIC key (hex) -> the sha256 of every artifact it may still vouch for. Bound to the key, not the kid name, so
+# the old key under any other kid (or through PXA_PACKAGE_PUBKEY) is held to the same list. Filled at release from the published records.
+PACKAGE_PINNED = {
+    "de9a21ae8508a373452f422fe110ea08e68ac72569019cb2214442facfdf7af4": frozenset((
+        # pins:begin
+        "0bb4db63cc22cb51b982833e42667384d78def0b8526ad34e432a8f46a957eba",
+        "0fda9bed208443bb59fbd5750ee66a6de4b83537dab616947e508001573370c4",
+        "288ed36fcf22359684eae6028c0b853093e01b440f8acc2c44f5e5752fd3176b",
+        "41d240e2d8af683fdedce28fa6c2f4ab8fbe5dd3500d067d3811d43aedee9ba3",
+        "4826d3bffd9e9c4c00f7a058ed5864cb8d37fba799a739f84e6c4e072b1a7f9f",
+        "5e24253d01219e540c98218dcdcb5f9d0c75a32a4a402fbf2239e16427df56b3",
+        "7134659cf086e1ed7b8c3133fd637185e98e9dbd8231c97c90fa6fbde9c757a0",
+        "844aed239b07d94e0493fa6eca031b92f8437d34a171ae326aff91b238f42b75",
+        "880aa382da484955456813e9895170106cc710134d349e783f61dcce6e11dc0f",
+        "916c00247a10e95a9276448924e3c2180946cb788eed458a02b17aa7ec87aaea",
+        "99f07b18fb373781e627465f47b5ee001b6285f6a280bcf72bad3e015d0f85bb",
+        "c7d38e4ead08a692942106fa12c21036570a15513bd65348896d15b2ac85877c",
+        "d7e45ebc05254e973d31033dd77babfe8fc0f5e0966d4ea26b5861f962c890eb",
+        "e9a6060cc9f6d9db4b875f30fcd0fa69917ae48bc98b5cdd6c43d54f9e4739d0",
+        "ea910aa166fa967a9aae226f89ccfbc4e43d5c3aae4441bb62dc50b0db032820",
+        # pins:end
+    )),
+}
+RETIRED_KEY_MSG = ("This download is signed with a PXA key that was retired, and it is not one of the files published under that key, "
+                   "so it was refused. Try again later, and tell us in the PXA Network Discord #support if it keeps happening.")
 SIGN_PREFIX = b"pxqe-pkg|"
 MANIFEST_PREFIX = b"pxqe-manifest|"
 DEFAULT_PLATFORM = "linux-x86_64"
@@ -201,6 +230,22 @@ def pubkey_bytes(kid=None):
     return bytes.fromhex(h)
 
 
+def pinned_ok(pub, shas):
+    """False when `pub` is a retired package key and not every sha256 in `shas` is on its pinned list (an empty list never passes);
+    True for every other key. Call it after the signature verified, with the sha256 of each artifact the signed text vouches for."""
+    pins = PACKAGE_PINNED.get(pub.hex() if isinstance(pub, (bytes, bytearray)) else str(pub or "").lower())
+    if pins is None:
+        return True
+    shas = [str(s or "").lower() for s in shas]
+    return bool(shas) and all(s in pins for s in shas)
+
+
+def require_pinned(pub, shas):
+    """PackageError (code retired_key) unless pinned_ok(pub, shas)."""
+    if not pinned_ok(pub, shas):
+        raise PackageError(RETIRED_KEY_MSG, "retired_key")
+
+
 def check_statement(o, want_edition, platform, cuda_major, want_build=None):
     """The answer of the licence server -> the manifest this module installs from. Raises PackageError unless the statement is signed
     by a key Control trusts AND says what was asked for."""
@@ -225,6 +270,7 @@ def check_statement(o, want_edition, platform, cuda_major, want_build=None):
         raise PackageError("The signed package description does not match what was asked for (edition, platform, CUDA version or build), so it was refused.", "bad_statement")
     if not re.fullmatch(r"[A-Za-z0-9._\-]{1,64}", str(st.get("build_id"))) or not re.fullmatch(r"[0-9a-f]{64}", str(st.get("sha256") or "")):
         raise PackageError("The signed package description has no valid build id or checksum, so it was refused.", "bad_manifest")
+    require_pinned(pub, [st["sha256"]])
     size = st.get("size")
     if not (isinstance(size, int) and 0 < size <= MAX_PACKAGE):
         raise PackageError("The signed package description has no valid size, so it was refused.", "bad_manifest")
@@ -245,6 +291,13 @@ def verify_package(path, manifest):
     want = str(manifest.get("sha256") or "").lower()
     if not re.fullmatch(r"[0-9a-f]{64}", want):
         raise PackageError("The package description has no valid checksum, so it was refused.", "bad_manifest")
+    try:
+        signed_sha = str(json.loads(str(manifest.get("statement") or "")).get("sha256") or "").lower()
+    except (ValueError, AttributeError):
+        signed_sha = ""
+    if signed_sha != want:                     # the checksum that counts is the SIGNED one (and the one the pin list is checked on)
+        raise PackageError("The package description does not match its signed statement, so it was refused.", "bad_manifest")
+    require_pinned(pub, [signed_sha])
     if manifest.get("size") is not None and os.path.getsize(path) != int(manifest["size"]):
         raise PackageError("The downloaded package is the wrong size (damaged or cut short). It was deleted: try again.", "bad_checksum")
     h = hashlib.sha256()
@@ -655,6 +708,9 @@ def verify_manifest_files(root):
                 sig = f.read().strip()
         except OSError:
             raise PackageError("The package's file list signature is unreadable, so it was refused.", "bad_package")
+        # any trusted package key, the retired one included: the archive these files came from already matched a statement that
+        # passed the signature AND the pin check (check_statement / verify_package), and the licence server keeps serving Pro
+        # packages it built (manifest signed then) under statements it signs now with the new kid.
         pubs = [pubkey_bytes(k) for k in list(PACKAGE_PUBKEYS) + [None]]
         if not any(p and ed25519_verify(p, MANIFEST_PREFIX + raw, _decode_sig(sig)) for p in pubs):
             raise PackageError("The package's file list is not signed correctly, so it was refused.", "bad_signature")

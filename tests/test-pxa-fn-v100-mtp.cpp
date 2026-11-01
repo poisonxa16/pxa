@@ -48,6 +48,20 @@ int main() {
     CHECK(!pxa_fn_v100_mtp_rule(board(3, 0.5f)).on);
     CHECK(!pxa_fn_v100_mtp_rule(board(3, 0.85f)).on);
     CHECK(pxa_fn_v100_mtp_rule(board(3, 0.751f)).on);
+    // PXA_MTP_STREAK (B8): the ceiling rises to S (held at 7 = verify width 8) when its D is the rule's ceiling 5
+    {
+        auto in = board(3);
+        in.streak_env = "7";
+        auto o = pxa_fn_v100_mtp_rule(in);
+        CHECK(o.on); CHECK(o.n_max == 7); CHECK(o.deep && strcmp(o.deep, "3:0.5:0.8") == 0);
+        in.streak_env = "9:0.25:5";  CHECK(pxa_fn_v100_mtp_rule(in).n_max == 7);   // clamped to width 8
+        in.streak_env = "6";         CHECK(pxa_fn_v100_mtp_rule(in).n_max == 6);
+        in.streak_env = "7:0.25:4";  CHECK(pxa_fn_v100_mtp_rule(in).n_max == 5);   // D is not the rule's ceiling: unchanged
+        in.streak_env = "0";         CHECK(pxa_fn_v100_mtp_rule(in).n_max == 5);
+        in.streak_env = nullptr;     CHECK(pxa_fn_v100_mtp_rule(in).n_max == 5);
+        in.streak_env = "7"; in.deep_env = "3:0.5:0.8";   // an explicit PXA_MTP_DEEP: the rule changes nothing
+        CHECK(!pxa_fn_v100_mtp_rule(in).on);
+    }
     if (g_fail) {
         fprintf(stderr, "test-pxa-fn-v100-mtp: %d failure(s)\n", g_fail);
         return 1;

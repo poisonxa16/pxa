@@ -1,8 +1,8 @@
 # Docker
 
-PXA 4.0 ships one engine image, `ghcr.io/poisonxa16/pxa:v4.0`. It carries the same binaries as the Linux
+PXA 4.0 ships one engine image, `ghcr.io/poisonxa16/pxa:v4.0.1`. It carries the same binaries as the Linux
 tarball (and no models: mount a folder at `/models`). It runs as a normal user and answers a health check
-on port 8080. The tag `latest` moves only with the public release; `v4.0` stays fixed.
+on port 8080. The tag `latest` moves only with the public release; `v4.0.1` stays fixed.
 
 You need Docker and the NVIDIA Container Toolkit, and an NVIDIA driver 570 or newer on the host. The cards
 are Tesla P100, Tesla V100 and the GTX 10-series (sm_60, sm_61 and sm_70).
@@ -11,7 +11,7 @@ are Tesla P100, Tesla V100 and the GTX 10-series (sm_60, sm_61 and sm_70).
 docker run -d --name pxa --gpus '"device=0,1"' --shm-size=1g -p 8080:8080 \
     -v /path/to/models:/models:ro \
     -v pxa-cache:/work/.cache/pxa -e PXA_CACHE_DIR=/work/.cache/pxa \
-    ghcr.io/poisonxa16/pxa:v4.0
+    ghcr.io/poisonxa16/pxa:v4.0.1
 ```
 
 - [Install PXA](install.md#container): the same command, with the notes for `--gpus` and `--runtime=nvidia`.

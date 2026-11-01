@@ -1,9 +1,28 @@
 {
  "GRANT_PUBKEYS": {
-  "ent-2026-10": "58061ebc1e9ef1c68c4021df250eb1297dc9c5082a2cc04752a246e917f0a15f"
+  "ent-2026-10": "58061ebc1e9ef1c68c4021df250eb1297dc9c5082a2cc04752a246e917f0a15f",
+  "ent-2026-10b": "121e0e8bee095cbf25a48a6edac9fa285fca0bd84c3d1748158cf24c8a4f1d41"
  },
  "PLUGIN_PUBKEYS": {
-  "plug-2026-10": "b2c3d31d1d635e63170891469ff336fc89928349232271d4b49c1d683f248f71"
+  "plug-2026-10": "b2c3d31d1d635e63170891469ff336fc89928349232271d4b49c1d683f248f71",
+  "plug-2026-10b": "bc59b747eea79b5f43c0147902057c92c9e048c12994748f5fc133093629e97b"
  },
- "note": "public keys only; PXA Control embeds this file as tools/pxa_control/store/pubkeys.json at release"
+ "PLUGIN_PINNED": {
+  "plug-2026-10": [
+   "160d80d715c6f6e2e271fd7a3c3f1a05bf04cb5da5fc2263275247d884fbabca",
+   "1c116ac6118ae02ec6fd144037c7c1c312ddcb7d22c89ac2264c9ef4356f7770",
+   "1c81ccc54fb72de0ba8a611b60b83175a189941766e8b254a3f9bd0c7ce86c47",
+   "26bdfc0c92018822fbb8dcf55d05668be6099a999177a6496d640150a43773d9",
+   "34f74fc3d0b869b3c3825da6caf6ea8442de484244e451c3bcf3e6695b449ce4",
+   "37ec24efff71b6edae7bf9d79e4c7f54545d8b96b1464820dbb1c31fad8ea9a7",
+   "3a48acfb008ea0e844c8484e9cb6053668a5d87281c4045b26d6482fa46622a0",
+   "488ae6f4be8b853fc6a980abd11597aa8eddf4ecf640ad6d0cbdd6345eb3989e",
+   "5915201a82275bae57a3f0b816212596d36265e6d7773ab549054cf1e51c29ec",
+   "613fc5b60e0287e903ff0875a437395e6047758d6b92d5312ca8f81440a3dc1b",
+   "9cc5e0dd927f817c935588dd396ae55827ef23e70b7707a81abd989348d75ebf",
+   "c51ffdf65aaa53270f19e0662aa50341d4db9ecfde520dcb5c02a40679cfb711",
+   "c7c3496ad10374b45731e0e5e3542ff108854267fc1aef6e4423444218d8ddd7"
+  ]
+ },
+ "note": "public keys only; PXA Control embeds this file as tools/pxa_control/store/pubkeys.json at release. 4.0.1 (key rotation 2026-10b): old and new kids both trusted; the OLD plugin kid only for the signed-manifest sha256 values in PLUGIN_PINNED (plugins already published under it); the old kids go in 4.1"
 }

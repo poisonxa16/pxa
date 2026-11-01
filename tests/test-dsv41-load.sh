@@ -25,5 +25,6 @@ run hash           "fail:has no hash-routed layers"
 run qnorm          "fail:wrong number of tensors"
 run tid2eid        "fail:wrong number of tensors"
 run cand_not_src   "fail:is not a kv source layer"
+run cand_oob       "fail:candidate_source_layer_id 600 is out of range"
 echo "test-dsv41-load: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

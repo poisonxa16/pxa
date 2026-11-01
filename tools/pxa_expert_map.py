@@ -16,6 +16,7 @@ import csv
 import ctypes
 import json
 import os
+import re
 import shutil
 import sys
 import urllib.request
@@ -24,16 +25,49 @@ _PXQN = None
 _PXQN_TRIED = False
 
 
+# what the fast lib/ needs from the CPU (pxa-launch.py CPU_FAST_NEEDS, tools/pxa-cpu-check.sh)
+CPU_FAST_NEEDS = ("avx", "avx2", "fma", "f16c")
+
+
+def _cpu_needs_compat():
+    """True when lib-compat/ is the right library on this CPU: the wrapper picked it (PXA_CPU_LIB_PICKED=compat), it is
+    forced (PXA_CPU_LIB=compat), or the CPU lacks one of CPU_FAST_NEEDS. Same rule as pxa-launch.py cpu_isa_missing()."""
+    if os.environ.get("PXA_CPU_LIB_PICKED") == "compat":
+        return True
+    mode = os.environ.get("PXA_CPU_LIB", "auto").strip().lower()
+    if mode in ("fast", "compat"):
+        return mode == "compat"
+    try:
+        with open(os.environ.get("PXA_CPUINFO") or "/proc/cpuinfo", errors="replace") as f:
+            for line in f:
+                if re.match(r"flags\s*:", line):
+                    have = set(line.split(":", 1)[1].split())
+                    return any(x not in have for x in CPU_FAST_NEEDS)
+    except OSError:
+        pass
+    return False
+
+
 def _pxqn():
     global _PXQN, _PXQN_TRIED
     if _PXQN_TRIED:
         return _PXQN
     _PXQN_TRIED = True
     path = os.environ.get("PXA_PXQN_LIB") or "libggml-pxqn.so"
-    try:
-        _PXQN = ctypes.CDLL(path)
-    except OSError:
-        _PXQN = None
+    tries = [path]
+    # Since 4.0.1 the pxa wrapper keeps the package's lib/ off Control's own LD_LIBRARY_PATH (only the engine
+    # programs get it), so a bare name is looked for in the package as well: lib-compat/ first on a CPU that needs it.
+    E = os.environ.get("PXA_ENGINE_DIR")
+    if E and not os.environ.get("PXA_PXQN_LIB"):
+        subs = ("lib-compat", "lib") if _cpu_needs_compat() else ("lib",)
+        tries += [os.path.join(E, d, "libggml-pxqn.so") for d in subs]
+    _PXQN = None
+    for p in tries:
+        try:
+            _PXQN = ctypes.CDLL(p)
+            break
+        except OSError:
+            continue
     return _PXQN
 
 

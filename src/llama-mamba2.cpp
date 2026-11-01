@@ -78,6 +78,7 @@ ggml_tensor * delta_net::build_layer_mamba2(ggml_context * ctx0, ggml_cgraph * g
     const int64_t d_inner  = hparams.ssm_d_inner;
     const int64_t d_state  = hparams.ssm_d_state;
     const int64_t n_head   = hparams.ssm_dt_rank;
+    GGML_ASSERT(n_head > 0 && hparams.ssm_n_group > 0);   // the loader rejects such a file; never divide by zero here
     const int64_t head_dim = d_inner / n_head;
     const int64_t n_group  = hparams.ssm_n_group;
     const int64_t conv_dim = d_inner + 2*n_group*d_state;

@@ -112,7 +112,7 @@ JOBS=${JOBS:-6}
 # THE RELEASE RECIPE, in one place: the fast build and the lib-compat build differ ONLY in the CPU flags. GGML_NATIVE=OFF is
 # not optional: ggml's default is -march=native of the machine that compiles, which puts that machine's AVX-512 (or anything
 # else) into a package other people run. The stubs link flags let a container without a driver link the CUDA driver symbols.
-RECIPE_COMMON="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHS\" -DCMAKE_BUILD_TYPE=Release -DGGML_SCHED_MAX_COPIES=2 -DPXA_PXQN_ENCODER=OFF -DPXA_LOCK_PUBKEYS=pxl-2026-10:e0cd04be16b884fabac90f4843d4a0590f3962b0b1d13d96aa5df70b9a160cb1 -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DPXA_RELEASE_BUILD=ON -DCMAKE_EXE_LINKER_FLAGS=\"-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs\" -DCMAKE_SHARED_LINKER_FLAGS=\"-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs\""
+RECIPE_COMMON="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHS\" -DCMAKE_BUILD_TYPE=Release -DGGML_SCHED_MAX_COPIES=2 -DPXA_PXQN_ENCODER=OFF -DPXA_LOCK_PUBKEYS=pxl-2026-10:e0cd04be16b884fabac90f4843d4a0590f3962b0b1d13d96aa5df70b9a160cb1,pxl-2026-10b:5094e3b750267d0a5f3d1ba92bfa41b116a09556f1b5da37faf40a4093d01a18 -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DPXA_RELEASE_BUILD=ON -DCMAKE_EXE_LINKER_FLAGS=\"-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs\" -DCMAKE_SHARED_LINKER_FLAGS=\"-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs\""
 RECIPE_FAST="$RECIPE_COMMON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
 RECIPE_COMPAT="$RECIPE_COMMON -DPXA_X86_COMPAT=ON"
 BUILD_TARGETS="llama-server llama-cli llama-bench llama-perplexity llama-quantize llama-pxq-export llama-imatrix llama-gguf-split test-pxq-cpu-dot test-kv-seq-shadow test-narrow-kernel-parity"
@@ -687,7 +687,10 @@ if dimg -- 'command -v patchelf' >/dev/null 2>&1; then
     done
   '
 else
-  info "patchelf NOT found in $DEV_IMAGE — binaries rely on the wrapper scripts' LD_LIBRARY_PATH (documented in START-HERE.md)"
+  # Since 4.0.1 the wrappers no longer put lib/ on PXA Control's path, so Control's own runs of the engine programs and a
+  # direct bin/llama-server need RUNPATH $ORIGIN/../lib. A package without it is not shippable (use DEV_IMAGE=pxa-sm60-dev:pkg
+  # or a pxa-release-build image: both carry patchelf).
+  die "patchelf NOT found in $DEV_IMAGE: the binaries would have no RUNPATH \$ORIGIN/../lib (set DEV_IMAGE to an image with patchelf)"
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -764,18 +767,23 @@ cat > "$STAGE/pxa-launch" <<'WRAP'
 # tools/pxa-launch.py's own engine auto-detection (ENGINE_DIR_CANDIDATES) looks for a
 # BUILD-TREE layout (E/bin, E/src, E/ggml/src, E/examples/mtmd) — this release tarball ships a
 # flat bin/ + lib/ instead, so auto-detection alone would not find bin/llama-server here.
-# PXA_ENGINE_DIR=$HERE tells it exactly where to look; LD_LIBRARY_PATH=$HERE/lib is then
-# preserved by pxa-launch.py's own engine_ld_path() (which appends the build-tree subdirs it
-# finds under PXA_ENGINE_DIR — none, in this flat layout — to whatever LD_LIBRARY_PATH it
-# inherits, which is this line's $HERE/lib).
+# PXA_ENGINE_DIR=$HERE tells it exactly where to look. The bundled lib/ (and lib-compat/) is NOT
+# exported here: pxa-launch.py's engine_ld_path() puts $HERE/lib (lib-compat/ first when this CPU
+# needs it) on the path of each engine program it starts, and the binaries carry RUNPATH
+# $ORIGIN/../lib. Exporting it for Python too (4.0.0) leaked our older libstdc++ into every system
+# program PXA Control starts: xdg-open -> kde-open (Qt 6) died with "GLIBCXX_3.4.32 not found" on
+# Debian 13 / GCC 14 distributions. The user's own LD_LIBRARY_PATH is passed on unchanged.
 HERE=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 export PXA_ENGINE_DIR="$HERE"
-export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# A CPU without AVX2 / FMA / F16C gets lib-compat/ first on the path (one plain line says so): the fast lib/ would stop with
-# "Illegal instruction" while it loads. tools/pxa-launch.py makes the same choice for the servers it starts itself.
+# A CPU without AVX2 / FMA / F16C needs lib-compat/ (the fast lib/ would stop with "Illegal instruction"); the check
+# prints its one plain line here and tools/pxa-launch.py makes the same choice for the servers it starts. The path
+# change pxa_cpu_pick makes is for engine programs only, so the user's value is put back before Python starts.
 if [ -r "$HERE/tools/pxa-cpu-check.sh" ]; then
+  if [ -n "${LD_LIBRARY_PATH+x}" ]; then _pxa_user_ldp_set=1; _pxa_user_ldp=$LD_LIBRARY_PATH; else _pxa_user_ldp_set=0; fi
   . "$HERE/tools/pxa-cpu-check.sh"
   pxa_cpu_pick "$HERE/lib-compat" || exit 1
+  if [ "$_pxa_user_ldp_set" = 1 ]; then export LD_LIBRARY_PATH="$_pxa_user_ldp"; else unset LD_LIBRARY_PATH; fi
+  unset _pxa_user_ldp _pxa_user_ldp_set
 fi
 # No __pycache__ inside the package (review N3): PXA Control and its python children write no bytecode next to tools/.
 export PYTHONDONTWRITEBYTECODE=1
@@ -787,6 +795,8 @@ cat > "$STAGE/run-server.sh" <<'WRAP'
 #!/bin/bash
 # run-server.sh — run llama-server directly (no auto-tuning) with this package's ./lib set up.
 HERE=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+# the user's own value, for PXA Control below (a Python program that starts system programs such as the browser opener)
+if [ -n "${LD_LIBRARY_PATH+x}" ]; then _pxa_user_ldp_set=1; _pxa_user_ldp=$LD_LIBRARY_PATH; else _pxa_user_ldp_set=0; fi
 export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # A CPU without AVX2 / FMA / F16C gets lib-compat/ first on the path (one plain line says so): the fast lib/ would stop with
 # "Illegal instruction" while it loads. PXA_CPU_LIB=fast|compat forces a choice.
@@ -814,7 +824,9 @@ if [ "$pxa_control" = 0 ]; then
 fi
 if [ "$pxa_control" = 1 ] && [ "${PXA_CONTROL:-}" != "0" ] && [ -f "$HERE/tools/pxa-launch.py" ] \
    && command -v python3 >/dev/null 2>&1; then
-  PXA_ENGINE_DIR="${PXA_ENGINE_DIR:-$HERE}" PYTHONDONTWRITEBYTECODE=1 python3 -B "$HERE/tools/pxa-launch.py" --control-for-pid $$ || true
+  # Control runs with the user's LD_LIBRARY_PATH, not the engine's (see pxa-launch above); a subshell keeps this one's.
+  ( if [ "$_pxa_user_ldp_set" = 1 ]; then export LD_LIBRARY_PATH="$_pxa_user_ldp"; else unset LD_LIBRARY_PATH; fi
+    PXA_ENGINE_DIR="${PXA_ENGINE_DIR:-$HERE}" PYTHONDONTWRITEBYTECODE=1 python3 -B "$HERE/tools/pxa-launch.py" --control-for-pid $$ ) || true
 fi
 exec "$HERE/bin/llama-server" "$@"
 WRAP
@@ -906,7 +918,15 @@ fi
 if [ -d "$EXPORT/tools/pxa_chat" ]; then
   cp -a "$EXPORT/tools/pxa_chat" "$STAGE/tools/pxa_chat"
   find "$STAGE/tools/pxa_chat" -name __pycache__ -prune -exec rm -rf {} +
+  # the in-house agent binding needs PXA Anibal, which never ships (see below); routes.py imports it lazily and answers
+  # 503 agent_unavailable without it (4.0.0 shipped pxa_chat without these two files)
+  rm -f "$STAGE/tools/pxa_chat/vigil_bind.py" "$STAGE/tools/pxa_chat/test_vigil_bind.py"
 fi
+# NOT staged (4.0.1 package): the plugin platform (tools/pxa_plugins), PXA Anibal (tools/anibal) and its
+# compat alias tools/vigil.py. Plugins and Anibal never ship in the package (security review F4b, plugins plan S9; owner
+# 2026-10-21: no plugin in any package, Anibal included); plugin_leak_guard below refuses a stage that has them, so staging
+# them here made every tree that carries them unpackageable. PXA Control and the Chat tab run without them (4.0.0 shipped
+# without them).
 # The shipped catalog is the PUBLIC table (owner 2026-10-08: no closed rows in what ships), the one the engine embeds:
 # a REF with the closed sources goes through the release filter, and then the catalog copy and every shipped binary but
 # the closed library itself are checked for closed lever names (a BUILD_DIR configured with PXA_LEVER_CATALOG_FULL=ON,

@@ -1,18 +1,20 @@
 /* PXA Control service worker. Network first for the app shell, then this cache.
    A request under /api/ is never answered here, so chat streams stay on the network. */
-var CACHE = "pxa-shell-v1";
+var CACHE = "pxa-shell-v3";
 var SHELL = [
   "/", "/favicon.png", "/mark.png", "/agent-manifest.json",
   "/agent-icon-192.png", "/agent-icon-512.png",
-  "/encode.css", "/live.css", "/profiles.css", "/agent.css",
+  "/theme.css", "/encode.css", "/live.css", "/profiles.css", "/agent.css",
   "/vendor/katex/katex.min.css", "/vendor/katex/katex.min.js",
   "/agent-markdown.css", "/agent-attach.css", "/agent-actions.css", "/agent-params.css",
   "/agent-context.css", "/agent-ux.css", "/agent-stream.css", "/agent-memory.css",
+  "/agent-vigil.css",
   "/chat.css", "/chat-history.css", "/chat-markdown.css", "/chat-actions.css",
   "/chat-stream.css", "/chat-attach.css", "/chat-params.css", "/chat-context.css", "/chat-ux.css",
   "/encode.js", "/live.js", "/profiles.js", "/mqtt.js", "/agent.js",
   "/agent-markdown.js", "/agent-attach.js", "/agent-actions.js", "/agent-params.js",
   "/agent-context.js", "/agent-ux.js", "/agent-stream.js", "/agent-memory.js",
+  "/agent-vigil.js",
   "/chat.js", "/chat-history.js", "/chat-markdown.js", "/chat-actions.js",
   "/chat-stream.js", "/chat-attach.js", "/chat-params.js", "/chat-context.js", "/chat-ux.js"
 ];

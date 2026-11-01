@@ -1111,7 +1111,7 @@ def memory_tool(name, a, ctx):
         fact = str(a.get("fact") or a.get("fact_or_id") or a.get("id") or "").strip()
     if name in ("remember", "memory_save"):
         try:
-            r = ctx.memory.add(fact, source=ctx.chat_id or None)
+            r = ctx.memory.add(fact, source=ctx.chat_id or None, provenance="tool")
         except M.MemoryError_ as e:
             ctx.memory_event = {"op": "refused", "text": M.clean(fact)[:120] if "secret" not in str(e) else "",
                                 "why": str(e)}

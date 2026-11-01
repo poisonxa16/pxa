@@ -71,6 +71,14 @@ then there these they this those to too us was we were what when where which who
 yours user user's users also very really please remember forget note save that's""".split())
 
 
+PROVENANCES = ("user_authored", "user_confirmed", "tool", "untrusted")
+
+
+def _prov(p):
+    """who wrote a fact; anything unknown is untrusted (fail closed)."""
+    return p if p in PROVENANCES else "untrusted"
+
+
 class MemoryError_(ValueError):
     """a fact that may not be stored (secret, style rule, empty, too long). str() is the plain-words reason."""
 
@@ -183,7 +191,7 @@ class Store(object):
     def facts(self):
         return sorted(self.load()["facts"], key=lambda f: (not f.get("pinned"), -(f.get("updated") or 0)))
 
-    def add(self, text, source=None, pinned=False, created=None):
+    def add(self, text, source=None, pinned=False, created=None, provenance=None):
         """-> {"fact", "status": "added"|"updated"|"same", "evicted": [...]}. Raises MemoryError_ on refusal."""
         t = clean(text)
         why = screen(t)
@@ -202,11 +210,14 @@ class Store(object):
                 best.update(updated=now)
                 if status == "updated":
                     best["text"] = t
+                    best["provenance"] = _prov(provenance)   # new text: its writer decides trust
                 if pinned:
                     best["pinned"] = True
                 return {"fact": dict(best), "status": status, "evicted": []}
             f = {"id": f"m{d['next_id']}", "text": t, "created": created or now, "updated": now,
-                 "source": source, "pinned": bool(pinned)}
+                 "source": source, "pinned": bool(pinned),
+                 # who wrote it: "user_authored" (typed by the user) or "tool" (the model's remember tool)
+                 "provenance": _prov(provenance)}
             d["next_id"] += 1
             d["facts"].append(f)
             evicted = []
@@ -282,7 +293,8 @@ class Store(object):
                 return None
             f = {"id": str(fact.get("id") or f"m{d['next_id']}"), "text": clean(fact["text"]),
                  "created": fact.get("created") or time.time(), "updated": fact.get("updated") or time.time(),
-                 "source": fact.get("source"), "pinned": bool(fact.get("pinned"))}
+                 "source": fact.get("source"), "pinned": bool(fact.get("pinned")),
+                 "provenance": _prov(fact.get("provenance"))}
             if not re.match(r"^m\d+$", f["id"]):
                 f["id"] = f"m{d['next_id']}"
             d["next_id"] = max(d["next_id"], int(f["id"][1:]) + 1)

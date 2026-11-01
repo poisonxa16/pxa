@@ -195,7 +195,7 @@
 .ag-chip:hover,.ag-chip.ag-menu-open{border-color:var(--dim)}
 .ag-chip-k{color:var(--faint);font-weight:500}
 .ag-chip .dot{width:8px;height:8px}
-.ag-srv-n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ag-srv-n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:6.5rem}
 .ag-send{width:34px;height:34px;border-radius:50%;border:0;background:var(--accent);color:var(--on-accent);display:grid;place-items:center;cursor:pointer;flex:none}
 .ag-send:hover{background:var(--accent-hover)}
 .ag-send:disabled{background:var(--surface-3);color:var(--faint);cursor:not-allowed}
@@ -273,7 +273,7 @@
   .ag-ctools{display:none}
   .ag-box-row{flex-wrap:nowrap}
   #ag-mode-chip{flex:none;max-width:42%}
-  #ag-srv{flex:1 1 auto;min-width:0;max-width:none}
+  #ag-srv{flex:1 1 auto;min-width:9rem;max-width:none}
 }
 /* ---- memory across chats ---- */
 .ag-memb{display:flex;align-items:center;gap:8px;margin:6px 10px 4px;height:34px;padding:0 10px;border:1px solid transparent;border-radius:var(--r1);background:none;color:var(--dim);font-size:var(--fs-1);font-weight:600;cursor:pointer;text-align:left}

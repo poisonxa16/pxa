@@ -1524,7 +1524,13 @@ def load_pubkeys(path=None):
     GRANT_PUBKEYS.update(ok(d.get("GRANT_PUBKEYS")))
     try:
         from .. import plugins as _plugins
-        _plugins.PLUGIN_PUBKEYS.update(ok(d.get("PLUGIN_PUBKEYS")))
+        pk = ok(d.get("PLUGIN_PUBKEYS"))
+        _plugins.PLUGIN_PUBKEYS.update(pk)
+        # 4.0.1 rotation: {"PLUGIN_PINNED": {kid: {signed-manifest sha256: note}}}: that kid's key verifies only those manifests
+        for kid, pins in (d.get("PLUGIN_PINNED") or {}).items() if isinstance(d.get("PLUGIN_PINNED"), dict) else ():
+            if str(kid) in pk and isinstance(pins, (dict, list)):
+                got = _plugins.PLUGIN_PINNED.setdefault(pk[str(kid)], set())
+                got.update(str(h).lower() for h in pins if re.fullmatch(r"[0-9a-fA-F]{64}", str(h)))
     except Exception:  # noqa: BLE001 - the plugin keys are optional here
         pass
     return d

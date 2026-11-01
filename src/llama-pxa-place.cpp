@@ -466,12 +466,18 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
                 cost.layer_us = PXA_XC_SMALLTAIL_ASYNC_LAYER_US;
             }
             const bool   ring_lend  = in.xc_ring_lend && !in.xc_cold_zc;   // R3a: CPU cold path only (zero-copy reads the ring from 65 tokens)
-            const int    ring_l     = (in.xc_ring1_auto && small_tail ? 1 : 2) * (ring_lend ? -1 : 1);
+            // ring floor (pxa_place_input::xc_ring_lend_floor): a load whose prefill ubatches stream keeps one (or two)
+            // layers of ring in VRAM (charged, allocated at load, not lent) and lends the rest, so a wide graph copies its cold experts
+            // through it instead of reading them in place over the link
+            const bool   ring_floor = ring_lend && in.xc_ring_lend_floor > 0;
+            const bool   ring_lent  = ring_lend && !ring_floor;
+            const int    ring_n     = in.xc_ring1_auto && small_tail ? 1 : 2;   // the ring the plan charges without lending
+            const int    ring_l     = ring_floor ? (in.xc_ring_lend_floor >= 2 ? ring_n : 1) : ring_n * (ring_lent ? -1 : 1);
             const size_t credit     = in.xc_slack_credit + (small_tail ? in.xc_slack_auto : 0);
             const size_t xc_target = target + in.xc_extra_compute > credit ? target + in.xc_extra_compute - credit : 1;
             bool xc_ok = have && pxa_xc_choose(layers, eb, tb, cnts, in.n_expert, xc_target, xc, cost, ring_l);
             const size_t guard_xc = guard_for(in.xc_extra_compute);
-            if (xc_ok && guard_xc > 0 && xc.cold_bytes < (ring_lend ? 0 : xc.ring) + guard_xc) {
+            if (xc_ok && guard_xc > 0 && xc.cold_bytes < (ring_lent ? 0 : xc.ring) + guard_xc) {
                 // bug #339: the plan the credit allows misses the guard: choose again with the guard as the target (the same
                 // search, so the cheapest cold set that leaves the floor free); none -> whole layers with the guard below
                 pxa_xc_choice xg;
@@ -494,7 +500,8 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
                 for (const auto & c : cnts) n_all += c.size();
                 r.dev_stream[d] = xc.cold_bytes;
                 r.dev_ring[d]   = xc.ring;
-                r.xc_ring_lent  = r.xc_ring_lent || ring_lend;
+                r.xc_ring_lent  = r.xc_ring_lent || ring_lent;
+                r.xc_ring_floor = r.xc_ring_floor || ring_floor;
                 r.streamed     += xc.cold_bytes;
                 ok = true; xc_done = true;
                 any_expert_stream = true;
@@ -503,7 +510,8 @@ pxa_place_result pxa_place_plan(const pxa_place_input & in) {
                         "cost %.0f us/layer + %.0f us/%% miss, sm_%d; ring %d layer%s%s, slack credit %.0f MiB%s)",
                         n_cold, n_all, xc.n_layers, layers.size(), xc.cap, 100.0*r.xc_miss,
                         in.xc_extra_compute/(double)MiB, in.xc_cold_zc ? "zero-copy" : "cpu", cost.layer_us, cost.miss_us, dev.cc,
-                        abs(ring_l), abs(ring_l) == 1 ? "" : "s", ring_lend ? " LENT (not charged, on demand)" : "",
+                        abs(ring_l), abs(ring_l) == 1 ? "" : "s",
+                        ring_lent ? " LENT (not charged, on demand)" : ring_floor ? " (lend floor: the rest of the ring LENT)" : "",
                         credit/(double)MiB, small_tail ? ", small-tail rule" : "");
                 what = xc_what;
             }

@@ -14,7 +14,7 @@ from .routes import HostPolicy      # so a host can build the policy without rea
 
 __version__ = "1.0"
 UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
-AGENT_PLUGINS = ("markdown", "attach", "actions", "params", "context", "ux", "stream", "memory")
+AGENT_PLUGINS = ("markdown", "attach", "actions", "params", "context", "ux", "stream", "memory", "vigil")
 # routes whose request body may be larger than Control's 1 MiB default: a run carries up to 4 images of <=1.4 MB
 # of base64 each (routes.take_images), so 1 MiB refused any image over ~750 KB [C13]
 BODY_LIMITS = {"/api/chat/run": 8 << 20}

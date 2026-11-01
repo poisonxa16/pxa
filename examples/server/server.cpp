@@ -1,5 +1,6 @@
 #pragma warning(disable : 4996)
 #include "server-context.h"
+#include "pxa-lan-nudge.h"   // 4.0.1: warn on a non-loopback bind with no API key
 #include "pxa-ckpt-evict.h"
 #include "pxa-spec-load.h"
 #include "pxa-mtp-cache-only.h"
@@ -3337,6 +3338,7 @@ static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params
             fin.steered       = (sel && *sel && atoi(sel) != 0) || pxa_spec_policy_enabled();
             fin.set_env       = getenv("PXA_FLASHNEXT_V100_SET");
             fin.deep_env      = getenv("PXA_MTP_DEEP");
+            fin.streak_env    = getenv("PXA_MTP_STREAK");
             const pxa_fn_v100_mtp_out fo = pxa_fn_v100_mtp_rule(fin);
             if (fo.on && pxa_hs_env_apply_this()) {
                 const int was = fin.mtp_n_max;
@@ -3649,6 +3651,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    {   // the LAN API-key nudge (pxa-lan-nudge.h): warn, never refuse
+        const std::string nudge = pxa_lan_nudge(params.hostname, params.api_keys.size());
+        if (!nudge.empty()) {
+            LOG_WARNING(nudge.c_str(), {});
+        }
+    }
+
     std::unordered_map<std::string, std::string> log_data;
 
     log_data["hostname"] = params.hostname;
@@ -3833,7 +3842,9 @@ int main(int argc, char ** argv) {
     // PXA_XCACHE_PLAN_V2: the expert-cache planner prices a cold expert per speculative ROUND, so it needs the number of tokens one
     // target decode verifies (1 + the largest draft depth of the chain) BEFORE the model is planned. overwrite=0: an exported value wins.
     if (params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) || params.has_mtp) {
-        const int32_t nmax = params.speculative.get_max_stage_n_max();
+        int32_t nmax = params.speculative.get_max_stage_n_max();
+        // PXA_MTP_STREAK: the chain runs past D only after a full cycle, so the plan keeps pricing D + 1 (the plan without it)
+        if (pxa_mtp_streak().on && nmax > pxa_mtp_streak().deep) nmax = pxa_mtp_streak().deep;
         if (nmax > 0) setenv("PXA_XCACHE_VERIFY_WIDTH", std::to_string(nmax + 1).c_str(), 0);
     }
 

@@ -35,6 +35,8 @@
 #include <iostream>
 #include <regex>
 #include <exception>
+#include <filesystem>
+#include <system_error>
 
 // bug #221: the most alternatives a request may ask for per token (n_probs / logprobs / top_logprobs).
 // OpenAI caps top_logprobs at 20; 1024 leaves room for local tooling without letting one request
@@ -721,9 +723,11 @@ static bool pxa_ckpt_prompt_end(); // PXA_CKPT_PROMPT_END: defined with the chec
 void server_context::init() {
     // PXA_DUMP_MTP_EMBD_v1: the dump directory must exist; the rows exist only with the MTP head armed
     if (!params_base.pxa_dump_mtp_embd.empty()) {
-        const std::string cmd = "mkdir -p '" + params_base.pxa_dump_mtp_embd + "'";
-        if (system(cmd.c_str()) != 0) {
-            LOG_ERROR("PXA_DUMP_MTP_EMBD: cannot create the dump directory", {{"dir", params_base.pxa_dump_mtp_embd}});
+        // no shell: the operator's path is a path, never a command line (4.0 security review L1)
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(params_base.pxa_dump_mtp_embd), ec);
+        if (ec) {
+            LOG_ERROR("PXA_DUMP_MTP_EMBD: cannot create the dump directory", {{"dir", params_base.pxa_dump_mtp_embd}, {"error", ec.message()}});
         }
         const char * lz = getenv("PXA_MTP_LAZY_WARMUP");
         LOG_INFO("PXA_DUMP_MTP_EMBD: writing the MTP conditioning rows of every prompt", {

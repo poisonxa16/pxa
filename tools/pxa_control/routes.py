@@ -28,6 +28,9 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/store-mock.json": ("store-mock.json", "application/json; charset=utf-8"),
           "/mark.png": ("mark.png", "image/png"),
           "/favicon.png": ("mark.png", "image/png"),
+          # the shared design tokens (Control, the Assistant view and Vigil): an
+          # absolute path, so a PXA_CONTROL_UI_DIR override still gets them
+          "/theme.css": (os.path.join(HERE, "pxa_chat", "ui", "theme.css"), "text/css; charset=utf-8"),
           # the installable app (PWA): manifest, shell service worker, its registration, icons and
           # the host picker (also the offline page and the Android app's start page)
           "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json; charset=utf-8"),

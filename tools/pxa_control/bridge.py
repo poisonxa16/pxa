@@ -1,6 +1,7 @@
 """PXA Control: the launcher bridge -- the auto-start rule, the run records a second `pxa` reads, and starting or
 reusing a background Control (`ensure_control`). See the comment block in core above CONTROL_IDLE_S."""
 from .core import *  # noqa: F401,F403
+from .core import _NO_PROXY_OPENER
 from .auth import *  # noqa: F401,F403
 
 
@@ -56,6 +57,7 @@ def control_answers(port, token=None, timeout=1.5):
     try:
         rq = urllib.request.Request(f"http://127.0.0.1:{int(port)}/api/health",
                                     headers={"X-PXA-Token": token} if token else {})
+        # never through http_proxy / the system proxy: the token must not leave the machine (4.0 security review M3)
         with _NO_PROXY_OPENER.open(rq, timeout=timeout) as r:
             return "control_version" in json.loads(r.read().decode("utf-8", "replace") or "{}")
     except Exception:       # noqa: BLE001

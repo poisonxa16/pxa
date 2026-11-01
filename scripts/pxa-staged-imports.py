@@ -135,9 +135,51 @@ def view_stage(stage):
     return out
 
 
+def _dockerignore(tree):
+    """-> ignored(rel) for the tree's .dockerignore (docker's rules: '**' spans directories and may match none, '*' and
+    '?' stay inside one path part, a matching directory takes everything under it, a later '!' line re-includes)."""
+    rules = []
+    try:
+        lines = open(os.path.join(tree, ".dockerignore"), encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        lines = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        neg = ln.startswith("!")
+        pat = ln[1:] if neg else ln
+        pat = pat.strip("/")
+        rx, i = "", 0
+        while i < len(pat):
+            if pat.startswith("**/", i):
+                rx, i = rx + "(?:.*/)?", i + 3
+            elif pat.startswith("**", i):
+                rx, i = rx + ".*", i + 2
+            elif pat[i] == "*":
+                rx, i = rx + "[^/]*", i + 1
+            elif pat[i] == "?":
+                rx, i = rx + "[^/]", i + 1
+            else:
+                rx, i = rx + re.escape(pat[i]), i + 1
+        rules.append((neg, re.compile(rx + r"\Z")))
+
+    def ignored(rel):
+        parts = rel.replace(os.sep, "/").strip("/").split("/")
+        cands = ["/".join(parts[:k]) for k in range(1, len(parts) + 1)]
+        hit = False
+        for neg, rx in rules:
+            if any(rx.match(c) for c in cands):
+                hit = not neg
+        return hit
+    return ignored
+
+
 def view_image(dockerfile, tree):
-    """module name -> path, for the tools/ python files the image COPYs (flat /usr/local/bin)."""
+    """module name -> path, for the tools/ python files the image COPYs (flat /usr/local/bin); a file the tree's
+    .dockerignore keeps out of the build context never reaches the image, so it is not in the view."""
     text = open(dockerfile, encoding="utf-8", errors="replace").read()
+    ignored = _dockerignore(tree)
     out = {}
     for line in text.splitlines():
         if not line.startswith("COPY ") or "tools/" not in line:
@@ -147,11 +189,12 @@ def view_image(dockerfile, tree):
                 continue
             src = os.path.join(tree, tok)
             if tok.endswith(".py"):
-                out[os.path.basename(tok)[:-3]] = src
+                if not ignored(tok):
+                    out[os.path.basename(tok)[:-3]] = src
             elif os.path.isdir(src):                       # a package copied whole
                 out[os.path.basename(tok)] = os.path.join(src, "__init__.py")
                 for f in sorted(os.listdir(src)):
-                    if f.endswith(".py"):
+                    if f.endswith(".py") and not ignored(tok.rstrip("/") + "/" + f):
                         out[f[:-3]] = os.path.join(src, f)
     return out
 

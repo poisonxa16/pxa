@@ -24,6 +24,10 @@ import sys as _sys
 _sys.dont_write_bytecode = True
 import types as _types
 
+# Every program Control starts: no console window on Windows, no package libraries for system programs on Linux (childenv.py).
+from . import childenv as _childenv                       # noqa: E402
+_childenv.install()
+
 from . import core, auth, bridge, routes, server          # noqa: E402  (order: each imports the ones before it)
 from .core import *  # noqa: F401,F403
 from .auth import *  # noqa: F401,F403

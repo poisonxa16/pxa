@@ -211,6 +211,7 @@ def verify_manifest(o, base, channel, platform, cuda_major):
         if not re.fullmatch(r"[0-9a-f]{64}", sha) or not isinstance(size, int) or not (0 < size <= MAX_FILE):
             raise PackageError("The signed library description has no valid checksum or size for %s, so it was refused." % name, "bad_manifest")
         out_files.append({"name": name, "sha256": sha, "size": int(size)})
+    pkg.require_pinned(pub, [f["sha256"] for f in out_files])   # a retired package key: only files published under it (4.0.1)
     return {"lib_id": lib_id, "version": version, "channel": channel, "platform": platform, "cuda_major": cuda_major,
             "min_engine": str(st.get("min_engine") or ""), "sm": [int(x) for x in st.get("sm") or [] if isinstance(x, int)],
             "files": out_files, "kid": str(o.get("kid") or ""), "manifest": o["manifest"], "signature": o["signature"],

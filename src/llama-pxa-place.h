@@ -94,6 +94,14 @@ struct pxa_place_input {
     // go to resident experts and the CUDA backend allocates the ring on demand when a wide graph streams (zero-copy reads when the VRAM
     // is not there; ggml/src/ggml-cuda/pxa/pxa-stream.cuh). The zero-copy cold path reads the ring from 65 tokens up: never lent there.
     bool   xc_ring_lend     = false;
+    // Ring floor (PXA_XCACHE_RING_LEND_FLOOR; llama.cpp sets it, a hand-built input keeps the R3a plan): with
+    // xc_ring_lend, a load whose ubatch is at or above the CPU-alias width (its prefill graphs stream the cold experts) keeps a
+    // ONE-layer ring in VRAM (the small-tail ring: the largest cold layer + the largest cold tensor + 32 MiB, charged and allocated at
+    // load) and lends the rest of the two-layer ring. A fully lent ring is not there when a 4096-token prefill ubatch wants it (the
+    // VRAM is short), so every cold expert was read in place over the link, which the RIX id-GEMV re-reads per token tile (G30 RC
+    // 57ada390ef: pp ~105 t/s vs 401 with the ring; card-4 quick test 10-29: RING_LEND=0 alone 548-628 pp8k / 592 pp28k vs 72-75 /
+    // 74-78 lent). 0 = lend all (R3a), 1 = keep one layer (lend the rest), 2 = keep the ring the plan charges without lending (the unlent plan exactly).
+    int    xc_ring_lend_floor = 0;
     // C042 small tail on the async CPU-pool cold path (2026-10-19; llama.cpp sets it when PXA_XCACHE_ASYNC is on and
     // PXA_XCACHE_SMALLTAIL_COST is not =0): inside the small-tail scope the R4 per-layer price is PXA_XC_SMALLTAIL_ASYNC_LAYER_US
     bool   xc_async_cost    = false;
@@ -151,6 +159,7 @@ struct pxa_place_result {
     std::vector<size_t> dev_deficit;  // bytes that did not fit per device (0 = fits)
     std::vector<size_t> dev_ring;     // ring bytes per device
     bool        xc_ring_lent = false; // R3a: dev_ring is lent (not charged by the plan; the backend allocates it on demand)
+    bool        xc_ring_floor = false; // xc_ring_lend_floor: lending asked, dev_ring is the one-layer floor (charged, allocated at load)
     size_t      streamed = 0;
     std::string reason;
 };

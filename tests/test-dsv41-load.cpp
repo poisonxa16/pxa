@@ -1,9 +1,10 @@
 // DeepSeek-V4.1 ("deepseek41") loader check.
 //
-//   test-dsv41-load MODEL.gguf [ok|fail[:substring]]
+//   test-dsv41-load MODEL.gguf [ok|load|fail[:substring]]
 //
 // ok   : the model must load (CPU, mmap, no context) and every per-layer tensor the
 //        validated hparams call for must be bound, every tensor V4.1 lacks must be null.
+// load : the model must load (any arch; no V4.1 layout checks).
 // fail : loading must fail (and the error log must contain `substring` if one is given).
 //
 // The loader itself already enforces "every tensor in the file is bound" (n_created ==
@@ -37,7 +38,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string expect = argc > 2 ? argv[2] : "ok";
-    const bool want_ok = expect == "ok";
+    const bool want_ok = expect == "ok" || expect == "load";
     const std::string want_sub = (!want_ok && expect.size() > 5) ? expect.substr(5) : "";
 
     llama_log_set(log_cb, nullptr);
@@ -69,6 +70,12 @@ int main(int argc, char ** argv) {
     if (!model) {
         fprintf(stderr, "FAIL: %s did not load. Log:\n%s", argv[1], g_log.c_str());
         return 1;
+    }
+    if (expect == "load") {   // any arch: it loads, nothing more (the control of test-hparams-hostile.sh)
+        printf("PASS loaded %s (n_layer %u, nextn %u)\n", argv[1], model->hparams.n_layer,
+               model->hparams.nextn_predict_layers);
+        llama_free_model(model);
+        return 0;
     }
 
     const auto & hp = model->hparams;

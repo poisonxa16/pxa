@@ -13,8 +13,13 @@ permissions:
 
 jobs:
   linux-x64-cuda12:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, ARM64, oracle, vigil]
     steps:
+      - name: Refuse non-x86 runners
+        if: runner.arch != 'X64'
+        run: |
+          echo "::error::x86_64 CUDA job: needs an x86 self-hosted runner"; exit 1
+
       - uses: actions/checkout@v4
 
       - name: Install CUDA toolkit

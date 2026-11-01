@@ -244,6 +244,7 @@ def verify_beta_files(o):
                 or size <= 0 or size > pkg.MAX_PACKAGE or role not in ("tarball", "notes", "docker") or name in files):
             raise PackageError("The signed file list names an invalid file, so it was refused.", "bad_manifest")
         files[name] = {"name": name, "role": role, "size": size, "sha256": sha, "url": urls.get(name, "")}
+    pkg.require_pinned(pub, [f["sha256"] for f in files.values()])   # a retired package key: only files published under it (4.0.1)
     try:
         exp = int(o.get("expires") or 0)
     except (TypeError, ValueError):
@@ -379,6 +380,7 @@ def verify_release(o, base, channel, platform, cuda_major):
         by_role[role] = {"name": name, "sha256": sha, "size": int(size), "role": role}
     if sorted(by_role) != ["notes", "tarball"]:
         raise PackageError("The signed engine release does not list a tarball and its notes, so it was refused.", "bad_manifest")
+    pkg.require_pinned(pub, [by_role["tarball"]["sha256"], by_role["notes"]["sha256"]])   # a retired package key: published files only
     return {"build_id": bid, "version": version, "channel": channel, "platform": platform, "cuda_major": cuda_major,
             "sm": [int(x) for x in st.get("sm") or [] if isinstance(x, int)], "tarball": by_role["tarball"], "notes": by_role["notes"],
             "kid": str(o.get("kid") or ""), "manifest": o["manifest"], "signature": o["signature"], "base": base.rstrip("/"),
@@ -610,6 +612,7 @@ def notes(d=None, base=None, key=None):
             raise PackageError("The saved release statement no longer verifies, so the notes are not shown.", "bad_signature")
         st = json.loads(s["manifest"])
         want = [f for f in st.get("files") or [] if isinstance(f, dict) and f.get("role") == "notes"]
+        pkg.require_pinned(pub, [f.get("sha256") for f in want])
         p = os.path.join(d, NOTES_DIR, str(s.get("build_id")) + ".md")
         if not want or not os.path.isfile(p) or os.path.getsize(p) > NOTES_MAX or _sha256(p) != want[0].get("sha256"):
             raise PackageError("The saved release notes do not match the signed release, so they are not shown.", "bad_notes")

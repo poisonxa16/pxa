@@ -1,0 +1,55 @@
+/* PXA Control's design tokens: the one theme shared by Control (pxa_control_ui/index.html), the
+   Assistant view (pxa_chat/ui/agent*.css) and Vigil (vigil/ui/control.css, hud.css, presence.js).
+   Dark by default; [data-theme=light] is Control's light toggle. Served at /theme.css by Control,
+   at /api/chat/vigil/ui/theme.css to the Control-hosted panes and at /vigil/theme.css by :7878.
+   Change a value here and every surface follows; add no page-specific rules here, tokens only. */
+:root{
+  color-scheme:dark;
+  --bg:#0F1012;--surface:#16171A;--surface-2:#1C1E22;--surface-3:#25272C;
+  --line:#26282E;--line-2:#363940;--text:#ECEDEF;--dim:#A1A6AF;--faint:#868B95;--on-accent:#0B1220;
+  --accent:#6B9BF2;--accent-hover:#86AEF5;--accent-2:#5C8DEB;--accent-text:#9DBCF7;--link:#9DBCF7;
+  --grad:linear-gradient(90deg,var(--accent),var(--accent-2));
+  --ok:#3DD39F;--warn:#F2B33D;--bad:#FF6B6B;--neutral:#8B94A5;
+  --ok-bg:rgba(61,211,159,.10);--warn-bg:rgba(242,179,61,.10);--bad-bg:rgba(255,107,107,.10);--accent-bg:rgba(107,155,242,.12);
+  --scrim:rgba(0,0,0,.6);--tint:rgba(255,255,255,.07);--tint-2:rgba(0,0,0,.25);
+  /* Vigil presence states (orb, HUD): cool hues; amber is kept for the one state that needs you */
+  --state-idle:#5C8DEB;--state-listening:#5FC8E8;--state-thinking:#8E86F0;--state-speaking:#9DBCF7;--state-tool:#4FC1B8;--state-approval:#F2B33D;
+  /* categorical chart palette: validated for colour-vision safety and 3:1 contrast on both the dark and the light card surface; same values in both themes */
+  --series-1:#3987E5;--series-2:#D95926;--series-3:#199E70;--series-4:#C98500;--series-5:#D55181;--series-6:#008300;--series-7:#9085E9;--series-8:#E66767;
+  --chart-grid:#25272C;--chart-text:#A1A6AF;
+  --shadow:0 1px 2px rgba(0,0,0,.35),0 8px 24px rgba(0,0,0,.18);
+  /* glass and depth (Anibal): translucent panel surfaces, a 1px top highlight, a 3-step elevation scale */
+  --glass:rgba(22,23,26,.74);--glass-2:rgba(28,30,34,.82);--glass-hi:rgba(255,255,255,.07);--glass-line:rgba(255,255,255,.09);
+  --glass-blur:blur(18px) saturate(160%);
+  --elev-1:0 1px 2px rgba(0,0,0,.30),0 2px 6px rgba(0,0,0,.16);
+  --elev-2:0 2px 4px rgba(0,0,0,.30),0 10px 28px rgba(0,0,0,.26);
+  --elev-3:0 4px 10px rgba(0,0,0,.34),0 22px 56px rgba(0,0,0,.40);
+  --ease:cubic-bezier(.2,.7,.2,1);--t-1:160ms;--t-2:220ms;
+  --focus:0 0 0 2px var(--bg),0 0 0 4px var(--accent-2);
+  /* keyboard focus ring: #7FD8FF is ~10:1 on every dark surface (#0F1012..#25272C) */
+  --ring:#7FD8FF;--ring-glow:0 0 0 4px rgba(127,216,255,.22),0 0 14px 2px rgba(127,216,255,.35);
+  --font:"IBM Plex Sans","Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --fs-0:12px;--fs-1:13px;--fs-2:14.5px;--fs-3:17px;--fs-4:21px;--fs-5:28px;
+  --s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:24px;--s6:32px;
+  --s-1:4px;--s-2:8px;--s-3:12px;--s-4:16px;--s-5:24px;--s-6:32px;
+  --r-sm:6px;--r-md:10px;--r-lg:16px;
+  --r1:8px;--r2:14px;--pill:999px;--header:60px;--safe:env(safe-area-inset-bottom,0px);
+}
+[data-theme=light]{
+  color-scheme:light;
+  --bg:#F6F7F9;--surface:#FFFFFF;--surface-2:#F2F4F7;--surface-3:#E7EAEF;--line:#E2E5EA;--line-2:#CDD2DA;
+  --text:#12161F;--dim:#4F5867;--faint:#636B7A;--on-accent:#FFFFFF;
+  --accent:#2F5FD0;--accent-hover:#2550B8;--accent-2:#3D6FE0;--accent-text:#2550B8;--link:#2550B8;
+  --ok:#0F7A55;--warn:#995700;--bad:#B3261E;--ok-bg:#E8F6F0;--warn-bg:#FFF4E2;--bad-bg:#FCEBEA;--accent-bg:#EAF0FC;
+  --scrim:rgba(16,24,40,.35);--tint:rgba(16,24,40,.06);--tint-2:rgba(16,24,40,.05);
+  --state-idle:#3D6FE0;--state-listening:#1A8FB3;--state-thinking:#5B4FD6;--state-speaking:#2550B8;--state-tool:#128A80;--state-approval:#995700;
+  --chart-grid:#E3E6EB;--chart-text:#566070;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 18px rgba(16,24,40,.06);
+  --glass:rgba(255,255,255,.74);--glass-2:rgba(255,255,255,.84);--glass-hi:rgba(255,255,255,.90);--glass-line:rgba(16,24,40,.10);
+  --elev-1:0 1px 2px rgba(16,24,40,.08),0 2px 6px rgba(16,24,40,.06);
+  --elev-2:0 2px 4px rgba(16,24,40,.08),0 10px 28px rgba(16,24,40,.12);
+  --elev-3:0 4px 10px rgba(16,24,40,.10),0 22px 56px rgba(16,24,40,.20);
+  /* focus ring: #1F4FC2 is ~6:1 on every light surface (#FFFFFF..#E7EAEF) */
+  --ring:#1F4FC2;--ring-glow:0 0 0 4px rgba(31,79,194,.18);
+}

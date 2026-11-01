@@ -17,6 +17,8 @@
 // Off: PXA_MTP_DEEP=0 (the --spec-type row runs as written), or PXA_FLASHNEXT_V100_SET=0 (the whole set).
 // An explicit PXA_MTP_DEEP value is the user's: the rule then changes nothing (no ceiling raise either).
 
+#include "pxa-mtp-streak.h"
+
 #include <cmath>
 #include <cstdlib>
 
@@ -33,6 +35,7 @@ struct pxa_fn_v100_mtp_in {
     bool        steered       = false;   // PXA_SPEC_SELECT / PXA_SPEC_POLICY live
     const char * set_env      = nullptr; // getenv("PXA_FLASHNEXT_V100_SET")
     const char * deep_env     = nullptr; // getenv("PXA_MTP_DEEP")
+    const char * streak_env   = nullptr; // getenv("PXA_MTP_STREAK")
 };
 
 struct pxa_fn_v100_mtp_out {
@@ -45,6 +48,9 @@ struct pxa_fn_v100_mtp_out {
 static constexpr int   PXA_FN_V100_MTP_CEIL = 5;
 static constexpr float PXA_FN_V100_MTP_PMIN = 0.75f;
 static const char * const PXA_FN_V100_MTP_DEEP = "3:0.5:0.8";
+// PXA_MTP_STREAK (B8, common/pxa-mtp-streak.h): the streak-gated chain needs the ceiling at its S so the verify batch, the
+// checkpoint rows and the chain reserve fit width S + 1; held at 7 = verify width 8, the bitwise one-token-decode limit.
+static constexpr int   PXA_FN_V100_MTP_STREAK_MAX = 7;
 
 static inline pxa_fn_v100_mtp_out pxa_fn_v100_mtp_rule(const pxa_fn_v100_mtp_in & in) {
     pxa_fn_v100_mtp_out o;
@@ -61,6 +67,10 @@ static inline pxa_fn_v100_mtp_out pxa_fn_v100_mtp_rule(const pxa_fn_v100_mtp_in 
     }
     o.on    = true;
     o.n_max = PXA_FN_V100_MTP_CEIL;
+    const pxa_mtp_streak_cfg sk = pxa_mtp_streak_parse(in.streak_env);
+    if (sk.on && sk.deep == PXA_FN_V100_MTP_CEIL) {
+        o.n_max = sk.cap < PXA_FN_V100_MTP_STREAK_MAX ? sk.cap : PXA_FN_V100_MTP_STREAK_MAX;
+    }
     o.deep  = PXA_FN_V100_MTP_DEEP;
     o.why   = "measured row";
     return o;

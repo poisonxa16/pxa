@@ -271,6 +271,10 @@ static void llm_load_hparams_dsv41(llama_model_loader & ml, llama_hparams & hpar
             throw std::runtime_error(format("DeepSeek-V4.1: layer %u is a kv/index source but has compress ratio 0", il));
         }
     }
+    if (hparams.dsv41_cand_source_layer >= n_layer) {   // a GGUF value: bounds-check before it indexes the flag table
+        throw std::runtime_error(format("DeepSeek-V4.1: candidate_source_layer_id %u is out of range (n_layer %u)",
+                    hparams.dsv41_cand_source_layer, n_layer));
+    }
     if (!hparams.dsv41_is_kv_source[hparams.dsv41_cand_source_layer]) {
         throw std::runtime_error(format("DeepSeek-V4.1: candidate_source_layer_id %u is not a kv source layer",
                     hparams.dsv41_cand_source_layer));
@@ -2498,6 +2502,21 @@ void llm_load_hparams(
                 }
             } break;
         default: (void)0;
+    }
+
+    // a hostile or broken GGUF must fail the load with a message, not wrap an unsigned count or divide by zero later
+    if (hparams.nextn_predict_layers > hparams.n_layer) {
+        throw std::runtime_error(format("nextn_predict_layers %u exceeds block_count %u",
+                    hparams.nextn_predict_layers, hparams.n_layer));
+    }
+    if (hparams.ssm_mamba2 &&
+        (hparams.ssm_dt_rank == 0 || hparams.ssm_n_group == 0 || hparams.ssm_d_state == 0 || hparams.ssm_d_conv == 0 ||
+         hparams.ssm_d_inner == 0 || hparams.ssm_d_inner % hparams.ssm_dt_rank != 0 || hparams.ssm_d_inner % hparams.ssm_n_group != 0 ||
+         hparams.ssm_dt_rank % hparams.ssm_n_group != 0)) {
+        throw std::runtime_error(format("Mamba-2: ssm.time_step_rank %u and ssm.group_count %u must be > 0 and divide "
+                    "ssm.inner_size %u, ssm.group_count must divide ssm.time_step_rank "
+                    "(ssm.state_size %u, ssm.conv_kernel %u must be > 0)",
+                    hparams.ssm_dt_rank, hparams.ssm_n_group, hparams.ssm_d_inner, hparams.ssm_d_state, hparams.ssm_d_conv));
     }
 
     model.ftype = ml.ftype;

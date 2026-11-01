@@ -6859,6 +6859,16 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
         // R3a ring lending (2026-10-25; default OFF, PXA_XCACHE_RING_LEND=1 arms it): the CPU cold path reads no ring below the CPU-alias
         // width, so the plan gives the ring's bytes to resident experts and the backend allocates the ring on demand (llama-pxa-place.h)
         in.xc_ring_lend = pxa_env_value_flag(getenv("PXA_XCACHE_RING_LEND"), 0);
+        // ring floor (PXA_XCACHE_RING_LEND_FLOOR: unset = auto (1 when the ubatch streams), =0 lend all (R3a), =1 keep one
+        // layer, =2 keep the two-layer ring = no lending for this load): a load whose ubatch
+        // reaches the CPU-alias width streams its prefill graphs through the ring; a fully lent ring is rarely there for them (the VRAM
+        // the hot experts took), so lending keeps one layer of it in VRAM there (llama-pxa-place.h xc_ring_lend_floor)
+        if (in.xc_ring_lend) {
+            int narrow_moe = model.hparams.n_expert_used > 0 ? (int)((int64_t)32*model.hparams.n_expert/model.hparams.n_expert_used) : 0;
+            if (const char * e = getenv("PXA_STREAM_NARROW_MOE")) narrow_moe = std::max(0, atoi(e));
+            const char * fl = getenv("PXA_XCACHE_RING_LEND_FLOOR");
+            in.xc_ring_lend_floor = fl && *fl ? std::min(2, std::max(0, atoi(fl))) : ((int) n_ubatch >= narrow_moe ? 1 : 0);
+        }
         {   // C042 small tail on the async CPU-pool cold path (2026-10-19; the server's PXA_AUTO_XCACHE_SMALLTAIL arms
             // PXA_XCACHE_ASYNC there): the planner prices a cold layer at the async path's measured cost; PXA_XCACHE_SMALLTAIL_COST=0 = the split path's
             const char * as = getenv("PXA_XCACHE_ASYNC");
@@ -7175,6 +7185,13 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
             for (size_t d = 0; d < in.devices.size(); ++d) {
                 if (r.dev_ring[d] > 0) ggml_backend_cuda_stream_set_ring(in.devices[d].id, r.dev_ring[d]);
                 if (r.dev_ring[d] > 0 && r.xc_ring_lent) ggml_backend_cuda_stream_set_ring_lent(in.devices[d].id, true);
+            }
+            if (r.xc_ring_floor) {
+                LLAMA_LOG_INFO("PXA_XCACHE: ring lend keeps a %s floor in VRAM (%.0f MiB, PXA_XCACHE_RING_LEND_FLOOR=%d): ubatch %d reaches the "
+                        "CPU-alias width, so prefill graphs copy their cold experts through it instead of reading them in place over the link%s "
+                        "(PXA_XCACHE_RING_LEND_FLOOR=0 = lend all)\n", in.xc_ring_lend_floor >= 2 ? "two-layer" : "one-layer",
+                        r.dev_ring.empty() ? 0.0 : r.dev_ring[0]/1048576.0, in.xc_ring_lend_floor, (int) n_ubatch,
+                        in.xc_ring_lend_floor >= 2 ? "" : "; the rest of the two-layer ring is lent to resident experts");
             }
             if (r.xc_ring_lent) {
                 // the same width rule as pxa_stream_make_aliases: graphs narrower than this compute the cold experts on the CPU

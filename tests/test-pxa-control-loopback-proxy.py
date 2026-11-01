@@ -65,6 +65,22 @@ class Seat(http.server.BaseHTTPRequestHandler):
     do_GET = do_POST = _any
 
 
+class Control(http.server.BaseHTTPRequestHandler):
+    tokens = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        Control.tokens.append(self.headers.get("X-PXA-Token"))
+        out = json.dumps({"ok": True, "control_version": "test"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+
 class LoopbackNoProxy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -150,6 +166,19 @@ class LoopbackNoProxy(unittest.TestCase):
         s.close()
         self.assertFalse(C.control_answers(dead, token="tok-not-for-the-proxy", timeout=1))
         self.assertEqual(Proxy.seen, [])
+
+    def test_bridge_control_probe_keeps_the_token_off_the_proxy(self):
+        # M3 (4.0 security review): bridge.control_answers sent X-PXA-Token through http_proxy
+        from pxa_control import bridge as B
+        ctl = serve(Control)
+        try:
+            Control.tokens.clear()
+            self.assertTrue(B.control_answers(ctl.server_address[1], token="FAKE-CONTROL-TOKEN", timeout=3))
+            self.assertEqual(Proxy.seen, [], "the Control token went to the proxy")
+            self.assertEqual(Control.tokens, ["FAKE-CONTROL-TOKEN"])
+        finally:
+            ctl.shutdown()
+            ctl.server_close()
 
 
 if __name__ == "__main__":

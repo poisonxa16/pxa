@@ -113,6 +113,39 @@ int main() {
     }
     // (6) a fitting model stays resident, lend or not
     CHECK(pxa_place_plan(make_input(70, false, 0, true, 0, true)).mode == 0, "a fitting model must stay resident");
+    // (7) ring floor (PXA_XCACHE_RING_LEND_FLOOR): lending with a floor keeps ONE layer of ring in VRAM, charged and
+    //     not lent (the small-tail ring of the plan's own cold set); the plan sits between the full ring and the fully lent one;
+    //     without lending the floor changes nothing
+    {
+        auto fi = make_input(70, false, 9000, true, 0, true); fi.xc_ring_lend_floor = 1;
+        const auto fl = pxa_place_plan(fi);
+        const size_t w1 = max_cold(fl)*PER_EXPERT + max_cold(fl)*(PER_EXPERT/3) + 32*MiB;
+        printf("floor: %zu cold, ring %.0f MiB (kept), streamed %.0f MiB, L=%d cap=%d miss %.2f%%\n", n_cold(fl), fl.dev_ring[0]/(double)MiB,
+               fl.streamed/(double)MiB, fl.xc_layers, fl.xc_cap, 100.0*fl.xc_miss);
+        CHECK(fl.mode == 2 && !fl.xc_ring_lent && fl.xc_ring_floor, "floor: the ring must be kept (not lent) and flagged as the floor");
+        CHECK(fl.dev_ring[0] == w1, "floor: kept ring %zu != the one-layer rule %zu", fl.dev_ring[0], w1);
+        CHECK(fl.streamed < base.streamed && fl.streamed > lend.streamed, "floor: streamed %.0f MiB must sit between lent %.0f and base %.0f",
+              fl.streamed/(double)MiB, lend.streamed/(double)MiB, base.streamed/(double)MiB);
+        // The search minimises layer_us*L + miss_us*miss% (R4), so the miss alone need not sit between: with one ring layer charged the
+        // floor can buy fewer cold layers with a higher miss (here L 26 vs 28 at 39.7% vs 36.4%, 1300 us/layer, 268 us/% miss). What sits
+        // between by construction is the predicted cost: under a smaller charge every (L, cap) stops at the same or an earlier prefix.
+        auto cost = [](const pxa_place_result & r) { return r.xc_cost_layer_us*r.xc_layers + r.xc_cost_miss_us*100.0*r.xc_miss; };
+        printf("cost: base %.0f, lend %.0f, floor %.0f us/token (%.0f us/layer, %.0f us/%% miss)\n", cost(base), cost(lend), cost(fl),
+               fl.xc_cost_layer_us, fl.xc_cost_miss_us);
+        CHECK(cost(fl) <= cost(base) && cost(fl) >= cost(lend), "floor: the predicted cost must sit between the lent and the base plan");
+        CHECK(fl.streamed >= fl.dev_ring[0] + 9000*MiB - 64*MiB, "floor: the plan must free the deficit plus the kept ring");
+        auto fo = make_input(70, false, 9000, true, 0, false); fo.xc_ring_lend_floor = 1;
+        CHECK(same_plan(pxa_place_plan(fo), base) && !pxa_place_plan(fo).xc_ring_floor, "floor without lending changed the plan");
+        auto fz = make_input(70, true, 9000, true, 0, true); fz.xc_ring_lend_floor = 1;
+        const auto zc = pxa_place_plan(make_input(70, true, 9000, true, 0));
+        CHECK(same_plan(pxa_place_plan(fz), zc), "floor on the zero-copy cold path changed the plan");
+        auto f0 = make_input(70, false, 9000, true, 0, true); f0.xc_ring_lend_floor = 0;
+        CHECK(same_plan(pxa_place_plan(f0), lend) && pxa_place_plan(f0).xc_ring_lent, "floor 0 must be the R3a lent plan exactly");
+        // floor 2: the two-layer ring kept = the plan without lending, exactly
+        auto f2 = make_input(70, false, 9000, true, 0, true); f2.xc_ring_lend_floor = 2;
+        const auto p2 = pxa_place_plan(f2);
+        CHECK(same_plan(p2, base) && !p2.xc_ring_lent && p2.xc_ring_floor, "floor 2 must be the unlent plan exactly");
+    }
     printf("%s\n", fails ? "FAILED" : "ALL PASS");
     return fails ? 1 : 0;
 }
