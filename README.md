@@ -12,7 +12,7 @@
 </p>
 
 ```bash
-tar xzf pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz && cd pxa-v4.0.1    # 1. unpack the release tarball
+tar xzf pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz && cd pxa-v4.0.1    # 1. unpack the release tarball
 ./pxa                                                                  # 2. PXA Control opens in your browser
 # 3. pick your cards, pick a model, press Start.  No browser? Run ./pxa --tui for the same steps in the terminal.
 ```
@@ -132,7 +132,7 @@ The converter's Python packages are not in the tarball. Install them once:
 | GTX 1080 Ti | `sm_61` | 11 GB | Works. One card only. Smaller models. |
 | Tesla P40 | `sm_61` | 24 GB | Recognised and allowed to use the 16 GB-class settings. **Not measured by us yet.** |
 | Other GTX 10-series, Titan X, Titan Xp, Quadro P cards | `sm_61` | varies | Same chip family as the 1080 Ti. Expected to work. Not individually tested. |
-| RTX 20-series and newer | `sm_75` and up | | **Not in this build.** It is compiled for `sm_60`, `sm_61` and `sm_70` only. |
+| RTX 20-series and newer, T4, GTX 16-series | `sm_75`, `sm_80`, `sm_86`, `sm_89` | varies | Best effort. The release tarball `pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz` carries native code for these cards. Not measured by us; Turing (`sm_75`) has not had a runtime test yet. |
 
 **Software.** Linux x86-64. An NVIDIA driver 570 or newer (the package brings its own CUDA 12.8 runtime, so you do not install the toolkit). `python3` for the launcher. Any x86-64 CPU. About 5 GB of disk for the package, plus your models. The tarball needs glibc 2.35 or newer (Ubuntu 22.04 and newer). The Windows engine and the Docker image have their own notes in [`docs/install.md`](docs/install.md). macOS has no engine: the Mac download is the PXA Control client for a rig on your network.
 
@@ -153,7 +153,7 @@ The converter's Python packages are not in the tarball. Install them once:
 
 | Platform | Download | What you get |
 |---|---|---|
-| Linux x86_64 (glibc 2.35+, NVIDIA driver 570+) | the tarball, `pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz` | The engine and PXA Control. Steps below. |
+| Linux x86_64 (glibc 2.35+, NVIDIA driver 570+) | the tarball, `pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz` | The engine and PXA Control. Steps below. |
 | Docker (Linux, NVIDIA runtime) | `docker pull ghcr.io/poisonxa16/pxa:v4.0.1` | The same binaries as the tarball. Steps below. |
 | Windows x64 | `pxa-control-win64.exe` and `pxa-engine-win64-cuda12.zip` (unsigned: SmartScreen asks once) | PXA Control and the engine. [Windows steps](docs/install.md#windows). |
 | macOS (Intel and Apple silicon) | the PXA Control zip (unsigned: Gatekeeper asks once) | PXA Control only, for a rig on your network. [Mac steps](docs/install.md#macos). |
@@ -164,7 +164,7 @@ Check each download against the sha256 on the release page before you use it. Th
 **Tarball.** Download it from the [release page](https://github.com/poisonxa16/pxa/releases/latest). Then:
 
 ```bash
-tar xzf pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70.tar.gz
+tar xzf pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz
 cd pxa-v4.0.1
 ./pxa --doctor                 # checks your cards, driver and CPU; starts nothing
 ./pxa                          # opens PXA Control in your browser
@@ -296,7 +296,7 @@ Valued Supporters can also opt in to the beta channel from the update window, to
 
 **Do I need NVLink?** No. Cards on plain PCIe work. The engine tests peer-to-peer copies at start and falls back to a safe route on boards where they corrupt data.
 
-**Can I use my RTX card?** Not with this build. It carries code for `sm_60`, `sm_61` and `sm_70` only.
+**Can I use my RTX card?** Yes, as best effort. The release tarball `pxa-v4.0.1-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz` carries native code for `sm_75`, `sm_80`, `sm_86` and `sm_89` as well. We tune and measure on P100 and V100 only, so there are no speed numbers for RTX cards, and Turing (RTX 20-series, GTX 16-series, T4) has not had a runtime test yet. A one-line "it started and answered" in Discord helps.
 
 **Something is wrong.** Use **Report a problem** in PXA Control. It builds a report with paths, host names and addresses removed, shows you every byte, and sends only when you press Send. Or ask in the Discord #support channel. Known problems are listed in [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md).
 
