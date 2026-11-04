@@ -790,7 +790,9 @@ _MAKE_HINT = {
     "no-tool": "Encode tab, Rescan. If it stays, reinstall the encoder (Get the encoder).",
     "no-runtime": "Encode tab, Download the GPU runtime (one time), then press Resume.",
     "no-python-packages": "Install them with pip (the Checks list names them), then start again.",
-    "convert-failed": "The bundled converter may not know this architecture yet. Convert it with the PXA engine's own tools and pick the .gguf file instead.",
+    "convert-failed": "Open the log for the converter's own message. If it says the model is not supported, convert it with the PXA engine's own tools and pick the .gguf file instead.",
+    "convert-oom": "Close other programs (or add swap) and press Resume; it continues from the convert step. Update the encoder too (Encode tab): converters before the 2026-11 package keep the whole model in memory while converting.",
+    "convert-killed": "Press Resume; it continues from the convert step. If it stops again at the same place, the computer is running out of memory: close other programs or add swap.",
     "q8-failed": "Press Resume to try again; if it repeats, open the log.",
     "encoder": "Stop whatever else is using the card (Servers tab) and press Resume. If it repeats, open the log.",
     "busy": "Another encode is using this work folder. Wait for it, or cancel it, then press Resume.",
@@ -805,11 +807,55 @@ _MAKE_HINT = {
 }
 
 
-def explain_make_failure(rc, err=None, text=""):
+_OLD_CONVERT_TEXT = re.compile(r"may not support this architecture", re.I)
+
+
+def _gb(n):
+    return "%.1f GB" % (float(n) / (1 << 30))
+
+
+def convert_facts_text(f):
+    """Control's own view of a convert step that stopped -> a plain clause, or "". `f` = {conv_peak, limit, total, min_avail, free_disk,
+    last_tensor} as the job runner measured them (any of them may be missing)."""
+    if not f:
+        return ""
+    parts = []
+    if f.get("conv_peak"):
+        parts.append("the converter used up to %s of memory%s" % (_gb(f["conv_peak"]), (" of %s this computer allows" % _gb(f["limit"])) if f.get("limit") else ""))
+    if f.get("min_avail") is not None and f.get("total"):
+        parts.append("free memory fell to %s of %s" % (_gb(f["min_avail"]), _gb(f["total"])))
+    if f.get("free_disk") is not None:
+        parts.append("%s free on the work disk" % _gb(f["free_disk"]))
+    if f.get("last_tensor"):
+        parts.append("it stopped at %s" % f["last_tensor"])
+    return "; ".join(parts)
+
+
+def convert_ran_out_of_memory(f):
+    """True when what Control measured says the convert step ran out of memory: the converter reached 60% of what the computer allows, or
+    free memory fell under 3% of the RAM."""
+    if not f:
+        return False
+    lim = f.get("limit") or f.get("total")
+    if f.get("conv_peak") and lim and f["conv_peak"] >= 0.6 * lim:
+        return True
+    return bool(f.get("min_avail") is not None and f.get("total") and f["min_avail"] < 0.03 * f["total"])
+
+
+def explain_make_failure(rc, err=None, text="", facts=None):
     """A `pxqe make` that did not finish -> {code, message, hint, resumable}. `err` is its last `error` event (None if it died without one),
-    `text` the human lines it printed last. Plain sentences, no traceback, no key. A licence refusal (exit 3) is worded the way the
-    older flow words it, so the page reads the same either way."""
+    `text` the human lines it printed last, `facts` what Control itself measured while the convert step ran (convert_facts_text). Plain
+    sentences, no traceback, no key. A licence refusal (exit 3) is worded the way the older flow words it, so the page reads the same either way.
+    An encoder package from before 2026-11 says "may not support this architecture" for EVERY converter failure, an out-of-memory kill
+    included; Control's measurements then name the real cause."""
     err = err or {}
+    if (err.get("code") or "") == "convert-failed" and _OLD_CONVERT_TEXT.search(err.get("message") or "") and facts:
+        ft = convert_facts_text(facts)
+        if convert_ran_out_of_memory(facts):
+            return {"code": "convert-oom", "message": "The converter ran out of memory (%s). The model's architecture is not the problem." % ft,
+                    "hint": _MAKE_HINT["convert-oom"], "resumable": True}
+        if ft:
+            err = dict(err, message="The bundled converter stopped (%s). Open the log for its own message." % ft)
     msg = (err.get("message") or "").strip()
     code = err.get("code") or ""
     blob = (msg + "\n" + (text or "")).strip()
@@ -971,7 +1017,7 @@ def parse_line(line):
 # (regex over the encoder's output, code, the sentence shown, what to do). First match wins.
 _FAILS = [
     # machine binding and the sharing pause come BEFORE the generic 403 pattern: the server sends them as "(HTTP 403): <sentence>",
-    # and the user needs the real next step (/encoder reset, or an admin), not "get a fresh key" (e2e-v3 #15203)
+    # and the user needs the real next step (/encoder reset, or an admin), not "get a fresh key"
     (r"already in use on \d+ machines?|registered to a different machine|device limit", "device_limit",
      "This key is already registered to other machines (two at most), so it will not run on this one.",
      "Move it to this computer with /encoder reset in the PXA Network Discord (once every 30 days), or ask an admin there."),

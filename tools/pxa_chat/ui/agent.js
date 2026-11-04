@@ -1194,9 +1194,14 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     const go = () => {
       const v = inp.value.trim(); if (!v) return;
       let tok = v;
-      try { const u = new URL(v, location.origin); tok = u.searchParams.get("token") || (/^https?:/i.test(v) ? "" : v); } catch (e) { /* a bare token */ }
+      try {
+        const u = new URL(v, location.origin);
+        tok = u.searchParams.get("token") || new URLSearchParams(u.hash.slice(1)).get("token") || (/^https?:/i.test(v) ? "" : v);
+      } catch (e) { /* a bare token */ }
       if (!tok) { toast("That address has no ?token=... in it.", true); return; }
-      location.assign(location.origin + "/?token=" + encodeURIComponent(tok) + location.hash);   // the same tab, so the chat opens again
+      // the tab keeps the token (sessionStorage, auth.js; never a cookie) and reloads in place, so the chat opens again
+      if (window.PXA_AUTH) { window.PXA_AUTH.set(tok); location.reload(); return; }
+      location.assign(location.origin + "/?token=" + encodeURIComponent(tok));
     };
     inp.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
     const n = el("div", {class: "ag-note bad ag-signin-note", role: "alert"}, el("span", {text: "You are signed out: PXA Control restarted with a new access token. Open the new address (it ends in ?token=...) to sign in again; this chat is saved."}),
@@ -1458,7 +1463,11 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
     if (window.innerWidth <= 900) setSide(false);
     hk("sessionChange", null, G);
   }
-  function exportChat(fmt) { if (!A.session) { toast("Nothing to save yet: start a chat first.", true); return; } location.href = `/api/chat/export?id=${encodeURIComponent(A.session)}&format=${fmt}`; }
+  // a download is a navigation: it cannot carry the X-PXA-Token header, so it goes with a single-use ticket (auth.js)
+  function apiGo(path) {
+    (window.PXA_AUTH ? window.PXA_AUTH.url(path) : Promise.resolve(path)).then(u => location.assign(u), e => toast(e.message, true));
+  }
+  function exportChat(fmt) { if (!A.session) { toast("Nothing to save yet: start a chat first.", true); return; } apiGo(`/api/chat/export?id=${encodeURIComponent(A.session)}&format=${fmt}`); }
   function copyCurl() {
     const body = Object.assign({message: R.input.value.trim() || "Hello!", server: A.selected, preset: A.preset, advanced: true}, advSettings());
     const base = location.origin;
@@ -1640,7 +1649,7 @@ window.PXAMarkdown = window.PXAMarkdown || (function () {
               el("label", {class: "f", title: "how many relevant facts each chat sees, besides pinned ones"}, "Facts per message", R.memK),
               el("label", {class: "f", title: "the most tokens the memory block may take in the prompt"}, "Token budget", R.memBudget)),
             el("div", {class: "row", style: "gap:8px;flex-wrap:wrap;margin:8px 0"},
-              el("button", {type: "button", class: "b", id: "ag-mem-export", text: "Export", onclick: () => { location.href = "/api/chat/memory/export"; }}),
+              el("button", {type: "button", class: "b", id: "ag-mem-export", text: "Export", onclick: () => { apiGo("/api/chat/memory/export"); }}),
               el("button", {type: "button", class: "b", id: "ag-mem-import", text: "Import", onclick: () => file.click()}), file,
               el("button", {type: "button", class: "b", text: "Copy JSON", onclick: () => copyText(JSON.stringify(A.mem.facts, null, 2))})),
             el("div", {class: "tiny", text: "Raw facts"}), R.memRaw))));

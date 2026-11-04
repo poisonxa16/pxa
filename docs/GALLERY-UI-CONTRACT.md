@@ -1,8 +1,8 @@
 # Connector gallery: Control UI contract (server side: plugins/gallery-control 24e017c270)
 
 The server API lives in tools/pxa_plugins/gallery_api.py. The page belongs to UX (ui/*): this file is the contract, and no UI file was changed.
-Auth: these are ordinary Control ROUTES, so they get the same Host check, the same LAN token (cookie, X-PXA-Token or
-Bearer) and the same rule that a POST must come from the same origin as every other /api/plugins/* route.
+Auth: these are ordinary Control ROUTES, so they get the same Host check, the same LAN token (X-PXA-Token or
+Bearer; never a cookie) and the same rule that a POST must come from the same origin as every other /api/plugins/* route.
 
 ## GET /api/plugins/gallery
 ```json

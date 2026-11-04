@@ -7,6 +7,7 @@
 
 #include "pxa-env-flag.h"
 #include "reduce.cuh"
+#include "pxa/pxqn-ext-call.cuh"
 #include "ggml-common.h"
 #include "ggml-backend.h"
 
@@ -1123,6 +1124,14 @@ extern "C" void pxa_tsplit_reduce_half(ggml_backend_cuda_context & ctx_i, ggml_t
 
         char * data = (char *)dst->src[dev_i]->data + (size_t)start * type_size;
 
+        // PXA_CLOSED_HOOK: the PXQN library's "xchg" role may take this exchange (same descriptor, lines and token);
+        // without the library, or when it declines, the kernels below run unchanged
+        if (!pull && dst->type == GGML_TYPE_F32 &&
+            pxqn_ext_xchg(dev_i, (int)dst->type, n_dev, chunk, dst->ne[0], ggml_nrows(dst), (float *)data, &task,
+                          sizeof(task), this_token, (int *)p->err_dev, p->buf_bytes, p->blocks, stream)) {
+            continue;
+        }
+
         if (dst->type == GGML_TYPE_F16) {
             switch (n_dev) {
                 case 2: k_pxa_tsplit_fused<half, 2><<<p->blocks, p->threads, 0, stream>>>(
@@ -1226,6 +1235,13 @@ static bool pxa_ts_epi_q8_on() {
 static bool pxa_ts_epi_mt_on() {
     static const bool v = [] { const char * e = getenv("PXA_TSPLIT_EPI_MT"); return e && *e && atoi(e) != 0; }();
     return v;
+}
+// the most rows of a multi-row epilogue: PXA_TSPLIT_EPI_MT's 4, more where the PXQN library's exchange runs it (PXA_CLOSED_HOOK)
+static int pxa_epi_mt_rows(int nd, int64_t ne0) {
+    const int mt = pxa_ts_epi_mt_on() ? 4 : 0;
+    if (pxa_ts_pull()) return mt;
+    static const int lines = pxa_ts_env_int("PXA_TSPLIT_REDUCE_BLOCKS", PXA_TS_BLOCKS);
+    return std::max(mt, pxqn_ext_xchg_rows(nd, ne0, lines));
 }
 // ggml-cuda.cu pxa_pxqn_q8_wanted's rule on a split graph: a PXQN4 / PXQN4S8 MUL_MAT within 16 nodes reads rht
 static bool pxa_epi_q8_wanted(const ggml_cgraph * g, int i_rht) {
@@ -1532,13 +1548,14 @@ extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int *
                 open[d].swap(keep);
             }
             if (t->op == GGML_OP_REDUCE && t->op_params[2] >= 2 && t->op_params[2] <= 4 && t->op_params[4] == 0 &&
-                t->type == GGML_TYPE_F32 && (t->ne[1] == 1 || (pxa_ts_epi_mt_on() && t->ne[1] >= 2 && t->ne[1] <= 4)) &&
+                t->type == GGML_TYPE_F32 && t->ne[1] >= 1 && t->ne[1] <= 8 &&
                 t->ne[2] == 1 && t->ne[3] == 1 &&
                 t->ne[0] % 128 == 0 && t->ne[0] >= 1024 && t->ne[0] <= 11264 &&
                 !pxa_reduce_pinned_handles(t) && pxa_tsplit_reduce_handles(t)) {
                 int idx[GGML_CUDA_MAX_DEVICES];
                 const int nd = pxa_ts_collect_idx(t, idx);
                 bool ok = nd >= 2 && nd <= 4;   // n > 2 only reaches here when the fused route takes it
+                if (ok && t->ne[1] > 1) ok = t->ne[1] <= pxa_epi_mt_rows(nd, t->ne[0]);
                 if (std::find(g_epi_cache.ne0.begin(), g_epi_cache.ne0.end(), t->ne[0]) == g_epi_cache.ne0.end()) {
                     g_epi_cache.ne0.push_back(t->ne[0]);
                 }
@@ -1572,6 +1589,9 @@ extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int *
     for (auto & p : g_epi_plans) {
         for (int r = 0; r < p.ndev; ++r) if (p.h[r].stage != 2) p.ok = false;
         for (int r = 0; r < p.ndev; ++r) if (p.R->ne[1] > 1 && p.h[r].q8) p.ok = false;   // EPI_MT: no q8_1 sidecar
+        for (int r = 0; r < p.ndev; ++r) {   // multi-row norm-only: EPI_MT's 2..4 rows only
+            if (p.R->ne[1] > 1 && p.h[r].norm_only && !(pxa_ts_epi_mt_on() && p.R->ne[1] <= 4)) p.ok = false;
+        }
         if (!p.ok) continue;
         for (int r = 0; r < p.ndev; ++r) if (!p.h[r].norm_only) norms[p.h[r].norm] = &p;
     }
@@ -1643,7 +1663,7 @@ extern "C" void ggml_cuda_pxa_epi_plan(int n, ggml_cgraph ** graphs, const int *
         for (auto & p : g_epi_plans) if (p.ok && p.R->ne[1] > 1) ++nmt;
         if (nmt > 0 && !said_mt.exchange(true)) {
             fprintf(stderr, "PXA_TSPLIT_EPI_MT: %d reduces of %lld rows take the fused epilogue (bit-identical; "
-                            "opt-in via PXA_TSPLIT_EPI_MT=1)\n", nmt, (long long) g_epi_plans.front().R->ne[1]);
+                            "PXA_TSPLIT_EPI_MT=1 or the PXQN library's exchange)\n", nmt, (long long) g_epi_plans.front().R->ne[1]);
         }
     }
     if (pxa_keyed) {
@@ -1836,7 +1856,8 @@ static void pxa_tsplit_epi_half(ggml_backend_cuda_context & ctx_i, pxa_ts_pipeli
     memcpy(&eps, h.norm->op_params, sizeof(float));
     const ggml_tensor * rht = h.rht;
     if (nrows > 1) {   // PXA_TSPLIT_EPI_MT: every payload is pushed by the epilogue (the producer push is one-row only)
-        GGML_ASSERT(!h.q8 && !h.pushed.load(std::memory_order_acquire) && nrows <= 4 && nrows <= p->blocks);
+        GGML_ASSERT(!h.q8 && !h.pushed.load(std::memory_order_acquire) && nrows <= 8 &&
+                    (nrows <= 4 ? nrows <= p->blocks : !h.norm_only && p->blocks >= 8));
         // block b writes row b of y once it has read row b of pa / pb: an output over a dying input at the SAME address
         // is safe, at a shift a block could overwrite rows another block has not read yet -> y goes to a pool buffer and
         // is copied over (ggml_cuda_pxqn_rms_rht's rule; the same values either way)
@@ -1849,7 +1870,12 @@ static void pxa_tsplit_epi_half(ggml_backend_cuda_context & ctx_i, pxa_ts_pipeli
         };
         float * y = ydst;
         ggml_cuda_pool_alloc<float> y_tmp(ctx_i.pool());
-        const bool y_copy = shifted(pa) || shifted(pb);
+        // PXA_CLOSED_HOOK: where the library's multi-row epilogue takes this reduce (push layout, rows() covers it), its
+        // output is written only after every input read, so a shifted overlap needs no copy; the library refuses a
+        // shifted y on any other route
+        const bool lib_epi = !h.norm_only && task.nwrite == task.nrank - 1 &&
+                             pxqn_ext_xchg_rows(task.nrank, ncols, task.lines) >= (int)nrows;
+        const bool y_copy = (shifted(pa) || shifted(pb)) && !lib_epi;
         if (y_copy) y = y_tmp.alloc((size_t)(ncols*nrows));
         if (h.norm_only) {
             GGML_ASSERT(rht == nullptr);
@@ -2623,7 +2649,9 @@ static int pxa_pfs_match(pxa_pfs_half & h, const ggml_tensor * R, int r, ggml_cg
         cur = pred;
         idx = j;
     }
-    if (!ggml_cuda_pxqn_type(cur->src[0]->type)) return 9;
+    if (!ggml_cuda_pxqn_type(cur->src[0]->type) &&
+        !(ggml_cuda_pxqn_pfs_cublas_plan(0, (int64_t) cur->src[0]->type, 0, 0, 0) > 0 && ggml_is_contiguous(cur->src[0]) &&
+          cur->src[1] && cur->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(cur->src[1]))) return 9;
     if (cur->type != GGML_TYPE_F32 || !pxa_pfs_rows_ok(cur, R)) return 10;
     // outside operands: computed before the GEMM (an earlier node of this split, another split, a leaf)
     for (int e = 0; e < next; ++e) {
@@ -2746,6 +2774,18 @@ static void pxa_pfs_plan_build(int n, ggml_cgraph ** graphs, const int * devs, c
             why[w0 ? w0 : w1]++;
             g_pfs_plans.pop_back();
             continue;
+        }
+        if (!ggml_cuda_pxqn_type(p.h[0].mm->src[0]->type) || !ggml_cuda_pxqn_type(p.h[1].mm->src[0]->type)) {
+            // PXA_CLOSED_HOOK: a cuBLAS producer's slice width is the library's (PXA_PF_SLICE_TOK forces both kinds)
+            const int cc = std::min(ggml_cuda_info().devices[0].cc, ggml_cuda_info().devices[1].cc);   // ranks = devices 0, 1
+            const int64_t tcb = ggml_cuda_pxqn_pfs_cublas_plan(1, ny, cc, pxa_pfs_tok_env(), PXA_PF_MAX_CHUNKS);
+            const int nsl = tcb > 0 ? (int) ((ny + tcb - 1) / tcb) : 0;
+            if (nsl < 2) {
+                why[14]++;
+                g_pfs_plans.pop_back();
+                continue;
+            }
+            p.slice = tcb; p.nslice = nsl;
         }
         g_pfs_by_reduce[R] = &p;
         for (int r = 0; r < 2; ++r) {

@@ -8,6 +8,10 @@
 //                           with a postMessage bridge that only reaches /api/plugins/<that plugin>/* (plugins/ui.py has the contract)
 //   Its own tab          -> a plugin whose manifest says ui.tab.nav gets a button in Control's section bar once it is allowed and
 //                           unlocked ("plug-<id>"): the same sealed frame, full height, kept open while you visit other sections
+//   Notices              -> what a plugin said with notify (newest first, text only); a notice that names a place in its page
+//                           ({tab, ref}, checked by the host) has an Open button: it opens that plugin's page and hands the place to it
+//                           (pxa.onOpen). A page may say how many things wait there (pxa.waiting(n)): the count shows on its tab and
+//                           in this page's title, "(3) PXA Control"; a count only, never what waits
 //   Speech on this computer -> the engines + voice models the speech plugins use (cards' "speech" block): Set up speech ->
 //                           POST /api/plugins/host/speech/setup {languages?}; the 5 s refresh shows the setup's progress
 // Words: coins and supporter rewards. Nothing here prices anything.
@@ -21,6 +25,12 @@
   const RUN_WORDS = {running: "Running", starting: "Starting", stopped: "Stopped", locked: "Locked", failed: "Stopped after repeated failures", stopping: "Stopping", restarting: "Restarting"};
   let data = null, last = "", err = null, timer = null, frame = null, loading = null, loadSeq = 0, doneOk = 0;
   const tabs = {};          // plugin id -> {btn, sec, frame: {id, el} | null}: the plugins that have their own tab in the bar
+  const waits = {};         // plugin id -> what its page says waits there (pxa.waiting), while its page is open
+  const opens = {};         // plugin id -> {spot: {tab, ref}, at} of a clicked notice, until its page says ready (60 s at most)
+  const OPEN_TTL_MS = 60000;
+  let painted = null;       // what paintWaits last drew (it draws only on a change)
+  const cleared = new Set(); // notice ids the person cleared (this page only)
+  let baseTitle = null;
 
   const dlg = () => $("#sd");
   function dialog(title, body, actions) {
@@ -289,6 +299,59 @@
       note(p) ? el("p", {class: "tiny", "data-k": "note", text: note(p)}) : null,
       el("div", {class: "acts"}, ...actions(p)));
   }
+  // ---------------- notices: newest first, the person's clear is kept while this page is open ----------------
+  function noticeList() {
+    const ns = (data && Array.isArray(data.notices)) ? data.notices : [];
+    return ns.filter(n => n && typeof n.text === "string" && !(n.id != null && cleared.has(n.id))).slice(-8).reverse();
+  }
+  function noticesPanel(ns) {
+    const when = at => { const d = new Date((Number(at) || 0) * 1000); return isNaN(d) ? "" : d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"}); };
+    const item = n => {
+      const p = row(n.plugin), spot = n.open && typeof n.open.tab === "string" ? n.open : null;
+      return el("li", {class: "phn", "data-notice": n.id != null ? String(n.id) : null},
+        el("b", {text: p ? p.name : String(n.plugin || "")}), el("span", {class: "phn-t", text: n.text}),
+        el("small", {class: "tiny", text: when(n.at)}),
+        p && p.page && spot ? el("button", {class: "b sm", type: "button", "data-act": "open-notice", text: "Open",
+                                           onclick: () => openAt(p, spot)}) : null);
+    };
+    return el("section", {class: "phnotices", "data-ph": "notices", "aria-label": "Notices from plugins"},
+      el("div", {class: "phbar"}, el("b", {text: "Notices"}), el("span", {class: "sp"}),
+        el("button", {class: "b ghost sm", type: "button", "data-act": "clear-notices", text: "Clear",
+                      onclick: () => { ns.forEach(n => { if (n.id != null) cleared.add(n.id); }); last = ""; render(); }})),
+      el("ul", {class: "phnlist"}, ...ns.map(item)));
+  }
+  function openAt(p, spot) {                                         // the plugin's own page, at the place its notice named
+    openPage(p);                                                     // first: opening may close an old page, which drops its open
+    opens[p.plugin_id] = {spot: {tab: String(spot.tab), ref: String(spot.ref == null ? "" : spot.ref)}, at: Date.now()};
+    const f = tabs[p.plugin_id] ? tabs[p.plugin_id].frame : (frame && frame.id === p.plugin_id ? frame : null);
+    if (f && f.ready) sendOpen(f);                                   // a page that is already up gets it now; a new one on ready
+  }
+  function sendOpen(f) {
+    const o = opens[f.id]; if (!o) return;
+    delete opens[f.id];
+    if (!(Date.now() - o.at < OPEN_TTL_MS)) return;                  // a click long ago is not delivered later
+    const spot = o.spot;
+    try { f.el.contentWindow.postMessage({pxa: "plugin/1", op: "open", plugin_id: f.id, open: spot}, "*"); } catch (e) { /* gone */ }
+  }
+  function paintWaits() {
+    const key = Object.keys(tabs).sort().map(id => id + "=" + (waits[id] || 0)).join(",") + "|" +
+                Object.keys(waits).sort().map(id => id + "=" + waits[id]).join(",");
+    if (key === painted) return;                                     // a flood of the same count draws nothing
+    painted = key;
+    let total = 0;
+    for (const id of Object.keys(waits)) total += waits[id];
+    for (const [id, t] of Object.entries(tabs)) {
+      let b = t.btn.querySelector(".nbadge.phw"); const n = waits[id] || 0;
+      if (!n) { if (b) b.remove(); continue; }
+      if (!b) { b = el("span", {class: "nbadge phw"}); t.btn.append(b); }
+      b.textContent = n > 99 ? "99+" : String(n);
+      b.title = n === 1 ? "1 thing waits for you here" : n + " things wait for you here";
+    }
+    if (baseTitle === null) baseTitle = document.title.replace(/^\(\d+\+?\) /, "");
+    document.title = total > 0 ? "(" + (total > 99 ? "99+" : total) + ") " + baseTitle : baseTitle;
+  }
+  function dropWait(id) { delete opens[id]; if (id in waits) { delete waits[id]; paintWaits(); } }
+
   function render() {
     const root = $("#ph-root"); if (!root) return;
     if (dlg() && dlg().open) { last = ""; navSync(); return; }        // a card is open: draw again after it closes
@@ -300,6 +363,8 @@
       if (data.lan) kids.push(el("p", {class: "tiny", text: "This page is open from another device: permissions can only be given at the computer itself."}));
       kids.push(el("div", {class: "pgrid", "data-ph": "list"}, ...ps.map(card)));
     }
+    const ns = noticeList();
+    if (ns.length) kids.push(noticesPanel(ns));
     if (data && data.speech) {
       if (!ps.length) kids.push(el("h3", {class: "sect", text: "On this computer"}));
       kids.push(speechPanel(data.speech));
@@ -315,11 +380,15 @@
     for (const k of ["--bg", "--surface", "--surface-2", "--line", "--text", "--dim", "--accent", "--accent-text", "--ok", "--warn", "--bad", "--font", "--mono"]) vars[k] = cs.getPropertyValue(k).trim();
     return {name: document.documentElement.dataset.theme || "dark", vars};
   };
+  // a frame's load cannot carry the X-PXA-Token header: its address takes a single-use ticket (auth.js)
+  function frameSrc(f, src) {
+    (window.PXA_AUTH ? PXA_AUTH.url(src) : Promise.resolve(src)).then(u => { f.src = u; }, e => { f.srcdoc = ""; toast(e.message, true); });
+  }
   function openPage(p) {
     if (tabs[p.plugin_id]) { showTab("plug-" + p.plugin_id); return; }     // it has its own tab: open it there
     closePage();
-    const src = "/api/plugins/host/frame?plugin_id=" + encodeURIComponent(p.plugin_id);
-    const f = el("iframe", {class: "phframe", title: p.page.title, sandbox: "allow-scripts", src, referrerpolicy: "no-referrer", "data-plugin": p.plugin_id});
+    const f = el("iframe", {class: "phframe", title: p.page.title, sandbox: "allow-scripts", referrerpolicy: "no-referrer", "data-plugin": p.plugin_id});
+    frameSrc(f, "/api/plugins/host/frame?plugin_id=" + encodeURIComponent(p.plugin_id));
     const panel = el("section", {class: "phpanel", "data-ph": "page", "aria-label": p.page.title},
       el("div", {class: "phbar"}, el("b", {text: p.page.title}), el("span", {class: "tiny", text: "runs in a sealed frame: it cannot see this page or your token, and can only talk to " + p.name}),
         el("span", {class: "sp"}), el("button", {class: "b sm", type: "button", text: "Close", onclick: closePage})), f);
@@ -327,7 +396,12 @@
     $("#ph-page").append(panel);
     panel.scrollIntoView({block: "nearest"});
   }
-  function closePage() { if (frame && frame.panel) frame.panel.remove(); frame = null; }
+  function closePage() {
+    if (frame) delete opens[frame.id];                               // a click for a page that closed is not delivered later
+    if (frame && frame.panel) frame.panel.remove();
+    if (frame && !(tabs[frame.id] && tabs[frame.id].frame)) dropWait(frame.id);
+    frame = null;
+  }
   const b64 = buf => { let s = "", u = new Uint8Array(buf); for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); };
   function pathOk(id, path) {
     if (typeof path !== "string" || path.length > 2000 || /[\u0000-\u001f\\]/.test(path)) return false;
@@ -348,7 +422,8 @@
     const m = ev.data, target = frame.el.contentWindow;
     if (!m || m.pxa !== "plugin/1") return;
     const say = o => { try { target.postMessage(Object.assign({pxa: "plugin/1"}, o), "*"); } catch (e) { /* frame gone */ } };
-    if (m.op === "ready") { say({op: "hello", plugin_id: frame.id, theme: themeMsg()}); return; }
+    if (m.op === "ready") { say({op: "hello", plugin_id: frame.id, theme: themeMsg()}); frame.ready = true; sendOpen(frame); return; }
+    if (m.op === "waiting") { const n = Math.floor(Number(m.n)); waits[frame.id] = isFinite(n) ? Math.max(0, Math.min(999, n)) : 0; paintWaits(); return; }
     if (m.op === "resize") { if (frame.full) return; const h = Math.max(160, Math.min(2400, Number(m.height) || 0)); if (h) frame.el.style.height = h + "px"; return; }
     if (m.op !== "fetch") return;
     const id = m.id, method = String(m.method || "GET").toUpperCase();
@@ -379,7 +454,7 @@
     if (!bar || !before || !main) return;
     const want = new Map(((data && data.plugins) || []).filter(wantsTab).map(p => [p.plugin_id, p]));
     for (const id of Object.keys(tabs)) if (!want.has(id)) {
-      const t = tabs[id]; t.btn.remove(); t.sec.remove(); delete tabs[id];
+      const t = tabs[id]; t.btn.remove(); t.sec.remove(); delete tabs[id]; dropWait(id);
       if (typeof S !== "undefined" && S.tab === "plug-" + id) showTab("plugins");
     }
     for (const [id, p] of want) {
@@ -404,8 +479,8 @@
     if (run && t.frame && t.state === "running") return;                 // already showing the page: never reload a working frame
     t.state = p.state || "stopped";
     if (run) {
-      const src = "/api/plugins/host/frame?plugin_id=" + encodeURIComponent(id);
-      const f = el("iframe", {class: "phframe ptframe", title: p.page.title, sandbox: "allow-scripts", src, referrerpolicy: "no-referrer", "data-plugin": id});
+      const f = el("iframe", {class: "phframe ptframe", title: p.page.title, sandbox: "allow-scripts", referrerpolicy: "no-referrer", "data-plugin": id});
+      frameSrc(f, "/api/plugins/host/frame?plugin_id=" + encodeURIComponent(id));
       t.frame = {id, el: f, full: true};
       t.sec.replaceChildren(el("div", {class: "ptbar"}, el("h2", {text: p.page.title}),
         el("span", {class: "tiny", text: "runs in a sealed frame: it cannot see the rest of PXA Control or your token, and only talks to " + p.name}),
@@ -413,6 +488,8 @@
       return;
     }
     t.frame = null;
+    delete opens[id];                                                // stopped: a click for it is not delivered later
+    if (!(frame && frame.id === id)) dropWait(id);                     // its page is gone: so is what it said waits there
     const busy = p.state === "starting" || p.state === "restarting";
     t.sec.replaceChildren(el("div", {class: "ptbar"}, el("h2", {text: p.page.title})),
       el("div", {class: "ptoff"}, el("p", {class: "muted", text: busy ? p.name + " is starting." : p.name + " is off." + (note(p) ? " " + note(p) : "")}),

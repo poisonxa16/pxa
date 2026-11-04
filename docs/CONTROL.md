@@ -44,16 +44,27 @@ Control binds to `127.0.0.1` unless you pass `--lan`, and **a token guards the A
 modes**.
 
 - **On this machine** (default) the token is fresh for every session. It rides in the address
-  Control opens for you (`?token=` once) and then becomes an `HttpOnly`, `SameSite=Strict` cookie,
-  named per port. A copy lives in the session's run record (`control-<pid>.json`, mode 0600, in a
-  0700 directory of your own config area), which is how running the app a second time opens the
-  same session signed in. Only `GET /api/health` and `GET /metrics` answer without the token on loopback.
+  Control opens for you (`?token=` once); Control redirects to `/#token=...`, and the page keeps it
+  in that browser tab only (`sessionStorage`) and drops it from the address bar. It is **never a
+  cookie**: browsers send a host's cookies to every port of it, so any other program listening on
+  the same machine would receive one. A reload keeps the tab signed in. **Each new tab or window signs
+  in once** (the token lives in that tab's `sessionStorage` only): open the address the app
+  printed, paste the token into the sign-in page, or run the app again (it opens a signed-in
+  tab). Windows PXA Control opens itself (the Vigil page, the HUD, a download) carry the
+  sign-in with them. A copy lives in the
+  session's run record (`control-<pid>.json`, mode 0600, in a 0700 directory of your own config
+  area), which is how running the app a second time opens the same session signed in. Only
+  `GET /api/health` and `GET /metrics` answer without the token on loopback.
 - **With `--lan`** the token is the persistent one in `~/.config/pxa/token` (mode 0600, created
-  on first use). `PXA_CONTROL_TOKEN` overrides it (16 or more of `A-Z a-z 0-9 _ -`). Nothing is
-  open without it on `--lan`. Open `http://<host>:<port>/?token=<token>` once from the other device.
-- **Ways to present it:** the cookie (a browser), the `X-PXA-Token` header, `Authorization:
-  Bearer <token>` (for example a Prometheus scrape job), or `?token=` on a **GET** only. A POST or
-  DELETE never takes the token from the query string.
+  on first use). `PXA_CONTROL_TOKEN` overrides it (16 or more of `A-Z a-z 0-9 _ -`). Nothing under
+  `/api/` is open without it on `--lan` (the page's own code is: it is the same in every package).
+  Open `http://<host>:<port>/?token=<token>` once from the other device; a bookmark of that address
+  keeps working.
+- **Ways to present it:** the `X-PXA-Token` header (the page sends it on every request),
+  `Authorization: Bearer <token>` (for example a Prometheus scrape job), or `?token=` on a **GET**
+  only. A POST or DELETE never takes the token from the query string. A `Cookie` is never read.
+  What a browser opens without a header (a plugin's page, a download link, the engine's own page
+  in a new tab) carries a single-use ticket for that one address, valid for 60 seconds.
 
 Do not paste the token into chat or a bug report; Control scrubs it from its own logs and reports.
 

@@ -311,6 +311,7 @@ struct llm_build_context {
     ggml_cgraph * build_starcoder2();
     ggml_cgraph * build_nemotron();    // PXA Nemotron port
     ggml_cgraph * build_nemotron_h();  // PXA Nemotron port (Nemotron-H dense + MoE hybrids)
+    ggml_cgraph * build_lfm();         // PXA LFM port (LFM2 dense, LFM2-MoE, LFM3)
     ggml_tensor * build_nemotron_h_mtp(ggml_cgraph * gf, ggml_tensor * prev_hidden, float kq_scale,   // PXA_NEMOTRON_MTP
             const std::function<ggml_tensor *(ggml_tensor *, const llama_layer &, int)> & build_moe);
 

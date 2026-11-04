@@ -87,6 +87,39 @@ class TensorNameMap:
 
         MODEL_TENSOR.ROPE_FACTORS_LONG: (),
         MODEL_TENSOR.ROPE_FACTORS_SHORT: (),
+        # vision projector (mmproj) tensors -- adapted from llama.cpp gguf-py @ 961c376a2d (MIT, Copyright (c) 2023-2026 The ggml authors)
+
+        MODEL_TENSOR.V_MMPROJ_FC: (
+            "model.connector.modality_projection.proj",
+            "connector.modality_projection.proj",
+        ),
+
+        MODEL_TENSOR.V_ENC_EMBD_CLS: (
+            "vision_tower.vision_model.embeddings.class_embedding",
+        ),
+
+        MODEL_TENSOR.V_ENC_EMBD_PATCH: (
+            "vision_tower.vision_model.embeddings.patch_embedding",
+            "model.vision_model.embeddings.patch_embedding",
+            "visual.patch_embed.proj",
+        ),
+
+        MODEL_TENSOR.V_ENC_EMBD_POS: (
+            "vision_tower.vision_model.embeddings.position_embedding",
+            "model.vision_model.embeddings.position_embedding",
+            "visual.pos_embed",
+        ),
+
+        MODEL_TENSOR.V_PRE_NORM: (
+            "vision_tower.vision_model.pre_layrnorm",
+        ),
+
+        MODEL_TENSOR.V_POST_NORM: (
+            "vision_tower.vision_model.post_layernorm",
+            "model.vision_model.post_layernorm",
+            "visual.merger.ln_q",
+            "visual.merger.norm",
+        ),
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
@@ -703,6 +736,86 @@ class TensorNameMap:
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
+        ),
+        # vision projector (mmproj) tensors -- adapted from llama.cpp gguf-py @ 961c376a2d (MIT, Copyright (c) 2023-2026 The ggml authors)
+
+        MODEL_TENSOR.V_MMPROJ: (
+            "visual.merger.mlp.{bid}",
+        ),
+
+        MODEL_TENSOR.V_MMPROJ_MLP: (
+            "mlp1.{bid}",
+        ),
+
+        MODEL_TENSOR.V_ENC_ATTN_QKV: (
+            "visual.blocks.{bid}.attn.qkv",
+        ),
+
+        MODEL_TENSOR.V_ENC_ATTN_Q: (
+            "vision_tower.vision_model.encoder.layers.{bid}.self_attn.q_proj",
+            "model.vision_model.encoder.layers.{bid}.self_attn.q_proj",
+            "visual.blocks.{bid}.attn.q",
+        ),
+
+        MODEL_TENSOR.V_ENC_ATTN_K: (
+            "vision_tower.vision_model.encoder.layers.{bid}.self_attn.k_proj",
+            "model.vision_model.encoder.layers.{bid}.self_attn.k_proj",
+            "visual.blocks.{bid}.attn.k",
+        ),
+
+        MODEL_TENSOR.V_ENC_ATTN_V: (
+            "vision_tower.vision_model.encoder.layers.{bid}.self_attn.v_proj",
+            "model.vision_model.encoder.layers.{bid}.self_attn.v_proj",
+            "visual.blocks.{bid}.attn.v",
+        ),
+
+        MODEL_TENSOR.V_ENC_INPUT_NORM: (
+            "vision_tower.vision_model.encoder.layers.{bid}.layer_norm1",
+            "vision_tower.vision_model.encoder.layers.{bid}.norm1",
+            "model.vision_model.encoder.layers.{bid}.layer_norm1",
+            "visual.blocks.{bid}.norm1",
+        ),
+
+        MODEL_TENSOR.V_ENC_ATTN_O: (
+            "vision_tower.vision_model.encoder.layers.{bid}.self_attn.out_proj",
+            "vision_tower.vision_model.encoder.layers.{bid}.attn.proj",
+            "model.vision_model.encoder.layers.{bid}.self_attn.out_proj",
+            "visual.blocks.{bid}.attn.proj",
+        ),
+
+        MODEL_TENSOR.V_ENC_POST_ATTN_NORM: (
+            "vision_tower.vision_model.encoder.layers.{bid}.layer_norm2",
+            "vision_tower.vision_model.encoder.layers.{bid}.norm2",
+            "model.vision_model.encoder.layers.{bid}.layer_norm2",
+            "visual.blocks.{bid}.norm2",
+        ),
+
+        MODEL_TENSOR.V_ENC_FFN_UP: (
+            "vision_tower.vision_model.encoder.layers.{bid}.mlp.fc1",
+            "model.vision_model.encoder.layers.{bid}.mlp.fc1",
+            "visual.blocks.{bid}.mlp.fc1",
+            "visual.blocks.{bid}.mlp.up_proj",
+            "visual.blocks.{bid}.mlp.linear_fc1",
+        ),
+
+        MODEL_TENSOR.V_ENC_FFN_GATE: (
+            "visual.blocks.{bid}.mlp.gate_proj",
+        ),
+
+        MODEL_TENSOR.V_ENC_FFN_DOWN: (
+            "vision_tower.vision_model.encoder.layers.{bid}.mlp.fc2",
+            "model.vision_model.encoder.layers.{bid}.mlp.fc2",
+            "visual.blocks.{bid}.mlp.fc2",
+            "visual.blocks.{bid}.mlp.down_proj",
+            "visual.blocks.{bid}.mlp.linear_fc2",
+        ),
+
+        MODEL_TENSOR.V_LAYER_SCALE_1: (
+            "vision_tower.vision_model.encoder.layers.{bid}.ls1",
+        ),
+
+        MODEL_TENSOR.V_LAYER_SCALE_2: (
+            "vision_tower.vision_model.encoder.layers.{bid}.ls2",
         ),
     }
 

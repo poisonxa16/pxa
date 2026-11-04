@@ -4,6 +4,7 @@
 // Shared body of the two sm_60 quantized-KV flash-attention routes (2026-09-27):
 //   PXA_FA_QKV_DIRECT  narrow nodes, query width 1..8 (decode, speculative verify)  fattn-qkv-direct.cu
 //   PXA_FA_QKV_TILE    wide nodes, query width > 8 (prefill ubatch, wide verify)    fattn-qkv-tile.cu
+// PXA_CLOSED_HOOK: launch() offers a narrow node to ggml_cuda_pxqn_attn_narrow first (pxqn.cuh); -1 = the plain route here.
 //
 // One block per (column tile, KV head, KV split) serves the G query heads of one GQA group times
 // NC query columns (R = G*NC rows), so every K/V byte is fetched once per group and column tile.
@@ -47,6 +48,7 @@
 //
 
 #include "../fattn-vec-common.cuh"
+#include "pxqn.cuh"   // PXA_CLOSED_HOOK: ggml_cuda_pxqn_attn_narrow (the closed narrow route; -1 = this file's launch)
 
 namespace pxa_qkv {
 
@@ -697,6 +699,9 @@ static __global__ void flash_attn_qkv(
 // split at minimum) instead of 256 keys, so short caches still fill the card.
 template <int D, int G, int NC, ggml_type TYPE>
 static void launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool narrow = false) {
+    if (narrow && ggml_cuda_pxqn_attn_narrow(ctx, dst, D, G, NC, (int) TYPE) == 0) {   // PXA_CLOSED_HOOK
+        return;
+    }
     launch_fattn<D, NC, G>(ctx, dst, flash_attn_qkv<D, G, NC, TYPE>, NW, 0, narrow ? plan<D, G*NC, TYPE>::T : KV_GRAN,
                            /*need_f16_K=*/false, /*need_f16_V=*/false);
 }

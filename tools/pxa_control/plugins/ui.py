@@ -12,7 +12,9 @@
   `pxa.fetch("/api/plugins/<its id>/...", {method, body, headers})`; the Control page checks the message came from THAT frame,
   that the path is under /api/plugins/<that plugin's id>/ (never another plugin, never /api/plugins/host or any other Control
   route), and makes the call with its own cookie; the answer comes back as {status, ctype, text | b64}. `pxa.theme` / `pxa.onTheme`
-  carry the page's colours; `pxa.resize(px)` asks for a height. Nothing else crosses.
+  carry the page's colours; `pxa.resize(px)` asks for a height; `pxa.onOpen(fn)` gets the {tab, ref} of a notice the person clicked
+  (the plugin's own notify open, checked by the host: two plain words, never Control's); `pxa.waiting(n)` tells Control how many
+  things wait for the person there (a count only: Control shows it on the plugin's tab and in its own title). Nothing else crosses.
 v1 limit: the page is ONE html file (inline css and js); its other files are not served to the frame.
 """
 import os
@@ -233,12 +235,19 @@ BRIDGE_JS = r"""<script>
   };
   api.resize = function (px) { parent.postMessage({pxa: "plugin/1", op: "resize", height: Math.round(Number(px) || 0)}, "*"); };
   api.onTheme = function (fn) { listeners.push(fn); if (api.theme && api.theme.name) fn(api.theme); };
+  var opens = [], held = null;
+  api.onOpen = function (fn) { opens.push(fn); if (held) { var o = held; held = null; fn(o); } };
+  api.waiting = function (n) { parent.postMessage({pxa: "plugin/1", op: "waiting", n: Math.max(0, Math.min(999, Math.floor(Number(n) || 0)))}, "*"); };
   window.addEventListener("message", function (ev) {
     if (ev.source !== parent) return;
     var d = ev.data;
     if (!d || d.pxa !== "plugin/1") return;
     if (d.op === "result" && pending[d.id]) { var p = pending[d.id]; delete pending[d.id]; p.resolve(d); }
     else if (d.op === "error" && pending[d.id]) { var q = pending[d.id]; delete pending[d.id]; q.reject(new Error(d.error || "refused")); }
+    else if (d.op === "open" && d.open && typeof d.open.tab === "string") {
+      var o = {tab: String(d.open.tab), ref: String(d.open.ref == null ? "" : d.open.ref)};
+      if (opens.length) { opens.forEach(function (fn) { try { fn(o); } catch (e) {} }); } else { held = o; }
+    }
     else if (d.op === "hello" || d.op === "theme") {
       api.theme = d.theme || {}; api.id = d.plugin_id || api.id;
       var r = document.documentElement;

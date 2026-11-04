@@ -394,4 +394,9 @@ class CheckWinPackageTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    # the public source tree has no ggml/src/win-compat/ggml-pxqn.def (it ships with the closed library), the same rule as
+    # scripts/pxa-def-exports-check.py: nothing to check there, reported to ctest as SKIPPED (77)
+    if not os.path.exists(os.path.join(REPO, "ggml", "src", "win-compat", "ggml-pxqn.def")):
+        print("test-check-win-package: SKIP: ggml-pxqn.def not in the public tree")
+        raise SystemExit(77)
     unittest.main()

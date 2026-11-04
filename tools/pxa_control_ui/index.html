@@ -12,6 +12,7 @@
 <title>PXA Control</title>
 <link rel="icon" href="/favicon.png">
 <meta name="theme-color" content="#0F1012">
+<script src="/auth.js"></script>
 <script>/* the theme before first paint: ?theme=, else the saved choice, else the OS (prefers-color-scheme) */
 (function () { var v = null; try { v = JSON.parse(localStorage.getItem("pxa-control.theme") || "null"); } catch (e) { v = null; }
   try { var q = new URLSearchParams(location.search).get("theme"); if (q === "light" || q === "dark") v = q; } catch (e) { /* old browser */ }
@@ -1193,7 +1194,7 @@ async function api(path, opts) {
   catch (e) { throw new Error(e.name === "AbortError" ? `no answer from PXA Control within ${Math.round(ms / 1000)} s` : "PXA Control is unreachable (is it still running?)"); }
   finally { clearTimeout(t); }
   let j = null; try { j = await r.json(); } catch (e) { /* non-JSON */ }
-  if (r.status === 401) throw new Error("not signed in: open the GUI's address with ?token=... again");
+  if (r.status === 401) throw new Error("not signed in: open the address PXA Control printed (it ends in ?token=...) again, or run pxa");
   if (!r.ok) throw Object.assign(new Error((j && j.error) || ("HTTP " + r.status)), {status: r.status, code: j && j.code});   // .code: a caller can tell bad_image from the rest
   return j;
 }

@@ -146,7 +146,7 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------
-# Qwen4Exp pipeline-parallel repair (fork defect #1545: hyper_connection_mixer
+# Qwen4Exp pipeline-parallel repair (fork defect: hyper_connection_mixer
 # is the literal None on non-last PP ranks, which AutoWeightsLoader cannot skip).
 # Imported AFTER the audit so the repair runs OUTSIDE it -- i.e. before the load
 # the audit measures. PXA_QWEN4EXP_PP_FIX=0 disables; the module never raises here.
@@ -157,7 +157,7 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------
-# safetensors get_tensor diagnosis + independent re-read (#1574: every worker
+# safetensors get_tensor diagnosis + independent re-read (every worker
 # dies at 0/76 with "could not determine the shape of object type
 # 'torch.storage.UntypedStorage'" and the traceback never names the tensor).
 # PXA_ST_FALLBACK=0 disables, =strict logs and re-raises.
@@ -178,7 +178,7 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------
-# Qwen4Exp n-gram PLE at pipeline_parallel_size > 1 (fork wall #1595: every rank
+# Qwen4Exp n-gram PLE at pipeline_parallel_size > 1 (fork wall: every rank
 # raises "N-gram PLE embedding currently requires pipeline_parallel_size=1").
 # PP is the only legal 4-card shape for this checkpoint, so this lifts the wall
 # by running the fork's OWN post-assertion statements. PXA_QWEN4EXP_PLE_PP=0

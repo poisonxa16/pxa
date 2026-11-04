@@ -2156,6 +2156,85 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        // PXA LFM port (mainline src/llama-arch.cpp, MIT): LFM2 names its final norm token_embd_norm
+        LLM_ARCH_LFM2,
+        {
+            { LLM_TENSOR_OUTPUT_NORM,     "token_embd_norm" },
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+            // the short-conv operator reuses the SSM tensor slots (conv window = ssm_conv1d)
+            { LLM_TENSOR_SSM_CONV1D,      "blk.%d.shortconv.conv" },
+            { LLM_TENSOR_SSM_IN,          "blk.%d.shortconv.in_proj" },
+            { LLM_TENSOR_SSM_OUT,         "blk.%d.shortconv.out_proj" },
+        },
+    },
+    {
+        LLM_ARCH_LFM2MOE,
+        {
+            { LLM_TENSOR_OUTPUT_NORM,     "token_embd_norm" },
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+            // the short-conv operator reuses the SSM tensor slots (conv window = ssm_conv1d)
+            { LLM_TENSOR_SSM_CONV1D,      "blk.%d.shortconv.conv" },
+            { LLM_TENSOR_SSM_IN,          "blk.%d.shortconv.in_proj" },
+            { LLM_TENSOR_SSM_OUT,         "blk.%d.shortconv.out_proj" },
+            { LLM_TENSOR_FFN_GATE_INP,    "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,   "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,   "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,     "blk.%d.ffn_up_exps" },
+            { LLM_TENSOR_FFN_EXP_PROBS_B, "blk.%d.exp_probs_b" },
+        },
+    },
+    {
+        LLM_ARCH_LFM3,
+        {
+            { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
+            { LLM_TENSOR_ROPE_FREQS,      "rope_freqs" },
+            { LLM_TENSOR_ATTN_GATE,       "blk.%d.attn_gate" },
+            { LLM_TENSOR_ATTN_POST_NORM,  "blk.%d.post_attention_norm" },
+            { LLM_TENSOR_FFN_POST_NORM,   "blk.%d.post_ffw_norm" },
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+            // the short-conv operator reuses the SSM tensor slots (conv window = ssm_conv1d)
+            { LLM_TENSOR_SSM_CONV1D,      "blk.%d.shortconv.conv" },
+            { LLM_TENSOR_SSM_IN,          "blk.%d.shortconv.in_proj" },
+            { LLM_TENSOR_SSM_OUT,         "blk.%d.shortconv.out_proj" },
+        },
+    },
+    {
         LLM_ARCH_UNKNOWN,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
@@ -2416,6 +2495,7 @@ const char * llama_model_type_name(e_model type) {
         case MODEL_A13B:          return "A13B";
         case MODEL_7B_A1B:        return "7B.A1B";
         case MODEL_8B_A1B:        return "8B.A1B";
+        case MODEL_24B_A2B:       return "24B.A2B";
         case MODEL_12B_A2_5B:     return "12B.A2.5B";
         case MODEL_16B_A1B:       return "16B.A1B";
         case MODEL_21B_A3B:       return "21B.A3B";

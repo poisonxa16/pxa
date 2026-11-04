@@ -2038,7 +2038,7 @@ def tsplit_auto_quad(sel, environ=None):
 
 def tsplit_bug206_note(n):
     """The past-a-pair note, as ONE function so it reads identically wherever it is printed:
-    when '--sm auto' declines the tensor split past a pair, and (#8382 problem 4) when an
+    when '--sm auto' declines the tensor split past a pair, and (tensor-split problem 4) when an
     operator forces '-sm tensor' BY HAND on a set the default does not cover. Pure so the
     selftest can call it directly."""
     return (f"{n} cards selected - past a pair the tensor split is a default only on 4 identical "
@@ -5429,7 +5429,7 @@ def doctor(a, gpus, gpu_err):
     # ---- model -----------------------------------------------------------------------------
     if a.model:
         kind = model_kind(a.model)
-        # #8382 problem 3: model_profile() only fills hdr_err for kind in (gguf, gguf_broken), so
+        # tensor-split problem 3: model_profile() only fills hdr_err for kind in (gguf, gguf_broken), so
         # a MISSING or otherwise unloadable path used to fall through with hdr_err left None,
         # probs left empty, and doctor printed "OK" and exited 0 on a model that cannot load.
         if kind == "missing":
@@ -5768,7 +5768,7 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
         print("  -sm: 'auto' reached the command builder unresolved - emitting layer. This is "
               "a bug in this launcher, not a setting; please report it.")
     # ---- -c: follow the SAME engine cell -b/-ub follow below, when nothing more specific has
-    # already claimed -c (#8382's other half; pxa-registry.cpp "---- -c ----" now derives -c from
+    # already claimed -c (the tensor-split issue's other half; pxa-registry.cpp "---- -c ----" now derives -c from
     # ac.batch_cell_ctx, the identical cell -b/-ub reads there, for exactly this reason - one
     # source of truth instead of a second formula that can drift from it). A row matched BY FILE
     # still owns -c (R.ctx set, e.g. '4xp100-flashnext' -c 150016) - it is more specific than a
@@ -5778,7 +5778,7 @@ def build_llama_cmd(plan, a, sel, prof, ctx, ub_expect, mmproj, explain=False):
     # specific than the engine's own answer, so the engine wins here too, exactly as it already
     # does for -b/-ub just below. Without this, a file with no row of its own kept anchor -c 4096
     # while -b/-ub already took the engine's bigger cell, and llama.cpp silently clamped n_batch
-    # down to n_ctx at load - #8382 reborn from THIS launcher instead of a bare boot (found on
+    # down to n_ctx at load - the tensor-split issue reborn from THIS launcher instead of a bare boot (found on
     # mix27/PXQ3-balanced/Q8_0 at 2x600/2x700: rel-integrate2 build-3 parity triage, 2026-09-25).
     if not a.ctx and not (R is not None and R.ctx):
         _ec = engine_pick(getattr(plan, "engine_ac", None), "c")
@@ -8572,7 +8572,7 @@ def selftest(gpus):
     ok_all &= a16
     print(f"  A16 a split GGUF is sized and profiled over all its shards, and a missing shard "
           f"is named (bug #229): {'PASS' if a16 else 'FAIL'}")
-    # A17 (#8382 problem 4): '-sm tensor' typed BY HAND on more than a pair must warn with the
+    # A17 (tensor-split problem 4): '-sm tensor' typed BY HAND on more than a pair must warn with the
     #     SAME bug #206 text the auto resolver prints when it declines tensor past a pair - the
     #     auto path silently avoiding the bug used to be no help to someone who overrides it.
     a17 = (resolve_auto_split("llama", _c(70, V100, 4), qwen, "", None, "on")[1] == tsplit_bug206_note(4)
@@ -8583,7 +8583,7 @@ def selftest(gpus):
            and "".join(src).count("tsplit_bug206_note(") >= 2)
     ok_all &= a17
     print(f"  A17 '-sm tensor' by hand on >2 cards warns with the auto path's own bug #206 text "
-          f"(#8382 problem 4): {'PASS' if a17 else 'FAIL'}")
+          f"(tensor-split problem 4): {'PASS' if a17 else 'FAIL'}")
     # A17b (2026-10-24): the OneCard mix takes the auto tensor split on a P100 pair only; other mixes and V100 pairs stay layer.
     _oc = dict(qwen, tier="PXQ_UNIVERSAL", hist={257: 49, 259: 100, 263: 1, 8: 60})
     a17b = (resolve_auto_split("llama", _c(60, P100, 2), _oc, "", None, "on")[0] == "tensor"
@@ -8961,7 +8961,7 @@ def plan_and_build(a, gpus):
                 f"--sm tensor asks for the split by hand; the engine has the last word on "
                 f"whether it will run it.")
 
-    # #8382 problem 4: '--sm auto' and the engine registry both always pick 'layer' past a pair
+    # tensor-split problem 4: '--sm auto' and the engine registry both always pick 'layer' past a pair
     # (bug #206), so a.sm can only be 'tensor' with len(sel) > 2 here when tensor was FORCED BY
     # HAND - and that path used to print '-sm tensor' with no warning at all. Same text the auto
     # path prints when it declines tensor for the same reason.
@@ -9845,7 +9845,7 @@ def main():
     # code path runs. There is no interactive-only behaviour below this block.
     procs, _procs_ok = resident_procs(gpus or [])
     # Cards + model given = nothing left to ask (the launcher asks only cards and model). The workload then
-    # defaults like a scripted call: chat when --np<=1, serve above it (infer_workload). e2e-v3 #15070: the
+    # defaults like a scripted call: chat when --np<=1, serve above it (infer_workload). e2e-v3: the
     # README's './pxa --gpus 0 --model M --yes' used to stop at the workload question and start nothing.
     want_prompt = (not a.gpus or not a.model)
     if want_prompt and not a.no_interactive and not a.no_tui and gpus:

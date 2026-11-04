@@ -12,6 +12,7 @@ sync case, a Control server on 127.0.0.1. No GPU, no internet. POSIX (the Window
 import http.server
 import importlib.util
 import json
+import re
 import os
 import shutil
 import socket
@@ -284,9 +285,17 @@ class Host(unittest.TestCase):
         self.assertEqual(j["listen"], [{"port": 15310, "proto": "http", "host": "0.0.0.0"}, {"port": 15311, "proto": "http", "host": "127.0.0.1"}])
         rows = [r for r in audit_rows() if r["plugin"] == "stubfree" and r["event"] == "start"]
         self.assertTrue(rows and rows[-1]["by"] == "use")
+        # the socket folder is <cfg>/plugins/run, or a private tempdir when that path would not fit sun_path (~104 bytes;
+        # a long TMPDIR such as a /dev/shm test run): the host reports the one it used, both must be 0700
+        run = self.host.runs["stubfree"]
         d = os.path.join(CFG, "plugins", "run")
-        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
-        self.assertEqual(stat.S_IMODE(os.stat(self.host.runs["stubfree"].address).st_mode), 0o600)
+        if len(d) <= 80:
+            self.assertEqual(run.sock_dir, d)
+        else:
+            self.assertTrue(os.path.basename(run.sock_dir).startswith("pxa-plug-"), run.sock_dir)
+        self.assertEqual(os.path.dirname(run.address), run.sock_dir)
+        self.assertEqual(stat.S_IMODE(os.stat(run.sock_dir).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(run.address).st_mode), 0o600)
 
     def test_token_origin_and_host_checks_run_before_the_plugin(self):
         self.consent("stubfree")
@@ -334,11 +343,32 @@ class Host(unittest.TestCase):
         self.assertEqual(self.ctl("POST", "/api/plugins/stubfree/call", {"name": "entitlement.state"})[1]["result"], {"state": "free"})
         self.ctl("POST", "/api/plugins/stubfree/call", {"name": "notify", "args": {"text": "hello from the stub"}})
         self.assertIn("hello from the stub", [n["text"] for n in self.ctl("GET", "/api/plugins/host")[1]["notices"]])
+        for spot in ({"tab": "needs", "ref": 12}, {"tab": "needs", "ref": "a b"}, {"tab": "Needs!", "ref": "1"}, "needs"):
+            self.ctl("POST", "/api/plugins/stubfree/call", {"name": "notify", "args": {"text": "asks " + json.dumps(spot), "open": spot}})
+        got = self.ctl("GET", "/api/plugins/host")[1]["notices"][-4:]
+        self.assertEqual([n.get("open") for n in got], [{"tab": "needs", "ref": "12"}, None, None, None])   # plain words only
+        self.assertEqual(len({n["id"] for n in got}), 4)                                                # each its own number
+        self.assertTrue(all(re.match(r"\A[0-9a-f]{8}-[0-9]+\Z", n["id"]) for n in got), got)        # "<boot>-<n>" (#52426 M1)
+        again = H.PluginHost(CFG, cache=self.cache, pubkeys=PLUG_KEYS, tick_s=3600)                    # a restarted host
+        self.assertNotEqual(again._notice_boot, self.host._notice_boot)        # so a page's cleared ids never hide its notices
+        self.assertTrue(all(n["plugin"] == "stubfree" for n in got))
         self.host.stop("stubfree", "test")
         self.consent("stubfree")                                                  # all of it now
         st, j, _ = self.ctl("POST", "/api/plugins/stubfree/call", {"name": "model.chat", "args": {"messages": [{"role": "user", "content": "x"}]}})
         self.assertEqual((j["status"], j["result"]), (200, {"reply": "hi"}))
         self.assertEqual(self.chats[-1]["messages"][0]["content"], "x")
+
+    def test_notice_open_takes_two_plain_words_only(self):
+        ok = H.notice_open
+        self.assertEqual(ok({"tab": "needs", "ref": "12"}), {"tab": "needs", "ref": "12"})
+        self.assertEqual(ok({"tab": "needs", "ref": 7}), {"tab": "needs", "ref": "7"})
+        self.assertEqual(ok({"tab": "rooms"}), {"tab": "rooms", "ref": ""})
+        self.assertEqual(ok({"tab": "a" * 32, "ref": "x" * 64}), {"tab": "a" * 32, "ref": "x" * 64})
+        for bad in (None, "needs", ["needs"], {}, {"tab": ""}, {"tab": "Needs"}, {"tab": "needs\n"}, {"tab": "a" * 33},
+                    {"tab": "../x"}, {"tab": "needs", "ref": "x" * 65}, {"tab": "needs", "ref": "1\n"}, {"tab": "needs", "ref": True},
+                    {"tab": "needs", "ref": "<b>"}, {"tab": "needs", "ref": 1.5}, {"tab": "needs", "ref": {"x": 1}},
+                    {"tab": "javascript:x", "ref": "1"}, {"tab": 3, "ref": "1"}):
+            self.assertIsNone(ok(bad), repr(bad))
 
     def test_model_list_needs_model_chat_and_is_empty_without_servers(self):
         self.host.stop("stubfree", "test")

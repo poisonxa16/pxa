@@ -580,6 +580,12 @@ if grep -q '^PXA_PXQN_CLOSED_SRC:BOOL=ON' "$BUILD_DIR/CMakeCache.txt" 2>/dev/nul
   cp -a "$EXPORT/docs/LICENSE-ggml-pxqn.txt" "$STAGE/LICENSE-ggml-pxqn.txt"
 fi
 
+# Fail closed on the tools the steps below need inside $DEV_IMAGE: a missing readelf turns the RUNPATH and debug-strip
+# loops into silent no-ops (every file is "not ELF"), a missing nm makes the lib-compat symbol check compare two empty lists.
+TOOLS_MISSING=$(dimg -- 'for t in ldd readelf patchelf strip objdump nm; do command -v "$t" >/dev/null 2>&1 || printf "%s " "$t"; done; echo') \
+  || die "could not run the tool check in DEV_IMAGE=$DEV_IMAGE"
+[ -z "${TOOLS_MISSING// /}" ] || die "DEV_IMAGE=$DEV_IMAGE lacks: $TOOLS_MISSING-- the package steps would silently do nothing; use a pxa-release-build image"
+
 LDD_SCRIPT='
 set -e
 export LD_LIBRARY_PATH=/build/bin:/build/src:/build/ggml/src:/build/examples/mtmd
@@ -686,6 +692,15 @@ if dimg -- 'command -v patchelf' >/dev/null 2>&1; then
       patchelf --set-rpath "\$ORIGIN/../lib" "$f" 2>/dev/null || true
     done
   '
+  # fail closed: every staged ELF program and library now carries an $ORIGIN RUNPATH, and there was at least one of them
+  RUNPATH_BAD=$(dimg -v "$STAGE:/stage:ro" -- '
+    n=0; for f in /stage/bin/* /stage/lib/*.so* /stage/lib-compat/*.so*; do
+      [ -f "$f" ] && [ ! -L "$f" ] || continue
+      readelf -h "$f" >/dev/null 2>&1 || continue
+      n=$((n+1)); readelf -d "$f" 2>/dev/null | grep -qE "R(UN)?PATH.*[\$]ORIGIN" || echo "no \$ORIGIN RUNPATH: ${f#/stage/}"
+    done; [ "$n" -gt 0 ] || echo "no ELF file found under bin/ lib/ lib-compat/"') || die "the RUNPATH check could not run in $DEV_IMAGE"
+  [ -z "$RUNPATH_BAD" ] || die "RUNPATH not set on the stage:
+$RUNPATH_BAD"
 else
   # Since 4.0.1 the wrappers no longer put lib/ on PXA Control's path, so Control's own runs of the engine programs and a
   # direct bin/llama-server need RUNPATH $ORIGIN/../lib. A package without it is not shippable (use DEV_IMAGE=pxa-sm60-dev:pkg
@@ -751,6 +766,8 @@ $SYMDIFF"
   [ "$(echo "$SYMDIFF" | grep '^soname fast:' | sed 's/^soname fast: *//')" = "$(echo "$SYMDIFF" | grep '^soname compat:' | sed 's/^soname compat: *//')" ] \
     || die "lib-compat/libggml.so has a different soname than lib/libggml.so:
 $SYMDIFF"
+  echo "$SYMDIFF" | grep -qE '^exported strong symbols fast=[1-9][0-9]* compat=[1-9][0-9]*$' \
+    || die "the lib-compat symbol check read no symbols (nm missing or failed): $(echo "$SYMDIFF" | grep '^exported strong symbols')"
   info "lib-compat symbols: $(echo "$SYMDIFF" | grep '^exported strong symbols')"
   if [ -f "$STAGE/lib/libggml-pxqn.so" ]; then
     ln -f "$STAGE/lib/libggml-pxqn.so" "$STAGE/lib-compat/libggml-pxqn.so"
@@ -919,8 +936,9 @@ if [ -d "$EXPORT/tools/pxa_chat" ]; then
   cp -a "$EXPORT/tools/pxa_chat" "$STAGE/tools/pxa_chat"
   find "$STAGE/tools/pxa_chat" -name __pycache__ -prune -exec rm -rf {} +
   # the in-house agent binding needs PXA Anibal, which never ships (see below); routes.py imports it lazily and answers
-  # 503 agent_unavailable without it (4.0.0 shipped pxa_chat without these two files)
-  rm -f "$STAGE/tools/pxa_chat/vigil_bind.py" "$STAGE/tools/pxa_chat/test_vigil_bind.py"
+  # 503 agent_unavailable without it (4.0.0 shipped pxa_chat without these two files); test_vigil_pass.py tests the
+  # Anibal pass check and imports anibal too
+  rm -f "$STAGE/tools/pxa_chat/vigil_bind.py" "$STAGE/tools/pxa_chat/test_vigil_bind.py" "$STAGE/tools/pxa_chat/test_vigil_pass.py"
 fi
 # NOT staged (4.0.1 package): the plugin platform (tools/pxa_plugins), PXA Anibal (tools/anibal) and its
 # compat alias tools/vigil.py. Plugins and Anibal never ship in the package (security review F4b, plugins plan S9; owner

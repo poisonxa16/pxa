@@ -290,6 +290,13 @@ llama_test(test-pxa-host-resident)
 llama_build(test-pxa-epi-stash.cpp)
 llama_test(test-pxa-epi-stash)
 
+# bug #376: the token-embedding GET_ROWS on a q5_K / q6_K table is BYTE-equal to the CPU's dequantize_row for every row id,
+# with the table mapped, copied, or in a CUDA_Host copy (PXA_HOST_RESIDENT), and the scheduler keeps it on the CPU backend.
+# Synthetic tables here; `test-pxa-embd-rows <table.bin> <q5_K|q6_K> <ne0> <ne1>` runs it on a model's real token_embd bytes.
+llama_build(test-pxa-embd-rows.cpp)
+target_link_libraries(test-pxa-embd-rows PRIVATE ggml)
+llama_test(test-pxa-embd-rows)
+
 llama_build(test-kv-seq-shadow.cpp)
 target_include_directories(test-kv-seq-shadow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 llama_test(test-kv-seq-shadow)
@@ -539,6 +546,20 @@ llama_test(test-pxa-kqmmv-vid)
 # set-but-unusable PXA_XCACHE_COUNTS treated as unset (2026-10-12)
 llama_build(test-pxa-xcache-counts.cpp)
 llama_test(test-pxa-xcache-counts)
+# the closed library's .speed writer (ggml_pxqn_xcache_speed_write, todo od2-learned-windows): one atomic replace, as every counts
+# csv and learned .state write: the exact LF bytes, a second write replaces the first (Windows), the temp file and the directory
+# fsync'd (POSIX: this binary exports its own fsync, which the library's calls reach first), a failed write or move keeps the old
+# file. Drives the built libggml-pxqn / ggml-pxqn.dll. CPU only, closed tree only.
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-pxqn-xcache-speed.cpp AND TARGET ggml-pxqn)
+    add_executable(test-pxqn-xcache-speed test-pxqn-xcache-speed.cpp)
+    target_compile_features(test-pxqn-xcache-speed PRIVATE cxx_std_17)
+    target_link_libraries(test-pxqn-xcache-speed PRIVATE ${CMAKE_DL_LIBS})
+    if (NOT WIN32)
+        set_target_properties(test-pxqn-xcache-speed PROPERTIES ENABLE_EXPORTS ON)
+    endif()
+    add_dependencies(test-pxqn-xcache-speed ggml-pxqn)
+    add_test(NAME test-pxqn-xcache-speed COMMAND $<TARGET_FILE:test-pxqn-xcache-speed> $<TARGET_FILE:ggml-pxqn>)
+endif()
 # PXA_XCACHE_OT (glm-mc-2): the expert split under a user -ot placement
 llama_build(test-pxa-xcache-ot.cpp)
 llama_test(test-pxa-xcache-ot)
@@ -554,6 +575,18 @@ llama_test(test-pxa-xcache-async NAME test-pxa-xcache-async-gateless ARGS --gate
 llama_test(test-pxa-xcache-async NAME test-pxa-xcache-async-fatal ARGS --expect-fatal)
 # not a ctest: needs the tiny glm5next GGUF; driven by tests/run-xcache-ot-bitid.sh
 llama_build(test-pxa-xcache-ot-logits.cpp)
+# the PXQN library's role tables (ggml-pxqn-ext.h): present, and without the library
+llama_build(test-pxqn-ext.cpp)
+llama_test(test-pxqn-ext NAME test-pxqn-ext)
+if (PXA_PXQN_CLOSED_SRC AND GGML_CUDA AND BUILD_SHARED_LIBS)
+    llama_test(test-pxqn-ext NAME test-pxqn-ext-lib ARGS --want-gemv --want-place --want-chain --want-sched --want-fa)
+    llama_test(test-pxqn-ext NAME test-pxqn-ext-lib-sched-on ARGS --want-sched --want-place)
+    set_tests_properties(test-pxqn-ext-lib-sched-on PROPERTIES ENVIRONMENT "PXA_MTP_ASYNC_INPUTS=1;PXA_MTP_HEAD_DIRECT=1")
+    llama_test(test-pxqn-ext NAME test-pxqn-ext-lib-keep-on ARGS --want-sched)
+    set_tests_properties(test-pxqn-ext-lib-keep-on PROPERTIES ENVIRONMENT "PXA_MTP_GRAPH_REUSE=1")
+endif()
+llama_test(test-pxqn-ext NAME test-pxqn-ext-nolib ARGS --want-none)
+set_tests_properties(test-pxqn-ext-nolib PROPERTIES ENVIRONMENT "PXA_PXQN_DISABLE=1")
 find_program(PXA_PYTHON3 python3)
 if (PXA_PYTHON3)
     add_test(NAME test-pxa-lever-catalog
@@ -633,13 +666,17 @@ if (PXA_PYTHON3)
     set_tests_properties(test-make-windows-release PROPERTIES TIMEOUT 300)
     add_test(NAME test-check-win-package
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-check-win-package.py)
-    set_tests_properties(test-check-win-package PROPERTIES TIMEOUT 300)
+    set_tests_properties(test-check-win-package PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_test(NAME test-release-scan-payloads
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-release-scan-payloads.py)
     set_tests_properties(test-release-scan-payloads PROPERTIES TIMEOUT 300)
     # release-scan.py allow rules (@secrets-allow, @archive-allow)
     add_test(NAME test-release-scan-allow
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-release-scan-allow.py)
+    # release-scan.py check 6, closed-lib: no speed mechanism added after the public baseline (synthetic git fixtures)
+    add_test(NAME test-release-scan-closedlib
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-release-scan-closedlib.py)
+    set_tests_properties(test-release-scan-closedlib PROPERTIES TIMEOUT 120)
     # the public source export's evidence-id scrub (scripts/pxa-public-scrub.py, run by pxa-lever-catalog.py --public-filter)
     add_test(NAME test-pxa-public-scrub
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-public-scrub.py)
@@ -931,6 +968,16 @@ if (PXA_PYTHON3)
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-encode.py)
 endif()
 
+# The converter's vision-language models (Qwen2.5-VL, Qwen3-VL, Qwen3-VL-MoE, SmolVLM2, InternVL): text model + --mmproj projector from
+# tiny random checkpoints (tests/gen_tiny_vl.py), names, keys and the rearranged tensors checked. Skips (77) without torch/transformers.
+if (PXA_PYTHON3)
+    add_test(NAME test-convert-vl
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-convert-vl.py)
+    set_tests_properties(test-convert-vl PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+    add_test(NAME test-convert-nommap
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-convert-nommap.py)
+endif()
+
 # 4.0.1 key rotation 2026-10b (tests/test-pxa-dual-trust-kids.py): packages, engine/library updates, beta file lists, plugins and
 # grants trust the old and the new kid; for the two LOADED-code keys (package, plugin) the old key only vouches for the pinned
 # artifacts already published under it; an unknown kid is refused; the shipped lists hold exactly the rotation's public keys.
@@ -998,6 +1045,22 @@ if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-pxqn-overdrive.cpp AND PXA_PXQN_CLOS
     llama_build(test-pxqn-overdrive.cpp)
     add_dependencies(test-pxqn-overdrive ggml-pxqn)
     llama_test(test-pxqn-overdrive)
+endif()
+
+# The KQ mask decision of the closed "upload" role + the open side that asks it, against the pre-move open rule, at TRIM_W
+# 0 / 1 / 2 / 4 / 8 and mask modes 0..2; nolib = v4.0.1. Closed tree only.
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test-pxqn-upload.cpp AND PXA_PXQN_CLOSED_SRC)
+    llama_build(test-pxqn-upload.cpp)
+    add_dependencies(test-pxqn-upload ggml-pxqn)
+    llama_test(test-pxqn-upload NAME test-pxqn-upload)
+    foreach (pxa_w 1 2 4 8)
+        foreach (pxa_m 0 1 2)
+            llama_test(test-pxqn-upload NAME test-pxqn-upload-w${pxa_w}-m${pxa_m})
+            set_tests_properties(test-pxqn-upload-w${pxa_w}-m${pxa_m} PROPERTIES ENVIRONMENT "PXA_KQ_MASK_TRIM_W=${pxa_w};PXA_KQ_MASK_PAD1=${pxa_m}")
+        endforeach()
+    endforeach()
+    llama_test(test-pxqn-upload NAME test-pxqn-upload-nolib)
+    set_tests_properties(test-pxqn-upload-nolib PROPERTIES ENVIRONMENT "PXA_PXQN_DISABLE=1;PXA_KQ_MASK_TRIM_W=4;PXA_KQ_MASK_PAD1=2")
 endif()
 
 # 4.0.1 key rotation 2026-10b: the lock library trusts a kid-picked LIST of lock-signing keys (old + new kid): a new-kid token and
@@ -1305,6 +1368,10 @@ if (PXA_PYTHON3 AND _pxa_tiny_np EQUAL 0)
     # 4.0.1 security (review L4): zero / non-dividing Mamba-2 sizes and a wrapped nextn_predict_layers fail the load
     add_test(NAME test-hparams-hostile COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-hparams-hostile.sh $<TARGET_FILE:test-dsv41-load>)
 endif()
+
+# GGML_OP_CLAMP on the CPU must clamp every row with any thread count (dsv41 oracle finding 10-31: rows
+# j % nth != 0 were left unclamped, breaking the DS4/DS4.1/GLM-5 SwiGLU limits on CPU). CPU only, no model.
+llama_build_and_test(test-clamp-mt.cpp)
 
 # DeepSeek-V4.1 chat template (todo dsv41-bringup, D2): models/templates/deepseek-ai-DeepSeek-V4.1.jinja must render the
 # reference encoder's own golden pairs (encoding/tests of the V4.1 release, read in place) byte for byte.
@@ -1944,3 +2011,6 @@ if (PXA_SPEC_TEST_MODEL)
         set_tests_properties(test-spec-server-probs-onoff PROPERTIES SKIP_RETURN_CODE 77 LABELS "model" TIMEOUT 1800)
     endif()
 endif()
+
+# the closed tree's own tests (closed itself; absent from the public tree)
+include(${CMAKE_CURRENT_SOURCE_DIR}/pxa-closed-tests.cmake OPTIONAL)

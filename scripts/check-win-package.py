@@ -639,15 +639,18 @@ def cuobjdump_crosscheck(res, fat_dir, archs, image):
     if not files:
         return
     if not shutil.which("docker"):
-        res.add("MANUAL", "cuobjdump", "docker not found; run cuobjdump --list-elf on the extracted fatbins in %s" % fat_dir)
+        res.add("FAIL", "cuobjdump", "docker not found, so the --cuobjdump cross-check cannot run (fails closed); run it where docker and %s exist" % image)
         return
     for f in files:
-        cmd = ["docker", "run", "--rm", "--network", "none", "--cpuset-cpus", os.environ.get("CHECK_WIN_CPUS", "36-53"),
+        cmd = ["docker", "run", "--rm", "--network", "none", "--cpuset-cpus", os.environ.get("CHECK_WIN_CPUS", "0-7,16-17,36-43,52-53"),
                "-v", "%s:/w:ro" % fat_dir, image, "cuobjdump", "--list-elf", "/w/" + f]
         try:
             p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
         except subprocess.TimeoutExpired:
-            res.add("WARN", "cuobjdump", "%s: timed out" % f)
+            res.add("FAIL", "cuobjdump", "%s: cuobjdump timed out (fails closed)" % f)
+            continue
+        if p.returncode != 0 and ".cubin" not in p.stdout:
+            res.add("FAIL", "cuobjdump", "%s: cuobjdump did not run (exit %d: %s) -- fails closed" % (f, p.returncode, p.stdout.strip()[:160]))
             continue
         got = sorted(set(int(x) for x in re.findall(r"\.sm_(\d+)\.cubin", p.stdout)))
         lack = arch_lack(archs, got, f in VENDOR_FATBINS)

@@ -4,7 +4,7 @@
 (function () {
   const $ = s => document.querySelector(s);
   const msg = (t, err) => { const m = $("#sh-msg"); m.textContent = t || ""; m.classList.toggle("err", !!err); };
-  let card = null;
+  let card = null, svgUrl = null;
 
   async function api(path) {
     const r = await fetch(path, {credentials: "same-origin", headers: {Accept: "application/json"}});
@@ -25,7 +25,12 @@
   async function show() {
     try {
       card = await api("/api/share/card?" + q());
-      const src = "/api/share/card.svg?" + q();
+      // the image is fetched with the X-PXA-Token header (auth.js) and shown from a blob: no token or ticket in an address
+      const r = await fetch("/api/share/card.svg?" + q(), {headers: {Accept: "image/svg+xml"}});
+      if (!r.ok) throw new Error(r.status === 401 ? "Open this page from PXA Control (Help menu > Share your rig's speed) so it is signed in." : "HTTP " + r.status);
+      const src = URL.createObjectURL(await r.blob());
+      if (svgUrl) URL.revokeObjectURL(svgUrl);
+      svgUrl = src;
       $("#sh-img").src = src;
       $("#sh-img").alt = card.headline;
       $("#sh-svg").href = src;

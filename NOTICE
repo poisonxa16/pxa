@@ -11,18 +11,10 @@ all upstream projects, which are preserved in full.
 Lineage
 -------
 
-    ggml-org/llama.cpp          MIT   Copyright (c) 2023-2024 the llama.cpp authors
+    llama.cpp                   MIT   Copyright (c) 2023-2024 the llama.cpp authors
       ggml                      MIT   Copyright (c) 2023-2024 the ggml authors
-        ikawrakow/ik_llama.cpp  MIT   Copyright (c) 2024-2025 the ik_llama.cpp authors
-          pxa             MIT   Copyright (c) 2026 PXA Network
-
-This project forked from ikawrakow/ik_llama.cpp at commit 1520eda98056
-("prompt cache: Fix assertion ... (#1913)", 2026-06-04) and has been developed
-independently since.
-
-The repository history is flattened, so there is no git merge-base with
-upstream. To diff or cherry-pick against upstream, compare against that exact
-commit.
+        ik_llama.cpp            MIT   Copyright (c) 2024-2025 the ik_llama.cpp authors
+          pxa                   MIT   Copyright (c) 2026 PXA Network
 
 Individual changes ported from upstream after the fork point are marked inline
 in the source with the originating upstream pull request number, so their
@@ -30,8 +22,13 @@ provenance can be traced without relying on git history.
 
 The Nemotron architectures (nemotron, nemotron_h, nemotron_h_moe) and the
 Mamba-2 selective scan (GGML_OP_SSM_SCAN2, CPU and CUDA) were ported by hand
-from ggml-org/llama.cpp at commit b76b13379d (2026-10-15); they carry the same
+from llama.cpp at commit b76b13379d (2026-10-15); they carry the same
 MIT license and the llama.cpp authors' copyright listed above.
+
+The vision-language converter classes (Qwen2-VL / Qwen2.5-VL, Qwen3-VL,
+Qwen3-VL-MoE, SmolVLM / Idefics3, InternVL) and the --mmproj vision projector
+export in convert_hf_to_gguf.py and gguf-py were ported from llama.cpp
+at commit 961c376a2d (2026-10-26); same MIT license and copyright as above.
 
 
 What PXA Network contributes

@@ -92,6 +92,9 @@ enum llm_arch {
     LLM_ARCH_DEEPSEEK4_DSPARK,
     LLM_ARCH_GLM5NEXT,
     LLM_ARCH_DEEPSEEK41,     // DeepSeek-V4.1-Flash (CSA2/CED/Engram); names follow the ISTA GGUF header
+    LLM_ARCH_LFM2,           // PXA LFM port: LiquidAI LFM2 dense (short-conv + GQA hybrid)
+    LLM_ARCH_LFM2MOE,        // PXA LFM port: LFM2-MoE / LFM2.5-A*B (short-conv + GQA + sigmoid-routed MoE)
+    LLM_ARCH_LFM3,           // PXA LFM port: LFM3 (short-conv + gated SWA/full GQA)
     LLM_ARCH_UNKNOWN,
 };
 
@@ -264,6 +267,8 @@ enum llm_kv {
     LLM_KV_SSM_STATE_SIZE,
     LLM_KV_SSM_TIME_STEP_RANK,
     LLM_KV_SSM_GROUP_COUNT,
+    LLM_KV_SHORTCONV_L_CACHE, // PXA LFM port
+    LLM_KV_DECISION_BLOCK_COUNT, // PXA LFM port: only read to refuse the non-causal decision-head files
 
     LLM_KV_TOKENIZER_MODEL,
     LLM_KV_TOKENIZER_PRE,

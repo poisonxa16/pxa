@@ -9,7 +9,7 @@ const EN = {
   st: null, built: false, step: 1, src: null, srcText: store.get("enc.src", ""), srcErr: "", srcBusy: false,
   rig: null, cards: store.get("enc.cards", null), other: store.get("enc.other", false), vram: store.get("enc.vram", ""),
   plan: null, planErr: "", planBusy: false, tier: null,
-  adv: {work_dir: "", out_dir: "", keep: false, use_hessians: null, encode_card: "", licence_ack: false}, lock: store.get("enc.lock", null),
+  adv: {work_dir: "", out_dir: "", keep: false, use_hessians: null, encode_card: "", licence_ack: false, mmproj: true}, lock: store.get("enc.lock", null),
   checks: null, checksErr: "", checksBusy: false, advOpen: false, advFocus: null,
   job: null, logLines: [], logSeq: 0, jobTimer: null, pkgTimer: null, pkgDismissed: false, rtTimer: null, rtDismissed: false, rtAsked: false, showGet: false, showPicker: false, test: null, updAsked: false,
   lib: null, libAsked: false, libMsg: "",
@@ -342,7 +342,11 @@ function stepSource() {
       el("div", {class: "row", style: "margin:4px 0"}, badge(SUP[sup.level] || "warn", "PXA support: " + (sup.level || "unknown")), el("span", {class: "tiny", text: sup.text || ""})),
       el("div", {class: "row", style: "margin:4px 0"}, badge(LIC[lic.level] || "warn", "Model licence: " + (lic.id || "unknown")), el("span", {class: "tiny", text: lic.text || ""})),
       lic.level === "noderivs" ? el("div", {class: "alert warn", id: "en-licwarn"}, "Heads up: this licence does not allow sharing a quantized copy. You can still make one for yourself; do not upload or share it.") : null,
-      ...((s.notes || []).map(n => el("div", {class: "tiny", text: n})))));
+      ...((s.notes || []).map(n => el("div", {class: "tiny", text: n}))),
+      s.vision ? el("div", {id: "en-vision", style: "margin:6px 0"},
+        el("div", {class: "row"}, badge(s.vision.supported ? "ok" : "warn", s.vision.supported ? "Vision: images supported" : "Vision: text only"), el("span", {class: "tiny", text: s.vision.text})),
+        s.vision.supported ? el("label", {class: "check", style: "margin-top:4px"}, el("input", {type: "checkbox", id: "en-mmproj", checked: EN.adv.mmproj,
+          onchange: ev => { EN.adv.mmproj = ev.target.checked; }}), "Also export the vision projector (mmproj)") : null) : null));
   }
   const can = s && s.support && s.support.level !== "unsupported";
   kids.push(el("div", {class: "row en-act", style: "margin-top:14px;justify-content:flex-end"},
@@ -533,6 +537,7 @@ function renderLock() {
 // ------------------------------------------------------------------ step 3: checks
 function enBody() {
   const b = {source: EN.srcText, tier: EN.tier, keep: EN.adv.keep, licence_ack: EN.adv.licence_ack};
+  if (EN.src && EN.src.vision && EN.src.vision.supported) b.mmproj = !!EN.adv.mmproj;
   Object.assign(b, enTarget());
   if (EN.adv.work_dir) b.work_dir = EN.adv.work_dir;
   if (EN.adv.out_dir) b.out_dir = EN.adv.out_dir;
@@ -658,6 +663,9 @@ function stepDone() {
     el("div", {class: "en-facts"}, fact("Size", enBytes(r.size)), fact("Tensors", c.encoded ? c.exact + " of " + c.encoded + " decoded back exactly" : (r.tier_tensors || 0) + " in " + r.tier), fact("Quality class", r.cls)),
     el("div", {class: "tiny"}, "File"), el("div", {class: "en-path"}, el("div", {class: "cmd", id: "en-outpath", text: r.path}), el("button", {class: "b", text: "Copy", onclick: () => copyText(r.path)})),
     el("div", {class: "tiny", style: "margin-top:8px"}, "sha256"), el("div", {class: "en-path"}, el("div", {class: "cmd", id: "en-outsha", text: r.sha256}), el("button", {class: "b", text: "Copy", onclick: () => copyText(r.sha256)})),
+    r.mmproj && r.mmproj.path ? el("div", {class: "tiny", style: "margin-top:8px"}, "Vision projector (loads with the model)") : null,
+    r.mmproj && r.mmproj.path ? el("div", {class: "en-path"}, el("div", {class: "cmd", id: "en-outmmproj", text: r.mmproj.path}), el("button", {class: "b", text: "Copy", onclick: () => copyText(r.mmproj.path)})) : null,
+    r.mmproj && !r.mmproj.path ? el("div", {class: "alert warn", id: "en-mmprojerr", style: "display:block;margin-top:8px"}, "The model file is fine, but its vision projector was not exported, so it is text-only for now: " + (r.mmproj.error || "") + " " + (r.mmproj.hint || "")) : null,
     el("div", {id: "en-test", style: "margin-top:14px"}),
     el("div", {class: "row en-act", style: "margin-top:14px"}, el("button", {class: "b pri", id: "en-testit", text: "Test it", onclick: enTest}),
       el("button", {class: "b", id: "en-share", text: "Share your score", hidden: !(EN.test && EN.test.result), onclick: enShare}),

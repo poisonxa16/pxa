@@ -14,6 +14,7 @@ bool pxa_verify_argmax_on();
 #include "llama-pxa-xcache-async.h"   // PXA_XCACHE_ASYNC cold path
 #include "llama-pxa-xcache-skip.h"    // PXA_XCACHE_SKIP_COLD_RANK (opt-in): drop the cold tail of a decode / verify window
 #include "ggml-pxqn.h"
+#include "ggml-pxqn-ext.h"
 #include "pxa-pxq-split.h"
 #include "pxa-tsplit.h"
 
@@ -3714,11 +3715,40 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             }
         }
         GGML_ASSERT(!o.empty());
+        // PXA_CLOSED_HOOK role "place": asked once per join. The tensor-split draft head (PXA_MTP_SHORTLIST_DUAL) can also
+        // take the no-gather read-back below, so it offers PARTS_OK; a library that does not know that bit declines the
+        // whole question (-1), and the engine asks again without it (the join's device as before).
+        int place_ix = -1;
+        bool place_parts = false;
+        if (o.size() > 1 && !pxa_head_direct_ok(lctx) && !pxa_head_direct_draft_ok(lctx, output)) {
+            const auto op = lctx.cparams.mtp_op_type;
+            const bool draft = output == lctx.model.output_mtp_shortlist;
+            // the companion always runs with embeddings on (it reads its own hidden back by name, "result_norm", which the
+            // unjoined slices leave alone), so embeddings do not bar the parts read-back here
+            const bool parts_ok = draft && output->extra == &lctx.model.mtp_shortlist_split &&
+                                  (op == MTP_OP_DRAFT_GEN || op == MTP_OP_UPDATE_ACCEPTED);
+            ggml_pxqn_place_args pa = { (uint32_t) sizeof(ggml_pxqn_place_args), GGML_PXQN_PLACE_JOIN, (int32_t) o.size(),
+                                        (int32_t) split_output->n_device,
+                                        (draft ? (uint32_t) GGML_PXQN_PLACE_DRAFT : 0u) |
+                                        (parts_ok ? (uint32_t) GGML_PXQN_PLACE_PARTS_OK : 0u), 0 };
+            place_ix = ggml_pxqn_place_pick(&pa);
+            if (place_ix == GGML_PXQN_PLACE_NO_JOIN) {
+                place_parts = true;
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1) == 0) {
+                    LLAMA_LOG_INFO("%s: MTP draft head: %d slices read back unjoined, one argmax per card (role place)\n",
+                                   __func__, (int) o.size());
+                }
+            } else if (place_ix < 0 && parts_ok) {
+                pa.flags &= ~(uint32_t) GGML_PXQN_PLACE_PARTS_OK;
+                place_ix = ggml_pxqn_place_pick(&pa);
+            }
+        }
         if (o.size() == 1) {
             cur = o.front();
             if (pxa_amax_head(lctx, output)) pxa_amax_attach(lctx, ctx, { cur }, output == lctx.model.output_mtp_shortlist);   // PXA_VERIFY_ARGMAX
         }
-        else if (pxa_head_direct_ok(lctx) || pxa_head_direct_draft_ok(lctx, output)) {
+        else if (place_parts || pxa_head_direct_ok(lctx) || pxa_head_direct_draft_ok(lctx, output)) {
             // PXA_TSPLIT_LMHEAD_DIRECT: no gather. The leading slices go to the builder (expanded into
             // the graph ahead of the last one) under the name the read-back looks for; the last slice
             // is returned and becomes "result_output". llama_decode reassembles the row on the host.
@@ -3736,6 +3766,16 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             cur = ggml_concat(ctx, o[0], o[1], 0);
             for (int id = 2; id < int(o.size()); ++id) {
                 cur = ggml_concat(ctx, cur, o[id], 0);
+            }
+            // PXA_CLOSED_HOOK role "place" (ggml-pxqn-ext.h, asked above): the join's device; -1 = the scheduler's choice
+            {
+                const int ix = place_ix;
+                if (ix >= 0 && split_output->splits[ix] && split_output->splits[ix]->buffer) {
+                    const ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(split_output->splits[ix]->buffer);
+                    for (auto * backend : lctx.backends) {
+                        if (ggml_backend_supports_buft(backend, bt)) { ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend); break; }
+                    }
+                }
             }
             if (pxa_amax_head(lctx, output)) pxa_amax_attach(lctx, ctx, { cur }, output == lctx.model.output_mtp_shortlist);   // PXA_VERIFY_ARGMAX
         }
@@ -4268,6 +4308,12 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_NEMOTRON_H_MOE:
             {
                 result = llm.build_nemotron_h();
+            } break;
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_LFM3:
+            {
+                result = llm.build_lfm();
             } break;
         case LLM_ARCH_XVERSE:
             {

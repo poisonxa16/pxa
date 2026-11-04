@@ -53,7 +53,7 @@ def main(argv=None):
     if os.path.exists(out):
         shutil.rmtree(out)
     os.makedirs(out)
-    ign = shutil.ignore_patterns("__pycache__", "*.pyc", "tests", "vigil_bind.py", "test_vigil_bind.py")  # agent binding: needs Anibal, never ships
+    ign = shutil.ignore_patterns("__pycache__", "*.pyc", "tests", "vigil_bind.py", "test_vigil_bind.py", "test_vigil_pass.py")  # agent binding: needs Anibal, never ships
     for d in DIRS:
         shutil.copytree(os.path.join(T, d), os.path.join(out, d), ignore=ign)
     for f in FILES:

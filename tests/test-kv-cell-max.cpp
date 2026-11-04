@@ -230,6 +230,90 @@ int main() {
                "cost", size, us);
     }
 
+    // -----------------------------------------------------------------------------------------
+    // PXA_KV_CELL_MAX_UB: the epoch-validated memo must answer the exact scan's integer after any
+    // mix of the edits the engine makes. Placements go the find_slot way (sync check, pos +
+    // add_seq, widen); removals, whole-cell copies, multi-seq cells and vector swaps go through the
+    // ordinary cell API and must invalidate the memo by themselves. Plus the decode pattern: one
+    // placed token per call must be a memo hit and walk O(1) cells.
+    {
+        std::mt19937 rng(20261103);
+        const uint32_t size = 4096;
+        llama_kv_cache cache;
+        cache.size = size;
+        cache.cells.resize(size);
+        uint32_t head = 0;
+        int n_hits = 0, n_calls = 0, n_bad = 0;
+        auto place = [&](uint32_t lo, uint32_t n, llama_seq_id seq) {
+            const bool sync = llama_kv_cache_cmax_in_sync(cache);
+            for (uint32_t i = lo; i < lo + n && i < size; ++i) {
+                cache.cells[i].pos = (llama_pos) i;
+                cache.cells[i].add_seq(seq);
+            }
+            llama_kv_cache_cell_max_widen(cache, sync, lo + n);
+        };
+        for (int step = 0; step < 200000; ++step) {
+            const int op = (int) (rng() % 10);
+            if (op < 5) {                                   // placement at head (decode / prefill)
+                const uint32_t n = (rng() % 4 == 0) ? 1 + rng() % 64 : 1;
+                if (head + n > size) head = rng() % (size / 2);
+                place(head, n, (llama_seq_id) (rng() % 3));
+                head += n;
+            } else if (op == 5) {                           // seq_rm of a range
+                const uint32_t a = rng() % size, b = std::min(size, a + 1 + (uint32_t) (rng() % 512));
+                for (uint32_t i = a; i < b; ++i) {
+                    if (cache.cells[i].pos >= 0) { cache.cells[i].clear_seq(); cache.cells[i].pos = -1; }
+                }
+                if (rng() % 2) head = a;
+            } else if (op == 6) {                           // seq_cp onto live cells (multi-seq)
+                const uint32_t a = rng() % size;
+                if (cache.cells[a].pos >= 0 && !cache.cells[a].is_empty()) cache.cells[a].add_seq(7);
+            } else if (op == 7) {                           // defrag-like whole-cell move down
+                const uint32_t a = rng() % size, b = rng() % size;
+                const uint32_t hi = std::max(a, b), lo = std::min(a, b);
+                cache.cells[lo] = cache.cells[hi];
+                cache.cells[hi] = llama_kv_cell();
+            } else if (op == 8 && step % 97 == 0) {         // a restore that swaps the vector in
+                std::vector<llama_kv_cell> other(cache.cells.begin(), cache.cells.end());
+                const uint32_t a = rng() % size;
+                if (other[a].pos < 0) { other[a].pos = (llama_pos) a; other[a].add_seq(1); }
+                cache.cells.swap(other);
+            }
+            bool hit = false;
+            const uint32_t got = llama_kv_cache_cell_max_ub(cache, 1, &hit);
+            const uint32_t want = llama_kv_cells_max_below(cache, size);
+            ++n_calls; n_hits += hit ? 1 : 0;
+            if (got != want) {
+                if (n_bad++ < 5) fprintf(stderr, "FAIL memo step %d op %d: memo %u, exact %u\n", step, op, got, want);
+            }
+        }
+        // decode pattern on a big ring: one token placed per call -> memo hit every call after the first
+        const uint32_t big = 262144;
+        llama_kv_cache dec;
+        dec.size = big;
+        dec.cells.resize(big);
+        for (uint32_t i = 0; i < 3500; ++i) { dec.cells[i].pos = (llama_pos) i; dec.cells[i].add_seq(0); }
+        int dec_hits = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (uint32_t t = 0; t < 512; ++t) {
+            const bool sync = llama_kv_cache_cmax_in_sync(dec);
+            dec.cells[3500 + t].pos = (llama_pos) (3500 + t);
+            dec.cells[3500 + t].add_seq(0);
+            llama_kv_cache_cell_max_widen(dec, sync, 3500 + t + 1);
+            bool hit = false;
+            const uint32_t got = llama_kv_cache_cell_max_ub(dec, 1, &hit);
+            dec_hits += hit ? 1 : 0;
+            if (got != 3500 + t + 1) { if (n_bad++ < 5) fprintf(stderr, "FAIL decode t %u: %u\n", t, got); }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / 512;
+        printf("%-28s %d random edits: memo == exact every call (%d memo hits); decode 262144 @3.5k: "
+               "%d/511 hits, %.2f us per call\n", "memo (PXA_KV_CELL_MAX_UB)", n_calls, n_hits, dec_hits, us);
+        if (n_bad) { fprintf(stderr, "FAIL: memo differed from the exact scan %d times\n", n_bad); ++n_fail; }
+        if (dec_hits < 511) { fprintf(stderr, "FAIL: decode pattern missed the memo (%d hits)\n", dec_hits); ++n_fail; }
+        if (n_hits == 0) { fprintf(stderr, "FAIL: the random walk never hit the memo\n"); ++n_fail; }
+    }
+
     printf("\nsampled scan was short in %d of the cases above; exact scan short in 0\n", n_sampled_short);
     if (n_sampled_short == 0) {
         fprintf(stderr, "FAIL: the retired sampled scan never under-reported -- the test no longer "

@@ -56,16 +56,46 @@ class ChatError(Exception):
         self.code, self.status, self.headers = code, status, headers or None
 
 
-def _vigil():
+def _locked(a):
+    """the 403 a /api/chat/vigil/* route answers while PXA Control holds no supporter pass for Anibal (MED-1)."""
+    return ChatError((a or {}).get("message") or "Anibal is locked on this computer", "locked", 403)
+
+
+# The Remote pane's off switches (remote_ui.Remote.op): stop the tunnel, revoke a device, sign a session out, kill remote
+# access. On a Control app that is already running they work without a supporter pass, like /api/chat/vigil/kill: losing
+# the pass must never leave the owner unable to shut remote access off. start, pair and config still need the pass.
+REMOTE_OFF_OPS = frozenset(("stop", "revoke", "sign_out", "kill"))
+
+
+def _vigil(hub=None):
     """the in-house agent binding (vigil_bind, which needs the anibal package), imported on first use, so pxa_chat and
     plain chat work in a tree without that package (the public source tree, a package without the agent). A
-    /api/chat/vigil/* route answers 503 agent_unavailable there, and only when it is called."""
+    /api/chat/vigil/* route answers 503 agent_unavailable there, and only when it is called.
+    Every /api/chat/vigil/* route passes its hub: then the supporter pass is checked first (MED-1, the H1 re-read), and
+    while Control holds no pass for Anibal on this computer the route answers 403 locked before anything is built,
+    started or served. The binding is read without a hub only for the route table (_vigil_features), the kill switch
+    on a loop that exists (vigil/kill), the Remote pane's local-only check, and the Remote pane's off switches on a
+    Control app that is already running (REMOTE_OFF_OPS)."""
     try:
         from . import vigil_bind
     except ImportError as e:
         raise ChatError("the in-house agent is not part of this build (%s)" % (getattr(e, "name", None) or "import failed"),
                         "agent_unavailable", 503)
+    if hub is not None:
+        a = vigil_bind.refusal_for(hub)
+        if a is not None:
+            raise _locked(a)
     return vigil_bind
+
+
+def _vigil_loop(hub):
+    """-> (the binding, the hub's loop) behind the pass check; a pass lost between the check and the build answers
+    403 locked as well."""
+    vb = _vigil(hub)
+    try:
+        return vb, vb.loop_for(hub)
+    except vb.Locked as e:
+        raise _locked(e.answer)
 
 
 def _vigil_features():
@@ -101,6 +131,8 @@ class Hub(object):
 
     def __init__(self, cfg_root, load_config=None, host=None, who=None):
         self.root = cfg_root
+        self.control_root = None             # PXA Control's own config folder (pxa_chat.register): where the agent's
+                                             # supporter pass is read (vigil_bind.lease_for; MED-1), never cfg_root
         self.who = who or (lambda: None)     # -> the asking client's address (set by Control per request), or None
         self.load_config = load_config or (lambda: {})
         self.store = sessions.Ephemeral(sessions.Store(cfg_root))
@@ -689,15 +721,15 @@ def make_routes(hub_getter, reply):
         return {"ok": True}
 
     def vigil_turn(app, hub, body, query):
-        v = _vigil().loop_for(hub)
-        return _vigil().with_card(v, v.turn(str(body.get("chat_id") or body.get("session_id") or ""), body.get("message")))
+        vb, v = _vigil_loop(hub)
+        return vb.with_card(v, v.turn(str(body.get("chat_id") or body.get("session_id") or ""), body.get("message")))
 
     def vigil_resume(app, hub, body, query):
-        v = _vigil().loop_for(hub)
-        return _vigil().with_card(v, v.resume(str(body.get("chat_id") or body.get("session_id") or "")))
+        vb, v = _vigil_loop(hub)
+        return vb.with_card(v, v.resume(str(body.get("chat_id") or body.get("session_id") or "")))
 
     def vigil_approve(app, hub, body, query):
-        v = _vigil().loop_for(hub)
+        v = _vigil_loop(hub)[1]
         # F36b: the approval source comes from the credential, never the body. This route sits behind
         # the Control (UI) token, so it is always the UI click; voice uses its own token on Vigil's server.
         ok, code = v.approve(str(body.get("id") or body.get("approval_id") or ""), str(body.get("decision") or ""),
@@ -707,28 +739,33 @@ def make_routes(hub_getter, reply):
         return {"ok": True, "code": code}
 
     def vigil_kill(app, hub, body, query):
-        v = _vigil().loop_for(hub)
+        # the kill switch always works on a loop that exists, pass or not: it only stops work (MED-1). Without a loop
+        # it goes through the pass check like every other route, so nothing is built just to be killed.
+        v = getattr(hub, "_vigil_loop", None)
+        if v is None:
+            v = _vigil_loop(hub)[1]
         v.kill()
         return {"ok": True, "killed": True}
 
     def vigil_audit(app, hub, body, query):
-        v = _vigil().loop_for(hub)
+        v = _vigil_loop(hub)[1]
         chat = _q1(query, "chat_id") or _q1(query, "session") or None
         return {"rows": v.audit.list(chat)}
 
     # ---- Vigil panes inside Control (approvals, audit, memory, jobs, settings, onboarding, start/stop)
     def vigil_events(app, hub, body, query):
         # Host + Control token: the dispatcher. Origin + Last-Event-ID: VigilEvents.stream_to.
-        return _vigil().VigilEvents(hub, query)
+        return _vigil(hub).VigilEvents(hub, query)
 
     def vigil_page(app, hub, body, query):
-        return reply(_vigil().pane_page(), "text/html; charset=utf-8", 200,
+        vb = _vigil(hub)
+        return reply(vb.pane_page(), "text/html; charset=utf-8", 200,
                      {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                       "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
-                      "Content-Security-Policy": _vigil().PANE_CSP})
+                      "Content-Security-Policy": vb.PANE_CSP})
 
     def vigil_hud(app, hub, body, query):
-        html, csp = _vigil().hud_page(secrets.token_urlsafe(16))
+        html, csp = _vigil(hub).hud_page(secrets.token_urlsafe(16))
         return reply(html, "text/html; charset=utf-8", 200,
                      {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                       "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
@@ -736,18 +773,31 @@ def make_routes(hub_getter, reply):
 
     def vigil_asset(name):
         def asset(app, hub, body, query):
-            data, ctype = _vigil().pane_asset(name)
+            vb = _vigil(hub)
+            data, ctype = vb.pane_asset(name)
             extra = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
             if name == "sw.js":   # the worker controls the Vigil app under the pane base (never pages or the API)
-                extra["Service-Worker-Allowed"] = _vigil().PANE_BASE + "/"
+                extra["Service-Worker-Allowed"] = vb.PANE_BASE + "/"
             return reply(data, ctype, 200, extra)
         asset.__name__ = "vigil_asset_" + name.replace(".", "_")
         return asset
 
     def vigil_pane(method, name):
         def pane(app, hub, body, query):
+            remote_post = name == "remote" and method == "POST"
+            if remote_post and not _vigil().request_local():
+                # remote access is managed on this machine only (remote_ui.Remote.op), whatever the pass state: an
+                # off-machine caller is refused before the pass is asked, so it learns nothing about it, and nothing is built
+                raise ChatError("remote access is managed on this machine only", "local_only", 403)
+            op = str(body.get("op") or "") if isinstance(body, dict) else ""
+            if remote_post and op in REMOTE_OFF_OPS and getattr(hub, "_vigil_control", None) is not None:
+                vb = _vigil()   # an off switch on the running Control app never waits on the pass, like vigil/kill
+            else:
+                vb = _vigil(hub)
             try:
-                out = _vigil().control_for(hub).pane(method, name, body, query, local=_vigil().request_local())
+                out = vb.control_for(hub).pane(method, name, body, query, local=vb.request_local())
+            except vb.Locked as e:                # the pass went away between the check and a Start
+                raise _locked(e.answer)
             except PermissionError as e:          # remote-access ops from off this machine
                 raise ChatError(str(e), getattr(e, "code", "forbidden"), 403)
             except LookupError as e:

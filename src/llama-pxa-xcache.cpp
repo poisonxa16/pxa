@@ -2,6 +2,8 @@
 // llama-pxa-xcache.cpp -- see llama-pxa-xcache.h for the design. The policy (what to swap, how many per step) is the closed
 // library's (ggml_pxqn_xcache_policy); this file is the mechanism: counter read-back, the two-phase slot copy, the map flips.
 #include "ggml-pxqn-tune.h"
+#include "llama-pxa-counts.h"
+#include "ggml-pxqn-ext.h"
 #include "llama-pxa-tokmiss.h"
 #include "llama-pxa-xcache.h"
 #include "llama.h"
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -42,12 +45,15 @@
 bool llama_pxa_xcache_residency_blocks(void) { return false; }
 void llama_pxa_xcache_tick(llama_model &, int) {}
 void llama_pxa_xcache_seq_start(llama_model &) {}
+int llama_pxa_xcache_batch_start(llama_model &, int, bool, void (*)(void *), void *) { return 0; }
 bool llama_pxa_xcache_companion_quiet(void) { return false; }
 void llama_pxa_xcache_note_tokens(llama_model &, int) {}
 void llama_pxa_xcache_adaptor_free(llama_model &) {}
 bool llama_pxa_xcache_stats(const struct llama_model *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *) { return false; }
 bool llama_pxa_xcache_rtier_stats(const llama_model *, uint64_t *, uint64_t *) { return false; }
 bool llama_pxa_xcache_evict_file_stats(const llama_model *, uint64_t *, uint64_t *) { return false; }
+bool llama_pxa_xcache_role_stats(const llama_model *, llama_pxa_xc_role_stats *) { return false; }
+int llama_pxa_xcache_check(const llama_model *) { return -1; }
 bool llama_pxa_tokmiss_on() { return false; }
 void llama_pxa_tokmiss_note_request(const int32_t *, int, int, uint64_t) {}
 void llama_pxa_tokmiss_note_batch(const llama_token *, int) {}
@@ -76,6 +82,26 @@ int env_int(const char * name, int def) {
 }
 
 }
+
+// the engine's view of the library's book of this session's learned counts (the "learn" role, ggml-pxqn-ext.h)
+struct pxa_learn_handle {
+    const ggml_pxqn_learn_api * t = nullptr;
+    void * book = nullptr;
+    std::string path;           // the learned csv this session writes; empty = it writes nothing
+    double keep = 0;            // the share of the boot's learned counts each save carries
+    double prior_tokens = 0;    // the tokens those counts were counted from
+    bool armed() const { return !path.empty() && t && book; }
+    bool counted() const { return armed() && t->counted && t->counted(book) != 0; }
+    void stop() const { if (armed() && t->stop) t->stop(book); }
+    // write_csv(path) writes the rows; the sessions on record after the save, -1 = nothing saved
+    int save(const std::function<bool(const std::string &)> & write_csv, double tokens, bool shutdown) {
+        if (!armed()) return -1;
+        struct ud_t { const std::function<bool(const std::string &)> * w; } ud = { &write_csv };
+        return t->save(book, [](void * u, const char * p) { return (*((ud_t *) u)->w)(std::string(p)) ? 1 : 0; }, &ud, tokens,
+                       shutdown ? 1 : 0);
+    }
+    ~pxa_learn_handle() { if (t && book && t->release) t->release(book); }
+};
 
 // One-time probe of what the CPU can stream out of the pinned cold stack: the cold path's matvec is bound by this (GB/s of weight bytes).
 // `threads` readers sum their slice of up to 256 MiB twice; the second pass is timed. Reported, and used for the miss price log only.
@@ -128,6 +154,8 @@ static void pxa_warn_learned_cache(const std::string & path) {
 
 // llama.cpp. Empty when the learned csv has nowhere writable. Never the curated path.
 bool llama_pxa_xcache_learned_path(const llama_model * model, char * buf, size_t n);
+// llama.cpp. The cache role's state file: the first existing one among the learned counts' places, named with suffix (false: none).
+bool llama_pxa_xcache_role_path(const llama_model * model, const char * suffix, char * buf, size_t n);
 
 struct llama_model::pxa_xc_adaptor {
     struct lay {
@@ -252,10 +280,28 @@ struct llama_model::pxa_xc_adaptor {
     uint64_t n_ef = 0;
     std::atomic<uint64_t> n_ef_fail{0}, us_ef{0}, n_ef_done{0};
     int64_t  us_rt_worker = 0;
-    bool learn = false;             // this session writes <model>.expert-counts.learned.csv
+    // this session's learned counts: the library's "learn" role (ggml-pxqn-ext.h) keeps their book; armed = this session writes
+    // <model>.expert-counts.learned.csv (and the role its record beside it); learn.keep / learn.prior_tokens: the share of the
+    // boot's learned counts each save carries, and the tokens they were counted from
+    pxa_learn_handle learn;
     bool learn_saved = false;       // one log line for the periodic save
     bool learn_wait_logged = false;
-    std::string learn_path;
+
+    // ---- the "cache" role (ggml-pxqn-ext.h): request-scoped state of the expert cache; the library decides, this adaptor reads
+    // the counters and makes the moves. R-tier + RIX only (the hot set carried across requests; with RIX an expert's placement
+    // never changes a bit). A move set is made in one synchronous burst (the reset_to_plan pattern), then the policy is
+    // re-created at that point with the prior the role gives (role_reseed).
+    const ggml_pxqn_cache_api * role = nullptr;
+    void * role_st = nullptr;
+    bool   role_on = false;
+    bool   role_rebased = false;     // after a move set the policy observes the counts since base_cnt (it was re-created there)
+    std::vector<std::vector<uint32_t>> role_sel;              // per layer: the counters at the running request's select
+    std::vector<ggml_pxqn_xc_layer_cfg> role_lcfg;            // the re-created policy's layers and their prior
+    std::vector<std::vector<double>>    role_prior;
+    std::condition_variable rt_idle_cv;                       // rt_loop finished a job (a move set waits for it)
+    uint64_t n_role_waits = 0, n_role_drop_plans = 0, n_role_drop = 0;
+    int64_t  us_role = 0, us_role_moves = 0;
+    bool     role_saved = false, role_save_warned = false;
 
     explicit pxa_xc_adaptor(llama_model & m) : model(m) {}
 
@@ -264,9 +310,11 @@ struct llama_model::pxa_xc_adaptor {
         rt_shutdown();
         drain();
         io_shutdown();
-        if (learn) persist_learned(true);
+        if (learn.armed()) persist_learned(true);
         if (pst && pol) pol->destroy(pst);
         pst = nullptr;
+        if (role && role_st) role->destroy(role_st);
+        role_st = nullptr;
         if (stage) ggml_backend_cuda_xcache_pinned_free(stage);
         for (auto * b : rt_stage) if (b) ggml_backend_cuda_xcache_pinned_free(b);
     }
@@ -429,6 +477,7 @@ struct llama_model::pxa_xc_adaptor {
                 adapt ? "ON" : "observing only", L.size(), any_spare, obs_every, pcie_gbs, det ? "deterministic" : "copy-completion",
                 cpu_use > 0 ? "on" : "off");
         if (adapt) arm_learn();
+        if (adapt) role_init();
         return true;
     }
 
@@ -656,6 +705,17 @@ struct llama_model::pxa_xc_adaptor {
                 obs[i].counts = b;
                 obs[i].hits   = b[L[i].n_expert + 0];
                 obs[i].misses = b[L[i].n_expert + 1];
+                if (role_rebased) {
+                    // the cache role: a move set re-created the policy at base_cnt (its counts start at 0 there), so it observes the counts
+                    // since then; written by the decode thread while this thread was idle, before the job that reads them
+                    const size_t n = (size_t) L[i].n_expert;
+                    const auto & bc = base_cnt[i];
+                    auto & rc = rel_cnt[i];
+                    for (size_t e = 0; e < n; ++e) rc[e] = b[e] - bc[e];     // u32 wrap-safe
+                    obs[i].counts = rc.data();
+                    obs[i].hits   = b[n + 0] - bc[n + 0];
+                    obs[i].misses = b[n + 1] - bc[n + 1];
+                }
                 const uint32_t dh = obs[i].hits - prev_hit[i], dm = obs[i].misses - prev_miss[i];   // u32 wrap-safe
                 prev_hit[i] = obs[i].hits; prev_miss[i] = obs[i].misses;
                 tot_hit += dh; tot_miss += dm; win_hit += dh; win_miss += dm;
@@ -665,9 +725,9 @@ struct llama_model::pxa_xc_adaptor {
                 rt_views[i].n_spare = rt_spare[i];
                 eb_sum += L[i].eb;
             }
-            pol->observe(pst, rt_ntok, obs.data());
+            if (pst) pol->observe(pst, rt_ntok, obs.data());   // null only after a failed re-creation (the cache role), which also sets broken
             int32_t n = 0;
-            if (!broken) {
+            if (!broken && pst) {
                 int32_t n_budget = pol->swap_budget(pst, rt_ntok);
                 if (swap_cap > 0) n_budget = std::min<int32_t>(n_budget, swap_cap*obs_every);
                 if (n_budget > 0) {
@@ -684,6 +744,7 @@ struct llama_model::pxa_xc_adaptor {
                 rt_done = true;
                 us_rt_worker += ggml_time_us() - t0;
             }
+            rt_idle_cv.notify_all();    // a move set waiting for this job goes on
         }
     }
 
@@ -767,64 +828,49 @@ struct llama_model::pxa_xc_adaptor {
     }
 
 
-    int learn_sessions() const {
-        int sessions = 0;
-        FILE * f = fopen((learn_path + ".state").c_str(), "r");
-        if (!f) return 0;
-        char line[128];
-        while (fgets(line, sizeof(line), f)) {
-            int n = 0;
-            if (sscanf(line, "sessions %d", &n) == 1 && n > 0) sessions = n;
-        }
-        fclose(f);
-        return sessions;
-    }
-
-    void learn_write_state(int sessions, int learning) const {
-        if (learn_path.empty()) return;
-        const std::string st = learn_path + ".state";
-        const std::string tmp = st + ".tmp";
-        FILE * f = fopen(tmp.c_str(), "w");
-        if (!f) return;
-        fprintf(f, "sessions %d\nlearning %d\n", sessions < 0 ? 0 : sessions, learning ? 1 : 0);
-        const bool ok = fclose(f) == 0 && rename(tmp.c_str(), st.c_str()) == 0;
-        if (!ok) std::remove(tmp.c_str());
-    }
-
+    // Arms the learned counts through the library's "learn" role: a boot on learned counts (llama.cpp sets
+    // model.pxa_xc_learned_tokens) carries a share of them in every save, a boot on the curated map saves this session's counts
+    // only. No role (no library, an older one): nothing learned or written. The role off: not armed, nothing written.
     void arm_learn() {
+        const ggml_pxqn_learn_api * t = ggml_pxqn_learn_api_get();
+        if (!t) return;
+        char msg[512];
+        if (t->off(msg, sizeof(msg))) {
+            LLAMA_LOG_INFO("PXA_XCACHE: %s\n", msg[0] ? msg : "learning off this session");
+            return;
+        }
         char buf[4096];
-        if (!llama_pxa_xcache_learned_path(&model, buf, sizeof(buf))) {
+        const std::string where = llama_pxa_xcache_learned_path(&model, buf, sizeof(buf)) ? std::string(buf) : std::string();
+        int rc = GGML_PXQN_LEARN_NOT_LEARNED;
+        void * b = t->arm(where.c_str(), model.pxa_xc_learned_tokens, &rc, msg, sizeof(msg));
+        if (rc == GGML_PXQN_LEARN_NO_PATH) {
             LLAMA_LOG_WARN("PXA_XCACHE: not saving learned counts. There is no writable directory beside the model or in the cache, so they are lost when this process ends.\n");
             return;
         }
-        learn_path = buf;
-        const std::string suf = ".expert-counts.learned.csv";
-        if (learn_path.size() < suf.size() || learn_path.compare(learn_path.size() - suf.size(), suf.size(), suf) != 0) {
-            learn_path.clear();
-            return;
-        }
-        if (const char * forced = getenv("PXA_XCACHE_COUNTS")) {
-            if (learn_path == forced) { learn_path.clear(); return; }
-        }
-        learn = true;
-        learn_write_state(learn_sessions(), 1);
-        pxa_warn_learned_cache(learn_path);
-        LLAMA_LOG_INFO("PXA_XCACHE: learning on; saving counts to %s. The curated file is left as it is.\n", learn_path.c_str());
+        if (rc != GGML_PXQN_LEARN_ARMED || !b) return;
+        learn.t = t;
+        learn.book = b;
+        learn.path = where;
+        learn.keep = t->carry ? t->carry(b) : 0.0;
+        learn.prior_tokens = t->carry_tokens ? t->carry_tokens(b) : 0.0;
+        pxa_warn_learned_cache(learn.path);
+        LLAMA_LOG_INFO("PXA_XCACHE: learning on; saving counts to %s. The curated file is left as it is.%s\n", learn.path.c_str(), msg);
     }
 
     void maybe_persist() {
-        if (learn && n_obs > 0 && (n_obs % 32ull) == 0) persist_learned(false);
+        if (learn.armed() && n_obs > 0 && (n_obs % 32ull) == 0) persist_learned(false);
     }
 
-    // The library builds the learned rows. This function packs the prior and the device
-    // counters, then writes the csv. The curated file is never opened for write.
-    // No library: this session does not save learned counts.
+    // The library builds the learned rows. This function packs the prior and the device counters, then saves them through learn
+    // (the csv, then the role's record). The curated file is never opened for write. No library: nothing is saved. A boot on
+    // learned counts carries learn.keep of them in the rows (the role's rows), and the record's tokens follow the rows.
     void persist_learned(bool shutdown) {
-        if (!learn || learn_path.empty() || !stage) return;
+        if (!learn.armed() || !stage) return;
         if (!read_counters()) {
-            if (shutdown) learn_write_state(learn_sessions(), 0);
+            if (shutdown) learn.stop();
             return;
         }
+        role_save(shutdown);     // the cache role's state beside the learned csv (its own file, whatever the csv save does next)
         const int n_layer = (int) model.hparams.n_layer;
         const int n_expert = (int) model.hparams.n_expert;
         if (n_layer <= 0 || n_expert <= 0) return;
@@ -837,23 +883,24 @@ struct llama_model::pxa_xc_adaptor {
                 LLAMA_LOG_WARN("PXA_XCACHE: not saving learned counts; the library that builds them is not loaded\n");
                 learn_wait_logged = true;
             }
-            if (shutdown) learn_write_state(learn_sessions(), 0);
+            if (shutdown) learn.stop();
             return;
         }
-        std::vector<double> prior((size_t) n_layer * (size_t) n_expert, 0.0);
-        for (int il = 0; il < n_layer && il < (int) model.pxa_xc_prior.size(); ++il) {
-            const auto & row = model.pxa_xc_prior[(size_t) il];
-            if ((int) row.size() != n_expert) continue;
-            for (int e = 0; e < n_expert; ++e) prior[(size_t) il * (size_t) n_expert + (size_t) e] = row[(size_t) e];
-        }
+        const std::vector<double> prior = pxa_xc_prior_flat(model.pxa_xc_prior, n_layer, n_expert);   // llama-pxa-counts.h
         std::vector<int> obs_il;
         std::vector<uint32_t> obs;
+        double routed_max = 0;   // the most routings one main-model layer counted: n_used per token (prompt or generated)
         for (size_t i = 0; i < L.size(); ++i) {
             const int il = L[i].il;
             if (il < 0 || il >= n_layer || L[i].n_expert != n_expert) continue;
             const uint32_t * b = stage + L[i].stage_off;
             obs_il.push_back(il);
             obs.insert(obs.end(), b, b + n_expert);
+            if (il < n_main) {   // an MTP head's layer counts the draft's own tokens
+                double s = 0;
+                for (int e = 0; e < n_expert; ++e) s += (double) b[e];
+                routed_max = std::max(routed_max, s);
+            }
         }
         std::vector<uint8_t> routed((size_t) n_layer, 0);
         for (const auto & kv : model.tensors_by_name) {
@@ -863,17 +910,21 @@ struct llama_model::pxa_xc_adaptor {
             const int il = atoi(name.c_str() + 4);
             if (il >= 0 && il < n_layer) routed[(size_t) il] = 1;
         }
+        const bool accum = learn.keep > 0 && learn.t && learn.t->rows;
         std::vector<uint64_t> counts((size_t) n_layer * (size_t) n_expert, 0);
         int wait_layer = -1;
-        const int rc = build(n_layer, n_expert, n_main, prior.data(),
-                             obs_il.empty() ? nullptr : obs_il.data(), (int) obs_il.size(),
-                             obs.empty() ? nullptr : obs.data(), routed.data(), counts.data(), &wait_layer);
+        const int rc = accum ? learn.t->rows(n_layer, n_expert, n_main, prior.data(), learn.keep,
+                                     obs_il.empty() ? nullptr : obs_il.data(), (int) obs_il.size(),
+                                     obs.empty() ? nullptr : obs.data(), routed.data(), counts.data(), &wait_layer)
+                             : build(n_layer, n_expert, n_main, prior.data(),
+                                     obs_il.empty() ? nullptr : obs_il.data(), (int) obs_il.size(),
+                                     obs.empty() ? nullptr : obs.data(), routed.data(), counts.data(), &wait_layer);
         if (rc == 1) {
-            if (shutdown) learn_write_state(learn_sessions(), 0);
+            if (shutdown) learn.stop();
             return;
         }
         if (rc == 2) {
-            if (shutdown) learn_write_state(learn_sessions(), 0);
+            if (shutdown) learn.stop();
             if (!learn_wait_logged) {
                 LLAMA_LOG_WARN("PXA_XCACHE: not saving learned counts; layer %d has no counts yet\n", wait_layer);
                 learn_wait_logged = true;
@@ -881,20 +932,24 @@ struct llama_model::pxa_xc_adaptor {
             return;
         }
         if (rc != 0) {
-            if (shutdown) learn_write_state(learn_sessions(), 0);
+            if (shutdown) learn.stop();
             return;
         }
-        if (!llama_pxa_xcache_counts_write(&model, counts.data(), n_layer, n_expert, learn_path.c_str())) {
-            if (shutdown) learn_write_state(learn_sessions(), 0);
-            LLAMA_LOG_WARN("PXA_XCACHE: could not save learned counts to %s\n", learn_path.c_str());
+        // every save rewrites the tokens with the rows (the role's record follows them)
+        const double tokens = (n_used > 0 ? routed_max / n_used : 0.0) + (accum ? learn.keep * learn.prior_tokens : 0.0);
+        const int sessions = learn.save([&](const std::string & p) {
+            return llama_pxa_xcache_counts_write(&model, counts.data(), n_layer, n_expert, p.c_str());
+        }, tokens, shutdown);
+        if (sessions < 0) {
+            LLAMA_LOG_WARN("PXA_XCACHE: could not save learned counts to %s\n", learn.path.c_str());
             return;
         }
         if (shutdown) {
-            learn_write_state(learn_sessions() + 1, 0);
-            LLAMA_LOG_INFO("PXA_XCACHE: saved learned counts to %s\n", learn_path.c_str());
+            LLAMA_LOG_INFO("PXA_XCACHE: saved learned counts to %s (%.0f tokens over %d sessions)\n", learn.path.c_str(), tokens, sessions);
         } else if (!learn_saved) {
             learn_saved = true;
-            LLAMA_LOG_INFO("PXA_XCACHE: saved learned counts to %s\n", learn_path.c_str());
+            LLAMA_LOG_INFO("PXA_XCACHE: saved learned counts to %s (%.0f tokens over %d sessions%s)\n", learn.path.c_str(), tokens,
+                    sessions, learn.counted() ? ", this one included" : "");
         }
     }
 
@@ -1090,6 +1145,391 @@ struct llama_model::pxa_xc_adaptor {
         fflush(trace);
     }
 
+    // ---- the slot tables' walk (llama_pxa_xcache_check) ---------------------------------------------------------------------
+    // every expert has one home (map >= 0: the hot slot that names it; <= -2: the cold slot that names it), no slot holds two, the
+    // model's slot lists name only experts whose map entry points back, a free cold slot is in the spare list or held by a swap
+    // whose evict is in flight (exactly one of the two), and busy marks exactly the experts of the swaps in flight. A hot slot may
+    // be vacant (a swap between its evict and its admit, or one abandoned after a failed copy).
+    int check_tables() const {
+        int bad = 0;
+        for (size_t i = 0; i < L.size(); ++i) {
+            const lay & l = L[i];
+            const auto & xl = model.pxa_xc[l.il];
+            const int nh = (int) xl.hot.size(), nc = (int) xl.cold.size();
+            std::vector<int> seen_h((size_t) nh, 0), seen_c((size_t) nc, 0), free_c((size_t) nc, 0);
+            if ((int) l.map.size() != l.n_expert || (int) l.busy.size() != l.n_expert) { ++bad; continue; }
+            for (int e = 0; e < l.n_expert; ++e) {
+                const int32_t v = l.map[(size_t) e];
+                if (v >= 0) {
+                    if (v >= nh || xl.hot[(size_t) v] != e) ++bad; else ++seen_h[(size_t) v];
+                } else if (v <= -2) {
+                    const int c = -2 - v;
+                    if (c >= nc || xl.cold[(size_t) c] != e) ++bad; else ++seen_c[(size_t) c];
+                } else {
+                    ++bad;   // -1: no home
+                }
+            }
+            for (int k : seen_h) if (k > 1) ++bad;
+            for (int k : seen_c) if (k > 1) ++bad;
+            for (int k = 0; k < nh; ++k) {
+                const int e = xl.hot[(size_t) k];
+                if (e >= 0 && (e >= l.n_expert || l.map[(size_t) e] != k)) ++bad;
+            }
+            for (int k = 0; k < nc; ++k) {
+                const int e = xl.cold[(size_t) k];
+                if (e >= 0 && (e >= l.n_expert || l.map[(size_t) e] != -2 - k)) ++bad;
+            }
+            for (int32_t c : l.spare) {
+                if (c < 0 || c >= nc || xl.cold[(size_t) c] >= 0) ++bad; else ++free_c[(size_t) c];
+            }
+            std::vector<uint8_t> want((size_t) l.n_expert, 0);
+            for (const op & o : ops) {
+                if (o.li != (int) i) continue;
+                if (o.e_in >= 0 && o.e_in < l.n_expert) want[(size_t) o.e_in] = 1;
+                if (o.e_out >= 0 && o.e_out < l.n_expert) want[(size_t) o.e_out] = 1;
+                // the free cold slot an evict is copying into: popped from the spare list, named at the evict's flip (a dummy swap
+                // never names it)
+                if ((o.phase == 0 || swap_dummy) && o.c_free >= 0 && o.c_free < nc) ++free_c[(size_t) o.c_free];
+            }
+            for (int k = 0; k < nc; ++k) if (xl.cold[(size_t) k] < 0 && free_c[(size_t) k] != 1) ++bad;
+            for (int e = 0; e < l.n_expert; ++e) if ((l.busy[(size_t) e] != 0) != (want[(size_t) e] != 0)) ++bad;
+        }
+        return bad;
+    }
+
+    // ---- the cache role (ggml-pxqn-ext.h) ---------------------------------------------------------------------------------------
+
+    void role_init() {
+        const char * why = nullptr;
+        if (!rtier)                                    why = "the hot set is not carried across requests here; PXA_XCACHE_RTIER=1 carries it";
+        else if (!ggml_pxa_rix_on())                   why = "RIX is off, so a moved set would change the answers of the requests after it";
+        else if (swap_dummy)                           why = "PXA_XCACHE_SWAP_DUMMY moves no expert";
+        else if (!pol || !pst || base_cnt.size() != L.size() || rel_cnt.size() != L.size()) why = "no policy state";
+        const ggml_pxqn_cache_api * t = why ? nullptr : ggml_pxqn_cache_api_get();
+        if (!t) {
+            if (why) LLAMA_LOG_INFO("PXA_XCACHE: cache role off (%s)\n", why);
+            return;
+        }
+        std::vector<ggml_pxqn_cache_layer> ls(L.size());
+        for (size_t i = 0; i < L.size(); ++i) {
+            ls[i].il       = L[i].il;
+            ls[i].n_expert = L[i].n_expert;
+            ls[i].n_slots  = (int32_t) model.pxa_xc[L[i].il].hot.size();
+        }
+        ggml_pxqn_cache_args a = {};
+        a.size       = (uint32_t) sizeof(a);
+        a.n_layers   = (int32_t) L.size();
+        a.layers     = ls.data();
+        a.n_used     = n_used > 0 ? (double) n_used : 8.0;
+        a.maxw       = freeze.maxw;
+        a.model_path = model.pxa_model_path.c_str();
+        struct stat st;
+        if (!model.pxa_model_path.empty() && stat(model.pxa_model_path.c_str(), &st) == 0) a.model_size = (uint64_t) st.st_size;
+        char msg[1024];
+        void * s = t->create(&a, msg, sizeof(msg));
+        if (!s) {
+            if (msg[0]) LLAMA_LOG_INFO("PXA_XCACHE: cache role: %s\n", msg);
+            return;
+        }
+        role = t;
+        role_st = s;
+        role_sel.assign(L.size(), {});
+        role_on = true;
+        role_load();
+        if (msg[0]) LLAMA_LOG_INFO("PXA_XCACHE: cache role: %s\n", msg);
+    }
+
+    // ---- the role's state file: beside the learned csv, written where and when this session writes it (its save points, the exit
+    // save closing the running request first), read at boot under the learned prior's switch and evidence rule. The learned prior
+    // off neither reads nor writes it (the learned book does not arm). The role checks the bytes; a file it refuses is ignored
+    // with one line.
+    std::string role_file() const {
+        static const char suf[] = ".expert-counts.learned.csv";
+        const size_t ns = sizeof(suf) - 1;
+        if (!role || !role->file_suffix || !role->file_suffix[0]) return "";
+        if (!learn.armed() || learn.path.size() < ns || learn.path.compare(learn.path.size() - ns, ns, suf) != 0) return "";
+        return learn.path.substr(0, learn.path.size() - ns) + role->file_suffix;
+    }
+
+    // the views of the counters in stage and of the resident sets the role reads
+    struct role_view_buf {
+        std::vector<const uint32_t *> cnt;
+        std::vector<std::vector<uint8_t>> res;
+        std::vector<const uint8_t *> resp;
+        std::vector<const double *> pri;
+        ggml_pxqn_cache_view v = {};
+    };
+    void role_view(role_view_buf & b) const {
+        b.cnt.resize(L.size());
+        b.pri.resize(L.size());
+        b.res = role_resident();
+        b.resp.resize(L.size());
+        for (size_t i = 0; i < L.size(); ++i) {
+            b.cnt[i]  = stage + L[i].stage_off;
+            b.resp[i] = b.res[i].data();
+            b.pri[i]  = i < prior.size() && prior[i].size() == (size_t) L[i].n_expert ? prior[i].data() : nullptr;
+        }
+        b.v.size     = (uint32_t) sizeof(b.v);
+        b.v.counters = b.cnt.data();
+        b.v.resident = b.resp.data();
+        b.v.prior    = b.pri.data();
+    }
+
+    // a learned save point; stage holds the counters persist_learned just read
+    void role_save(bool shutdown) {
+        if (!role_on) return;
+        const std::string p = role_file();
+        if (p.empty()) return;
+        if (shutdown) role_close_request();
+        const void * data = nullptr;
+        const size_t n = role->save(role_st, &data);
+        if (n == 0 || !data) return;
+        if (!pxa_file_replace(p, std::string((const char *) data, n))) {
+            if (!role_save_warned) LLAMA_LOG_WARN("PXA_XCACHE: could not save the cache role's state to %s\n", p.c_str());
+            role_save_warned = true;
+            return;
+        }
+        if (shutdown || !role_saved) LLAMA_LOG_INFO("PXA_XCACHE: saved the cache role's state to %s\n", p.c_str());
+        role_saved = true;
+    }
+
+    // at boot (role_init)
+    void role_load() {
+        if (const ggml_pxqn_learn_api * lt = ggml_pxqn_learn_api_get(); lt && lt->off(nullptr, 0)) return;
+        if (!role->file_suffix || !role->file_suffix[0] || !role->load) return;
+        char buf[4096];
+        if (!llama_pxa_xcache_role_path(&model, role->file_suffix, buf, sizeof(buf))) return;      // none yet
+        if (model.pxa_xc_learned_tokens < 0) {
+            LLAMA_LOG_INFO("PXA_XCACHE: not reading %s: this boot planned from the curated map (it is read with the learned counts "
+                    "it was saved beside)\n", buf);
+            return;
+        }
+        std::string bytes;
+        if (FILE * f = fopen(buf, "rb")) {
+            char tmp[65536];
+            size_t n;
+            while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0) bytes.append(tmp, n);
+            fclose(f);
+        }
+        char msg[512];
+        const int rc = role->load(role_st, bytes.data(), bytes.size(), msg, sizeof(msg));
+        if (rc < 0) LLAMA_LOG_WARN("PXA_XCACHE: %s: %s\n", buf, msg);
+        else        LLAMA_LOG_INFO("PXA_XCACHE: %s: %s\n", buf, msg);
+    }
+
+    // the role stops for the rest of the session with one warning; fail = the adaptation stops starting swaps too (a copy or the
+    // tables went wrong, the rule of any failed copy)
+    void role_off(const char * why, bool fail) {
+        if (role_on) {
+            LLAMA_LOG_WARN("PXA_XCACHE: %s; the cache role is off for this session%s\n", why,
+                    fail ? ", and no new swap starts (as after any failed copy)" : "");
+        }
+        role_on = false;
+        if (role && role_st && role->halt) role->halt(role_st);
+        if (fail) broken = true;
+    }
+
+    // the set each split layer serves once every swap in flight has landed (map-hot, minus each swap's e_out, plus its e_in):
+    // n_slots experts per layer, what drain() leaves
+    std::vector<std::vector<uint8_t>> role_resident() const {
+        std::vector<std::vector<uint8_t>> r(L.size());
+        for (size_t i = 0; i < L.size(); ++i) {
+            r[i].assign((size_t) L[i].n_expert, 0);
+            for (int e = 0; e < L[i].n_expert; ++e) if (L[i].map[(size_t) e] >= 0) r[i][(size_t) e] = 1;
+        }
+        for (const op & o : ops) {
+            r[(size_t) o.li][(size_t) o.e_out] = 0;
+            r[(size_t) o.li][(size_t) o.e_in]  = 1;
+        }
+        return r;
+    }
+
+    // the running request ended (stage holds the counters now)
+    void role_close_request() {
+        role_view_buf b;
+        role_view(b);
+        role->end(role_st, &b.v);
+    }
+
+    // a request start (llama_pxa_xcache_seq_start; prompt = llama_pxa_xcache_batch_start's PROMPT start): the role closes the
+    // previous request and keeps the counters as the new request's base. true = the start ran
+    bool role_seq_start(bool prompt = false) {
+        if (!role_on || broken) return false;
+        const int64_t t0 = ggml_time_us();
+        if (!read_counters()) {
+            role_off("the routing counters could not be read at a sequence start", false);
+            return false;
+        }
+        role_view_buf b;
+        role_view(b);
+        role->start(role_st, &b.v, prompt ? 1 : 0);
+        us_role += ggml_time_us() - t0;
+        return true;
+    }
+
+    // llama_pxa_xcache_batch_start: the request-start decision for one main-model batch
+    int role_batch(int n_tokens, bool strict) {
+        if (!role || !role_st) return strict && n_tokens > 0 ? GGML_PXQN_CACHE_START_STRICT : GGML_PXQN_CACHE_START_NONE;
+        return role->batch(role_st, role_on && !broken ? 1 : 0, strict ? 1 : 0, n_tokens);
+    }
+
+    // the tick the role asked for: it reads the counters and the resident set, and may ask for a move set. true = moved
+    bool role_select() {
+        if (!role_on || broken) return false;
+        const int64_t t0 = ggml_time_us();
+        if (!read_counters()) {
+            role_off("the routing counters could not be read at a request's first decode", false);
+            return false;
+        }
+        role_view_buf b;
+        role_view(b);
+        for (size_t i = 0; i < L.size(); ++i) role_sel[i].assign(b.cnt[i], b.cnt[i] + L[i].n_expert + 8);
+        const int act = role->select(role_st, &b.v);
+        if (act == GGML_PXQN_CACHE_ACT_NONE) {
+            us_role += ggml_time_us() - t0;
+            return false;
+        }
+        double ms = 0;
+        int outcome = 0;
+        if (act == GGML_PXQN_CACHE_ACT_MOVE) {
+            const int64_t t1 = ggml_time_us();
+            outcome = role_move() ? 1 : 2;
+            const int64_t dt = ggml_time_us() - t1;
+            us_role_moves += dt;
+            ms = dt/1000.0;
+        }
+        char msg[1024];
+        role->finish(role_st, role_on ? 1 : 0, outcome, ms, log_every > 0 ? msg : nullptr, log_every > 0 ? sizeof(msg) : 0);
+        if (log_every > 0 && msg[0]) LLAMA_LOG_INFO("PXA_XCACHE: cache role: %s\n", msg);
+        us_role += ggml_time_us() - t0;
+        return outcome == 1;
+    }
+
+    // One synchronous burst, the reset_to_plan pattern. The planner stands still (a job in flight is waited for, its plan dropped:
+    // it was made against the set this burst replaces) and every swap in flight lands (drain). Then per layer one chain on the
+    // layer's copy stream, in order, so a single free cold slot carries it: evict e_out from its hot slot into the free cold slot
+    // (D2H, also with PXA_XCACHE_EVICT_FILE: the stream orders it before the admit that reuses the slot), admit e_in from its cold
+    // slot into that hot slot, and e_in's old cold slot is the next free one. No graph runs here (between two decodes), one event
+    // per device is waited for before the maps move on the device, and the tables are walked after. A failure: one warning, the
+    // role off and no new swap; an admit that cannot be enqueued leaves its hot slot vacant and every expert one home (apply_due's
+    // rule). The moves are the role's plan on the settled tables.
+    bool role_move() {
+        if (rtier) {
+            std::unique_lock<std::mutex> lk(rt_mu);
+            if (rt_job) ++n_role_waits;
+            rt_idle_cv.wait(lk, [&] { return !rt_job || rt_stop; });
+            if (rt_done) {
+                ++n_role_drop_plans;
+                n_role_drop += rt_nout > 0 ? (uint64_t) rt_nout : 0;
+                rt_nout = 0;
+                rt_done = false;
+                ++n_obs;
+            }
+        }
+        drain();
+        if (broken) {
+            role_off("a swap in flight failed before a move set", false);
+            return false;
+        }
+        std::vector<std::vector<uint8_t>> cur(L.size());
+        std::vector<const uint8_t *> curp(L.size());
+        for (size_t i = 0; i < L.size(); ++i) {
+            cur[i].assign((size_t) L[i].n_expert, 0);
+            for (int e = 0; e < L[i].n_expert; ++e) if (L[i].map[(size_t) e] >= 0) cur[i][(size_t) e] = 1;
+            curp[i] = cur[i].data();
+        }
+        const ggml_pxqn_cache_move * mv = nullptr;
+        const double * val = nullptr;
+        const size_t np = role->plan(role_st, curp.data(), &mv, &val);
+        size_t n_sw = 0;
+        double g_sw = 0;
+        bool ok = true;
+        size_t p = 0;
+        while (ok && p < np) {
+            const int li = mv[p].layer;
+            lay & l = L[(size_t) li];
+            auto & xl = model.pxa_xc[l.il];
+            if (l.spare.empty()) {      // no free cold slot in this layer (not a plan this adaptor makes): leave it as it is
+                while (p < np && mv[p].layer == li) ++p;
+                continue;
+            }
+            int32_t c_free = l.spare.back();
+            l.spare.pop_back();
+            for (; p < np && mv[p].layer == li; ++p) {
+                const int e_in = mv[p].e_in, e_out = mv[p].e_out;
+                const int32_t s = l.map[(size_t) e_out], c_in = -2 - l.map[(size_t) e_in];
+                if (s < 0 || l.map[(size_t) e_in] > -2 || l.busy[(size_t) e_in] || l.busy[(size_t) e_out]) { ok = false; break; }
+                if (!copy_slot(l, false, s, c_free)) { ok = false; break; }        // nothing moved: c_free is still free
+                l.map[(size_t) e_out] = -2 - c_free;
+                xl.cold[(size_t) c_free] = e_out;
+                xl.hot[(size_t) s] = -1;
+                l.dirty = true;
+                if (!copy_slot(l, true, s, c_in)) { c_free = -1; ok = false; break; }   // e_out holds c_free now
+                l.map[(size_t) e_in] = s;
+                xl.hot[(size_t) s] = e_in;
+                xl.cold[(size_t) c_in] = -1;
+                c_free = c_in;
+                ++n_sw;
+                g_sw += val[p];
+            }
+            if (c_free >= 0) l.spare.push_back(c_free);
+        }
+        for (int d : devs) {
+            void * ev = ggml_backend_cuda_xcache_event_record(d);
+            if (!ev) { ok = false; continue; }
+            ggml_backend_cuda_xcache_event_sync(ev);
+            ggml_backend_cuda_xcache_event_free(ev);
+        }
+        flush_maps();
+        ok = ok && check_tables() == 0;
+        role->moved(role_st, ok ? 1 : 0, n_sw, g_sw);
+        if (!ok) {
+            role_off("a move set did not complete", true);
+            return false;
+        }
+        role_reseed();
+        return role_on;
+    }
+
+    // The policy starts over at the select's counters, with the prior the role gives. Its decayed counts described the set before;
+    // kept, they would swap the moves straight back. The routings since its last observation go into the hit totals first; then
+    // base_cnt = those counters and every later observation is relative to them (rt_loop), since a new policy state starts its
+    // own counters at 0.
+    void role_reseed() {
+        for (size_t i = 0; i < L.size(); ++i) {
+            const size_t n = (size_t) L[i].n_expert;
+            const auto & c = role_sel[i];
+            const uint32_t h = role_rebased ? c[n] - base_cnt[i][n] : c[n];
+            const uint32_t m = role_rebased ? c[n + 1] - base_cnt[i][n + 1] : c[n + 1];
+            const uint32_t dh = h - prev_hit[i], dm = m - prev_miss[i];      // u32 wrap-safe
+            tot_hit += dh; tot_miss += dm; win_hit += dh; win_miss += dm; lay_hit[i] += dh; lay_miss[i] += dm;
+            base_cnt[i] = c;
+            prev_hit[i] = 0;
+            prev_miss[i] = 0;
+        }
+        role_rebased = true;
+        tokens_since_obs = 0;
+        ticks_since_obs  = 0;
+        role_lcfg = lcfg;
+        role_prior.assign(L.size(), {});
+        for (size_t i = 0; i < L.size(); ++i) {
+            const size_t n = (size_t) L[i].n_expert;
+            const double * mp = i < prior.size() && prior[i].size() == n ? prior[i].data() : nullptr;
+            role_prior[i].assign(n, 0.0);
+            if (!role->prior || !role->prior(role_st, (int32_t) i, mp, role_prior[i].data())) {
+                role_prior[i].clear();
+                role_lcfg[i].prior = nullptr;
+                continue;
+            }
+            role_lcfg[i].prior = role_prior[i].data();
+        }
+        ggml_pxqn_xc_cfg c = cfg_saved;
+        c.layers = role_lcfg.data();
+        pol->destroy(pst);
+        pst = pol->create(&c);
+        if (!pst) role_off("the policy could not be re-created after a move set", true);
+    }
+
     // ---- reporting ----------------------------------------------------------------------------------------------------------
 
     void stats_line(const char * tag) {
@@ -1113,6 +1553,16 @@ struct llama_model::pxa_xc_adaptor {
                 "planner %.0f us per job (off the decode thread), cap %d swaps per decode\n", tag, (unsigned long long) n_rt_jobs,
                 (unsigned long long) n_rt_skip, (unsigned long long) n_rt_stale, n_rt_jobs ? (double) us_rt_worker/(double) n_rt_jobs : 0.0, swap_cap);
         if (swap_dummy) LLAMA_LOG_INFO("PXA_XCACHE_SWAP_DUMMY%s: %llu dummy swaps (bytes moved, map never flipped)\n", tag, (unsigned long long) n_dummy);
+        if (tag[0] != 0 && role && role_st && role->summary) {      // the summary only (tag is never null: "" or " summary")
+            ggml_pxqn_cache_host h = {};
+            h.size = (uint32_t) sizeof(h);
+            h.on = role_on ? 1 : 0;
+            h.waits = n_role_waits; h.dropped_jobs = n_role_drop_plans; h.dropped_moves = n_role_drop;
+            h.ms_all = us_role/1000.0; h.ms_moves = us_role_moves/1000.0;
+            char msg[2048];
+            role->summary(role_st, &h, msg, sizeof(msg));
+            if (msg[0]) LLAMA_LOG_INFO("PXA_XCACHE%s: cache role: %s\n", tag, msg);
+        }
         if (evict_file) LLAMA_LOG_INFO("PXA_XCACHE_EVICT_FILE%s: %llu evicts read from the model file (%llu failed), %.0f us per read (IO thread), 0 evict bytes on the link\n",
                 tag, (unsigned long long) n_ef, (unsigned long long) n_ef_fail.load(),
                 n_ef_done.load() ? (double) us_ef.load()/(double) n_ef_done.load() : 0.0);
@@ -1201,6 +1651,15 @@ struct llama_model::pxa_xc_adaptor {
         // keeps its slots (nothing points at a slot being written) and is applied at the next decode tick
         const bool frozen = adapt && llama_pxa_xc_frozen(freeze, n_tokens);
         if (frozen) ++n_frozen_ticks;
+        // the cache role: its select runs at the tick it asks for, before anything of this tick moves; after a move set nothing is
+        // in flight and the policy starts over at this tick's counters, so the tick's own adaptation is skipped
+        if (role && role_st && role->tick(role_st, n_tokens)) {
+            if (role_select()) {
+                us_tick += ggml_time_us() - t0;
+                ++n_ticks;
+                return;
+            }
+        }
         if (adapt && !frozen) apply_due();
         tokens_since_obs += (uint32_t) std::max(n_tokens, 0);
         ++ticks_since_obs;
@@ -1296,6 +1755,29 @@ void llama_pxa_xcache_seq_start(llama_model & model) {
     std::lock_guard<std::mutex> lock(pxa_xc_tick_mu());
     if (!model.pxa_xc_ad->active) return;
     model.pxa_xc_ad->reset_to_plan();
+    model.pxa_xc_ad->role_seq_start();     // the cache role's request start
+}
+
+// llama_decode's request-start hook (llama-pxa-xcache.h): the decision and the adaptor's one bit under the tick lock; then, outside
+// it (llama_synchronize ticks), the work in flight completes and the start runs. An adaptor that did not start (no policy, a hot-swap
+// group) takes the strict path as before: synchronize, then a llama_pxa_xcache_seq_start that does nothing.
+int llama_pxa_xcache_batch_start(llama_model & model, int n_tokens, bool strict, void (*sync)(void * ud), void * ud) {
+    if (model.pxa_xc.empty() || !model.pxa_xc_ad) return GGML_PXQN_CACHE_START_NONE;
+    int kind = GGML_PXQN_CACHE_START_NONE;
+    {
+        std::lock_guard<std::mutex> lock(pxa_xc_tick_mu());
+        auto * a = model.pxa_xc_ad;
+        kind = a->active ? a->role_batch(n_tokens, strict) : (strict && n_tokens > 0 ? GGML_PXQN_CACHE_START_STRICT : GGML_PXQN_CACHE_START_NONE);
+    }
+    if (kind == GGML_PXQN_CACHE_START_NONE) return kind;
+    if (sync) sync(ud);         // llama_synchronize: the batch before this one has landed and ticked
+    if (kind == GGML_PXQN_CACHE_START_STRICT) {
+        llama_pxa_xcache_seq_start(model);
+        return kind;
+    }
+    std::lock_guard<std::mutex> lock(pxa_xc_tick_mu());     // the cache role's own start, never reset_to_plan
+    auto * a = model.pxa_xc_ad;
+    return a && a->active && a->role_seq_start(true) ? kind : GGML_PXQN_CACHE_START_NONE;
 }
 
 bool llama_pxa_xcache_stats(const struct llama_model * model, uint64_t * hits, uint64_t * misses,
@@ -1325,6 +1807,27 @@ bool llama_pxa_xcache_rtier_stats(const llama_model * model, uint64_t * jobs, ui
     if (jobs)  *jobs  = a->n_rt_jobs;
     if (stale) *stale = a->n_rt_stale;
     return true;
+}
+
+bool llama_pxa_xcache_role_stats(const llama_model * model, llama_pxa_xc_role_stats * out) {
+    if (!model || !model->pxa_xc_ad || !model->pxa_xc_ad->active) return false;
+    auto * a = model->pxa_xc_ad;
+    if (out) {
+        out->on            = a->role_on;
+        out->waits         = a->n_role_waits;
+        out->dropped_plans = a->n_role_drop_plans;
+        out->dropped_swaps = a->n_role_drop;
+        out->ms            = a->us_role/1000.0;
+        out->role          = {};
+        out->role.size     = (uint32_t) sizeof(out->role);
+        if (a->role && a->role_st && a->role->stats) a->role->stats(a->role_st, &out->role);
+    }
+    return true;
+}
+
+int llama_pxa_xcache_check(const llama_model * model) {
+    if (!model || !model->pxa_xc_ad || !model->pxa_xc_ad->active) return -1;
+    return model->pxa_xc_ad->check_tables();
 }
 
 void llama_pxa_xcache_adaptor_free(llama_model & model) {

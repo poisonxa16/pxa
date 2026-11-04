@@ -8,6 +8,7 @@ server are the fakes of tests/encode_fakes.py.
 
     python3 tests/test-pxa-encode.py          (wired into CTest as test-pxa-encode)
 """
+import errno
 import hashlib
 import importlib.util
 import json
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -70,6 +72,10 @@ def moe_repo(experts=256, arch="Qwen3_5MoeForConditionalGeneration"):
     return repo
 
 
+REPOS["tiny/Tiny-VL"] = F.tiny_vl_repo()                              # a vision-language source: the projector (mmproj) is exported beside the GGUF
+REPOS["tiny/Tiny-VL-Sharded"] = F.tiny_vl_repo(sharded=True)          # ... with its vision tower in its own shard
+REPOS["tiny/Tiny-VL-NoPre"] = F.tiny_vl_repo()                         # ... without the preprocessor config: the projector export fails
+del REPOS["tiny/Tiny-VL-NoPre"]["files"]["preprocessor_config.json"]
 REPOS["tiny/Tiny-MoE"] = moe_repo()                                    # a mixture-of-experts source, for the counts stage and the PXQN refusal
 HF = F.FakeHF(REPOS)
 CDN = F.FakeCDN(HF)
@@ -1559,6 +1565,437 @@ class Download(unittest.TestCase):
         self.assertIn("cannot reach Hugging Face", j["error"]["message"])
 
 
+class VisionProjector(unittest.TestCase):
+    """A vision-language source (Qwen3-VL, Qwen2.5-VL, SmolVLM2, InternVL): the page offers the projector (mmproj) and the job writes
+    mmproj-<name>-F16.gguf beside the GGUF, named so the engine pairs it with every tier made from the model."""
+
+    def test_the_real_converter_lists_the_vision_archs(self):
+        conv = os.path.join(ROOT, "convert_hf_to_gguf.py")
+        mm = PL.converter_mmproj_arch_names(conv)
+        for a in ("Qwen2_5_VLForConditionalGeneration", "Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration",
+                  "SmolVLMForConditionalGeneration", "Idefics3ForConditionalGeneration", "InternVisionModel"):
+            self.assertIn(a, mm)
+        self.assertNotIn("Qwen3ForCausalLM", mm)                       # a text class is not a projector class
+        text = PL.converter_arch_names(conv)
+        for a in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration", "SmolVLMForConditionalGeneration", "InternVLChatModel"):
+            self.assertIn(a, text)
+        self.assertNotIn("InternVisionModel", text)                     # a projector-only name converts no text model
+
+    def test_vision_tower_sentence(self):
+        cfg = {"architectures": ["Qwen3VLForConditionalGeneration"], "vision_config": {"depth": 2}}
+        self.assertTrue(PL.vision_tower(cfg, {"Qwen3VLForConditionalGeneration"})["supported"])
+        self.assertFalse(PL.vision_tower(cfg, {"Other"})["supported"])
+        self.assertFalse(PL.vision_tower(cfg, None)["supported"])
+        self.assertIsNone(PL.vision_tower({"architectures": ["Qwen3ForCausalLM"]}, {"Qwen3VLForConditionalGeneration"}))
+        # InternVL names its vision tower in vision_config.architectures
+        self.assertTrue(PL.vision_tower({"architectures": ["InternVLChatModel"], "vision_config": {"architectures": ["InternVisionModel"]}},
+                                        {"InternVisionModel"})["supported"])
+
+    def test_inspect_offers_it_and_a_text_model_does_not_get_it(self):
+        r = Rig("pro")
+        src = r.svc.inspect("tiny/Tiny-VL")
+        self.assertTrue(src["vision"]["supported"])
+        self.assertIsNone(r.svc.inspect("tiny/Tiny-Qwen3")["vision"])
+        rows = {c["id"]: c for c in r.svc.checks(r.body(source="tiny/Tiny-VL"))["checks"]}
+        self.assertEqual(rows["vision"]["status"], "ok")
+        rows = {c["id"]: c for c in r.svc.checks(r.body(source="tiny/Tiny-VL", mmproj=False))["checks"]}
+        self.assertEqual(rows["vision"]["status"], "warn")
+        self.assertIn("text-only", rows["vision"]["text"])
+        self.assertNotIn("vision", {c["id"] for c in r.svc.checks(r.body())["checks"]})
+
+    def _done(self, r, j):
+        self.assertEqual(j["status"], "done", (j["error"], r.svc.log_view(j["id"])["lines"][-8:]))
+        return j["result"]
+
+    def test_the_job_writes_the_projector_beside_the_gguf(self):
+        r = Rig("pro")
+        res = self._done(r, r.wait(r.svc.start(r.body(source="tiny/Tiny-VL"))["id"]))
+        mm = res["mmproj"]
+        self.assertEqual(mm["path"], os.path.join(r.models, "mmproj-Tiny-VL-F16.gguf"))
+        self.assertTrue(os.path.isfile(mm["path"]))
+        self.assertEqual(L.gguf_header(mm["path"])["kv"]["general.architecture"], "clip")
+        # the launcher pairs it with the encoded model by name
+        self.assertTrue(L.mmproj_matches_model(res["path"], mm["path"]))
+        self.assertEqual(os.listdir(os.path.join(r.dir, "work")), [])
+        # a second tier of the same model keeps the one projector (a -2 copy would leave the launcher two to choose from)
+        before = os.path.getmtime(mm["path"])
+        res2 = self._done(r, r.wait(r.svc.start(r.body("pxqn3", source="tiny/Tiny-VL"))["id"]))
+        self.assertEqual(res2["mmproj"]["path"], mm["path"])
+        self.assertEqual(os.path.getmtime(mm["path"]), before)
+        self.assertEqual(len([f for f in os.listdir(r.models) if f.startswith("mmproj")]), 1)
+
+    def test_turned_off_means_no_projector(self):
+        r = Rig("pro")
+        for off in (False, 0, "false", "off", None):
+            self.assertFalse(r.svc._req(r.body(source="tiny/Tiny-VL", mmproj=off))["mmproj"], off)
+        self.assertTrue(r.svc._req(r.body(source="tiny/Tiny-VL"))["mmproj"])
+        res = self._done(r, r.wait(r.svc.start(r.body(source="tiny/Tiny-VL", mmproj=False))["id"]))
+        self.assertIsNone(res.get("mmproj"))
+        self.assertEqual([f for f in os.listdir(r.models) if f.startswith("mmproj")], [])
+
+    def test_a_failed_projector_does_not_cost_the_model(self):
+        r = Rig("pro")
+        j = r.wait(r.svc.start(r.body(source="tiny/Tiny-VL-NoPre"))["id"])
+        res = self._done(r, j)
+        self.assertTrue(os.path.isfile(res["path"]))
+        self.assertIn("could not be exported", res["mmproj"]["error"])
+        self.assertNotIn("path", res["mmproj"])
+        self.assertTrue(any(ln.startswith("vision projector NOT exported") for ln in r.svc.log_view(j["id"])["lines"]))
+        self.assertEqual([f for f in os.listdir(r.models) if f.startswith("mmproj")], [])
+
+    def test_a_projector_of_another_model_is_never_overwritten(self):
+        r = Rig("pro")
+        other = os.path.join(r.models, "mmproj-Tiny-VL-F16.gguf")
+        with open(other, "wb") as f:
+            f.write(b"GGUF another model's projector")
+        j = r.wait(r.svc.start(r.body(source="tiny/Tiny-VL"))["id"])
+        res = self._done(r, j)
+        with open(other, "rb") as f:
+            self.assertEqual(f.read(), b"GGUF another model's projector")
+        self.assertEqual(res["mmproj"]["path"], os.path.join(r.models, "mmproj-Tiny-VL-F16-2.gguf"))
+        self.assertTrue(any("load this one with --mmproj" in ln for ln in r.svc.log_view(j["id"])["lines"]))
+        self.assertFalse([f for f in os.listdir(r.models) if f.endswith(".part")])
+
+    def test_a_text_model_runs_as_before(self):
+        r = Rig("pro")
+        j = r.wait(r.svc.start(r.body())["id"])
+        res = self._done(r, j)
+        self.assertIsNone(res.get("mmproj"))
+        self.assertFalse(any("--mmproj" in ln for ln in r.svc.log_view(j["id"])["lines"]))
+
+    def test_a_sharded_model_fetches_only_the_vision_shard_for_the_projector(self):
+        r = Rig("pro")
+        j = r.wait(r.svc.start(r.body(source="tiny/Tiny-VL-Sharded"))["id"])
+        res = self._done(r, j)
+        self.assertTrue(os.path.isfile(res["mmproj"]["path"]))
+        log = r.svc.log_view(j["id"])["lines"]
+        if not legacy():                                # the make flow downloads the model itself: Control fetches only what the projector needs
+            fetch = [ln for ln in log if ln.startswith("vision projector: fetching")]
+            self.assertEqual(len(fetch), 1, log[-10:])
+            self.assertIn("model-00002-of-00002.safetensors", fetch[0])
+            self.assertNotIn("model-00001-of-00002.safetensors", fetch[0])
+        self.assertEqual(os.listdir(os.path.join(r.dir, "work")), [])
+
+    def test_a_local_folder_source(self):
+        r = Rig("pro")
+        d = os.path.join(r.dir, "vl-folder")
+        os.makedirs(d)
+        for n, b in F.tiny_vl_repo()["files"].items():
+            with open(os.path.join(d, n), "wb") as f:
+                f.write(b)
+        res = self._done(r, r.wait(r.svc.start(r.body(source=d))["id"]))
+        self.assertEqual(os.path.basename(res["mmproj"]["path"]), "mmproj-vl-folder-F16.gguf")
+        self.assertTrue(os.path.isdir(d) and os.path.isfile(os.path.join(d, "model.safetensors")))   # the user's folder is never touched
+
+    # ---- cleanup (S-1 and the review leftovers) -------------------------------------------------------------------------
+    def _rename_exdev(self, under):
+        """os.rename that answers EXDEV for any destination under `under`: the output folder is on another disk."""
+        real = os.rename
+
+        def other_disk(src, dst):                    # from outside `under` into it (a .part beside the target is on its disk)
+            u = os.path.abspath(under) + os.sep
+            return os.path.abspath(dst).startswith(u) and not os.path.abspath(src).startswith(u)
+
+        def fake(src, dst, *a, **k):
+            if other_disk(src, dst):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real(src, dst, *a, **k)
+        real_link = os.link
+
+        def fake_link(src, dst, *a, **k):
+            if other_disk(src, dst):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_link(src, dst, *a, **k)
+        return _Both(mock.patch.object(os, "rename", fake), mock.patch.object(os, "link", fake_link))
+
+    def test_a_planted_link_at_the_projector_part_name_is_not_written_through(self):
+        r = Rig("pro")
+        victim = os.path.join(r.dir, "victim.json")
+        with open(victim, "wb") as f:
+            f.write(b"keep me")
+        os.symlink(victim, os.path.join(r.models, "mmproj-Tiny-VL-F16.gguf.part"))
+        with self._rename_exdev(r.models):
+            res = self._done(r, r.wait(r.svc.start(r.body(source="tiny/Tiny-VL"))["id"]))
+        with open(victim, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
+        mm = res["mmproj"]["path"]
+        self.assertFalse(os.path.islink(mm))
+        self.assertEqual(L.gguf_header(mm)["kv"]["general.architecture"], "clip")
+
+    def test_a_dangling_link_at_an_output_name_is_not_written_through(self):
+        r = Rig("pro")
+        victim = os.path.join(r.dir, "made-by-the-link")
+        os.symlink(victim, os.path.join(r.models, "Tiny-VL-PXQN4.gguf"))
+        os.symlink(victim + "-mm", os.path.join(r.models, "mmproj-Tiny-VL-F16.gguf"))
+        with self._rename_exdev(r.models):
+            res = self._done(r, r.wait(r.svc.start(r.body(source="tiny/Tiny-VL"))["id"]))
+        self.assertFalse(os.path.lexists(victim))
+        self.assertFalse(os.path.lexists(victim + "-mm"))
+        self.assertFalse(os.path.islink(res["path"]))
+        self.assertTrue(res["path"].endswith("-2.gguf"), res["path"])
+        self.assertEqual(os.path.basename(res["mmproj"]["path"]), "mmproj-Tiny-VL-F16-2.gguf")
+
+    def test_moving_into_place_across_disks(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        src, dst = os.path.join(d, "a.tmp"), os.path.join(d, "out", "a.gguf")
+        os.makedirs(os.path.dirname(dst))
+        with open(src, "wb") as f:
+            f.write(b"GGUF data")
+        with self._rename_exdev(os.path.dirname(dst)):
+            E._move_new(src, dst)
+        self.assertFalse(os.path.exists(src))
+        with open(dst, "rb") as f:
+            self.assertEqual(f.read(), b"GGUF data")
+        self.assertEqual(os.listdir(os.path.dirname(dst)), ["a.gguf"])
+        os.symlink(os.path.join(d, "elsewhere"), dst + "2")
+        with open(src, "wb") as f:
+            f.write(b"x")
+        with self._rename_exdev(os.path.dirname(dst)):
+            self.assertRaises(FileExistsError, E._move_new, src, dst + "2")       # a name that is taken, even by a dangling link
+        self.assertFalse(os.path.lexists(os.path.join(d, "elsewhere")))
+
+    def _served(self, repo, fn):
+        return [(rng, n) for path, rng, n in list(HF.served) if path.endswith("/%s/resolve/main/%s" % (repo, fn)) or
+                path.endswith("/cdn/%s/%s" % (repo, fn))]
+
+    def test_the_weights_are_downloaded_once(self):
+        """The projector needs only the vision tower: Control reads it out of the weights by byte range, so a one-file model is not
+        fetched a second time next to the download the encoder (or the download stage) makes."""
+        r = Rig("pro")
+        del HF.served[:]
+        res = self._done(r, r.wait(r.svc.start(r.body(source="tiny/Tiny-VL"))["id"]))
+        self.assertTrue(os.path.isfile(res["mmproj"]["path"]))
+        size = len(REPOS["tiny/Tiny-VL"]["files"]["model.safetensors"])
+        got = self._served("tiny/Tiny-VL", "model.safetensors")
+        whole = [n for rng, n in got if n == size]
+        self.assertEqual(len(whole), 1, got)                              # one full download, by whoever converts the text model
+        if not legacy():
+            part = sum(n for rng, n in got if n != size)
+            vis = sum(2 * F._n(sh) for sh in F.VL_VISION.values())
+            self.assertGreaterEqual(part, vis)
+            self.assertLess(part, size // 2)
+
+    def test_the_vision_tensors_are_copied_exactly(self):
+        r = Rig("pro")
+        del HF.served[:]
+        j = r.svc.start(r.body(source="tiny/Tiny-VL-Sharded", keep=True))
+        wd = os.path.join(r.dir, "work", j["id"])
+        seen = {}
+        real = E.EncodeService._export_mmproj
+
+        def spy(svc, jj, src_dir, wdir, sid):
+            seen["dir"] = os.path.basename(src_dir.rstrip(os.sep))
+            for fn in os.listdir(src_dir):
+                if fn.endswith(".safetensors"):
+                    seen.update(F.safetensors_tensors(os.path.join(src_dir, fn)))
+            return real(svc, jj, src_dir, wdir, sid)
+        with mock.patch.object(E.EncodeService, "_export_mmproj", spy):
+            self._done(r, r.wait(j["id"]))
+        # the converter names the projector (general.name) after the folder: it carries the model's name, as a full download does
+        self.assertEqual(seen.pop("dir"), "Tiny-VL-Sharded" if not legacy() else "src")
+        self.assertEqual(set(seen) & set(F.VL_VISION), set(F.VL_VISION))
+        for k in F.VL_VISION:
+            self.assertTrue(seen[k] == F.tensor_fill(k, 2 * F._n(F.VL_VISION[k])), k)
+        if not legacy():
+            self.assertNotIn("lm_head.weight", set(seen))               # only the vision tower is read out of the mixed shard
+            # the text-only shard is never read for the projector (only the encoder's own download of it, whole)
+            self.assertEqual([rng for rng, n in self._served("tiny/Tiny-VL-Sharded", "model-00001-of-00002.safetensors")], [None])
+            self.assertTrue(all(rng for rng, n in self._served("tiny/Tiny-VL-Sharded", "model-00002-of-00002.safetensors")[:-1]))
+
+    def test_the_disk_check_counts_the_projector(self):
+        r = Rig("pro")
+        on = r.svc.checks(r.body(source="tiny/Tiny-VL"))["disk"]["need"]
+        off = r.svc.checks(r.body(source="tiny/Tiny-VL", mmproj=False))["disk"]["need"]
+        cfg = json.loads(REPOS["tiny/Tiny-VL"]["files"]["config.json"])
+        self.assertGreater(PL.vision_params_estimate(cfg), 0)
+        self.assertGreaterEqual(on - off, 2 * 2 * PL.vision_params_estimate(cfg))      # the F16 projector in work and in the output folder
+        self.assertEqual(r.svc.checks(r.body())["disk"]["need"], r.svc.checks(r.body(mmproj=True))["disk"]["need"])   # a text model: nothing added
+
+    def test_the_vision_estimate_is_close_on_real_configs(self):
+        """Measured on the real checkpoints (vision-tower parameters out of their safetensors headers, 2026-10-31)."""
+        real = {  # config fields the estimate reads -> measured vision parameters
+            "InternVL2_5-1B": ({"architectures": ["InternVLChatModel"], "downsample_ratio": 0.5, "llm_config": {"hidden_size": 896},
+                                "vision_config": {"hidden_size": 1024, "intermediate_size": 4096, "num_hidden_layers": 24, "patch_size": 14,
+                                                  "hidden_act": "gelu"}}, 308495104),
+            "Qwen2.5-VL-3B": ({"architectures": ["Qwen2_5_VLForConditionalGeneration"], "hidden_size": 2048,
+                               "vision_config": {"hidden_size": 1280, "intermediate_size": 3420, "depth": 32, "patch_size": 14, "temporal_patch_size": 2,
+                                                 "out_hidden_size": 2048, "spatial_merge_size": 2, "hidden_act": "silu"}}, 668684288),
+            "Qwen3-VL-2B": ({"architectures": ["Qwen3VLForConditionalGeneration"], "text_config": {"hidden_size": 2048},
+                             "vision_config": {"hidden_size": 1024, "intermediate_size": 4096, "depth": 24, "patch_size": 16, "temporal_patch_size": 2,
+                                               "out_hidden_size": 2048, "spatial_merge_size": 2, "hidden_act": "gelu_pytorch_tanh",
+                                               "deepstack_visual_indexes": [5, 11, 17]}}, 406957056),
+            "SmolVLM2-2.2B": ({"architectures": ["SmolVLMForConditionalGeneration"], "scale_factor": 3, "text_config": {"hidden_size": 2048},
+                               "vision_config": {"intermediate_size": 4304, "num_hidden_layers": 27, "patch_size": 14}}, 434220912),
+        }
+        for name, (cfg, measured) in real.items():
+            est = PL.vision_params_estimate(cfg)
+            self.assertGreaterEqual(est, measured, name)                    # never short: it sizes a disk check
+            self.assertLess(est, measured * 1.3, name)
+
+    def test_a_hostile_vision_config_cannot_break_the_estimate(self):
+        """The config comes from the model's author: Infinity, NaN, huge or tiny numbers give a bounded figure, never an exception."""
+        for vc, top in (({"hidden_size": float("inf")}, {}), ({"depth": float("nan"), "hidden_size": 10 ** 40}, {}),
+                        ({"hidden_size": 1024}, {"downsample_ratio": 1e-300}), ({"hidden_size": "big", "depth": True}, {}),
+                        ({"spatial_merge_size": 10 ** 9, "deepstack_visual_indexes": list(range(1000))}, {})):
+            cfg = dict(top, architectures=["Qwen3VLForConditionalGeneration"], vision_config=vc)
+            n = PL.vision_params_estimate(json.loads(json.dumps(cfg)))
+            self.assertTrue(0 < n <= PL.VISION_PARAMS_MAX, (vc, top, n))
+            PL.human_bytes(2 * n)
+
+    def test_the_converter_runs_offline_without_the_token(self):
+        r = Rig("pro")
+        rec = os.path.join(r.dir, "tool-env.jsonl")
+        with mock.patch.dict(os.environ, {"PXA_FAKE_TOOL_ENV": rec, "HF_TOKEN": "hf_" + "Q" * 34, "HUGGING_FACE_HUB_TOKEN": "hf_" + "R" * 34}):
+            self._done(r, r.wait(r.svc.start(r.body(source="tiny/Tiny-VL"))["id"]))
+        with open(rec) as f:
+            runs = [json.loads(ln) for ln in f if '"convert"' in ln]
+        self.assertTrue(runs)
+        for run in runs:
+            self.assertEqual(run["HF_HUB_OFFLINE"], "1", run)
+            self.assertFalse(run["token"], run)
+
+    def test_the_vision_tensor_names_come_from_the_converter(self):
+        """Control picks the vision tower out of the weights with the prefix list of the converter it runs (one list, not two)."""
+        conv = os.path.join(ROOT, "convert_hf_to_gguf.py")
+        pre = PL.converter_vision_prefixes(conv)
+        self.assertEqual(pre, PL.VISION_PREFIXES_DEFAULT)                  # the built-in copy (an unreadable converter) matches it too
+        for name in ("model.visual.blocks.0.attn.qkv.weight", "visual.merger.mlp.0.weight", "thinker.visual.patch_embed.proj.weight",
+                     "model.vision_model.encoder.layers.0.mlp.fc1.weight", "model.connector.modality_projection.proj.weight",
+                     "vision_model.embeddings.patch_embedding.weight", "mlp1.1.weight", "model.vision_tower.blocks.0.norm1.weight",
+                     "model.multi_modal_projector.linear_1.weight"):
+            self.assertTrue(PL.is_vision_tensor(name, pre), name)
+        for name in ("model.language_model.layers.0.self_attn.q_proj.weight", "lm_head.weight", "model.text_model.embed_tokens.weight",
+                     "language_model.model.layers.0.mlp.up_proj.weight", "model.layers.0.mlp.gate_proj.weight"):
+            self.assertFalse(PL.is_vision_tensor(name, pre), name)
+        r = Rig("pro")
+        self.assertEqual(r.svc.vision_prefixes(), PL.converter_vision_prefixes(r.svc.find_convert()))
+
+    # ---- the independent read of 00872ebfd8 (#53005): L-1 .. L-4 ----------------------------------------------------------
+    def _fetch_direct(self, repo, files):
+        r = Rig("pro")
+        jid = "direct-%d" % len(r.svc.rt)
+        r.svc.rt[jid] = E.Rt()
+        d = tempfile.mkdtemp(dir=TMP)
+        try:
+            return r.svc._fetch_vision_tensors({"id": jid}, repo, files, d, None), d
+        finally:
+            self.assertFalse([f for f in os.listdir(d) if f.endswith(".part")])
+
+    def _hostile(self, name, blob):
+        repo = "tiny/Hostile-%s" % name
+        HF.repos[repo] = dict(F.tiny_vl_repo(), files={"model.safetensors": blob})
+        return repo
+
+    def test_L1_hostile_header_numbers_give_the_plain_error(self):
+        inf = b'{"model.visual.a":{"dtype":"BF16","shape":[1],"data_offsets":[0,Infinity]}}'
+        deep = b"[" * 200000
+        for name, hb in (("inf", inf), ("deep", deep)):
+            hb += b" " * ((-len(hb)) % 8)
+            blob = struct.pack("<Q", len(hb)) + hb + b"\0" * 16
+            repo = self._hostile(name, blob)
+            with self.assertRaises(E._StageFailed) as cm:
+                self._fetch_direct(repo, [("model.safetensors", len(blob))])
+            self.assertIn("not a readable safetensors", cm.exception.message, name)
+
+    def test_L3_a_weights_file_without_a_listed_size_is_refused(self):
+        blob = REPOS["tiny/Tiny-VL"]["files"]["model.safetensors"]
+        for size in (0, None):
+            with self.assertRaises(E._StageFailed) as cm:
+                self._fetch_direct("tiny/Tiny-VL", [("model.safetensors", size)])
+            self.assertIn("size", cm.exception.message)
+        n, d = self._fetch_direct("tiny/Tiny-VL", [("model.safetensors", len(blob))])
+        self.assertEqual(set(F.safetensors_tensors(os.path.join(d, "model.safetensors"))), set(F.VL_VISION))
+
+    def test_a_206_must_say_which_bytes_it_carries(self):
+        blob = REPOS["tiny/Tiny-VL"]["files"]["model.safetensors"]
+        for cr in ("none", "badend"):
+            repo = "tiny/Tiny-VL-CR-%s" % cr
+            HF.repos[repo] = dict(F.tiny_vl_repo(), cr=cr)
+            with self.assertRaises(E._StageFailed) as cm:
+                self._fetch_direct(repo, [("model.safetensors", len(blob))])
+            self.assertEqual(cm.exception.code, "download", cr)
+
+    def test_L2_a_name_taken_after_the_check_is_never_replaced(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        final = os.path.join(d, "out.gguf")
+        with open(final, "wb") as f:
+            f.write(b"theirs")
+        other = tempfile.mkdtemp(dir=TMP)
+        for exdev in (False, True):
+            src = os.path.join(other if exdev else d, "a.tmp")
+            with open(src, "wb") as f:
+                f.write(b"ours")
+            real = os.path.lexists
+            ctx = self._rename_exdev(d) if exdev else _Both()
+            with ctx, mock.patch.object(os.path, "lexists", lambda p: False if p == final else real(p)):
+                self.assertRaises(FileExistsError, E._move_new, src, final)      # the race: free when checked, taken at the rename
+            with open(final, "rb") as f:
+                self.assertEqual(f.read(), b"theirs", exdev)
+            self.assertTrue(os.path.isfile(src))
+            self.assertFalse([f for f in os.listdir(d) if f.endswith(".part")], exdev)                  # no .part left behind
+
+    def test_L2_moving_without_hard_links(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        src, final = os.path.join(d, "a.tmp"), os.path.join(d, "b.gguf")
+        with open(src, "wb") as f:
+            f.write(b"ours")
+
+        def nolink(a, b, *x, **k):
+            raise OSError(errno.EPERM, "Operation not permitted")
+        with mock.patch.object(os, "link", nolink):
+            E._move_new(src, final)
+        with open(final, "rb") as f:
+            self.assertEqual(f.read(), b"ours")
+        self.assertFalse(os.path.exists(src))
+
+    def test_L4_a_projector_name_taken_at_the_last_moment_is_not_fatal(self):
+        real = E._move_new
+        calls = []
+
+        def once(src, final):
+            calls.append(final)
+            if len(calls) == 1:
+                raise FileExistsError(errno.EEXIST, "taken", final)
+            return real(src, final)
+        r = Rig("pro")
+        with mock.patch.object(E, "_move_new", once):
+            res = self._done(r, r.wait(r.svc.start(r.body(source="tiny/Tiny-VL"))["id"]))
+        self.assertEqual(os.path.basename(res["mmproj"]["path"]), "mmproj-Tiny-VL-F16-2.gguf")
+
+        def never(src, final):
+            if os.path.basename(final).startswith("mmproj-"):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(src, final)
+        r = Rig("pro")
+        with mock.patch.object(E, "_move_new", never):
+            res = self._done(r, r.wait(r.svc.start(r.body(source="tiny/Tiny-VL"))["id"]))
+        self.assertTrue(os.path.isfile(res["path"]))
+        self.assertIn("could not be", res["mmproj"]["error"])
+
+    def test_the_page_offers_the_checkbox(self):
+        with open(os.path.join(TOOLS, "pxa_control_ui", "encode.js")) as f:
+            js = f.read()
+        self.assertIn('id: "en-mmproj"', js)
+        self.assertIn("b.mmproj = !!EN.adv.mmproj", js)
+        self.assertIn('id: "en-outmmproj"', js)
+
+
+class _Both(object):
+    """Enter several context managers as one (none: a no-op)."""
+    def __init__(self, *cms):
+        self.cms = cms
+
+    def __enter__(self):
+        for c in self.cms:
+            c.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        for c in reversed(self.cms):
+            c.__exit__(*exc)
+        return False
+
+
 class _Legacy(object):
     """Run the same job tests against an older encoder (CLI version 1): Control keeps the multi-command path for it."""
     def setUp(self):
@@ -1581,6 +2018,10 @@ class ResumeStateLegacy(_Legacy, ResumeState):
 
 
 class LicenceRefusalsAtRunTimeLegacy(_Legacy, LicenceRefusalsAtRunTime):
+    pass
+
+
+class VisionProjectorLegacy(_Legacy, VisionProjector):
     pass
 
 
@@ -1715,6 +2156,77 @@ class AdapterMake(unittest.TestCase):
         self.assertEqual((k["code"], k["resumable"]), ("killed", True))
         self.assertIn("exit 77", X(77, None, "")["message"])
         self.assertNotIn("Traceback", json.dumps([d, c, o, r]))
+
+    def test_convert_failure_names_the_real_cause(self):
+        """2026-11-03 (#valued-lounge report): a 256-expert MoE died at blk.2 ffn_down_exps on a 32 GB machine and the page said the
+        converter "may not support this architecture". An encoder package from before 2026-11 says that for EVERY converter failure; what
+        Control measured (the converter's peak memory, free memory, free disk, the last tensor) now names the cause."""
+        X = AD.explain_make_failure
+        G = 1 << 30
+        old = {"stage": "convert", "code": "convert-failed", "resumable": False,
+               "message": "The bundled converter could not convert this model (INFO:hf-to-gguf:blk.2.ffn_down_exps.weight, torch.bfloat16 --> BF16, "
+                          "shape = {512, 2048, 256}). It may not support this architecture yet: convert the model with the engine's own tools and give the .gguf file instead."}
+        oom = {"conv_peak": int(28.6 * G), "limit": 32 * G, "total": 32 * G, "min_avail": int(0.2 * G), "free_disk": 11000 * G,
+               "last_tensor": "blk.2.ffn_down_exps.weight"}
+        r = X(1, old, "", facts=oom)
+        self.assertEqual((r["code"], r["resumable"]), ("convert-oom", True))
+        for want in ("ran out of memory", "28.6 GB", "32.0 GB", "blk.2.ffn_down_exps.weight", "free on the work disk", "not the problem"):
+            self.assertIn(want, r["message"])
+        self.assertIn("Update the encoder", r["hint"])
+        # the cgroup cap alone (a 16 GB container on a big box) is enough to call it
+        self.assertEqual(X(1, old, "", facts={"conv_peak": int(15.8 * G), "limit": 16 * G, "total": 188 * G})["code"], "convert-oom")
+        # free memory hit the floor while the converter itself stayed small (other programs took the rest): still memory
+        self.assertEqual(X(1, old, "", facts={"conv_peak": 4 * G, "limit": 32 * G, "total": 32 * G, "min_avail": int(0.5 * G)})["code"], "convert-oom")
+        # plenty of memory left: not called memory; the numbers replace the architecture guess, the log is the next step
+        n = X(1, old, "", facts={"conv_peak": 3 * G, "limit": 64 * G, "total": 64 * G, "min_avail": 40 * G, "free_disk": 500 * G, "last_tensor": "blk.7.attn_qkv.weight"})
+        self.assertEqual(n["code"], "convert-failed")
+        self.assertIn("3.0 GB", n["message"])
+        self.assertIn("blk.7.attn_qkv.weight", n["message"])
+        self.assertNotIn("architecture", n["message"])
+        self.assertNotIn("may not know this architecture", n["hint"])
+        # no measurements (another OS, an old Control path): the encoder's own sentence stands
+        self.assertIn("may not support this architecture", X(1, old, "")["message"])
+        # a 2026-11 encoder names the cause itself; Control passes its sentence through (and does not read "memory" as the CARD running out)
+        new = {"stage": "convert", "code": "convert-oom", "resumable": True,
+               "message": "The converter was stopped by SIGKILL at blk.2.ffn_down_exps.weight because the computer ran short of memory (RAM) (it used 28.6 GB "
+                          "of memory at its peak, of 32.0 GB this computer allows; 10.7 TB free on the work disk). Close other programs or add memory or swap, "
+                          "then run the same command again; it continues from this step."}
+        r2 = X(1, new, "", facts=oom)
+        self.assertEqual((r2["code"], r2["resumable"]), ("convert-oom", True))
+        self.assertEqual(r2["message"], new["message"])
+        self.assertEqual(X(1, dict(new, code="convert-killed"), "")["code"], "convert-killed")
+
+    def test_convert_watch_measures_the_converter(self):
+        if not os.path.isdir("/proc/self"):
+            self.skipTest("needs /proc")
+        import subprocess
+        wd = tempfile.mkdtemp(dir=TMP)
+        os.makedirs(os.path.join(wd, "logs"))
+        with open(os.path.join(wd, "logs", "convert.log"), "w") as f:
+            f.write("INFO:hf-to-gguf:blk.1.ffn_up_exps.weight, torch.bfloat16 --> BF16, shape = {2048, 512, 256}\n"
+                    "INFO:hf-to-gguf:blk.2.ffn_down_exps.weight, torch.bfloat16 --> BF16, shape = {512, 2048, 256}\nwriting\n")
+        # a parent (stands in for `pxqe make`) whose child runs a script named like the converter and holds ~120 MB
+        conv = os.path.join(wd, "convert_hf_to_gguf.py")
+        with open(conv, "w") as f:
+            f.write("import sys, time\nb = bytearray(120 << 20)\nfor i in range(0, len(b), 4096):\n    b[i] = 1\nprint('ok', flush=True)\ntime.sleep(30)\n")
+        code = "import subprocess, sys\np = subprocess.Popen([sys.executable, sys.argv[1]], stdout=subprocess.PIPE)\np.stdout.readline()\nprint('ready', flush=True)\np.wait()\n"
+        par = subprocess.Popen([sys.executable, "-c", code, conv], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(par.stdout.readline().strip(), "ready")
+            w = E._ConvertWatch(wd)
+            w.sample(par.pid)
+            f = w.facts()
+        finally:
+            for c in E.EncodeService._descendants(par.pid):
+                os.kill(c, signal.SIGKILL)
+            par.kill()
+            par.wait()
+        self.assertGreaterEqual(f["conv_peak"], 120 << 20)
+        self.assertLess(f["conv_peak"], 1 << 30)
+        self.assertEqual(f["last_tensor"], "blk.2.ffn_down_exps.weight")
+        self.assertIsNotNone(f["free_disk"])
+        self.assertTrue(f["limit"] and f["total"] and f["limit"] <= f["total"])
+        self.assertIsNotNone(f["min_avail"])
 
     def test_licence_job_lines_of_the_pro_encoder(self):
         self.assertEqual(AD.parse_line("licence: job J-99ab0c started (2 encodes left after this one)"), {"event": "job", "jid": "J-99ab0c", "left": 2, "unlimited": False})

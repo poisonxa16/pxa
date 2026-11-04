@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """release-scan.py - the release package scan gate: nothing ships until this passes on the exact files.
 
-    PXA_RELEASE_BLOCKLIST=/path/to/blocklist  scripts/release-scan.py [--json OUT] [--work DIR] INPUT...
+    PXA_RELEASE_BLOCKLIST=/path/to/blocklist  scripts/release-scan.py [--json OUT] [--work DIR] [--gguf-ours REGEX] INPUT...
+    scripts/release-scan.py --closedlib BASE_REF [--report] [--json OUT] [--allow FILE] [--closed-list FILE]
+                            [--repo GITDIR] (EXPORT_DIR | --ref REF)                          (check 6 only)
 
 INPUT is an unpacked package directory, a package tarball (.tar.gz / .tgz / .tar), a zip archive, a
 `docker save` archive (plain or gzipped), or one bare file (a program, a .dll, a data file). Exit 0 = clean; 2 = at least one BLOCK hit (no package, no upload); 3 = the gate could not
 run (no block list, unreadable input, self-test failed). The gate FAILS CLOSED: an unset or missing block list
 is exit 3, never a pass.
 
-Three checks, all on the exact files that would ship:
+Six checks; 1-5 on the exact files that would ship, 6 on the source tree about to be pushed:
   1. text: every text file against the block list's categories (regexes and literal id lists);
   2. secrets: token shapes on all text and binary strings, plus the literal contents of the secret files the
      block list names (directory given there, never here). A secret hit prints the FILE NAME and the rule id
@@ -25,6 +27,56 @@ Three checks, all on the exact files that would ship:
      that does not open as a zip with members (the stdlib's zipimport.pyc) is scanned as bytes, not unpacked. A payload that
      is found but cannot be unpacked (corrupt, no `zstd` tool, over the size budget) stops the gate (exit 3): fail
      closed. Mach-O files (macOS) get the strings pass like ELF/PE.
+  5. GGUF metadata (no third-party maker in our metadata): every file that starts with the GGUF magic (in archives
+     and payloads, and under a container image's skip lists too) has its header KV section read (v2/v3, either byte
+     order; never the tensor infos or data, so a 20+ GB model costs a few MB of reads). "Us" = a FULLMATCH of
+     --gguf-ours REGEX, else $PXA_GGUF_OURS, else (?i)\\s*(PXA|PXA Network|PXQ)\\s* (never a substring). A gguf-meta
+     block: general.quantized_by, or a string held by any quantize.imatrix.* key, that is not us (an absent or empty
+     quantized_by passes by design: it names nobody); a string held by general.repo_url / url / author / homepage /
+     license.link / organization / description / name or any general.source* key but .doi / .uuid (each string
+     element of an array too) that is not us, not an org on the upstream allow-list (exact, case-insensitive;
+     scripts/release-scan-upstream-orgs.txt, reviewed by the maintainers) and not EXACTLY a declared general.base_model.N.repo_url
+     that is https on huggingface.co or github.com, without userinfo, port, '..', '\\', '%', '?' or '#', whose org is
+     on that list (a self-declared base anywhere else names nobody; KVs come in any order, so these are decided after
+     the walk). Also ours: general.name / general.description that start with 'PXA ' at byte 0 (case-sensitive)
+     and hold no '/', no 'www.' and no domain-like token (a dot, then 2+ letters ending the token); our quantizer's quantize.imatrix.ignored_by note, byte for byte. An upstream
+     test GGUF listed in scripts/release-scan-gguf-exempt.txt (exact sha256 + basename; only files with hits are
+     hashed) has no hits; a missing or malformed list, like the org list, stops the gate (exit 3). An empty
+     string names nobody; numeric values are not hits. The report names the KEY only (control
+     characters stripped), never the value. A file that cannot be read, or a header that does not parse or is over
+     the bounds (truncated, unknown version or type, more than 5M keys + array elements walked, 4096 strings or 1 MiB
+     in the checked keys, 256 base model URLs), is a gguf-meta block too: fail closed. A .tar nested in a package is
+     not unpacked (it is a nested-archive block), so never put a GGUF-carrying archive in @archive-allow.
+  6. closed-lib (a SOURCE tree about to be pushed publicly, run on its own with --closedlib, no block list): every
+     speed mechanism added after the public baseline lives in the closed PXQN library (libggml-pxqn.so /
+     ggml-pxqn.dll); the open tree gets only the versioned hook plus a plain fallback. The candidate (an exported
+     directory, or --ref REF in --repo) is diffed against BASE_REF (the public release tag, fetched into the private
+     repo) and every addition below is a hit, printed as file:line, category, reason:
+       new-cuda-file    (a) a new .cu / .cuh file;
+       new-kernel       (a) a new __global__ kernel (on an added code line, any C-family file);
+       new-lever        (b) a quoted PXA_* / GGML_PXA* / GGML_CUDA_* name on an added code line that appears nowhere
+                        in the baseline tree (one hit per name per file);
+       speed-path-code  (c) an added hunk with code (not blank, not comment-only, not only an evidence-id change the
+                        public scrub empties) in a speed path: ggml/src/ggml-cuda*, ggml-cpu, ggml-hip, ggml-musa,
+                        common/pxa-registry.cpp (the autoconfig picks = tune tables), common/speculative*, or a
+                        file under src/ common/ ggml/ include/ examples/ tools/server/ whose name carries spec,
+                        speculative, draft, mtp, xcache, snapshot(s), snapbank, tune, tuning, overdrive, tierpipe,
+                        verify or autoconfig; in any other C-family file under those directories, a hunk whose code
+                        names a speed word (draft, mtp, specul, verify, xcache, snapshot, tune, overdrive, tierpipe,
+                        __global__, <<<, getenv, pxqn, fuse(d), gemv, mmvq, lm_head, autoconfig);
+       closed-path-present  (directory candidate only) a path of scripts/pxa-closed-files.txt in the public tree.
+     Not hits: paths of the closed list (the export omits them; on a --ref candidate the new switch names found there
+     are listed as a NOTE for the audit), docs (docs/, common/pxa-lever-catalog.inc = the public switch list), tests
+     (tests/, test-*, *_test.*), and (c) in the versioned hook files: ggml/src/ggml-pxqn-api.h,
+     ggml/src/ggml-pxqn-loader.cpp, ggml/src/ggml-cuda/pxa/pxqn-api.cuh, ggml/src/ggml-cuda/pxa/pxqn-stub.cu,
+     ggml/src/win-compat/ggml-pxqn.def, and any file whose first 40 lines carry the marker PXA_CLOSED_HOOK (a plain
+     fallback); (a) and (b) still apply there. Hook code changed without a *VERSION* #define bump is a WARN. The
+     reviewed allowlist scripts/release-scan-closedlib-allow.txt (closed itself) holds '<kind>:<value> | <reason> |
+     <approver>' lines, kind path (fnmatch glob: every hit in those files), sym (a kernel or switch name) or hunk
+     (hunk:<path>:<sha256>: one speed-path-code hunk, sha256 over its code lines stripped and joined by newlines, as
+     the report prints it in [hunk:...]; a changed line re-opens it; never use a path glob for a speed file); a
+     missing or malformed allowlist or closed list stops the check (exit 3). Exit 0 clean, 2 hits, 3 cannot run;
+     --report lists the hits and exits 0 (audit).
 plus file rules (file-name patterns that must not ship at all, e.g. compiled-language sources); inside a
 payload the compiled-Python names (*.pyc, *.pyo) a onefile build always carries are exempt from the file rules.
 
@@ -39,6 +91,9 @@ Its format (one directive per line, `#` comments):
   @secrets-skip <regex>       secret files (relative name) that are public by nature (public keys)
   @secrets-allow <regex> GLOB[,GLOB]   that secret file's literals are allowed in these package files only (a record
                               of text that was already published, e.g. a provenance record of shipped tables)
+  @shape-allow <secret-shape-id> <sha256> GLOB[,GLOB]   a known upstream text file (a pinned third-party library) whose
+                              exact bytes (sha256) name that secret shape as a constant, e.g. a key header a parser
+                              looks for: its hits of that one shape are warnings at those paths with those bytes only
   @archive-allow GLOB[,GLOB]  a binary archive at this package path is a known upstream file (e.g. a build wrapper jar,
                               a prebuilt web bundle): reported as a warning instead of a block (its inside is not read)
   @image-skip <prefix>        container paths never scanned (toolkits the base image installs)
@@ -47,8 +102,8 @@ Its format (one directive per line, `#` comments):
 Hits inside a documented switch name (PXA_*, PXQ_*, GGML_*, LLAMA_*) are not hits: the switch list a user reads
 is public by design. Stdlib only.
 """
-import argparse, bz2, fnmatch, gzip, io, lzma, json, marshal, mmap, os, re, shutil, stat, struct, subprocess, sys, tarfile, \
-    tempfile, zipfile, zlib
+import argparse, bz2, fnmatch, gzip, hashlib, io, lzma, json, marshal, mmap, os, re, shutil, stat, struct, subprocess, sys, tarfile, \
+    tempfile, unicodedata, zipfile, zlib
 
 TEXT_LIMIT = 16 << 20
 ELF_MAGIC = b"\x7fELF"
@@ -109,6 +164,7 @@ SECRET_SHAPES = [
     ("secret-shape-discord", r"\b[MN][A-Za-z\d]{23,25}\.[\w-]{6}\.[\w-]{27,}"),
 ]
 SECRET_SHAPES = [(n, re.compile(p)) for n, p in SECRET_SHAPES]
+SHAPE_IDS = frozenset(n for n, _ in SECRET_SHAPES)
 
 
 class GateError(Exception):
@@ -126,6 +182,7 @@ class Rules:
         self.secrets_skip = []
         self.secrets_allow = []  # (secret-name regex, [file globs])
         self.archive_allow = []  # package-path globs of known upstream binary archives
+        self.shape_allow = []    # (secret-shape id, sha256 of the file's bytes, [package-path globs])
         self.image_skip = []
         self.selftests = []
 
@@ -179,6 +236,13 @@ def load_rules(path, rules=None, seen=None):
                 if not rx or not globs:
                     raise GateError("%s:%d: @secrets-allow needs a secret-name regex and file globs" % (os.path.basename(path), n))
                 rules.secrets_allow.append((re.compile(rx), globs))
+            elif head == "@shape-allow":
+                f = rest.split()
+                globs = [g for g in (f[2] if len(f) == 3 else "").split(",") if g]
+                if len(f) != 3 or f[0] not in SHAPE_IDS or not re.fullmatch(r"[0-9a-f]{64}", f[1]) or not globs:
+                    raise GateError("%s:%d: @shape-allow needs a secret-shape id, a sha256 and file globs"
+                                    % (os.path.basename(path), n))
+                rules.shape_allow.append((f[0], f[1], globs))
             elif head == "@archive-allow":
                 globs = [g for g in rest.split(",") if g]
                 if not globs:
@@ -287,8 +351,9 @@ def masked(text, rules, switches):
     return text
 
 
-def scan_blob(rep, rel, text, kind, rules, switches, stoks):
-    """kind = 'text' or 'binary' (the joined strings of an ELF or PE file)."""
+def scan_blob(rep, rel, text, kind, rules, switches, stoks, sha=None):
+    """kind = 'text' or 'binary' (the joined strings of an ELF or PE file). sha = the sha256 of a text file's bytes
+    (only those can match an @shape-allow row)."""
     t = masked(text, rules, switches)
     base_ext = os.path.splitext(rel)[1]
     for c in rules.cats:
@@ -311,8 +376,10 @@ def scan_blob(rep, rel, text, kind, rules, switches, stoks):
     for m in PLUGIN_MODULE_RX.finditer(text):
         rep.add(PLUGIN_CAT, rel, m.group(0))
     for name, rx in SECRET_SHAPES:
+        ok = sha is not None and any(n == name and h == sha and any(fnmatch.fnmatch(rel, g) for g in gl)
+                                     for n, h, gl in rules.shape_allow)
         for _ in rx.finditer(text):
-            rep.add(name, rel, None, secret=True)
+            rep.add(name, rel, None, secret=True, warn=ok)
     for src in secret_hits(text, stoks):
         if any(rx.search(src) and any(fnmatch.fnmatch(rel, g) for g in gl) for rx, gl in rules.secrets_allow):
             continue
@@ -488,6 +555,312 @@ def classify(path):
     return "text"
 
 
+# ------------------------------------------------------------------------------------------------ GGUF metadata
+GGUF_MAGIC = b"GGUF"
+GGUF_CAT = "gguf-meta"
+GGUF_OURS_DEFAULT = r"(?i)\s*(PXA|PXA Network|PXQ)\s*"      # names us: a FULLMATCH of this allow-list, never a substring
+_GGUF = {"ours": re.compile(GGUF_OURS_DEFAULT), "upstream": None, "exempt": None}   # main(): ours from --gguf-ours
+# exact notes our own tools write (examples/quantize/quantize.cpp, when the PXQ tiers ignore an offered imatrix): no maker
+GGUF_OWN_NOTES = {"quantize.imatrix.ignored_by": ("pxq-tiers (PXA_PXQ_IMX unset)",)}      # byte for byte
+# our model name / description: 'PXA ' at byte 0 (case-sensitive, nothing stripped), with no '/' (so no '://'), no 'www.'
+# and no domain-like token: a dot (or an IDNA dot look-alike) then 2+ letters that end the token (evil.com, x.io,
+# mirror.example.org, EVIL.COM:8080, .xn-- punycode); digit labels such as 3.8 or v4.0.1 never match
+GGUF_PXA_NAMED = ("general.name", "general.description")
+GGUF_DOMAIN_RX = re.compile(r"[.\u3002\uff0e\uff61](?:xn--[\w-]+|[^\W\d_]{2,}(?![\w-]))", re.I)
+GGUF_FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}   # value type -> bytes
+GGUF_STRING, GGUF_ARRAY = 8, 9
+GGUF_MAX_STR = 64 << 20         # one key or string
+GGUF_MAX_ARRAY = 10 ** 8        # elements of one array
+GGUF_MAX_KV = 10 ** 6
+GGUF_MAX_WALK = 5 * 10 ** 6     # keys + string / nested-array elements walked per file (fixed-size arrays are seeked)
+GGUF_MAX_NEST = 8               # arrays of arrays
+GGUF_MAX_HEADER = 512 << 20     # header bytes read per file, at most
+GGUF_MAX_KEPT = 4096            # strings of the checked keys decoded per file (attribution ones kept to the end) ...
+GGUF_MAX_KEPT_CHARS = 1 << 20   # ... and their characters
+GGUF_MAX_BASE = 256             # declared base model repo URLs per file
+# attribution keys (.match on the lower-cased key); general.source.doi / .uuid are identifiers, never a maker's name
+GGUF_ATTRIB_RX = re.compile(r"general\.(?:repo_url|url|author|homepage|license\.link|organization|description|name)\Z"
+                            r"|general\.source(?!\.(?:doi|uuid)\Z)")
+GGUF_BASE_URL_KEY_RX = re.compile(r"general\.base_model\.[0-9]+\.repo_url\Z")
+# a declared base repo URL that may name an upstream: https, huggingface.co or github.com (no userinfo, no port), a plain path
+GGUF_UPSTREAM_URL_RX = re.compile(r"https://(?:huggingface\.co|github\.com)/([A-Za-z0-9][A-Za-z0-9._-]*)(?:/[A-Za-z0-9._-]+)*/?",
+                                  re.I)
+GGUF_UPSTREAM_BAD = ("..", "\\", "%", "?", "#")
+GGUF_UPSTREAM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-scan-upstream-orgs.txt")
+# upstream test GGUFs exempt from check 5 by exact sha256 + basename ('<sha256>  <repo-relative path>' lines)
+GGUF_EXEMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-scan-gguf-exempt.txt")
+GGUF_EXEMPT_RX = re.compile(r"([0-9a-f]{64}) [ *]([^/\s][^\\]*)")
+GGUF_ORG_RX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+class GGUFError(Exception):
+    pass
+
+
+def gguf_upstream_orgs():
+    """The upstream allow-list, lower-cased: GGUF_UPSTREAM_FILE next to this script, one org per line, '#' comments
+    (the maintainers review it). Missing, unreadable, malformed or empty: the gate cannot run (exit 3)."""
+    if _GGUF["upstream"] is None:
+        name = os.path.basename(GGUF_UPSTREAM_FILE)
+        try:
+            with open(GGUF_UPSTREAM_FILE, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except (OSError, UnicodeDecodeError) as e:
+            raise GateError("the upstream org allow-list %s is unreadable (%s): the gate fails closed" % (name, type(e).__name__))
+        orgs = set()
+        for n, line in enumerate(lines, 1):
+            line = line.split("#", 1)[0].strip()
+            if line and (not GGUF_ORG_RX.match(line) or ".." in line):
+                raise GateError("%s:%d: not an org name: the gate fails closed" % (name, n))
+            if line:
+                orgs.add(line.lower())
+        if not orgs:
+            raise GateError("the upstream org allow-list %s is empty: the gate fails closed" % name)
+        _GGUF["upstream"] = frozenset(orgs)
+    return _GGUF["upstream"]
+
+
+def gguf_exempt_list():
+    """{basename: {sha256}} of the upstream test GGUFs exempt from check 5: GGUF_EXEMPT_FILE next to this script,
+    '<sha256>  <repo-relative path>' lines (sha256sum format), '#' comments (the maintainers review it). A file is exempt only
+    with exactly that content under that basename; a changed or new one blocks until the list is updated. Missing,
+    unreadable or malformed: the gate cannot run (exit 3)."""
+    if _GGUF["exempt"] is None:
+        name = os.path.basename(GGUF_EXEMPT_FILE)
+        try:
+            with open(GGUF_EXEMPT_FILE, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except (OSError, UnicodeDecodeError) as e:
+            raise GateError("the GGUF exemption list %s is unreadable (%s): the gate fails closed" % (name, type(e).__name__))
+        ex = {}
+        for n, line in enumerate(lines, 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            m = GGUF_EXEMPT_RX.fullmatch(line.rstrip())
+            if not m:
+                raise GateError("%s:%d: not a '<sha256>  <repo-relative path>' line: the gate fails closed" % (name, n))
+            ex.setdefault(os.path.basename(m.group(2)), set()).add(m.group(1))
+        _GGUF["exempt"] = ex
+    return _GGUF["exempt"]
+
+
+def _gguf_exempt(path):
+    """path is a listed upstream test GGUF: its basename is listed and its sha256 is listed for that basename. Only
+    files with gguf-meta hits get here, so ordinary files are never hashed."""
+    shas = gguf_exempt_list().get(os.path.basename(path))
+    if not shas:
+        return False
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return False
+    return h.hexdigest() in shas
+
+
+class _GGUFHeader:
+    """Sequential reads over a GGUF header, never past the end of the file or GGUF_MAX_HEADER. Fixed-size values
+    and arrays of them are skipped by seeking, never parsed (a vocabulary's scores and token types)."""
+
+    def __init__(self, f, size):
+        self.f, self.size, self.pos, self.bo = f, size, 0, "<"
+        self.kept = [GGUF_MAX_KEPT, GGUF_MAX_KEPT_CHARS]       # budget left for decoded strings (strings())
+        self.walk = GGUF_MAX_WALK                               # budget left for keys + walked elements (walked())
+
+    def _room(self, n):
+        if self.pos + n > self.size:
+            raise GGUFError("truncated")
+        if self.pos + n > GGUF_MAX_HEADER:
+            raise GGUFError("header over %d MiB" % (GGUF_MAX_HEADER >> 20))
+
+    def take(self, n):
+        self._room(n)
+        b = self.f.read(n)
+        if len(b) != n:
+            raise GGUFError("truncated")
+        self.pos += n
+        return b
+
+    def skip(self, n):
+        self._room(n)
+        self.f.seek(n, 1)
+        self.pos += n
+
+    def walked(self, n):
+        self.walk -= n
+        if self.walk < 0:
+            raise GGUFError("over %d keys and array elements" % GGUF_MAX_WALK)
+
+    def u32(self):
+        return struct.unpack(self.bo + "I", self.take(4))[0]
+
+    def u64(self):
+        return struct.unpack(self.bo + "Q", self.take(8))[0]
+
+    def strlen(self):
+        n = self.u64()
+        if n > GGUF_MAX_STR:
+            raise GGUFError("string over %d MiB" % (GGUF_MAX_STR >> 20))
+        return n
+
+    def strings(self, t):
+        """The strings in one value of type t (see _gguf_value), decoded within the per-file budget: past
+        GGUF_MAX_KEPT strings or GGUF_MAX_KEPT_CHARS characters the header fails closed."""
+        got = []
+
+        def keep(s):
+            self.kept[0] -= 1
+            self.kept[1] -= len(s)
+            if self.kept[0] < 0 or self.kept[1] < 0:
+                raise GGUFError("checked keys over %d strings or %d MiB" % (GGUF_MAX_KEPT, GGUF_MAX_KEPT_CHARS >> 20))
+            got.append(s)
+        _gguf_value(self, t, keep)
+        return got
+
+
+def _gguf_value(r, t, visit=None, depth=0):
+    """Walk one value of type t: visit(s) gets every string in it (the value itself, or each string element of an
+    array, nested arrays included); without visit the value is skipped. The elements of string and nested arrays are
+    charged to the walk budget up front (a hostile header cannot burn minutes)."""
+    if t in GGUF_FIXED:
+        r.skip(GGUF_FIXED[t])
+    elif t == GGUF_STRING:
+        n = r.strlen()
+        if visit is None:
+            r.skip(n)
+        else:
+            visit(r.take(n).decode("utf-8", "replace"))
+    elif t == GGUF_ARRAY:
+        if depth >= GGUF_MAX_NEST:
+            raise GGUFError("arrays nested too deep")
+        et, n = r.u32(), r.u64()
+        if n > GGUF_MAX_ARRAY:
+            raise GGUFError("array over %d elements" % GGUF_MAX_ARRAY)
+        if et in GGUF_FIXED:
+            r.skip(n * GGUF_FIXED[et])
+        elif et in (GGUF_STRING, GGUF_ARRAY):
+            r.walked(n)
+            for _ in range(n):
+                _gguf_value(r, et, visit, depth + 1)
+        else:
+            raise GGUFError("unknown value type")
+    else:
+        raise GGUFError("unknown value type")
+
+
+def _gguf_upstream_url(u, upstream):
+    """u (a stripped general.base_model.N.repo_url) may name the base model: https on huggingface.co or github.com,
+    no userinfo or port, none of '..', '\\', '%', '?', '#', and its org (the first path segment) on the upstream list."""
+    m = GGUF_UPSTREAM_URL_RX.fullmatch(u)
+    return bool(m) and not any(b in u for b in GGUF_UPSTREAM_BAD) and m.group(1).lower() in upstream
+
+
+def _gguf_key(key):
+    """A key as printed: control and format characters (Unicode category C*) removed, at most 80 characters."""
+    return "".join(c for c in key if not unicodedata.category(c).startswith("C"))[:80]
+
+
+def _gguf_hit(key, base=False):
+    return "%s: value %s" % (_gguf_key(key), "names neither us nor an allow-listed upstream" if base else "does not name us")
+
+
+def gguf_meta_hits(path):
+    """The gguf-meta hits of one file (see _gguf_meta_walk); none for a listed upstream test GGUF (gguf_exempt_list:
+    exact sha256 and basename)."""
+    out = _gguf_meta_walk(path)
+    return [] if out and _gguf_exempt(path) else out
+
+
+def _gguf_meta_walk(path):
+    """The gguf-meta hits of one file, from its header KV section only ([] for a file without the GGUF magic, a short
+    one included). A hit names the KEY, never the value:
+      general.quantized_by that is not a string naming us (absent or empty passes by design: it names nobody);
+      a quantize.imatrix.* key holding a string that does not name us;
+      an attribution key (GGUF_ATTRIB_RX) holding a string that is not us, not an allow-listed upstream org (exact,
+      case-insensitive) and not EXACTLY a declared base repo URL that _gguf_upstream_url accepts (decided after the
+      walk: the base model keys may come later);
+      a file that cannot be read, or a header that does not parse or is over the bounds (fail closed).
+    Us = a fullmatch of _GGUF["ours"]; one of our own tools' notes under its key, byte for byte (GGUF_OWN_NOTES); a
+    general.name / general.description that is 'PXA ' + text with no '/', 'www.' or domain (GGUF_PXA_NAMED)."""
+    try:
+        with open(path, "rb", buffering=0) as f:
+            if f.read(4) != GGUF_MAGIC:
+                return []
+    except OSError:
+        return ["GGUF header unreadable (file not readable)"]       # it may be a GGUF: block
+    out, ours = [], _GGUF["ours"]
+    attrib, bases = [], []
+
+    def foreign(lk, s):                               # names somebody, and not us
+        if s in GGUF_OWN_NOTES.get(lk, ()):
+            return False
+        if lk in GGUF_PXA_NAMED and s.startswith("PXA ") and "/" not in s and "www." not in s.lower() \
+                and not GGUF_DOMAIN_RX.search(s):
+            return False
+        s = s.strip()
+        return bool(s) and not ours.fullmatch(s)
+
+    try:
+        with open(path, "rb", buffering=1 << 20) as f:
+            r = _GGUFHeader(f, os.fstat(f.fileno()).st_size)
+            ver = r.take(8)[4:]
+            r.bo = next((bo for bo in "<>" if struct.unpack(bo + "I", ver)[0] in (2, 3)), None)
+            if r.bo is None:
+                raise GGUFError("unsupported version")
+            r.u64()                                   # n_tensors: the tensor infos follow the KVs, never read
+            n_kv = r.u64()
+            if n_kv > GGUF_MAX_KV:
+                raise GGUFError("over %d keys" % GGUF_MAX_KV)
+            for _ in range(n_kv):
+                r.walked(1)
+                key = r.take(r.strlen()).decode("utf-8", "replace")
+                t, lk = r.u32(), key.lower()
+                if lk == "general.quantized_by" or lk.startswith("quantize.imatrix."):
+                    if any(foreign(lk, s) for s in r.strings(t)) or (lk == "general.quantized_by" and t != GGUF_STRING):
+                        out.append(_gguf_hit(key))
+                elif GGUF_ATTRIB_RX.match(lk):
+                    vals = [s.strip() for s in r.strings(t) if foreign(lk, s)]
+                    if vals:
+                        attrib.append((key, vals))
+                elif GGUF_BASE_URL_KEY_RX.match(lk):
+                    bases += [s.strip() for s in r.strings(t)]
+                    if len(bases) > GGUF_MAX_BASE:
+                        raise GGUFError("over %d base model repo URLs" % GGUF_MAX_BASE)
+                else:
+                    _gguf_value(r, t)
+    except GGUFError as e:
+        return out + ["GGUF header unreadable (%s)" % e]
+    except OSError:
+        return out + ["GGUF header unreadable (read error)"]
+    if attrib:
+        upstream = gguf_upstream_orgs()
+        good = {u for u in bases if _gguf_upstream_url(u, upstream)}
+        for key, vals in attrib:
+            if not all(v in good or v.lower() in upstream for v in vals):
+                out.append(_gguf_hit(key, base=True))
+    return out
+
+
+def make_gguf_sample(kvs):
+    """A minimal GGUF v3 header (self-test): 0 tensors; kvs = [(key, value)], str -> string, int -> u32,
+    a list -> array of strings."""
+    def s(x):
+        b = x.encode("utf-8")
+        return struct.pack("<Q", len(b)) + b
+    out = GGUF_MAGIC + struct.pack("<IQQ", 3, 0, len(kvs))
+    for k, v in kvs:
+        if isinstance(v, str):
+            val = struct.pack("<I", GGUF_STRING) + s(v)
+        elif isinstance(v, int):
+            val = struct.pack("<II", 4, v)
+        else:
+            val = struct.pack("<IIQ", GGUF_ARRAY, GGUF_STRING, len(v)) + b"".join(s(x) for x in v)
+        out += s(k) + val
+    return out + b"\0" * 32
+
+
 def documented_switches(root, rules):
     sw = set(rules.allow_switch)
     for dp, _, fs in os.walk(root):
@@ -539,6 +912,13 @@ def scan_tree(root, rep, rules, stoks, only=None, prefix="", depth=0, outer_swit
             p = os.path.join(dp, f)
             rel = prefix + os.path.relpath(p, root)
             if only is not None and not only(rel):
+                # an image's skip lists (base OS paths, dpkg-owned files) never hide a GGUF: its header is checked
+                try:
+                    if stat.S_ISREG(os.lstat(p).st_mode):
+                        for d in gguf_meta_hits(p):
+                            rep.add(GGUF_CAT, rel, d)
+                except OSError:
+                    pass
                 continue
             try:
                 st = os.lstat(p)
@@ -556,6 +936,8 @@ def scan_tree(root, rep, rules, stoks, only=None, prefix="", depth=0, outer_swit
             if pn:
                 rep.add(PLUGIN_CAT, rel, pn)
             k = classify(p)
+            for d in gguf_meta_hits(p):               # check 5: any file with the GGUF magic, whatever its name
+                rep.add(GGUF_CAT, rel, d)
             if k != "text" and zip_has_plugin(p):
                 rep.add(PLUGIN_CAT, rel, "zip with a plugin manifest")
             if k != "text":
@@ -586,7 +968,9 @@ def scan_tree(root, rep, rules, stoks, only=None, prefix="", depth=0, outer_swit
                     rep.add("oversize-text", rel, None, warn=True)
                     continue
                 rep.n_text += 1
-                scan_blob(rep, rel, open(p, "rb").read().decode("utf-8", "replace"), "text", rules, switches, stoks)
+                raw = open(p, "rb").read()
+                scan_blob(rep, rel, raw.decode("utf-8", "replace"), "text", rules, switches, stoks,
+                          sha=hashlib.sha256(raw).hexdigest())
                 if re.search(r"\.(?:tar|tgz|gz|zip|whl|xz|bz2|7z)$", f):
                     rep.add("nested-archive", rel, f, warn=True)
             else:
@@ -1207,9 +1591,24 @@ def self_test(rules, work):
         if nk is not None:
             open(os.path.join(d, "o2"), "wb").write(nk)
             onefile.append("o2")
+        # GGUF metadata (check 5): a foreign quantizer, calibration set and repo URL must be caught; a clean header
+        # whose repo URL is exactly its declared base repo URL (an org on the upstream list) must not
+        base_url = "https://huggingface.co/%s/selftest-model" % sorted(gguf_upstream_orgs())[0]
+        gguf_base = [("general.architecture", "llama"), ("tokenizer.ggml.tokens", ["<s>", "a", "b"]),
+                     ("quantize.imatrix.chunks_count", 8), ("general.base_model.0.repo_url", base_url)]
+        open(os.path.join(d, "g1.gguf"), "wb").write(make_gguf_sample(gguf_base + [
+            ("general.quantized_by", "selftest-other-quantizer"), ("quantize.imatrix.dataset", "selftest-other-set"),
+            ("general.repo_url", "https://huggingface.co/selftest-other-quantizer/selftest-model")]))
+        open(os.path.join(d, "g2.gguf"), "wb").write(make_gguf_sample(gguf_base + [("general.repo_url", base_url)]))
         rep = Report("selftest")
         scan_tree(d, rep, rules, {})
         bad = []
+        gm = rep.hits.get(GGUF_CAT, {})
+        if set(gm.get("g1.gguf", (0, []))[1]) != {_gguf_hit("general.quantized_by"), _gguf_hit("quantize.imatrix.dataset"),
+                                                  _gguf_hit("general.repo_url", base=True)}:
+            bad.append("%s (GGUF sample missed)" % GGUF_CAT)
+        if "g2.gguf" in gm:
+            bad.append("%s (clean GGUF sample hit)" % GGUF_CAT)
         for i, (cat, s) in enumerate(samples):
             c = cats.get(cat)
             if (c is None or "text" in c["scope"]) and names[i] not in rep.hits.get(cat, {}):
@@ -1270,6 +1669,415 @@ def plugin_self_test(work, rules, pe_stub):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ------------------------------------------------------------------------------------------------ check 6: closed-lib
+# Owner order 2026-11-01: every speed mechanism added after public v4.0.1 lives in the closed PXQN library
+# (libggml-pxqn.so / ggml-pxqn.dll); the open tree gets only the versioned hook plus a plain fallback. This check diffs the
+# tree about to be pushed publicly against the public baseline and names every added speed mechanism (module doc, check 6).
+CL_HERE = os.path.dirname(os.path.abspath(__file__))
+CL_ALLOW_FILE = os.path.join(CL_HERE, "release-scan-closedlib-allow.txt")
+CL_CLOSED_FILE = os.path.join(CL_HERE, "pxa-closed-files.txt")
+CL_MARKER = "PXA_CLOSED_HOOK"
+CL_MARKER_LINES = 40
+CL_CFAMILY = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cuh", ".inc", ".inl", ".metal", ".comp",
+              ".cl", ".m", ".mm")
+CL_CUDA_EXT = (".cu", ".cuh")
+# the versioned hook: the closed library's table + loader (C) and the CUDA forward table + its open forwards
+CL_HOOK_PATHS = ("ggml/src/ggml-pxqn-api.h", "ggml/src/ggml-pxqn-loader.cpp", "ggml/src/ggml-cuda/pxa/pxqn-api.cuh",
+                 "ggml/src/ggml-cuda/pxa/pxqn-stub.cu", "ggml/src/win-compat/ggml-pxqn.def")
+CL_DOC_GLOBS = ("docs/*", "*/docs/*", "common/pxa-lever-catalog.inc")      # the catalog = the public switch list (generated)
+CL_TEST_GLOBS = ("tests/*", "*/tests/*", "test-*", "*/test-*", "test_*", "*/test_*", "*_test.*", "*-test.*",
+                 "*/testdata/*")
+CL_ENGINE_DIRS = ("src/", "common/", "ggml/", "include/", "examples/", "tools/server/")
+# speed paths: any added code there is a mechanism (outside the hook files)
+CL_SPEED_GLOBS = ("ggml/src/ggml-cuda/*", "ggml/src/ggml-cuda.cu", "ggml/src/ggml-cpu/*", "ggml/src/ggml-hip/*",
+                  "ggml/src/ggml-musa/*", "common/pxa-registry.cpp", "common/speculative*")
+CL_SPEED_TOKENS = frozenset(("spec", "speculative", "draft", "mtp", "xcache", "snapshot", "snapshots", "snapbank", "tune",
+                             "tuning", "tunes", "overdrive", "tierpipe", "verify", "autoconfig"))
+# a core engine file (C-family under CL_ENGINE_DIRS, not a speed path): an added hunk is a mechanism when its code says so
+CL_SPEED_WORDS = re.compile(r"(?i)(draft|mtp|specul|verify|xcache|snapshot|snapbank|\btun(?:e|ing)|overdrive|tierpipe|"
+                            r"__global__|<<<|getenv|pxqn|\bfused?\b|gemv|mmvq|lm_head|autoconfig)")
+CL_LEVER_LIT = re.compile(r'"((?:PXA_|GGML_PXA|GGML_CUDA_)[A-Z0-9_]*[A-Z0-9])"')
+CL_LEVER_NAME = r"(PXA_|GGML_PXA|GGML_CUDA_)[A-Z0-9_]*[A-Z0-9]"
+CL_IDENT_CALL = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+CL_VERSION_DEF = re.compile(r"#\s*define\s+\w*VERSION\w*\s")
+CL_CATS = ("new-cuda-file", "new-kernel", "new-lever", "speed-path-code", "closed-path-present")
+CL_CAT_WHY = {
+    "new-cuda-file": "(a) a new CUDA source file",
+    "new-kernel": "(a) a new __global__ kernel",
+    "new-lever": "(b) a new PXA_* / GGML_PXA* / GGML_CUDA_* switch name",
+    "speed-path-code": "(c) new code in a speed path outside the versioned hook",
+    "closed-path-present": "a closed path (pxa-closed-files.txt) in the public tree",
+}
+
+
+def _cl_git(repo, *args, ok=(0,), binary=False):
+    p = subprocess.run(["git", "-C", repo, "-c", "core.quotepath=off"] + list(args), capture_output=True)
+    if p.returncode not in ok:
+        raise GateError("git %s failed (rc %d): %s" % (" ".join(args[:3]), p.returncode,
+                                                         p.stderr.decode("utf-8", "replace").strip()[:300]))
+    return p.stdout if binary else p.stdout.decode("utf-8", "replace")
+
+
+def _cl_match(path, globs):
+    return any(fnmatch.fnmatchcase(path, g) for g in globs)
+
+
+def _cl_is_code(line):
+    s = line.strip()
+    return bool(s) and not s.startswith(("//", "/*", "*", "*/"))
+
+
+def _cl_code_part(line):
+    """The line without a trailing // comment (naive: a // inside a string literal also cuts; good enough for the check)."""
+    i = line.find("//")
+    return line if i < 0 else line[:i]
+
+
+def cl_load_list(path, what):
+    if not os.path.isfile(path):
+        raise GateError("the %s %s does not exist: check 6 fails closed" % (what, path))
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def cl_closed_match(path, closed):
+    for e in closed:
+        e2 = e.rstrip("/")
+        if path == e2 or path.startswith(e2 + "/") or (any(c in e2 for c in "*?[") and fnmatch.fnmatchcase(path, e2)):
+            return True
+    return False
+
+
+def cl_load_allow(path):
+    """'<kind>:<value> | <reason> | <approver>' per line; kind path (fnmatch glob, repo-relative: every hit in those files),
+    sym (a kernel or switch name: its new-kernel / new-lever hits) or hunk (<path>:<sha256>, cl_hunk_sha: that one
+    speed-path-code hunk while its code lines stay the same). Anything else stops the check (exit 3)."""
+    out = {"path": [], "sym": set(), "hunk": set()}
+    for i, ln in enumerate(cl_load_list(path, "allowlist"), 1):
+        parts = [p.strip() for p in ln.split("|")]
+        if len(parts) != 3 or not all(parts) or ":" not in parts[0]:
+            raise GateError("allowlist %s: entry %d is not '<path|sym>:<value> | <reason> | <approver>'" % (path, i))
+        kind, val = parts[0].split(":", 1)
+        kind, val = kind.strip(), val.strip()
+        if kind not in ("path", "sym", "hunk") or not val:
+            raise GateError("allowlist %s: entry %d: unknown kind %r (path, sym or hunk)" % (path, i, kind))
+        if kind == "hunk":
+            hp, _, hs = val.rpartition(":")
+            if not hp or not re.fullmatch(r"[0-9a-f]{64}", hs):
+                raise GateError("allowlist %s: entry %d: hunk entry is not hunk:<path>:<sha256, 64 lowercase hex>" % (path, i))
+            out["hunk"].add((hp, hs))
+        elif kind == "path":
+            out["path"].append(val)
+        else:
+            out["sym"].add(val)
+    return out
+
+
+def cl_parse_diff(text):
+    """{path: [(added [(new_lineno, text)], removed [text]), ...]}: the hunks of a -U0 diff."""
+    files, cur, ln, hunk = {}, None, 0, None
+    for line in text.split("\n"):
+        if line.startswith("diff --git "):
+            cur = None
+        elif line.startswith("+++ "):
+            p = line[4:]
+            cur = None if p == "/dev/null" else (p[2:] if p.startswith("b/") else p)
+            if cur is not None:
+                files.setdefault(cur, [])
+        elif line.startswith("@@ ") and cur is not None:
+            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            ln = int(m.group(1)) if m else 0
+            hunk = ([], [])
+            files[cur].append(hunk)
+        elif cur is not None and hunk is not None and line.startswith("+"):
+            hunk[0].append((ln, line[1:]))
+            ln += 1
+        elif cur is not None and hunk is not None and line.startswith("-") and not line.startswith("--- "):
+            hunk[1].append(line[1:])
+    return files
+
+
+CL_EVID = re.compile(r'(\bevidence\s*=\s*)"(?:[^"\\\n]|\\.)*"')   # scripts/pxa-public-scrub.py's EVID rule
+
+
+def cl_scrub_only(added, removed):
+    """True when a hunk only changes what the public export scrub empties (evidence ids): the exported line is the old one."""
+    if not added or len(added) != len(removed):
+        return False
+    return all(CL_EVID.sub(r'\1""', t) == CL_EVID.sub(r'\1""', r) for (_, t), r in zip(added, removed))
+
+
+def cl_hunk_sha(code_lines):
+    """The id of an added hunk for a hunk: allowlist entry: sha256 over its code lines (blank and comment-only lines are
+    already dropped), each stripped of surrounding whitespace, joined by '\\n'. Any code change re-opens the hunk."""
+    return hashlib.sha256("\n".join(t.strip() for t in code_lines).encode("utf-8")).hexdigest()
+
+
+def _cl_blob_sha(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+class ClosedLibScan:
+    def __init__(self, repo, base, closed, allow, cand_ref=None, cand_dir=None):
+        self.repo, self.base, self.closed, self.allow = repo, base, closed, allow
+        self.cand_ref, self.cand_dir = cand_ref, cand_dir
+        self.hits, self.warns, self.allowed = [], [], 0
+        self.closed_changed, self.closed_levers = [], set()
+        self.n_files = 0
+        self._marker = {}
+
+    # -- candidate access
+    def cand_text(self, path):
+        if self.cand_dir:
+            with open(os.path.join(self.cand_dir, path), "rb") as f:
+                return f.read().decode("utf-8", "replace")
+        return _cl_git(self.repo, "show", "%s:%s" % (self.cand_ref, path))
+
+    def is_hook(self, path):
+        if path in CL_HOOK_PATHS:
+            return True
+        if path not in self._marker:
+            head = "\n".join(self.cand_text(path).split("\n")[:CL_MARKER_LINES])
+            self._marker[path] = CL_MARKER in head
+        return self._marker[path]
+
+    # -- the added lines per file, both candidate kinds
+    def changes(self):
+        """[(path, status 'A'|'M', hunks [(added [(lineno, text)], removed [text])])] of the C-family files."""
+        out = []
+        if self.cand_ref:
+            st = _cl_git(self.repo, "diff", "--name-status", "--no-renames", "-z", self.base, self.cand_ref)
+            toks = st.split("\0")
+            status = {}
+            i = 0
+            while i + 1 < len(toks):
+                status[toks[i + 1]] = toks[i][:1]
+                i += 2
+            cpaths = [p for p, s in status.items() if s in "AM" and p.lower().endswith(CL_CFAMILY)]
+            self.closed_changed = sorted(p for p, s in status.items() if s in "AM" and cl_closed_match(p, self.closed))
+            diff = _cl_git(self.repo, "diff", "-U0", "--no-color", "--no-renames", "--no-ext-diff", "--src-prefix=a/",
+                           "--dst-prefix=b/", self.base, self.cand_ref, "--", *["*" + e for e in CL_CFAMILY])
+            added = cl_parse_diff(diff)
+            for p in sorted(cpaths):
+                out.append((p, status[p], added.get(p, [])))
+            return out
+        base_blobs = {}
+        for rec in _cl_git(self.repo, "ls-tree", "-r", "-z", self.base).split("\0"):
+            if "\t" in rec:
+                meta, p = rec.split("\t", 1)
+                parts = meta.split()
+                if len(parts) == 3 and parts[1] == "blob":
+                    base_blobs[p] = parts[2]
+        tmpd = tempfile.mkdtemp(prefix="rs-closedlib-")
+        try:
+            for dp, dns, fns in os.walk(self.cand_dir):
+                dns[:] = sorted(d for d in dns if d != ".git")
+                for fn in sorted(fns):
+                    full = os.path.join(dp, fn)
+                    rel = os.path.relpath(full, self.cand_dir).replace(os.sep, "/")
+                    if os.path.islink(full) or not os.path.isfile(full):
+                        continue
+                    if cl_closed_match(rel, self.closed):
+                        self.closed_changed.append(rel)
+                        continue
+                    if not rel.lower().endswith(CL_CFAMILY):
+                        continue
+                    with open(full, "rb") as f:
+                        data = f.read()
+                    bsha = base_blobs.get(rel)
+                    if bsha is not None and bsha == _cl_blob_sha(data):
+                        continue
+                    if bsha is None:
+                        lines = data.decode("utf-8", "replace").split("\n")
+                        if lines and lines[-1] == "":
+                            lines.pop()
+                        out.append((rel, "A", [([(i + 1, t) for i, t in enumerate(lines)], [])]))
+                        continue
+                    bfile = os.path.join(tmpd, "base")
+                    with open(bfile, "wb") as f:
+                        f.write(_cl_git(self.repo, "cat-file", "blob", bsha, binary=True))
+                    d = _cl_git(self.repo, "diff", "--no-index", "-U0", "--no-color", "--no-ext-diff", "--", bfile, full,
+                                ok=(0, 1))
+                    added = cl_parse_diff(d)
+                    out.append((rel, "M", next(iter(added.values()), [])))
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
+        self.closed_changed.sort()
+        return out
+
+    def hit(self, path, line, cat, reason, sym=None, hunk=None):
+        if _cl_match(path, self.allow["path"]) or (sym is not None and sym in self.allow["sym"]) or \
+                (hunk is not None and (path, hunk) in self.allow["hunk"]):
+            self.allowed += 1
+            return
+        self.hits.append({"path": path, "line": line, "category": cat, "reason": reason, "sym": sym, "hunk": hunk})
+
+    def run(self):
+        base_names = set(_cl_git(self.repo, "grep", "-h", "-o", "-I", "-E", CL_LEVER_NAME, self.base, ok=(0, 1)).split())
+        hook_changed, hook_versioned = [], False
+        for path, status, hunks in self.changes():
+            hunks = [h for h in hunks if not cl_scrub_only(*h)]
+            added = [x for h in hunks for x in h[0]]
+            if cl_closed_match(path, self.closed):
+                if self.cand_ref:          # the export omits it: list the switch names there for the audit, never a hit
+                    for _, t in added:
+                        for m in CL_LEVER_LIT.finditer(t):
+                            if m.group(1) not in base_names:
+                                self.closed_levers.add(m.group(1))
+                continue
+            if _cl_match(path, CL_DOC_GLOBS) or _cl_match(path, CL_TEST_GLOBS):
+                continue
+            self.n_files += 1
+            hook = self.is_hook(path)
+            if status == "A" and path.lower().endswith(CL_CUDA_EXT) and not hook:
+                self.hit(path, 1, "new-cuda-file", "new CUDA source file (%d lines)" % len(added))
+            seen_lever = set()
+            for ln, t in added:
+                if not _cl_is_code(t):
+                    continue
+                code = _cl_code_part(t)
+                if "__global__" in code:
+                    after = code.split("__global__", 1)[1]
+                    names = [n for n in CL_IDENT_CALL.findall(after) if not n.startswith("__")]
+                    name = names[0] if names else "?"
+                    self.hit(path, ln, "new-kernel", "new __global__ kernel %s" % name, sym=name)
+                for m in CL_LEVER_LIT.finditer(code):
+                    n = m.group(1)
+                    if n not in base_names and n not in seen_lever:
+                        seen_lever.add(n)
+                        self.hit(path, ln, "new-lever", "new switch name %s (not in the baseline tree)" % n, sym=n)
+            if hook:
+                if any(_cl_is_code(t) for _, t in added):
+                    hook_changed.append(path)
+                    hook_versioned = hook_versioned or any(CL_VERSION_DEF.search(t) for _, t in added)
+                continue
+            speed_why = None
+            if _cl_match(path, CL_SPEED_GLOBS):
+                speed_why = "speed path"
+            elif path.startswith(CL_ENGINE_DIRS):
+                toks = set(re.split(r"[-_.]", os.path.basename(path).lower()))
+                hit_t = sorted(toks & CL_SPEED_TOKENS)
+                if hit_t:
+                    speed_why = "speed path (name: %s)" % hit_t[0]
+                else:
+                    speed_why = "core"
+            if speed_why is None:
+                continue
+            for hunk, _ in hunks:
+                code = [(ln, t) for ln, t in hunk if _cl_is_code(t)]
+                if not code:
+                    continue
+                if speed_why == "core":
+                    # a line that only reads allowlisted switch names (sym:) carries no speed word of its own
+                    words = [CL_SPEED_WORDS.search(_cl_code_part(t)) for _, t in code
+                             if not (CL_LEVER_LIT.search(_cl_code_part(t)) and
+                                     all(n in self.allow["sym"] for n in CL_LEVER_LIT.findall(_cl_code_part(t))))]
+                    words = [w.group(1) for w in words if w]
+                    if not words:
+                        continue
+                    self.hit(path, code[0][0], "speed-path-code",
+                             "%d code line(s) in a core file, speed word '%s'" % (len(code), words[0]),
+                             hunk=cl_hunk_sha([t for _, t in code]))
+                else:
+                    self.hit(path, code[0][0], "speed-path-code", "%d code line(s) in a %s" % (len(code), speed_why),
+                             hunk=cl_hunk_sha([t for _, t in code]))
+        if self.cand_dir:
+            for p in self.closed_changed:
+                self.hit(p, 1, "closed-path-present", "closed path (scripts/pxa-closed-files.txt) in the public tree")
+        if hook_changed and not hook_versioned:
+            self.warns.append("hook file(s) changed without a *VERSION* #define bump (fine for an optional dlsym symbol "
+                              "with a NULL fallback; otherwise bump the table version): " + ", ".join(hook_changed))
+        return self
+
+
+def closedlib_main(argv):
+    ap = argparse.ArgumentParser(prog="release-scan.py --closedlib",
+                                 description="check 6, closed-lib: no speed mechanism added after the public baseline "
+                                             "(exit 0 clean, 2 hits, 3 cannot run; --report always 0 unless 3)")
+    ap.add_argument("--closedlib", metavar="BASE", required=True, help="the public baseline ref (e.g. the public v4.0.1 tag)")
+    ap.add_argument("tree", nargs="?", help="the exported tree about to be pushed (a directory)")
+    ap.add_argument("--ref", help="the candidate as a git ref in --repo instead of a directory")
+    ap.add_argument("--repo", default=None, help="git repository holding BASE (and --ref); default: this script's repo")
+    ap.add_argument("--allow", default=CL_ALLOW_FILE, help="reviewed allowlist (default %(default)s)")
+    ap.add_argument("--closed-list", default=None,
+                    help="closed paths the export omits (default: the candidate's scripts/pxa-closed-files.txt, else "
+                         "this script's copy)")
+    ap.add_argument("--report", action="store_true", help="list the hits without failing (audit)")
+    ap.add_argument("--json", help="write the hits (path, line, category, reason) to this file")
+    a = ap.parse_args(argv)
+    try:
+        if bool(a.tree) == bool(a.ref):
+            raise GateError("give exactly one candidate: a directory or --ref REF")
+        repo = a.repo
+        if not repo:
+            p = subprocess.run(["git", "-C", CL_HERE, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+            repo = p.stdout.strip() if p.returncode == 0 else os.getcwd()
+        base_sha = _cl_git(repo, "rev-parse", "--verify", "-q", a.closedlib + "^{commit}").strip()
+        cand_ref = cand_dir = None
+        if a.ref:
+            cand_ref = _cl_git(repo, "rev-parse", "--verify", "-q", a.ref + "^{commit}").strip()
+        else:
+            cand_dir = os.path.abspath(a.tree)
+            if not os.path.isdir(cand_dir):
+                raise GateError("candidate %s is not a directory" % a.tree)
+        closed_path, closed = a.closed_list, None
+        if not closed_path:
+            if cand_dir and os.path.isfile(os.path.join(cand_dir, "scripts", "pxa-closed-files.txt")):
+                closed_path = os.path.join(cand_dir, "scripts", "pxa-closed-files.txt")
+            elif cand_ref:
+                txt = _cl_git(repo, "show", "%s:scripts/pxa-closed-files.txt" % cand_ref, ok=(0, 128))
+                if txt:
+                    fd, tmp_closed = tempfile.mkstemp(prefix="rs-closed-", suffix=".txt")
+                    with os.fdopen(fd, "w") as f:
+                        f.write(txt)
+                    try:
+                        closed = cl_load_list(tmp_closed, "closed list")
+                    finally:
+                        os.unlink(tmp_closed)
+                    closed_path = "%s:scripts/pxa-closed-files.txt" % a.ref
+            if not closed_path:
+                closed_path = CL_CLOSED_FILE
+        if closed is None:
+            closed = cl_load_list(closed_path, "closed list")
+        allow = cl_load_allow(a.allow)
+        sc = ClosedLibScan(repo, base_sha, closed, allow, cand_ref=cand_ref, cand_dir=cand_dir).run()
+    except GateError as e:
+        print("release-scan: CANNOT RUN check 6 (closed-lib): %s" % e, file=sys.stderr)
+        return 3
+    cand_label = ("%s (%s)" % (a.ref, cand_ref[:12])) if cand_ref else cand_dir
+    print("release-scan check 6 (closed-lib): base %s (%s) -> %s: %d open C-family file(s) changed, %d closed path(s) "
+          "changed, %d allowlisted" % (a.closedlib, base_sha[:12], cand_label, sc.n_files, len(sc.closed_changed),
+                                       sc.allowed))
+    order = {c: i for i, c in enumerate(CL_CATS)}
+    for h in sorted(sc.hits, key=lambda h: (order.get(h["category"], 99), h["path"], h["line"])):
+        print("  %s:%d  %s  %s%s" % (h["path"], h["line"], h["category"], h["reason"],
+                                     "  [hunk:%s:%s]" % (h["path"], h["hunk"]) if h.get("hunk") else ""))
+    counts = {}
+    for h in sc.hits:
+        counts[h["category"]] = counts.get(h["category"], 0) + 1
+    for w in sc.warns:
+        print("  WARN  %s" % w)
+    if sc.closed_levers:
+        print("  NOTE  new switch names inside closed paths (the export omits them; OK): %s"
+              % ", ".join(sorted(sc.closed_levers)))
+    print("  counts: %s" % (", ".join("%s %d" % (c, counts[c]) for c in CL_CATS if c in counts) or "none"))
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump({"base": a.closedlib, "base_sha": base_sha, "candidate": a.ref or cand_dir,
+                       "candidate_sha": cand_ref, "hits": sc.hits, "counts": counts, "warns": sc.warns,
+                       "allowed": sc.allowed, "closed_changed": sc.closed_changed,
+                       "closed_new_levers": sorted(sc.closed_levers)}, f, indent=1, sort_keys=True)
+    if a.report:
+        print("release-scan check 6: REPORT - %d hit(s) listed, not failing" % len(sc.hits))
+        return 0
+    if sc.hits:
+        print("release-scan check 6: FAIL - %d speed mechanism(s) added since %s outside the closed library"
+              % (len(sc.hits), a.closedlib))
+        return 2
+    print("release-scan check 6: PASS - 0 hits")
+    return 0
+
+
 # ------------------------------------------------------------------------------------------------ main
 SECRET_CATS = ("secret-",)
 
@@ -1298,6 +2106,10 @@ def print_report(rep, show):
 
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if any(x == "--closedlib" or x.startswith("--closedlib=") for x in argv):
+        return closedlib_main(argv)               # check 6: a source tree against the public baseline, no block list
     ap = argparse.ArgumentParser(description="release package scan gate (exit 0 clean, 2 blocked, 3 cannot run)")
     ap.add_argument("inputs", nargs="+", help="package directory, package tarball, or docker save archive")
     ap.add_argument("--blocklist", default=os.environ.get("PXA_RELEASE_BLOCKLIST", ""), help="default: $PXA_RELEASE_BLOCKLIST")
@@ -1305,9 +2117,18 @@ def main(argv=None):
     ap.add_argument("--work", default=os.environ.get("TMPDIR", "/tmp"), help="where archives are unpacked (needs ~3x their size)")
     ap.add_argument("--show", type=int, default=8, help="files listed per category")
     ap.add_argument("--jobs", type=int, default=JOBS, help="worker processes for the binaries (default %(default)s)")
+    ap.add_argument("--gguf-ours", default=os.environ.get("PXA_GGUF_OURS") or GGUF_OURS_DEFAULT,
+                    help="regex that names us in GGUF metadata, check 5, as a FULLMATCH (default: $PXA_GGUF_OURS, else "
+                         + GGUF_OURS_DEFAULT + ")")
     a = ap.parse_args(argv)
     _set_jobs(a.jobs)
     try:
+        try:
+            _GGUF["ours"] = re.compile(a.gguf_ours)
+        except re.error as e:
+            raise GateError("--gguf-ours / PXA_GGUF_OURS is not a valid regex (%s): the gate fails closed" % e)
+        gguf_upstream_orgs()                       # the upstream allow-list and the exemption list must load,
+        gguf_exempt_list()                         # or the gate cannot run
         if not a.blocklist:
             raise GateError("PXA_RELEASE_BLOCKLIST is not set: the gate fails closed (no block list, no package)")
         if not os.path.isfile(a.blocklist):

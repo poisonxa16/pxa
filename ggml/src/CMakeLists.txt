@@ -387,6 +387,8 @@ if (GGML_CUDA)
         # Source properties of the closed-library sources (closed tree only; absent from the public tree, which does
         # not compile those sources)
         include(${CMAKE_CURRENT_SOURCE_DIR}/pxqn-closed-props.cmake OPTIONAL)
+        # the closed library's newer sources: out of the glob above, into GGML_SOURCES_PXQN_CUDA (closed tree only)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/pxqn-closed-srcs.cmake OPTIONAL)
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-wmma*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-mma*.cu")
@@ -1649,6 +1651,7 @@ if (PXA_PXQN_CLOSED_SRC)
                         "this static build has no PXQN support")
     else()
         set(_pxqn_srcs pxqn-cpu.c pxqn-cpu-mmv.c pxqn-lib.cpp pxqn-lock.cpp pxqn-recipe.cpp pxqn-spec-select.cpp pxqn-spec-defaults.cpp pxqn-xcache-policy.cpp pxqn-tune.cpp pxqn-xcache-learn.cpp pxqn-xcache-cpupool.cpp pxqn-overdrive.cpp)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/pxqn-closed-srcs.cmake OPTIONAL)   # its newer host sources (closed tree only)
         # the CPU matmul (pxqn-cpu-mmv.c): its AVX2 and baseline copies must produce the same bits (no FMA contraction, ever),
         # and the file is baseline x86-64 whatever the directory-scope ARCH flags say: the AVX2 clone sits behind
         # target("avx2") and a run-time cpuid choice, everything else must run on the oldest x86-64 CPU

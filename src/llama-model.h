@@ -112,6 +112,7 @@ enum e_model {
     MODEL_A13B,
     MODEL_7B_A1B,
     MODEL_8B_A1B,
+    MODEL_24B_A2B,   // PXA LFM port: LFM2.5-24B-A2B
     MODEL_12B_A2_5B,
     MODEL_16B_A1B,
     MODEL_21B_A3B, // Ernie MoE small
@@ -780,6 +781,7 @@ struct llama_model {
     std::string pxa_model_path;                   // the GGUF path (sidecar lookup: <path>.expert-counts.csv)
     std::string pxa_xc_bootstrap_path;            // set when the expert cache found no routing counts: where a startup profile should write them
     std::vector<std::vector<double>> pxa_xc_prior;   // per layer: the static counts the plan was made from (the adaptor's prior), [layer][n_expert] or empty
+    double pxa_xc_learned_tokens = -1;            // the plan's counts are the learned file, counted from these tokens (its .state); -1 = they are not
     // PXA_XCACHE online adaptation state (counters read-back, swap state machine, policy handle); created at the first decode
     // after the load, destroyed with the model. Defined in llama-pxa-xcache.cpp.
     struct pxa_xc_adaptor;

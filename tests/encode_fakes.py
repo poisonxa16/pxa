@@ -111,6 +111,11 @@ def make_engine_dir(d, delay=0.0):
     _launcher(os.path.join(d, "bin", "llama-imatrix"), "llama-imatrix", fake)
     with open(os.path.join(d, "convert_hf_to_gguf.py"), "w") as f:       # run by Python, like the real converter
         f.write("import subprocess, sys\nsys.exit(subprocess.call([sys.executable, %r, 'convert_hf_to_gguf', %r] + sys.argv[1:]))\n" % (TOOLS, fake))
+        # the vision projector registrations of the real converter, as Control reads them (text, never imported)
+        f.write('_VISION = """\n@Model.register("Qwen3VLForConditionalGeneration")\nclass Qwen3VLVisionModel(MmprojModel):\n"""\n')
+        # the vision-side tensor prefixes, as the real converter's VL text classes skip them (Control reads this list too)
+        f.write('_VL = """\n    _vl_skip_prefixes: tuple[str, ...] = (\n        "visual.", "vision_tower.", "vision_model.", "vision.", "mlp1.",'
+                ' "multi_modal_projector.",\n        "connector.", "merger.", "image_newline",\n    )\n"""\n')
     _launcher(os.path.join(d, "bin", "llama-server"), "llama-server", fake)
     return d
 
@@ -301,24 +306,31 @@ class _Base(object):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def serve_range(self, h, data, delay=0.0):
+    def serve_range(self, h, data, delay=0.0, log=None, cr="ok"):
+        """200 with the whole body, or 206 for `Range: bytes=a-` / `bytes=a-b`. log: a list that gets (path, Range header, bytes sent).
+        cr: "ok", "none" (a 206 without Content-Range) or "badend" (a Content-Range whose end is not the one sent)."""
         rng = h.headers.get("Range")
-        start = 0
+        start, end = 0, len(data) - 1
         code = 200
         if rng and rng.startswith("bytes="):
-            start = int(rng[6:].split("-")[0] or 0)
+            a, _, b = rng[6:].partition("-")
+            start = int(a or 0)
+            if b:
+                end = min(end, int(b))
             if start >= len(data):
                 h.send_response(416)
                 h.send_header("Content-Length", "0")
                 h.end_headers()
                 return
             code = 206
-        body = data[start:]
+        body = data[start:end + 1]
+        if log is not None:
+            log.append((h.path, rng, len(body)))
         h.send_response(code)
         h.send_header("Content-Type", "application/octet-stream")
         h.send_header("Content-Length", str(len(body)))
-        if code == 206:
-            h.send_header("Content-Range", "bytes %d-%d/%d" % (start, len(data) - 1, len(data)))
+        if code == 206 and cr != "none":
+            h.send_header("Content-Range", "bytes %d-%d/%d" % (start, end + (1 if cr == "badend" else 0), len(data)))
         h.end_headers()
         try:
             for i in range(0, len(body), 8192):
@@ -330,24 +342,60 @@ class _Base(object):
             pass
 
 
-def safetensors_bytes(n_layers=4, hidden=64, vocab=128, inter=128):
-    """A real (small) safetensors file: a JSON header + zero data, BF16."""
-    shapes = {"model.embed_tokens.weight": [vocab, hidden], "lm_head.weight": [vocab, hidden]}
-    for l in range(n_layers):
+def safetensors_bytes(n_layers=4, hidden=64, vocab=128, inter=128, extra=None, text=True, pattern=False):
+    """A real (small) safetensors file: a JSON header + zero data, BF16. extra: more {name: shape} tensors (a vision tower);
+    text=False leaves the text model out; pattern=True fills every tensor with its own bytes (so a copy can be checked exactly)."""
+    shapes = {"model.embed_tokens.weight": [vocab, hidden], "lm_head.weight": [vocab, hidden]} if text else {}
+    for l in range(n_layers if text else 0):
         for n, s in (("self_attn.q_proj", [hidden, hidden]), ("self_attn.k_proj", [hidden // 2, hidden]), ("self_attn.v_proj", [hidden // 2, hidden]),
                      ("self_attn.o_proj", [hidden, hidden]), ("mlp.gate_proj", [inter, hidden]), ("mlp.up_proj", [inter, hidden]),
                      ("mlp.down_proj", [hidden, inter])):
             shapes["model.layers.%d.%s.weight" % (l, n)] = s
-    hdr, off = {}, 0
-    for k, s in shapes.items():
+    shapes.update(extra or {})
+    hdr, off, data = {}, 0, []
+    for i, (k, s) in enumerate(shapes.items()):
         n = 2
         for d in s:
             n *= d
         hdr[k] = {"dtype": "BF16", "shape": s, "data_offsets": [off, off + n]}
+        data.append(tensor_fill(k, n) if pattern else b"\0" * n)
         off += n
     hb = json.dumps(hdr).encode()
     hb += b" " * ((-len(hb)) % 8)
-    return struct.pack("<Q", len(hb)) + hb + b"\0" * off, sum(_n(s) for s in shapes.values())
+    return struct.pack("<Q", len(hb)) + hb + b"".join(data), sum(_n(s) for s in shapes.values())
+
+
+def tensor_fill(name, n):
+    """n bytes that belong to this tensor name only."""
+    seed = hashlib.sha256(name.encode()).digest()
+    return (seed * (n // len(seed) + 1))[:n]
+
+
+def safetensors_tensors(path):
+    """{name: raw bytes} of a safetensors file; raises ValueError when the header and the data do not agree."""
+    with open(path, "rb") as f:
+        b = f.read()
+    n = struct.unpack("<Q", b[:8])[0]
+    hdr = json.loads(b[8:8 + n])
+    base, out = 8 + n, {}
+    for k, v in hdr.items():
+        if k == "__metadata__":
+            continue
+        a, e = v["data_offsets"]
+        if not (0 <= a <= e <= len(b) - base) or e - a != 2 * _n(v["shape"]):
+            raise ValueError("bad offsets for %s in %s" % (k, path))
+        out[k] = b[base + a:base + e]
+    return out
+
+
+VL_VISION = {"model.visual.patch_embed.proj.weight": [32, 3, 2, 16, 16], "model.visual.blocks.0.attn.qkv.weight": [96, 32],
+             "model.visual.blocks.1.attn.qkv.weight": [96, 32], "model.visual.merger.mlp.0.weight": [128, 128],
+             "model.visual.deepstack_merger_list.0.linear_fc1.weight": [128, 128]}
+
+
+def safetensors_header(b):
+    n = struct.unpack("<Q", b[:8])[0]
+    return {k: v for k, v in json.loads(b[8:8 + n]).items() if k != "__metadata__"}
 
 
 def _n(s):
@@ -369,6 +417,27 @@ def tiny_repo(license="apache-2.0", layers=4, arch="Qwen3ForCausalLM", gated=Fal
     return {"license": license, "files": files, "params": n, "gated": gated, "need_token": False, "redirect": False, "delay": 0.0}
 
 
+def tiny_vl_repo(layers=4, arch="Qwen3VLForConditionalGeneration", sharded=False):
+    """A vision-language repo: the text config under text_config, a vision_config, a preprocessor config. sharded=True splits the
+    weights in two shards (text, vision) with an index, the way large VL checkpoints ship."""
+    st, n = safetensors_bytes(layers)
+    cfg = {"architectures": [arch], "model_type": "qwen3_vl", "text_config": tiny_config(layers, arch=arch),
+           "vision_config": {"model_type": "qwen3_vl", "depth": 2, "hidden_size": 32, "num_heads": 2, "patch_size": 16,
+                             "deepstack_visual_indexes": [0]}}
+    files = {"config.json": json.dumps(cfg).encode(), "tokenizer.json": b"{}",
+             "preprocessor_config.json": json.dumps({"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5]}).encode()}
+    if sharded:                               # shard 1: text only; shard 2: the vision tower and the head, the way real VL shards mix them
+        files["model-00001-of-00002.safetensors"] = st
+        files["model-00002-of-00002.safetensors"], _ = safetensors_bytes(extra=dict(VL_VISION, **{"lm_head.weight": [128, 64]}), text=False,
+                                                                        pattern=True)
+        wm = {k: "model-00001-of-00002.safetensors" for k in safetensors_header(st)}
+        wm.update({k: "model-00002-of-00002.safetensors" for k in list(VL_VISION) + ["lm_head.weight"]})
+        files["model.safetensors.index.json"] = json.dumps({"metadata": {}, "weight_map": wm}).encode()
+    else:
+        files["model.safetensors"], n = safetensors_bytes(layers, extra=VL_VISION, pattern=True)
+    return {"license": "apache-2.0", "files": files, "params": n, "gated": False, "need_token": False, "redirect": False, "delay": 0.0}
+
+
 class FakeHF(_Base):
     """repos: {'org/name': tiny_repo()}. The big file can redirect to a CDN on another port (to prove the token stays home)."""
 
@@ -376,6 +445,7 @@ class FakeHF(_Base):
         _Base.__init__(self)
         self.repos = repos
         self.cdn = cdn
+        self.served = []                      # (path, Range header, bytes sent) of every file served (FakeCDN adds its own)
 
     def handle(self, h, method, body):
         u = urllib.parse.urlparse(h.path)
@@ -405,7 +475,7 @@ class FakeHF(_Base):
                 h.send_header("Content-Length", "0")
                 h.end_headers()
                 return
-            return self.serve_range(h, r["files"][fn], r.get("delay", 0.0))
+            return self.serve_range(h, r["files"][fn], r.get("delay", 0.0), self.served, r.get("cr", "ok"))
         return self.reply(h, 404, {"error": "no route"})
 
 
@@ -420,7 +490,7 @@ class FakeCDN(_Base):
         r = self.hf.repos.get(repo)
         if r is None or fn not in r["files"]:
             return self.reply(h, 404, {"error": "no"})
-        return self.serve_range(h, r["files"][fn], r.get("delay", 0.0))
+        return self.serve_range(h, r["files"][fn], r.get("delay", 0.0), self.hf.served)
 
 
 class FakeLicence(_Base):

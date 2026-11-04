@@ -134,6 +134,13 @@ struct llama_kv_cache {
     // consulted for a recurrent cache (there a cell index IS a sequence id). See llama-kv-index.h.
     llama_kv_seq_index seq_index;
 
+    // PXA_KV_CELL_MAX_UB: memo of the exact cell_max (see llama_kv_cache_cell_max_ub below).
+    // cmax_data == nullptr means "no memo". Mutable: the scan is a const query that refreshes it.
+    mutable uint32_t     cmax_ub    = 0;
+    mutable uint64_t     cmax_epoch = 0;
+    mutable const void * cmax_data  = nullptr;
+    mutable uint32_t     cmax_size  = 0;
+
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)
@@ -306,6 +313,77 @@ struct llama_kv_cache {
         }
     }
 };
+
+// PXA_KV_CELL_MAX_UB (2026-11-03). The exact cell_max walks down from the top of
+// the ring to the first live cell, so its cost is (size - cell_max) cells of 64 bytes: at 3.5k
+// depth in a 262144-cell cache that is ~258k cache lines per decode token (1.2 ms warm, 2.8 ms cold
+// measured on this box), at 128k depth ~0.5-1.5 ms -- all of it on the serial host path between two
+// tokens. The memo below keeps the answer EXACT without a whitelist of insertion sites:
+//   - after every scan it records the answer r, the tag epoch, the cells' storage and size;
+//     at that moment no cell at index >= r is live;
+//   - every edit of a cell's sequence set and every whole-cell copy bumps the tag epoch
+//     (llama_kv_cell), a moved/swapped/resized vector changes data()/size, so a memo whose epoch,
+//     data and size all still match proves NO cell changed since -- r is still an upper bound;
+//   - the one edit that keeps it in sync is the ordinary placement in llama_kv_cache_find_slot,
+//     which marks [head, head + n) live through add_seq only and then raises the bound to
+//     max(r, head + n) (llama_kv_cache_cell_max_widen; only when the memo was in sync right before);
+//   - anything else (seq_rm, seq_cp, defrag, a state read, a checkpoint restore, a second cache's
+//     edit: the epoch is global) misses the memo and pays the full scan, exactly as before.
+// A live cell can only appear above the bound through an edit that does not bump the epoch: a
+// direct `pos` write that brings a NON-EMPTY cell from pos < 0 to pos >= 0. No such cell exists
+// outside the recurrent cache (seq_add/seq_rm clear the set whenever pos drops below 0), and a
+// recurrent cache never uses the memo. Mode 2 cross-checks every memo answer against the full scan
+// and aborts on a mismatch (gate arm). Bit-identical: the answer is the same integer.
+inline uint32_t llama_kv_cells_max_below(const llama_kv_cache & cache, uint32_t start) {
+    for (uint32_t i = start; i > 0; --i) {
+        const llama_kv_cell & cell = cache.cells[i - 1];
+        if (cell.pos >= 0 && !cell.is_empty()) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+inline bool llama_kv_cache_cmax_in_sync(const llama_kv_cache & cache) {
+    return !cache.recurrent && cache.cmax_data != nullptr &&
+           cache.cmax_data == (const void *) cache.cells.data() &&
+           cache.cmax_size == cache.size && cache.size == (uint32_t) cache.cells.size() &&
+           cache.cmax_epoch == llama_kv_tag_epoch() && cache.cmax_ub <= cache.size;
+}
+
+// mode 0: the full scan only (the previous behaviour); 1: memo; 2: memo + full-scan cross-check.
+// `hit` (optional) reports whether the memo answered.
+inline uint32_t llama_kv_cache_cell_max_ub(const llama_kv_cache & cache, int mode, bool * hit = nullptr) {
+    if (hit) *hit = false;
+    if (mode <= 0 || cache.recurrent) {
+        return llama_kv_cells_max_below(cache, cache.size);
+    }
+    const bool sync = llama_kv_cache_cmax_in_sync(cache);
+    const uint32_t r = llama_kv_cells_max_below(cache, sync ? cache.cmax_ub : cache.size);
+    if (mode >= 2 && sync) {
+        const uint32_t full = llama_kv_cells_max_below(cache, cache.size);
+        if (full != r) {
+            fprintf(stderr, "PXA_KV_CELL_MAX_UB=2: memo answered %u, the full scan %u (size %u, bound %u)\n",
+                    r, full, cache.size, cache.cmax_ub);
+            abort();
+        }
+    }
+    if (hit) *hit = sync;
+    cache.cmax_ub    = r;
+    cache.cmax_epoch = llama_kv_tag_epoch();
+    cache.cmax_data  = (const void *) cache.cells.data();
+    cache.cmax_size  = cache.size;
+    return r;
+}
+
+// after a placement of cells [.., hi) through add_seq only; was_sync = in sync right before it
+inline void llama_kv_cache_cell_max_widen(llama_kv_cache & cache, bool was_sync, uint32_t hi) {
+    if (!was_sync) {
+        return;
+    }
+    cache.cmax_ub    = std::max(cache.cmax_ub, std::min(hi, cache.size));
+    cache.cmax_epoch = llama_kv_tag_epoch();
+}
 
 struct llama_control_vector {
     std::vector<struct ggml_tensor *> tensors; // per layer
@@ -812,6 +890,7 @@ struct llama_context {
     // goes away. Only for a single-sequence pure-greedy verify (the rows need the target's own argmax).
     struct llama_context *   pxa_fold_ctx     = nullptr;  // the companion (llama_set_mtp_fold_ctx)
     bool                     pxa_xc_companion = false;    // this ctx has run an MTP op (the speculation companion)
+    bool                     pxa_mtp_keep_graph = false;  // role sched KEEP_GRAPH: keep prev_mtp across decodes (PXA_MTP_GRAPH_REUSE)
     bool                     pxa_fold_req     = false;    // request for the next decode
     bool                     pxa_fold_active  = false;    // this decode builds/uses the fold
     bool                     pxa_fold_valid   = false;    // the last decode produced fold rows

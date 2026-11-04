@@ -36,6 +36,9 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json; charset=utf-8"),
           "/sw.js": ("sw.js", "application/javascript; charset=utf-8"),
           "/pwa.js": ("pwa.js", "application/javascript; charset=utf-8"),
+          # signs the tab in (control-cookie-port-scope): the token from #token= into sessionStorage, the
+          # X-PXA-Token header on every same-origin fetch / EventSource, tickets for frames, scripts and downloads
+          "/auth.js": ("auth.js", "application/javascript; charset=utf-8"),
           "/hosts.html": ("hosts.html", "text/html; charset=utf-8"),
           "/icon-192.png": ("icon-192.png", "image/png"),
           "/icon-512.png": ("icon-512.png", "image/png")}
@@ -999,7 +1002,22 @@ def r_enc_browse(app, body, query):
     return app.encode_call("browse", _q(query, "path"))
 
 
+def r_auth_ticket(app, body, query):
+    """POST /api/auth/ticket {path}: a single-use ticket for ONE GET of that API path within TICKET_TTL_S, for the
+    navigations that cannot carry the X-PXA-Token header (a plugin's sealed frame, a <script src>, a download link,
+    a page in a new tab). Reached only through the token, like every POST (control-cookie-port-scope)."""
+    path, query = (body or {}).get("path"), (body or {}).get("query", "")
+    if not Tickets.path_ok(path):
+        raise Invalid("path must be one API path: /api/..., no query string")
+    if not Tickets.query_ok(query):
+        raise Invalid("query must be the query string the GET will carry (no '?', no '#')")
+    if app.tickets is None or not app.token:
+        return {"ticket": "", "ttl_s": 0}          # the no-token test mode: nothing to stand in for
+    return {"ticket": app.tickets.mint(path, query), "ttl_s": int(app.tickets.ttl)}
+
+
 ROUTES = {
+    ("POST", "/api/auth/ticket"): r_auth_ticket,
     ("GET", "/api/info"): r_info,
     ("GET", "/api/rig"): r_rig,
     ("GET", "/api/rig/live"): r_rig_live,
@@ -1138,6 +1156,8 @@ if CHAT is not None:                     # the chat agent's routes + agent.js/ag
     try:
         CHAT.register(ROUTES, STATIC, Reply, config_dir, load_config, host=chat_host_policy, who=_core.req_who)
         BODY_LIMITS.update(getattr(CHAT, "BODY_LIMITS", None) or {})
+        if hasattr(CHAT, "public_code"):          # the Vigil page/HUD shells + their assets: public code (auth.js signs in)
+            PUBLIC_GET.update(CHAT.public_code(ROUTES))
     except Exception as _chat_err:       # noqa: BLE001
         CHAT, CHAT_IMPORT_ERROR = None, f"{_chat_err.__class__.__name__}: {_chat_err}"
         _core.CHAT, _core.CHAT_IMPORT_ERROR = CHAT, CHAT_IMPORT_ERROR     # App reads them from core

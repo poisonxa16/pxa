@@ -19,7 +19,8 @@
 #                           they never fail the gate (not built by us; their arch lists are NVIDIA's)
 #   --allow GLOB            a documented exception (basename glob), reported as ALLOWED, never fails;
 #                           repeatable. Keep it empty unless the release owner signs an exception off.
-#   --no-cuobjdump          fatbin header scan only (no CUDA toolkit and no docker on this host)
+#   --no-cuobjdump          fatbin header scan only (no CUDA toolkit and no docker on this host); without it a missing
+#                           cuobjdump, or a cuobjdump run that prints nothing for a file, is exit 3 (fail closed)
 #   --keep                  keep --work
 # cuobjdump: the host's if on PATH (or $CUDA_HOME/bin), else docker image $PXA_CUOBJDUMP_IMAGE
 # (default pxa-release-build:cu128-u2204-cc, run with --network none, NVIDIA_VISIBLE_DEVICES=none).
@@ -63,7 +64,7 @@ if [ "$NOCUO" = 0 ]; then
   if command -v cuobjdump >/dev/null; then CUO=host
   elif [ -n "${CUDA_HOME:-}" ] && [ -x "$CUDA_HOME/bin/cuobjdump" ]; then CUO=host; PATH="$CUDA_HOME/bin:$PATH"
   elif command -v docker >/dev/null && docker image inspect "${PXA_CUOBJDUMP_IMAGE:-pxa-release-build:cu128-u2204-cc}" >/dev/null 2>&1; then CUO=docker
-  else echo "gate-sm75-check: no cuobjdump (host or docker image); falling back to the fatbin header scan" >&2; fi
+  else echo "gate-sm75-check: no cuobjdump (host, \$CUDA_HOME or the docker image): the gate fails closed (exit 3); pass --no-cuobjdump to run the fatbin header scan only" >&2; exit 3; fi
 fi
 export GATE_ARCHS="$ARCHS" GATE_PTX="$PTX" GATE_WORK="$WORK" GATE_JSON="$JSON" GATE_VENDOR="$VENDOR" GATE_CUO="$CUO" \
        GATE_IMAGE="${PXA_CUOBJDUMP_IMAGE:-pxa-release-build:cu128-u2204-cc}"
@@ -255,12 +256,19 @@ if CUO and to_cuo:
             cur = line[3:]; blocks[cur] = []
         elif cur is not None:
             blocks[cur].append(line)
+    # fail closed: every file handed to cuobjdump must come back with its own block (a docker or tool failure prints none,
+    # and a silent fall-back to the header scan would hide that the cross-check never ran)
+    unseen = [p for _, p in to_cuo if p not in blocks]
+    if unseen and not tool_err:
+        tool_err = f"cuobjdump printed nothing for {len(unseen)} of {len(to_cuo)} file(s) (first: {unseen[0]}): the gate fails closed"
     for i, p in to_cuo:
         lines = blocks.get(p)
         if lines is None:
             continue
         if any(l.startswith("!! cuobjdump exit") for l in lines) and not any(".cubin" in l for l in lines):
             results[i]["cuobjdump"] = {"error": " ".join(l for l in lines if l.strip())[:300]}
+            if any(l.startswith("!! cuobjdump exit 126") or l.startswith("!! cuobjdump exit 127") for l in lines) and not tool_err:
+                tool_err = f"cuobjdump cannot run ({' '.join(l for l in lines if l.strip())[:160]}): the gate fails closed"
             continue
         archs = sorted({int(a) for l in lines for a in re.findall(r"\.sm_(\d+)a?\.cubin", l)})
         results[i]["cuobjdump"] = {"sass": archs, "cubins": sum(1 for l in lines if ".cubin" in l)}

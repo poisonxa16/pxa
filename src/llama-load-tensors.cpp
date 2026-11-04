@@ -128,6 +128,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     bool create_nemotron_tensors(const LLM_TN & tn);   // PXA Nemotron port
     bool create_nemotron_h_tensors(const LLM_TN & tn); // PXA Nemotron port (dense + MoE hybrid)
 
+    bool create_lfm_tensors(const LLM_TN & tn); // PXA LFM port (LFM2 dense, LFM2-MoE, LFM3)
+
     bool create_xverse_tensors(const LLM_TN & tn);
 
     bool create_command_r_tensors(const LLM_TN & tn);
@@ -3207,6 +3209,90 @@ bool create_tensors_helper::create_nemotron_tensors(const LLM_TN & tn) {
 // PXA Nemotron port: tensors per mainline src/models/nemotron-h.cpp. Three block kinds, told apart by
 // the per-layer hparams: Mamba-2 (n_head_kv == 0 && n_ff == 0), attention (n_ff == 0), MLP / MoE (n_ff > 0).
 // The MTP / latent-MoE tensors of Nemotron 3 Super are not loaded yet (phase 2).
+// PXA LFM port: LFM2 / LFM2-MoE / LFM3 (mainline src/models/lfm2.cpp, lfm2moe.cpp, lfm3.cpp load_arch_tensors,
+// MIT, see NOTICE). Every block is pre-norm (RMS) and is a short-conv block (no KV heads) or a GQA block with
+// q/k RMS norms; the FFN is SwiGLU (dense) or a sigmoid-routed SwiGLU MoE after n_layer_dense_lead. The short-conv
+// tensors sit in the SSM slots: conv window = ssm_conv1d {l_cache, n_embd}, in_proj = ssm_in, out_proj = ssm_out.
+// LFM3 adds a per-head sigmoid output gate (wqkv_gate {n_embd, n_head}), optional sandwich post norms and the
+// global rope_freqs factors on its full-attention blocks.
+bool create_tensors_helper::create_lfm_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const bool is_lfm3 = model.arch == LLM_ARCH_LFM3;
+    const int64_t l_cache = hparams.n_shortconv_l_cache;
+
+    model.tok_embd    = create_tensor(ctx_input,  tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab});
+    model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+    model.output      = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+    if (model.output == NULL) {
+        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+    }
+
+    bool rope_freqs_loaded = false;
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        auto & layer = model.layers[i];
+
+        layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+        layer.ffn_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd});
+        if (is_lfm3) {
+            layer.attn_post_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+            layer.ffn_post_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_POST_NORM,  "weight", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
+            if ((layer.attn_post_norm == nullptr) != (layer.ffn_post_norm == nullptr)) {
+                throw std::runtime_error("lfm3: both post norms or neither are required");
+            }
+        }
+
+        const bool is_moe_layer = model.arch == LLM_ARCH_LFM2MOE && i >= (int) hparams.n_layer_dense_lead;
+        if (is_moe_layer) {
+            GGML_ASSERT(n_expert && n_expert_used);
+            const int64_t n_ff_exp = hparams.n_ff_exp;
+            layer.ffn_gate_inp    = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert});
+            layer.ffn_gate_exps   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert});
+            layer.ffn_down_exps   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS,   "weight", i), {n_ff_exp, n_embd, n_expert});
+            layer.ffn_up_exps     = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,     "weight", i), {n_embd, n_ff_exp, n_expert});
+            layer.ffn_exp_probs_b = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert});
+        } else {
+            const int64_t n_ff_i = hparams.n_ff(i);
+            layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff_i});
+            layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_i, n_embd});
+            layer.ffn_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff_i});
+        }
+
+        if (hparams.is_recurrent(i)) {
+            layer.ssm_conv1d = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {l_cache, n_embd});
+            layer.ssm_in     = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_IN,     "weight", i), {n_embd, 3*n_embd});
+            layer.ssm_out    = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_OUT,    "weight", i), {n_embd, n_embd});
+        } else {
+            const int64_t n_head_i      = hparams.n_head(i);
+            const int64_t n_embd_head_i = hparams.n_embd_head_k(i);
+            const int64_t n_embd_q      = n_embd_head_i * n_head_i;   // LFM3: may differ from n_embd
+            const int64_t n_embd_k_i    = hparams.n_embd_k_gqa(i);
+            const int64_t n_embd_v_i    = hparams.n_embd_v_gqa(i);
+            if (n_embd_k_i != n_embd_v_i) {
+                throw std::runtime_error(format("%s: layer %d needs equal key and value sizes", llama_model_arch_name(model.arch), i));
+            }
+            layer.attn_q_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_i});
+            layer.attn_k_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_i});
+            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_q});
+            layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_i});
+            layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_i});
+            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_q, n_embd});
+            if (is_lfm3) {
+                layer.wqkv_gate = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_i});
+                if (!hparams.swa_layers[i]) {
+                    layer.rope_freqs = create_tensor(ctx_layer, tn(LLM_TENSOR_ROPE_FREQS, "weight"), {n_embd_head_i/2},
+                            rope_freqs_loaded ? llama_model_loader::TENSOR_DUPLICATED : 0);
+                    rope_freqs_loaded = true;
+                }
+            }
+        }
+    }
+    return use_mmap_buffer;
+}
+
 bool create_tensors_helper::create_nemotron_h_tensors(const LLM_TN & tn) {
     LOADING_PRELUDE
 
@@ -6216,6 +6302,10 @@ bool create_tensors_helper::create_tensors() {
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
             use_mmap_buffer = create_nemotron_h_tensors(tn); break;
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_LFM3:
+            use_mmap_buffer = create_lfm_tensors(tn); break;
         case LLM_ARCH_XVERSE:
             use_mmap_buffer = create_xverse_tensors(tn); break;
         case LLM_ARCH_COMMAND_R:

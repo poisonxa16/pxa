@@ -26,6 +26,7 @@ always one plain sentence (EncodeError), never a traceback.
 """
 
 import collections
+import errno
 import hashlib
 import json
 import os
@@ -148,6 +149,83 @@ def _dev(p):
         return None
 
 
+def _mem_limit():
+    """-> (bytes this machine lets a job use: the smaller of the RAM and the cgroup limit Control runs under (a container, a slice), RAM total).
+    (None, None) where /proc is missing (Windows, macOS)."""
+    total = None
+    try:
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                if ln.startswith("MemTotal:"):
+                    total = int(ln.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None, None
+    limit = total
+    try:
+        with open("/proc/self/cgroup") as f:
+            rel = next((ln.strip().split(":", 2)[2] for ln in f if ln.startswith("0::")), None)
+    except (OSError, IndexError):
+        rel = None
+    d = "/sys/fs/cgroup" + (rel or "/")
+    while rel is not None and d.startswith("/sys/fs/cgroup"):
+        try:
+            with open(os.path.join(d, "memory.max")) as f:
+                v = f.read().strip()
+            if v.isdigit() and (limit is None or int(v) < limit):
+                limit = int(v)
+        except OSError:
+            pass
+        if d == "/sys/fs/cgroup":
+            break
+        d = os.path.dirname(d)
+    return limit, total
+
+
+class _ConvertWatch(object):
+    """What Control itself sees while `pxqe make` converts: the converter's peak resident memory (from /proc), the lowest free memory, and
+    afterwards the free disk and the last tensor in the converter's log. An encoder package from before 2026-11 reports every converter
+    failure, an out-of-memory kill included, as "may not support this architecture"; these numbers name the real cause. Linux only (/proc);
+    elsewhere it records nothing and the encoder's own sentence stands."""
+
+    def __init__(self, wd):
+        self.wd, self.conv_peak, self.min_avail = wd, 0, None
+        self.on = os.path.isdir("/proc/self")
+
+    def sample(self, pid):
+        if not self.on:
+            return
+        for c in EncodeService._descendants(pid):
+            try:
+                with open("/proc/%d/cmdline" % c, "rb") as f:
+                    if b"convert_hf_to_gguf" not in f.read():
+                        continue
+                with open("/proc/%d/status" % c) as f:
+                    for ln in f:
+                        if ln.startswith("VmRSS:"):
+                            self.conv_peak = max(self.conv_peak, int(ln.split()[1]) * 1024)
+            except (OSError, ValueError, IndexError):
+                continue
+        a = _meminfo_available()
+        if a is not None and (self.min_avail is None or a < self.min_avail):
+            self.min_avail = a
+
+    def last_tensor(self):
+        try:
+            with open(os.path.join(self.wd, "logs", "convert.log"), "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 16384))
+                lines = f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            return None
+        hits = [ln.split("hf-to-gguf:", 1)[1].split(",")[0].strip() for ln in lines if "hf-to-gguf:" in ln and "-->" in ln]
+        return hits[-1][:120] if hits else None
+
+    def facts(self):
+        limit, total = _mem_limit()
+        return {"conv_peak": self.conv_peak or None, "limit": limit, "total": total, "min_avail": self.min_avail if self.conv_peak else None,
+                "free_disk": _free_bytes(self.wd), "last_tensor": self.last_tensor()}
+
+
 _WINDOWS = os.name == "nt"
 # signals Windows lacks: SIGKILL (its SIGTERM is already a hard kill), SIGSTOP / SIGCONT (no pause there: the job flag only)
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -178,6 +256,79 @@ def _group_signal(pid, sig):
     if not (hasattr(os, "killpg") and hasattr(os, "getpgid")):
         raise OSError("no process groups on this platform")
     os.killpg(os.getpgid(int(pid)), sig)
+
+
+def _open_new(path):
+    """A new file at path, opened for writing; never an existing one and never through a link (O_EXCL refuses any name that is taken,
+    a dangling link included). -> a binary file object."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o666)
+    return os.fdopen(fd, "wb")
+
+
+_NO_HARDLINKS = {errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EMLINK, getattr(errno, "ENOTSUP", -1), getattr(errno, "EOPNOTSUPP", -1)}
+
+
+def _link_new(src, final):
+    """Hard-link src at final: atomic no-clobber (FileExistsError when final is taken, a dangling link included). -> False when this
+    filesystem has no hard links; EXDEV and other errors are raised."""
+    try:
+        os.link(src, final)
+        return True
+    except FileExistsError:
+        raise
+    except OSError as e:
+        if e.errno in _NO_HARDLINKS:
+            return False
+        raise
+
+
+def _place_new(src, final):
+    """Put src (same disk as final) at final without ever replacing anything: a hard link and then src removed; where the filesystem
+    has no hard links, a check and a rename (the one case with a window between the two)."""
+    if _link_new(src, final):
+        os.unlink(src)
+        return
+    if os.path.lexists(final):
+        raise FileExistsError(errno.EEXIST, "already exists", final)
+    os.rename(src, final)
+
+
+def _move_new(src, final):
+    """Move src to final, which must be a free name (FileExistsError otherwise, a dangling link counts as taken; nothing that is there,
+    or appears there meanwhile, is replaced). On the same disk: _place_new. Across disks: a copy into a fresh .part beside final
+    (created with O_EXCL | O_NOFOLLOW, so a link planted at a .part name is never written through), then _place_new: there is never a
+    half file under the final name."""
+    if os.path.lexists(final):
+        raise FileExistsError(errno.EEXIST, "already exists", final)
+    try:
+        _place_new(src, final)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    d, base = os.path.split(final)
+    for _ in range(100):
+        part = os.path.join(d, ".%s.%s.part" % (base, secrets.token_hex(4)))
+        try:
+            f = _open_new(part)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(errno.EEXIST, "no free temporary name", final)
+    try:
+        with f, open(src, "rb") as s:
+            shutil.copyfileobj(s, f, 4 << 20)
+            f.flush()
+            os.fsync(f.fileno())
+        _place_new(part, final)
+    except BaseException:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        raise
+    os.unlink(src)
 
 
 def _sha256_file(path, progress=None, cancelled=None):
@@ -660,9 +811,30 @@ class EncodeService(object):
         self._insp[key] = (time.time(), out)
         return out
 
-    def converter_names(self):
+    def _converter_scan(self):
+        """(text names, projector names) of the converter, read once per file version."""
         p = self.find_convert()
-        return PL.converter_arch_names(p) if p else None
+        if not p:
+            return None, None
+        try:
+            key = (p, os.path.getmtime(p), os.path.getsize(p))
+        except OSError:
+            return None, None
+        if getattr(self, "_conv_scan", (None,))[0] != key:
+            self._conv_scan = (key, PL.converter_arch_names(p), PL.converter_mmproj_arch_names(p), PL.converter_vision_prefixes(p))
+        return self._conv_scan[1], self._conv_scan[2]
+
+    def vision_prefixes(self):
+        """The vision-side tensor prefixes of the converter this service runs (the default list when there is none)."""
+        if self._converter_scan()[0] is None:
+            return PL.VISION_PREFIXES_DEFAULT
+        return self._conv_scan[3]
+
+    def converter_names(self):
+        return self._converter_scan()[0]
+
+    def converter_mmproj_names(self):
+        return self._converter_scan()[1]
 
     def _common(self, out, cfg, license_id):
         facts = PL.facts_from_config(cfg) if cfg else {}
@@ -670,6 +842,8 @@ class EncodeService(object):
                     "kv_bytes_tok": facts.get("kv_bytes_tok"), "n_ctx_train": facts.get("n_ctx_train"), "tied": facts.get("tie", False),
                     "moe": bool(facts.get("experts")), "experts": facts.get("experts") if isinstance(facts.get("experts"), int) else 0})
         out["support"] = PL.arch_support(out["arch"], self.converter_names())
+        # a vision-language model: its projector (mmproj) can be exported beside the GGUF (only from Hugging Face weights)
+        out["vision"] = PL.vision_tower(cfg, self.converter_mmproj_names()) if cfg and out.get("kind") in ("hf", "folder") else None
         out["licence"] = PL.classify_licence(license_id)
         out["param_label"] = PL.param_label(out.get("params"))
         out["size_h"] = PL.human_bytes(out.get("size_bytes"))
@@ -972,6 +1146,9 @@ class EncodeService(object):
             if enc_card not in {c["index"] for c in local}:
                 raise EncodeError("Card %s does not exist on this machine." % enc_card)
         use_hess = self._use_hess(info, tier, body)
+        vis = src.get("vision") or {}
+        mm = body.get("mmproj", True)                                                        # on by default when the model can see
+        mmproj = bool(vis.get("supported")) and (mm is True or str(mm).strip().lower() in ("1", "true", "on", "yes"))
         want = body.get("lock")
         if want not in (None, "") and want not in AD.LOCK_MODES:
             raise EncodeError("Pick who can load the file: only you, any PXA supporter, or anyone.")
@@ -980,7 +1157,7 @@ class EncodeService(object):
         return {"src": src, "tier": tier, "row": row, "info": info, "work": work, "out": out, "enc_card": enc_card, "local": local,
                 "lock_view": lview, "lock": lmode, "lock_error": lerr,
                 "flow": "make" if AD.supports_make(info) else "legacy",
-                "use_hess": use_hess, "keep": bool(body.get("keep")), "classic": AD.is_classic(tier),
+                "use_hess": use_hess, "keep": bool(body.get("keep")), "classic": AD.is_classic(tier), "mmproj": mmproj,
                 "stages": self.stages_for(src, info, use_hess, AD.is_classic(tier)),
                 "dump_cards": [c["index"] for c in local if c["index"] in (body.get("cards") or [c["index"]])] or [c["index"] for c in local],
                 "licence_ack": bool(body.get("licence_ack")), "targets": body.get("cards")}
@@ -1114,6 +1291,15 @@ class EncodeService(object):
             add("arch", "Architecture", "warn", src["support"]["text"])
         else:
             add("arch", "Architecture", "ok", "%s: %s" % (src["arch"] or "", src["support"]["text"]))
+        vis = src.get("vision")
+        if vis:
+            if not vis["supported"]:
+                add("vision", "Vision", "warn", vis["text"])
+            elif q["mmproj"]:
+                add("vision", "Vision", "ok", vis["text"])
+            else:
+                add("vision", "Vision", "warn", "This model can see images, but you turned off the vision projector: the GGUF will be text-only.",
+                    "Tick \"Also export the vision projector\" on step 1 to keep image input.")
         # a mixture-of-experts model with a PXQN tier: the encoder's PXQN stages cannot encode routed experts unless it says so (feature MOE_PXQN_FEATURE).
         # Said here, before the download, so nobody fetches 70 GB to be refused at the skeleton; the classic tiers work for these models.
         if src.get("moe") and info and not q["classic"] and MOE_PXQN_FEATURE not in (info.get("features") or ()):
@@ -1122,7 +1308,9 @@ class EncodeService(object):
         # disk: one figure (PL.disk_need) for the Disk space row and the facts under the list, so the two always match
         tb = row["size_bytes"] or 0
         same = _dev(q["work"]) == _dev(q["out"])
-        dn = PL.disk_need(src, tb, q["stages"], same_disk=same)
+        vis = src.get("vision") or {}
+        pw, po = PL.projector_disk(src, fetch=q["flow"] == "make" and src["kind"] == "hf") if (q["mmproj"] and vis.get("supported")) else (0, 0)
+        dn = PL.disk_need(src, tb, q["stages"], same_disk=same, extra_work=pw, extra_out=po)
         peak, outb = dn["work_peak"], dn["result"]
         fw, fo = _free_bytes(q["work"]), _free_bytes(q["out"])
         if same:
@@ -1330,7 +1518,7 @@ class EncodeService(object):
                         "tier": q["tier"], "tier_name": tname, "cls": q["row"]["cls"], "name": name, "work": q["work"], "out": q["out"], "enc_card": q["enc_card"],
                         "dump_cards": q["dump_cards"], "keep": q["keep"], "use_hess": q["use_hess"], "encoder": q["info"]["path"] if q["info"] else None,
                         "edition": q["info"]["edition"] if q["info"] else None, "size_estimate": q["row"]["size_bytes"], "targets": q["targets"],
-                        "licence_level": q["src"]["licence"]["level"], "flow": q["flow"], "lock": q["lock"],
+                        "licence_level": q["src"]["licence"]["level"], "flow": q["flow"], "lock": q["lock"], "mmproj": q["mmproj"],
                         "out_file": self._pick_out(q["out"], name, tname) if q["flow"] == "make" else None},
              "stages": [{"id": s, "label": STAGE_LABEL[s], "status": "pending", "pct": 0.0, "detail": "", "weight": weights[s], "started": None, "finished": None}
                         for s in q["stages"]],
@@ -1671,12 +1859,16 @@ class EncodeService(object):
             shutil.rmtree(wd, ignore_errors=True)       # the finished file was moved out; nothing else in here is needed
 
     # process helper
-    def _exec(self, j, argv, env=None, parse=None, cwd=None):
+    def _exec(self, j, argv, env=None, parse=None, cwd=None, watch=None):
         """Run argv, log every line (key and tokens scrubbed), keep the last 80 for the failure sentence. `parse(line)` returning True means
         the line was a machine line (the `@pxqe ` progress lines): it is neither logged nor kept."""
         rt = self.rt[j["id"]]
         e = dict(os.environ)
-        e.update(env or {})
+        for k, v in (env or {}).items():
+            if v is None:
+                e.pop(k, None)
+            else:
+                e[k] = v
         self._log(j, "$ " + " ".join(_scrub(a) for a in argv))
         try:
             p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, bufsize=1,
@@ -1690,6 +1882,15 @@ class EncodeService(object):
         if rt.paused:
             self._signal(p, _SIGSTOP)
         tail = collections.deque(maxlen=80)
+        done = threading.Event()
+        if watch is not None:
+            def _watch():
+                while not done.wait(2.0):
+                    try:
+                        watch.sample(p.pid)
+                    except Exception:  # noqa: BLE001 - a measurement must never break the job
+                        pass
+            threading.Thread(target=_watch, daemon=True).start()
         try:
             for line in p.stdout:
                 line = line.rstrip("\n")
@@ -1703,6 +1904,7 @@ class EncodeService(object):
             except OSError:
                 pass
         rc = p.wait()
+        done.set()
         rt.proc = None
         j["pid"] = None
         if rt.cancel.is_set():
@@ -1732,24 +1934,37 @@ class EncodeService(object):
             pass
         return env
 
+    def _convert_env(self):
+        """The converter reads only local files: it runs offline (a tokenizer or config that points at the Hub, or remote code, is not
+        fetched) and without the Hugging Face token (None removes a variable in _exec)."""
+        env = self._tool_env()
+        env.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_TOKEN": None, "HUGGING_FACE_HUB_TOKEN": None})
+        return env
+
     # --- stages
     def _s_download(self, j, st, wd):
-        rt, P = self.rt[j["id"]], j["params"]
+        P = j["params"]
         src_dir = os.path.join(wd, "src")
-        os.makedirs(src_dir, exist_ok=True)
         files = [(n, int(s)) for n, s in (P["source"].get("files") or [])]
+        done_bytes = self._fetch_files(j, P["source"]["id"], files, src_dir, "download")
+        self._log(j, "downloaded %s" % PL.human_bytes(done_bytes))
+
+    def _fetch_files(self, j, repo, files, dest_dir, sid):
+        """Download (name, size) files of a Hugging Face repo into dest_dir, resuming .part files; progress on stage sid (None: no
+        progress bar). -> bytes on disk."""
+        rt = self.rt[j["id"]]
+        os.makedirs(dest_dir, exist_ok=True)
         total = sum(s for _, s in files) or 1
         hf = PL.HF()
-        repo = P["source"]["id"]
         done_bytes = 0
-        t0 = time.time()
         for name, size in files:
             if "/" in name or name.startswith(".") or "\\" in name:
                 continue
-            dest = os.path.join(src_dir, name)
+            dest = os.path.join(dest_dir, name)
             if os.path.isfile(dest) and (not size or os.path.getsize(dest) == size):
                 done_bytes += os.path.getsize(dest)
-                self._set(j, "download", pct=done_bytes / total, detail="%s of %s" % (PL.human_bytes(done_bytes), PL.human_bytes(total)))
+                if sid:
+                    self._set(j, sid, pct=done_bytes / total, detail="%s of %s" % (PL.human_bytes(done_bytes), PL.human_bytes(total)))
                 continue
             part = dest + ".part"
             have = os.path.getsize(part) if os.path.isfile(part) else 0
@@ -1784,16 +1999,15 @@ class EncodeService(object):
                             break
                         f.write(b)
                         got += len(b)
-                        if time.time() - last > 0.4:
+                        if sid and time.time() - last > 0.4:
                             last = time.time()
                             cur = done_bytes + got
-                            rate = (cur) / max(1e-3, time.time() - t0)
-                            self._set(j, "download", pct=cur / total, detail="%s of %s" % (PL.human_bytes(cur), PL.human_bytes(total)))
+                            self._set(j, sid, pct=cur / total, detail="%s of %s" % (PL.human_bytes(cur), PL.human_bytes(total)))
             except (urllib.error.URLError, OSError, TimeoutError):
                 raise _StageFailed("offline", "The download was interrupted.", "Press Resume; it continues where it stopped.")
             os.replace(part, dest)
             done_bytes += os.path.getsize(dest)
-        self._log(j, "downloaded %s" % PL.human_bytes(done_bytes))
+        return done_bytes
 
     def _src_dir(self, j, wd):
         s = j["params"]["source"]
@@ -1802,6 +2016,8 @@ class EncodeService(object):
     def _s_convert(self, j, st, wd):
         out = os.path.join(wd, "bf16.gguf")
         if os.path.isfile(out) and os.path.getsize(out) > 0:
+            if j["params"].get("mmproj"):
+                self._export_mmproj(j, self._src_dir(j, wd), wd, "convert")
             return
         conv = self.find_convert()
         if not conv:
@@ -1823,10 +2039,252 @@ class EncodeService(object):
             os.unlink(tmp)
         except OSError:
             pass
-        rc, tail = self._exec(j, [self.convert_python(), conv, self._src_dir(j, wd), "--outtype", "bf16", "--outfile", tmp], self._tool_env(), parse)
+        rc, tail = self._exec(j, [self.convert_python(), conv, self._src_dir(j, wd), "--outtype", "bf16", "--outfile", tmp], self._convert_env(), parse)
         if rc != 0 or not os.path.isfile(tmp):
             self._fail_from(j, rc, tail)
         os.replace(tmp, out)
+        if j["params"].get("mmproj"):
+            self._export_mmproj(j, self._src_dir(j, wd), wd, "convert")
+
+    # --- the vision projector (mmproj) of a vision-language model ----------------------------------------------
+    @staticmethod
+    def mmproj_out(out_dir, name):
+        """<out>/mmproj-<name>-F16.gguf: the engine pairs a projector with the model whose file name starts with the same name
+        (pxa-launch find_mmproj / pick_mmproj_auto), so every tier made from one model shares one projector."""
+        return os.path.join(out_dir, "mmproj-%s-F16.gguf" % name)
+
+    def _export_mmproj(self, j, src_dir, wd, sid):
+        """Convert the vision tower of the model in src_dir into the projector file beside the output. A projector already at that
+        name with the same bytes (an earlier tier of the same model) is kept as it is; one with other bytes (another model of the same
+        name, or an older converter) is never overwritten: this one gets the next free name and the log says how to load it.
+        Never fatal: the text model is what the job is for, so a failed export is recorded in j["mmproj"]["error"] and logged."""
+        P = j["params"]
+        try:
+            self._export_mmproj_or_fail(j, src_dir, wd, sid)
+        except _StageFailed as e:
+            j["mmproj"] = {"error": e.message, "hint": e.hint}
+            self._log(j, "vision projector NOT exported: %s %s" % (e.message, e.hint))
+            self._save(j)
+        finally:
+            if P.get("mmproj"):
+                j.setdefault("mmproj", {"error": "not exported"})
+
+    def _export_mmproj_or_fail(self, j, src_dir, wd, sid):
+        P = j["params"]
+        conv = self.find_convert()
+        if not conv:
+            raise _StageFailed("missing_tool", "The converter (convert_hf_to_gguf.py) was not found.", "It comes with the PXA engine build.")
+        tmp = os.path.join(wd, "mmproj.gguf.tmp")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        if sid and any(s["id"] == sid for s in j["stages"]):
+            self._set(j, sid, detail="vision projector")
+        rc, tail = self._exec(j, [self.convert_python(), conv, src_dir, "--mmproj", "--outtype", "f16", "--outfile", tmp], self._convert_env(), None)
+        if rc != 0 or not os.path.isfile(tmp):
+            ex = AD.explain_failure(_scrub(tail, self._secrets()), rc)
+            raise _StageFailed(ex["code"], "The vision projector (mmproj) could not be exported: " + ex["message"], ex["hint"])
+        os.makedirs(P["out"], exist_ok=True)
+        sha = _sha256_file(tmp, None, lambda: False)
+        n = 1
+        for _ in range(100):
+            final = self.mmproj_out(P["out"], P["name"]) if n == 1 else os.path.join(P["out"], "mmproj-%s-F16-%d.gguf" % (P["name"], n))
+            if os.path.lexists(final):               # a link (even a dangling one) is a taken name, never followed or hashed
+                if not os.path.islink(final) and os.path.isfile(final) and _sha256_file(final, None, lambda: False) == sha:
+                    os.unlink(tmp)
+                    self._log(j, "vision projector: %s already holds this projector; kept" % final)
+                    j["mmproj"] = {"path": final, "size": os.path.getsize(final), "sha256": sha}
+                    self._save(j)
+                    return
+                n += 1
+                continue
+            try:
+                _move_new(tmp, final)                 # the output folder may be another disk: never a half file, never through a link
+                break
+            except FileExistsError:                   # taken after the check: the next name
+                n += 1
+            except OSError as e:
+                raise _StageFailed("mmproj", "The vision projector could not be placed in %s (%s)." % (P["out"], e.strerror or e),
+                                   "Check the output folder (space, permissions), then start again.")
+        else:
+            raise _StageFailed("mmproj", "The vision projector could not be placed: no free name for it in %s." % P["out"],
+                               "Move the old mmproj-%s-F16-*.gguf files away, then start again." % P["name"])
+        j["mmproj"] = {"path": final, "size": os.path.getsize(final), "sha256": sha}
+        self._log(j, "vision projector: %s (%s)" % (final, PL.human_bytes(j["mmproj"]["size"])))
+        if n > 1:
+            self._log(j, "note: another projector already had the name %s; load this one with --mmproj %s" % (self.mmproj_out(P["out"], P["name"]), final))
+        self._save(j)
+
+    def _mmproj_source(self, j, wd):
+        """A folder that holds what the projector export reads. A local folder is used as it is. For a Hugging Face model the `make`
+        flow downloads the weights itself, so Control reads only the vision tower out of them, by byte range (the configs, plus one
+        model.safetensors holding the vision-tower tensors): the model is downloaded once, by the encoder."""
+        P = j["params"]
+        src = P["source"]
+        if src["kind"] == "folder":
+            return src["src_dir"]
+        # the converter names the projector (general.name / basename / finetune) after the folder: give it the model's name
+        d = os.path.join(wd, "mmproj-src", os.path.basename(src["id"].rstrip("/")) or "model")
+        files = [(n, int(sz)) for n, sz in (src.get("files") or [])]
+        small = [(n, sz) for n, sz in files if not n.endswith(".safetensors")]
+        sid = "convert" if any(s["id"] == "convert" for s in j["stages"]) else None
+        self._fetch_files(j, src["id"], small, d, sid)
+        weights = [(n, sz) for n, sz in files if n.endswith(".safetensors")]
+        idx_path = os.path.join(d, "model.safetensors.index.json")
+        if os.path.isfile(idx_path):                   # a sharded model: only the shards the index puts vision-tower tensors in
+            idx = _read_json(idx_path) or {}
+            wm = idx.get("weight_map") if isinstance(idx.get("weight_map"), dict) else {}
+            pre = self.vision_prefixes()
+            need = {f for t, f in wm.items() if isinstance(t, str) and PL.is_vision_tensor(t, pre)}
+            if not need:
+                raise _StageFailed("mmproj", "The model index names no vision-tower tensors, so there is no projector to export.",
+                                   "Untick \"Also export the vision projector\" and start again.")
+            weights = [(n, sz) for n, sz in weights if n in need]
+            os.unlink(idx_path)                        # the vision file below is the only weights file the converter sees
+        self._fetch_vision_tensors(j, src["id"], weights, d, sid)
+        return d
+
+    _ST_HEADER_MAX = 100 << 20                       # the safetensors format's own limit on the JSON header
+
+    def _hf_range(self, j, hf, repo, name, start, end):
+        """Yield the bytes start..end (inclusive) of one repo file, in chunks. A server that ignores Range (200) is read from the
+        start and the bytes before `start` are dropped; a 206 for another range is refused."""
+        rt = self.rt[j["id"]]
+        url = "%s/%s/resolve/main/%s" % (hf.endpoint, repo, name)
+        try:
+            r = hf.open(url, {"Range": "bytes=%d-%d" % (start, end)}, timeout=60)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise _StageFailed("gated", "Hugging Face refused the download of %s (gated or private)." % repo,
+                                   "Accept the model's licence on huggingface.co and set HF_TOKEN, then Resume.")
+            raise _StageFailed("download", "Hugging Face answered %d for %s." % (e.code, name), "Resume tries again.")
+        except (urllib.error.URLError, OSError, TimeoutError):
+            raise _StageFailed("offline", "The download stopped: cannot reach Hugging Face.", "Check your connection and press Resume.")
+        want = end - start + 1
+        with r:
+            skip = 0
+            if r.status == 206:                        # it must say it carries exactly the bytes asked for
+                m = re.match(r"^\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*$", r.headers.get("Content-Range") or "")
+                if not m or int(m.group(1)) != start or int(m.group(2)) != end:
+                    raise _StageFailed("download", "Hugging Face sent another part of %s than was asked for." % name, "Resume tries again.")
+            elif r.status == 200:
+                skip = start
+            else:
+                raise _StageFailed("download", "Hugging Face answered %d for %s." % (r.status, name), "Resume tries again.")
+            try:
+                while want > 0:
+                    self._wait_unpaused(rt)
+                    if rt.cancel.is_set():
+                        raise _Cancelled()
+                    b = r.read(min(1 << 20, skip + want) if skip else min(1 << 20, want))
+                    if not b:
+                        raise _StageFailed("offline", "The download was interrupted.", "Press Resume; it continues where it stopped.")
+                    if skip:
+                        cut = min(skip, len(b))
+                        skip -= cut
+                        b = b[cut:]
+                        if not b:
+                            continue
+                    want -= len(b)
+                    yield b
+            except (urllib.error.URLError, OSError, TimeoutError):
+                raise _StageFailed("offline", "The download was interrupted.", "Press Resume; it continues where it stopped.")
+
+    def _fetch_vision_tensors(self, j, repo, weights, d, sid):
+        """Write d/model.safetensors with only the vision-tower tensors of the repo's weight files: each file's header is read by
+        byte range, then the byte ranges of the vision tensors (neighbouring ones read as one range). The tensors keep their names,
+        dtypes, shapes and bytes. -> bytes written."""
+        out = os.path.join(d, "model.safetensors")
+        if os.path.isfile(out):
+            return os.path.getsize(out)                  # done by an earlier run of this job (written whole, then renamed)
+        hf = PL.HF()
+        pre = self.vision_prefixes()
+        plan, seen = [], set()                           # (file, absolute start, absolute end (exclusive), tensor, dtype, shape)
+        bad = _StageFailed("mmproj", "The weights of this model are not a readable safetensors file, so the projector cannot be read.",
+                           "Untick \"Also export the vision projector\" and start again.")
+        for name, size in weights:
+            if "/" in name or name.startswith(".") or "\\" in name:
+                continue
+            if not size or size < 8:                     # every offset is checked against the listed size: no size, no bound
+                raise _StageFailed("mmproj", "Hugging Face did not list the size of %s, so its vision tower cannot be read safely." % name,
+                                   "Untick \"Also export the vision projector\" and start again, or convert from a local folder.")
+            head = b"".join(self._hf_range(j, hf, repo, name, 0, 7))
+            n = struct.unpack("<Q", head)[0] if len(head) == 8 else 0
+            if not 2 <= n <= self._ST_HEADER_MAX or 8 + n > size:
+                raise bad
+            try:
+                hdr = json.loads(b"".join(self._hf_range(j, hf, repo, name, 8, 8 + n - 1)))
+            except (ValueError, RecursionError):
+                raise bad
+            if not isinstance(hdr, dict):
+                raise bad
+            base = 8 + n
+            for t, v in hdr.items():
+                if t == "__metadata__" or t in seen or not PL.is_vision_tensor(t, pre):
+                    continue
+                try:
+                    lo, hi = (int(x) for x in v["data_offsets"])
+                    dt, shape = str(v["dtype"]), [int(x) for x in v["shape"]]
+                except (TypeError, ValueError, KeyError, OverflowError):
+                    raise bad
+                if lo < 0 or hi < lo or base + hi > size or any(x < 0 for x in shape):
+                    raise bad
+                seen.add(t)
+                plan.append((name, base + lo, base + hi, t, dt, shape))
+        if not plan:
+            raise _StageFailed("mmproj", "The weights hold no vision-tower tensors, so there is no projector to export.",
+                               "Untick \"Also export the vision projector\" and start again.")
+        order = {nm: i for i, (nm, _) in enumerate(weights)}
+        plan.sort(key=lambda x: (order[x[0]], x[1]))
+        for p0, p1 in zip(plan, plan[1:]):
+            if p0[0] == p1[0] and p1[1] < p0[2]:          # two tensors over the same bytes: not a file safetensors writes
+                raise bad
+        hdr, off = {}, 0
+        for nm, a, b, t, dt, shape in plan:
+            hdr[t] = {"dtype": dt, "shape": shape, "data_offsets": [off, off + (b - a)]}
+            off += b - a
+        hb = json.dumps(hdr, separators=(",", ":")).encode()
+        hb += b" " * ((-len(hb)) % 8)
+        spans = []                                       # [file, start, end, [(start, end) of each tensor]]: neighbours read as one
+        for nm, a, b, t, dt, shape in plan:
+            if spans and spans[-1][0] == nm and 0 <= a - spans[-1][2] <= (1 << 20):
+                spans[-1][2] = max(spans[-1][2], b)
+                spans[-1][3].append((a, b))
+            else:
+                spans.append([nm, a, b, [(a, b)]])
+        total = off
+        self._log(j, "vision projector: fetching %d vision-tower tensors (%s) from %s" % (len(plan), PL.human_bytes(total),
+                                                                                          ", ".join(dict.fromkeys(p[0] for p in plan))))
+        part = out + ".part"
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        done, last = 0, 0.0
+        with _open_new(part) as f:
+            f.write(struct.pack("<Q", len(hb)) + hb)
+            for nm, a, b, pieces in spans:
+                if b <= a:
+                    continue
+                pos = a
+                for chunk in self._hf_range(j, hf, repo, nm, a, b - 1):
+                    c0, c1 = pos, pos + len(chunk)
+                    for pa, pb in pieces:                 # the bytes of this chunk that belong to a vision tensor
+                        lo, hi = max(c0, pa), min(c1, pb)
+                        if lo < hi:
+                            f.write(chunk[lo - c0:hi - c0])
+                            done += hi - lo
+                    pos = c1
+                    if sid and time.time() - last > 0.4:
+                        last = time.time()
+                        self._set(j, sid, pct=min(0.99, done / float(total or 1)),
+                                  detail="vision projector: %s of %s" % (PL.human_bytes(done), PL.human_bytes(total)))
+        if done != total:
+            os.unlink(part)
+            raise bad
+        os.replace(part, out)
+        return os.path.getsize(out)
 
     def _quant(self, j, sid, src, dst, ftype, env=None, label=""):
         tool = self.find_tool("pxq-quantize", "llama-quantize")
@@ -2055,14 +2513,15 @@ class EncodeService(object):
         sha = _sha256_file(enc, lambda f: self._set(j, "verify", pct=0.1 + 0.9 * f, detail="checksum"), rt.cancel.is_set)
         os.makedirs(P["out"], exist_ok=True)
         final = self._pick_out(P["out"], P["name"], P["tier_name"])
-        shutil.move(enc, final)
+        _move_new(enc, final)
         pxq_counts = {}
         for t in h.get("tensors") or []:
             nm = L.PXQ_GGML_TYPE.get(t[1])
             if nm:
                 pxq_counts[nm] = pxq_counts.get(nm, 0) + 1
         j["result"] = {"path": final, "sha256": sha, "size": os.path.getsize(final), "tier": P["tier_name"], "cls": P["cls"], "name": P["name"],
-                       "encoded": c["encoded"], "exact": c["exact"], "tier_tensors": pxq_counts.get(want, sum(pxq_counts.values())), "types": pxq_counts}
+                       "encoded": c["encoded"], "exact": c["exact"], "tier_tensors": pxq_counts.get(want, sum(pxq_counts.values())), "types": pxq_counts,
+                       "mmproj": j.get("mmproj")}
         self._log(j, "sha256 %s  %s" % (sha, final))
 
     # ---- the one-command flow (`pxqe make`, CLI version 2) -----------------------------------------------------
@@ -2071,7 +2530,7 @@ class EncodeService(object):
         """<out>/<name>-<tier>.gguf, or -2, -3 ... : a finished file is never overwritten."""
         base = "%s-%s" % (name, tier_name)
         final, n = os.path.join(out_dir, base + ".gguf"), 1
-        while os.path.exists(final):
+        while os.path.lexists(final):                  # a dangling link is a taken name too: nothing is written through it
             n += 1
             final = os.path.join(out_dir, "%s-%d.gguf" % (base, n))
         return final
@@ -2153,6 +2612,11 @@ class EncodeService(object):
         local = {c["index"] for c in self.cards()[0]}
         cards = [i for i in ([P.get("enc_card")] + list(P.get("dump_cards") or [])) if i is not None and i in local]
         cards = list(dict.fromkeys(cards))                       # the encode card first: `--device 0` is then the encode card
+        if P.get("mmproj") and not (j.get("mmproj") or {}).get("path"):
+            mm_dir = self._mmproj_source(j, wd)
+            self._export_mmproj(j, mm_dir, wd, "convert")
+            if mm_dir != src.get("src_dir"):
+                shutil.rmtree(os.path.join(wd, "mmproj-src"), ignore_errors=True)
         engine, ngl = self._make_engine(j)
         py = self.convert_python()
         requant = AD.is_classic(P["tier"]) and src["kind"] == "gguf" and src.get("gguf_kind") == "q8_0"       # a second lossy pass: the quantizer wants both flags
@@ -2177,7 +2641,8 @@ class EncodeService(object):
                 j["licence_jid"] = h["jid"]
                 self._save(j)
             return False
-        rc, tail = self._exec(j, argv, env, parse)
+        watch = _ConvertWatch(wd)
+        rc, tail = self._exec(j, argv, env, parse, watch=watch)
         if rc == 0 and st["done"]:
             return self._finish_make(j, st["done"], wd)
         if rc == 0:
@@ -2185,7 +2650,10 @@ class EncodeService(object):
         err = st["err"]
         if err:
             err = dict(err, message=_scrub(err["message"], self._secrets()))
-        ex = AD.explain_make_failure(rc, err, _scrub(tail, self._secrets()))
+        facts = watch.facts() if (err or {}).get("stage") == "convert" or (err or {}).get("code", "").startswith("convert") else None
+        if facts:
+            self._log(j, "convert step: %s" % (AD.convert_facts_text(facts) or "nothing measured"))
+        ex = AD.explain_make_failure(rc, err, _scrub(tail, self._secrets()), facts=facts)
         raise _StageFailed(ex["code"], ex["message"], ex["hint"])
 
     def _finish_make(self, j, ev, wd):
@@ -2213,7 +2681,7 @@ class EncodeService(object):
         j["counts"].update({"encoded": 0, "exact": 0, "bad": 0})
         j["result"] = {"path": out, "sha256": ev["sha256"], "size": ev["size"], "tier": P["tier_name"], "cls": P["cls"], "name": P["name"],
                        "encoded": 0, "exact": 0, "tier_tensors": pxq_counts.get(want, sum(pxq_counts.values())), "types": pxq_counts,
-                       "lock": self._lock_result(j, h, ev), "counts": counts}
+                       "lock": self._lock_result(j, h, ev), "counts": counts, "mmproj": j.get("mmproj")}
         self._log(j, "sha256 %s  %s" % (ev["sha256"], out))
         if not P.get("keep"):
             shutil.rmtree(wd, ignore_errors=True)               # the finished file is already in the output folder; nothing else in here is needed

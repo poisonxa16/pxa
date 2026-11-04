@@ -1,7 +1,8 @@
 // The KQMMV verify-identity width rule (ggml/src/ggml-cuda/pxa/kq-mmv-vid.h), pure host, no GPU.
 // PXA_KQMMV_VERIFY_ID_SMALL is an on/off switch (the registry sets "1" for nemotron_h_moe and qwen4exp): "1" must mean ON
 // (Nemotron's small attention k/v launches keep KQMMV at verify widths 3..4), never a width cap of 1. PXA_KQMMV_VERIFY_ID_SMALL_W
-// (default 8) widens launches of <= 1024 rows only while the switch is on; with it off every launch keeps the base cap (4).
+// (default 8) widens launches of <= 1024 rows only while the switch is on; with it off every launch keeps the base cap (5 since
+// 2026-11-02; 4 before, now the PXA_KQMMV_VERIFY_ID=4 off switch).
 #include "../ggml/src/ggml-cuda/pxa/kq-mmv-vid.h"
 
 #include <cstdio>
@@ -11,7 +12,7 @@ static int g_fail = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++g_fail; } } while (0)
 
 int main() {
-    const int MAXNY = 8, BASE = 4;   // KQMMV_MAX_NY, PXA_KQMMV_VERIFY_ID default
+    const int MAXNY = 8, BASE = 5;   // KQMMV_MAX_NY, PXA_KQMMV_VERIFY_ID default (5 since 2026-11-02)
     // the switch: the registry's "1" is ON; unset / empty / "0" are OFF
     CHECK( pxa_kqmmv_vid_small_parse("1"));
     CHECK( pxa_kqmmv_vid_small_parse("8"));
@@ -35,11 +36,13 @@ int main() {
         CHECK(pxa_kqmmv_vid_small_grouped(on, cap, 3));
         CHECK(pxa_kqmmv_vid_small_grouped(on, cap, 4));
         CHECK(!pxa_kqmmv_vid_small_grouped(on, cap, 1));
-        // a grouped launch over 1024 rows keeps the base cap: widths 3..4 still on, 5 off
+        // a grouped launch over 1024 rows keeps the base cap: widths 3..5 still on, 6 off
         const int cap2 = pxa_kqmmv_vid_cap(BASE, on, W, 2048);
         CHECK(cap2 == BASE);
-        CHECK(pxa_kqmmv_vid_small_grouped(on, cap2, 4));
-        CHECK(!pxa_kqmmv_vid_small_grouped(on, cap2, 5));
+        CHECK(pxa_kqmmv_vid_small_grouped(on, cap2, 5));
+        CHECK(!pxa_kqmmv_vid_small_grouped(on, cap2, 6));
+        // the previous cap (PXA_KQMMV_VERIFY_ID=4, the off switch): 5 off
+        CHECK(!pxa_kqmmv_vid_small_grouped(on, pxa_kqmmv_vid_cap(4, on, W, 2048), 5));
     }
     // qwen4exp (Hemlock) under the registry: DeltaNet alpha/beta (96 rows) at verify widths 5..8 are served
     {

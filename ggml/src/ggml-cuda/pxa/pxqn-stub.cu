@@ -171,6 +171,33 @@ int ggml_cuda_pxqn_gate_tail(ggml_backend_cuda_context & ctx, const ggml_tensor 
                              const ggml_tensor * rht, const ggml_tensor * mm) {
     return T() ? T()->p_ggml_cuda_pxqn_gate_tail(ctx, gview, a, y, rht, mm) : -1;
 }
+int ggml_cuda_pxqn_window(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, const ggml_cuda_window_host * host) {
+    return T() ? T()->p_ggml_cuda_pxqn_window(ctx, cgraph, i, host) : i;
+}
+int ggml_cuda_pxqn_attn_narrow(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int D, int G, int NC, int type) {
+    return T() ? T()->p_ggml_cuda_pxqn_attn_narrow(ctx, dst, D, G, NC, type) : -1;
+}
+int ggml_cuda_pxqn_attn_wide(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    return T() ? T()->p_ggml_cuda_pxqn_attn_wide(ctx, dst) : -1;
+}
+int64_t ggml_cuda_pxqn_pfs_cublas_plan(int what, int64_t a, int64_t b, int64_t c, int64_t d) {
+    return T() ? T()->p_ggml_cuda_pxqn_pfs_cublas_plan(what, a, b, c, d) : 0;
+}
+int ggml_cuda_pxqn_pfs_cublas_run(int cc, int nslice, int64_t slice, int64_t ncols, bool f16out, const ggml_cuda_pfs_host * host) {
+    return T() ? T()->p_ggml_cuda_pxqn_pfs_cublas_run(cc, nslice, slice, ncols, f16out, host) : -1;
+}
+int ggml_cuda_pxqn_input_copy(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const void * src, size_t size, int mode) {
+    return T() ? T()->p_ggml_cuda_pxqn_input_copy(ctx, dst, src, size, mode) : -1;
+}
+int ggml_cuda_pxqn_input_fence(int device) {
+    return T() ? T()->p_ggml_cuda_pxqn_input_fence(device) : 0;
+}
+void ggml_cuda_pxqn_input_wait(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (T()) T()->p_ggml_cuda_pxqn_input_wait(ctx, cgraph, i);
+}
+int ggml_cuda_pxqn_get_rows(ggml_backend_cuda_context * ctx, const ggml_tensor * dst) {
+    return T() ? T()->p_ggml_cuda_pxqn_get_rows(ctx, dst) : -1;
+}
 int ggml_cuda_pxqn_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     return T() ? T()->p_ggml_cuda_pxqn_mul_mat_id(ctx, dst) : -1;
 }

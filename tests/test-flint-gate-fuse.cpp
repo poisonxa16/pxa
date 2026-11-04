@@ -21,6 +21,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "pxa-test-portable.h"   // setenv on native Windows too
 
 #include <cmath>
 #include <cstdint>

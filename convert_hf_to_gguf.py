@@ -46,6 +46,11 @@ AnyModel = TypeVar("AnyModel", bound="type[Model]")
 
 class Model:
     _model_classes: dict[str, type[Model]] = {}
+    # vision projector (mmproj) converters, keyed by the same HF architecture names; picked with --mmproj
+    _mmproj_classes: dict[str, type[Model]] = {}
+
+    # config keys that hold the layer count (MmprojModel adds the vision-tower spellings)
+    n_block_keys: list[str] = ["n_layers", "num_hidden_layers", "n_layer", "num_layers"]
 
     dir_model: Path
     ftype: gguf.LlamaFileType
@@ -86,8 +91,8 @@ class Model:
         self.is_safetensors = len(self.part_names) > 0
         if not self.is_safetensors:
             self.part_names = Model.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
-        self.hparams = Model.load_hparams(self.dir_model)
-        self.block_count = self.find_hparam(["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
+        self.hparams = self.init_hparams(Model.load_hparams(self.dir_model))
+        self.block_count = self.find_hparam(self.n_block_keys)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
         self.tensor_names = None
         self.metadata_override = metadata_override
@@ -115,6 +120,10 @@ class Model:
         # would require using decorated functions instead of simply defining the property
         if "model_arch" not in cls.__dict__:
             raise TypeError(f"Missing property 'model_arch' for {cls.__name__!r}")
+
+    def init_hparams(self, hparams: dict[str, Any]) -> dict[str, Any]:
+        """Hook: the config a class converts from (vision-language classes pick the text or the vision part)."""
+        return hparams
 
     def find_hparam(self, keys: Iterable[str], optional: bool = False) -> Any:
         key = next((k for k in keys if k in self.hparams), None)
@@ -147,7 +156,9 @@ class Model:
         for part_name in self.part_names:
             logger.info(f"gguf: loading model part '{part_name}'")
             ctx: ContextManager[Any]
-            if self.is_safetensors:
+            if self.is_safetensors and self.lazy and _pxa_no_mmap():
+                ctx = contextlib.nullcontext(_PxaSafetensorsReader(self.dir_model / part_name))
+            elif self.is_safetensors:
                 from safetensors import safe_open
                 ctx = cast(ContextManager[Any], safe_open(self.dir_model / part_name, framework="pt", device="cpu"))
             else:
@@ -563,17 +574,19 @@ class Model:
         assert names
 
         def func(modelcls: AnyModel) -> AnyModel:
+            # a vision projector class registers under the same HF names as the text class, in its own table
+            table = cls._mmproj_classes if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ else cls._model_classes
             for name in names:
-                cls._model_classes[name] = modelcls
+                table[name] = modelcls
             return modelcls
         return func
 
     @classmethod
-    def from_model_architecture(cls, arch: str) -> type[Model]:
+    def from_model_architecture(cls, arch: str, mmproj: bool = False) -> type[Model]:
         try:
-            return cls._model_classes[arch]
+            return (cls._mmproj_classes if mmproj else cls._model_classes)[arch]
         except KeyError:
-            raise NotImplementedError(f'Architecture {arch!r} not supported!') from None
+            raise NotImplementedError(f'Architecture {arch!r} not supported{" for --mmproj" if mmproj else ""}!') from None
 
     def does_token_look_special(self, token: str | bytes) -> bool:
         if isinstance(token, (bytes, bytearray)):
@@ -6834,6 +6847,556 @@ class DeepseekV4Model(Model):
         return False
 
 
+###### VISION-LANGUAGE MODELS (text model + mmproj vision projector) ######
+#
+# Qwen2-VL / Qwen2.5-VL, Qwen3-VL, Qwen3-VL-MoE, SmolVLM / SmolVLM2 (Idefics3) and InternVL.
+# The text model converts as usual; `--mmproj` converts the vision tower into the projector file the engine's
+# mtmd clip loader reads (llama-mtmd-cli / llama-server --mmproj).
+# Adapted from llama.cpp `conversion/base.py` (MmprojModel), `conversion/qwenvl.py`, `conversion/qwen3vl.py`,
+# `conversion/smolvlm.py` and `conversion/internvl.py` @ upstream commit 961c376a2d (MIT, Copyright (c) 2023-2026 The ggml authors).
+
+
+class VLTextModel:
+    """Mixin for the text half of a vision-language checkpoint.
+
+    The text config is merged to the top level (`text_config`, or InternVL's `llm_config`), the vision tower and
+    projector tensors are skipped, and the wrapper prefixes (`model.language_model.`, `language_model.`,
+    `model.text_model.`, `thinker.`) are removed so the plain text-model mapping applies.
+    """
+
+    _vl_skip_prefixes: tuple[str, ...] = (
+        "visual.", "vision_tower.", "vision_model.", "vision.", "mlp1.", "multi_modal_projector.",
+        "connector.", "merger.", "image_newline",
+    )
+
+    def init_hparams(self, hparams: dict[str, Any]) -> dict[str, Any]:
+        hparams = super().init_hparams(hparams)  # type: ignore[misc]
+        text = hparams.get("text_config") or hparams.get("llm_config")
+        if isinstance(text, dict):
+            # the top-level architecture stays: it names the checkpoint, not the inner language model
+            hparams = {**hparams, **text, "architectures": hparams.get("architectures")}
+        # transformers v5 keeps the rope base inside rope_parameters; the text classes read the top-level rope_theta
+        rope = hparams.get("rope_parameters") or hparams.get("rope_scaling") or {}
+        if "rope_theta" not in hparams and isinstance(rope, dict) and rope.get("rope_theta") is not None:
+            hparams["rope_theta"] = rope["rope_theta"]
+        return hparams
+
+    @classmethod
+    def vl_text_tensor_name(cls, name: str) -> str | None:
+        if name.startswith("thinker."):
+            name = name[len("thinker."):]
+        core = name[len("model."):] if name.startswith("model.") else name
+        if core.startswith(cls._vl_skip_prefixes):
+            return None
+        # model.language_model.layers.N -> model.layers.N; language_model.model.layers.N -> model.layers.N;
+        # language_model.lm_head -> lm_head; model.text_model.layers.N (SmolVLM) -> model.layers.N
+        name = name.replace("language_model.", "", 1)
+        name = name.replace("text_model.", "", 1)
+        return name
+
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        for name, data in super().get_tensors():  # type: ignore[misc]
+            new_name = self.vl_text_tensor_name(name)
+            if new_name is not None:
+                yield new_name, data
+
+
+def _vl_add_mrope_sections(model: Model) -> None:
+    # M-RoPE: the rotary dims split into (temporal, height, width) sections; the engine reads 4 entries
+    rope = model.hparams.get("rope_scaling") or model.hparams.get("rope_parameters") or {}
+    sections = rope.get("mrope_section")
+    if sections is None:
+        raise ValueError("vision-language Qwen model without rope_scaling.mrope_section in its config")
+    sections = list(sections)
+    while len(sections) < 4:
+        sections.append(0)
+    model.gguf_writer.add_rope_dimension_sections(sections[:4])
+    logger.info(f"gguf: mrope sections: {sections[:4]}")
+
+
+@Model.register("Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration")
+class Qwen2VLModel(VLTextModel, Qwen2Model):
+    model_arch = gguf.MODEL_ARCH.QWEN2VL
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        _vl_add_mrope_sections(self)
+
+
+@Model.register("Qwen3VLForConditionalGeneration")
+class Qwen3VLTextModel(VLTextModel, Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.QWEN3VL
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        _vl_add_mrope_sections(self)
+        vision_config = self.hparams.get("vision_config") or {}
+        self.gguf_writer.add_num_deepstack_layers(len(vision_config.get("deepstack_visual_indexes", [])))
+
+
+@Model.register("Qwen3VLMoeForConditionalGeneration")
+class Qwen3VLMoeTextModel(VLTextModel, Qwen3MoeModel):
+    model_arch = gguf.MODEL_ARCH.QWEN3VLMOE
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        _vl_add_mrope_sections(self)
+        vision_config = self.hparams.get("vision_config") or {}
+        self.gguf_writer.add_num_deepstack_layers(len(vision_config.get("deepstack_visual_indexes", [])))
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # the packed expert tensors have no ".weight" suffix in the checkpoint; they are weights all the same (not forced to F32)
+        if name.endswith(("mlp.experts.gate_up_proj", "mlp.experts.down_proj")):
+            return True
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Qwen3-VL-MoE stores the experts packed and transposed: gate_up_proj {n_expert, n_embd, 2*n_ff_exp} and
+        # down_proj {n_expert, n_ff_exp, n_embd}. The GGUF wants {n_expert, n_ff_exp, n_embd} for gate/up and
+        # {n_expert, n_embd, n_ff_exp} for down (torch order), so each is permuted and gate/up are split.
+        if name.endswith(("mlp.experts.down_proj", "mlp.experts.down_proj.weight")):
+            mapped = name if name.endswith(".weight") else f"{name}.weight"
+            return [(self.map_tensor_name(mapped), data_torch.permute(0, 2, 1).contiguous())]
+        if name.endswith(("mlp.experts.gate_up_proj", "mlp.experts.gate_up_proj.weight")):
+            if data_torch.ndim < 3 or data_torch.shape[-1] % 2 != 0:
+                raise ValueError(f"Unexpected gate_up_proj shape for {name}: {tuple(data_torch.shape)}")
+            split_dim = data_torch.shape[-1] // 2
+            base = name.removesuffix(".weight").rsplit(".", 1)[0]
+            gate = data_torch[..., :split_dim].permute(0, 2, 1).contiguous()
+            up = data_torch[..., split_dim:].permute(0, 2, 1).contiguous()
+            return [(self.map_tensor_name(f"{base}.gate_proj.weight"), gate),
+                    (self.map_tensor_name(f"{base}.up_proj.weight"), up)]
+        return super().modify_tensors(data_torch, name, bid)
+
+
+@Model.register("SmolVLMForConditionalGeneration", "Idefics3ForConditionalGeneration")
+class SmolVLMTextModel(VLTextModel, LlamaModel):
+    model_arch = gguf.MODEL_ARCH.LLAMA
+
+    def init_hparams(self, hparams: dict[str, Any]) -> dict[str, Any]:
+        hparams = super().init_hparams(hparams)
+        # SmolVLM2's text_config leaves out values its transformers class defaults (VLlama3: 32 heads, kv heads = heads)
+        hparams.setdefault("num_attention_heads", 32)
+        hparams.setdefault("num_key_value_heads", hparams["num_attention_heads"])
+        return hparams
+
+
+# vision-language wrappers whose language model is a plain text architecture named in the sub-config
+# (InternVL: llm_config.architectures is Qwen2ForCausalLM, InternLM2ForCausalLM or LlamaForCausalLM)
+_VL_WRAPPER_ARCHES: tuple[str, ...] = ("InternVLChatModel",)
+
+
+def get_text_model_class(hparams: dict[str, Any]) -> type[Model]:
+    arch = hparams["architectures"][0]
+    if arch not in _VL_WRAPPER_ARCHES:
+        return Model.from_model_architecture(arch)
+    sub = hparams.get("text_config") or hparams.get("llm_config") or {}
+    sub_arches = sub.get("architectures") or []
+    if not sub_arches:
+        raise NotImplementedError(f"Architecture {arch!r}: the config names no language-model architecture")
+    base = Model.from_model_architecture(sub_arches[0])
+    # the inner text class, plus the VL tensor/config handling (built once per run, never registered)
+    return cast("type[Model]", type(f"{base.__name__}VLText", (VLTextModel, base), {"model_arch": base.model_arch}))
+
+
+def get_mmproj_model_class(hparams: dict[str, Any]) -> type[Model]:
+    vision_config = hparams.get("vision_config")
+    if not isinstance(vision_config, dict):
+        raise NotImplementedError(f"{hparams['architectures'][0]!r} has no vision tower (no vision_config): nothing to export with --mmproj")
+    for arch in (vision_config.get("architectures") or []) + [hparams["architectures"][0]]:
+        if arch in Model._mmproj_classes:
+            return Model._mmproj_classes[arch]
+    return Model.from_model_architecture(hparams["architectures"][0], mmproj=True)
+
+
+class MmprojModel(Model):
+    """Vision tower + projector -> the mtmd clip GGUF (`general.architecture` = "clip")."""
+
+    model_arch = gguf.MODEL_ARCH.MMPROJ
+    preprocessor_config: dict[str, Any]
+    global_config: dict[str, Any]
+    hparams_vision: dict[str, Any]
+    n_embd_text: int
+
+    n_block_keys = ["n_layers", "num_hidden_layers", "n_layer", "num_layers", "depth", "layers", "encoder_layers"]
+
+    def init_hparams(self, hparams: dict[str, Any]) -> dict[str, Any]:
+        import copy
+        hparams = dict(hparams)
+        if "llm_config" in hparams and "text_config" not in hparams:
+            hparams["text_config"] = hparams["llm_config"]  # InternVL
+        text_config = {**hparams, **(hparams.get("text_config") or {})}
+        self.n_embd_text = text_config.get("hidden_size", text_config.get("n_embd", 0))
+        if not self.n_embd_text:
+            raise ValueError("the language model's hidden_size was not found in config.json")
+        self.global_config = copy.deepcopy(hparams)
+        vision = self.get_vision_config()
+        if vision is None:
+            raise ValueError("vision_config not found in config.json")
+        self.hparams_vision = vision
+        # vision-only from here on: find_hparam and the block count read the vision tower
+        return vision
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.preprocessor_config = {}
+        for fname, inner in (("preprocessor_config.json", "media_proc_cfg"), ("processor_config.json", "image_processor")):
+            path = self.dir_model / fname
+            if path.is_file():
+                with open(path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if isinstance(cfg.get(inner), dict):
+                    cfg = {**cfg, **cfg[inner]}
+                self.preprocessor_config = {**self.preprocessor_config, **cfg}
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        return self.global_config.get("vision_config")
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+        if "language_model." in name:
+            return None
+        return super().filter_tensors(item)
+
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        for name, data in super().get_tensors():
+            item = self.filter_tensors((name, lambda d=data: d))
+            if item is not None:
+                yield item[0], item[1]()
+
+    def set_type(self):
+        self.gguf_writer.add_type(gguf.GGUFType.MMPROJ)
+
+    def set_vocab(self):
+        pass  # a projector has no vocabulary
+
+    def prepare_metadata(self, vocab_only: bool):
+        out_dir = self.fname_out if self.fname_out.is_dir() else None
+        super().prepare_metadata(vocab_only=vocab_only)
+        if out_dir is not None:
+            output_type: str = self.ftype.name.partition("_")[2]
+            fname_default = gguf.naming_convention(self.metadata.name, self.metadata.basename, self.metadata.finetune,
+                                                   self.metadata.version, size_label=None, output_type=output_type, model_type=None)
+            self.fname_out = out_dir / f"mmproj-{fname_default}.gguf"
+
+    def set_gguf_parameters(self):
+        self.gguf_writer.add_file_type(self.ftype)
+        self.gguf_writer.add_clip_has_vision_encoder(True)
+        self.gguf_writer.add_vision_projection_dim(self.n_embd_text)
+        self.image_size = self.find_vparam(["image_size"])
+        self.gguf_writer.add_vision_image_size(self.image_size)
+        self.gguf_writer.add_vision_patch_size(self.find_vparam(["patch_size"]))
+        self.gguf_writer.add_vision_embedding_length(self.find_vparam(["hidden_size", "width"]))
+        self.gguf_writer.add_vision_feed_forward_length(self.find_vparam(["intermediate_size"]))
+        self.gguf_writer.add_vision_block_count(self.find_vparam(self.n_block_keys))
+        self.gguf_writer.add_vision_head_count(self.find_vparam(["num_attention_heads", "num_heads", "heads"]))
+        self.gguf_writer.add_vision_image_mean(self.preprocessor_config["image_mean"])
+        self.gguf_writer.add_vision_image_std(self.preprocessor_config["image_std"])
+
+    def write_vocab(self):
+        raise ValueError("a vision projector (--mmproj) has no vocabulary to export")
+
+    def find_vparam(self, keys: Iterable[str], optional: bool = False) -> Any:
+        key = next((k for k in keys if k in self.hparams_vision), None)
+        if key is not None:
+            return self.hparams_vision[key]
+        if optional:
+            return None
+        raise KeyError(f"could not find any of: {keys}")
+
+    def _pxa_squeeze_for_write(self, new_name: str, d: Tensor) -> Tensor:
+        # the clip loader takes the shapes as the vision tower has them (v.class_embd {n_embd, 1, 1}); no squeeze
+        return d
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if ".patch_embd.weight" in new_name:
+            return gguf.GGMLQuantizationType.F16 if self.ftype == gguf.LlamaFileType.MOSTLY_F16 else gguf.GGMLQuantizationType.F32
+        if ".position_embd." in new_name:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+
+def _split_fused_qkv(data_torch: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    c3 = data_torch.shape[0]
+    if c3 % 3 != 0:
+        raise ValueError(f"fused qkv with {c3} rows is not divisible by 3")
+    c = c3 // 3
+    return data_torch[:c], data_torch[c: c * 2], data_torch[c * 2:]
+
+
+def _split_conv3d_patch_embd(data_torch: Tensor) -> list[tuple[str, Tensor]]:
+    # Conv3D {c_out, c_in, t=2, kh, kw} -> two Conv2Ds, one per temporal slice (the clip loader sums them)
+    if data_torch.ndim != 5 or data_torch.shape[2] != 2:
+        raise ValueError(f"only temporal_patch_size 2 is supported, got patch_embed shape {tuple(data_torch.shape)}")
+    base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH]
+    return [(base + ".weight", data_torch[:, :, 0, ...]), (base + ".weight.1", data_torch[:, :, 1, ...])]
+
+
+@Model.register("Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration")
+class Qwen2VLVisionModel(MmprojModel):
+    model_arch = gguf.MODEL_ARCH.MMPROJ
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        hv = self.hparams_vision
+        hv["image_size"] = hv.get("image_size", 560)
+        hv["num_attention_heads"] = hv.get("num_heads")
+        hv["num_hidden_layers"] = hv.get("depth")
+        if "embed_dim" in hv:  # qwen2vl: hidden_size is the FFN width there
+            hv["intermediate_size"] = hv.get("hidden_size")
+            hv["hidden_size"] = hv.get("embed_dim")
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        model_type = self.global_config["model_type"]
+        if model_type == "qwen2_vl":
+            self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN2VL)
+        elif model_type == "qwen2_5_vl":
+            self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN25VL)
+            self.gguf_writer.add_vision_use_silu(True)
+            # window attention everywhere except every n_wa_pattern-th layer
+            fullatt = self.hparams_vision.get("fullatt_block_indexes")
+            if not fullatt:
+                raise ValueError("fullatt_block_indexes is required for qwen2_5_vl")
+            n_wa_pattern = fullatt[0] + 1
+            for i in range(1, len(fullatt)):
+                if fullatt[i] - fullatt[i - 1] != n_wa_pattern:
+                    raise ValueError(f"Invalid fullatt_block_indexes: {fullatt}")
+            self.gguf_writer.add_vision_n_wa_pattern(n_wa_pattern)
+        else:
+            raise ValueError(f"Unknown QwenVL model type: {model_type}")
+        self.gguf_writer.add_vision_attention_layernorm_eps(self.global_config.get("rms_norm_eps", 1e-6))
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.startswith("model.visual."):  # transformers >= 4.52 layout
+            name = name.replace("model.visual.", "visual.", 1)
+        if not name.startswith("visual."):
+            return None
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if ".qkv." in name:
+            out: list[tuple[str, Tensor]] = []
+            for part, t in zip(("q", "k", "v"), _split_fused_qkv(data_torch)):
+                out.extend(super().modify_tensors(t, name.replace("qkv", part), bid))
+            return out
+        if "patch_embed.proj.weight" in name:
+            return _split_conv3d_patch_embd(data_torch)
+        return super().modify_tensors(data_torch, name, bid)
+
+
+@Model.register("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
+class Qwen3VLVisionModel(MmprojModel):
+    model_arch = gguf.MODEL_ARCH.MMPROJ
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        hv = self.hparams_vision
+        if "image_size" not in hv:
+            # num_position_embeddings = (image_size / patch_size) ** 2
+            num_pos = hv.get("num_position_embeddings", 2304)
+            patch_size = hv.get("patch_size", 16)
+            hv["image_size"] = int(num_pos ** 0.5 * patch_size)
+        hv["num_attention_heads"] = hv.get("num_heads")
+        hv["num_hidden_layers"] = hv.get("depth")
+        self.is_deepstack_layers = [False] * int(hv["num_hidden_layers"] or 0)
+        for idx in hv.get("deepstack_visual_indexes", []):
+            self.is_deepstack_layers[idx] = True
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN3VL)
+        self.gguf_writer.add_vision_use_gelu(True)
+        if (merge_size := self.hparams_vision.get("spatial_merge_size")) is not None:
+            self.gguf_writer.add_vision_spatial_merge_size(int(merge_size))
+        rms_norm_eps = (self.global_config.get("text_config") or {}).get("rms_norm_eps", 1e-6)
+        self.gguf_writer.add_vision_attention_layernorm_eps(rms_norm_eps)
+        if self.is_deepstack_layers:
+            self.gguf_writer.add_vision_is_deepstack_layers(self.is_deepstack_layers)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.startswith("model.visual."):
+            name = name.replace("model.visual.", "visual.", 1)
+        if not name.startswith("visual."):
+            return None
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("visual.deepstack_merger_list."):
+            prefix, rest = name.split(".", maxsplit=3)[2:]
+            # the list index -> the absolute vision layer it taps
+            idx = self.hparams_vision.get("deepstack_visual_indexes", [])[int(prefix)]
+            for head, ttype in (("norm.", gguf.MODEL_TENSOR.V_DS_NORM), ("linear_fc1.", gguf.MODEL_TENSOR.V_DS_FC1),
+                                ("linear_fc2.", gguf.MODEL_TENSOR.V_DS_FC2)):
+                if rest.startswith(head):
+                    return [(self.format_tensor_name(ttype, idx, suffix=f".{rest[len(head):]}"), data_torch)]
+            raise ValueError(f"Unexpected deepstack tensor: {name}")
+        if name.startswith("visual.merger."):
+            suffix = name.split(".", 2)[2]
+            if suffix.startswith("linear_fc"):
+                fc_idx_str, tail = suffix.split(".", 1)
+                fc_num = int(fc_idx_str.replace("linear_fc", ""))
+                if fc_num not in (1, 2):
+                    raise ValueError(f"unexpected fc index {fc_num} in {name}")
+                # same slots as Qwen2-VL's merger mlp.0 / mlp.2
+                return [(self.format_tensor_name(gguf.MODEL_TENSOR.V_MMPROJ, 0 if fc_num == 1 else 2, suffix=f".{tail}"), data_torch)]
+            if suffix.startswith("norm."):
+                return [(self.format_tensor_name(gguf.MODEL_TENSOR.V_POST_NORM, suffix=f".{suffix.split('.', 1)[1]}"), data_torch)]
+            raise ValueError(f"Unexpected merger tensor: {name}")
+        if name == "visual.patch_embed.proj.weight":
+            return _split_conv3d_patch_embd(data_torch)
+        if name == "visual.patch_embed.proj.bias":
+            return [(gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".bias", data_torch)]
+        return super().modify_tensors(data_torch, name, bid)
+
+
+@Model.register("Idefics3ForConditionalGeneration", "SmolVLMForConditionalGeneration")
+class SmolVLMVisionModel(MmprojModel):
+    model_arch = gguf.MODEL_ARCH.MMPROJ
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.hparams_vision.get("model_type") == "smolvlm_vision":
+            # SmolVLM2's config.json leaves out values its transformers class defaults
+            self.hparams_vision.setdefault("hidden_size", 1152)
+            self.hparams_vision.setdefault("num_attention_heads", 16)
+            self.hparams_vision.setdefault("intermediate_size", 3072)
+        # the transformers default (Idefics3 / SmolVLM vision config), which config.json usually leaves out
+        self.hparams_vision.setdefault("layer_norm_eps", 1e-6)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.IDEFICS3)
+        self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams_vision.get("layer_norm_eps", 1e-5))
+        self.gguf_writer.add_vision_projector_scale_factor(self.global_config.get("scale_factor", 2))
+        self.gguf_writer.add_vision_use_gelu(True)
+        preproc_image_size = (self.preprocessor_config.get("size") or {}).get("longest_edge", self.image_size)
+        self.gguf_writer.add_vision_preproc_image_size(preproc_image_size)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if ".embeddings." in name:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+        if not ("vision_tower" in name or "vision_model" in name or "model.connector" in name):
+            return None
+        return super().filter_tensors(item)
+
+
+@Model.register("InternVisionModel", "InternVLChatModel")
+class InternVisionModel(MmprojModel):
+    model_arch = gguf.MODEL_ARCH.MMPROJ
+
+    def set_gguf_parameters(self):
+        hv = self.hparams_vision
+        if isinstance(hv["image_size"], list):
+            hv["image_size"] = hv["image_size"][0]
+        if isinstance(hv["patch_size"], list):
+            hv["patch_size"] = hv["patch_size"][0]
+        super().set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.INTERNVL)
+        self.gguf_writer.add_vision_attention_layernorm_eps(hv["layer_norm_eps"])
+        if hv["hidden_act"] == "silu":
+            self.gguf_writer.add_vision_use_silu(True)
+        elif hv["hidden_act"] == "gelu":
+            self.gguf_writer.add_vision_use_gelu(True)
+        else:
+            raise ValueError(f"Unsupported hidden_act: {hv['hidden_act']}")
+        downsample_ratio = self.global_config.get("downsample_ratio")
+        if downsample_ratio is None:
+            raise ValueError("InternVL config without downsample_ratio")
+        self.gguf_writer.add_vision_projector_scale_factor(int(1.0 / downsample_ratio))
+        # dynamic tiling bounds (older InternVL configs leave them out)
+        if (min_tiles := self.global_config.get("min_dynamic_patch", 0)) > 0:
+            self.gguf_writer.add_vision_preproc_min_tiles(min_tiles)
+        if (max_tiles := self.global_config.get("max_dynamic_patch", 0)) > 0:
+            self.gguf_writer.add_vision_preproc_max_tiles(max_tiles)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if not name.startswith(("vision_model", "mlp1")):
+            return None
+        if name.startswith("vision_model"):
+            name = "vision_tower." + name
+        if (".ls" in name or "position_embedding" in name) and not name.endswith(".weight"):
+            name += ".weight"
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if ".qkv." in name:
+            out: list[tuple[str, Tensor]] = []
+            for part, t in zip(("q", "k", "v"), _split_fused_qkv(data_torch)):
+                out.extend(super().modify_tensors(t, name.replace("attn.qkv", f"self_attn.{part}_proj"), bid))
+            return out
+        return super().modify_tensors(data_torch, name, bid)
+
+
+def _pxa_no_mmap() -> bool:
+    """Read safetensors weights with plain file reads instead of a memory map. ON by default on Windows, where safetensors maps every
+    shard copy-on-write and Windows charges the WHOLE mapping against the commit limit (RAM + page file): the lazy converter keeps every
+    shard's map alive until the write, so a 72 GB model failed at the 7th shard with "The paging file is too small for this operation to
+    complete (os error 1455)" under a 16 GB job limit (rig3080, 2026-11-03). Elsewhere the map costs only page cache. PXA_CONVERT_NO_MMAP=1
+    forces it on, =0 off. The bytes read are the same either way, so the GGUF is byte-identical."""
+    v = os.environ.get("PXA_CONVERT_NO_MMAP", "")
+    if v in ("0", "1"):
+        return v == "1"
+    return os.name == "nt"
+
+
+class _PxaSafetensorsReader:
+    """One .safetensors file read by offset: the same keys() / get_slice(name) surface the lazy path uses from safe_open, but each
+    tensor is read from the file when it is materialised (one tensor in RAM at a time) and no memory map is held."""
+
+    class _Slice:
+        def __init__(self, path: Path, dtype: str, shape: list[int], start: int, end: int):
+            self.path, self.dtype, self.shape, self.start, self.end = path, dtype, shape, start, end
+
+        def get_dtype(self) -> str:
+            return self.dtype
+
+        def get_shape(self) -> list[int]:
+            return list(self.shape)
+
+        def __getitem__(self, key: Any) -> Tensor:
+            if key != slice(None):
+                raise NotImplementedError("only the whole tensor can be read")
+            buf = bytearray(self.end - self.start)
+            with open(self.path, "rb") as f:
+                f.seek(self.start)
+                if f.readinto(buf) != len(buf):
+                    raise OSError(f"{self.path}: short read")
+            dtype = LazyTorchTensor._dtype_str_map[self.dtype]
+            if not buf:
+                return torch.empty(self.shape, dtype=dtype)
+            return torch.frombuffer(buf, dtype=dtype).reshape(self.shape)
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        with open(self.path, "rb") as f:
+            n = int.from_bytes(f.read(8), "little")
+            hdr = json.loads(f.read(n))
+        base = 8 + n
+        self._meta = {k: v for k, v in hdr.items() if k != "__metadata__"}
+        self._base = base
+
+    def keys(self) -> list[str]:
+        return sorted(self._meta.keys())
+
+    def get_slice(self, name: str) -> "_PxaSafetensorsReader._Slice":
+        v = self._meta[name]
+        lo, hi = (int(x) for x in v["data_offsets"])
+        return self._Slice(self.path, v["dtype"], [int(x) for x in v["shape"]], self._base + lo, self._base + hi)
+
+
 ###### CONVERSION LOGIC ######
 
 
@@ -6966,6 +7529,11 @@ def parse_args() -> argparse.Namespace:
         "--metadata", type=Path,
         help="Specify the path for an authorship metadata override file"
     )
+    parser.add_argument(
+        "--mmproj", action="store_true",
+        help="export the vision projector (mmproj) of a vision-language model instead of its text model; "
+             "the file loads with llama-mtmd-cli / llama-server --mmproj. Default output name: mmproj-<model>-<type>.gguf",
+    )
 
     return parser.parse_args()
 
@@ -7034,10 +7602,18 @@ def main() -> None:
         model_architecture = hparams["architectures"][0]
 
         try:
-            model_class = Model.from_model_architecture(model_architecture)
-        except NotImplementedError:
-            logger.error(f"Model {model_architecture} is not supported")
+            if args.mmproj:
+                if args.vocab_only:
+                    logger.error("--vocab-only and --mmproj do not combine: a projector has no vocabulary")
+                    sys.exit(1)
+                model_class = get_mmproj_model_class(hparams)
+            else:
+                model_class = get_text_model_class(hparams)
+        except NotImplementedError as e:
+            logger.error(f"Model {model_architecture} is not supported{' for --mmproj' if args.mmproj else ''}: {e}")
             sys.exit(1)
+        if not args.mmproj and isinstance(hparams.get("vision_config"), dict) and model_architecture in Model._mmproj_classes:
+            logger.info("this model has a vision tower: run the converter again with --mmproj to export its projector")
 
         model_instance = model_class(dir_model=dir_model, ftype=output_type, fname_out=fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,

@@ -336,6 +336,28 @@ class Tab(unittest.TestCase):
             html = f.read()
         self.assertIn("pluginTabOpen(", html)
 
+    def test_notices_open_and_waiting_code(self):
+        """notices: text only, an Open button only for a host-checked {tab, ref}, handed to THAT plugin's frame; the waiting
+        count is a number on its tab and in the title, never text from the page."""
+        with open(os.path.join(UI_DIR, "plugin-host.js"), encoding="utf-8") as f:
+            js = f.read()
+        self.assertIn('el("span", {class: "phn-t", text: n.text})', js)     # the notice's words go in as text
+        send = js[js.index("function sendOpen(f) {"):js.index("function paintWaits()")]
+        self.assertIn("f.el.contentWindow.postMessage(", send)              # only into the frame of the plugin it belongs to
+        self.assertIn("const o = opens[f.id]", send)                        # behaviour: OpenRouting below
+        self.assertIn('if (m.op === "waiting") { const n = Math.floor(Number(m.n)); waits[frame.id] = isFinite(n) ? '
+                      'Math.max(0, Math.min(999, n)) : 0;', js)
+        paint = js[js.index("function paintWaits()"):js.index("function dropWait(")]
+        self.assertIn('document.title = total > 0 ? "(" + (total > 99 ? "99+" : total) + ") " + baseTitle : baseTitle;', paint)
+        self.assertNotIn("m.text", paint)
+        bridge = U.BRIDGE_JS
+        self.assertIn("api.onOpen = function (fn)", bridge)
+        self.assertIn('var o = {tab: String(d.open.tab), ref: String(d.open.ref == null ? "" : d.open.ref)};', bridge)
+        self.assertIn('op: "waiting", n: Math.max(0, Math.min(999, Math.floor(Number(n) || 0)))', bridge)
+        self.assertNotIn("innerHTML", bridge)
+        with open(os.path.join(UI_DIR, "plugin-host.css"), encoding="utf-8") as f:
+            self.assertIn(".phnotices{", f.read())
+
 
 NODE = shutil.which("node")
 PANEL_RUN = r"""
@@ -360,6 +382,201 @@ def speech_buttons(sp):
     if out.returncode:
         raise AssertionError(out.stderr)
     return json.loads(out.stdout)
+
+
+NOTICE_RUN = r"""
+const src = require("fs").readFileSync(process.argv[1], "utf8");
+const cut = (start, end) => { const a = src.indexOf(start), b = src.indexOf(end, a); return src.slice(a, b); };
+const el = (tag, attrs, ...kids) => ({tag, attrs: attrs || {}, kids: kids.flat().filter(k => k != null)});
+const input = JSON.parse(process.argv[2]);
+let data = input.data, last = "x", opened = [];
+const cleared = new Set();
+const row = id => data && data.plugins.find(p => p.plugin_id === id);
+const openAt = (p, spot) => { opened.push([p.plugin_id, spot]); };
+const render = () => {};
+eval(cut("  function noticeList() {", "  function openAt(p, spot) {").replace("function noticeList", "var noticeList = function")
+     .replace("function noticesPanel", "var noticesPanel = function"));
+const out = {items: []};
+const panel = noticesPanel(noticeList());
+const text = n => typeof n === "string" ? n : (n.attrs.text || "") + (n.kids || []).map(text).join("");
+const list = panel.kids[1];
+list.kids.forEach(li => {
+  const btn = li.kids.find(k => k.tag === "button");
+  out.items.push({id: li.attrs["data-notice"], who: li.kids[0].attrs.text, text: li.kids[1].attrs.text, open: !!btn});
+  if (btn) btn.attrs.onclick();
+});
+out.opened = opened;
+panel.kids[0].kids.find(k => k.tag === "button").attrs.onclick();
+out.after = noticeList().length;
+console.log(JSON.stringify(out));
+"""
+
+
+ROUTE_RUN = r"""
+const src = require("fs").readFileSync(process.argv[1], "utf8");
+const cut = (start, end) => { const a = src.indexOf(start), b = src.indexOf(end, a); if (a < 0 || b < 0) throw new Error("cut " + start); return src.slice(a, b); };
+let now = 1000000, titleSets = 0, title = "PXA Control", handler = null, frame = null, data = {plugins: []};
+Date.now = () => now;
+const document = {get title() { return title; }, set title(v) { titleSets++; title = v; }};
+const window = {addEventListener: (n, f) => { if (n === "message") handler = f; }};
+const S = {tab: "plugins"};
+const wins = {}, newWin = id => { const w = {id, got: [], postMessage(m) { this.got.push(m); }}; (wins[id] = wins[id] || []).push(w); return w; };
+function el(tag, attrs, ...kids) {
+  const n = {tag, attrs: attrs || {}, kids, children: [], textContent: "", title: "", style: {}, removed: false,
+    remove() { this.removed = true; }, append(c) { this.children.push(c); }, replaceChildren(...k) { this.kids = k; },
+    addEventListener() {}, scrollIntoView() {}, insertBefore() {},
+    querySelector(sel) { return this.children.find(c => c.attrs && c.attrs.class === "nbadge phw" && !c.removed) || null; }};
+  if (tag === "iframe") n.contentWindow = newWin(attrs["data-plugin"]);
+  return n;
+}
+const bar = el("div"), main = el("div");
+bar.querySelector = () => ({});
+main.querySelector = () => null;
+const $ = sel => ({"#tabs": bar, "#main": main, "#ph-page": el("div")})[sel] || null;
+const icon = () => null, note = () => "", post = async () => ({}), toast = () => {}, themeMsg = () => ({name: "dark", vars: {}});
+const frameSrc = (f, src) => { f.src = src; };      // the ticketed frame address (auth.js) is browser plumbing
+const gateRun = () => true, start = () => {}, load = async () => {};
+const tabs = {}, waits = {}, opens = {};
+const OPEN_TTL_MS = 60000;
+let painted = null, baseTitle = null;
+const showTab = t => { S.tab = t; if (t.startsWith("plug-")) drawTab(t.slice(5)); };
+function openPage(p) {
+  if (tabs[p.plugin_id]) { showTab("plug-" + p.plugin_id); return; }
+  closePage();
+  frame = {id: p.plugin_id, el: {contentWindow: newWin(p.plugin_id)}, panel: el("section")};
+}
+eval(cut("  function openAt(p, spot) {", "  function render() {"));
+eval(cut("  function closePage() {", "  const b64 ="));
+eval(cut("  function frameOf(src) {", '  window.addEventListener("message"'));
+eval(cut('  const wantsTab = p =>', "  function drawTab(id) {").replace("const wantsTab", "var wantsTab"));
+eval(cut("  function drawTab(id) {", "  window.pluginTabOpen"));
+eval(cut('  window.addEventListener("message", async ev => {', '    if (m.op !== "fetch") return;') + "\n  });");
+const send = (w, d) => handler({source: w, data: Object.assign({pxa: "plugin/1"}, d)});
+const opensOf = id => (wins[id] || []).map(w => w.got.filter(m => m.op === "open").map(m => m.open));
+const plug = (id, nav, state) => ({plugin_id: id, name: id, ok: true, state: state || "running", consent: {status: "granted"},
+  page: {title: id, nav: !!nav}});
+const out = {};
+// A and B have their own tabs, both running and ready
+data.plugins = [plug("a", true), plug("b", true), plug("c", false)];
+navSync(); showTab("plug-a"); showTab("plug-b");
+send(wins.a[0], {op: "ready"}); send(wins.b[0], {op: "ready"});
+openAt(data.plugins[0], {tab: "needs", ref: 9});
+out.routed = {a: opensOf("a"), b: opensOf("b")};
+// C has no tab: its page opens on the click and gets the open on ready, once
+openAt(data.plugins[2], {tab: "needs", ref: "3"});
+out.beforeReady = opensOf("c");
+send(wins.c[0], {op: "ready"}); send(wins.c[0], {op: "ready"});
+out.afterReady = opensOf("c");
+out.hello = wins.c[0].got.filter(m => m.op === "hello").length;
+// a click whose page closes before ready is not delivered to the next page
+openAt(data.plugins[2], {tab: "needs", ref: "4"});
+closePage(); openPage(data.plugins[2]);
+send(wins.c[2], {op: "ready"});
+out.afterClose = opensOf("c")[2];
+// a click older than 60 s is not delivered
+openAt(data.plugins[2], {tab: "needs", ref: "5"});
+now += 61000;
+send(wins.c[3], {op: "ready"});
+out.stale = opensOf("c")[3];
+// waiting: a number on the tab and in the title, drawn only on a change, dropped when the page goes
+send(wins.a[0], {op: "waiting", n: 3});
+out.t1 = title; const sets = titleSets;
+for (let i = 0; i < 50; i++) send(wins.a[0], {op: "waiting", n: 3});
+out.flood = titleSets - sets;
+send(wins.b[0], {op: "waiting", n: "<b>2</b>"}); out.t2 = title;
+send(wins.b[0], {op: "waiting", n: 2}); out.t3 = title;
+out.badgeA = (tabs.a.btn.children.find(c => !c.removed) || {}).textContent;
+data.plugins[0].state = "stopped"; drawTab("a"); out.t4 = title;            // A stopped: its count goes
+send(wins.c[3], {op: "waiting", n: 4}); out.t5 = title;
+closePage(); out.t6 = title;                                                // C's page closed: its count goes
+data.plugins = [plug("c", false)]; navSync(); out.t7 = title;               // B's tab removed: its count goes
+out.tabs = Object.keys(tabs);
+console.log(JSON.stringify(out));
+"""
+
+BRIDGE_RUN = r"""
+const html = process.argv[1];
+const code = html.replace(/^<script>/, "").replace(/<\/script>$/, "");
+let handler = null;
+const parent = {got: [], postMessage(m) { this.got.push(m); }};
+const window = {addEventListener: (n, f) => { if (n === "message") handler = f; }};
+const document = {documentElement: {style: {setProperty() {}}, dataset: {}}};
+eval(code);
+const pxa = window.pxa, seen = [];
+const send = (d, source) => handler({source: source || parent, data: Object.assign({pxa: "plugin/1"}, d)});
+send({op: "open", open: {tab: "needs", ref: 7}});                 // before the page listens: held
+send({op: "open", open: {tab: "x", ref: "1"}}, {});               // not from Control: ignored
+send({op: "open", open: {tab: 5}});                               // not a plain tab: ignored
+pxa.onOpen(o => seen.push(o));                                    // the held one, once
+send({op: "open", open: {tab: "needs", ref: null}});
+pxa.waiting("<b>5</b>"); pxa.waiting(1e9); pxa.waiting(3.7);
+console.log(JSON.stringify({seen, sent: parent.got.filter(m => m.op === "waiting").map(m => m.n), ready: parent.got[0].op}));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class OpenRouting(unittest.TestCase):
+    """review #52426 M2: the notice click, the ready handshake and the waiting count, run in node (behaviour, not text)."""
+
+    def run_js(self, script, *args):
+        import subprocess
+        out = subprocess.run([NODE, "-e", script] + list(args), capture_output=True, text=True, timeout=60)
+        if out.returncode:
+            raise AssertionError(out.stderr)
+        return json.loads(out.stdout)
+
+    def test_a_click_reaches_only_its_own_plugins_frame_once_and_never_late(self):
+        out = self.run_js(ROUTE_RUN, os.path.join(UI_DIR, "plugin-host.js"))
+        self.assertEqual(out["routed"], {"a": [[{"tab": "needs", "ref": "9"}]], "b": [[]]})   # B's ready frame gets nothing
+        self.assertEqual(out["beforeReady"], [[]])                                             # C's new page: on ready ...
+        self.assertEqual(out["afterReady"], [[{"tab": "needs", "ref": "3"}]])                  # ... once, not twice
+        self.assertEqual(out["hello"], 2)
+        self.assertEqual(out["afterClose"], [])                                                # closed before ready: dropped
+        self.assertEqual(out["stale"], [])                                                     # older than 60 s: dropped
+
+    def test_the_waiting_count_is_a_number_drawn_on_change_and_dropped_with_the_page(self):
+        out = self.run_js(ROUTE_RUN, os.path.join(UI_DIR, "plugin-host.js"))
+        self.assertEqual(out["t1"], "(3) PXA Control")
+        self.assertEqual(out["flood"], 0)                                                      # 50 same counts: no redraw
+        self.assertEqual(out["t2"], "(3) PXA Control")                                         # junk is 0
+        self.assertEqual(out["t3"], "(5) PXA Control")
+        self.assertEqual(out["badgeA"], "3")
+        self.assertEqual(out["t4"], "(2) PXA Control")                                         # A stopped
+        self.assertEqual(out["t5"], "(6) PXA Control")
+        self.assertEqual(out["t6"], "(2) PXA Control")                                         # C's page closed
+        self.assertEqual(out["t7"], "PXA Control")                                             # B's tab removed
+        self.assertEqual(out["tabs"], [])
+
+    def test_the_bridge_holds_an_early_open_and_replays_it_once(self):
+        out = self.run_js(BRIDGE_RUN, U.BRIDGE_JS.strip())
+        self.assertEqual(out["seen"], [{"tab": "needs", "ref": "7"}, {"tab": "needs", "ref": ""}])
+        self.assertEqual(out["sent"], [0, 999, 3])
+        self.assertEqual(out["ready"], "ready")
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class NoticePanel(unittest.TestCase):
+    def run_panel(self, data):
+        import subprocess
+        out = subprocess.run([NODE, "-e", NOTICE_RUN, os.path.join(UI_DIR, "plugin-host.js"), json.dumps({"data": data})],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode:
+            raise AssertionError(out.stderr)
+        return json.loads(out.stdout)
+
+    def test_newest_first_text_only_and_open_only_for_a_checked_place_in_a_plugin_with_a_page(self):
+        plugins = [{"plugin_id": "hive", "name": "Hive Lite", "page": {"title": "Hive Lite"}},
+                   {"plugin_id": "nopage", "name": "Quiet", "page": None}]
+        ns = [{"id": i, "plugin": "hive", "text": "note %d" % i, "at": 0} for i in range(1, 10)]
+        ns[-1]["open"] = {"tab": "needs", "ref": "9"}
+        ns.append({"id": 10, "plugin": "nopage", "text": "<b>not markup</b>", "at": 0, "open": {"tab": "x", "ref": ""}})
+        out = self.run_panel({"plugins": plugins, "notices": ns})
+        self.assertEqual([it["id"] for it in out["items"]], ["10", "9", "8", "7", "6", "5", "4", "3"])   # newest 8, newest first
+        self.assertEqual(out["items"][0], {"id": "10", "who": "Quiet", "text": "<b>not markup</b>", "open": False})
+        self.assertEqual(out["items"][1], {"id": "9", "who": "Hive Lite", "text": "note 9", "open": True})
+        self.assertFalse(any(it["open"] for it in out["items"][2:]))
+        self.assertEqual(out["opened"], [["hive", {"tab": "needs", "ref": "9"}]])
+        self.assertEqual(out["after"], 2)                                     # Clear hides these 8; the 2 oldest are next
 
 
 @unittest.skipUnless(NODE, "node is not installed")

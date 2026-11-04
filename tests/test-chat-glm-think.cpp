@@ -9,6 +9,7 @@
 // Usage: test-chat-glm-think   (run from the source root: reads models/templates/*.jinja)
 
 #include "chat.h"
+#include "pxa-test-portable.h"   // setenv / unsetenv on native Windows too
 
 #include <cstdio>
 #include <cstdlib>

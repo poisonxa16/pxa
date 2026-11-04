@@ -47,6 +47,11 @@ struct delta_net {
     ggml_tensor * build_layer_mamba2(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, int il, const llm_build_cb & cb) const;
 
+    // PXA LFM port: one LFM short-conv operator (LFM2 / LFM2-MoE / LFM3), its (l_cache-1) x n_embd window kept in
+    // the same s_l rows with the same per-sequence routing inputs. Defined in src/llama-shortconv.cpp.
+    ggml_tensor * build_layer_shortconv(ggml_context * ctx0, ggml_cgraph * gf,
+            ggml_tensor * cur, int il, const llm_build_cb & cb) const;
+
 private:
 
     llama_context     & lctx;

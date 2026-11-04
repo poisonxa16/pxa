@@ -1356,6 +1356,10 @@ struct ggml_backend_sched {
     // reserved plan has been replaced by a narrow one and re-reserve.
     int n_replans;
     bool pxa_prev_async;   // PXA_SCHED_ASYNC_MAX_TOKENS: the last graph of this scheduler ran with async inputs
+    uint32_t pxa_inq_mask;  // PXA_CLOSED_HOOK host KQ_MASK_COPY: backends with an enqueued mask copy this graph (fenced at its end)
+    struct ggml_tensor * pxa_pre[16];  // KQ_MASK_COPY mode 2: device copies enqueued at graph start (copy_inputs skips them)
+    int pxa_pre_n;
+    bool pxa_async_force;  // PXA_CLOSED_HOOK role "sched": async split inputs for THIS scheduler (ggml_backend_sched_set_pxa_async_inputs)
     bool split_mode_graph;
     bool is_async = false;
     bool debug;
@@ -1402,6 +1406,8 @@ extern "C" GGML_API ggml_backend_sched_t pxa_ggml_backend_sched_clone(ggml_backe
     s->max_extra_alloc     = src->max_extra_alloc;
     s->callback_eval           = src->callback_eval;
     s->callback_eval_user_data = src->callback_eval_user_data;
+    // role "sched" (k-draft): a graph slot cloned from an MTP companion scheduler keeps its async split inputs
+    if (src->pxa_async_force) ggml_backend_sched_set_pxa_async_inputs(s, true);
     return s;
 }
 
@@ -1805,8 +1811,10 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                     int * this_node_backend_id = &tensor_backend_id(node->src[j]);
                     if (*this_node_backend_id == -1) {
                         *this_node_backend_id = j;
-                    } else {
-                        GGML_ASSERT(*this_node_backend_id == j);
+                    } else if (*this_node_backend_id != j) {
+                        fprintf(stderr, "%s: reduce '%s' source %d '%s' (%s) is on backend %d, not %d\n", __func__,
+                                node->name, j, node->src[j]->name, ggml_op_desc(node->src[j]), *this_node_backend_id, j);
+                        GGML_ABORT("reduce source on the wrong backend");
                     }
                     if (view_src == node->src[j]) {
                         src_id = j;
@@ -2480,7 +2488,10 @@ static int pxa_kqmask_mode_cached() {
     // directions, and the trim is additionally gated on live_rows == 1 at run time.
     static const int mode = [] {
         const char * e = getenv("PXA_KQ_MASK_PAD1");
-        int v = e ? atoi(e) : (ggml_pxa_config_level() >= 2 ? 1 : 0);
+        // 2026-11-03: ENHANCE default 1 -> 2. Mode 2 also skips the host fill of the 15 dead rows
+        // (a 15*n_kv*2 B memset per token: 0.9 -> 0.53 ms of host time per token at n_kv 128k on 2x P100 27B,
+        // PXA_HOST_TIMING); the skip is taken only where the trim provably fires, so the device bytes are the same.
+        int v = e ? atoi(e) : (ggml_pxa_config_level() >= 2 ? 2 : 0);
         if (v < 0) v = 0;
         if (v > 2) v = 2;
         return v;
@@ -2504,6 +2515,7 @@ static int64_t   pxa_kqmask_trim_saved     = 0;
 // per-graph-compute trace accumulators
 static int64_t   pxa_tr_in_copies = 0, pxa_tr_in_bytes = 0, pxa_tr_in_us = 0;
 static int64_t   pxa_tr_kq_copies = 0, pxa_tr_kq_bytes = 0, pxa_tr_kq_us = 0;
+static const char * pxa_tr_kq_src = "-";   // buffer type of the mask's host copy (CUDA_Host = pinned, CPU = pageable)
 static int64_t   pxa_tr_step      = 0;
 
 void ggml_backend_pxa_set_kqmask_live_rows(int64_t rows) { pxa_kqmask_live_rows = rows; }
@@ -2545,18 +2557,37 @@ bool ggml_backend_pxa_graph_reaches_end(const struct ggml_cgraph * g) {
     return false;
 }
 
+#include "ggml-pxqn-ext-host.h"   // role "upload" (its KQ_MASK sites)
+
+// A narrow graph wider than one row asks the "upload" role (ggml-pxqn-ext-host.h). Without the library both answers are 0
+// and the decode-only rule is the whole behaviour.
+static int64_t pxa_kqmask_role_ask(int32_t site, int64_t live, int32_t mode) {
+    if (live < 2 || live > INT32_MAX) return 0;
+    const struct ggml_pxqn_upload_args a = { (uint32_t) sizeof(struct ggml_pxqn_upload_args), site, {(int32_t) live, mode, 0, 0} };
+    return ggml_pxqn_upload_mode(&a);
+}
+// true when llama_set_inputs may leave the pad rows of an n_tokens-row mask (n_tokens > 1) unfilled
+extern "C" GGML_API bool ggml_backend_pxa_kqmask_skip_fill(int64_t n_tokens);   // declared at its one consumer (src/llama.cpp)
+bool ggml_backend_pxa_kqmask_skip_fill(int64_t n_tokens) {
+    return pxa_kqmask_role_ask(GGML_PXQN_UPLOAD_KQ_MASK_FILL, n_tokens, pxa_kqmask_mode_cached()) > 0;
+}
+
 // true when `input` is a causal flash-attention KQ mask whose pad rows are provably dead
 static inline bool pxa_kqmask_trimmable(const struct ggml_tensor * input, size_t * live_bytes_out) {
     if (pxa_kqmask_mode_cached() == 0)            return false;
-    if (pxa_kqmask_live_rows != 1)                return false;   // decode only, see note above
+    const int64_t live = pxa_kqmask_live_rows;
+    if (live < 1)                                 return false;   // unknown
     if (input->type != GGML_TYPE_F16)             return false;   // F16 == the flash_attn mask
     if (input->ne[2] != 1 || input->ne[3] != 1)   return false;
     if (input->ne[1] != GGML_KQ_MASK_PAD)         return false;   // exactly one padded row-group
     if (!ggml_is_contiguous(input))               return false;
     if (strcmp(input->name, "KQ_mask") != 0 && strcmp(input->name, "KQ_mask_swa") != 0) return false;
+    // decode: row 0 (see note above); wider: the rows the upload role names, never fewer than the live rows
+    const int64_t rows = live == 1 ? 1 : pxa_kqmask_role_ask(GGML_PXQN_UPLOAD_KQ_MASK_ROWS, live, 0);
+    if (rows < live)                              return false;
     const size_t row_bytes = input->nb[1];
-    if (row_bytes == 0 || row_bytes >= ggml_nbytes(input)) return false;
-    *live_bytes_out = row_bytes;                                  // one row
+    if (row_bytes == 0 || (size_t) rows*row_bytes >= ggml_nbytes(input)) return false;
+    *live_bytes_out = (size_t) rows*row_bytes;                    // one row at decode
     return true;
 }
 
@@ -2581,6 +2612,10 @@ static inline bool pxa_kqmask_trimmable(const struct ggml_tensor * input, size_t
 extern "C" void ggml_cuda_stage_graph_begin(void);
 extern "C" void ggml_cuda_stage_graph_end(void);
 extern "C" bool ggml_cuda_stage_h2d(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * key, const void * src, size_t offset, size_t size);
+// PXA_CLOSED_HOOK (host role KQ_MASK_COPY): enqueue one device copy of a host input (false = declined, the caller copies);
+// the fence waits on the host until every copy enqueued on that backend has read its source
+extern "C" bool ggml_cuda_pxa_input_copy(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t size, int mode);
+extern "C" void ggml_cuda_pxa_input_fence(ggml_backend_t backend);
 extern "C" void ggml_cuda_stage_report(void);
 extern "C" void ggml_cuda_timeline_epoch(void);
 extern "C" void ggml_cuda_tsplit_segment_set(int on);
@@ -2694,6 +2729,22 @@ static bool pxa_sched_async_now(void) {
     return lim <= 0 || g_pxa_async_batch_tokens.load(std::memory_order_relaxed) <= lim;
 }
 
+// per scheduler: the global lever, or this scheduler armed by ggml_backend_sched_set_pxa_async_inputs (the closed
+// library's "sched" role, e.g. the MTP draft companion of a tensor split); same decode-width gate either way
+static bool pxa_sched_async_now_s(ggml_backend_sched_t sched) {
+    if (pxa_sched_async_now()) {
+        return true;
+    }
+    if (sched == nullptr || !sched->pxa_async_force) {
+        return false;
+    }
+    const int lim = pxa_sched_async_max_tokens();
+    return lim <= 0 || g_pxa_async_batch_tokens.load(std::memory_order_relaxed) <= lim;
+}
+static bool pxa_sched_async_armed_s(ggml_backend_sched_t sched) {
+    return pxa_sched_async_inputs() || (sched != nullptr && sched->pxa_async_force);
+}
+
 // PXA_SCHED_ASYNC_WAR (2026-10-23, bug #350), default ON: see ggml_backend_sched_copy_inputs. =0 restores the old
 // guard (a probe switch; the old guard returns non-finite logits on long prompts under the tensor split).
 static bool pxa_sched_async_war(void) {
@@ -2708,18 +2759,73 @@ static bool pxa_sched_async_war(void) {
 // a freed range within the same graph), and an address-keyed cache then hands the second one
 // the first one's bytes. That is a silent, layout-dependent content swap, which is exactly
 // the failure class this lever was accused of.
-static bool pxa_sched_stage_h2d(ggml_backend_t split_backend, ggml_tensor * dst, const ggml_tensor * key, const void * src, size_t size) {
+static bool pxa_sched_stage_h2d(ggml_backend_t split_backend, bool async_now, ggml_tensor * dst, const ggml_tensor * key, const void * src, size_t size) {
 #ifdef GGML_USE_CUDA
     // the per-graph gate (PXA_SCHED_ASYNC_MAX_TOKENS): a wide graph opens no staging generation (compute_splits), so it
     // must not stage into the previous graph's ring either (that crashed the first 2048-token prompt ubatch: cuBLAS
     // "internal operation failed" after the staged copy landed in a generation whose event was never recorded)
-    if (!pxa_sched_async_now() || dst == nullptr || src == nullptr) return false;
+    if (!async_now || dst == nullptr || src == nullptr) return false;
     if (split_backend->iface.set_tensor_async == nullptr) return false;
     return ggml_cuda_stage_h2d(split_backend, dst, key, src, 0, size);
 #else
-    GGML_UNUSED(split_backend); GGML_UNUSED(dst); GGML_UNUSED(key); GGML_UNUSED(src); GGML_UNUSED(size);
+    GGML_UNUSED(split_backend); GGML_UNUSED(async_now); GGML_UNUSED(dst); GGML_UNUSED(key); GGML_UNUSED(src); GGML_UNUSED(size);
     return false;
 #endif
+}
+
+// PXA_CLOSED_HOOK (host role KQ_MASK_COPY): the attention mask of a wide graph is the one large user input (n_kv x n_tokens
+// f16 per card); the library may have it enqueued instead of copied with the host blocked, so the per-card copies overlap
+// (and, mode 2, run under the graph's first ops). The same bytes reach the same device tensor; the end of the graph fences.
+static bool pxa_sched_input_enqueue(ggml_backend_sched_t sched, int backend_id, const ggml_tensor * input, ggml_tensor * input_cpy) {
+#ifdef GGML_USE_CUDA
+    if (input_cpy == nullptr || input->buffer == nullptr || !ggml_backend_buffer_is_host(input->buffer)) return false;
+    if (strncmp(input->name, "KQ_mask", 7) != 0 || ggml_nbytes(input_cpy) != ggml_nbytes(input)) return false;
+    const int mode = (int) ggml_pxqn_host_mode(GGML_PXQN_HOST_KQ_MASK_COPY, (int64_t) ggml_nbytes(input));
+    if (mode <= 0) return false;
+    if (!ggml_cuda_pxa_input_copy(sched->backends[backend_id], input_cpy, input->data, ggml_nbytes(input), mode)) return false;
+    sched->pxa_inq_mask |= 1u << backend_id;
+    return true;
+#else
+    GGML_UNUSED(sched); GGML_UNUSED(backend_id); GGML_UNUSED(input); GGML_UNUSED(input_cpy);
+    return false;
+#endif
+}
+
+// mode 2: the device copies of the wide graph's mask are enqueued before any split runs (the library orders each one after the
+// card's earlier work and makes the graph's first reader wait for it), so they run under the ops ahead of the first attention
+static bool pxa_sched_input_preissued(ggml_backend_sched_t sched, const ggml_tensor * input_cpy) {
+    for (int k = 0; k < sched->pxa_pre_n; k++) if (sched->pxa_pre[k] == input_cpy) return true;
+    return false;
+}
+
+static void pxa_sched_input_preissue(ggml_backend_sched_t sched) {
+    sched->pxa_pre_n = 0;
+#ifdef GGML_USE_CUDA
+    for (int i = 0; i < sched->n_splits; i++) {
+        ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; j++) {
+            ggml_tensor * input = split->inputs[j];
+            if (!(input->flags & GGML_TENSOR_FLAG_INPUT) || input->buffer == nullptr || !ggml_backend_buffer_is_host(input->buffer)) continue;
+            if (strncmp(input->name, "KQ_mask", 7) != 0) continue;
+            ggml_tensor * cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+            if (cpy == nullptr || cpy == input || ggml_nbytes(cpy) != ggml_nbytes(input) || pxa_sched_input_preissued(sched, cpy)) continue;
+            if (ggml_pxqn_host_mode(GGML_PXQN_HOST_KQ_MASK_COPY, (int64_t) ggml_nbytes(input)) != 2) return;
+            if (sched->pxa_pre_n >= 16) return;
+            if (!ggml_cuda_pxa_input_copy(sched->backends[split->backend_id], cpy, input->data, ggml_nbytes(input), 2)) continue;
+            sched->pxa_pre[sched->pxa_pre_n++] = cpy;
+            sched->pxa_inq_mask |= 1u << split->backend_id;
+        }
+    }
+#endif
+}
+
+static void pxa_sched_input_fence(ggml_backend_sched_t sched) {
+#ifdef GGML_USE_CUDA
+    for (int b = 0; sched->pxa_inq_mask != 0 && b < sched->n_backends; b++) {
+        if (sched->pxa_inq_mask & (1u << b)) ggml_cuda_pxa_input_fence(sched->backends[b]);
+    }
+#endif
+    sched->pxa_inq_mask = 0;
 }
 
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
@@ -2740,7 +2846,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     // copied peer-to-peer, on the host otherwise (user inputs and host-side sources go
     // through synchronous copies that need the host to block anyway). n_copies == 1 has no
     // events and is unaffected.
-    const bool pxa_async_in = pxa_sched_async_now();
+    const bool pxa_async_in = pxa_sched_async_now_s(sched);
     // PXA_SCHED_ASYNC_WAR (2026-10-23, bug #350). The slot event marks the end of the LAST SPLIT WITH INPUTS on this
     // backend, and the peer copies of this split run on the SOURCE backend's stream. With async inputs at n_copies == 1
     // nothing else orders those copies (or a host fallback copy) after the destination's later work - splits without
@@ -2808,6 +2914,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
         }
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (pxa_sched_input_preissued(sched, input_cpy)) continue;   // KQ_MASK_COPY mode 2: enqueued at graph start
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
             // if there are multiple inputs for the split, and we have already synchronized this backend, no need to do it again.
             // ---- PXA_KQ_MASK_PAD1 (default OFF) ----
@@ -2821,7 +2928,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             const int64_t pxa_t0 = pxa_kqmask_trace_on() ? ggml_time_us() : 0;
             const size_t pxa_copy_bytes = pxa_trim ? pxa_live_bytes : ggml_nbytes(input);
             const bool   pxa_staged = ggml_backend_buffer_is_host(input->buffer) && input_cpy != nullptr &&
-                                      pxa_sched_stage_h2d(split_backend, input_cpy, input, input->data, pxa_copy_bytes);
+                                      pxa_sched_stage_h2d(split_backend, pxa_async_in, input_cpy, input, input->data, pxa_copy_bytes);
             if (!pxa_staged && !synced_on_input) {
                 // inputs from the user must be copied immediately to prevent the user
                 // overwriting the data before the copy is done
@@ -2843,7 +2950,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     pxa_kqmask_trim_saved += ggml_nbytes(input) - pxa_live_bytes;
                 }
             } else if (pxa_trim) {
-                // rows 1..15 are dead at n_tokens == 1; row 0 is the contiguous prefix
+                // rows live_rows..15 are dead (row 0 only at n_tokens == 1); the live rows are the contiguous prefix
                 ggml_backend_tensor_set(input_cpy, input->data, 0, pxa_live_bytes);
                 pxa_kqmask_trim_count++;
                 pxa_kqmask_trim_saved += ggml_nbytes(input) - pxa_live_bytes;
@@ -2854,7 +2961,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                             (long long) pxa_kqmask_trim_count, input->name,
                             ggml_nbytes(input), pxa_live_bytes, (long long) pxa_kqmask_trim_saved);
                 }
-            } else {
+            } else if (!pxa_sched_input_enqueue(sched, split_backend_id, input, input_cpy)) {
                 ggml_backend_tensor_copy(input, input_cpy);
             }
             if (pxa_kqmask_trace_on()) {
@@ -2863,6 +2970,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 pxa_tr_in_copies++; pxa_tr_in_bytes += nb; pxa_tr_in_us += dt;
                 if (strncmp(input->name, "KQ_mask", 7) == 0) {
                     pxa_tr_kq_copies++; pxa_tr_kq_bytes += nb; pxa_tr_kq_us += dt;
+                    pxa_tr_kq_src = input->buffer ? ggml_backend_buffer_name(input->buffer) : "-";
                 }
             }
         } else {
@@ -2985,7 +3093,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                 // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                 if (pxa_async_in && input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
-                        pxa_sched_stage_h2d(split_backend, input_cpy, input, input->data, ggml_nbytes(input))) {
+                        pxa_sched_stage_h2d(split_backend, pxa_async_in, input_cpy, input, input->data, ggml_nbytes(input))) {
                     // staged: ordered on the destination compute stream, no host block
                 } else
                 if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -4259,7 +4367,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     const int64_t pxa_hd_t0 = pxa_hd ? ggml_time_us() : 0;
     // PXA_SCHED_TIMELINE / PXA_SCHED_ASYNC_INPUTS: one epoch per scheduler graph
     // (== one llama_decode at -ub == -b)
-    const bool pxa_async_graph = pxa_sched_async_now();
+    const bool pxa_async_graph = pxa_sched_async_now_s(sched);
     sched->pxa_prev_async = pxa_async_graph;
     g_pxa_last_graph_async.store(pxa_async_graph, std::memory_order_relaxed);
     ggml_backend_sync_epoch();
@@ -5259,7 +5367,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             ggml_backend_sync_tag_pop();
         }
-    } else if (pxa_sched_async_now() || (sched->pxa_prev_async && pxa_sched_async_inputs())) {
+    } else if (pxa_sched_async_now_s(sched) || (sched->pxa_prev_async && pxa_sched_async_armed_s(sched))) {
         // (PXA_SCHED_ASYNC_MAX_TOKENS: also once when a wide graph follows an async one, which may still be running)
         // n_copies == 1 and no host block per split: the previous graph is still running and
         // the caller is about to overwrite the very tensors it is reading, on a stream that
@@ -5302,7 +5410,10 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         pxa_tr_in_copies = pxa_tr_in_bytes = pxa_tr_in_us = 0;
         pxa_tr_kq_copies = pxa_tr_kq_bytes = pxa_tr_kq_us = 0;
     }
+    pxa_sched_input_preissue(sched);
     const enum ggml_status pxa_st = ggml_backend_sched_compute_splits(sched);
+    if (sched->pxa_inq_mask) pxa_sched_input_fence(sched);   // the host may rewrite the inputs once this returns
+    sched->pxa_pre_n = 0;
     if (pxa_kqmask_trace_on()) {
         static const int64_t every = [] {
             const char * e = getenv("PXA_KQ_MASK_TRACE_EVERY");
@@ -5312,10 +5423,10 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         if (pxa_tr_step % every == 0) {
             fprintf(stderr,
                 "PXA_KQMASK_TRACE step=%lld live_rows=%lld mode=%d | inputs: n=%lld bytes=%lld us=%lld"
-                " | KQ_mask: n=%lld bytes=%lld us=%lld | trimmed=%lld saved_bytes=%lld\n",
+                " | KQ_mask: n=%lld bytes=%lld us=%lld src=%s | trimmed=%lld saved_bytes=%lld\n",
                 (long long) pxa_tr_step, (long long) pxa_kqmask_live_rows, pxa_kqmask_mode_cached(),
                 (long long) pxa_tr_in_copies, (long long) pxa_tr_in_bytes, (long long) pxa_tr_in_us,
-                (long long) pxa_tr_kq_copies, (long long) pxa_tr_kq_bytes, (long long) pxa_tr_kq_us,
+                (long long) pxa_tr_kq_copies, (long long) pxa_tr_kq_bytes, (long long) pxa_tr_kq_us, pxa_tr_kq_src,
                 (long long) pxa_kqmask_trim_count, (long long) pxa_kqmask_trim_saved);
         }
         pxa_tr_step++;
@@ -5351,6 +5462,30 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 
 int ggml_backend_sched_get_n_replans(ggml_backend_sched_t sched) {
     return sched->n_replans;
+}
+
+// the per-scheduler arm (PXA_CLOSED_HOOK role "sched"). The slot events the async path waits on are created here when
+// the global lever did not create them in ggml_backend_sched_new. Call between graphs (never while one is running).
+void ggml_backend_sched_set_pxa_async_inputs(ggml_backend_sched_t sched, bool on) {
+    if (sched == nullptr || sched->pxa_async_force == on) {
+        return;
+    }
+    if (on) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            for (int c = 0; c < sched->n_copies; c++) {
+                if (sched->events[b][c] == NULL) {
+                    sched->events[b][c] = ggml_backend_event_new(sched->backends[b]);
+                }
+            }
+        }
+    } else {
+        ggml_backend_sched_synchronize(sched);   // a forced graph may still be running; the next one blocks again
+    }
+    sched->pxa_async_force = on;
+}
+
+bool ggml_backend_sched_get_pxa_async_inputs(ggml_backend_sched_t sched) {
+    return sched != nullptr && sched->pxa_async_force;
 }
 
 bool ggml_backend_sched_async_inputs(void) {

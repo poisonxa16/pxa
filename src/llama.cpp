@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "ggml-pxqn-ext-host.h"
 #include "pxa-env-flag.h"
 #include "llama-impl.h"
 #include "llama-pxa-profile-keep.h"
@@ -911,6 +912,26 @@ void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
         }
     }
     cparams.mtp_op_type = value;
+    if (value != MTP_OP_NONE && !pxa_xc_companion && sched != nullptr && model.pxa_tsplit) {
+        // PXA_CLOSED_HOOK role "sched" (ggml-pxqn-ext-host.h): the library may arm scheduler options for the companion's
+        // scheduler (first MTP op; no graph of this context is running between ops). 0 = the engine's own rule.
+        int n_dev = 0;
+        for (auto * b : backends) {
+            if (!ggml_backend_is_cpu(b)) n_dev++;
+        }
+        const ggml_pxqn_sched_args sa = { (uint32_t) sizeof(ggml_pxqn_sched_args), GGML_PXQN_SCHED_DRAFT, n_dev,
+                                          (uint32_t) GGML_PXQN_SCHED_TSPLIT, {0, 0} };
+        const uint32_t opts = ggml_pxqn_sched_pick(&sa);
+        if (opts & GGML_PXQN_SCHED_ASYNC_INPUTS) {
+            ggml_backend_sched_set_pxa_async_inputs(sched, true);
+            LLAMA_LOG_INFO("%s: MTP companion scheduler: async split inputs on %d devices (role sched)\n",
+                           __func__, n_dev);
+        }
+        if ((opts & GGML_PXQN_SCHED_KEEP_GRAPH) && !pxa_mtp_keep_graph) {
+            pxa_mtp_keep_graph = true;
+            LLAMA_LOG_INFO("%s: MTP companion keeps its graph between decodes (role sched)\n", __func__);
+        }
+    }
     if (value != MTP_OP_NONE) pxa_xc_companion = true;   // sticky: this context is the speculation companion
 }
 
@@ -2130,6 +2151,8 @@ static bool llama_kv_cache_find_slot(
         }
     }
 
+    // PXA_KV_CELL_MAX_UB: was the cell_max memo in sync before this placement?
+    const bool pxa_cmax_sync = llama_kv_cache_cmax_in_sync(cache);
     {
         llama_kv_index_edit idx_edit(cache.seq_index); // PXA_KV_SEQ_RM_INDEX: mirrored block
         for (uint32_t i = 0; i < n_tokens; i++) {
@@ -2144,6 +2167,7 @@ static bool llama_kv_cache_find_slot(
     }
 
     cache.used += n_tokens;
+    llama_kv_cache_cell_max_widen(cache, pxa_cmax_sync, cache.head + n_tokens);
 
     return true;
 }
@@ -2172,16 +2196,15 @@ static bool llama_kv_cache_find_slot(
 // A monotone upper bound raised at every insertion would make it O(1) amortised; that needs a
 // whitelist of insertion sites where a MISS is silently this same NaN, so it is deliberately not
 // on the release path (ledger idea kv-cell-max-exact-scan-cache).
+// PXA_CLOSED_HOOK role "host" site KV_CELL_MAX: 1 = the epoch-validated memo in llama-context.h answers, 2 = the memo
+// cross-checked against the full scan (aborts on a mismatch), 0 (no library) = the plain full scan
+static int pxa_kv_cell_max_mode() {
+    static const int mode = (int) ggml_pxqn_host_mode(GGML_PXQN_HOST_KV_CELL_MAX, 0);
+    return mode;
+}
+
 static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache) {
-    for (uint32_t i = cache.size; i > 0; --i) {
-        const llama_kv_cell & cell = cache.cells[i - 1];
-
-        if (cell.pos >= 0 && !cell.is_empty()) {
-            return i;
-        }
-    }
-
-    return 0;
+    return llama_kv_cache_cell_max_ub(cache, pxa_kv_cell_max_mode());
 }
 
 bool llama_kv_cache::checkpoint_supported() const {
@@ -6479,9 +6502,33 @@ bool llama_pxa_xcache_learned_path(const llama_model * model, char * buf, size_t
     return true;
 }
 
+// the cache role's state file a boot reads (src/llama-pxa-xcache.cpp), named like the learned counts with suffix: the first existing
+// one among their places (beside the model, then the cache dir), so a read-only install reads what a session left there. The
+// adaptor writes it beside the learned csv it writes.
+bool llama_pxa_xcache_role_path(const llama_model * model, const char * suffix, char * buf, size_t n);
+bool llama_pxa_xcache_role_path(const llama_model * model, const char * suffix, char * buf, size_t n) {
+    if (!model || !suffix || !*suffix || !buf || n < 2) return false;
+    static const char suf[] = ".expert-counts.learned.csv";
+    const size_t ns = sizeof(suf) - 1;
+    for (const auto & c : pxa_xcache_learned_candidates(model->pxa_model_path)) {
+        if (c.size() < ns) continue;
+        const std::string p = c.substr(0, c.size() - ns) + suffix;
+        if (!pxa_file_exists(p)) continue;
+        if (p.size() + 1 > n) return false;
+        snprintf(buf, n, "%s", p.c_str());
+        return true;
+    }
+    return false;
+}
+
 // Which file a boot opens. An explicit PXA_XCACHE_COUNTS is passed through and is not swapped.
-// The library decides. No library: the curated file, never a learned one.
-static std::string pxa_xcache_counts_select(const std::string & model_path, const std::vector<std::string> & cands) {
+// The library decides. No library (or no "learn" role, ggml-pxqn-ext.h), or the role off: the curated file, never a learned one.
+// The learned file chosen: fallback = the curated file (the loader opens it if it refuses the learned one) and learned_tokens =
+// the tokens the role's record says the rows were counted from. Otherwise fallback is empty and learned_tokens -1.
+static std::string pxa_xcache_counts_select(const std::string & model_path, const std::vector<std::string> & cands,
+        std::string & fallback, double & learned_tokens) {
+    fallback.clear();
+    learned_tokens = -1;
     std::string curated;
     for (const auto & c : cands) {
         if (pxa_file_exists(c)) { curated = c; break; }
@@ -6493,8 +6540,19 @@ static std::string pxa_xcache_counts_select(const std::string & model_path, cons
             if (pxa_file_exists(c)) { learned = c; break; }
         }
     }
+    const ggml_pxqn_learn_api * lt = ggml_pxqn_learn_api_get();
+    if (!learned.empty() && lt && lt->off(nullptr, 0)) {
+        // the role off: the library is not handed the learned file, its record is not read, and the learner does not arm
+        if (!curated.empty()) {
+            LLAMA_LOG_INFO("PXA_XCACHE: using curated counts %s (learning off: the learned counts %s are neither read nor written)\n",
+                    curated.c_str(), learned.c_str());
+        } else {
+            LLAMA_LOG_INFO("PXA_XCACHE: not using the learned counts %s (learning off: neither read nor written)\n", learned.c_str());
+        }
+        return curated;
+    }
     ggml_pxqn_xcache_counts_pick_fn pick = ggml_pxqn_xcache_counts_pick_get();
-    if (!pick) {
+    if (!pick || !lt) {
         if (!learned.empty()) {
             LLAMA_LOG_WARN("PXA_XCACHE: not using learned counts %s; the library that chooses them is not loaded\n", learned.c_str());
         }
@@ -6506,10 +6564,23 @@ static std::string pxa_xcache_counts_select(const std::string & model_path, cons
                          learned.empty() ? nullptr : learned.c_str(),
                          explicit_flag ? 1 : 0, &learned_mean, &curated_mean);
     if (use == 1 && !learned.empty()) {
-        LLAMA_LOG_INFO("PXA_XCACHE: using learned counts %s\n", learned.c_str());
+        double tok = 0;
+        int ses = 0;
+        lt->record(learned.c_str(), &tok, &ses);
+        LLAMA_LOG_INFO("PXA_XCACHE: using learned counts %s (%.0f tokens over %d sessions)\n", learned.c_str(), tok, ses);
+        fallback = curated;
+        learned_tokens = tok;
         return learned;
     }
-    if (!curated.empty()) LLAMA_LOG_INFO("PXA_XCACHE: using curated counts %s\n", curated.c_str());
+    if (!curated.empty() && !learned.empty()) {
+        double tok = 0;
+        int ses = 0;
+        lt->record(learned.c_str(), &tok, &ses);
+        LLAMA_LOG_INFO("PXA_XCACHE: using curated counts %s (not the learned counts %s: %.0f tokens over %d sessions)\n",
+                curated.c_str(), learned.c_str(), tok, ses);
+    } else if (!curated.empty()) {
+        LLAMA_LOG_INFO("PXA_XCACHE: using curated counts %s\n", curated.c_str());
+    }
     return curated;
 }
 
@@ -6576,36 +6647,16 @@ void llama_pxa_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_
     ctx->cparams.cb_eval_user_data = user_data;
 }
 
-// counts[il * n_expert + e] -> tensor,expert,count rows for each layer's down-expert tensor (the planner reads the down rows first)
+// counts[il * n_expert + e] -> tensor,expert,count rows for each layer's down-expert tensor (the planner reads the down rows
+// first). The rows and the replace are src/llama-pxa-counts.h (pxa_counts_csv_write); this adds each layer's router width.
 bool llama_pxa_xcache_counts_write(const struct llama_model * model, const uint64_t * counts, int n_layers, int n_expert, const char * path) {
     if (!model || !counts || !path || !*path || n_expert <= 0) return false;
-    const std::string tmp = std::string(path) + ".tmp";
-    FILE * f = fopen(tmp.c_str(), "w");
-    if (!f) return false;
-    fprintf(f, "tensor,expert,count\n");
-    // The hot/cold split replaces the original expert tensor, so blk.N.ffn_down_exps.weight
-    // may no longer be in tensors_by_name. The loader still reads that name. Write every layer
-    // that actually has counts.
-    long rows = 0;
-    for (int il = 0; il < n_layers; ++il) {
-        char nm[128];
-        snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", il);
-        uint64_t tot = 0;
-        for (int e = 0; e < n_expert; ++e) tot += counts[(size_t) il*n_expert + e];
-        if (tot == 0) continue;
-        // a layer with fewer experts than expert_count (Nemotron 3.5 Bolt) gets rows for its own experts: its router's width
-        int n_l = n_expert;
-        if (il < (int) model->layers.size() && model->layers[il].ffn_gate_inp) {
-            const int64_t w = model->layers[il].ffn_gate_inp->ne[1];
-            if (w > 1 && w < n_expert) n_l = (int) w;
-        }
-        for (int e = 0; e < n_l; ++e) { fprintf(f, "%s,%d,%llu\n", nm, e, (unsigned long long) counts[(size_t) il*n_expert + e]); ++rows; }
+    // a layer with fewer experts than expert_count (Nemotron 3.5 Bolt) gets rows for its own experts: its router's width
+    std::vector<int> widths((size_t) std::max(n_layers, 0), 0);
+    for (int il = 0; il < n_layers && il < (int) model->layers.size(); ++il) {
+        if (model->layers[il].ffn_gate_inp) widths[(size_t) il] = (int) model->layers[il].ffn_gate_inp->ne[1];
     }
-    if (fclose(f) != 0 || rows <= 0 || rename(tmp.c_str(), path) != 0) {
-        remove(tmp.c_str());
-        return false;
-    }
-    return true;
+    return pxa_counts_csv_write(path, counts, n_layers, n_expert, widths.empty() ? nullptr : widths.data());
 }
 
 // PXA_XCACHE online adaptation (src/llama-pxa-xcache.cpp): spare hot slots per split layer, 0 = static plan (adaptation off,
@@ -6928,7 +6979,7 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
             const int64_t width = std::max<int64_t>(2, vw ? atoll(vw) : 4);   // tokens per verify pass: 1 + the draft depth (3 unless the server said so)
             const auto & hp = model.hparams;
             in.spec_reserve.assign(in.devices.size(), 0);
-            if (hp.ssm_mamba2 && hp.ssm_d_inner > 0) {
+            if ((hp.ssm_mamba2 && hp.ssm_d_inner > 0) || hp.n_shortconv_l_cache > 0) {   // PXA LFM port: short conv = one n_embd_v_s() row too
                 // Mamba-2 (nemotron_h / nemotron_h_moe): the scan/conv kernels capture no per-step state, so the chain claims no per-step
                 // rows; it keeps one whole-state checkpoint per recurrent layer (conv (d_conv-1)*(d_inner + 2*n_group*d_state) + scan
                 // d_state*d_inner, i.e. one n_embd_v_s() row) for one sequence. The gated-delta-net formula below prices
@@ -6975,8 +7026,9 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
                     tot/1048576.0, (long long) width, companion >> 20);
         }
         std::string path;
+        std::string pxa_xc_fallback;   // the curated map, when the boot chose the learned one
         pxa_xc_cands = pxa_xcache_counts_candidates_logged(model.pxa_model_path);
-        path = pxa_xcache_counts_select(model.pxa_model_path, pxa_xc_cands);
+        path = pxa_xcache_counts_select(model.pxa_model_path, pxa_xc_cands, pxa_xc_fallback, model.pxa_xc_learned_tokens);
         if (path.empty() && !pxa_xc_cands.empty()) path = pxa_xc_cands.front();
         const int n_exp = (int)model.hparams.n_expert;
         bool biased = false;   // expert biases / merged-by-the-loader up_gate are not split (yet)
@@ -7010,12 +7062,14 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
                 LLAMA_LOG_INFO("PXA_XCACHE: cold path guard on (PXA_XCACHE_NEMO_GUARD=1: load that starts later moves narrow graphs to zero-copy; output then depends on the load)\n");
             }
         }
+pxa_xc_counts_load:   // a learned file the loader refuses comes back here once, with the curated map
         if (xc_on && n_exp > 1 && !path.empty() && !biased) {
             std::vector<std::vector<double>> down(n_layer), other(n_layer);
             if (FILE * f = fopen(path.c_str(), "r")) {
                 // Counts are per model file (a re-quantised file keeps its routing, another model
                 // does not). A file whose shape does not match this model is REFUSED as a whole --
-                // never partially applied -- and the placement falls back to whole-layer streaming.
+                // never partially applied -- and the placement falls back to whole-layer streaming
+                // (a refused learned file falls back to the curated map first).
                 std::set<std::string> exp_names;
                 std::vector<char> layer_has_exps(n_layer, 0);
                 // experts per layer from its routed-expert tensors: n_exp everywhere except files whose layers hold fewer
@@ -7072,6 +7126,15 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
                     }
                 }
                 if (refuse.empty() && n_rows == 0) refuse = "no routed-expert rows";
+                if (!refuse.empty() && !pxa_xc_fallback.empty() && path != pxa_xc_fallback) {
+                    // learned counts saved for another model under this file's name: the curated map instead
+                    LLAMA_LOG_WARN("PXA_XCACHE: learned counts %s do not fit this model (%s); using the curated counts %s\n",
+                            path.c_str(), refuse.c_str(), pxa_xc_fallback.c_str());
+                    path = pxa_xc_fallback;
+                    pxa_xc_fallback.clear();
+                    model.pxa_xc_learned_tokens = -1;
+                    goto pxa_xc_counts_load;
+                }
                 if (!refuse.empty()) {
                     LLAMA_LOG_ERROR("PXA_XCACHE: REFUSED counts file %s: %s. Counts are per model file; regenerate them with "
                             "PXA_MOE_COUNTS_CSV=<csv> llama-imatrix on this GGUF. Whole-layer expert streaming.\n",
@@ -7168,29 +7231,41 @@ static void pxa_stream_plan(const llama_model_loader & ml, llama_model & model, 
             // the policy in the closed library (PXA_XCACHE_ADAPT=0, =observe, or an engine without it keeps the static plan exactly).
             model.pxa_xc_prior.clear();
             if (const int n_spare = in.xc_n_expert_l.empty() ? pxa_xc_adapt_spare_slots() : 0; n_spare > 0) {   // per-layer expert counts: static plan
-                size_t n_layers_adapt = 0, eb_max = 0;
+                size_t eb_max = 0;
                 for (const auto & t : in.tensors) if (t.kind == PXA_PLACE_EXPERTS && model.hparams.n_expert > 0) eb_max = std::max(eb_max, t.bytes/(size_t)model.hparams.n_expert);
-                model.pxa_xc_prior.assign(n_layer, {});
-                for (int il = 0; il < n_layer && il < (int)model.pxa_xc.size(); ++il) {
-                    auto & xl = model.pxa_xc[il];
-                    if (xl.cold.empty() || xl.hot.empty()) continue;
-                    xl.cold.insert(xl.cold.end(), (size_t) n_spare, -1);      // free cold slots at the end of the stack
-                    ++n_layers_adapt;
-                    if (il < (int)in.xc_counts.size() && (int)in.xc_counts[il].size() == (int)model.hparams.n_expert) model.pxa_xc_prior[il] = in.xc_counts[il];
-                }
+                // the free cold slots of every split layer and the prior rows (llama-pxa-counts.h)
+                const size_t n_layers_adapt = pxa_xc_adapt_layers(model.pxa_xc, model.pxa_xc_prior, in.xc_counts, n_layer,
+                        (int) model.hparams.n_expert, n_spare);
                 for (size_t d = 0; d < r.dev_ring.size(); ++d) if (r.dev_ring[d] > 0) r.dev_ring[d] += 3*(size_t)n_spare*eb_max;
-                LLAMA_LOG_INFO("PXA_XCACHE: online adaptation: %d free cold slot(s) in each of %zu split layers (pinned host RAM, the hot stacks keep their planned size)\n",
-                        n_spare, n_layers_adapt);
+                size_t n_whole = 0;   // layers with counts the plan kept whole on the card: the learned save carries their rows
+                for (int il = 0; il < n_layer && il < (int)model.pxa_xc_prior.size() && il < (int)model.pxa_xc.size(); ++il) {
+                    if (!model.pxa_xc_prior[il].empty() && (model.pxa_xc[il].cold.empty() || model.pxa_xc[il].hot.empty())) ++n_whole;
+                }
+                LLAMA_LOG_INFO("PXA_XCACHE: online adaptation: %d free cold slot(s) in each of %zu split layers (pinned host RAM, the hot stacks keep their planned size)%s\n",
+                        n_spare, n_layers_adapt, n_whole > 0 ? format("; the %zu layers kept whole on the card keep their counts in the learned save", n_whole).c_str() : "");
             }
             for (size_t d = 0; d < in.devices.size(); ++d) {
                 if (r.dev_ring[d] > 0) ggml_backend_cuda_stream_set_ring(in.devices[d].id, r.dev_ring[d]);
                 if (r.dev_ring[d] > 0 && r.xc_ring_lent) ggml_backend_cuda_stream_set_ring_lent(in.devices[d].id, true);
             }
             if (r.xc_ring_floor) {
-                LLAMA_LOG_INFO("PXA_XCACHE: ring lend keeps a %s floor in VRAM (%.0f MiB, PXA_XCACHE_RING_LEND_FLOOR=%d): ubatch %d reaches the "
-                        "CPU-alias width, so prefill graphs copy their cold experts through it instead of reading them in place over the link%s "
+                // the floor's reason: auto keeps one layer only when the ubatch reaches the CPU-alias width, but a set
+                // PXA_XCACHE_RING_LEND_FLOOR keeps its floor at any ubatch, so the width clause is printed only when it holds
+                int narrow_moe = model.hparams.n_expert_used > 0 ? (int)((int64_t)32*model.hparams.n_expert/model.hparams.n_expert_used) : 0;
+                if (const char * e = getenv("PXA_STREAM_NARROW_MOE")) narrow_moe = std::max(0, atoi(e));
+                const char * fl = getenv("PXA_XCACHE_RING_LEND_FLOOR");
+                const bool wide = (int) n_ubatch >= narrow_moe;
+                char why[200];
+                if (wide) {
+                    snprintf(why, sizeof(why), "ubatch %d reaches the CPU-alias width (%d), so prefill graphs copy their cold experts "
+                            "through it instead of reading them in place over the link", (int) n_ubatch, narrow_moe);
+                } else {
+                    snprintf(why, sizeof(why), "kept as set; ubatch %d is below the CPU-alias width (%d), so no graph of this load "
+                            "streams through it", (int) n_ubatch, narrow_moe);
+                }
+                LLAMA_LOG_INFO("PXA_XCACHE: ring lend keeps a %s floor in VRAM (%.0f MiB, PXA_XCACHE_RING_LEND_FLOOR=%d%s): %s%s "
                         "(PXA_XCACHE_RING_LEND_FLOOR=0 = lend all)\n", in.xc_ring_lend_floor >= 2 ? "two-layer" : "one-layer",
-                        r.dev_ring.empty() ? 0.0 : r.dev_ring[0]/1048576.0, in.xc_ring_lend_floor, (int) n_ubatch,
+                        r.dev_ring.empty() ? 0.0 : r.dev_ring[0]/1048576.0, in.xc_ring_lend_floor, fl && *fl ? "" : ", auto", why,
                         in.xc_ring_lend_floor >= 2 ? "" : "; the rest of the two-layer ring is lent to resident experts");
             }
             if (r.xc_ring_lent) {
@@ -7404,7 +7479,8 @@ static int pxa_layer_balance_env() {
 // Refused (RAM path kept, one warning) when O_DIRECT does not work on the file, when the file sits on
 // a rotational or unidentified device, or when a 256-row probe (best of 3) reads slower than
 // PXA_PLE_DIRECT_MIN_ROWS_S (default 5000 rows/s: a token needs 16 rows, a 512-token prefill
-// ubatch ~8k; a disk does a few hundred random reads/s, an SSD tens of thousands). PXA_PLE_DIRECT=2 skips the device and probe
+// ubatch ~8k; a disk does a few hundred random reads/s, an SSD tens of thousands; on an identified SSD a slow first probe is
+// repeated, PXA_PLE_DIRECT_PROBE_TRIES, default 8, 250 ms apart, so a busy moment after the load does not decide the session). PXA_PLE_DIRECT=2 skips the device and probe
 // refusals (lab use: measuring a slow disk). PXA_PLE_DIRECT_CACHE_MIB (default 256) sizes the row
 // cache, PXA_PLE_DIRECT_DEPTH (default 32) the reads in flight (Linux AIO from the decode thread;
 // PXA_PLE_DIRECT_IO=threads uses a pool of preading threads instead), PXA_PLE_DIRECT_STATS=N prints
@@ -7613,12 +7689,30 @@ static void llm_pxa_ple_direct_open(llama_model_loader & ml, llama_model & model
         willneed_if_declined();
         return;
     }
-    const double rps     = rd->probe(256, 0x5eed, 3);
+    double       rps     = rd->probe(256, 0x5eed, 3);
     const double min_rps = pxa_ple_direct_env_f("PXA_PLE_DIRECT_MIN_ROWS_S", 5000);
+    // An SSD that is busy right after the load (the expert fill, writeback, another process on the device) can read under
+    // the floor for a moment; refusing then put the whole session on the mapping path (od2-lead ramp diag 10-31: 942-4313
+    // rows/s probes on an NVMe that read 18-49k on the next boots, -10% decode for the session). On an identified SSD a slow
+    // first probe is repeated PXA_PLE_DIRECT_PROBE_TRIES-1 times, 250 ms apart, and the best one decides (=1 one probe only).
+    // Either path reads the same file bytes, so the output does not change.
+    int tries = 1;
+    if (rps < min_rps && mode < 2 && rot == 0) {
+        const int max_tries = std::max(1, (int) pxa_ple_direct_env_f("PXA_PLE_DIRECT_PROBE_TRIES", 8));
+        while (rps < min_rps && tries < max_tries) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            rps = std::max(rps, rd->probe(256, 0x5eed + (uint64_t) tries, 3));
+            ++tries;
+        }
+        if (tries > 1) {
+            LLAMA_LOG_INFO("%s: PXA_PLE_DIRECT: the first probe read under the floor; best of %d probes %.0f rows/s "
+                           "(PXA_PLE_DIRECT_PROBE_TRIES=1 decides on the first)\n", __func__, tries, rps);
+        }
+    }
     if (rps < min_rps && mode < 2) {
-        LLAMA_LOG_WARN("%s: PXA_PLE_DIRECT: refused: a 256-row probe (best of 3) read %.0f rows/s from %s, below "
+        LLAMA_LOG_WARN("%s: PXA_PLE_DIRECT: refused: %d x 256-row probe (best of 3) read %.0f rows/s from %s, below "
                        "PXA_PLE_DIRECT_MIN_ROWS_S=%.0f; keeping the RAM path (file mapping)\n",
-                       __func__, rps, dev.c_str(), min_rps);
+                       __func__, tries, rps, dev.c_str(), min_rps);
         willneed_if_declined();
         return;
     }
@@ -9663,6 +9757,12 @@ void pxa_ht_close_step(uint32_t n_tokens_all, int mtp_op, int reuse_why, int nkv
 // llama_kv_cell (one int compare) instead of std::set::find into a heap node per cell. The
 // predicate is unchanged; only the lookup is. The shadow is maintained unconditionally by the
 // cell accessors, so this is a read-side switch that can be A/B'd at will.
+// PXA_CLOSED_HOOK role "host" site KQ_MASK_THREADS: the threads that fill a decode-shaped KQ mask of n_kv columns
+// (the library's answer; 1 = this thread alone, the plain fill)
+static int pxa_kq_mask_fill_threads(int64_t n_kv) {
+    return std::max(1, std::min(16, (int) ggml_pxqn_host_mode(GGML_PXQN_HOST_KQ_MASK_THREADS, n_kv)));
+}
+
 static bool pxa_kv_seq_soa_enabled() {
     // DEFAULT 2026-09-03: ON at ENHANCE (the default level), OFF at DEFAULT/REFERENCE. The
     // shadow is maintained unconditionally by the cell accessors, so this only swaps a
@@ -9886,6 +9986,8 @@ static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
     return relative_bucket;
 }
+
+extern "C" bool ggml_backend_pxa_kqmask_skip_fill(int64_t n_tokens);   // ggml-backend.cpp
 
 static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     //
@@ -10277,13 +10379,34 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             // For causal attention, use only the previous KV cells
             // of the correct sequence for each token of the batch.
             // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
+            // role "host" KQ_MASK_THREADS (2026-11-03): when the library answers > 1 for this n_kv, the
+            // decode-shaped fill (flash attention, no alibi) splits the cell range across that many threads; each
+            // writes its own disjoint columns of every row with the same predicate, so the mask bytes are identical.
+            const int pxa_mask_mt = (!hparams.use_alibi && cparams.flash_attn) ? pxa_kq_mask_fill_threads(n_kv) : 1;
+            if (pxa_mask_mt > 1) {
+                const int64_t npt = (n_kv + pxa_mask_mt - 1) / pxa_mask_mt;
+                auto work = [&](int t) {
+                    const int first = (int) (t*npt);
+                    const int last  = (int) std::min<int64_t>(n_kv, first + npt);
+                    for (int j = 0; first < last && j < n_tokens; ++j) {
+                        noalibi_f16(j, batch.pos[j], batch.seq_id[j][0], first, last);
+                    }
+                };
+                std::vector<std::thread> pxa_w;
+                pxa_w.reserve(pxa_mask_mt - 1);
+                for (int t = 1; t < pxa_mask_mt; ++t) pxa_w.emplace_back(work, t);
+                work(0);
+                for (auto & w : pxa_w) w.join();
+            }
             for (int h = 0; h < 1; ++h) {
                 for (int j = 0; j < n_tokens; ++j) {
                     const llama_pos    pos    = batch.pos[j];
                     const llama_seq_id seq_id = batch.seq_id[j][0];
 
                     if (!hparams.use_alibi && cparams.flash_attn) {
-                        noalibi_f16(j, pos, seq_id, 0, n_kv);
+                        if (pxa_mask_mt <= 1) {
+                            noalibi_f16(j, pos, seq_id, 0, n_kv);
+                        }
                         continue;
                     }
 
@@ -10335,8 +10458,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 // needs n_tokens >= 32 and this branch is n_tokens == 1). The conditions here are
                 // the same ones pxa_kqmask_trimmable() checks, so the fill is skipped ONLY when the
                 // trim is guaranteed to fire; mode 1 keeps the fill.
+                // Wider graphs: the upload role says (ggml_backend_pxa_kqmask_skip_fill; false without the library).
                 const bool pxa_skip_pad_fill =
-                    ggml_backend_pxa_kqmask_mode() >= 2 && n_tokens == 1 && cparams.flash_attn &&
+                    (n_tokens == 1 ? ggml_backend_pxa_kqmask_mode() >= 2 : ggml_backend_pxa_kqmask_skip_fill(n_tokens)) && cparams.flash_attn &&
                     (!lctx.inp_KQ_mask     || lctx.inp_KQ_mask->ne[1]     == GGML_KQ_MASK_PAD) &&
                     (!lctx.inp_KQ_mask_swa || lctx.inp_KQ_mask_swa->ne[1] == GGML_KQ_MASK_PAD) &&
                     data == nullptr && data_swa == nullptr;
@@ -12464,7 +12588,8 @@ pxa_gslot_retry_main:   // bug #348 safety net: a graph slot that could not allo
                     // with PXA_SCHED_ASYNC_INPUTS armed (the host no longer blocks per split,
                     // so a submitted graph outlives the call), the previous ubatch may still
                     // be reading them - freeing them under it is an illegal access
-                    if (ggml_backend_sched_get_n_copies(lctx.sched) > 1 || ggml_backend_sched_async_inputs()) {
+                    if (ggml_backend_sched_get_n_copies(lctx.sched) > 1 || ggml_backend_sched_async_inputs() ||
+                        ggml_backend_sched_get_pxa_async_inputs(lctx.sched)) {
                         ggml_backend_sync_tag_push("decode:reserve_real_drain");
                         ggml_backend_sched_synchronize(lctx.sched);
                         ggml_backend_sync_tag_pop();
@@ -12636,7 +12761,8 @@ pxa_gslot_retry_main:   // bug #348 safety net: a graph slot that could not allo
             // llama_decode with no logits read between them); drain first. n_copies == 1
             // (PXA_PIPELINE_PP off) never gets here, and in single-stream decode the sampler
             // has already synchronized, so this costs nothing there.
-            if (ggml_backend_sched_get_n_copies(lctx.sched) > 1 || ggml_backend_sched_async_inputs()) {
+            if (ggml_backend_sched_get_n_copies(lctx.sched) > 1 || ggml_backend_sched_async_inputs() ||
+                        ggml_backend_sched_get_pxa_async_inputs(lctx.sched)) {
                 ggml_backend_sync_tag_push("decode:reused_graph_input_rewrite_drain");
                 ggml_backend_sched_synchronize(lctx.sched);
                 ggml_backend_sync_tag_pop();
@@ -12773,7 +12899,11 @@ pxa_gslot_retry_main:   // bug #348 safety net: a graph slot that could not allo
             comp.n_outputs = lctx.pxa_fold_w;
             llama_batch fb = {};
             fb.n_tokens = lctx.pxa_fold_w;
-            fb.token    = nullptr;   // the rows embed the argmax in-graph; no token input is bound
+            // the placeholders, never read as tokens (no token input is bound: the rows embed the argmax in-graph).
+            // they must be non-null -- with token == nullptr an IMROPE/MROPE model's position fill took the
+            // embeddings-batch branch and copied 4*w positions out of the w-entry pos array (planes 1-3 read
+            // past its end); with them the fill writes the token-batch layout (pos, pos, pos, 0) a commit writes
+            fb.token    = lctx.pxa_fold_btok.data();
             fb.pos      = lctx.pxa_fold_bpos.data();
             fb.n_seq_id = lctx.pxa_fold_bnseq.data();
             fb.seq_id   = lctx.pxa_fold_bseqp.data();
@@ -13257,7 +13387,9 @@ pxa_gslot_retry_main:   // bug #348 safety net: a graph slot that could not allo
 #if PXA_PRINT_TIMING
     auto tim1 = ggml_time_us();
 #endif
-    if (!lctx.prev) {
+    // PXA_CLOSED_HOOK role "sched" GGML_PXQN_SCHED_KEEP_GRAPH: an MTP decode that left a reuse record keeps it (and the
+    // scheduler's allocation) for the next decode, as a plain decode with a record does
+    if (!lctx.prev && !(lctx.pxa_mtp_keep_graph && cparams.mtp_op_type != MTP_OP_NONE && lctx.prev_mtp)) {
         lctx.reset_scheduler();
     }
 #if PXA_PRINT_TIMING
@@ -17299,6 +17431,9 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_MTP:
         case LLM_ARCH_HY_V3:
+        case LLM_ARCH_LFM2:          // PXA LFM port
+        case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_LFM3:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -17975,12 +18110,12 @@ static void pxa_per_step_bytes_by_buft(const llama_kv_cache & kv, const llama_mo
 // draft. Refuse it there: auto mode then takes the whole-state checkpoint (gpu-fallback at one state slot, cpu
 // otherwise) and the server re-decodes the accepted tokens, which is exact.
 static bool pxa_per_step_refused_mamba2(const llama_model & model) {
-    if (!model.hparams.ssm_mamba2) {
+    if (!model.hparams.recurrent_no_per_step()) {   // PXA LFM port: the short conv captures no per-step state either
         return false;
     }
     static std::atomic<bool> told{false};
     if (!told.exchange(true)) {
-        LLAMA_LOG_WARN("%s: per-step recurrent checkpoints are not wired for Mamba-2 layers; using the whole-state "
+        LLAMA_LOG_WARN("%s: per-step recurrent checkpoints are not wired for Mamba-2 / short-conv layers; using the whole-state "
                        "checkpoint (accepted tokens are re-decoded after a rejected draft)\n", __func__);
     }
     return true;
@@ -18169,7 +18304,8 @@ int llama_spec_ckpt_budget_max_tokens(struct llama_context * ctx, int want_max_t
         return std::min(want_max_tokens, (int) kv.ckpt.fixed_max_tokens);
     }
     // PXA_NEMOTRON_MTP: no per-step buffers are ever claimed on a Mamba-2 model (see spec_ckpt_try_per_step)
-    if (ctx->model.hparams.ssm_mamba2) {
+    // PXA LFM port: nor on a short-conv model (pxa_ckpt_fill_per_step_dims would divide by its zero DeltaNet dims)
+    if (ctx->model.hparams.recurrent_no_per_step()) {
         return want_max_tokens;
     }
     pxa_ckpt_fill_per_step_dims(kv, ctx->model);
@@ -20676,11 +20812,13 @@ int32_t llama_decode(
     }
     // PXA_XCACHE_ADAPT_RESET (default on, with PXA_XCACHE_ADAPT): a batch that starts a sequence at position 0 on an empty cache
     // (no other sequence alive whose floats could change) puts the adapted hot set back to the plan first, so the same request
-    // repeats its answer exactly whatever ran before it (src/llama-pxa-xcache.cpp reset_to_plan)
-    if (ctx->model.pxa_xc_ad && !ctx->pxa_xc_companion && ctx->cparams.mtp_op_type == MTP_OP_NONE &&
-        batch.n_tokens > 0 && ctx->kv_self.used == 0 && (batch.pos ? batch.pos[0] == 0 : batch.all_pos_0 == 0)) {
-        llama_synchronize(ctx);
-        llama_pxa_xcache_seq_start(const_cast<llama_model &>(ctx->model));
+    // repeats its answer exactly whatever ran before it (src/llama-pxa-xcache.cpp reset_to_plan). The expert cache's role table
+    // (ggml-pxqn-ext.h, "cache") may start a request at other batches too. A start synchronizes first, so the batch before it has
+    // ticked.
+    if (ctx->model.pxa_xc_ad && !ctx->pxa_xc_companion && ctx->cparams.mtp_op_type == MTP_OP_NONE && batch.n_tokens > 0) {
+        const bool strict = ctx->kv_self.used == 0 && (batch.pos ? batch.pos[0] == 0 : batch.all_pos_0 == 0);
+        llama_pxa_xcache_batch_start(const_cast<llama_model &>(ctx->model), batch.n_tokens, strict,
+                [](void * c) { llama_synchronize((llama_context *) c); }, ctx);
     }
     const auto & pxa_busy = ctx->model.pxa_busy_us;    // PXA_PLE_PREFETCH_PACE: the table's prefetch waits while this runs
     if (pxa_busy) pxa_busy->store(INT64_MAX, std::memory_order_relaxed);

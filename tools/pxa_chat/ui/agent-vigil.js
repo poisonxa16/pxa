@@ -9,10 +9,14 @@
     return new Promise(function (ok, bad) {
       if (window[global]) return ok(window[global]);
       const s = document.createElement("script");
-      s.src = "/api/chat/vigil/ui/" + name;
       s.onload = function () { window[global] ? ok(window[global]) : bad(new Error(name)); };
       s.onerror = function () { bad(new Error(name)); };
-      document.head.appendChild(s);
+      // a <script src> cannot carry the X-PXA-Token header: a single-use ticket for this one load (auth.js)
+      const path = "/api/chat/vigil/ui/" + name;
+      (window.PXA_AUTH ? window.PXA_AUTH.url(path) : Promise.resolve(path)).then(function (u) {
+        s.src = u;
+        document.head.appendChild(s);
+      }, function () { bad(new Error(name)); });
     });
   }
   function loadCards() {

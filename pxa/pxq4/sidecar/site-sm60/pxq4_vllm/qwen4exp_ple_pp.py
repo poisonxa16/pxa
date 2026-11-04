@@ -1,6 +1,6 @@
 """qwen4exp_ple_pp.py -- run the Qwen4Exp n-gram PLE at pipeline_parallel_size > 1.
 
-THE FORK WALL (blocker #1595).  ``vllm/models/qwen4_exp/nvidia/model_state.py:34-40``::
+THE FORK WALL.  ``vllm/models/qwen4_exp/nvidia/model_state.py:34-40``::
 
     if vllm_config.parallel_config.pipeline_parallel_size > 1:
         raise RuntimeError(

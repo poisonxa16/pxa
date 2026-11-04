@@ -331,8 +331,9 @@ left as it is. If it is still missing at startup, the server profiles the model 
 it. `PXA_XCACHE_COUNTS=<csv>` names a different file and is never replaced.
 
 **Learned expert map.** `<model>.expert-counts.learned.csv`, beside the model or in the cache
-directory (`$PXA_CACHE_DIR`, else `$XDG_CACHE_HOME/pxa`, else `~/.cache/pxa`). The learned file
-is used when a measurement says it is faster. An explicit `PXA_XCACHE_COUNTS` is never swapped.
+directory (`$PXA_CACHE_DIR`, else `$XDG_CACHE_HOME/pxa`, else `~/.cache/pxa`). With the PXQN library a
+boot uses the learned file once it holds enough evidence; the boot log names the map it uses. An
+explicit `PXA_XCACHE_COUNTS` is never swapped.
 
 Measured 2026-10-09 on the 32 GB file, one P100 16 GB, the command line above, the Overdrive
 environment, adaptation off (`PXA_XCACHE_ADAPT=0`, which the set the engine applies now uses too), greedy,

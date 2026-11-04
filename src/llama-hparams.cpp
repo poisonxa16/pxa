@@ -1392,6 +1392,73 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_LFM3:
+            {
+                // PXA LFM port (mainline src/models/lfm2.cpp / lfm2moe.cpp / lfm3.cpp load_arch_hparams, MIT, see NOTICE)
+                ml.get_key(LLM_KV_SHORTCONV_L_CACHE,           hparams.n_shortconv_l_cache);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                if (hparams.n_shortconv_l_cache < 2) {
+                    throw std::runtime_error(format("%s: shortconv.l_cache %u must be >= 2", llama_model_arch_name(model.arch), hparams.n_shortconv_l_cache));
+                }
+                // a layer is a short-conv block iff it has no KV heads
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+                }
+                if (model.arch == LLM_ARCH_LFM2MOE) {
+                    ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                    ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func);
+                    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                    switch (hparams.n_layer) {
+                        case 24: model.type = e_model::MODEL_8B_A1B;  break;
+                        case 40: model.type = e_model::MODEL_24B_A2B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                } else if (model.arch == LLM_ARCH_LFM2) {
+                    // every block is dense; the non-causal decision-head variant is not ported
+                    hparams.n_layer_dense_lead = hparams.n_layer;
+                    uint32_t n_layer_decision = 0;
+                    ml.get_key(LLM_KV_DECISION_BLOCK_COUNT, n_layer_decision, false);
+                    if (n_layer_decision > 0) {
+                        throw std::runtime_error("lfm2: decision-head models are not supported");
+                    }
+                    // an optional sliding window on the attention blocks (mainline: is_swa = !is_recr)
+                    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
+                        for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                            hparams.swa_layers[i] = !hparams.recurrent_layer_arr[i];
+                        }
+                    }
+                    switch (hparams.n_ff()) {
+                        case  4608: model.type = e_model::MODEL_350M; break;
+                        case  6912: model.type = e_model::MODEL_700M; break;
+                        case  8192: model.type = e_model::MODEL_1_2B; break;
+                        case 10752: model.type = e_model::MODEL_2_6B; break;
+                        default:    model.type = e_model::MODEL_UNKNOWN;
+                    }
+                } else {
+                    // LFM3 always mixes full and sliding-window attention blocks; the SWA blocks use their own rope base
+                    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+                    bool any_swa = false;
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        any_swa = any_swa || hparams.swa_layers[i];
+                    }
+                    if (!any_swa) {
+                        throw std::runtime_error("lfm3: sliding window attention layers are required");
+                    }
+                    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
+                    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,       hparams.rope_freq_base_train_swa);
+                    ml.get_key(LLM_KV_ATTENTION_CAUSAL, hparams.causal_attn, false);
+                    if (!hparams.causal_attn) {
+                        throw std::runtime_error("lfm3: non-causal (decision) models are not supported");
+                    }
+                    switch (hparams.n_ff()) {
+                        case 7680: model.type = e_model::MODEL_1_7B; break;
+                        default:   model.type = e_model::MODEL_UNKNOWN;
+                    }
+                }
+            } break;
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
             {

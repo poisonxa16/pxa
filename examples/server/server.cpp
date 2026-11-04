@@ -1391,6 +1391,13 @@ static bool pxa_big_sm61_single(void) {
 // at load like the VRAM ladder. Unset or =1 picks 4096, =N (256..8192, a multiple of 256) picks N, =0 turns it off.
 // Gate (det recipe E, Flash-Next 1x V100): det 12/12 long + short, needle 28k identical to the -ub 2048 control.
 // C042 (2026-10-18): a qwen35moe PXQN4 file on one V100 that streams only a small tail gets 2048 instead (PXA_AUTO_UB_STREAM_DECODE).
+// PXA_UB_CEILING=N (> 0): a -ub ceiling over the measured cell (see its use below); 0 = none
+static int pxa_ub_ceiling_env() {
+    const char * e = getenv("PXA_UB_CEILING");
+    const int v = e && *e ? atoi(e) : 0;
+    return v > 0 ? v : 0;
+}
+
 static int pxa_stream_ub_pick(const gpt_params & params, const pxa_topology & topo, const pxa_model_info & model, std::string & why) {
 #if defined(GGML_USE_CUDA)
     const char * ev = getenv("PXA_AUTO_UB_STREAM");
@@ -1982,6 +1989,19 @@ static int pxa_server_resolve_params(int argc, char ** argv, gpt_params & params
                         }
                         fprintf(stderr, "PXA_AUTO: -ub %d is a ceiling here, not a pick: %s (pass -ub N to choose, "
                                         "PXA_AUTO_UB_FASTEST=0 for the measured cell alone)\n", fit_top, fit_why);
+                    }
+                    // PXA_UB_CEILING=N (set by the library's rows for a seat, or by hand): the measured cell's -ub is the floor
+                    // and -ub N a ceiling walked down to it at load (PXA_UB_FIT) when N does not fit
+                    if (card_ub && params.n_ubatch < pxa_ub_ceiling_env() && params.pxa_ub_origin != PXA_UB_FIT) {
+                        const int ceil_ub = pxa_ub_ceiling_env();
+                        params.pxa_ub_fit_floor = params.n_ubatch;
+                        params.pxa_ub_origin    = PXA_UB_FIT;
+                        params.n_ubatch         = ceil_ub;
+                        if (params.n_batch < ceil_ub) {
+                            params.n_batch = ceil_ub;
+                        }
+                        fprintf(stderr, "PXA_AUTO: -ub %d ceiling (PXA_UB_CEILING; walked down to -ub %d at load if it does "
+                                        "not fit)\n", ceil_ub, params.pxa_ub_fit_floor);
                     }
                     // (2026-09-25, ws6-server) the 1x sm_61 cell no longer forces --ctx-checkpoints 0.
                     // Context checkpoints live in host RAM (server_prompt_checkpoint::data), not on

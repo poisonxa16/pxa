@@ -36,7 +36,17 @@
 //   PXA_XCACHE_DECODE_MAXW     widest batch (tokens) that still adapts, default 16 (1..256): two times the widest verify / async
 //                              cold-lane width in use (MTP n_max 3 verifies 4, PLAN_V2 prices 6, the async lane covers 1..8) and half the
 //                              width the adaptor already treats as a prefill-sized observation (32)
+//
+// The cache role (ggml-pxqn-ext.h, role "cache"): an optional table of the closed library that holds request-scoped state of the
+// cache. The adaptor tells it where requests start (llama_pxa_xcache_batch_start), hands it the routing counters and the resident
+// sets when it asks, and makes the moves it plans in one synchronous burst between two decodes (the planner job in flight waited
+// for, every swap in flight landed, evict / admit chains on each layer's copy stream, the maps flushed once every copy landed),
+// then re-creates the policy at that point with the prior the role gives. R-tier + RIX only: an expert's placement cannot change
+// a bit there, so a move changes speed, never an answer. Without the table (no library, an older one, or the table switched off) the hot set
+// is carried across requests as it is.
 #pragma once
+
+#include "ggml-pxqn-ext.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -71,8 +81,17 @@ bool llama_pxa_xcache_residency_blocks(void);
 void llama_pxa_xcache_tick(llama_model & model, int n_tokens);
 
 // a batch starts a sequence at position 0 (llama_decode, main model): with PXA_XCACHE_ADAPT_RESET (default on) the adaptation goes
-// back to the planned hot set first, so a repeated request repeats its answer exactly; =0 keeps the hot set across requests
+// back to the planned hot set first, so a repeated request repeats its answer exactly; =0 keeps the hot set across requests.
+// R-tier + RIX: the cache role's request start runs after it.
+// llama_decode reaches it through llama_pxa_xcache_batch_start.
 void llama_pxa_xcache_seq_start(llama_model & model);
+
+// llama_decode, before every main-model batch (MTP_OP_NONE, not the speculation companion) once the adaptor exists: strict = the
+// batch starts a sequence at position 0 on an empty cache. The request-start decision is the cache role's (without it: STRICT for a
+// strict batch): STRICT runs llama_pxa_xcache_seq_start; PROMPT (a start the role asks for) runs the role's request start alone,
+// never reset_to_plan. Either way sync(ud) (llama_synchronize) first completes the work in flight, so the batch before it has
+// ticked. Returns the GGML_PXQN_CACHE_START_* kind (0 = none).
+int llama_pxa_xcache_batch_start(llama_model & model, int n_tokens, bool strict, void (*sync)(void * ud), void * ud);
 
 // the speculation companion context takes the quiet path (a switch of the PXQN library, ggml-pxqn-tune.h; off without it):
 // its decodes only note their tokens (llama_pxa_xcache_note_tokens) instead of ticking
@@ -86,3 +105,16 @@ bool llama_pxa_xcache_evict_file_stats(const llama_model * model, uint64_t * rea
 
 // finish every copy in flight, print the summary, free the adaptor (the model destructor)
 void llama_pxa_xcache_adaptor_free(llama_model & model);
+
+// the cache role this session: the adaptor's own counts and the role's (ggml_pxqn_cache_stats, their meaning is the role's)
+struct llama_pxa_xc_role_stats {
+    bool     on;               // the role runs (R-tier + RIX, the table present and running, no failed move set)
+    uint64_t waits, dropped_plans, dropped_swaps;   // a planner job in flight at a move set: waited for; plans (and their swaps) dropped
+    double   ms;               // host time of the role's starts, selects and move sets
+    struct ggml_pxqn_cache_stats role;
+};
+// false: no adaptor running
+bool llama_pxa_xcache_role_stats(const llama_model * model, llama_pxa_xc_role_stats * out);
+// the adaptor's own walk of its slot tables (every expert one home, every slot one expert at most, the free cold slots exactly the
+// spare list, the model's slot lists agree with the map, busy = in a swap in flight): the violations found, -1 without an adaptor
+int llama_pxa_xcache_check(const llama_model * model);

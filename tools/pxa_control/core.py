@@ -35,9 +35,12 @@ What it adds on top of the CLI:
 
 SAFETY (a web page drives GPUs, so every edge is closed on purpose):
   * binds 127.0.0.1 unless --lan; a token guards the API in both modes: a fresh one per session on 127.0.0.1
-    (carried in the URL the launcher opens, kept in the 0600 run record), the persistent one with --lan; it becomes
-    an HttpOnly SameSite=Strict cookie named per port after the first visit (only GET /api/health and GET /metrics
-    answer without it on 127.0.0.1). Threat model and fixes H1-H10: tests/test-pxa-control-security.py;
+    (carried in the URL the launcher opens, kept in the 0600 run record), the persistent one with --lan; the page
+    keeps it in the tab (sessionStorage) and sends it as the X-PXA-Token header, never as a cookie: browsers send
+    a host's cookies to every port of it, so any other local listener could replay one (control-cookie-port-scope).
+    Navigations that cannot carry a header take a single-use path-bound ticket (POST /api/auth/ticket). Only GET
+    /api/health and GET /metrics answer without it on 127.0.0.1. Threat model and fixes H1-H10:
+    tests/test-pxa-control-security.py;
   * Host header must name this server (DNS-rebinding guard); every API request and every state change needs
     Sec-Fetch-Site same-origin|none and an Origin equal to http://<Host> when the browser sends them;
   * hashed-script CSP (no 'unsafe-inline' scripts, no eval), frame/CORP/COOP/Permissions headers on every answer;
@@ -138,7 +141,8 @@ DEFAULT_PORT = 7777
 DEFAULT_SERVER_PORT = 8080
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # tools/: the package lives in tools/pxa_control/
 UI_DIR = os.environ.get("PXA_CONTROL_UI_DIR") or os.path.join(HERE, "pxa_control_ui")
-TOKEN_COOKIE = "pxa_control_token"      # the legacy cookie name (still read); a Control sets TOKEN_COOKIE_<port> (H3)
+TOKEN_COOKIE = "pxa_control_token"      # the cookie names Controls before control-cookie-port-scope set (TOKEN_COOKIE and
+                                         # TOKEN_COOKIE_<port>): never set and never read now; kept so tests can replay one
 MAX_BODY = 1 << 20
 BODY_LIMITS = {}                         # path -> bytes, for a route that legitimately takes more (chat images)
 SESSION_TOKEN_BYTES = 24                 # the per-session loopback token: secrets.token_urlsafe(24) = 32 characters (H1)
@@ -3281,9 +3285,10 @@ class App(object):
         if token is None:
             token = load_or_make_token() if lan else secrets.token_urlsafe(SESSION_TOKEN_BYTES)
         self.token = token or None
-        self.cookie_name = f"{TOKEN_COOKIE}_{int(port or 0)}"     # H3: one cookie per Control (cookies ignore ports)
-        from .auth import AuthThrottle            # auth imports core: the import is here, not at the top
+        self.cookie_name = f"{TOKEN_COOKIE}_{int(port or 0)}"     # the old per-port name: never set, never read (H3)
+        from .auth import AuthThrottle, Tickets   # auth imports core: the import is here, not at the top
         self.auth_throttle = AuthThrottle()
+        self.tickets = Tickets()                  # single-use stand-ins for the header on a navigation (H3)
         self.seat = Seat(L, "main")          # the first server (the single seat of older versions)
         self.seats = {"main": self.seat}
         self.seats_lock = threading.Lock()
@@ -4861,7 +4866,9 @@ class App(object):
         if not _is_llama_server(argv):
             x["port"] = r.get("port") or x.get("port")
             x["model"] = r.get("model") or x.get("model")
-        if not x.get("gpus") and r.get("gpus"):
+        if r.get("gpus"):
+            # the cards the launcher picked are what it set; a process env that merely inherited
+            # NVIDIA_VISIBLE_DEVICES=all (a container default) must not widen them
             x["gpus"] = r["gpus"]
         by = "run-server.sh" if r.get("by") == "run-server.sh" else "pxa"
         x.update({"adopted": True, "control": True, "origin": "launcher", "launched_by": by,

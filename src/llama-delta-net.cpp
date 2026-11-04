@@ -49,24 +49,28 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
     auto & hparams = model.hparams;
 
     GGML_ASSERT(batch.n_tokens > 0);
-    GGML_ASSERT(hparams.ssm_n_group > 0);
-    GGML_ASSERT(hparams.ssm_dt_rank > 0);
-    GGML_ASSERT(hparams.ssm_d_conv > 0);
-    GGML_ASSERT(hparams.ssm_d_inner % hparams.ssm_dt_rank == 0);
+    // PXA LFM port: short-conv rows ((l_cache-1)*n_embd, llama_hparams::n_embd_v_s) have no DeltaNet dims;
+    // this object only supplies their per-sequence routing (build_layer_shortconv, src/llama-shortconv.cpp).
+    if (hparams.n_shortconv_l_cache == 0) {
+        GGML_ASSERT(hparams.ssm_n_group > 0);
+        GGML_ASSERT(hparams.ssm_dt_rank > 0);
+        GGML_ASSERT(hparams.ssm_d_conv > 0);
+        GGML_ASSERT(hparams.ssm_d_inner % hparams.ssm_dt_rank == 0);
 
-    const int64_t head_k_dim     = hparams.ssm_d_state;
-    const int64_t num_k_heads    = hparams.ssm_n_group;
-    const int64_t num_v_heads    = hparams.ssm_dt_rank;
-    const int64_t head_v_dim     = hparams.ssm_d_inner / num_v_heads;
-    const int64_t key_dim        = head_k_dim * num_k_heads;
-    const int64_t value_dim      = head_v_dim * num_v_heads;
-    const int64_t ssm_state_dim  = head_v_dim * head_v_dim * num_v_heads;
-    const int64_t conv_dim       = key_dim * 2 + value_dim;
-    const int64_t conv_state_dim = (hparams.ssm_d_conv - 1) * conv_dim;
-    const int64_t state_dim      = conv_state_dim + ssm_state_dim;
-    // PXA Nemotron port: Mamba-2 rows have their own layout (llama_hparams::n_embd_v_s); this object only
-    // supplies the per-sequence routing for them (build_layer_mamba2, src/llama-mamba2.cpp).
-    GGML_ASSERT(hparams.ssm_mamba2 || hparams.n_embd_v_s() == (uint32_t) state_dim);
+        const int64_t head_k_dim     = hparams.ssm_d_state;
+        const int64_t num_k_heads    = hparams.ssm_n_group;
+        const int64_t num_v_heads    = hparams.ssm_dt_rank;
+        const int64_t head_v_dim     = hparams.ssm_d_inner / num_v_heads;
+        const int64_t key_dim        = head_k_dim * num_k_heads;
+        const int64_t value_dim      = head_v_dim * num_v_heads;
+        const int64_t ssm_state_dim  = head_v_dim * head_v_dim * num_v_heads;
+        const int64_t conv_dim       = key_dim * 2 + value_dim;
+        const int64_t conv_state_dim = (hparams.ssm_d_conv - 1) * conv_dim;
+        const int64_t state_dim      = conv_state_dim + ssm_state_dim;
+        // PXA Nemotron port: Mamba-2 rows have their own layout (llama_hparams::n_embd_v_s); this object only
+        // supplies the per-sequence routing for them (build_layer_mamba2, src/llama-mamba2.cpp).
+        GGML_ASSERT(hparams.ssm_mamba2 || hparams.n_embd_v_s() == (uint32_t) state_dim);
+    }
 
     const bool has_explicit_seq_info = batch.n_seq_id != nullptr && batch.seq_id != nullptr;
     token_seq_ids.resize(batch.n_tokens, 0);

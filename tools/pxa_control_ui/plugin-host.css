@@ -31,6 +31,13 @@
 .phpanel{margin:0 0 var(--s5);border:1px solid var(--line);border-radius:var(--r2);background:var(--surface);overflow:hidden;box-shadow:var(--shadow)}
 .phbar{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;padding:10px var(--s4);border-bottom:1px solid var(--line);background:var(--surface-2)}
 .phbar .sp{flex:1}
+/* notices from plugins (notify): newest first, an Open button when the notice names a place in the plugin's page */
+.phnotices{margin:0 0 var(--s5);border:1px solid var(--line);border-radius:var(--r2);background:var(--surface);overflow:hidden}
+.phnlist{list-style:none;margin:0;padding:0}
+.phn{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;padding:8px var(--s4);border-top:1px solid var(--line)}
+.phn:first-child{border-top:0}
+.phn .phn-t{flex:1 1 12rem;min-width:0;overflow-wrap:anywhere}
+.phn .tiny{color:var(--dim)}
 .phframe{display:block;width:100%;height:min(60vh,460px);min-height:280px;border:0;background:var(--surface)}
 /* a plugin's own tab (ui.tab.nav): its bar, then the sealed frame filling the rest of the window */
 .ptbar{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;margin:0 0 var(--s3)}

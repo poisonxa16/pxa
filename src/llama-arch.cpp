@@ -90,6 +90,9 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
     { LLM_ARCH_DEEPSEEK4_DSPARK, "deepseek4-dspark" },
     { LLM_ARCH_DEEPSEEK41,      "deepseek41"   },
+    { LLM_ARCH_LFM2,            "lfm2"         },
+    { LLM_ARCH_LFM2MOE,         "lfm2moe"      },
+    { LLM_ARCH_LFM3,            "lfm3"         },
     // PXA_GLM5NEXT: GLM-5.3-Flash. Upstream PR #27773 registers the string "glm5-next", but
     // the GGUFs people actually have (unsloth/GLM-5.3-Flash-GGUF, and Unsloth's own branch)
     // write "glm5next" with no hyphen, and the KV prefix follows the arch string, so the two
@@ -291,6 +294,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SSM_STATE_SIZE,                "%s.ssm.state_size"     },
     { LLM_KV_SSM_TIME_STEP_RANK,            "%s.ssm.time_step_rank" },
     { LLM_KV_SSM_GROUP_COUNT,               "%s.ssm.group_count"    },
+    { LLM_KV_SHORTCONV_L_CACHE,             "%s.shortconv.l_cache"  },
+    { LLM_KV_DECISION_BLOCK_COUNT,          "%s.decision.block_count" },
 
     { LLM_KV_TOKENIZER_MODEL,                "tokenizer.ggml.model"                    },
     { LLM_KV_TOKENIZER_PRE,                  "tokenizer.ggml.pre"                      },
@@ -374,6 +379,10 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
     case LLM_ARCH_QWEN4EXP:
     // PXA_GLM5NEXT: 34 KDA (recurrent) + 11 MLA blocks in one trunk
     case LLM_ARCH_GLM5NEXT:
+    // PXA LFM port: short-conv layers keep their (l_cache-1) x n_embd conv window in the s_l rows
+    case LLM_ARCH_LFM2:
+    case LLM_ARCH_LFM2MOE:
+    case LLM_ARCH_LFM3:
         return true;
     default:
         return false;

@@ -18,6 +18,11 @@ if not os.path.exists(deff):
 m = re.search(r"set\(_pxqn_srcs\s+([^)]*)\)", cm)
 if not m: print("pxa-def-exports-check: no set(_pxqn_srcs ...) in ggml/src/CMakeLists.txt"); sys.exit(1)
 srcs = m.group(1).split()
+# the newer closed host sources (closed tree only): ggml/src/pxqn-closed-srcs.cmake, appended to _pxqn_srcs
+inc = os.path.join(src, "pxqn-closed-srcs.cmake")
+if os.path.exists(inc):
+    mi = re.search(r"set\(_pxqn_closed_host\s+([^)]*)\)", open(inc, encoding="utf-8").read())
+    if mi: srcs += mi.group(1).split()
 for r in re.finditer(r"if\s*\(\s*MSVC\s*\)(.*?)endif\(\)", cm, re.S):
     for rm in re.finditer(r"list\(REMOVE_ITEM\s+_pxqn_srcs\s+([^)]*)\)", r.group(1)):
         srcs = [s for s in srcs if s not in rm.group(1).split()]

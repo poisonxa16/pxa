@@ -1,6 +1,7 @@
 // Copyright (c) 2026 PXA Network. Part of PXA; distributed under the repository's licence (see LICENSE).
 // ggml-pxqn-overdrive.h -- PXA Overdrive: the per-class lever set the closed PXQN library (libggml-pxqn) carries, and
 // the decision that applies it. Open: this header holds the shapes only. No lever name, no value, no class rule.
+// PXA_CLOSED_HOOK: shapes only (the versioned Overdrive table of the closed library).
 //
 // The engine's autoconfig registry (common/pxa-registry.cpp) hands the library what it knows about the seat (the
 // cards, the GGUF header, the user's picks, the configuration level) and appends the rows the library answers with,
@@ -44,6 +45,8 @@ struct ggml_pxqn_od_in {
     uint32_t         flags;         // GGML_PXQN_OD_IN_*
 };
 #define GGML_PXQN_OD_IN_SPLIT_FORCED 1u   // the user named -sm (split is the user's, not the registry's pick)
+#define GGML_PXQN_OD_IN_SET_OFF      2u   // the engine's off switch (PXA_AUTO_OVERDRIVE=0 / PXA_NO_OVERDRIVE=1): no Overdrive set;
+                                          // the library may still answer a seat's own rows (recipe 2), nothing else
 
 // one row of the answer: an environment variable and the value the recipe was measured with
 struct ggml_pxqn_od_row {

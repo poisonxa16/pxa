@@ -1,0 +1,24 @@
+# release-scan-gguf-exempt.txt - upstream test GGUFs exempt from scripts/release-scan.py check 5 (GGUF metadata).
+#
+# '<sha256>  <repo-relative path>' per line (sha256sum format), '#' starts a comment line. A file is exempt only
+# with EXACTLY this content (sha256) under this basename: a changed byte, another name or a new file blocks until
+# this list is regenerated and the maintainers review it. Only upstream test files that carry no maker of ours belong here
+# (the models/ggml-vocab-*.gguf tokenizer fixtures). Regenerate from the repo root:
+#   sha256sum models/ggml-vocab-*.gguf
+7c53c3c516ac67c7ca12977b9690fdea3d2ef13bbaed6378f98191a13ef5ca00  models/ggml-vocab-aquila.gguf
+4f5b955697f3bd3108070b1d5936c7eb9fc542b81c6932e59abddec75bca1963  models/ggml-vocab-baichuan.gguf
+fbcbe22278fb302694d5f4a41bfe48c5f90e8e3554eab1c0435387dff654a854  models/ggml-vocab-bert-bge.gguf
+a2f8cfea952ef7c391a6d92a1c309d0bd32e36384d9b9230569a7425732f27d9  models/ggml-vocab-command-r.gguf
+91cb1379f2e33af1c4866b194622b7a0e12e8f0c9dba7ba2f10d55978730bec1  models/ggml-vocab-deepseek-coder.gguf
+867f77537b54565f0d81d508c04edc41aa1d4ffc1a92745f225b4c1b02755f76  models/ggml-vocab-deepseek-llm.gguf
+9f0bf8b0733680398b72e652e90f260f43782f326e75545fc0e49611a5ba35ad  models/ggml-vocab-falcon.gguf
+cedc56ca6e2e89f63e781696d1fd76b4b1d49e6720dee86463e915f6e90016ac  models/ggml-vocab-gpt-2.gguf
+ae593a7f9b8bb174ed4f5019e41530463e4dac7aa06e42dee8aa650d2bdac53d  models/ggml-vocab-gpt-neox.gguf
+97272e430d53bc7688f52d5e0ad8ea8f163ede9f1bbd1694feaa504797d5d96e  models/ggml-vocab-llama-bpe.gguf
+16c3724582d59aa8bf84711894e833f916ee46a31d80e21312759c48bf8d0e69  models/ggml-vocab-llama-spm.gguf
+59dc382612866d1fc6c11ea531318d327598f3412d9c8f8600607cdf3030898f  models/ggml-vocab-mpt.gguf
+917c2c5f3b181d2d002683316ec528077f14af83dbe8eaef8f0ed272446d6fea  models/ggml-vocab-nanbeige.gguf
+967d7190d11c4842eab697079d98d56c2116e10eb617be355a2733bfc132e326  models/ggml-vocab-phi-3.gguf
+44c2f46b715f585c6ab513970e8a006bfa5badd6108560054921cf598d154d8c  models/ggml-vocab-qwen2.gguf
+ac3ceda902fed91ccf74312b305d9b86c37e4f8e35fa9cc6ef3ce34fca7d4678  models/ggml-vocab-refact.gguf
+fedb892b4e1bd3c1f2fcdae356440b14fb458f4264d586e5c987ed93df4e174d  models/ggml-vocab-starcoder.gguf

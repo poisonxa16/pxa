@@ -109,7 +109,17 @@ static void expect(const char * name, const char * topo, const pxa_model_info & 
     // Nemotron-H MoE): its own rows below ("qwen35 verify identity: sm_60 only"), left out of the count of the split's two
     const size_t n_vid = (env_of(ac, "PXA_FA_VEC_NY1_SPLIT") != nullptr ? 1 : 0) + (env_of(ac, "PXA_KQMMV_VERIFY_ID_SMALL") != nullptr ? 1 : 0) +
                          (env_of(ac, "PXA_KQMMV_VERIFY_ID_SMALL_W") != nullptr ? 1 : 0);
-    const size_t n_split_env = ac.env.size() - (rb != nullptr ? 1 : 0) - n_pf16k - n_v70 - n_p2t - n_vid;
+    // the closed library's rows for a seat (PXA_AUTO_OVERDRIVE, ggml-pxqn-overdrive.h) ride on some tensor-pair seats when the
+    // library is present: its neutral rows and its library-only rows, left out of the count (they are the library's, pinned by
+    // the closed tests/test-pxqn-overdrive.cpp)
+    size_t n_od = 0;
+    if (const pxa_pick * po = pick(ac, "PXA_AUTO_OVERDRIVE"); po && po->applied) {
+        // the library's rows: its neutral ones and the names the loaded library declares (no closed row named here)
+        for (const auto & e : ac.env) {
+            n_od += e.first == "PXA_UB_CEILING" || e.first == "PXA_DRAFT_ARGMAX" || pxa_lever_is_closed(e.first) ? 1 : 0;
+        }
+    }
+    const size_t n_split_env = ac.env.size() - (rb != nullptr ? 1 : 0) - n_pf16k - n_v70 - n_p2t - n_od - n_vid;
     const bool ok = rb_ok && ac.split == want_split && ac.n_batch == want_b && ac.n_ubatch == want_ub &&
                     sm != nullptr && sm->value == want_sm_value &&
                     // the tensor split always travels with its environment, and only it does. Checked by NAME:

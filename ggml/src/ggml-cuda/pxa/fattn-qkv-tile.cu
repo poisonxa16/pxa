@@ -74,6 +74,9 @@ void ggml_cuda_flash_attn_ext_qkv_tile(ggml_backend_cuda_context & ctx, ggml_ten
                 ggml_type_name(K->type), (int) Q->ne[1], (int) K->ne[1], g);
     }
 
+    if (ggml_cuda_pxqn_attn_wide(ctx, dst) == 0) {   // PXA_CLOSED_HOOK: the closed wide route (PXA_FA_RT); -1 = this route
+        return;
+    }
     switch (K->type) {
         case GGML_TYPE_Q4_0: qkvt_launch_type<GGML_TYPE_Q4_0>(ctx, dst, g); return;
         case GGML_TYPE_Q8_0: qkvt_launch_type<GGML_TYPE_Q8_0>(ctx, dst, g); return;

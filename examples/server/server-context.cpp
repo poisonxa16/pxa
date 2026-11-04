@@ -8,6 +8,7 @@
 
 #include "common.h"
 #include "ggml.h"      // ggml_pxa_config_level (the PXA master config level)
+#include "ggml-pxqn-ext-host.h"   // role "host" (the interval checkpoint test)
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -6188,6 +6189,13 @@ void server_context::add_sampled_tokens() {
     }
 }
 
+// PXA_CLOSED_HOOK role "host" site CKPT_INTERVAL_SKIP: may the interval test below return before its full-cache scan when
+// the slot cannot be due yet (the library's answer; without it the test always scans, the plain rule)
+static bool pxa_ckpt_interval_skip() {
+    static const bool v = ggml_pxqn_host_mode(GGML_PXQN_HOST_CKPT_INTERVAL_SKIP, 0) > 0;
+    return v;
+}
+
 void  server_context::create_checkpoint_at_interval(server_slot & slot, const gpt_params & params_base, bool in_prompt) {
     if (params_base.do_checkpoint && params_base.ctx_checkpoints_interval > 0) {
         // ---- PXA_CKPT_PROMPT_POLICY (DEFAULT ON since 2026-09-03) ------------------------
@@ -6209,6 +6217,18 @@ void  server_context::create_checkpoint_at_interval(server_slot & slot, const gp
             const int32_t remaining = slot.n_prompt_tokens - slot.n_past_prompt;
             const int32_t near_end  = params_base.n_ubatch + std::max(0, params_base.ctx_checkpoints_tolerance);
             if (remaining > near_end) {
+                return;
+            }
+        }
+        // PXA_CKPT_INTERVAL_PREFILTER (default on, =0 off; 2026-11-03): this runs for every generated
+        // token, and llama_kv_cache_seq_pos_max() walks all cache.size cells (64 B each, a set lookup on every used one):
+        // ~0.7 ms per token on a -c 262144 seat (2x P100 27B: --ctx-checkpoints-interval 0 took "other" from ~2.0 to
+        // ~1.2 ms per token). The slot's own token list bounds the sequence's largest position from above
+        // (pos_next() - 1 for text, + slack for draft tokens still in the cache), so while even that bound is short of
+        // the interval the exact answer is too and the scan can be skipped: the same checkpoints at the same positions.
+        if (!in_prompt && pxa_ckpt_interval_skip()) {
+            const int64_t pos_hi = (int64_t) slot.cache_tokens.pos_next() + 64;
+            if ((int64_t) slot.checkpoint_pos + params_base.ctx_checkpoints_interval > 1 + pos_hi) {
                 return;
             }
         }

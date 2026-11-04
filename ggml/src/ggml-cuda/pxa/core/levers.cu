@@ -50,6 +50,9 @@ static const pxa_lever_row g_pxa_lever_rows[PXA_LEVER_COUNT] = {
     { "PXA_FA_TILE256",        "FA_TILE256",      0,
       "pre-Volta D=256 attention at batch > 8 uses the tile-f16 ncols=16 kernel instead of the "
       "single-column vec kernel. Default on; =0 is a kernel-selection rollback, not a fix." },
+    { "PXA_FA_SM61_TILE256",   "FA_SM61_TILE256", 0,
+      "GPUs without fast fp16 (sm_61): a head-256 attention node at batch > 8 runs the kernel the PXQN library "
+      "names instead of the vec-f32 kernel. Default on; =0 keeps the vec-f32 route. Without the library it does nothing." },
     { "PXA_FA_SWA_SLICE",      "FA_SWA_SLICE",    0,
       "restore the windowed KV slice at dispatch. UNSOUND with np>1 or slot reuse (it can cut a "
       "sequence's own cells out of the view and produce NaN logits). Single-sequence benchmarking only." },
@@ -366,6 +369,7 @@ static pxa_lever_state pxa_lever_resolve(int i) {
 
         case PXA_LEVER_FA_MMA_VOLTA_Q8: value = pxa_env_on_unless_zero(v) ? 1 : 0; break;
         case PXA_LEVER_FA_TILE256:      value = pxa_env_on_unless_zero(v) ? 1 : 0; break;
+        case PXA_LEVER_FA_SM61_TILE256: value = pxa_env_on_unless_zero(v) ? 1 : 0; break;
         case PXA_LEVER_FA_SWA_KEEP:     value = pxa_env_on_unless_zero(v) ? 1 : 0; break;
         case PXA_LEVER_SM60_FA_VEC_F32: value = pxa_env_on_unless_zero(v) ? 1 : 0; break;
         case PXA_LEVER_FA_SWA_SLICE:    value = pxa_env_on_if_one(v)     ? 1 : 0; break;

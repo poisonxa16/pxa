@@ -19943,10 +19943,11 @@ static void ggml_compute_forward_clamp_f32(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
+    // Rows are split over the threads below (j = ith; j += nth). The compute loop runs every node on
+    // all n_threads (params->nth = n_threads; GGML_OP_CLAMP's n_tasks = 1 only sizes the plan), so the
+    // old early return for ith != 0 left every row j % nth != 0 UNCLAMPED on the CPU (DeepSeek-V4/V4.1
+    // and GLM-5 SwiGLU limits; found by the dsv41 per-layer oracle, 10-31). Elementwise: the split
+    // changes no value.
     float min;
     float max;
     memcpy(&min, (float *) dst->op_params + 0, sizeof(float));

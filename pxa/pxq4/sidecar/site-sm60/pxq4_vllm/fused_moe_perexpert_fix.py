@@ -1,6 +1,6 @@
 """fused_moe_perexpert_fix.py -- a per-expert QUANTIZED weight is 3-D too, and vLLM assumes it is not.
 
-THE DEFECT (w11 arm 3, the error under the one in #1574).
+THE DEFECT (w11 arm 3, the error under the safetensors re-read one).
 
 ``FusedMoE.load_weights`` (fused_moe/layer.py:1160-1175) decides whether the checkpoint tensor it
 was just handed is the FUSED all-experts stack or ONE expert's weight by looking at its rank::

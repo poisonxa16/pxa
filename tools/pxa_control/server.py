@@ -76,48 +76,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _origin_ok(self):
         return origin_matches_host(self.headers)
 
-    def _cookie_tokens(self):
-        """the values of this Control's cookie, then of the legacy shared name (H3)."""
-        mine, legacy = [], []
-        c = self.headers.get("Cookie") or ""
-        for part in c.split(";"):
-            k, _, v = part.strip().partition("=")
-            if k == getattr(self.app, "cookie_name", None):
-                mine.append(v)
-            elif k == TOKEN_COOKIE:
-                legacy.append(v)
-        return mine + legacy
-
-    def _cookie_token(self):
-        t = self._cookie_tokens()
-        return t[0] if t else None
-
-    def _auth(self, query, method="GET"):
-        """-> (ok, set_cookie). Token from cookie, X-PXA-Token header, Authorization: Bearer, or ?token= on a GET
-        (the link the launcher opens; H10: a POST/DELETE never takes it from the query string)."""
+    def _auth(self, query, method="GET", path=""):
+        """-> (ok, from_query). Token from the X-PXA-Token header, Authorization: Bearer, or ?token= on a GET (the
+        link the launcher opens; H10: a POST/DELETE never takes it from the query string), or a single-use ?ticket=
+        for exactly this path on a GET. A Cookie header is never read: browsers send a host's cookies to every port
+        of it, so a cookie is anyone's on this machine to replay."""
         if not self.app.token:
             return True, False
         auth = self.headers.get("Authorization") or ""
         bearer = auth[7:].strip() if auth[:7].lower() == "bearer " else None     # a Prometheus scrape job
-        cands = [(c, False) for c in self._cookie_tokens()]
-        cands += [(self.headers.get("X-PXA-Token"), False), (bearer, False)]
+        cands = [(self.headers.get("X-PXA-Token"), False), (bearer, False)]
         if method in ("GET", "HEAD"):
             cands.append(((query.get("token") or [None])[0], True))
         for cand, from_query in cands:
             if cand and hmac.compare_digest(str(cand).encode("utf-8", "replace"), self.app.token.encode()):
                 return True, from_query
+        # the raw query, not the parse_qs dict: that drops blank values (?q=&x=1), which the ticket was minted with
+        if method == "GET" and query.get("ticket") and self.app.tickets.redeem(query["ticket"][0], path,
+                                                                                urllib.parse.urlsplit(self.path).query):
+            return True, False
         return False, False
 
     def _needs_token(self, method, path):
-        """H1: False only for what a Control on this machine shows without the token."""
+        """H1: False only for what a Control shows without the token: the page shell and its code (public, the
+        same files every package ships; it signs the tab in from sessionStorage), the sign-in form, and on this
+        machine only GET /api/health and GET /metrics."""
         if not self.app.token:
+            return False
+        if method in ("GET", "HEAD") and (path in STATIC or path == LOGIN_PATH or path in PUBLIC_GET):
             return False
         if self.app.lan:
             return True
         if method in ("GET", "HEAD") and path in OPEN_ON_LOOPBACK:
             return False
-        if method in ("GET", "HEAD") and path in STATIC and path not in PAGE_PATHS:
-            return False                     # js / css / icons: public code, nothing of the user's
         return True
 
     # ---- responses ------------------------------------------------------------------------
@@ -157,7 +148,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                "<code>pxa</code> again: it opens this page signed in. Or paste the token here.")
         return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
                 "<title>PXA Control</title><body style='font-family:system-ui;background:#111214;color:#ECEDEF;"
-                "display:grid;place-items:center;height:100vh;margin:0'><form method=get "
+                "display:grid;place-items:center;height:100vh;margin:0'><form method=get action='/' "
                 "style='display:grid;gap:10px;min-width:280px;max-width:420px'><b>PXA Control</b><span style='color:#A0A4AC'>"
                 + why + "</span>"
                 "<input name=token autocomplete=off style='padding:8px;border-radius:8px;border:1px solid #33363C;"
@@ -167,7 +158,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ---- routing --------------------------------------------------------------------------
     def do_HEAD(self):
         p = urllib.parse.urlparse(self.path).path
-        if p not in STATIC:            # a HEAD on /api/log/stream used to hold a thread forever
+        if p not in STATIC and p != LOGIN_PATH:     # a HEAD on /api/log/stream used to hold a thread forever
             return self._send(405, {"error": "HEAD only on the page"})
         self.do_GET()
 
@@ -200,9 +191,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # another site, not one on another port of this machine, not a sandboxed or file: page (Origin: null)
         if (api or method not in ("GET", "HEAD")) and not (fetch_site_ok(self.headers) and self._origin_ok()):
             return self._send(403, err_body("cross-origin request refused", "cross_origin", 403))
-        ok, set_cookie = True, False
-        if self._needs_token(method, path):
-            ok, set_cookie = self._auth(query, method)
+        ok, from_query = True, False
+        # a first visit: <page>?token=... (the launcher's link, a --lan bookmark, the sign-in form) is checked here
+        signin = bool(self.app.token) and method == "GET" and path in PAGE_PATHS and "token" in query
+        if signin or self._needs_token(method, path):
+            ok, from_query = self._auth(query, method, path)
             if not ok:
                 # H7: past AUTH_FAIL_MAX wrong/missing tokens a minute, an address gets a bare 429 (no login page,
                 # no JSON to build). A right token always passes: on loopback every client is 127.0.0.1, and a
@@ -219,17 +212,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(401, err_body("token required", "unauthorized", 401))
         self.app.last_request = time.time()
         _REQ.who = f"page {self.client_address[0]}" if self.client_address else "api"     # a page is looking: a background Control stays up
-        if set_cookie and method == "GET":
-            # drop the token from the address bar once it is in a cookie
+        if signin and from_query:
+            # the page signs the tab in: the token moves to the fragment (never sent to a server, never in a log or a
+            # Referer), the page's /auth.js keeps it in sessionStorage and drops it from the address bar. No cookie.
             q = {k: v for k, v in query.items() if k != "token"}
             loc = path + (("?" + urllib.parse.urlencode(q, doseq=True)) if q else "")
             self.send_response(303)
-            self.send_header("Location", loc)
-            self.send_header("Set-Cookie", f"{self.app.cookie_name}={self.app.token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict")
+            self.send_header("Location", loc + "#token=" + urllib.parse.quote(self.app.token, safe=""))
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
         try:
+            if method in ("GET", "HEAD") and path == LOGIN_PATH:
+                return self._send(200, self._login_page(), "text/html; charset=utf-8")
             if method == "GET" and path in STATIC:
                 fn, ctype = STATIC[path]
                 try:
@@ -529,7 +525,7 @@ def headless_hint(port, lan=False, environ=None, user=None):
     return [
         "  No desktop here, and PXA Control listens on this machine only (127.0.0.1), so another computer cannot reach it as it is.",
         f"  A) rerun with `pxa --gui --lan`: it listens on every interface (0.0.0.0), port {DEFAULT_PORT} by default, plain http,",
-        "     behind a random access token. Open the address it prints (it ends in ?token=...); a cookie remembers it after that.",
+        "     behind a random access token. Open the address it prints (it ends in ?token=...); the browser tab remembers it after that.",
         "     No other approval step. Use it on a network you trust.",
         f"  B) or from your own computer: ssh -L {port}:127.0.0.1:{port} {user}@{host}   then open the PXA Control address above",
         "     The text menu instead: pxa --tui",

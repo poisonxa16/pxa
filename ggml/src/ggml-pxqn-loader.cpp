@@ -3,6 +3,8 @@
 #include "ggml-pxqn-tune.h"
 #include "ggml-pxqn-levers.h"
 #include "ggml-pxqn-overdrive.h"
+#include "ggml-pxqn-ext.h"
+#include "ggml-pxqn-ext-host.h"
 #include "ggml.h"
 
 #include <cstdio>
@@ -465,9 +467,18 @@ bool ggml_pxqn_overdrive_choose(const struct ggml_pxqn_od_in * in, struct ggml_p
     // the engine's own off switches (public, documented): PXA_AUTO_OVERDRIVE=0 or PXA_NO_OVERDRIVE=1 stand the set down
     const char * od_env = getenv("PXA_AUTO_OVERDRIVE");
     const char * od_no  = getenv("PXA_NO_OVERDRIVE");
-    if ((od_env && *od_env && atoi(od_env) == 0) || (od_no && *od_no && atoi(od_no) != 0)) return false;
+    const bool off = (od_env && *od_env && atoi(od_env) == 0) || (od_no && *od_no && atoi(od_no) != 0);
     const auto * t = ggml_pxqn_overdrive_table();
-    return t && t->choose(in, out) > 0 && out->recipe > 0 && out->n_rows > 0 && out->rows;
+    if (!t) return false;
+    ggml_pxqn_od_in in2 = *in;
+    if (off) in2.flags |= GGML_PXQN_OD_IN_SET_OFF;
+    const bool ok = t->choose(&in2, out) > 0 && out->recipe > 0 && out->n_rows > 0 && out->rows;
+    // off: only a seat's own rows (recipe 2) pass, whatever an older library answers
+    if (!ok || (off && out->recipe != 2)) {
+        out->recipe = 0; out->n_rows = 0; out->rows = nullptr; out->pool_name = nullptr; out->why[0] = '\0';
+        return false;
+    }
+    return true;
 }
 void ggml_pxqn_overdrive_alias_apply(void) {
     const auto * t = ggml_pxqn_overdrive_table();
@@ -523,3 +534,173 @@ static int pxa_rix_maxw_env(void) {
 int ggml_pxa_rix_maxw(void) { static const int v = pxa_rix_maxw_env(); return pxa_rix().tl_off ? v : (1 << 30); }
 void ggml_pxa_rix_tl_off(int off) { const pxa_rix_syms & s = pxa_rix(); if (s.tl_off) s.tl_off(off); }
 #endif
+
+// ---- role tables (ggml-pxqn-ext.h): one optional symbol of the library, one table per role name ----
+#if defined(PXA_PXQN_NO_DLOPEN)
+const void * ggml_pxqn_ext_table(const char * role, uint32_t version, uint32_t min_size) {
+    (void) role; (void) version; (void) min_size;
+    return nullptr;
+}
+#else
+const void * ggml_pxqn_ext_table(const char * role, uint32_t version, uint32_t min_size) {
+    static std::once_flag once;
+    static ggml_pxqn_get_ext_api_fn get = nullptr;
+    std::call_once(once, [] {
+        if (!ggml_pxqn_lib() || !g_pxqn_handle) return;
+        get = (ggml_pxqn_get_ext_api_fn) dlsym(g_pxqn_handle, GGML_PXQN_EXT_SYM);
+    });
+    if (!get || !role || min_size < sizeof(struct ggml_pxqn_ext_head)) return nullptr;
+    const struct ggml_pxqn_ext_head * h = (const struct ggml_pxqn_ext_head *) get(role, version);
+    if (!h || h->version != version || h->size < min_size) return nullptr;
+    return h;
+}
+#endif
+
+const struct ggml_pxqn_gemv_api * ggml_pxqn_gemv_api_get(void) {
+    static const struct ggml_pxqn_gemv_api * t = [] {
+        const auto * g = (const struct ggml_pxqn_gemv_api *) ggml_pxqn_ext_table(GGML_PXQN_GEMV_ROLE, GGML_PXQN_GEMV_VERSION,
+                                                                                (uint32_t) sizeof(struct ggml_pxqn_gemv_api));
+        return g && g->launch ? g : nullptr;
+    }();
+    return t;
+}
+
+int ggml_pxqn_gemv_launch(const struct ggml_pxqn_gemv_args * a, void * stream) {
+    const struct ggml_pxqn_gemv_api * t = ggml_pxqn_gemv_api_get();
+    return t && a ? t->launch(a, stream) : -1;
+}
+
+const struct ggml_pxqn_xchg_api * ggml_pxqn_xchg_api_get(void) {
+    static const struct ggml_pxqn_xchg_api * t = [] {
+        const auto * g = (const struct ggml_pxqn_xchg_api *) ggml_pxqn_ext_table(GGML_PXQN_XCHG_ROLE, GGML_PXQN_XCHG_VERSION,
+                                                                                (uint32_t) sizeof(struct ggml_pxqn_xchg_api));
+        return g && g->launch ? g : nullptr;
+    }();
+    return t;
+}
+
+int ggml_pxqn_xchg_launch(const struct ggml_pxqn_xchg_args * a, void * stream) {
+    const struct ggml_pxqn_xchg_api * t = ggml_pxqn_xchg_api_get();
+    return t && a ? t->launch(a, stream) : -1;
+}
+
+int ggml_pxqn_xchg_rows(int32_t nrank, int64_t ne0, int32_t lines) {
+    const struct ggml_pxqn_xchg_api * t = ggml_pxqn_xchg_api_get();
+    return t && t->rows ? t->rows(nrank, ne0, lines) : 0;
+}
+
+const struct ggml_pxqn_place_api * ggml_pxqn_place_api_get(void) {
+    static const struct ggml_pxqn_place_api * t = [] {
+        const auto * g = (const struct ggml_pxqn_place_api *) ggml_pxqn_ext_table(GGML_PXQN_PLACE_ROLE, GGML_PXQN_PLACE_VERSION,
+                                                                                 (uint32_t) sizeof(struct ggml_pxqn_place_api));
+        return g && g->pick ? g : nullptr;
+    }();
+    return t;
+}
+
+const struct ggml_pxqn_chain_api * ggml_pxqn_chain_api_get(void) {
+    static const struct ggml_pxqn_chain_api * t = [] {
+        const auto * g = (const struct ggml_pxqn_chain_api *) ggml_pxqn_ext_table(GGML_PXQN_CHAIN_ROLE, GGML_PXQN_CHAIN_VERSION,
+                                                                                 (uint32_t) sizeof(struct ggml_pxqn_chain_api));
+        return g && g->next ? g : nullptr;
+    }();
+    return t;
+}
+
+int ggml_pxqn_chain_next(const struct ggml_pxqn_chain_args * a) {
+    const struct ggml_pxqn_chain_api * t = ggml_pxqn_chain_api_get();
+    if (!t || !a || a->size < sizeof(struct ggml_pxqn_chain_args)) return -1;
+    const int r = t->next(a);
+    return r == 0 || r == 1 ? r : -1;
+}
+
+const struct ggml_pxqn_sched_api * ggml_pxqn_sched_api_get(void) {
+    static const struct ggml_pxqn_sched_api * t = [] {
+        const auto * g = (const struct ggml_pxqn_sched_api *) ggml_pxqn_ext_table(GGML_PXQN_SCHED_ROLE, GGML_PXQN_SCHED_VERSION,
+                                                                                 (uint32_t) sizeof(struct ggml_pxqn_sched_api));
+        return g && g->pick ? g : nullptr;
+    }();
+    return t;
+}
+
+uint32_t ggml_pxqn_sched_pick(const struct ggml_pxqn_sched_args * a) {
+    const struct ggml_pxqn_sched_api * t = ggml_pxqn_sched_api_get();
+    if (!t || !a || a->size < sizeof(struct ggml_pxqn_sched_args)) return 0;
+    return t->pick(a) & GGML_PXQN_SCHED_OPTS_KNOWN;
+}
+
+const struct ggml_pxqn_upload_api * ggml_pxqn_upload_api_get(void) {
+    static const struct ggml_pxqn_upload_api * t = [] {
+        const auto * g = (const struct ggml_pxqn_upload_api *) ggml_pxqn_ext_table(GGML_PXQN_UPLOAD_ROLE, GGML_PXQN_UPLOAD_VERSION,
+                                                                                  (uint32_t) sizeof(struct ggml_pxqn_upload_api));
+        return g && g->mode ? g : nullptr;
+    }();
+    return t;
+}
+
+const struct ggml_pxqn_fa_api * ggml_pxqn_fa_api_get(void) {
+    static const struct ggml_pxqn_fa_api * t = [] {
+        const auto * g = (const struct ggml_pxqn_fa_api *) ggml_pxqn_ext_table(GGML_PXQN_FA_ROLE, GGML_PXQN_FA_VERSION,
+                                                                              (uint32_t) sizeof(struct ggml_pxqn_fa_api));
+        return g && g->pick ? g : nullptr;
+    }();
+    return t;
+}
+
+const struct ggml_pxqn_host_api * ggml_pxqn_host_api_get(void) {
+    static const struct ggml_pxqn_host_api * t = [] {
+        const auto * g = (const struct ggml_pxqn_host_api *) ggml_pxqn_ext_table(GGML_PXQN_HOST_ROLE, GGML_PXQN_HOST_VERSION,
+                                                                                (uint32_t) sizeof(struct ggml_pxqn_host_api));
+        return g && g->mode ? g : nullptr;
+    }();
+    return t;
+}
+
+int32_t ggml_pxqn_host_mode(int32_t site, int64_t r0) {
+    const struct ggml_pxqn_host_api * t = ggml_pxqn_host_api_get();
+    if (!t) return 0;
+    struct ggml_pxqn_host_args a = {};
+    a.size = (uint32_t) sizeof(a); a.site = site; a.r0 = r0;
+    const int32_t m = t->mode(&a);
+    return m > 0 ? m : 0;
+}
+
+int32_t ggml_pxqn_upload_mode(const struct ggml_pxqn_upload_args * a) {
+    const struct ggml_pxqn_upload_api * t = ggml_pxqn_upload_api_get();
+    if (!t || !a || a->size < sizeof(struct ggml_pxqn_upload_args)) return 0;
+    const int32_t m = t->mode(a);
+    return m > 0 ? m : 0;
+}
+
+int ggml_pxqn_fa_pick(const struct ggml_pxqn_fa_args * a) {
+    const struct ggml_pxqn_fa_api * t = ggml_pxqn_fa_api_get();
+    if (!t || !a || a->size < sizeof(struct ggml_pxqn_fa_args)) return -1;
+    const int r = t->pick(a);
+    return r == GGML_PXQN_FA_VEC_F32 || r == GGML_PXQN_FA_TILE_F32 ? r : -1;
+}
+
+int ggml_pxqn_place_pick(const struct ggml_pxqn_place_args * a) {
+    const struct ggml_pxqn_place_api * t = ggml_pxqn_place_api_get();
+    if (!t || !a || a->size < sizeof(struct ggml_pxqn_place_args)) return -1;
+    const int ix = t->pick(a);
+    if (ix == GGML_PXQN_PLACE_NO_JOIN && (a->flags & GGML_PXQN_PLACE_PARTS_OK)) return ix;
+    return ix >= 0 && ix < a->n_device ? ix : -1;
+}
+
+const struct ggml_pxqn_cache_api * ggml_pxqn_cache_api_get(void) {
+    static const struct ggml_pxqn_cache_api * t = [] {
+        const auto * c = (const struct ggml_pxqn_cache_api *) ggml_pxqn_ext_table(GGML_PXQN_CACHE_ROLE, GGML_PXQN_CACHE_VERSION,
+                                                                                 (uint32_t) sizeof(struct ggml_pxqn_cache_api));
+        return c && c->create && c->destroy && c->batch && c->select ? c : nullptr;
+    }();
+    return t;
+}
+
+const struct ggml_pxqn_learn_api * ggml_pxqn_learn_api_get(void) {
+    static const struct ggml_pxqn_learn_api * t = [] {
+        const auto * l = (const struct ggml_pxqn_learn_api *) ggml_pxqn_ext_table(GGML_PXQN_LEARN_ROLE, GGML_PXQN_LEARN_VERSION,
+                                                                                 (uint32_t) sizeof(struct ggml_pxqn_learn_api));
+        return l && l->off && l->arm && l->save && l->rows && l->record ? l : nullptr;
+    }();
+    return t;
+}

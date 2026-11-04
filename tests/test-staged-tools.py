@@ -70,6 +70,15 @@ def staged_from_packer(text):
     return names
 
 
+def removed_from_packer(text):
+    """repo-relative files the packer deletes from the stage again (`rm -f "$STAGE/tools/pxa_chat/x.py" ...`)"""
+    names = set()
+    for line in text.splitlines():
+        if re.match(r'^\s*rm -f\s', line):
+            names.update(re.findall(r'"\$STAGE/([A-Za-z0-9_./-]+)"', line))
+    return names
+
+
 def staged_from_dockerfile(text):
     names = set()
     for line in text.splitlines():
@@ -137,8 +146,10 @@ def main():
     packer = packer_text(root)
     dockerfile = os.path.join(root, "docker", "Dockerfile")
     staged = set()
+    removed = set()
     if packer:
         staged |= staged_from_packer(packer)
+        removed = removed_from_packer(packer)
     if os.path.isfile(dockerfile):
         staged |= staged_from_dockerfile(open(dockerfile, encoding="utf-8", errors="replace").read())
     fails = []
@@ -188,7 +199,7 @@ def main():
         if not os.path.isdir(d) or pkg not in carried:
             continue
         for f in sorted(os.path.relpath(os.path.join(dp, x), d) for dp, _dn, fs in os.walk(d) for x in fs):
-            if f.endswith(".py"):           # subpackages too (pxa_control/plugins, pxa_control/store)
+            if f.endswith(".py") and "tools/%s/%s" % (pkg, f) not in removed:   # subpackages too; files the packer drops again do not ship
                 n_tools += 1
                 for name in sorted(imports_in(os.path.join(d, f))):
                     if name.startswith("_") or name in EXTERNAL:

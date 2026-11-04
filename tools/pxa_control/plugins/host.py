@@ -79,6 +79,27 @@ ENV_KEEP = ("PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "SYSTEMROOT"
 RESPONSE_TYPES = ("application/json", "text/plain", "text/event-stream", "text/markdown", "text/csv", "application/octet-stream",
                   "audio/wav", "audio/mpeg", "audio/ogg", "audio/webm", "image/png", "image/jpeg", "image/webp")
 PLUGIN_CSP = "default-src 'none'; sandbox"
+# notify {text, open?}: open names a place in the plugin's own page ({tab, ref}, e.g. {"tab": "needs", "ref": "12"}). Control never
+# reads it: a click on the notice opens that plugin's page and hands open to the page through the bridge (pxa.onOpen). Anything that
+# is not exactly two short plain words is dropped (the notice still shows, the click just opens the page).
+_OPEN_TAB_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+_OPEN_REF_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
+
+
+def notice_open(raw):
+    """-> {"tab", "ref"} when raw is a dict with a plain tab name and a plain ref (str or int), else None."""
+    if not isinstance(raw, dict):
+        return None
+    tab, ref = raw.get("tab"), raw.get("ref", "")
+    if isinstance(ref, bool) or not isinstance(tab, str) or not _OPEN_TAB_RE.match(tab):
+        return None
+    if isinstance(ref, int):
+        ref = str(ref)
+    if not isinstance(ref, str) or (ref and not _OPEN_REF_RE.match(ref)):
+        return None
+    return {"tab": tab, "ref": ref}
+
+
 # host calls: name -> the permission it needs (None: compute only, or the plugin's own state)
 HOST_CALLS = {
     "model.chat": "model.chat",
@@ -226,6 +247,9 @@ class PluginHost(object):
         self.python, self.tools_dir = python, tools_dir   # None: found when first needed (the properties below)
         self.runs = {}
         self.notices = collections.deque(maxlen=50)
+        self._notice_seq = 0
+        self._notice_boot = secrets.token_hex(4)                          # ids differ across restarts: "<boot>-<n>"
+        self._notice_lock = threading.Lock()
         self._lock = threading.RLock()
         self._audit_lock = threading.Lock()
         self._stop = threading.Event()
@@ -731,6 +755,12 @@ class PluginHost(object):
             return {"status": 200, "result": {"state": s["state"]}}
         if name == "notify":
             n = {"plugin": r.pid, "text": str(args.get("text") or "")[:300], "at": int(time.time())}
+            with self._notice_lock:                                     # a number per notice, so the page can tell them apart
+                self._notice_seq += 1
+                n["id"] = "%s-%d" % (self._notice_boot, self._notice_seq)   # a page's cleared ids never hide a new boot's
+            spot = notice_open(args.get("open"))
+            if spot is not None:
+                n["open"] = spot                                    # handed back only to THIS plugin's own page on a click
             self.notices.append(n)
             return {"status": 200, "result": {"ok": True}}
         if name == "model.chat":

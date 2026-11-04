@@ -54,6 +54,40 @@ def main():
             ok = got == want and rc == 2
             print("%s  %-20s rc=%d hits=%s" % ("ok  " if ok else "FAIL", name, rc, sorted(got)))
             fails += not ok
+    # @shape-allow: a secret-shape hit in a known upstream text file (cryptography's ssh.py names the
+    # OpenSSH private-key header as a parsing constant) is allowed only at that path AND with those exact bytes
+    import hashlib
+    with tempfile.TemporaryDirectory() as t:
+        pkg = os.path.join(t, "pkg"); os.makedirs(os.path.join(pkg, "lib", "up"))
+        hdr = "-----BEGIN " + "OPENSSH PRIVATE KEY-----"
+        up = ('_SK_START = b"%s"\n' % hdr).encode()
+        open(os.path.join(pkg, "lib", "up", "ssh.py"), "wb").write(up)
+        open(os.path.join(pkg, "lib", "up", "other.py"), "wb").write(up)          # same bytes, other path: blocks
+        open(os.path.join(pkg, "lib", "mine.py"), "wb").write(up + b"# ours\n")   # other bytes: blocks
+        sha = hashlib.sha256(up).hexdigest()
+        base = "@category demo scope=text\n\\bDEMOBLOCKWORD\\b\n@selftest demo DEMOBLOCKWORD\n"
+        allp = {"lib/up/ssh.py", "lib/up/other.py", "lib/mine.py"}
+        for name, extra, want, rcw in (
+                ("no shape allow", "", allp, 2),
+                ("allow ssh.py by sha", "@shape-allow secret-shape-pem %s lib/up/ssh.py\n" % sha, allp - {"lib/up/ssh.py"}, 2),
+                ("allow glob by sha", "@shape-allow secret-shape-pem %s lib/*\n" % sha, {"lib/mine.py"}, 2),
+                ("wrong sha", "@shape-allow secret-shape-pem %s lib/up/ssh.py\n" % ("0" * 64), allp, 2),
+                ("other shape", "@shape-allow secret-shape-github %s lib/up/ssh.py\n" % sha, allp, 2)):
+            bl = os.path.join(t, "s-%d.txt" % len(name)); open(bl, "w").write(base + extra)
+            rc, js = run(bl, pkg, os.path.join(t, "s-%d.json" % len(name)))
+            got = set(hits(js, "secret-shape-pem"))
+            ok = got == want and rc == rcw
+            print("%s  %-20s rc=%d hits=%s" % ("ok  " if ok else "FAIL", name, rc, sorted(got)))
+            fails += not ok
+        os.remove(os.path.join(pkg, "lib", "up", "other.py")); os.remove(os.path.join(pkg, "lib", "mine.py"))
+        bl = os.path.join(t, "s-only.txt"); open(bl, "w").write(base + "@shape-allow secret-shape-pem %s lib/up/ssh.py\n" % sha)
+        rc, js = run(bl, pkg, os.path.join(t, "s-only.json"))
+        print("%s  only allowed file rc=%d (want 0)" % ("ok  " if rc == 0 else "FAIL", rc)); fails += rc != 0
+        for bad_line in ("@shape-allow secret-shape-pem %s\n" % sha, "@shape-allow demo %s lib/*\n" % sha,
+                         "@shape-allow secret-shape-pem %s lib/*\n" % sha[:63]):
+            bl = os.path.join(t, "s-bad.txt"); open(bl, "w").write(base + bad_line)
+            rc, _ = run(bl, pkg, os.path.join(t, "s-bad.json"))
+            print("%s  malformed shape-allow rc=%d (want 3)" % ("ok  " if rc == 3 else "FAIL", rc)); fails += rc != 3
     print("test-release-scan-allow: %s" % ("PASS" if not fails else "FAIL %d" % fails))
     return 1 if fails else 0
 

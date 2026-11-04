@@ -25,6 +25,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -129,42 +130,49 @@ class SessionToken(Base):
             st, _h, _b = req(self.port, path, method, body={} if method != "GET" else None)
             if st != 401:
                 open_.append((method, path, st))
-        self.assertEqual(sorted((m, p) for m, p, _st in open_), [("GET", "/api/health"), ("GET", "/metrics")])
+        # public code under /api/ (the Vigil page/HUD shells and their fixed assets; review #53657) is open like STATIC
+        pub = sorted(C.PUBLIC_GET)
+        self.assertTrue(all(p in ("/api/chat/vigil/page", "/api/chat/vigil/hud") or p.startswith("/api/chat/vigil/ui/")
+                            for p in pub), pub)
+        self.assertEqual(sorted((m, p) for m, p, _st in open_ if p not in C.PUBLIC_GET),
+                         [("GET", "/api/health"), ("GET", "/metrics")])
         self.assertEqual(dict(((m, p), st) for m, p, st in open_)[("GET", "/api/health")], 200)   # /metrics: 404 when off
         for method, path in routes[:40]:                               # and the token opens them (not 401)
             st, _h, _b = req(self.port, path, method, body={} if method != "GET" else None, headers=tok(self.app))
             self.assertNotEqual(st, 401, (method, path))
 
-    def test_the_page_needs_it_the_assets_do_not(self):
+    def test_the_page_shell_is_open_the_token_signs_the_tab_in(self):
+        # control-cookie-port-scope: a navigation cannot carry the header, so the shell (public code) loads without
+        # the token and signs the tab in from sessionStorage; a ?token= visit moves the token to the fragment
         st, h, b = req(self.port, "/")
-        self.assertEqual(st, 401)
-        self.assertIn(b"run <code>pxa</code> again", b)                 # the loopback sign-in hint
+        self.assertEqual(st, 200)
+        self.assertIn(b'<script src="/auth.js"></script>', b)
         self.assertEqual(req(self.port, "/chat.js")[0], 200)
         self.assertEqual(req(self.port, "/mark.png")[0], 200)
         st, h, _b = req(self.port, "/?token=" + self.app.token)
         self.assertEqual(st, 303)
-        self.assertEqual(h["Location"], "/")
-        ck = h["Set-Cookie"]
-        self.assertTrue(ck.startswith("pxa_control_token_7777=" + self.app.token + ";"))
-        for flag in ("HttpOnly", "SameSite=Strict", "Path=/"):
-            self.assertIn(flag, ck)
-        self.assertEqual(req(self.port, "/", headers={"Cookie": "pxa_control_token_7777=" + self.app.token})[0], 200)
-        self.assertEqual(req(self.port, "/?token=wrong" + "x" * 30)[0], 401)
+        self.assertEqual(h["Location"], "/#token=" + self.app.token)
+        self.assertNotIn("Set-Cookie", h)
+        st, _h, b = req(self.port, "/?token=wrong" + "x" * 30)
+        self.assertEqual(st, 401)
+        self.assertIn(b"run <code>pxa</code> again", b)                 # the loopback sign-in hint
+        st, _h, b = req(self.port, "/login")
+        self.assertEqual(st, 200)
+        self.assertIn(b"run <code>pxa</code> again", b)
 
-    def test_every_html_page_needs_it(self):
-        # review 10-18 night: /share.html joined STATIC without joining PAGE_PATHS, so a token-less open got the page
-        # instead of the sign-in page (H1: every HTML page is a page, only js/css/icons are open on loopback)
-        # /hosts.html is the one deliberate exception: the PWA's offline host picker (test_pxa_control_pwa), no user data
+    def test_every_html_page_signs_in_through_auth_js(self):
+        # review 10-18 night: /share.html joined STATIC without joining PAGE_PATHS; every page that calls the API must
+        # load /auth.js first and take the ?token= redirect. /hosts.html is the exception: the PWA's offline host
+        # picker (test_pxa_control_pwa), no API, no user data
         pages = sorted(p for p, (_fn, ct) in C.STATIC.items() if ct.startswith("text/html") and p != "/hosts.html")
         self.assertIn("/share.html", pages)
         for p in pages:
             st, h, b = req(self.port, p)
-            self.assertEqual(st, 401, p)
-            self.assertIn(b"run <code>pxa</code> again", b, p)
+            self.assertEqual(st, 200, p)
+            self.assertIn(b'<script src="/auth.js"></script>', b.split(b"</head>")[0], p)
             st, h, _b = req(self.port, p + "?token=" + self.app.token)
             self.assertEqual(st, 303, p)
-            self.assertEqual(h["Location"], p)
-            self.assertEqual(req(self.port, p, headers={"Cookie": "pxa_control_token_7777=" + self.app.token})[0], 200, p)
+            self.assertEqual(h["Location"], p + "#token=" + self.app.token)
 
     def test_wrong_tokens_and_bearer(self):
         for h in ({"X-PXA-Token": "nope"}, {"X-PXA-Token": self.app.token[:-1]}, {"Authorization": "Bearer x" * 3},
@@ -201,9 +209,11 @@ class SessionToken(Base):
 class LanToken(Base):
     lan = True
 
-    def test_nothing_is_open_on_the_lan(self):
-        for path in ("/api/health", "/metrics", "/chat.js", "/"):
+    def test_only_the_public_code_is_open_on_the_lan(self):
+        for path in ("/api/health", "/metrics", "/api/info"):
             self.assertEqual(req(self.port, path)[0], 401, path)
+        for path in ("/chat.js", "/", "/auth.js", "/login"):           # the shell signs in from sessionStorage
+            self.assertEqual(req(self.port, path)[0], 200, path)
         self.assertEqual(req(self.port, "/api/health", headers=tok(self.app))[0], 200)
         self.assertEqual(req(self.port, "/api/health", headers={"Host": "rig.lan:7777", **tok(self.app)})[0], 200)
 
@@ -217,8 +227,9 @@ class CrossOrigin(Base):
                 h["Sec-Fetch-Site"] = site
             self.assertEqual(req(self.port, "/api/info", headers=h)[0], want, site)
             self.assertEqual(req(self.port, "/api/stop", "POST", {}, headers=h)[0], want, site)
-        # a navigation from another site to the page is fine (it gets the sign-in page, not the API)
-        self.assertEqual(req(self.port, "/", headers={"Sec-Fetch-Site": "cross-site"})[0], 401)
+        # a navigation from another site to the page is fine (it gets the public shell, never the API)
+        self.assertEqual(req(self.port, "/", headers={"Sec-Fetch-Site": "cross-site"})[0], 200)
+        self.assertEqual(req(self.port, "/api/info", headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
 
     def test_origin_must_be_exactly_this_host(self):
         me = f"http://127.0.0.1:{self.port}"
@@ -236,23 +247,212 @@ class CrossOrigin(Base):
         self.assertEqual(req(self.port, "/api/health", headers={"Host": f"localhost:{self.port}"})[0], 200)
 
 
-# ---- H3 ---------------------------------------------------------------------------------------------------
-class CookiePerPort(unittest.TestCase):
-    def test_two_controls_two_cookies(self):
-        a, b = C.App(L, port=7777), C.App(L, port=7778)
-        self.assertNotEqual(a.cookie_name, b.cookie_name)
-        sa, pa = serve(a)
-        sb, pb = serve(b)
+# ---- H3 (control-cookie-port-scope) -------------------------------------------------------
+# Browsers send a host's cookies to EVERY port of it, so any other listener on 127.0.0.1 (or on the rig, --lan) got
+# Control's token cookie and could replay it: owner access. A per-port NAME does not help (still sent everywhere).
+# The token lives in the tab (sessionStorage) and rides the X-PXA-Token header; no answer sets a cookie, and a cookie
+# never signs anything in. Navigations that cannot carry a header (frames, downloads, script tags, new tabs) use a
+# short-lived single-use ticket bound to one path, minted through the header.
+def ticket(app, port, path):
+    st, _h, b = req(port, "/api/auth/ticket", "POST", {"path": path}, headers=tok(app))
+    assert st == 200, (st, b)
+    return json.loads(b)["ticket"]
+
+
+class TokenNeverInACookie(Base):
+    def visits(self):
+        t = self.app.token
+        return [("GET", "/", {}), ("GET", "/?token=" + t, {}), ("GET", "/share.html?token=" + t, {}),
+                ("GET", "/?token=wrong" + "x" * 30, {}), ("GET", "/login", {}), ("GET", "/chat.js", {}),
+                ("GET", "/api/info", tok(self.app)), ("GET", "/api/info?token=" + t, {}), ("GET", "/api/info", {}),
+                ("GET", "/api/health", {}), ("GET", "/api/info", {"Cookie": f"{self.app.cookie_name}={t}"}),
+                ("POST", "/api/auth/ticket", tok(self.app))]
+
+    def test_a_no_answer_ever_sets_a_cookie(self):
+        for method, path, h in self.visits():
+            st, hd, body = req(self.port, path, method, body={"path": "/api/info"} if method == "POST" else None, headers=h)
+            cookies = [v for k, v in hd.items() if k.lower() == "set-cookie"]
+            self.assertEqual(cookies, [], (method, path, st))
+            self.assertNotIn(self.app.token.encode(), body if path != "/api/auth/ticket" else b"", (method, path))
+
+    def test_b_a_cookie_alone_is_refused(self):
+        t = self.app.token
+        for ck in (f"{self.app.cookie_name}={t}", f"pxa_control_token={t}", f"a=b; {self.app.cookie_name}={t}; pxa_control_token={t}"):
+            self.assertEqual(req(self.port, "/api/info", headers={"Cookie": ck})[0], 401, ck)
+            self.assertEqual(req(self.port, "/api/stop", "POST", {}, headers={"Cookie": ck})[0], 401, ck)
+            self.assertEqual(req(self.port, "/api/auth/ticket", "POST", {"path": "/api/info"}, headers={"Cookie": ck})[0], 401, ck)
+        self.assertFalse(hasattr(self.app, "cookie_tokens"))
+
+    def test_c_the_header_works_a_bad_header_does_not(self):
+        self.assertEqual(req(self.port, "/api/info", headers=tok(self.app))[0], 200)
+        self.assertEqual(req(self.port, "/api/info", headers={**tok(self.app), "Cookie": "pxa_control_token=junk"})[0], 200)
+        for bad in ("nope", self.app.token[:-1], self.app.token + "x", "é" * 32, ""):
+            self.assertEqual(req(self.port, "/api/info", headers={"X-PXA-Token": bad})[0], 401, bad)
+            self.assertEqual(req(self.port, "/api/info", headers={"X-PXA-Token": bad,
+                                                                  "Cookie": f"{self.app.cookie_name}={self.app.token}"})[0], 401, bad)
+
+    def test_d_a_first_visit_redirects_to_an_address_without_the_token(self):
+        t = self.app.token
+        for p, want in (("/?token=" + t, "/"), ("/share.html?token=" + t, "/share.html"), ("/index.html?token=" + t, "/index.html"),
+                        ("/?theme=dark&token=" + t, "/?theme=dark")):
+            st, h, _b = req(self.port, p)
+            self.assertEqual(st, 303, p)
+            loc = h["Location"]
+            server_part, _sep, frag = loc.partition("#")
+            self.assertEqual(server_part, want, p)               # what reaches a server again has no token in it
+            self.assertNotIn(t, server_part)
+            self.assertEqual(frag, "token=" + urllib.parse.quote(t, safe=""), p)   # the tab reads it once, then drops it
+        st, _h, b = req(self.port, "/?token=wrong" + "x" * 30)
+        self.assertEqual(st, 401)
+        self.assertIn(b"<form", b)
+
+    def test_the_page_shell_is_public_code_the_api_is_not(self):
+        st, _h, b = req(self.port, "/")
+        self.assertEqual(st, 200)
+        head = b.split(b"</head>")[0]
+        first = re.search(rb"<script\b[^>]*\bsrc=\"?([^\s\">]+)", head)
+        self.assertEqual(first.group(1), b"/auth.js")        # signs the tab in before any other script asks the API
+        self.assertEqual(req(self.port, "/auth.js")[0], 200)
+        st, _h, b = req(self.port, "/login")
+        self.assertEqual(st, 200)
+        self.assertIn(b"name=token", b)
+        self.assertEqual(req(self.port, "/api/info")[0], 401)
+
+    def test_tickets_are_single_use_path_bound_and_short_lived(self):
+        t = ticket(self.app, self.port, "/api/info")
+        self.assertNotEqual(t, self.app.token)
+        self.assertEqual(req(self.port, "/api/info?ticket=" + t)[0], 200)
+        self.assertEqual(req(self.port, "/api/info?ticket=" + t)[0], 401)          # used up
+        t = ticket(self.app, self.port, "/api/info")
+        self.assertEqual(req(self.port, "/api/status?ticket=" + t)[0], 401)        # another path
+        self.assertEqual(req(self.port, "/api/info?ticket=" + t)[0], 401)          # a refused try also spends it
+        t = ticket(self.app, self.port, "/api/stop")
+        self.assertEqual(req(self.port, "/api/stop?ticket=" + t, "POST", {})[0], 401)   # GET only
+        t = ticket(self.app, self.port, "/api/info")
+        self.app.tickets.age(t, 10 ** 6)
+        self.assertEqual(req(self.port, "/api/info?ticket=" + t)[0], 401)          # expired
+        self.assertEqual(req(self.port, "/api/auth/ticket", "POST", {"path": "/api/info"})[0], 401)   # minting needs the header
+        for bad in ("/", "api/info", "/api/info?x=1", "//evil/api", "/api/../x", 7, ""):
+            self.assertEqual(req(self.port, "/api/auth/ticket", "POST", {"path": bad}, headers=tok(self.app))[0], 400, bad)
+        self.assertEqual(req(self.port, "/api/info?ticket=" + "x" * 32)[0], 401)
+
+    def test_the_ui_never_uses_a_cookie_and_sends_the_header(self):
+        ui = os.path.join(TOOLS, "pxa_control_ui")
+        with open(os.path.join(ui, "auth.js"), encoding="utf-8") as f:
+            js = f.read()
+        self.assertIn("sessionStorage", js)
+        self.assertIn("X-PXA-Token", js)
+        for d in (ui, os.path.join(TOOLS, "pxa_chat", "ui")):
+            for n in sorted(os.listdir(d)):
+                if n.endswith((".js", ".html")):
+                    with open(os.path.join(d, n), encoding="utf-8", errors="replace") as f:
+                        self.assertNotIn("document.cookie", f.read(), n)
+        for page in ("index.html", "share.html"):
+            with open(os.path.join(ui, page), encoding="utf-8") as f:
+                head = f.read().split("</head>")[0]
+            self.assertIn('<script src="/auth.js"></script>', head, page)
+
+
+class TokenNeverInACookieLan(TokenNeverInACookie):
+    lan = True
+
+    def test_the_page_shell_is_public_code_the_api_is_not(self):
+        super().test_the_page_shell_is_public_code_the_api_is_not()
+        for path in ("/api/health", "/metrics", "/api/info"):          # on the LAN only the code is public
+            self.assertEqual(req(self.port, path)[0], 401, path)
+
+
+class SignInEverywhere(Base):
+    """review of c25f0e952c (#53657): the Vigil pages Control serves, exports, frame tickets, HEAD /login."""
+
+    def vigil(self):
+        if ("GET", "/api/chat/vigil/page") not in C.ROUTES:
+            self.skipTest("the chat agent is not importable here")
+        # MED-1 (27796c4076): every /api/chat/vigil/* route answers 403 locked while Control holds no supporter pass for
+        # Anibal (pxa_chat/test_vigil_pass.py). These tests are about signing in, so they run with a pass, made the
+        # test-only way (anibal/tests/supporter_pass.py) in Control's own config folder, which the hub reads.
         try:
-            both = f"pxa_control_token_7777={a.token}; pxa_control_token_7778={b.token}"
-            self.assertEqual(req(pa, "/api/info", headers={"Cookie": both})[0], 200)
-            self.assertEqual(req(pb, "/api/info", headers={"Cookie": both})[0], 200)
-            self.assertEqual(req(pb, "/api/info", headers={"Cookie": f"pxa_control_token_7778={a.token}"})[0], 401)
-            self.assertEqual(req(pa, "/api/info", headers={"Cookie": f"pxa_control_token={a.token}"})[0], 200)   # legacy
-        finally:
-            for s in (sa, sb):
-                s.shutdown()
-                s.server_close()
+            from anibal.tests import supporter_pass
+        except ImportError:
+            self.skipTest("the Anibal plugin is not in this tree")
+        supporter_pass.unlock(self, cfg_dir=C.config_dir())
+
+    def test_vigil_pages_sign_in_through_auth_js_and_their_code_loads(self):
+        self.vigil()
+        for path in ("/api/chat/vigil/page", "/api/chat/vigil/hud"):
+            for h in ({}, tok(self.app), None):
+                if h is None:                                   # the way Control opens it: a ticket
+                    st, hd, b = req(self.port, path + "?ticket=" + ticket(self.app, self.port, path))
+                else:
+                    st, hd, b = req(self.port, path, headers=h)
+                self.assertEqual(st, 200, (path, h))
+                html = b.decode()
+                head = html.split("</head>")[0]
+                first = re.search(r"<script\b[^>]*\bsrc=\"([^\"]+)\"", head)
+                self.assertEqual(first.group(1), "/auth.js", path)  # before every other script
+                m = re.search(r"script-src 'nonce-([^']+)'", hd.get("Content-Security-Policy", ""))
+                if m:                                           # the HUD: only nonce'd scripts run
+                    self.assertIn('<script nonce="%s" src="/auth.js"></script>' % m.group(1), html)
+                self.assertNotIn(self.app.token, html)
+            srcs = sorted(set(re.findall(r'(?:src|href)="(/api/chat/vigil/ui/[^"?]+)"', html)))
+            self.assertTrue(srcs, path)
+            for s_ in srcs:                                     # its code: public, like Control's own scripts
+                self.assertEqual(req(self.port, s_)[0], 200, s_)
+                self.assertEqual(req(self.port, s_, headers=tok(self.app))[0], 200, s_)
+        for path in ("/api/chat/vigil/pane/state", "/api/chat/vigil/events", "/api/chat/vigil/pane/hud"):
+            self.assertEqual(req(self.port, path)[0], 401, path)          # its data: the token, as ever
+
+    def test_tickets_bind_the_query_too(self):
+        st, _h, b = req(self.port, "/api/auth/ticket", "POST", {"path": "/api/info", "query": "x=1"}, headers=tok(self.app))
+        self.assertEqual(st, 200, b)
+        t = json.loads(b)["ticket"]
+        self.assertEqual(req(self.port, "/api/info?x=2&ticket=" + t)[0], 401)          # another query
+        t = json.loads(req(self.port, "/api/auth/ticket", "POST", {"path": "/api/info", "query": "x=1"}, headers=tok(self.app))[2])["ticket"]
+        self.assertEqual(req(self.port, "/api/info?ticket=" + t + "&x=1")[0], 200)     # same query, any order
+        t = ticket(self.app, self.port, "/api/info")
+        self.assertEqual(req(self.port, "/api/info?x=1&ticket=" + t)[0], 401)          # no query bound: none allowed
+        fr = "/api/plugins/host/frame"
+        t = json.loads(req(self.port, "/api/auth/ticket", "POST", {"path": fr, "query": "plugin_id=a"}, headers=tok(self.app))[2])["ticket"]
+        self.assertEqual(req(self.port, fr + "?plugin_id=b&ticket=" + t)[0], 401)       # a frame ticket opens only its plugin
+        t = json.loads(req(self.port, "/api/auth/ticket", "POST", {"path": fr, "query": "plugin_id=a"}, headers=tok(self.app))[2])["ticket"]
+        self.assertNotEqual(req(self.port, fr + "?plugin_id=a&ticket=" + t)[0], 401)
+        for bad in (7, "a" * 2000, "x=1#y"):
+            self.assertEqual(req(self.port, "/api/auth/ticket", "POST", {"path": "/api/info", "query": bad}, headers=tok(self.app))[0], 400, bad)
+
+    def test_tickets_keep_blank_query_values(self):
+        # ctl-cookie-lows L1: a query with an empty value (?q=&x=1) mints and redeems as the same pairs
+        mint = lambda q: json.loads(req(self.port, "/api/auth/ticket", "POST", {"path": "/api/info", "query": q},
+                                        headers=tok(self.app))[2])["ticket"]
+        self.assertEqual(req(self.port, "/api/info?q=&x=1&ticket=" + mint("q=&x=1"))[0], 200)
+        self.assertEqual(req(self.port, "/api/info?x=1&ticket=" + mint("q=&x=1"))[0], 401)        # the blank pair is bound
+        self.assertEqual(req(self.port, "/api/info?q=&x=1&ticket=" + mint("x=1"))[0], 401)        # and not added for free
+
+    def test_login_answers_head(self):
+        st, h, b = req(self.port, "/login", "HEAD")
+        self.assertEqual(st, 200)
+        self.assertTrue(h["Content-Type"].startswith("text/html"))
+        self.assertEqual(b, b"")
+
+    def test_no_ui_navigation_to_the_api_without_a_ticket(self):
+        # location.href / location.assign / window.open of an /api/ address cannot carry the header: it must go
+        # through PXA_AUTH.url (a ticket). The Vigil page and HUD are public shells that sign in from the tab.
+        nav = re.compile(r"""(location\.href\s*=|location\.assign\(|location\.replace\(|window\.open\(|root\.open\()\s*[`"'](/api/[^`"'?]*)""")
+        hits = []
+        for d in (os.path.join(TOOLS, "pxa_control_ui"), os.path.join(TOOLS, "pxa_chat", "ui"), os.path.join(TOOLS, "anibal", "ui")):
+            if not os.path.isdir(d):
+                continue
+            for n in sorted(os.listdir(d)):
+                if n.endswith((".js", ".html")):
+                    with open(os.path.join(d, n), encoding="utf-8", errors="replace") as f:
+                        for i, line in enumerate(f, 1):
+                            for _k, path in nav.findall(line):
+                                if path not in ("/api/chat/vigil/page", "/api/chat/vigil/hud"):
+                                    hits.append(f"{n}:{i}: {path}")
+        self.assertEqual(hits, [])
+
+
+class SignInEverywhereLan(SignInEverywhere):
+    lan = True
 
 
 # ---- H4 ---------------------------------------------------------------------------------------------------
@@ -534,7 +734,7 @@ class Headers(Base):
             self.assertEqual(hd.get("Referrer-Policy"), "no-referrer", path)
 
     def test_page_csp_hashes_the_inline_scripts_and_forbids_inline_eval(self):
-        st, h, body = req(self.port, "/", headers={"Cookie": f"{self.app.cookie_name}={self.app.token}"})
+        st, h, body = req(self.port, "/")
         self.assertEqual(st, 200)
         csp = h["Content-Security-Policy"]
         script = re.search(r"script-src ([^;]*)", csp).group(1)
@@ -585,8 +785,8 @@ class Headers(Base):
 # ---- H10 --------------------------------------------------------------------------------------------------
 class QueryToken(Base):
     def test_query_token_only_on_get(self):
-        st, h, _b = req(self.port, "/api/info?token=" + self.app.token)        # a GET link: cookie, then the bare path
-        self.assertEqual((st, h.get("Location")), (303, "/api/info"))
+        st, h, _b = req(self.port, "/api/info?token=" + self.app.token)        # a GET link: answered, no cookie
+        self.assertEqual((st, h.get("Location"), h.get("Set-Cookie")), (200, None, None))
         self.assertEqual(req(self.port, "/api/stop?token=" + self.app.token, "POST", {})[0], 401)
         self.assertEqual(req(self.port, "/api/stop", "POST", {}, headers=tok(self.app))[0], 200)
         self.assertEqual(req(self.port, "/api/presets?token=" + self.app.token, "DELETE", {"name": "x"})[0], 401)

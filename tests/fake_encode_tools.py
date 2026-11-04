@@ -171,12 +171,63 @@ def tool_quantize(d, a):
     return 0
 
 
+def _record_env(tool):
+    """PXA_FAKE_TOOL_ENV=<file>: append what this tool run saw of the Hugging Face settings (names and flags only)."""
+    rec = os.environ.get("PXA_FAKE_TOOL_ENV")
+    if rec:
+        with open(rec, "a") as f:
+            f.write(json.dumps({"tool": tool, "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE"),
+                                "token": any(k in os.environ for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"))}) + "\n")
+
+
+def _vision_tensors(src):
+    """Names of the vision-tower tensors in the safetensors files of src; a file whose header and data disagree is an error."""
+    names = []
+    for fn in sorted(os.listdir(src)):
+        if not fn.endswith(".safetensors"):
+            continue
+        with open(os.path.join(src, fn), "rb") as f:
+            b = f.read()
+        n = struct.unpack("<Q", b[:8])[0]
+        hdr = json.loads(b[8:8 + n])
+        for k, v in hdr.items():
+            if k == "__metadata__":
+                continue
+            s, e = v["data_offsets"]
+            size = 2
+            for x in v["shape"]:
+                size *= x
+            if not (0 <= s <= e <= len(b) - 8 - n) or e - s != size:
+                raise ValueError("%s: bad offsets for %s" % (fn, k))
+            if ".visual." in "." + k:
+                names.append(k)
+    return names
+
+
 def tool_convert(d, a):
+    _record_env("convert")
     src = a[0]
     outfile = arg(a, "--outfile")
     if not os.path.isfile(os.path.join(src, "config.json")) or not any(f.endswith(".safetensors") for f in os.listdir(src)):
         print("convert: no config.json / safetensors in %s" % src)
         return 1
+    if "--mmproj" in a:                       # the vision projector: needs a vision_config and the preprocessor config, writes a small GGUF
+        with open(os.path.join(src, "config.json")) as f:
+            cfg = json.load(f)
+        if not isinstance(cfg.get("vision_config"), dict) or not os.path.isfile(os.path.join(src, "preprocessor_config.json")):
+            print("convert: --mmproj needs vision_config and preprocessor_config.json in %s" % src)
+            return 1
+        try:
+            vis = _vision_tensors(src)
+        except (ValueError, OSError, KeyError) as e:
+            print("convert: unreadable safetensors: %s" % e)
+            return 1
+        if not vis:
+            print("convert: --mmproj found no vision-tower tensors in %s" % src)
+            return 1
+        print("INFO:hf-to-gguf:v.blk.0.attn_qkv.weight, torch.bfloat16 --> F16, shape = {32, 96}", flush=True)
+        write_gguf(outfile, 1, 1, arch="clip", base_type=1, embed_type=1)
+        return 0
     n = layers_of(src)
     for l in range(n):
         print("INFO:hf-to-gguf:blk.%d.attn_q.weight, torch.bfloat16 --> BF16, shape = {64, 64}" % l, flush=True)

@@ -31,6 +31,7 @@ enum pxa_lever_id {
     PXA_LEVER_FA_MMA_VOLTA_Q8,   // ... and with a matched q8_0 K/V cache at head 256
     PXA_LEVER_FA_TILE_VOLTA,     // 0 off / 1 every batch size / 2 large batch only
     PXA_LEVER_FA_TILE256,        // pre-Volta D=256 batch>8 -> tile-f16 ncols=16
+    PXA_LEVER_FA_SM61_TILE256,   // sm_61 wide head-256 FA: the PXQN library may name the kernel (role "fa")
     PXA_LEVER_FA_SWA_SLICE,      // the unsound windowed KV slice, benchmarking only
     PXA_LEVER_FA_SWA_KEEP,       // keep n_swa in op_params[4] for the mask-driven KV scan
     PXA_LEVER_SM60_FA_VEC_F32,   // sm_60 decode -> fp32-accumulating vec kernel

@@ -114,10 +114,8 @@ class Item2OverdriveRecipeNotInTheOpenTree(unittest.TestCase):
     """Since 2026-10-19 (todo overdrive-levers-into-closed-lib) the launcher carries no Overdrive switch table: the
     engine applies the PXQN library's recipe at startup. Every preset carries only the force switch, the box rows
     (CPU pool, NUMA bind) and the site rows - not one recipe row."""
-    # PXA_XCACHE_RING_LEND=0 (one-V100 preset, 4.0 RC2): an open catalog lever set OFF for that class (a measured
-    # per-class override: prefill), not a closed recipe row; the closed-lever text guard still covers every preset.
     ALLOWED = ("PXA_OVERDRIVE=1", "PXA_XCACHE_CPUPOOL_CPUS=", "PXA_NUMA_BIND=", "GGML_CUDA_NO_PINNED=", "PXA_PLE_MMAP=",
-               "CUDA_DEVICE_ORDER=", "PXA_XCACHE_RING_LEND=0")
+               "CUDA_DEVICE_ORDER=")
 
     def test_launcher_has_no_switch_table_and_presets_carry_only_the_switch(self):
         m = load_launcher()

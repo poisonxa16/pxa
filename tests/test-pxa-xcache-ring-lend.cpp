@@ -4,6 +4,7 @@
 // ggml/src/ggml-cuda/pxa/pxa-stream.cuh and is checked on a card (tests/run-xcache-ring-lend.sh).
 // build: g++ -O1 -std=c++17 -Iinclude -Iggml/include -Iggml/src -Isrc tests/test-pxa-xcache-ring-lend.cpp src/llama-pxa-place.cpp -o /tmp/t
 #include "llama-pxa-place.h"
+#include "pxa-test-portable.h"   // unsetenv on native Windows too
 
 #include <algorithm>
 #include <cmath>

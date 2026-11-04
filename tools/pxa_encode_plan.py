@@ -12,6 +12,7 @@ Numbers that are not obvious carry their source in a comment. Where the measurem
 and the page says so: this file never invents a speed or a quality figure.
 """
 
+import ast
 import json
 import os
 import re
@@ -91,7 +92,7 @@ def tier_entry(name):
 HF_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,95}/[A-Za-z0-9][A-Za-z0-9._\-]{0,95}$")
 HF_URL_RE = re.compile(r"^(?:https?://)?(?:www\.)?(?:huggingface\.co|hf\.co)/([A-Za-z0-9][A-Za-z0-9._\-]*/[A-Za-z0-9][A-Za-z0-9._\-]*)(?:[/?#].*)?$")
 WANT_FILE_RE = re.compile(r"(\.safetensors|\.safetensors\.index\.json|config\.json|generation_config\.json|tokenizer[^/]*|"
-                          r"vocab[^/]*|merges\.txt|special_tokens_map\.json|added_tokens\.json|chat_template[^/]*|preprocessor_config\.json|"
+                          r"vocab[^/]*|merges\.txt|special_tokens_map\.json|added_tokens\.json|chat_template[^/]*|preprocessor_config\.json|processor_config\.json|"
                           r"[^/]*\.tiktoken|[^/]*\.model)$", re.I)
 
 
@@ -233,10 +234,116 @@ def converter_arch_names(path):
             blob = f.read()
     except OSError:
         return None
-    names = set()
-    for m in re.finditer(r"\.register\(([^)]*)\)", blob):
-        names.update(re.findall(r"[\"']([A-Za-z0-9_]+)[\"']", m.group(1)))
+    names, proj = set(), set()
+    for m in re.finditer(r"\.register\(([^)]*)\)(\s*\nclass\s+\w+\(([^)]*)\))?", blob):
+        found = re.findall(r"[\"']([A-Za-z0-9_]+)[\"']", m.group(1))
+        (proj if "MmprojModel" in (m.group(3) or "") else names).update(found)
+    # a vision projector class converts no text model, so its names count only when a text class has them too; the vision-language
+    # wrappers whose language model is named in the sub-config (_VL_WRAPPER_ARCHES, e.g. InternVLChatModel) do convert
+    w = re.search(r"_VL_WRAPPER_ARCHES[^=]*=\s*\(([^)]*)\)", blob)
+    if w:
+        names.update(re.findall(r"[\"']([A-Za-z0-9_]+)[\"']", w.group(1)))
     return names or None
+
+
+def converter_mmproj_arch_names(path):
+    """Architecture names the converter can export a vision projector (`--mmproj`) for: the names registered on a class
+    that subclasses MmprojModel (read as text, never imported). None when the converter has no mmproj export at all."""
+    try:
+        with open(path, errors="replace") as f:
+            blob = f.read()
+    except OSError:
+        return None
+    names = set()
+    for m in re.finditer(r"\.register\(([^)]*)\)\s*\nclass\s+\w+\(([^)]*)\)", blob):
+        if "MmprojModel" in m.group(2):
+            names.update(re.findall(r"[\"']([A-Za-z0-9_]+)[\"']", m.group(1)))
+    return names or None
+
+
+# The tensors of the vision side (tower + projector) of a VL checkpoint, by name prefix after "thinker." and "model." are taken off.
+# The converter's VL text classes skip exactly these (`_vl_skip_prefixes`); Control reads the list out of the converter it runs
+# (converter_vision_prefixes), and this copy is only for a converter it cannot read. A test keeps the two equal.
+VISION_PREFIXES_DEFAULT = ("visual.", "vision_tower.", "vision_model.", "vision.", "mlp1.", "multi_modal_projector.",
+                           "connector.", "merger.", "image_newline")
+_VL_PREFIX_RE = re.compile(r"_vl_skip_prefixes\s*(?::[^=\n]*)?=\s*(\([^)]*\))")
+
+
+def converter_vision_prefixes(path):
+    """The `_vl_skip_prefixes` tuples of the converter at path (read as text, never imported), in order, without repeats."""
+    try:
+        with open(path, errors="replace") as f:
+            blob = f.read()
+    except (OSError, TypeError):
+        return VISION_PREFIXES_DEFAULT
+    out = []
+    for m in _VL_PREFIX_RE.finditer(blob):
+        try:
+            v = ast.literal_eval(m.group(1))
+        except (ValueError, SyntaxError):
+            continue
+        for x in v if isinstance(v, tuple) else ():
+            if isinstance(x, str) and x and x not in out:
+                out.append(x)
+    return tuple(out) or VISION_PREFIXES_DEFAULT
+
+
+def is_vision_tensor(name, prefixes=VISION_PREFIXES_DEFAULT):
+    """True for a tensor of the vision tower or the projector (the converter's VL text classes drop the same names)."""
+    if name.startswith("thinker."):
+        name = name[len("thinker."):]
+    if name.startswith("model."):
+        name = name[len("model."):]
+    return name.startswith(tuple(prefixes))
+
+
+VISION_PARAMS_MAX = 1 << 40                              # caps what a config can make the disk check ask for
+
+
+def vision_params_estimate(cfg):
+    """Parameters of the vision tower + projector, from the config alone (no weights): blocks, patch embedding and the merger.
+    Errs high (it sizes the disk check): within +0..+26% of the measured towers of InternVL2.5-1B, Qwen2.5-VL-3B, Qwen3-VL-2B and
+    SmolVLM2-2.2B. 0 without a vision_config."""
+    vc = (cfg or {}).get("vision_config")
+    if not isinstance(vc, dict):
+        return 0
+    tc = cfg.get("text_config") or cfg.get("llm_config") or cfg
+    tc = tc if isinstance(tc, dict) else cfg
+
+    def num(d, *keys):                                   # a positive finite number in a sane range, else None (the default applies)
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and 1e-3 <= v <= 1e6:
+                return v
+        return None
+    h = int(num(vc, "hidden_size", "embed_dim", "width") or 1152)          # SigLIP so400m, the tower SmolVLM leaves unstated
+    inter = int(num(vc, "intermediate_size") or 4 * h)
+    depth = int(num(vc, "depth", "num_hidden_layers") or 27)
+    p = int(num(vc, "patch_size") or 14)
+    t = int(num(vc, "temporal_patch_size") or 1)
+    out = int(num(vc, "out_hidden_size") or num(tc, "hidden_size") or num(cfg, "hidden_size") or h)
+    mats = 3 if vc.get("hidden_act") == "silu" else 2                        # a gated MLP has three matrices
+    ds = num(cfg, "downsample_ratio")
+    m = min(64, max(1, int(num(vc, "spatial_merge_size") or num(cfg, "scale_factor") or (round(1.0 / ds) if ds else 1))))
+    k = m * m
+    merger = (k * h) ** 2 + k * h * out + out * out
+    deep = min(64, len(vc.get("deepstack_visual_indexes"))) if isinstance(vc.get("deepstack_visual_indexes"), list) else 0
+    n = int(depth * (4 * h * h + mats * h * inter) + 3 * p * p * t * h + merger * (1 + deep))
+    return max(1, min(VISION_PARAMS_MAX, n))
+
+
+def vision_tower(cfg, mmproj_names):
+    """The vision side of a Hugging Face config: has_tower (a vision_config is present), supported (the converter can export its
+    projector), and the sentence for the page. None when the model has no vision tower."""
+    vc = (cfg or {}).get("vision_config")
+    if not isinstance(vc, dict):
+        return None
+    arches = list(vc.get("architectures") or []) + list((cfg or {}).get("architectures") or [])
+    ok = bool(mmproj_names) and any(a in mmproj_names for a in arches)
+    return {"has_tower": True, "supported": ok, "params": vision_params_estimate(cfg),
+            "text": "This model can see images: its vision projector (mmproj) is exported next to the GGUF as an F16 file, "
+                    "and PXA loads it with the model." if ok else
+                    "This model has a vision tower, but this converter cannot export its projector: the GGUF will be text-only."}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -578,19 +685,33 @@ def stage_sizes(src, tier_bytes, plan_stages):
     return {"live": live, "peak": peak, "out": skel, "keep_extra": 0 if "quantize" in plan_stages else q8 + (hess if ldlq else 0)}
 
 
-def disk_need(src, tier_bytes, plan_stages, same_disk=True):
+def disk_need(src, tier_bytes, plan_stages, same_disk=True, extra_work=0, extra_out=0):
     """The ONE disk figure the Checks step shows, both in the Disk space row and in the facts under it.
     The work folder holds the download and the intermediate files (stage_sizes peak); the finished file is written to the output folder.
-    On one disk they add up: need = work peak + final file. On two disks each folder gets its own share.
+    On one disk they add up: need = work peak + final file. On two disks each folder gets its own share. extra_work / extra_out: more
+    bytes in each (the vision projector: projector_disk), counted on top of the peak.
     -> {"same_disk", "work_peak", "result", "work", "out", "need", "keep_extra"} (bytes; `work` / `out` = what each folder must hold)"""
     sz = stage_sizes(src, tier_bytes, plan_stages)
-    peak, res = sz["peak"], sz["out"]
+    peak, res = sz["peak"] + int(extra_work or 0), sz["out"] + int(extra_out or 0)
     if same_disk:
         work, out = peak + res, peak + res          # one filesystem: the same bytes, counted once
     else:
         work, out = peak, res
     return {"same_disk": bool(same_disk), "work_peak": peak, "result": res, "work": work, "out": out,
             "need": peak + res if same_disk else peak, "keep_extra": sz["keep_extra"]}
+
+
+def projector_disk(src, fetch):
+    """(work, out) bytes of the vision projector export: the F16 projector is written in the work folder and then placed in the
+    output folder; fetch=True adds the vision tower read out of the Hugging Face weights (the make flow, where the encoder downloads
+    the model itself), at the bytes per parameter of the download."""
+    vis = (src or {}).get("vision") or {}
+    n = int(vis.get("params") or 0)
+    if not n:
+        return 0, 0
+    f16 = 2 * n
+    bpp = (float(src.get("download_bytes") or 0) / src["params"]) if src.get("params") else 2.0
+    return f16 + (int(n * max(2.0, bpp)) if fetch else 0), f16
 
 
 def time_estimate(src, plan_stages, n_gpu_cards=1, bpw_factor=1.0):

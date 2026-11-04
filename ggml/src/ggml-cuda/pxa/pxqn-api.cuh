@@ -31,7 +31,13 @@ bool mul_mat_vec_pxqn4_q8_1_group_mix_cuda(mmvq_group_args & ga, mmvq_group_args
 //      merged 2026-10-22); 8: reserved, not cut (p01-35b adds nothing beyond 6)
 //   8 (cut 2026-10-22): 7 + ggml_cuda_pxqn_up_gate_down (PXA_PXQN_GU_DOWN; cut on a stream-K branch as "5" = rc2.2's 4 + it,
 //      renumbered to the next free number 2026-10-22; never ship a library with that "5" table)
-#define GGML_PXQN_CUDA_API_VERSION 8u
+//   9 (2026-10-29, never shipped; its last member renamed 2026-11-01): 8 + ggml_cuda_pxqn_window (a graph window at a node);
+//      still unshipped 2026-11-02: + ggml_cuda_pxqn_attn_narrow (the narrow attention route), ggml_cuda_pxqn_get_rows (a row gather)
+//  10 (2026-11-02): 9 + ggml_cuda_pxqn_attn_wide (the wide attention route, PXA_FA_RT)
+//  11 (2026-11-03): 10 + ggml_cuda_pxqn_pfs_cublas_plan, ggml_cuda_pxqn_pfs_cublas_run (PF_SLICE cuBLAS producers)
+//  12 (2026-11-03, never shipped): 11 + ggml_cuda_pxqn_input_copy, ggml_cuda_pxqn_input_fence (host role KQ_MASK_COPY)
+//  13 (2026-11-03): 12 + ggml_cuda_pxqn_input_wait (KQ_MASK_COPY mode 2: the first reader waits for the side-stream copy)
+#define GGML_PXQN_CUDA_API_VERSION 13u
 
 #define GGML_PXQN_CUDA_FNS(X) \
     X(ggml_cuda_pxqn_ctx_init) X(ggml_cuda_pxqn_mul_mat) X(ggml_cuda_pxqn_mul_mat_pair) X(ggml_cuda_pxqn_up_gate) \
@@ -57,7 +63,11 @@ bool mul_mat_vec_pxqn4_q8_1_group_mix_cuda(mmvq_group_args & ga, mmvq_group_args
     X(ggml_cuda_pxqn_mega_gdn_t) X(ggml_cuda_pxqn_mega_attn_t) X(ggml_cuda_pxqn_mega_moe_t3) \
     X(ggml_cuda_pxqn_mega_attn_tail) X(ggml_cuda_pxqn_mega_vw_selftest) \
     X(ggml_cuda_pxqn_dn_outgate) X(ggml_cuda_pxqn_gate_tail) X(mul_mat_vec_pxqn4_q8_1_group_mix_cuda) \
-    X(ggml_cuda_pxqn_up_gate_down)
+    X(ggml_cuda_pxqn_up_gate_down) \
+    X(ggml_cuda_pxqn_window) X(ggml_cuda_pxqn_attn_narrow) X(ggml_cuda_pxqn_get_rows) \
+    X(ggml_cuda_pxqn_attn_wide) \
+    X(ggml_cuda_pxqn_pfs_cublas_plan) X(ggml_cuda_pxqn_pfs_cublas_run) \
+    X(ggml_cuda_pxqn_input_copy) X(ggml_cuda_pxqn_input_fence) X(ggml_cuda_pxqn_input_wait)
 
 struct ggml_pxqn_cuda_api {
     uint32_t version;       // GGML_PXQN_CUDA_API_VERSION

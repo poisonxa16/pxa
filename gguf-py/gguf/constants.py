@@ -104,6 +104,7 @@ class Keys:
         HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
         SWIGLU_CLAMP_EXP                  = "{arch}.swiglu_clamp_exp"
         SWIGLU_CLAMP_SHEXP                = "{arch}.swiglu_clamp_shexp"
+        NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"  # qwen3vl
 
     class Attention:
         HEAD_COUNT        = "{arch}.attention.head_count"
@@ -156,6 +157,7 @@ class Keys:
         SCALING_YARN_ATTN_FACTOR = "{arch}.rope.scaling.yarn_attn_factor"
         SCALING_YARN_BETA_FAST   = "{arch}.rope.scaling.yarn_beta_fast"
         SCALING_YARN_BETA_SLOW   = "{arch}.rope.scaling.yarn_beta_slow"
+        DIMENSION_SECTIONS       = "{arch}.rope.dimension_sections"  # qwen2vl / qwen3vl M-RoPE
 
     class Split:
         LLM_KV_SPLIT_NO            = "split.no"
@@ -215,6 +217,43 @@ class Keys:
         TYPE       = "adapter.type"
         LORA_ALPHA = "adapter.lora.alpha"
 
+    # vision projector (mmproj) keys, read by the engine's mtmd clip loader (examples/mtmd/clip-impl.h)
+    # Adapted from llama.cpp gguf-py @ 961c376a2d (MIT, Copyright (c) 2023-2026 The ggml authors).
+    class Clip:
+        PROJECTOR_TYPE        = "clip.projector_type"
+        HAS_VISION_ENCODER    = "clip.has_vision_encoder"
+        HAS_AUDIO_ENCODER     = "clip.has_audio_encoder"
+        HAS_LLAVA_PROJECTOR   = "clip.has_llava_projector"
+
+    class ClipVision:
+        PROJECTOR_TYPE        = "clip.vision.projector_type"  # for mixed modality models
+        IMAGE_SIZE            = "clip.vision.image_size"
+        IMAGE_MIN_PIXELS      = "clip.vision.image_min_pixels"
+        IMAGE_MAX_PIXELS      = "clip.vision.image_max_pixels"
+        PREPROC_IMAGE_SIZE    = "clip.vision.preproc_image_size"
+        PREPROC_MIN_TILES     = "clip.vision.preproc_min_tiles"  # InternVL dynamic tiling
+        PREPROC_MAX_TILES     = "clip.vision.preproc_max_tiles"
+        PATCH_SIZE            = "clip.vision.patch_size"
+        EMBEDDING_LENGTH      = "clip.vision.embedding_length"
+        FEED_FORWARD_LENGTH   = "clip.vision.feed_forward_length"
+        PROJECTION_DIM        = "clip.vision.projection_dim"
+        BLOCK_COUNT           = "clip.vision.block_count"
+        IMAGE_MEAN            = "clip.vision.image_mean"
+        IMAGE_STD             = "clip.vision.image_std"
+        SPATIAL_MERGE_SIZE    = "clip.vision.spatial_merge_size"
+        USE_GELU              = "clip.use_gelu"
+        USE_SILU              = "clip.use_silu"
+        N_WA_PATTERN          = "clip.vision.n_wa_pattern"      # qwen2.5vl
+        IS_DEEPSTACK_LAYERS   = "clip.vision.is_deepstack_layers"  # qwen3vl
+        WINDOW_SIZE           = "clip.vision.window_size"
+
+        class Attention:
+            HEAD_COUNT      = "clip.vision.attention.head_count"
+            LAYERNORM_EPS   = "clip.vision.attention.layer_norm_epsilon"
+
+        class Projector:
+            SCALE_FACTOR    = "clip.vision.projector.scale_factor"
+
     class IMatrix:
         CHUNK_COUNT = "imatrix.chunk_count"
         CHUNK_SIZE  = "imatrix.chunk_size"
@@ -229,6 +268,7 @@ class GGUFType:
     MODEL   = "model"
     ADAPTER = "adapter"
     IMATRIX = "imatrix"
+    MMPROJ  = "mmproj"  # vision projector file for the mtmd clip loader
 
 
 class MODEL_ARCH(IntEnum):
@@ -297,6 +337,10 @@ class MODEL_ARCH(IntEnum):
     NEMOTRON     = auto()  # PXA Nemotron port
     NEMOTRON_H   = auto()  # PXA Nemotron port
     NEMOTRON_H_MOE = auto()  # PXA Nemotron port
+    QWEN2VL        = auto()
+    QWEN3VL        = auto()
+    QWEN3VLMOE     = auto()
+    MMPROJ         = auto()  # dummy arch for the mtmd clip loader
 
 class MODEL_TENSOR(IntEnum):
     TOKEN_EMBD           = auto()
@@ -433,6 +477,30 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_COMPRESSOR_APE   = auto()
     INDEXER_COMPRESSOR_NORM  = auto()
     FFN_GATE_TID2EID         = auto()
+    # vision projector (mmproj) tensors
+    V_MMPROJ                 = auto()
+    V_MMPROJ_FC              = auto()
+    V_MMPROJ_MLP             = auto()
+    V_ENC_EMBD_CLS           = auto()
+    V_ENC_EMBD_PATCH         = auto()
+    V_ENC_EMBD_POS           = auto()
+    V_ENC_ATTN_QKV           = auto()
+    V_ENC_ATTN_Q             = auto()
+    V_ENC_ATTN_K             = auto()
+    V_ENC_ATTN_V             = auto()
+    V_ENC_INPUT_NORM         = auto()
+    V_ENC_ATTN_O             = auto()
+    V_ENC_POST_ATTN_NORM     = auto()
+    V_ENC_FFN_UP             = auto()
+    V_ENC_FFN_GATE           = auto()
+    V_ENC_FFN_DOWN           = auto()
+    V_LAYER_SCALE_1          = auto()
+    V_LAYER_SCALE_2          = auto()
+    V_PRE_NORM               = auto()
+    V_POST_NORM              = auto()
+    V_DS_NORM                = auto()
+    V_DS_FC1                 = auto()
+    V_DS_FC2                 = auto()
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
@@ -501,6 +569,10 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NEMOTRON:       "nemotron",
     MODEL_ARCH.NEMOTRON_H:     "nemotron_h",
     MODEL_ARCH.NEMOTRON_H_MOE: "nemotron_h_moe",
+    MODEL_ARCH.QWEN2VL:        "qwen2vl",
+    MODEL_ARCH.QWEN3VL:        "qwen3vl",
+    MODEL_ARCH.QWEN3VLMOE:     "qwen3vlmoe",
+    MODEL_ARCH.MMPROJ:         "clip",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -640,6 +712,29 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.INDEXER_COMPRESSOR_APE:    "blk.{bid}.indexer_compressor_ape",
     MODEL_TENSOR.INDEXER_COMPRESSOR_NORM:   "blk.{bid}.indexer_compressor_norm",
     MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
+    MODEL_TENSOR.V_MMPROJ:                              "mm.{bid}",
+    MODEL_TENSOR.V_MMPROJ_FC:                           "mm.model.fc",
+    MODEL_TENSOR.V_MMPROJ_MLP:                          "mm.model.mlp.{bid}",
+    MODEL_TENSOR.V_ENC_EMBD_CLS:                        "v.class_embd",
+    MODEL_TENSOR.V_ENC_EMBD_PATCH:                      "v.patch_embd",
+    MODEL_TENSOR.V_ENC_EMBD_POS:                        "v.position_embd",
+    MODEL_TENSOR.V_ENC_ATTN_QKV:                        "v.blk.{bid}.attn_qkv",
+    MODEL_TENSOR.V_ENC_ATTN_Q:                          "v.blk.{bid}.attn_q",
+    MODEL_TENSOR.V_ENC_ATTN_K:                          "v.blk.{bid}.attn_k",
+    MODEL_TENSOR.V_ENC_ATTN_V:                          "v.blk.{bid}.attn_v",
+    MODEL_TENSOR.V_ENC_INPUT_NORM:                      "v.blk.{bid}.ln1",
+    MODEL_TENSOR.V_ENC_ATTN_O:                          "v.blk.{bid}.attn_out",
+    MODEL_TENSOR.V_ENC_POST_ATTN_NORM:                  "v.blk.{bid}.ln2",
+    MODEL_TENSOR.V_ENC_FFN_UP:                          "v.blk.{bid}.ffn_up",
+    MODEL_TENSOR.V_ENC_FFN_GATE:                        "v.blk.{bid}.ffn_gate",
+    MODEL_TENSOR.V_ENC_FFN_DOWN:                        "v.blk.{bid}.ffn_down",
+    MODEL_TENSOR.V_LAYER_SCALE_1:                       "v.blk.{bid}.ls1",
+    MODEL_TENSOR.V_LAYER_SCALE_2:                       "v.blk.{bid}.ls2",
+    MODEL_TENSOR.V_PRE_NORM:                            "v.pre_ln",
+    MODEL_TENSOR.V_POST_NORM:                           "v.post_ln",
+    MODEL_TENSOR.V_DS_NORM:                             "v.deepstack.{bid}.norm",
+    MODEL_TENSOR.V_DS_FC1:                              "v.deepstack.{bid}.fc1",
+    MODEL_TENSOR.V_DS_FC2:                              "v.deepstack.{bid}.fc2",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -1819,6 +1914,78 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
     ],
+    MODEL_ARCH.QWEN2VL: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.QWEN3VL: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.QWEN3VLMOE: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+    ],
+    MODEL_ARCH.MMPROJ: [
+        MODEL_TENSOR.V_MMPROJ,
+        MODEL_TENSOR.V_MMPROJ_FC,
+        MODEL_TENSOR.V_MMPROJ_MLP,
+        MODEL_TENSOR.V_ENC_EMBD_CLS,
+        MODEL_TENSOR.V_ENC_EMBD_PATCH,
+        MODEL_TENSOR.V_ENC_EMBD_POS,
+        MODEL_TENSOR.V_ENC_ATTN_QKV,
+        MODEL_TENSOR.V_ENC_ATTN_Q,
+        MODEL_TENSOR.V_ENC_ATTN_K,
+        MODEL_TENSOR.V_ENC_ATTN_V,
+        MODEL_TENSOR.V_ENC_INPUT_NORM,
+        MODEL_TENSOR.V_ENC_ATTN_O,
+        MODEL_TENSOR.V_ENC_POST_ATTN_NORM,
+        MODEL_TENSOR.V_ENC_FFN_UP,
+        MODEL_TENSOR.V_ENC_FFN_GATE,
+        MODEL_TENSOR.V_ENC_FFN_DOWN,
+        MODEL_TENSOR.V_LAYER_SCALE_1,
+        MODEL_TENSOR.V_LAYER_SCALE_2,
+        MODEL_TENSOR.V_PRE_NORM,
+        MODEL_TENSOR.V_POST_NORM,
+        MODEL_TENSOR.V_DS_NORM,
+        MODEL_TENSOR.V_DS_FC1,
+        MODEL_TENSOR.V_DS_FC2,
+    ],
     # TODO
 }
 
@@ -1877,6 +2044,15 @@ class TokenType(IntEnum):
     USER_DEFINED = 4
     UNUSED       = 5
     BYTE         = 6
+
+
+# projector type names, as the engine's mtmd clip loader spells them (examples/mtmd/clip-impl.h)
+class VisionProjectorType:
+    IDEFICS3 = "idefics3"
+    QWEN2VL  = "qwen2vl_merger"
+    QWEN25VL = "qwen2.5vl_merger"
+    QWEN3VL  = "qwen3vl_merger"
+    INTERNVL = "internvl"
 
 
 class RopeScalingType(Enum):

@@ -1284,19 +1284,22 @@ class TokenAuth(unittest.TestCase):
     def test_refused_without_token(self):
         self.assertEqual(req(self.port, "/api/info")[0], 401)
         code, _, body = req(self.port, "/")
-        self.assertEqual(code, 401)
+        self.assertEqual(code, 200)                                    # the public shell: /auth.js sends it to /login
+        self.assertIn(b'<script src="/auth.js"></script>', body)
+        code, _, body = req(self.port, "/login")
+        self.assertEqual(code, 200)
         self.assertIn(b"token", body)
         self.assertEqual(req(self.port, "/api/info", headers={"X-PXA-Token": "wrong"})[0], 401)
         self.assertEqual(req(self.port, "/api/info", headers={"Cookie": "pxa_control_token=nope"})[0], 401)
 
-    def test_header_query_cookie(self):
+    def test_header_query_never_a_cookie(self):
         self.assertEqual(req(self.port, "/api/info", headers={"X-PXA-Token": "s3cret-token"})[0], 200)
         code, h, _ = req(self.port, "/?token=s3cret-token&x=1")
         self.assertEqual(code, 303)
-        self.assertEqual(h.get("Location"), "/?x=1")
-        self.assertIn("pxa_control_token_7777=s3cret-token", h.get("Set-Cookie", ""))     # H3: one cookie per port
-        self.assertIn("HttpOnly", h.get("Set-Cookie", ""))
-        self.assertEqual(req(self.port, "/api/info", headers={"Cookie": "a=b; pxa_control_token=s3cret-token"})[0], 200)
+        self.assertEqual(h.get("Location"), "/?x=1#token=s3cret-token")      # the persisted --lan bookmark still signs in
+        self.assertNotIn("Set-Cookie", h)                                     # control-cookie-port-scope: never a cookie
+        self.assertEqual(req(self.port, "/api/info", headers={"Cookie": "a=b; pxa_control_token=s3cret-token"})[0], 401)
+        self.assertEqual(req(self.port, "/api/info", headers={"Cookie": "pxa_control_token_7777=s3cret-token"})[0], 401)
         # any Host is fine on a LAN bind (the token is the guard), cross-origin POST still refused
         self.assertEqual(req(self.port, "/api/info", host="192.168.1.5:7777",
                              headers={"X-PXA-Token": "s3cret-token"})[0], 200)

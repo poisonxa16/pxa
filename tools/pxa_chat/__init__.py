@@ -22,6 +22,14 @@ _hubs = {}
 _lock = threading.Lock()
 
 
+def public_code(ROUTES):
+    """the GET paths of these routes that serve public code, open like Control's own STATIC files (control-cookie-
+    port-scope): the Vigil page and HUD shells (templated package HTML, no token, no user data; they load /auth.js
+    first, so a reload or a PWA launch signs in from the tab) and their fixed asset list. Their data stays behind the token."""
+    shells = ("/api/chat/vigil/page", "/api/chat/vigil/hud")
+    return {p for (m, p) in ROUTES if m == "GET" and (p in shells or p.startswith("/api/chat/vigil/ui/"))}
+
+
 def register(ROUTES, STATIC, Reply, config_dir, load_config=None, host=None, who=None):
     """add the chat routes, agent.js/agent.css and the agent-<name> plugins to Control's tables.
 
@@ -36,6 +44,7 @@ def register(ROUTES, STATIC, Reply, config_dir, load_config=None, host=None, who
             if h is None:
                 h = _routes.Hub(os.path.join(config_dir(), "chat"), load_config,
                                 host(app) if callable(host) else host, who=who)
+                h.control_root = config_dir()       # the agent's supporter pass is read from Control's own folder
                 _hubs[id(app)] = h
             return h
     ROUTES.update(_routes.make_routes(hub_for, Reply))

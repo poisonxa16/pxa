@@ -161,6 +161,7 @@ GGML_API ggml_pxqn_xcache_learn_build_fn ggml_pxqn_xcache_learn_build_get(void);
 
 // Optional symbol: which counts file a boot opens. 0 = curated, 1 = learned.
 // explicit_flag nonzero returns 0. Means are filled when a measurement was read, else -1.
+// Without a measurement of both files, the library's own record of the learned file decides.
 // NULL when the library is absent: the engine keeps the curated file and does not open a learned one.
 #define GGML_PXQN_XCACHE_COUNTS_PICK_SYM "ggml_pxqn_xcache_counts_pick"
 typedef int (*ggml_pxqn_xcache_counts_pick_fn)(const char * curated, const char * learned, int explicit_flag,

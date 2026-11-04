@@ -6,13 +6,40 @@
 <a href="https://ko-fi.com/shatteredrealms1"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-Support%20PXA-FF5E5B?logo=ko-fi&logoColor=white&style=for-the-badge"></a>
 </p>
 
-# PXA 4.0.1
+# PXA 4.0.2
 
 PXA is a free inference engine for older datacenter cards, the Tesla P100 and V100, and for Pascal cards such as the GTX 1080 Ti. In every comparison below, 4.0 is ahead of v3.1 and of mainline llama.cpp on the same machine, on every prompt class we measured. 4.0 adds the Nemotron families and GLM-5.3-Flash, runs the Qwen3.6 35B-A3B mixture-of-experts model with its MTP block, makes Flash-Next with Overdrive several times faster on one V100, rebuilds PXA Control, and adds Docker, Windows and macOS builds. The numbers come first, then what changed.
 
-PXA 4.0.1 is a fix release on top of 4.0. The 4.0.1 changes come first; the 4.0 notes follow them unchanged.
+PXA 4.0.2 adds LFM support and misc speed improvements on top of 4.0.1. The 4.0.2 changes come first, then the 4.0.1 changes; the 4.0 notes follow them unchanged.
 
-## What is new in 4.0.1
+## What is new in 4.0.2
+
+**LFM support**
+- LFM2 models load and run.
+- LFM2-MoE models (8B and 24B) load and run.
+- LFM3 models load and run.
+
+**Misc speed improvements**
+- GTX 10xx (1080 Ti class): prompt processing is faster, about 40% on long prompts measured on a GTX 1080 Ti.
+- Two Tesla P100 cards with a 27B model and MTP: decoding is faster than in 4.0.1.
+- Tesla P100: k-quant layers decode a little faster, now on by default, with the same output.
+
+**Fixes**
+- Speculative decoding on Tesla P100 gives the same text as plain decoding on code, prose and chat prompts.
+- PXA Control no longer keeps its sign-in token in a browser cookie.
+- Misc fixes.
+
+**Good to know**
+- Windows and the PXA Control apps for Windows and macOS for 4.0.2 follow shortly; Linux and Docker come first.
+- Multi-GPU GTX 10xx and P40 setups are untested by us: please report how they run.
+- Turing cards (RTX 20xx, GTX 16xx, T4): every build carries native code for them, but they are not run-tested yet.
+
+| Platform | File |
+|---|---|
+| Linux x86_64 (CUDA 12.8, native code for sm_60, 61, 70, 75, 80, 86, 89) | `pxa-v4.0.2-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz` |
+| Docker image (Linux, NVIDIA runtime) | `ghcr.io/poisonxa16/pxa:v4.0.2` |
+
+## What was new in 4.0.1
 
 **Fixes**
 - Linux: opening PXA Control in your browser works again on newer distributions such as Debian 13; the libraries that ship with PXA are now used by the engine only.
@@ -31,7 +58,7 @@ PXA 4.0.1 is a fix release on top of 4.0. The 4.0.1 changes come first; the 4.0 
 - Overdrive on one V100 (Flash-Next class): an optional deeper draft chain that only runs right after a fully accepted round and while its confidence holds; same output, off by default.
 - GLM-5.3-Flash MTP with experts in host memory: an optional confidence gate skips the draft when the head is unsure, so those steps decode plainly; off by default.
 
-## Downloads
+## 4.0.1 downloads
 
 | Platform | File |
 |---|---|

@@ -935,6 +935,9 @@ struct kqmmv_mdesc { const void * w; float * dst; int64_t nb01; int64_t sd; int 
 
 // wide = the non-GU launches whose x does not fit the block take the wide form (k_kq_mmv_rw); false = the
 // chunked k_kq_mmv form (one row group per block, x re-staged per K chunk).
+// KQMMV_NO_RUN: a translation unit that uses only the device helpers above defines it and leaves this out, and with
+// it every instantiation of the kernel templates above (their launchers are templates too).
+#ifndef KQMMV_NO_RUN
 static cudaError_t kqmmv_run_mats(int T, int P, int ny, const float * x, int64_t sx, int K,
                                   const kqmmv_mdesc * ms, int n, bool gu, float limit, int nsm, cudaStream_t stream,
                                   bool wide = true) {
@@ -979,6 +982,7 @@ static cudaError_t kqmmv_run_mats(int T, int P, int ny, const float * x, int64_t
     return gu ? kqmmv_launch<true >(T, P, a, ny, nw, nsm, stream)
               : kqmmv_launch<false>(T, P, a, ny, nw, nsm, stream);
 }
+#endif // KQMMV_NO_RUN
 
 
 // ------------------------------------------------------------------------------------------------

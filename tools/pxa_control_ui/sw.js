@@ -4,7 +4,7 @@
    Never touched: /api/ (chat streams, state, tokens), /metrics, the engine proxy, anything on another origin. */
 var CACHE = "pxa-control-shell-v3";
 var PRECACHE = [
-  "/", "/hosts.html", "/manifest.webmanifest", "/pwa.js", "/icon-192.png", "/icon-512.png", "/favicon.png", "/mark.png",
+  "/", "/hosts.html", "/manifest.webmanifest", "/auth.js", "/pwa.js", "/icon-192.png", "/icon-512.png", "/favicon.png", "/mark.png",
   "/home.js", "/plugins.js", "/plugin-host.js", "/plugin-host.css", "/store.js", "/wallet.js", "/wallet.css", "/encode.js", "/encode.css", "/live.js", "/live.css",
   "/profiles.js", "/profiles.css", "/mqtt.js", "/chat.js", "/chat.css"
 ];

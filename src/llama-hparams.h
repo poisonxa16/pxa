@@ -130,6 +130,12 @@ struct llama_hparams {
     // PXA Nemotron port: Mamba-2 layers (Nemotron-H). The state row is the conv window over
     // x|B|C plus the {d_state, d_inner} scan state, not the DeltaNet {head_v, head_v, n_v} matrix.
     bool     ssm_mamba2  = false;
+    // PXA LFM port: short-conv operator (LFM2 / LFM2-MoE / LFM3) kernel length; the recurrent state row is
+    // the (l_cache - 1) x n_embd conv window (mainline llama_hparams::n_embd_r). 0 = not a short-conv model.
+    uint32_t n_shortconv_l_cache = 0;
+    // PXA LFM port: recurrent mixers whose kernels capture NO per-step state (Mamba-2 scan/conv, the LFM short conv):
+    // speculative decoding takes the whole-state checkpoint there, never the gated-delta-net per-step layout.
+    bool recurrent_no_per_step() const { return ssm_mamba2 || n_shortconv_l_cache > 0; }
 
     // PXQN revision 1 (ggml-pxqn.h): the rotation contract of the file, from pxa.pxqn.*.
     // pxqn_rev 0 = not a PXQN file (no key); pxqn_rot_sites = OR of PXQN_SITE_BIT(site) of the
@@ -328,6 +334,7 @@ struct llama_hparams {
         if (this->ssm_dt_rank != other.ssm_dt_rank) return true;
         if (this->ssm_n_group != other.ssm_n_group) return true;
         if (this->ssm_mamba2  != other.ssm_mamba2)  return true;
+        if (this->n_shortconv_l_cache != other.n_shortconv_l_cache) return true;
         if (this->recurrent_layer_arr != other.recurrent_layer_arr) return true;
 
         if (this->dec_start_token_id != other.dec_start_token_id) return true;
@@ -410,8 +417,8 @@ struct llama_hparams {
     }
 
     uint32_t n_embd_k_s() const { // dimension of the rolling state embeddings
-        if (ssm_n_group > 0) {
-            // qwen3next keeps all recurrent state in the V-cache tail
+        if (ssm_n_group > 0 || n_shortconv_l_cache > 0) {
+            // qwen3next / LFM short-conv keep all recurrent state in the V-cache tail (s_l)
             return 0;
         }
         // corresponds to Mamba's conv_states size
@@ -421,6 +428,10 @@ struct llama_hparams {
     }
 
     uint32_t n_embd_v_s() const { // dimension of the recurrent state embeddings
+        if (n_shortconv_l_cache > 0) {
+            // PXA LFM port: the short-conv window, (l_cache - 1) x n_embd
+            return (n_shortconv_l_cache - 1) * n_embd;
+        }
         if (ssm_mamba2) {
             // PXA Nemotron port: Mamba-2 row = conv state (d_conv - 1) * (d_inner + 2*n_group*d_state)
             //                     + scan state d_state * d_inner (head_dim * n_head == d_inner)

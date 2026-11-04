@@ -1,0 +1,26 @@
+# release-scan-upstream-orgs.txt - the upstream allow-list of scripts/release-scan.py check 5 (GGUF metadata).
+#
+# One org per line (the first path segment of its https://huggingface.co/<org>/... or https://github.com/<org>/...
+# repos; matched case-insensitively), '#' starts a comment. Only these orgs may be named in our GGUF metadata: as an
+# attribution value equal to the org, or as EXACTLY a declared general.base_model.N.repo_url under that org. A base
+# model whose org is not listed names nobody, so its repo URL blocks the release. The original model makers only,
+# never a quantizer or re-uploader. the maintainers review every change to this file.
+Qwen
+meta-llama
+google
+nvidia
+deepseek-ai
+zai-org
+mistralai
+microsoft
+ibm-granite
+allenai
+moonshotai
+openai
+tencent
+baidu
+MiniMaxAI
+internlm
+THUDM
+CohereForAI
+LiquidAI

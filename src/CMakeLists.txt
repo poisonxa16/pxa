@@ -76,6 +76,7 @@ add_library(llama
             llama-delta-net.h
             llama-delta-net.cpp
             llama-mamba2.cpp
+            llama-shortconv.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
@@ -93,6 +94,7 @@ add_library(llama
             graphs/build_starcoder2.cpp
             graphs/build_nemotron.cpp
             graphs/build_nemotron_h.cpp
+            graphs/build_lfm.cpp
             graphs/build_refact.cpp
             graphs/build_bert.cpp
             graphs/build_bloom.cpp

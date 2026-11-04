@@ -9,10 +9,19 @@ from .core import *  # noqa: F401,F403
 # package split moves it whole into pxa_control/auth.py.
 # ---------------------------------------------------------------------------------------------
 # H1: on a Control bound to this machine these answer without the token (monitoring; read-only; no secrets).
-# Everything else under /api/, the page itself and the engine proxy need it. Static assets (public code) are
-# open on loopback. On --lan nothing is open, as before.
+# Everything else under /api/ and the engine proxy need it. The page shell, its scripts, styles and icons are
+# public code (the same files every package ships) and open on loopback and on --lan alike: a browser navigation
+# cannot carry the X-PXA-Token header, so the shell loads first and signs the tab in from sessionStorage
+# (the token is never a cookie: browsers send a host's cookies to every
+# port of it). On --lan nothing under /api/ is open, /api/health and /metrics included.
 OPEN_ON_LOOPBACK = {"/api/health", "/metrics"}
-PAGE_PATHS = ("/", "/index.html", "/share.html")     # every HTML page: a token-less open gets the sign-in page, not the page
+PAGE_PATHS = ("/", "/index.html", "/share.html")     # every HTML page: a ?token= visit redirects to <page>#token=...
+LOGIN_PATH = "/login"                                # the sign-in form the shell sends a tab without a token to
+PUBLIC_GET = set()                                   # API paths that serve public code like STATIC: the Vigil page and HUD
+                                                     # shells and their fixed asset list (pxa_chat.public_code); they load
+                                                     # /auth.js first, every data route behind them still needs the token
+TICKET_TTL_S = 60.0                                  # a navigation ticket lives this long, and is good for one GET
+TICKET_MAX = 256                                     # unredeemed tickets kept; the oldest go first
 
 # H9: headers on every response (end_headers), and the two content security policies.
 SECURITY_HEADERS = (
@@ -66,7 +75,7 @@ def page_csp(html):
     return v
 
 
-_TOKEN_QS_RE = re.compile(r"(?i)([?&](?:token|access_token|key|k)=)[^&\s\"']+")   # k= : a plugin overlay key
+_TOKEN_QS_RE = re.compile(r"(?i)([?&](?:token|access_token|ticket|key|k)=)[^&\s\"']+")   # k= : a plugin overlay key
 
 
 def scrub_secrets(text, secrets_=()):
@@ -121,6 +130,65 @@ class AuthThrottle(object):
                 q = self.fails[who] = deque()
             q.append(now)
             return len(q)
+
+
+class Tickets(object):
+    """Single-use, path-bound, short-lived stand-ins for the token, for the navigations that cannot carry the
+    X-PXA-Token header: a plugin's sealed frame, a <script src>, a download link, a page opened in a new tab.
+    The page mints one through the header (POST /api/auth/ticket {path}) and puts ?ticket=<t> on that GET.
+    A ticket opens exactly one GET of exactly that path and query (the same name=value pairs, any order; ?ticket=
+    itself aside) within TICKET_TTL_S; any try, right or wrong, spends it. A plugin frame's ticket opens that plugin."""
+
+    def __init__(self, ttl=TICKET_TTL_S, cap=TICKET_MAX):
+        self.ttl, self.cap = float(ttl), int(cap)
+        self._lock = threading.Lock()
+        self._t = {}                    # ticket -> (path, monotonic deadline), oldest first
+
+    @staticmethod
+    def path_ok(path):
+        """a ticket may name one API path: absolute, no query or fragment, nothing that could walk elsewhere."""
+        return (isinstance(path, str) and 0 < len(path) <= 512 and (path.startswith("/api/") or path == "/metrics")
+                and not any(c in path for c in "?#\\%") and "//" not in path and "/../" not in path + "/"
+                and "/./" not in path + "/" and all(32 < ord(c) < 127 for c in path))
+
+    @staticmethod
+    def query_ok(query):
+        return isinstance(query, str) and len(query) <= 1024 and "#" not in query and all(32 < ord(c) < 127 for c in query)
+
+    @staticmethod
+    def _pairs(query):
+        """a query string or parse_qs dict -> its sorted (name, value) pairs, ?ticket= left out."""
+        if isinstance(query, dict):
+            items = [(k, v) for k, vs in query.items() for v in vs]
+        else:
+            items = urllib.parse.parse_qsl(query or "", keep_blank_values=True)
+        return tuple(sorted((k, v) for k, v in items if k != "ticket"))
+
+    def mint(self, path, query=""):
+        t = secrets.token_urlsafe(24)
+        now = time.monotonic()
+        with self._lock:
+            for k in [k for k, (_p, end, _q) in self._t.items() if end <= now]:
+                del self._t[k]
+            while len(self._t) >= self.cap:
+                self._t.pop(next(iter(self._t)))
+            self._t[t] = (path, now + self.ttl, self._pairs(query))
+        return t
+
+    def redeem(self, t, path, query=None):
+        if not isinstance(t, str) or not 0 < len(t) <= 64:
+            return False
+        with self._lock:
+            ent = self._t.pop(t, None)
+        return (ent is not None and hmac.compare_digest(ent[0].encode(), str(path).encode()) and time.monotonic() < ent[1]
+                and ent[2] == self._pairs(query or {}))
+
+    def age(self, t, seconds):
+        """tests: make one ticket `seconds` older."""
+        with self._lock:
+            if t in self._t:
+                p, end, q = self._t[t]
+                self._t[t] = (p, end - seconds, q)
 
 
 def fetch_site_ok(headers):

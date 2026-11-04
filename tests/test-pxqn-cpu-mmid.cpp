@@ -11,6 +11,7 @@
 // weight bytes. Exit 1 on any byte difference.
 #include "ggml.h"
 #include "ggml-pxa-lean.h"
+#include "pxa-test-portable.h"   // fseeko -> _fseeki64 on native Windows
 
 #include <algorithm>
 #include <cstdint>
@@ -108,7 +109,7 @@ int main(int argc, char ** argv) {
         ggml_tensor * t = ggml_new_tensor_3d(wctx, mt->type, mt->ne[0], mt->ne[1], mt->ne[2]);
         const int idx = gguf_find_tensor(g, nm);
         const size_t off = data_off + gguf_get_tensor_offset(g, idx);
-        if (fseeko(f, (off_t) off, SEEK_SET) != 0 || fread(t->data, 1, ggml_nbytes(t), f) != ggml_nbytes(t)) {
+        if (pxa_fseeko(f, (long long) off, SEEK_SET) != 0 || fread(t->data, 1, ggml_nbytes(t), f) != ggml_nbytes(t)) {
             fprintf(stderr, "read failed %s\n", nm); return 2;
         }
         W.push_back(t);

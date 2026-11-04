@@ -24,6 +24,7 @@
 #include "../fattn-tile-big.cuh"
 #include "../fattn-qkv-direct.cuh"
 #include "../fattn-qkv-tile.cuh"
+#include "../pxqn-ext-call.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -638,6 +639,14 @@ pxa_fa_plan_t pxa_fa_plan_node(ggml_backend_cuda_context & ctx, const pxa_fa_que
 
     // ---- no fast fp16 (sm_61 and older) ------------------------------------------------------
     if (!fast_fp16_available(cc)) {
+        // PXA_FA_SM61_TILE256 (dispatch only): a wide head-256 node runs the kernel the PXQN library names (role "fa");
+        // no library, no answer or a kernel that declines the node keeps the vec-f32 route below.
+        if (dispatch && Q->ne[1] > 8 && Q->ne[0] == 256 && pxa_lever(PXA_LEVER_FA_SM61_TILE256) != 0 &&
+            pxqn_ext_fa_pick(cc, (int) K->ne[0], (int) V->ne[0], Q->ne[1], K->ne[1], (int) K->type, (int) V->type,
+                             precision) == GGML_PXQN_FA_TILE_F32 &&
+            ggml_cuda_fattn_tile_f32_is_supported(ctx, dst)) {
+            return pxa_fa_take(PXA_FA_ROUTE_TILE_F32, true, "no fast fp16, D=256 wide, library route");
+        }
         if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
             return pxa_fa_take(PXA_FA_ROUTE_VEC_F32, ggml_cuda_fattn_vec_f32_is_supported(ctx, dst),
                                "no fast fp16, narrow or D=256");

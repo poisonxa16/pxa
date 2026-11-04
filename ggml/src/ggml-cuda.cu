@@ -3688,6 +3688,57 @@ static void pxa_f16_guard_to_fp32_cuda(const half * x, float * y, const float * 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// PF_SLICE (reduce.cu): a planned prefill reduce's producer on this route runs in the library's token slices
+// (PXA_CLOSED_HOOK ggml_cuda_pxqn_pfs_cublas_run); the engine offers its own GEMM + conversion on a column range
+extern "C" bool ggml_cuda_pxa_pfs_begin(ggml_backend_cuda_context * ctx, const ggml_tensor * mm, int * nslice, int64_t * slice);
+extern "C" void ggml_cuda_pxa_pfs_slice(ggml_backend_cuda_context * ctx, const ggml_tensor * mm, int s);
+
+struct pxa_cublas_cols {
+    ggml_backend_cuda_context * ctx; int id; cudaStream_t stream; const ggml_tensor * dst;
+    bool f32out, guarded; int64_t row_diff, ne10, ne00, ldc;
+    const half * src0; const half * src1; float * y; const float * cs; half * c16;
+};
+
+// the f16 GEMM + output conversion of ggml_cuda_op_mul_mat_cublas below, on token columns [t0, t0 + n) (every step is
+// column-local; tests/cublas-slice.cu); algo = an explicit cublasGemmAlgo_t for the f16 output (-1 = the default call)
+static void pxa_cublas_cols_gemm(void * user, int64_t t0, int64_t n, int algo) {
+    const pxa_cublas_cols & a = *(const pxa_cublas_cols *) user;
+    const half *  B  = a.src1 + t0*a.ne10;
+    float *       Y  = a.y + t0*a.ldc;
+    const float * cs = a.cs ? a.cs + t0 : nullptr;
+    cublasHandle_t hb = a.ctx->cublas_handle(a.id);
+    CUBLAS_CHECK(cublasSetStream(hb, a.stream));
+    if (a.f32out) {
+        const float alpha = 1.0f, beta = 0.0f;
+        pxa_cublas_gemm_ex_f16_tiled(hb, 0, a.row_diff, n, a.ne10, &alpha, a.src0, a.ne00, B, a.ne10, &beta, Y, CUDA_R_32F, a.ldc,
+                                     sizeof(float), CUBLAS_COMPUTE_32F);
+        if (cs) {
+            pxa_f16_guard_unscale_cuda(Y, cs, n, a.row_diff, a.ldc, a.stream);
+        }
+        return;
+    }
+    const half alpha = 1.0f, beta = 0.0f;
+    half * C = a.c16 + t0*a.ldc;
+    if (algo < 0 || cublasGemmEx(hb, CUBLAS_OP_T, CUBLAS_OP_N, a.row_diff, n, a.ne10, &alpha, a.src0, CUDA_R_16F, a.ne00, B, CUDA_R_16F,
+                                 a.ne10, &beta, C, CUDA_R_16F, a.ldc, CUBLAS_COMPUTE_16F, (cublasGemmAlgo_t) algo) != CUBLAS_STATUS_SUCCESS) {
+        pxa_cublas_gemm_ex_f16_tiled(hb, 0, a.row_diff, n, a.ne10, &alpha, a.src0, a.ne00, B, a.ne10, &beta, C, CUDA_R_16F, a.ldc,
+                                     sizeof(half), CUBLAS_COMPUTE_16F);
+    }
+    if (a.guarded && pxa_f16_guard_out()) {
+        pxa_f16_guard_to_fp32_cuda(C, Y, cs, n, a.row_diff, a.src0, a.ne00, B, a.ne10, a.ne10, a.stream);
+    } else if (cs) {
+        pxa_f16_guard_to_fp32_cuda(C, Y, cs, n, a.row_diff, nullptr, 0, nullptr, 0, 0, a.stream);
+    } else {
+        ggml_get_to_fp32_cuda(GGML_TYPE_F16)(C, Y, a.row_diff, n, a.stream);
+    }
+}
+
+static void pxa_cublas_cols_done(void * user, int s) {
+    const pxa_cublas_cols & a = *(const pxa_cublas_cols *) user;
+    ggml_cuda_pxa_pfs_slice(a.ctx, a.dst, s);
+    ggml_cuda_set_device(a.id);
+}
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -3986,6 +4037,28 @@ static void ggml_cuda_op_mul_mat_cublas(
         // 0 everywhere else, which is the single untiled call this path has always issued.
         const int pxa_cublas_tile = (compute_capability == PXA_CC_VOLTA && ggml_is_quantized(src0->type))
                                   ? pxa_volta_cublas_tile() : 0;
+
+        // PXA_CLOSED_HOOK: this GEMM produces a planned prefill reduce (reduce.cu PF_SLICE): the library runs it in token slices
+        // on pxa_cublas_cols_gemm and lets ggml_cuda_pxa_pfs_slice run the chain + push after each one. The weight is
+        // dequantized once and src1 converted once, as before.
+        {
+            int pfs_n = 0; int64_t pfs_tok = 0;
+            if (pxa_cublas_tile == 0 && id == ctx.device && row_diff == ldc && row_low == 0 && src1_ncols == dst->ne[1] &&
+                    dst_dd_i == (float *) dst->data && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+                    ggml_cuda_pxa_pfs_begin(&ctx, dst, &pfs_n, &pfs_tok)) {
+                const bool f32out = pxa_f32prec_take || pxa_volta_f32out;
+                ggml_cuda_pool_alloc<half> dst_f16s(ctx.pool(id));
+                if (!f32out) {
+                    dst_f16s.alloc(row_diff*src1_ncols);
+                }
+                pxa_cublas_cols cols = { &ctx, id, stream, dst, f32out, src1_guarded, row_diff, ne10, ne00, ldc,
+                                         src0_ptr, src1_ptr, dst_dd_i, dense_scale.get(), dst_f16s.get() };
+                const ggml_cuda_pfs_host host = { (uint32_t) sizeof(ggml_cuda_pfs_host), &cols, pxa_cublas_cols_gemm, pxa_cublas_cols_done };
+                GGML_ASSERT(ggml_cuda_pxqn_pfs_cublas_run(ggml_cuda_info().devices[id].cc, pfs_n, pfs_tok, src1_ncols, !f32out, &host) == 0);
+                GGML_UNUSED(src1_ddq_i);
+                return;
+            }
+        }
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
         if (pxa_f32prec_take || pxa_volta_f32out) {
@@ -10873,6 +10946,38 @@ static bool pxa_vf_try_gate_mix(ggml_backend_cuda_context & ctx, const ggml_cgra
     pxa_vf_count(ctx.device, PXA_VF_C_GMIX);
     return true;
 }
+
+// the closed library's graph window at a MUL_MAT node (pxqn.cuh ggml_cuda_window_host): what this engine offers it
+static bool pxa_win_same_device(const ggml_cgraph * cgraph, int i, int j) { return ops_are_same_device(cgraph, i, j); }
+static bool pxa_win_on_device(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    return t && t->data && t->buffer && ggml_backend_buffer_is_cuda(t->buffer)
+        && ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == ctx.device;
+}
+// t's q8_1 for the GEMV right after node j (PXA_VFUSE bit 32, pxa_vf_try_gate_mix's conditions); none -> NULL, the GEMV
+// quantizes itself
+static void * pxa_win_q8_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int j, const ggml_tensor * t,
+                             int64_t * kx, int64_t * rows) {
+    *kx = 0; *rows = 0;
+    if (!(pxa_vfuse_mask() & 32) || t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] % MATRIX_ROW_PADDING != 0) return nullptr;
+    int jc = -1;
+    const ggml_tensor * mm = pxa_vf_consumer(cgraph, j, t, jc);
+    if (!mm || !ops_are_same_device(cgraph, j, jc)) return nullptr;
+    const ggml_tensor * s1 = mm->src[1];
+    const int64_t k = s1->ne[0], r = s1->ne[1], padded = GGML_PAD(k, MATRIX_ROW_PADDING);
+    if (k != t->ne[0] || padded != k) return nullptr;
+    char * q8 = pxa_vf_buf(ctx.device, ctx.stream(), (size_t) (padded/QK8_1)*sizeof(block_q8_1)*r);
+    *kx = k; *rows = r;
+    return q8;
+}
+static void pxa_win_q8_note(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t kx, int64_t rows) {
+    auto & r = pxa_vf_rec[ctx.device];
+    r.t = t; r.data = t->data; r.st = ctx.stream(); r.eval = pxa_g2_eval_serial[ctx.device];
+    r.kx = kx; r.rows = rows; r.padded = kx;
+    pxa_vf_count(ctx.device, PXA_VF_C_GMIX);
+}
+static const ggml_cuda_window_host pxa_win_host = {
+    (uint32_t) sizeof(ggml_cuda_window_host), pxa_win_same_device, pxa_win_on_device, pxa_win_q8_out, pxa_win_q8_note,
+};
 // MUL_MAT(w [n, 1] f32, x [n, rows]) at node_n -> SIGMOID -> MUL(o, sig) -> ADD(r, mul): the verify-width shexp gate GEMV
 // (mul_mat_1row's mul_mat_row<float, 256> at 2..8 columns) and its tail in one launch. Returns the ADD's index, or node_n.
 static int pxa_vf_try_gate_tail(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
@@ -11752,7 +11857,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const int pxa_gm = pxa_try_deltanet_gather_mask(ctx, cgraph, i);
                 if (pxa_gm > 0) { i += pxa_gm; break; }
             }
-            ggml_cuda_op_get_rows(ctx, dst);
+            if (ggml_cuda_pxqn_get_rows(&ctx, dst) != 0) {   // the closed library's row gather first (pxqn.cuh), else the engine's
+                ggml_cuda_op_get_rows(ctx, dst);
+            }
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
@@ -12214,6 +12321,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 GGML_CUDA_LOG_ERROR("%s: cannot compute %s: src0->ne[3] = %" PRId64 ", src1->ne[3] = %" PRId64 " - fallback to CPU\n", __func__, dst->name, dst->src[0]->ne[3], dst->src[1]->ne[3]);
                 return -1;
             } else {
+                if (fusion) {                       // the closed library's graph window at this node (pxqn.cuh)
+                    const int je = ggml_cuda_pxqn_window(ctx, cgraph, i, &pxa_win_host);
+                    if (je > i) { i = je; break; }
+                }
                 const bool pxa_ov = pxa_ba_overlap_fork(ctx, cgraph, i);   // PXA_DN_BA_OVERLAP
                 i = ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst, cgraph, i);
                 if (pxa_ov) pxa_ba_overlap_join(ctx, i);
@@ -13918,6 +14029,8 @@ static void pxa_dump_nodes(ggml_backend_cuda_context * ctx, const ggml_cgraph * 
     }
 }
 
+static std::atomic<int> pxa_inq_side_pending[GGML_CUDA_MAX_DEVICES];   // KQ_MASK_COPY mode 2: a side-stream input copy awaits its reader
+
 static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
     bool & graph_evaluated_or_captured, bool & use_cuda_graph, bool & cuda_graph_update_required) {
     // flag used to determine whether it is an integrated_gpu
@@ -14034,6 +14147,7 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                 int64_t pxa_hp_n0 = 0;
                 if (pxa_host_phase_on() && pxa_hp_entry > 0) { pxa_hp_n0 = ggml_time_us(); pxa_hp_pre_us += pxa_hp_n0 - pxa_hp_entry; }
                 const int pxa_dump_i0 = i;
+                if (pxa_inq_side_pending[cuda_ctx->device].load(std::memory_order_relaxed)) ggml_cuda_pxqn_input_wait(*cuda_ctx, cgraph, i);   // PXA_CLOSED_HOOK KQ_MASK_COPY mode 2
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
                 if (pxa_evp_n >= 0 && pxa_evp_n < (int) g_pxa_evp_ev.size() - 1) {
                     g_pxa_evp_nm[pxa_evp_n] = node->name; g_pxa_evp_op[pxa_evp_n] = (int) node->op;
@@ -14391,6 +14505,23 @@ extern "C" void ggml_cuda_stage_graph_end(void) {
 // Stage `size` bytes of host memory at `src` and issue the host->device copy into
 // `dst` + `offset` on the destination backend's compute stream. Returns false when the
 // bytes do not fit this generation; the caller then falls back to the blocking path.
+// PXA_CLOSED_HOOK (host role KQ_MASK_COPY): the scheduler hands the library one device copy of a host input; false = declined
+// (nothing enqueued, the scheduler copies as before). The fence waits until the device's enqueued copies have read their sources.
+extern "C" bool ggml_cuda_pxa_input_copy(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t size, int mode) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || dst == nullptr || dst->buffer == nullptr) return false;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ggml_backend_buffer_get_type(dst->buffer) != ggml_backend_cuda_buffer_type(ctx->device)) return false;
+    const bool ok = ggml_cuda_pxqn_input_copy(*ctx, dst, src, size, mode) == 0;
+    if (ok && mode == 2) pxa_inq_side_pending[ctx->device].store(1, std::memory_order_relaxed);   // readers ask the library
+    return ok;
+}
+extern "C" void ggml_cuda_pxa_input_fence(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) return;
+    const int dev = ((ggml_backend_cuda_context *) backend->context)->device;
+    (void) ggml_cuda_pxqn_input_fence(dev);
+    pxa_inq_side_pending[dev].store(0, std::memory_order_relaxed);
+}
+
 extern "C" bool ggml_cuda_stage_h2d(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * key, const void * src, size_t offset, size_t size) {
     if (!pxa_stage_on() || pxa_stage_cur < 0 || size == 0) return false;
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
@@ -15261,7 +15392,9 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                         // for any fixed-block type (the same thing the I32 case above does).
                         return op->type == GGML_TYPE_F32 || op->type == op->src[0]->type;
                     default:
-                        return false;
+                        // a type the engine has no gather for: served when the closed library's row gather takes it
+                        // (pxqn.cuh ggml_cuda_pxqn_get_rows; without the library: false, as before)
+                        return ggml_cuda_pxqn_get_rows(nullptr, op) == 0;
                 }
             } break;
         case GGML_OP_SET_ROWS:

@@ -199,6 +199,10 @@ extern "C" {
     // n_copies > 1. Anything that reallocates or rewrites what a submitted graph reads must
     // drain first.
     GGML_API bool                 ggml_backend_sched_async_inputs(void);
+    // PXA_CLOSED_HOOK role "sched": async split inputs (no host block per split input copy) for ONE scheduler, whatever
+    // the global PXA_SCHED_ASYNC_INPUTS says; same decode-width gate. Call between graphs. Copy scheduling only.
+    GGML_API void                 ggml_backend_sched_set_pxa_async_inputs(ggml_backend_sched_t sched, bool on);
+    GGML_API bool                 ggml_backend_sched_get_pxa_async_inputs(ggml_backend_sched_t sched);
 
     // ---- PXA_SYNC_LOG (default OFF, PXA_SYNC_LOG=1) -------------------------------------
     // Host-blocking-sync census. Every blocking sync (ggml_backend_synchronize,

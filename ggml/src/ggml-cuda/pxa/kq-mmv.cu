@@ -31,6 +31,7 @@
 #include "kq-mmv.cuh"
 #include "kq-mmv-vid.h"
 #include "kq-vw.cuh"
+#include "pxqn-ext-call.cuh"
 
 #include <atomic>
 #include <cstdio>
@@ -159,19 +160,20 @@ static bool kqmmv_chunk_on() {
     return v;
 }
 
-// PXA_KQMMV_VERIFY_ID 4 (default) | 0 | 2..8 (2026-10-19, todo nemo-super-nextn-identity): a non-GU GEMV whose ONE-column
+// PXA_KQMMV_VERIFY_ID 5 (default since 2026-11-02) | 4 (the previous default, off switch) | 0 | 2..8 (2026-10-19, todo
+// nemo-super-nextn-identity): a non-GU GEMV whose ONE-column
 // launch takes this kernel with the whole activation staged (x fits KQMMV_XSINGLE at ny = 1) keeps this kernel at the
 // speculative-verify widths (2..4 by default) too, in the chunked k_kq_mmv form (x re-staged per K chunk, one row group per block),
 // instead of falling to the incumbent q8_1 MMVQ once ny x K no longer fits. The chunked form keeps the per-lane task order,
 // the fold and the xor reduce of the one-column launch (DETERMINISM / INVARIANCE in kq-mmv.cuh), so every verify column is
 // bitwise the one-token decode GEMV. Found on Nemotron 3.5 Super (ssm_out Q8_0 K = 8192 x 4096, 40 Mamba-2 layers): ny = 1 on
 // the h2 kernel, ny = 2 on the q8_1 MMVQ -> a K = 2 verify forward differed from two one-token forwards in every layer.
-// Plain decode (ny = 1) is untouched. The value is the widest verify batch served (default 4 = MTP n_max <= 3; up to 8): from
-// ny = 5 the h2 dot is ALU-bound per column and the incumbent is faster (kqmmv_wide note), so wider widths are opt-in.
+// Plain decode (ny = 1) is untouched. The value is the widest verify batch served (default 5 = MTP n_max <= 4; up to 8).
+// Default 5 keeps a width-5 verify bitwise equal to plain decode (at cap 4 it fell to the incumbent); =4 restores the previous cap.
 // 0 = the previous rule (those verify widths decline to the incumbent).
 static int kqmmv_verify_id_max() {
-    static const int v = [](){ const char * e = getenv("PXA_KQMMV_VERIFY_ID"); const int x = e && *e ? atoi(e) : 4;
-                                return x <= 0 ? 0 : x == 1 ? 4 : x > KQMMV_MAX_NY ? KQMMV_MAX_NY : x; }();
+    static const int v = [](){ const char * e = getenv("PXA_KQMMV_VERIFY_ID"); const int x = e && *e ? atoi(e) : 5;
+                                return x <= 0 ? 0 : x == 1 ? 5 : x > KQMMV_MAX_NY ? KQMMV_MAX_NY : x; }();
     return v;
 }
 // PXA_KQMMV_VERIFY_ID_SMALL (on/off, kernel default 0; the registry sets 1 for nemotron_h_moe, qwen4exp, qwen35 on sm_60) + _W
@@ -313,8 +315,18 @@ static void kqmmv_run(int device, cudaStream_t stream, int T, const ggml_tensor 
     int64_t vid_rows = 0;
     for (int i = 0; i < n; ++i) vid_rows += src0[i]->ne[1];
     const bool vid = !gu && (force_chunked || kqmmv_verify_id_shape(T, kqmmv_path(cc), (int) src1->ne[1], (int) src1->ne[0], vid_rows));
-    CUDA_CHECK(kqmmv_run_mats(T, kqmmv_path(cc), (int) src1->ne[1], (const float *) src1->data, src1->nb[1]/sizeof(float),
-                              (int) src1->ne[0], ms, n, gu, limit, nsm, stream, kqmmv_wide_on() && !vid));
+    const bool wide_ok = kqmmv_wide_on() && !vid;
+    // the MTP draft head (src/llama.cpp's shortlist copies, by name): the library may answer it from its own copy
+    const bool draft_head = !gu && n == 1 && strncmp(src0[0]->name, GGML_PXQN_DRAFT_HEAD_PREFIX, sizeof(GGML_PXQN_DRAFT_HEAD_PREFIX) - 1) == 0;
+    const uint32_t ext_flags = (gu ? GGML_PXQN_GEMV_GATE_UP : 0u) | (vid ? GGML_PXQN_GEMV_EXACT_COLUMNS : 0u) |
+                               (force_chunked ? GGML_PXQN_GEMV_SMALL : 0u) | (wide_ok ? GGML_PXQN_GEMV_WIDE_OK : 0u) |
+                               (draft_head ? GGML_PXQN_GEMV_DRAFT_HEAD : 0u);
+    const bool ext_done = pxqn_ext_gemv(device, cc, nsm, (int) src0[0]->type, src1->ne[1], src1->ne[0], (const float *) src1->data,
+                                        src1->nb[1]/sizeof(float), ms, n, ext_flags, limit, stream);
+    if (!ext_done) {
+        CUDA_CHECK(kqmmv_run_mats(T, kqmmv_path(cc), (int) src1->ne[1], (const float *) src1->data, src1->nb[1]/sizeof(float),
+                                  (int) src1->ne[0], ms, n, gu, limit, nsm, stream, wide_ok));
+    }
     // engagement banner: the first launch of each form (plain, grouped, gate/up) per device
     static std::atomic<uint32_t> seen{0};
     const int form = gu ? 2 : bias ? 3 : (n > 1 ? 1 : 0);
