@@ -8,6 +8,7 @@
 <a href="https://github.com/poisonxa16/pxa/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/poisonxa16/pxa?label=release&color=E69F00&style=for-the-badge"></a>
 <a href="https://benchmarks.pxanetwork.com"><img alt="Live leaderboard" src="https://img.shields.io/badge/Leaderboard-benchmarks.pxanetwork.com-E69F00?style=for-the-badge"></a>
 <a href="https://discord.pxanetwork.com"><img alt="Discord" src="https://img.shields.io/badge/Discord-PXA%20Network-5865F2?logo=discord&logoColor=white&style=for-the-badge"></a>
+<a href="https://www.reddit.com/r/PXANetwork/"><img alt="Reddit" src="https://img.shields.io/badge/Reddit-r%2FPXANetwork-FF4500?logo=reddit&logoColor=white&style=for-the-badge"></a>
 <a href="https://ko-fi.com/shatteredrealms1"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-Support%20PXA-FF5E5B?logo=ko-fi&logoColor=white&style=for-the-badge"></a>
 </p>
 
@@ -336,12 +337,15 @@ Valued Supporters can also opt in to the beta channel from the update window, to
 
 <p align="center">
 <a href="https://discord.pxanetwork.com"><img alt="Join the PXA Network Discord" src="https://img.shields.io/badge/Join%20the%20Discord-discord.pxanetwork.com-5865F2?logo=discord&logoColor=white&style=for-the-badge"></a>
+<a href="https://www.reddit.com/r/PXANetwork/"><img alt="PXA on Reddit" src="https://img.shields.io/badge/Reddit-r%2FPXANetwork-FF4500?logo=reddit&logoColor=white&style=for-the-badge"></a>
 <a href="https://ko-fi.com/shatteredrealms1"><img alt="Support PXA on Ko-fi" src="https://img.shields.io/badge/Support%20PXA-ko--fi.com%2Fshatteredrealms1-FF5E5B?logo=ko-fi&logoColor=white&style=for-the-badge"></a>
 </p>
 
 **Live leaderboard: https://benchmarks.pxanetwork.com** (every measured card setup, plus community scores sent from PXA Control → Benchmark).
 
 **Discord: https://discord.pxanetwork.com.** Help in #support, benchmark results and the community high-score board in #benchmarks, community rigs in #show-your-rig, development talk in #dev, new quants in #models, releases in #announcements.
+
+**Reddit: https://www.reddit.com/r/PXANetwork/.** Setups and numbers, help and bug reports; the pinned Start here post has the downloads, model files and the help template.
 
 **Support the work: https://ko-fi.com/shatteredrealms1.** Ko-fi memberships keep the quantization runs, the testing and the releases going.
 
