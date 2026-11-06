@@ -396,6 +396,12 @@ llama_test(test-kv-seq-rm-index)
 llama_build(test-kv-cell-max.cpp)
 target_include_directories(test-kv-cell-max PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 llama_test(test-kv-cell-max)
+# PXA_KV_K_GUARD (4.0.4): arch x requested K type -> the K type the context gets (Qwen2 family: <= 4-bit K -> q8_0),
+# over every arch and ggml type, plus the exported llama_pxa_kv_k_guard_type() with the switch unset / =1 / =0.
+# CPU only, no model.
+llama_build(test-pxa-kv-k-guard.cpp)
+target_include_directories(test-pxa-kv-k-guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+llama_test(test-pxa-kv-k-guard)
 # PXA_PLE_DIRECT: the O_DIRECT PLE row reader (header-only, src/llama-pxa-ple-direct.h) against a file
 # mapping on synthetic tables (Q8_0 / Q5_0 / F32 row sizes, rows straddling 4 KiB blocks, every cache
 # size). CPU only, no model; SKIPs when the build tree's filesystem refuses O_DIRECT. `--gguf FILE`
@@ -649,9 +655,18 @@ if (PXA_PYTHON3)
                     endif()
                 endif()
             endforeach()
+            # the closed library: its own SASS-only list (ggml/src/CMakeLists.txt sets CUDA_ARCHITECTURES on ggml-pxqn); a build
+            # that leaves the engine list on it (PXA_PXQN_SASS_ONLY=OFF, "native") checks it like the open libraries
+            set(_pxa_closed_flag --no-closed)
+            get_property(_pxa_pxqn_archs GLOBAL PROPERTY PXA_PXQN_SASS_ARCHS)
+            if (_pxa_pxqn_archs)
+                string(REPLACE "-real" "" _pxa_pxqn_real "${_pxa_pxqn_archs}")
+                string(REPLACE ";" " " _pxa_pxqn_real_s "${_pxa_pxqn_real}")
+                set(_pxa_closed_flag --closed-archs "${_pxa_pxqn_real_s}")
+            endif()
             add_test(NAME test-cuda-archs-embedded
                      COMMAND ${PXA_BASH} ${PROJECT_SOURCE_DIR}/scripts/gate-sm75-check.sh --archs "${_pxa_real_archs_s}" "--ptx=${_pxa_ptx_archs_s}"
-                             ${_pxa_cuo_flag} ${_pxa_cuda_bins})
+                             ${_pxa_closed_flag} ${_pxa_cuo_flag} ${_pxa_cuda_bins})
             if (PXA_CUOBJDUMP)
                 set_tests_properties(test-cuda-archs-embedded PROPERTIES ENVIRONMENT "CUDA_HOME=${_pxa_cuo_dir}/..")
             endif()
@@ -667,6 +682,11 @@ if (PXA_PYTHON3)
     add_test(NAME test-check-win-package
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-check-win-package.py)
     set_tests_properties(test-check-win-package PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    if (PXA_BASH)
+        add_test(NAME test-gate-sm75-closed
+                 COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-gate-sm75-closed.py)
+        set_tests_properties(test-gate-sm75-closed PROPERTIES TIMEOUT 300)
+    endif()
     add_test(NAME test-release-scan-payloads
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-release-scan-payloads.py)
     set_tests_properties(test-release-scan-payloads PROPERTIES TIMEOUT 300)
@@ -843,6 +863,14 @@ endif()
 if (PXA_PYTHON3)
     add_test(NAME test-pxa-control-beta2
              COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-control-beta2.py)
+endif()
+
+# PXA Control and the engine's K-cache guard (PXA_KV_K_GUARD, 4.0.4, bug #378): the Launch KV picker's note and the launch
+# plan's note for a Qwen2-family model with a 4-bit KV pick, /api/info, the arch from the header, and the bench payload
+# naming the K the engine reports in use. Loopback only, no GPU.
+if (PXA_PYTHON3)
+    add_test(NAME test-pxa-control-kvguard
+             COMMAND ${PXA_PYTHON3} ${PROJECT_SOURCE_DIR}/tests/test-pxa-control-kvguard.py)
 endif()
 
 # PXA Control's FREE shareable bench card (tools/pxa_control/share.py + share.html/js/css; todo control-share-report): the card

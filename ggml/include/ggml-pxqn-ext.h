@@ -340,6 +340,56 @@ GGML_API const struct ggml_pxqn_fa_api * ggml_pxqn_fa_api_get(void);
 // a->pick through the table; -1 without one or for a value outside enum ggml_pxqn_fa_route
 GGML_API int ggml_pxqn_fa_pick(const struct ggml_pxqn_fa_args * a);
 
+// ---- role "cbook": the codebook expert tier (GGML_TYPE_PXQNC): per-model tables + the decode entries ----
+// The engine hands the library the file's pxa.pxqnc.* keys untouched (the library parses and checks them and keeps the
+// tables: their layout, the decode and its kernels are the library's), then binds the bytes of every codebook-tier weight
+// tensor (host or device addresses) to that model; every decode entry finds the table of a weight from its address. One
+// registry per process (several models may be open). Without the table a file with such tensors is refused at load.
+#define GGML_PXQN_CBOOK_ROLE       "cbook"
+#define GGML_PXQN_CBOOK_VERSION    1u
+#define GGML_PXQN_CBOOK_KEY_PREFIX "pxa.pxqnc."
+
+static inline bool ggml_pxqn_cbook_type(enum ggml_type t) { return t == GGML_TYPE_PXQNC; }
+
+// one GGUF key/value as the file has it: a scalar's data points at the value, a string's at its NUL-terminated text, an
+// array's at its n elements of arr_type (a string array: n const char *)
+struct ggml_pxqn_cbook_kv {
+    const char * key;
+    int32_t      type;       // enum gguf_type
+    int32_t      arr_type;   // enum gguf_type of the elements (arrays only)
+    uint64_t     n;          // elements (1 for a scalar)
+    const void * data;
+};
+
+struct ggml_pxqn_cbook_api {
+    uint32_t version;   // GGML_PXQN_CBOOK_VERSION
+    uint32_t size;      // sizeof(struct ggml_pxqn_cbook_api)
+    // the model's tables from its keys; NULL with a plain sentence in err when the keys are refused
+    void * (*model_open)(const struct ggml_pxqn_cbook_kv * kv, int32_t n_kv, char * err, int32_t errlen);
+    // unbinds every tensor of the model and frees its tables (host and device copies); call after its buffers are gone
+    void   (*model_close)(void * model);
+    // binds the bytes [data, data + nbytes) of weight tensor `name` (type, ne[0..3]) to the model: 0 = ok, -1 = refused (err)
+    int    (*bind)(void * model, const char * name, int32_t type, const int64_t * ne, const void * data, size_t nbytes,
+                   char * err, int32_t errlen);
+    // drops the binding of the model's tensor that starts at `data` (its bytes are about to be freed or moved): 0 = done
+    int    (*unbind)(void * model, const void * data);
+    // 1 = the address lies inside a bound tensor
+    int    (*bound)(const void * data);
+    // CPU: row `row` of the bound 2-D slice at `data` (k = ne0) -> dst[0..k), f32, in the stored (rotated) basis
+    void   (*deq_row)(int32_t type, const void * data, int64_t row, int64_t k, float * dst);
+    // CUDA (NULL in a library without CUDA); cuda_ctx = the backend context (its layout is checked by the CUDA table)
+    int    (*cuda_supports)(const struct ggml_tensor * op);                  // 1 = this MUL_MAT_ID is served
+    int    (*cuda_mul_mat_id)(void * cuda_ctx, struct ggml_tensor * dst);   // 0 = done (every slot written), -1 = declined
+    // the routed-expert rotation absorbed into the n_mm MUL_MAT_IDs that read `rht` (adjacent, its only readers): 0 = the
+    // RHT (its output written too) and every MUL_MAT_ID done, -1 = declined (nothing launched)
+    int    (*cuda_rht_mul_mat_id)(void * cuda_ctx, struct ggml_tensor * rht, struct ggml_tensor * const * mm, int32_t n_mm);
+    // one line for the load log
+    const char * (*describe)(const void * model);
+};
+
+// the "cbook" table, NULL when absent (read once)
+GGML_API const struct ggml_pxqn_cbook_api * ggml_pxqn_cbook_api_get(void);
+
 #ifdef __cplusplus
 }
 #endif

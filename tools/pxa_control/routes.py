@@ -544,6 +544,7 @@ def r_info(app, body, query):
     return {"version": 1, "control_version": CONTROL_VERSION, "lan": app.lan, "port": app.port,
             "companion": app.companion, "idle_exit_s": app.idle_s if app.companion else None,
             "catalog_src": app.catalog_src, "levers": len(app.catalog), "kv_types": KV_TYPES,
+            "kv_k_guard": {"archs": list(KV_K_GUARD_ARCHS), "types": list(KV_K_GUARD_TYPES)},   # PXA_KV_K_GUARD note
             "split_modes": SPLIT_MODES, "config": config_path(), "docker": docker_bin() is not None,
             "extra_flags": sorted(EXTRA_FLAGS), "thinking": True, "token_required": bool(app.token),
             "store": dict(_store_urls())}         # store.js calls only what is announced here

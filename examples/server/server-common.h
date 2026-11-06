@@ -408,6 +408,9 @@ public:
 
     const mtmd::input_chunk_ptr& find_chunk(size_t idx) const;
 
+    // PXA_MTMD_SHIFT_SNAP_v1: a media chunk starts at idx (find_chunk would not throw)
+    bool is_media_start(size_t idx) const { return map_idx_to_media.count(idx) > 0; }
+
     // Manual free for the raw audio (PCM) or imagebuffers (RGB-f32 (!)) of a multimedia chunk.
     // This data will never be read again after encoding on the first turn that multimedia are received.
     void free_raw_media_data(size_t idx);

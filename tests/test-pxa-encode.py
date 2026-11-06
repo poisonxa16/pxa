@@ -2257,6 +2257,15 @@ class MakeFlow(unittest.TestCase):
         self.assertIn(m["python_env"], (sys.executable,))
         self.assertNotIn(GOOD_KEY, json.dumps(r.svc.job_view(j["id"])) + "\n".join(r.svc.log_view(j["id"])["lines"]))
 
+    def test_a_picked_encode_card_keeps_calibration_off_the_other_cards(self):
+        # Discord report 11-05: models busy on GPU0, "Card for the encode" = GPU1, both cards ticked as targets;
+        # the calibration step still ran on GPU0 because the job saw every ticked card.
+        r = Rig("pro")
+        v = r.svc.start(r.body(cards=[0, 1], encode_card=1))
+        j = r.wait(v["id"])
+        self.assertEqual(j["status"], "done", j["error"])
+        self.assertEqual(r.state_file()["makes"][0]["cuda_visible"], "1")
+
     def test_the_machine_lines_drive_the_bars_and_stay_out_of_the_log(self):
         r = Rig("pro")
         r.pace(0.03)

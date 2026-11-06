@@ -12,7 +12,9 @@ ROWS = {
   '`PXA_TSPLIT_EPI`': "| `PXA_TSPLIT_EPI` | **on** with the fused reduce at decode width | Ends each tensor-split phase in ONE launch per card instead of three or four: the residual add, the two-card sum and the next norm run in the reduce kernel itself. Output is byte-identical. The PXQN form of this epilogue ships in the release build " + REL + ". | `PXA_TSPLIT_EPI=0` runs the separate kernels exactly as before. |",
   '`PXA_TSPLIT_EPI_PUSH`': "| `PXA_TSPLIT_EPI_PUSH` | **on** with `PXA_TSPLIT_EPI` | The weight kernel that produces each card's partial also writes it straight into the other card's staging slot, so the card-to-card copy overlaps the matrix work. Byte-identical output. | `PXA_TSPLIT_EPI_PUSH=0` lets the reduce kernel do the copy. |",
   '`PXA_TSPLIT_EPI_NORM`': "| `PXA_TSPLIT_EPI_NORM` | **on** for P100 (sm_60) cards with `PXA_TSPLIT_EPI` | Gives the one-launch tensor-split epilogue to classic files (PXQ4, k-quants, Q8_0): the residual add, the two-card sum and the next RMS norm run in the reduce kernel, and the norm node is skipped. Byte-identical output (the norm kernel's exact operation order). `=2` also arms it on other architectures. | `PXA_TSPLIT_EPI_NORM=0` runs the separate kernels. |",
-  '`PXA_PXQ4_RB`': "| `PXA_PXQ4_RB` | **on** (P100 / sm_60, one-token decode of classic PXQ4 weights) in the release build " + REL + " | A faster P100 decode kernel for classic PXQ4 weights, including a one-launch up/gate + SiLU. Deterministic, not byte-identical to the open kernel. A build from source has no such kernel and decodes PXQ4 with the open kernel (correct, about 12% slower). | `PXA_PXQ4_RB=0` restores the open decode kernel. |",
+  '`PXA_PXQ4_RB`': "| `PXA_PXQ4_RB` | **on** (P100 / sm_60, one-token decode of classic PXQ4 weights) in the release build " + REL + " | A faster P100 decode kernel for classic PXQ4 weights, including a one-launch up/gate + SiLU, a faster launch (about +5% plain decode on 2x P100 with a 27B model) and faster speculative-decoding verify steps of 2-8 tokens (about +60% code and +50% chat decode with MTP on, same setup). Deterministic, not byte-identical to the open kernel; with MTP on the output differs from 4.0.3. A build from source has no such kernel and decodes PXQ4 with the open kernel (correct, about 12% slower). | `PXA_PXQ4_RB=0` restores the open decode kernel. |",
+  '`PXA_PXQ4_RBP`': None,   # closed lever (scripts/pxa-closed-levers.txt): its row is dropped, its effect is stated in the PXA_PXQ4_RB row
+  '`PXA_PXQ4_NYL`': None,   # closed lever: same
   '`PXA_SPEC_FAST_VERIFY`': "| `PXA_SPEC_FAST_VERIFY` | off (0) | Lets the speculative-decoding verify step (2–8 tokens at once) use cheaper arithmetic in the 4-bit weight kernels. On a V100 the verify kernel gets about 12% faster at 4 tokens. On a P100 it makes no measurable difference. | Leave it off unless you have measured it on your cards. With it on, greedy output with MTP on can differ slightly from MTP off. It is still the same every run. |",
   '`PXA_PXQN_RHT_NODE_NY`': "| `PXA_PXQN_RHT_NODE_NY` | on (1) | PXQN files " + REL + ": on a P100 the verify step (2–8 tokens) of the rotated layers is about 26% faster at 4 tokens; output unchanged bit for bit. | Set 0 only to compare against the old path. |",
  },
@@ -35,7 +37,8 @@ for rel, rows in ROWS.items():
             hits = [i for i in hits if lines[i].startswith('| ' + key + ' |')]
         if len(hits) != 1:
             print(f"FAIL: {rel}: key {key!r} matched {len(hits)} rows (want 1)"); bad = 1; continue
-        lines[hits[0]] = new
+        lines[hits[0]] = '\x00DROP' if new is None else new
+    lines = [l for l in lines if l != '\x00DROP']   # a None replacement drops the row (closed lever)
     p.write_text('\n'.join(lines))
     print(f"ok: {rel}: {len(rows)} rows thinned")
 # docs/lab/ is a closed directory. The public-tree omit pass removes it. Leave it removed:

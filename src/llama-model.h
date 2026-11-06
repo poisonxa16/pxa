@@ -788,6 +788,8 @@ struct llama_model {
     pxa_xc_adaptor * pxa_xc_ad = nullptr;
     // PXA_XCACHE_ASYNC host worker + slots (src/llama-pxa-xcache-async*.cpp); created when the first graph takes the async path
     mutable void * pxa_xc_async = nullptr;
+    // PXQN-C (the codebook expert tier): the library's handle of this model's tables (src/llama-pxqn.h), closed after the buffers
+    void * pxqnc = nullptr;
 
     ~llama_model();
 

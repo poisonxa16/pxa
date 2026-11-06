@@ -98,7 +98,7 @@ async function tabIntoFooter() {
       if (SHOTS.includes(t)) { await page.evaluate(() => { document.activeElement && document.activeElement.blur(); window.scrollTo(0, document.documentElement.scrollHeight); }); await sleep(300); await snap(t); }
       check(m.shown === 1, `${t}: the footer is shown`);
       if (m.shown !== 1) continue;
-      check(m.links.includes('https://discord.pxanetwork.com/') && m.links.includes('https://ko-fi.com/shatteredrealms1'), `${t}: the Discord and Ko-fi links`);
+      check(m.links.includes('https://discord.pxanetwork.com/') && m.links.includes('https://ko-fi.com/shatteredrealms1') && m.links.includes('https://www.reddit.com/r/PXANetwork/'), `${t}: the Discord, Reddit and Ko-fi links`);
       check(/^PXA Control \S/.test(m.ver), `${t}: the version: "${m.ver}"`);
       check(m.up === 'Update', `${t}: the Update button (an update waits): "${m.up}"`);
       check(m.after, `${t}: the footer comes after the page in the document`);

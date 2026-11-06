@@ -433,8 +433,51 @@ static void test_shift_keep() {
     printf("  shift keep: qwen n_keep 0 and gemma n_keep 1\n");
 }
 
+// bug #379: a multimodal prompt over ~1.5 x n_ctx drops k steps of n_discard; the end must not land inside an image.
+static void test_mtmd_no_prompt_shift() {
+    // a new media prompt at or over n_ctx is refused; under it, text-only, or self-extend (ga_n > 1) it is not
+    CHECK(pxa_mtmd_prompt_rejected(true, 1, 7108, 4096), "mtmd no-shift");
+    CHECK(pxa_mtmd_prompt_rejected(true, 1, 4096, 4096), "mtmd no-shift");
+    CHECK(!pxa_mtmd_prompt_rejected(true, 1, 4095, 4096), "mtmd no-shift");
+    CHECK(!pxa_mtmd_prompt_rejected(false, 1, 7108, 4096), "mtmd no-shift");
+    CHECK(!pxa_mtmd_prompt_rejected(true, 4, 7108, 4096), "mtmd no-shift");
+    const std::string m = pxa_mtmd_overflow_msg(7108, 4096);
+    CHECK(m == "the images in this chat need 7108 tokens but Context is 4096; raise Context (Control: model settings) or send fewer/smaller images", "mtmd no-shift");
+    std::printf("mtmd no prompt shift: ok\n");
+}
+
+static void test_shift_snap() {
+    const int32_t N = -1; // LLAMA_TOKEN_NULL, a media placeholder
+    // [0..3] text, image A at 4 (6 placeholders, 4..9), [10..11] text, image B at 12 (4 placeholders, 12..15), image C at 16 (2, 16..17), [18..19] text
+    std::vector<int32_t> tok = {1, 2, 3, 4, N, N, N, N, N, N, 5, 6, N, N, N, N, N, N, 7, 8};
+    std::vector<int32_t> starts = {4, 12, 16};
+    auto is_null  = [&](int32_t i) { return tok[(size_t) i] == N; };
+    auto is_start = [&](int32_t i) { for (int32_t s : starts) { if (s == i) return true; } return false; };
+    const int32_t n = (int32_t) tok.size();
+    // end inside image A (at 7): snap to 10, the text after it
+    CHECK(pxa_shift_snap_discard(n, 1, 6, is_null, is_start) == 9, "inside A: got %d", pxa_shift_snap_discard(n, 1, 6, is_null, is_start));
+    // end on text (10) or on a chunk start (4, 12, 16): unchanged
+    CHECK(pxa_shift_snap_discard(n, 1, 9, is_null, is_start) == 9, "text end must not move");
+    CHECK(pxa_shift_snap_discard(n, 1, 3, is_null, is_start) == 3, "chunk start A must not move");
+    CHECK(pxa_shift_snap_discard(n, 0, 12, is_null, is_start) == 12, "chunk start B must not move");
+    CHECK(pxa_shift_snap_discard(n, 0, 16, is_null, is_start) == 16, "chunk start C right after B must not move");
+    // end inside B (14): snap to 16 = the start of C, not through C
+    CHECK(pxa_shift_snap_discard(n, 0, 14, is_null, is_start) == 16, "inside B: got %d", pxa_shift_snap_discard(n, 0, 14, is_null, is_start));
+    // end inside C (17): snap to 18
+    CHECK(pxa_shift_snap_discard(n, 2, 15, is_null, is_start) == 16, "inside C: got %d", pxa_shift_snap_discard(n, 2, 15, is_null, is_start));
+    // nothing to do / text-only prompts
+    CHECK(pxa_shift_snap_discard(n, 1, 0, is_null, is_start) == 0, "zero discard");
+    std::vector<int32_t> text = {1, 2, 3, 4, 5};
+    auto t_null = [&](int32_t i) { return text[(size_t) i] == N; };
+    auto t_start = [&](int32_t) { return false; };
+    CHECK(pxa_shift_snap_discard((int32_t) text.size(), 1, 2, t_null, t_start) == 2, "text-only must not move");
+    printf("  shift snap: a multi-step discard never ends inside a media chunk\n");
+}
+
 int main() {
     test_shift_keep();
+    test_shift_snap();
+    test_mtmd_no_prompt_shift();
     test_parse();
     test_fast_path();
     test_drain_then_swap();

@@ -1209,6 +1209,22 @@ static double pxa_kv_type_bytes(const std::string & t) {
     return 2.0;   // a type this table does not know is priced as f16
 }
 
+// PXA_KV_K_GUARD (4.0.4): /props names the K cache the context was created with. A Qwen2-family model raises a 4-bit -ctk
+// to q8_0 at context init (src/llama-pxa-kv-guard.h), so the flag's own text would name a cache that does not exist.
+static std::string pxa_served_cache_type_k(const llama_model * model, const std::string & asked) {
+    if (model == nullptr) {
+        return asked;
+    }
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const char * name = ggml_type_name((ggml_type) t);
+        if (name != nullptr && asked == name) {
+            const ggml_type used = llama_pxa_kv_k_guard_type(llama_model_arch_string(model), (ggml_type) t);
+            return used == (ggml_type) t ? asked : std::string(ggml_type_name(used));
+        }
+    }
+    return asked;
+}
+
 static bool pxa_spec_mtp_fit(const gpt_params & params, pxa_spec_fit_t & f, std::string & why, int ub_at = 0) {
 #if defined(GGML_USE_CUDA)
     if (ggml_backend_cuda_get_device_count() != 1) { why = "not one card: per-card shares are not modelled"; return false; }
@@ -4540,7 +4556,7 @@ int main(int argc, char ** argv) {
             // bug report for a server started by hand, the bench result's KV column): the build and the KV cache types in use
             // (after the registry's pick, i.e. what the context was created with)
             { "build_info",                  std::string("b") + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT },
-            { "cache_type_k",                ctx_server.params_base.cache_type_k },
+            { "cache_type_k",                pxa_served_cache_type_k(ctx_server.model, ctx_server.params_base.cache_type_k) },
             { "cache_type_v",                ctx_server.params_base.cache_type_v },
 
         };

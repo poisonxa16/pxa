@@ -543,6 +543,8 @@ extern "C" {
         // PXA4: PXA subscriber flagship tier, ~5.06 bpw
         //   (closed decoder in libggml-pxqn).
         GGML_TYPE_PXA4     = 264,
+        // PXQN-C: the codebook expert tier, ~1.73 bpw (closed decoder in libggml-pxqn).
+        GGML_TYPE_PXQNC    = 265,
 
 
         // PINNED, deliberately, to 400 -- do NOT let this go back to taking

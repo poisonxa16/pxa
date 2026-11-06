@@ -1,6 +1,7 @@
 #include "llama-pxqn.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -105,6 +106,132 @@ void llama_pxqn_read_keys(const struct gguf_context * ctx, uint32_t & rev, uint6
     }
 }
 
+void llama_pxqn_read_rot_exps(const struct gguf_context * ctx, uint32_t n_layer, uint64_t seed_default,
+                              uint32_t & sites, std::vector<uint8_t> & layers, uint64_t & seed) {
+    sites = 0; seed = seed_default;
+    layers.assign(n_layer, 0);
+    const int ke = gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_EXPS);
+    if (ke < 0) {
+        if (gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_EXPS_LAYERS) >= 0 || gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_EXPS_SEED) >= 0) {
+            throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_ROT_EXPS_LAYERS "/" LLAMA_PXQN_KEY_ROT_EXPS_SEED " without "
+                                     LLAMA_PXQN_KEY_ROT_EXPS " -- malformed file");
+        }
+        return;
+    }
+    if (gguf_get_kv_type(ctx, ke) != GGUF_TYPE_STRING) {
+        throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_ROT_EXPS " is not a string -- malformed file");
+    }
+    sites = llama_pxqn_parse_sites(gguf_get_val_str(ctx, ke));
+    constexpr uint32_t EXPS = PXQN_SITE_BIT(PXQN_SITE_FFN_IN) | PXQN_SITE_BIT(PXQN_SITE_DOWN_IN);
+    if (sites & ~EXPS) {
+        throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_ROT_EXPS " names '" + llama_pxqn_sites_str(sites & ~EXPS) +
+                                 "': only the routed-expert sites ffn_in, down_in may be rotated there");
+    }
+    const int ks = gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_EXPS_SEED);
+    if (ks >= 0) {
+        if (gguf_get_kv_type(ctx, ks) != GGUF_TYPE_UINT64) {
+            throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_ROT_EXPS_SEED " is not a u64 -- malformed file");
+        }
+        seed = gguf_get_val_u64(ctx, ks);
+    }
+    const int kl = gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_EXPS_LAYERS);
+    if (kl < 0) {
+        layers.assign(n_layer, 1);
+        return;
+    }
+    if (gguf_get_kv_type(ctx, kl) != GGUF_TYPE_STRING) {
+        throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_ROT_EXPS_LAYERS " is not a string -- malformed file");
+    }
+    const std::string s = gguf_get_val_str(ctx, kl);
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        size_t end = s.find(',', pos);
+        if (end == std::string::npos) end = s.size();
+        std::string tok = s.substr(pos, end - pos);
+        while (!tok.empty() && (tok.back()  == ' ' || tok.back()  == '\t')) tok.pop_back();
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.erase(tok.begin());
+        if (!tok.empty()) {
+            long a = -1, b = -1;
+            char * e = nullptr;
+            a = strtol(tok.c_str(), &e, 10);
+            if (e && *e == '-') b = strtol(e + 1, &e, 10); else b = a;
+            if (!e || *e != '\0' || a < 0 || b < a || b >= (long) n_layer) {
+                throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_ROT_EXPS_LAYERS " entry '" + tok + "' is not a layer or range of layers 0.." +
+                                         std::to_string(n_layer ? n_layer - 1 : 0));
+            }
+            for (long il = a; il <= b; ++il) layers[il] = 1;
+        }
+        pos = end + 1;
+    }
+}
+
+void * llama_pxqnc_open(const struct gguf_context * ctx) {
+    const struct ggml_pxqn_cbook_api * cb = ggml_pxqn_cbook_api_get();
+    if (!cb) {
+        throw std::runtime_error(ggml_pxqn_available()
+            ? "PXQN-C (codebook expert tier) tensors need a libggml-pxqn that carries the codebook tier -- update to the latest PXA release"
+            : "PXQN-C (codebook expert tier) models need the PXA release build (libggml-pxqn)");
+    }
+    const size_t npre = strlen(GGML_PXQN_CBOOK_KEY_PREFIX);
+    std::vector<struct ggml_pxqn_cbook_kv> kv;
+    std::vector<std::vector<const char *>> strs;   // string arrays, kept alive across the call
+    const int n = gguf_get_n_kv(ctx);
+    strs.reserve(n);
+    for (int k = 0; k < n; ++k) {
+        const char * key = gguf_get_key(ctx, k);
+        if (!key || strncmp(key, GGML_PXQN_CBOOK_KEY_PREFIX, npre) != 0) continue;
+        struct ggml_pxqn_cbook_kv e = {};
+        e.key  = key;
+        e.type = (int32_t) gguf_get_kv_type(ctx, k);
+        e.n    = 1;
+        if (e.type == GGUF_TYPE_ARRAY) {
+            e.arr_type = (int32_t) gguf_get_arr_type(ctx, k);
+            e.n        = (uint64_t) gguf_get_arr_n(ctx, k);
+            if (e.arr_type == GGUF_TYPE_STRING) {
+                strs.emplace_back();
+                for (uint64_t i = 0; i < e.n; ++i) strs.back().push_back(gguf_get_arr_str(ctx, k, (int) i));
+                e.data = strs.back().data();
+            } else {
+                e.data = gguf_get_arr_data(ctx, k);
+            }
+        } else if (e.type == GGUF_TYPE_STRING) {
+            e.data = gguf_get_val_str(ctx, k);
+        } else {
+            e.data = gguf_get_val_data(ctx, k);
+        }
+        kv.push_back(e);
+    }
+    char err[512] = {0};
+    void * h = cb->model_open(kv.data(), (int32_t) kv.size(), err, (int32_t) sizeof(err));
+    if (!h) {
+        throw std::runtime_error(std::string("PXQN-C: ") + (err[0] ? err : "the codebook tier refused this file's tables"));
+    }
+    return h;
+}
+
+void llama_pxqnc_close(void * handle) {
+    const struct ggml_pxqn_cbook_api * cb = ggml_pxqn_cbook_api_get();
+    if (cb && handle) cb->model_close(handle);
+}
+
+void llama_pxqnc_bind(void * handle, const struct ggml_tensor * t) {
+    const struct ggml_pxqn_cbook_api * cb = ggml_pxqn_cbook_api_get();
+    GGML_ASSERT(cb && handle && t && t->data);
+    char err[512] = {0};
+    if (cb->bind(handle, t->name, (int32_t) t->type, t->ne, t->data, ggml_nbytes(t), err, (int32_t) sizeof(err)) != 0) {
+        throw std::runtime_error(std::string("PXQN-C: tensor ") + t->name + ": " + (err[0] ? err : "refused by the codebook tier"));
+    }
+}
+
+uint32_t llama_pxqn_arch_rot_exps(llm_arch arch) {
+    switch (arch) {
+        // llm_build_moe_ffn rotates the routed copy (src/llama-build-context.cpp); the router and the shared expert stay
+        // on the unrotated activation. Listed only where the routed experts go through that builder on a single device.
+        case LLM_ARCH_QWEN35MOE: return PXQN_SITE_BIT(PXQN_SITE_FFN_IN) | PXQN_SITE_BIT(PXQN_SITE_DOWN_IN);
+        default:                 return 0;
+    }
+}
+
 // "blk.<N>.<rest>" -> N and <rest> ("" / -1 when not a block tensor)
 static int pxqn_split_blk(const std::string & name, std::string & rest) {
     rest.clear();
@@ -119,6 +246,16 @@ static int pxqn_split_blk(const std::string & name, std::string & rest) {
     if (!any || i >= name.size() || name[i] != '.') return -1;
     rest = name.substr(i + 1);
     return n;
+}
+
+bool llama_pxqnc_tensor_ok(const std::string & tensor_name, int & layer, int & site) {
+    std::string rest;
+    layer = pxqn_split_blk(tensor_name, rest);
+    site = PXQN_SITE_NONE;
+    if (layer < 0) return false;
+    if (rest == "ffn_gate_exps.weight" || rest == "ffn_up_exps.weight") site = PXQN_SITE_FFN_IN;
+    else if (rest == "ffn_down_exps.weight")                            site = PXQN_SITE_DOWN_IN;
+    return site != PXQN_SITE_NONE;
 }
 
 int llama_pxqn_tensor_layer(const std::string & tensor_name) {

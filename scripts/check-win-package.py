@@ -42,6 +42,9 @@ PXQN_HOOKS = ("ggml_backend_cuda_pxqn_gu_counters_reset", "ggml_backend_cuda_pxq
               "ggml_backend_cuda_pxqn_gu_prefill_count")
 DEFAULT_ARCHS = (60, 61, 70, 75, 80, 86, 89)   # SASS: the release floor (sm 60;61;70;75) + 80;86;89
 DEFAULT_PTX = (89,)                            # PTX for the newest arch only: GPUs newer than sm_89 JIT it
+# the closed library (ggml-pxqn.dll) is SASS ONLY, no PTX (2026-11-04 #61684: PTX is close to source), with native
+# Blackwell (sm_100, sm_120: the release toolkit is CUDA 12.8); a card without its SASS runs the open kernels (loader probe)
+DEFAULT_CLOSED_ARCHS = DEFAULT_ARCHS + (100, 120)
 DEFAULT_BLOCKLIST = ""   # the private block list comes from PXA_RELEASE_BLOCKLIST or --blocklist
 CUOBJDUMP_IMAGE = "nvidia/cuda:12.8.1-devel-ubuntu22.04"
 
@@ -50,6 +53,7 @@ CUOBJDUMP_IMAGE = "nvidia/cuda:12.8.1-devel-ubuntu22.04"
 # major (cuBLAS 12.8 ships sm_86 + sm_90 and no sm_89: an RTX 40xx runs the sm_86 cubins natively, no JIT). Ours stay exact.
 VENDOR_PREFIXES = ("cublas", "cudart", "cusparse", "cufft", "curand", "nvrtc", "nvjit")
 VENDOR_FATBINS = set()      # extracted fatbin file names of vendor libs (for the cuobjdump cross-check)
+CLOSED_FATBINS = set()      # extracted fatbin file names of the closed library (SASS only: cross-checked for PTX too)
 
 
 def is_vendor(label):
@@ -479,7 +483,8 @@ def check_notes(res, guards, text, where):
         res.add("WARN", "notes-text", "%s does not mention %s" % (where, SUMS_NAME))
 
 
-def check_pe_file(res, label, data, bin_names, archs, want_fatbin, fat_dir, ptx_req=()):
+def check_pe_file(res, label, data, bin_names, archs, want_fatbin, fat_dir, ptx_req=(), closed_archs=None):
+    """closed_archs (not None) = the closed library: SASS for each of these in every fatbin, and NO PTX entry at all."""
     """Machine, import closure, fatbin archs, string rules. Returns PE or None."""
     try:
         pe = PE(data)
@@ -514,6 +519,14 @@ def check_pe_file(res, label, data, bin_names, archs, want_fatbin, fat_dir, ptx_
         ptx = sorted(set(sm for _i, k, sm in ents if k == 1))
         nfat = len(set(i for i, _k, _s in ents))
         vendor = is_vendor(label)
+        closed = closed_archs is not None and not vendor
+        if closed:
+            archs, ptx_req = tuple(closed_archs), ()
+            if ptx:
+                res.add("FAIL", "closed-ptx", "%s: the closed library carries PTX %s in %d of %d fatbins (must be SASS only, #61684)"
+                        % (label, ",".join("compute_%d" % p for p in ptx), len(set(i for i, k, _s in ents if k == 1)), nfat))
+            else:
+                res.add("PASS", "closed-ptx", "%s: closed library, no PTX in %d fatbins" % (label, nfat))
         lack = arch_lack(archs, sass, vendor)
         if lack:
             res.add("FAIL", "cuda-arch", "%s: SASS %s, missing sm_%s%s" % (label, sass, ",sm_".join(map(str, lack)),
@@ -529,19 +542,23 @@ def check_pe_file(res, label, data, bin_names, archs, want_fatbin, fat_dir, ptx_
             if k == 2:
                 per.setdefault(i, set()).add(sm)
         thin = [i for i in range(nfat) if not set(archs) <= per.get(i, set())]
-        if thin and not vendor:
+        if thin and closed:
+            res.add("FAIL", "cuda-arch", "%s: %d of %d fatbins of the closed library lack SASS for some of sm_%s" % (label, len(thin), nfat, ",sm_".join(map(str, archs))))
+        elif thin and not vendor:
             res.add("WARN", "cuda-arch", "%s: %d of %d fatbins lack SASS for some of sm_%s" % (label, len(thin), nfat, ",sm_".join(map(str, archs))))
         nojit = [p for p in ptx_req if p not in ptx]
         if nojit and not vendor:
             res.add("FAIL", "cuda-arch", "%s: PTX %s, missing compute_%s (GPUs newer than sm_%d cannot JIT it)"
                     % (label, ",".join("compute_%d" % p for p in ptx) or "none", ",compute_".join(map(str, nojit)), max(archs)))
-        elif not ptx and not vendor:
+        elif not ptx and not vendor and not closed:
             res.add("WARN", "cuda-arch", "%s: no PTX; GPUs newer than sm_%d cannot run it (notes must say which cards)" % (label, max(archs)))
         if fat_dir is not None:
             fb = first_fatbin(blob)
             if fb:
                 if vendor:
                     VENDOR_FATBINS.add(label.replace("/", "_") + ".fatbin")
+                if closed:
+                    CLOSED_FATBINS.add(label.replace("/", "_") + ".fatbin")
                 with open(os.path.join(fat_dir, label.replace("/", "_") + ".fatbin"), "wb") as f:
                     f.write(fb)
     elif want_fatbin:
@@ -634,7 +651,7 @@ def run_release_scan(res, label, target, blocklist, work, jobs):
         res.add("FAIL", "scan-gate", "%s: gate could not run (rc %d): %s" % (label, p.returncode, (tail[-1] if tail else "")[:200]))
 
 
-def cuobjdump_crosscheck(res, fat_dir, archs, image):
+def cuobjdump_crosscheck(res, fat_dir, archs, image, closed_archs=DEFAULT_CLOSED_ARCHS):
     files = sorted(f for f in os.listdir(fat_dir) if f.endswith(".fatbin"))
     if not files:
         return
@@ -653,7 +670,16 @@ def cuobjdump_crosscheck(res, fat_dir, archs, image):
             res.add("FAIL", "cuobjdump", "%s: cuobjdump did not run (exit %d: %s) -- fails closed" % (f, p.returncode, p.stdout.strip()[:160]))
             continue
         got = sorted(set(int(x) for x in re.findall(r"\.sm_(\d+)\.cubin", p.stdout)))
-        lack = arch_lack(archs, got, f in VENDOR_FATBINS)
+        lack = arch_lack(tuple(closed_archs) if f in CLOSED_FATBINS else archs, got, f in VENDOR_FATBINS)
+        if f in CLOSED_FATBINS:   # the closed library: cuobjdump must list no PTX either
+            cmd_ptx = cmd[:-2] + ["--list-ptx", "/w/" + f]
+            try:
+                q = subprocess.run(cmd_ptx, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
+                nptx = sum(1 for l in q.stdout.splitlines() if ".ptx" in l)
+                res.add("FAIL" if nptx else "PASS", "cuobjdump", "%s (first fatbin): cuobjdump --list-ptx lists %d PTX file(s)%s"
+                        % (f, nptx, " -- the closed library must be SASS only" if nptx else ""))
+            except subprocess.TimeoutExpired:
+                res.add("FAIL", "cuobjdump", "%s: cuobjdump --list-ptx timed out (fails closed)" % f)
         res.add("FAIL" if lack else "PASS", "cuobjdump", "%s (first fatbin): cuobjdump lists SASS sm_%s%s" % (
             f, ",sm_".join(map(str, got)) or "none", " (NVIDIA lib: same-major rule)" if f in VENDOR_FATBINS else ""))
 
@@ -671,6 +697,9 @@ def main(argv=None):
     ap.add_argument("--allow-test-hooks", action="store_true", help="accept the 3 gu_* test-hook exports (old or test build)")
     ap.add_argument("--archs", default=",".join(map(str, DEFAULT_ARCHS)))
     ap.add_argument("--ptx", default=",".join(map(str, DEFAULT_PTX)), help="required PTX archs (comma list; \"\" = none)")
+    ap.add_argument("--closed-archs", default=",".join(map(str, DEFAULT_CLOSED_ARCHS)),
+                    help="ggml-pxqn.dll: required SASS archs (comma list); it must carry NO PTX")
+    ap.add_argument("--no-closed", action="store_true", help="check ggml-pxqn.dll like the open DLLs (a 4.0.3-or-older package)")
     ap.add_argument("--blocklist", default="")
     ap.add_argument("--ctest-log", default="", help="the Windows ctest output (100%% tests passed line)")
     ap.add_argument("--cuobjdump", action="store_true", help="cross-check the fatbins with cuobjdump in docker")
@@ -697,6 +726,7 @@ def main(argv=None):
     terms = "" if a.no_pxqn else os.path.join(base, PXQN_TERMS_NAME)
     archs = tuple(int(x) for x in a.archs.split(",") if x.strip())
     ptx_req = tuple(int(x) for x in a.ptx.split(",") if x.strip())
+    closed_archs = None if a.no_closed else tuple(int(x) for x in a.closed_archs.split(",") if x.strip())
     blocklist = a.blocklist or os.environ.get("PXA_RELEASE_BLOCKLIST", "") or (DEFAULT_BLOCKLIST if os.path.isfile(DEFAULT_BLOCKLIST) else "")
     guards = load_module(os.path.join(REPO, "scripts", "windows-release-guards.py"), "win_guards")
     def_names = guards.def_export_names(os.path.join(REPO, DEF_REL))
@@ -755,7 +785,8 @@ def main(argv=None):
             data = z.read(names[n])
             base_l = low.rsplit("/", 1)[-1]
             want = base_l in ("ggml-cuda.dll",)
-            pe = check_pe_file(res, n, data, bin_names, archs, want, fat_dir, ptx_req)
+            pe = check_pe_file(res, n, data, bin_names, archs, want, fat_dir, ptx_req,
+                               closed_archs if base_l == PXQN_NAME else None)
             if pe is not None and pe.section(".nv_fatb") is not None and base_l in cuda_dlls:
                 seen_cuda = True
             if pe is not None and base_l == PXQN_NAME:
@@ -772,7 +803,7 @@ def main(argv=None):
                 res.add("FAIL", "pxqn", "%s missing beside the zip (use --no-pxqn for a PXQ-only package)" % PXQN_NAME)
             else:
                 data = read_bytes(pxqn)
-                pe = check_pe_file(res, PXQN_NAME, data, bin_names | {PXQN_NAME}, archs, True, fat_dir, ptx_req)
+                pe = check_pe_file(res, PXQN_NAME, data, bin_names | {PXQN_NAME}, archs, True, fat_dir, ptx_req, closed_archs)
                 if pe is not None:
                     check_exports(res, PXQN_NAME, pe, def_names, expect, a.allow_test_hooks)
                 del data
@@ -831,7 +862,7 @@ def main(argv=None):
             run_release_scan(res, "beside-the-zip", side, blocklist, os.path.join(work, "scan"), a.jobs)
 
         if a.cuobjdump:
-            cuobjdump_crosscheck(res, fat_dir, archs, a.cuobjdump_image)
+            cuobjdump_crosscheck(res, fat_dir, archs, a.cuobjdump_image, closed_archs or DEFAULT_CLOSED_ARCHS)
         else:
             res.add("MANUAL", "cuobjdump", "optional cross-check: rerun with --cuobjdump (docker, no GPU)")
 

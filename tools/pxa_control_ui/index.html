@@ -612,6 +612,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
     <div class="menu" id="help-menu" hidden>
       <button class="mi" id="rp-open" type="button" title="send a bug report to the PXA team (you review it first)"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17h.01"/></svg><span>Report a problem<small>You see exactly what is sent, and nothing goes until you press Send.</small></span></button>
       <a class="mi" href="https://discord.pxanetwork.com" target="_blank" rel="noopener"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg><span>PXA Network Discord<small>Help, news, benchmarks, plugin requests</small></span></a>
+      <a class="mi" href="https://www.reddit.com/r/PXANetwork/" target="_blank" rel="noopener"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg><span>Reddit: r/PXANetwork<small>The official subreddit: news, questions, setups</small></span></a>
       <a class="mi" href="/share.html" id="share-open" title="a free image of your rig's measured speed to post anywhere"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v7h16v-7M12 3v12M7 8l5-5 5 5"/></svg><span>Share your rig's speed<small>Free: a one-click image of a benchmark run, ready for Discord</small></span></a>
       <a class="mi" href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/></svg><span>Support PXA on Ko-fi<small>Donations become supporter coins for the Store</small></span></a>
       <hr>
@@ -780,7 +781,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
           <div class="form" style="margin-top:10px">
             <label class="f">Context (0 = auto)<input type="number" id="l-ctx" min="0" step="1024" value="0"><span class="tiny" id="l-ctx-res" style="text-transform:none;letter-spacing:0;font-weight:500"></span><button class="link" id="l-ctx-auto" type="button" hidden style="text-transform:none;letter-spacing:0;justify-self:start">What would auto pick?</button></label>
             <label class="f">Parallel slots (0 = auto)<input type="number" id="l-np" min="0" max="64" value="0"></label>
-            <label class="f">KV cache type<select id="l-kv"></select></label>
+            <label class="f">KV cache type<select id="l-kv"></select><span class="tiny" id="l-kv-note" aria-live="polite" style="text-transform:none;letter-spacing:0;font-weight:500"></span></label>
             <label class="f">Server port (empty = auto)<input type="number" id="l-port" min="0" max="65535" placeholder="auto"></label>
           </div>
           <div style="display:grid;gap:12px;margin-top:14px">
@@ -1021,7 +1022,7 @@ mark{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;bor
   <div id="st-root"><div class="skel"></div></div>
 </section>
 <!-- the app footer: one for every page (it used to sit on Servers only); plugin pages are added before it -->
-<footer class="foot" id="app-foot"><a href="https://discord.pxanetwork.com" target="_blank" rel="noopener">PXA Network Discord</a><a href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener">&#9829; Support PXA</a><span id="sv-ver"></span><button class="b" id="sv-up" type="button" hidden>Update</button></footer>
+<footer class="foot" id="app-foot"><a href="https://discord.pxanetwork.com" target="_blank" rel="noopener">PXA Network Discord</a><a href="https://www.reddit.com/r/PXANetwork/" target="_blank" rel="noopener">Reddit: r/PXANetwork</a><a href="https://ko-fi.com/shatteredrealms1" target="_blank" rel="noopener">&#9829; Support PXA</a><span id="sv-ver"></span><button class="b" id="sv-up" type="button" hidden>Update</button></footer>
 </main>
 </div>
 <dialog class="dlg" id="sd" aria-labelledby="sd-h" style="width:min(560px,96vw)"><h2 id="sd-h"></h2><div id="sd-body"></div><div class="acts" id="sd-acts"></div></dialog>
@@ -2294,8 +2295,21 @@ function modelInfo() {
     else note.replaceChildren();
   }
   chatQuantNote();
+  kvGuardNote();
+}
+// PXA_KV_K_GUARD (engine 4.0.4, bug #378): a Qwen2-family model runs a 4-bit K cache at q8_0; V stays as picked.
+// /api/info names the archs and types; the words match core.py kv_k_guard_note (the launch plan's note).
+function kvGuardNote() {
+  const n = $("#l-kv-note");
+  if (!n) return;
+  const g = S.info && S.info.kv_k_guard, kv = $("#l-kv").value;
+  const m = S.models && S.models.models.find(x => x.path === $("#l-model").value);
+  n.textContent = g && m && g.archs.includes(m.arch) && g.types.includes(kv)
+    ? `Qwen2-family model (${m.arch}): the engine keeps the K cache at q8_0, because a ${kv} K breaks these models; V stays ${kv}. PXA_KV_K_GUARD=0 turns this off.`
+    : "";
 }
 $("#l-model").addEventListener("change", () => { store.set("model", $("#l-model").value); modelInfo(); steps(); loadThinkModel(); loadCompanions(); });
+$("#l-kv").addEventListener("change", kvGuardNote);
 async function loadCompanions() {
   const dw = $("#l-draft-wrap"), hw = $("#l-hot-wrap");
   if (!dw || !hw) return;
@@ -2341,11 +2355,13 @@ function applyBody(b) {
   store.set("cards", b.gpus || []); renderLaunchCards();
   $$("#l-cards input").forEach(i => i.checked = (b.gpus || []).includes(+i.value));
   if (b.model) { $("#l-model").value = b.model; store.set("model", b.model); modelInfo(); }
-  $("#l-ctx").value = b.ctx || 0; if (window.ctxManualUi) setTimeout(ctxManualUi, 0); $("#l-np").value = b.np || 0; $("#l-kv").value = b.kv || "auto"; $("#l-port").value = b.port || "";
+  $("#l-ctx").value = b.ctx || 0; if (window.ctxManualUi) setTimeout(ctxManualUi, 0); $("#l-np").value = b.np || 0; $("#l-kv").value = b.kv || "auto"; kvGuardNote(); $("#l-port").value = b.port || "";
   $("#l-sm").setv(b.sm || "auto"); $("#l-fa").setv(b.fa || "auto"); $("#l-ngram").setv(b.ngram || "auto");
   $("#l-mtp").checked = !!b.mtp; $("#l-expose").checked = !!b.expose; $("#l-unmeasured").checked = !!b.accept_unmeasured; $("#l-busy").checked = !!b.allow_busy;
   S.pendingDraft = b.draft_model || ""; S.pendingHot = b.hot_models || []; loadCompanions();
   $("#l-extra").value = Array.isArray(b.extra_args) ? b.extra_args.map(a => /^[\w.,:=+\-\/]+$/.test(a) ? a : "'" + a.replace(/'/g, "'\\''") + "'").join(" ") : (b.extra_args || "");
+  // a stored launch keeps its vision projector as b.mmproj (the flag left extra args): show it again so a re-launch keeps it
+  if (b.mmproj && !/(^|\s)(-mm|--mmproj)(\s|=)/.test($("#l-extra").value)) $("#l-extra").value = ($("#l-extra").value + " --mmproj " + b.mmproj).trim();
   const ed = b.engine_dir || ""; const known = $$("#l-engine option").some(o => o.value === ed);
   $("#l-engine").value = known ? ed : ""; $("#l-engine-path").value = known ? "" : ed;
   S.leverVals = Object.assign({}, b.levers || {}); store.set("levers", S.leverVals); renderLevers();

@@ -61,6 +61,11 @@ int     ggml_cuda_pxqn_gate_tail(ggml_backend_cuda_context & ctx, const ggml_ten
                                  const ggml_tensor * rht, const ggml_tensor * mm);
 
 int  ggml_cuda_pxqn_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// PXQN-C (the codebook expert tier, GGML_TYPE_PXQNC): the library's role "cbook" (ggml-pxqn-ext.h). Without it the
+// type is never on a card (the loader refuses the file); a decline at compute time aborts with one message.
+bool ggml_cuda_pxqnc_supported(const ggml_tensor * op);
+int  ggml_cuda_pxqnc_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+int  ggml_cuda_pxqnc_rht_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * rht, ggml_tensor * const * mm, int n_mm);
 // A graph window at node i (a MUL_MAT): the library may compute node i and the nodes after it in one go. It returns the
 // index of the last node it computed (their outputs as their own kernels write them), or i (nothing launched: node i runs
 // as usual). host = what the engine offers it (below).

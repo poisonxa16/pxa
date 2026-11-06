@@ -1368,6 +1368,16 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 2,
     },
+    // PXQN-C: the codebook expert tier (routed experts only); decoded by the closed libggml-pxqn only
+    [GGML_TYPE_PXQNC] = {
+        .type_name                = "pxqnc",
+        .blck_size                = 256,
+        .type_size                = 55,
+        .is_quantized             = true,
+        .vec_dot                  = pxa_vec_dot_pxqn_no_cpu,
+        .nrows                    = 1,
+        .row_meta_size            = 2,
+    },
     [GGML_TYPE_Q8_K] = {
         .type_name                = "q8_K",
         .blck_size                = QK_K,
@@ -7632,6 +7642,8 @@ bool ggml_moe_up_gate_can_fuse(enum ggml_type type_up, enum ggml_type type_gate)
     (void)type_up; (void)type_gate;
     return false;
 #else
+    // PXQN-C (codebook expert tier): no fused up/gate kernel; its routed experts run as two MUL_MAT_IDs
+    if (type_up == GGML_TYPE_PXQNC || type_gate == GGML_TYPE_PXQNC) return false;
     if (type_up == type_gate) return true;
     // PXQ-UNIVERSAL mixed tiers (CUDA-only slab types): the fused CUDA MoE kernels
     // handle mixed up/gate pairs over {PXQ2, PXQ3, PXQ4} with independent per-operand

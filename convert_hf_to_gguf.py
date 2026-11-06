@@ -891,12 +891,14 @@ class Model:
         special_vocab.add_to_gguf(self.gguf_writer)
 
     def _create_vocab_sentencepiece(self):
-        from sentencepiece import SentencePieceProcessor
-
         tokenizer_path = self.dir_model / 'tokenizer.model'
 
         if not tokenizer_path.is_file():
+            # checked before the import: a model without tokenizer.model (BPE: tokenizer.json) falls back to the HF/gpt2 vocab
+            # in set_vocab and needs no sentencepiece package
             raise FileNotFoundError(f"File not found: {tokenizer_path}")
+
+        from sentencepiece import SentencePieceProcessor
 
         tokenizer = SentencePieceProcessor()
         tokenizer.LoadFromFile(str(tokenizer_path))

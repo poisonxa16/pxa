@@ -37,6 +37,7 @@ def load(path, name):
 
 
 REL_ARCHS = (60, 61, 70, 75, 80, 86, 89)   # the release layout: SASS for each, PTX for 89 only
+CLOSED_ARCHS = REL_ARCHS + (100, 120)      # the closed library (ggml-pxqn.dll): SASS only, no PTX (#61684)
 
 
 def fatbin(archs, ptx=True):
@@ -160,7 +161,7 @@ class CheckWinPackageTests(unittest.TestCase):
 
     def build(self, name="rel", members=None, drop=(), backslash=False, pxqn_exports=None, control=None,
               notice="Third-party: NVIDIA CUDA runtime (CUDA EULA); Microsoft Visual C++ runtime.\n", sums=True,
-              pxqn_extra=b"", terms="PXQN library terms\n"):
+              pxqn_extra=b"", terms="PXQN library terms\n", pxqn_fat=None):
         out = os.path.join(self.root, name)
         os.makedirs(out)
         fat3 = fatbin(REL_ARCHS, ptx=(89,))
@@ -189,7 +190,8 @@ class CheckWinPackageTests(unittest.TestCase):
                 arc = TOP + "/" + rel
                 z.writestr(arc.replace("/", "\\") if backslash else arc, data)
         exports = list(self.defs) if pxqn_exports is None else pxqn_exports
-        open(os.path.join(out, "ggml-pxqn.dll"), "wb").write(make_pe(exports=exports, fat=fat3, extra=pxqn_extra))
+        fatc = fatbin(CLOSED_ARCHS, ptx=False) if pxqn_fat is None else pxqn_fat
+        open(os.path.join(out, "ggml-pxqn.dll"), "wb").write(make_pe(exports=exports, fat=fatc, extra=pxqn_extra))
         if control is None:
             control = make_pe(imports=("KERNEL32.dll",)) + pyinstaller_payload(
                 [("pxa_control.app", "def main(): return 'hello'"), ("json.decoder", "x")],
@@ -250,6 +252,29 @@ class CheckWinPackageTests(unittest.TestCase):
         rc, fails, _ = self.run_check(out)
         self.assertEqual(rc, 1)
         self.assertFailCheck(fails, "cuda-arch", "sm_61")
+
+    def test_closed_lib_sass_only(self):
+        # the 4.0.3 layout (PTX 89 in every fatbin, no Blackwell SASS) fails the closed-library rule
+        out = self.build(pxqn_fat=fatbin(REL_ARCHS, ptx=(89,)))
+        rc, fails, _ = self.run_check(out)
+        self.assertEqual(rc, 1)
+        self.assertFailCheck(fails, "closed-ptx", "carries PTX compute_89")
+        self.assertFailCheck(fails, "cuda-arch", "missing sm_100,sm_120")
+        rc, fails, out_txt = self.run_check(out, "--no-closed")   # an old package, checked like the open DLLs
+        self.assertEqual((rc, fails), (0, []), out_txt)
+        # SASS only but without Blackwell: fails unless the closed list is narrowed explicitly
+        out = self.build(name="r2", pxqn_fat=fatbin(REL_ARCHS, ptx=False))
+        rc, fails, _ = self.run_check(out)
+        self.assertEqual(rc, 1)
+        self.assertFailCheck(fails, "cuda-arch", "missing sm_100,sm_120")
+        rc, fails, out_txt = self.run_check(out, "--closed-archs", ",".join(map(str, REL_ARCHS)))
+        self.assertEqual((rc, fails), (0, []), out_txt)
+        self.assertIn("closed library, no PTX", out_txt)
+        # one PTX entry anywhere fails it, even next to the full SASS list
+        out = self.build(name="r3", pxqn_fat=fatbin(CLOSED_ARCHS, ptx=(120,)))
+        rc, fails, _ = self.run_check(out)
+        self.assertEqual(rc, 1)
+        self.assertFailCheck(fails, "closed-ptx", "compute_120")
 
     def test_missing_ptx_fails(self):
         out = self.build(members={"bin/ggml.dll": make_pe(exports=("g",), fat=fatbin(REL_ARCHS, ptx=False))})

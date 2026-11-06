@@ -1019,6 +1019,22 @@ ggml_tensor * llm_build_context::build_pxqn_rht_ranges(ggml_context * ctx, const
     return ggml_reshape(ctx, out, x);
 }
 
+// PXQN-C rotation scope B: the RHT128 of a routed-expert site of layer `il` when the file stores that layer's routed experts
+// rotated for the site (hparams.pxqn_rot_exps_at), under the experts' seed; the identity otherwise
+ggml_tensor * llm_build_context::build_pxqn_rht_exps(ggml_context * ctx, const llama_hparams & hp, ggml_tensor * x, int il, int site) {
+    if (!(hp.pxqn_rot_exps_at(il) & PXQN_SITE_BIT(site))) {
+        return x;
+    }
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    if (x->nb[0] != sizeof(float)) {
+        x = ggml_cont(ctx, x);
+    }
+    GGML_ASSERT(x->ne[0] % PXQN_RHT_BLOCK == 0);
+    ggml_tensor * y = ggml_pxqn_rht(ctx, x, hp.pxqn_rot_exps_seed, il, site, 0);
+    ggml_format_name(y, "pxqn_rht_exps_%s-%d", site == PXQN_SITE_FFN_IN ? "ffn_in" : "down_in", il);
+    return y;
+}
+
 int64_t llm_build_context::pxqn_split_k0(const ggml_split_tensor_t * st, int id) {
     int64_t k0 = 0;
     for (int j = 0; j < id; ++j) {
@@ -1497,6 +1513,16 @@ llm_expert_gating_func_type   gating_op,
 
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
 
+    // PXQN-C rotation scope B (pxa.pxqn.rot.exps): the routed experts read a rotated COPY of their input (ffn_in: once per
+    // token per layer, shared by gate + up) and of every slot's SwiGLU output (down_in); the router above and the shared
+    // expert keep the unrotated activation. The identity (no node) for every file without the key.
+    const uint32_t rot_exps = lctx.model.hparams.pxqn_rot_exps_at(il);
+    ggml_tensor * cur_r = cur;
+    if (rot_exps & PXQN_SITE_BIT(PXQN_SITE_FFN_IN)) {
+        GGML_ASSERT(!weight_before_ffn);
+        cur_r = build_pxqn_rht_exps(ctx, lctx.model.hparams, cur, il, PXQN_SITE_FFN_IN);
+    }
+
     if (weight_before_ffn) {
         // TODO: this is a workaround as we don't yet have a repeat op that takes custom dim (ggml_repeat_4d)
         ggml_tensor * repeated = ggml_new_tensor_3d(ctx, cur->type, n_embd, n_expert_used, n_tokens);
@@ -1534,7 +1560,7 @@ llm_expert_gating_func_type   gating_op,
         // architecture passes a gate (or a fused up/gate) and never reaches this branch.
         if (gate_exps == nullptr && up_gate_exps == nullptr) {
             GGML_ASSERT(type_op == LLM_FFN_RELU_SQR || type_op == LLM_FFN_RELU);
-            ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur_r, selected_experts); // [n_ff, n_expert_used, n_tokens]
             cb(up, xname("ffn_moe_up"), il);
             if (up_exps_b) {
                 up = ggml_add_id(ctx, up, up_exps_b, selected_experts);
@@ -1565,16 +1591,16 @@ llm_expert_gating_func_type   gating_op,
             up_exps && gate_exps && !up_exps_b && !gate_exps_b &&
             lctx.cparams.fused_moe_up_gate &&
             ggml_moe_up_gate_can_fuse(up_exps->type, gate_exps->type)) {
-            par = ggml_moe_up_gate_clamped(ctx, up_exps, gate_exps, cur, selected_experts, dsv4_limit);
+            par = ggml_moe_up_gate_clamped(ctx, up_exps, gate_exps, cur_r, selected_experts, dsv4_limit);
             cb(par, xname("ffn_moe_swiglu_limited_fused"), il);
         } else if (can_use_fmoe && up_gate_exps) {
             if (up_gate_exps_b) {
-                par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
+                par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur_r, selected_experts, up_gate_exps_b, nullptr,
                         type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                         type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
             } else {
                 GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI_MOE);
-                par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur, selected_experts,
+                par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur_r, selected_experts,
                         type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
             }
             if (lctx.model.arch == LLM_ARCH_STEP35) {
@@ -1585,22 +1611,22 @@ llm_expert_gating_func_type   gating_op,
 
         if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && ggml_moe_up_gate_can_fuse(up_exps->type, gate_exps->type)) {
             if (up_exps_b || gate_exps_b) {
-                par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
+                par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur_r, selected_experts, up_exps_b, gate_exps_b,
                         type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                         type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
             } else {
                 GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI_MOE);
-                par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, selected_experts,
+                par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur_r, selected_experts,
                         type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
             }
             if (lctx.model.arch == LLM_ARCH_STEP35) {
                 *(float *)(par->op_params + 1) = lctx.model.hparams.swiglu_limits[il];
             }
         } else {
-            ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur_r, selected_experts); // [n_ff, n_expert_used, n_tokens]
             cb(up, xname("ffn_moe_up"), il);
 
-            ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur_r, selected_experts); // [n_ff, n_expert_used, n_tokens]
             cb(gate, xname("ffn_moe_gate"), il);
 
             if (graph) {
@@ -1645,6 +1671,11 @@ llm_expert_gating_func_type   gating_op,
         }
         }
         cb(par, xname("ffn_moe_gate_par"), il);
+
+        // PXQN-C scope B: the down_in rotation of every routed slot's activation (before any K window padding)
+        if (rot_exps & PXQN_SITE_BIT(PXQN_SITE_DOWN_IN)) {
+            par = build_pxqn_rht_exps(ctx, lctx.model.hparams, par, il, PXQN_SITE_DOWN_IN);
+        }
 
         // K-STRADDLE (pxa-pxq-split.h): a down shard whose K is wider than this device's slice of n_ff
         // carries its K window; zero-pad the activation to the shard's K (exact on every path; the fused PXQN MoE
@@ -1761,7 +1792,7 @@ llm_expert_gating_func_type   gating_op,
         }
         ggml_tensor * exp_hot = nullptr, * exp_cold = nullptr, * xc_check = nullptr;
         if (xc_async) {
-            ggml_tensor * ticket = ggml_moe_cold_submit(ctx, cur, ids_cold, xc_async);
+            ggml_tensor * ticket = ggml_moe_cold_submit(ctx, cur_r, ids_cold, xc_async);
             cb(ticket, "ffn_moe_cold_submit", il);
             // the hot half's first node depends on the ticket, so the submit is queued before every hot kernel
             static const bool pxa_xca_ticketdep = pxa_xca_flag("PXA_XCACHE_ASYNC_TICKETDEP", true);

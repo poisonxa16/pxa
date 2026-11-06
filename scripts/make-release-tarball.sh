@@ -578,6 +578,16 @@ if grep -q '^PXA_PXQN_CLOSED_SRC:BOOL=ON' "$BUILD_DIR/CMakeCache.txt" 2>/dev/nul
   # Windows zip; LICENSING.md links docs/LICENSE-ggml-pxqn.txt, staged below by keep_doc (2026-10-19)
   [ -f "$EXPORT/docs/LICENSE-ggml-pxqn.txt" ] || die "libggml-pxqn.so ships but docs/LICENSE-ggml-pxqn.txt is absent from REF $REF"
   cp -a "$EXPORT/docs/LICENSE-ggml-pxqn.txt" "$STAGE/LICENSE-ggml-pxqn.txt"
+  # SASS only, NO PTX (2026-11-04 #61684): the REF's own gate on the staged closed library (its SASS list = the
+  # release list + native Blackwell 100 120; any PTX entry fails); a REF whose gate predates the rule is skipped with a note.
+  # The gate fails closed (exit 3) when no cuobjdump runs (host, $CUDA_HOME or the release image).
+  if grep -q -- '--require-closed' "$EXPORT/scripts/gate-sm75-check.sh" 2>/dev/null; then
+    _cl_nums=$(printf '%s' "$CUDA_ARCHS" | tr ';' '\n' | grep -v -- '-virtual$' | sed 's/-real$//' | paste -sd' ')
+    nice -n 15 bash "$EXPORT/scripts/gate-sm75-check.sh" --archs "$_cl_nums" --require-closed "$STAGE/lib/libggml-pxqn.so" \
+      || die "lib/libggml-pxqn.so fails the closed-library gate (SASS only, no PTX, #61684): see the lines above"
+  else
+    info "REF $REF has no closed-library PTX rule in scripts/gate-sm75-check.sh (a pre-#61684 REF): skipped"
+  fi
 fi
 
 # Fail closed on the tools the steps below need inside $DEV_IMAGE: a missing readelf turns the RUNPATH and debug-strip

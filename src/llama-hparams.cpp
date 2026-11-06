@@ -356,6 +356,24 @@ void llm_load_hparams(
                              : " (it loads this family's PXQN files only unrotated; re-encode with --rot-sites none)"));
         }
     }
+    // PXQN-C rotation scope B: only the routed experts are rotated (llm_build_moe_ffn rotates a copy for them)
+    {
+        std::vector<uint8_t> lay;
+        llama_pxqn_read_rot_exps(ctx, hparams.n_layer, hparams.pxqn_rot_seed, hparams.pxqn_rot_exps, lay, hparams.pxqn_rot_exps_seed);
+        if (hparams.pxqn_rot_exps) {
+            if (hparams.n_layer > LLAMA_MAX_LAYERS) throw std::runtime_error("PXQN: too many layers for " LLAMA_PXQN_KEY_ROT_EXPS);
+            if (hparams.pxqn_rev == 0) throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_ROT_EXPS " without " LLAMA_PXQN_KEY_REV " -- malformed file");
+            if (hparams.pxqn_rev == 1 && gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_SEED) < 0 && gguf_find_key(ctx, LLAMA_PXQN_KEY_ROT_EXPS_SEED) < 0) {
+                throw std::runtime_error("PXQN: " LLAMA_PXQN_KEY_ROT_EXPS " without a rotation seed -- malformed file");
+            }
+            const uint32_t ok = llama_pxqn_arch_rot_exps(model.arch);
+            if (hparams.pxqn_rot_exps & ~ok) {
+                throw std::runtime_error(format("PXQN: rotated routed-expert sites '%s' (%s) are not supported for arch %s by this build",
+                        llama_pxqn_sites_str(hparams.pxqn_rot_exps).c_str(), LLAMA_PXQN_KEY_ROT_EXPS, llama_model_arch_name(model.arch)));
+            }
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) hparams.pxqn_rot_exps_layer[il] = lay[il];
+        }
+    }
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, model.name, false);

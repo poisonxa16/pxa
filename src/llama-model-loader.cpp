@@ -547,6 +547,38 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             throw std::runtime_error("PXQN models need the PXA release build (libggml-pxqn); "
                                      "classic PXQ/k-quants work in this build");
         }
+        // PXQN-C (the codebook expert tier): routed-expert tensors only, in whole 64-row panels and 256-K slabs, stored
+        // rotated under scope B (pxa.pxqn.rot.exps), decoded by the library's codebook tier, whose check of the file's tables
+        // runs here too -- all before any tensor is created
+        {
+            uint32_t rexps = 0; uint64_t rseed = 0; std::vector<uint8_t> rlay;
+            llama_pxqn_read_rot_exps(meta, LLAMA_MAX_LAYERS, pxqn_seed, rexps, rlay, rseed);
+            int n_cb = 0;
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                if (!ggml_pxqn_cbook_type(cur->type)) continue;
+                int il = -1, site = PXQN_SITE_NONE;
+                if (!llama_pxqnc_tensor_ok(cur->name, il, site)) {
+                    throw std::runtime_error(format("PXQN-C: %s is %s, a tier for routed-expert tensors only", cur->name, ggml_type_name(cur->type)));
+                }
+                if (cur->ne[1] % 64 != 0 || cur->ne[0] % 256 != 0 || cur->ne[3] != 1) {
+                    throw std::runtime_error(format("PXQN-C: %s is %lld x %lld: the tier needs rows %% 64 == 0 and K %% 256 == 0", cur->name,
+                                                    (long long) cur->ne[1], (long long) cur->ne[0]));
+                }
+                if (!(rexps & PXQN_SITE_BIT(site)) || il >= (int) rlay.size() || !rlay[il]) {
+                    throw std::runtime_error(format("PXQN-C: %s is stored rotated, but %s does not cover %s of layer %d -- malformed file",
+                                                    cur->name, LLAMA_PXQN_KEY_ROT_EXPS, llama_pxqn_site_name(site), il));
+                }
+                ++n_cb;
+            }
+            if (n_cb > 0) {
+                if (pxqn_rev == 0) {
+                    throw std::runtime_error("PXQN-C tensors in a file without " LLAMA_PXQN_KEY_REV " -- malformed file");
+                }
+                llama_pxqnc_close(llama_pxqnc_open(meta));   // throws with the library's sentence
+                LLAMA_LOG_INFO("%s: PXQN-C codebook tier: %d routed-expert tensors, rotated sites %s\n", __func__, n_cb,
+                               llama_pxqn_sites_str(rexps).c_str());
+            }
+        }
         if (pxqn_rev > 0) {
             LLAMA_LOG_INFO("%s: PXQN revision %u, rotated sites: %s%s\n", __func__, pxqn_rev,
                            pxqn_sites ? llama_pxqn_sites_str(pxqn_sites).c_str() : "none",

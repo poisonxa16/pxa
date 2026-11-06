@@ -1159,7 +1159,9 @@ class EncodeService(object):
                 "flow": "make" if AD.supports_make(info) else "legacy",
                 "use_hess": use_hess, "keep": bool(body.get("keep")), "classic": AD.is_classic(tier), "mmproj": mmproj,
                 "stages": self.stages_for(src, info, use_hess, AD.is_classic(tier)),
-                "dump_cards": [c["index"] for c in local if c["index"] in (body.get("cards") or [c["index"]])] or [c["index"] for c in local],
+                # a card picked for the encode is the ONLY card the job uses (calibration included): the other cards may be busy
+                "dump_cards": ([enc_card] if body.get("encode_card") not in (None, "") else
+                               [c["index"] for c in local if c["index"] in (body.get("cards") or [c["index"]])] or [c["index"] for c in local]),
                 "licence_ack": bool(body.get("licence_ack")), "targets": body.get("cards")}
 
     def _coin_check(self, add, lic, st, left):

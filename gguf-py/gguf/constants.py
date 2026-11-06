@@ -2124,6 +2124,7 @@ class GGMLQuantizationType(IntEnum):
     PXQN4S8   = 262   # ladder: N4 int book x SUB16/8, PXQ4-HQ slab order (4.50 + 16/K bpw)
     PXQN5     = 263   # ladder: 5-bit uniform x SUB16/16, 128-K slabs (5.25 + 16/K bpw)
     PXA4      = 264   # PXA subscriber flagship tier (~5.06 bpw)
+    PXQNC     = 265   # PXQN-C codebook expert tier (~1.73 bpw), routed experts only
     Q8_0_X4   =  97
     Q8_1_X4   =  98
     Q8_2_X4   =  99
@@ -2370,6 +2371,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.PXQN4S8     : (  32,   18),  # + 2 B/row anchor meta
     GGMLQuantizationType.PXQN5       : ( 128,   84),  # + 2 B/row anchor meta
     GGMLQuantizationType.PXA4        : ( 128,   81),  # + 2 B/row anchor meta
+    GGMLQuantizationType.PXQNC       : ( 256,   55),  # + 2 B/row anchor meta
     GGMLQuantizationType.Q4_0_4_4    : (  32,   18),
     GGMLQuantizationType.Q4_0_4_8    : (  32,   18),
     GGMLQuantizationType.Q4_0_8_8    : (  32,   18),

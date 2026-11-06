@@ -934,6 +934,11 @@ extern "C" {
 
     LLAMA_API const char * llama_model_arch_string(const struct llama_model * model);
 
+    // PXA_KV_K_GUARD (4.0.4): the K cache type a context of a model with GGUF architecture `arch` (e.g. "qwen2vl",
+    // what llama_model_arch_string returns) is created with when `type_k` is asked. Qwen2-family models (qwen2,
+    // qwen2vl, qwen2moe) raise a K of 4 bits or fewer to q8_0; any other arch, or PXA_KV_K_GUARD=0, gets `type_k`.
+    LLAMA_API enum ggml_type llama_pxa_kv_k_guard_type(const char * arch, enum ggml_type type_k);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,

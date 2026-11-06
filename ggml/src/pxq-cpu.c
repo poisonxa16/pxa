@@ -51,6 +51,7 @@
 #include "ggml-pxq1-tables.h"
 #include "ggml-pxqn.h"
 #include "ggml-pxqn-api.h"
+#include "ggml-pxqn-ext.h"   // role "cbook": the codebook expert tier (PXQN-C)
 
 #include <math.h>
 #include <stddef.h>
@@ -178,6 +179,8 @@ bool pxa_pxq_is_cpu_supported(enum ggml_type type) {
         case GGML_TYPE_PXQN5:
         case GGML_TYPE_PXA4:
             return ggml_pxqn_available();   // the closed libggml-pxqn decodes them
+        case GGML_TYPE_PXQNC:
+            return ggml_pxqn_cbook_api_get() != NULL;   // the library's codebook tier (role "cbook")
         default:
             return false;
     }
@@ -320,6 +323,13 @@ static void pxa_pxqn_deq_row_fwd(enum ggml_type type, const void * data, int64_t
     l->cpu->deq_row(type, data, row, k, dst);
 }
 
+// PXQN-C (the codebook expert tier): the library's role "cbook" decodes it (a file with such tensors is refused without it)
+static void pxa_pxqnc_deq_row_fwd(enum ggml_type type, const void * data, int64_t row, int64_t k, float * dst) {
+    const struct ggml_pxqn_cbook_api * c = ggml_pxqn_cbook_api_get();
+    if (!c) { fprintf(stderr, "%s (codebook tier)\n", GGML_PXQN_MISSING_MSG); abort(); }
+    c->deq_row((int32_t) type, data, row, k, dst);
+}
+
 void pxa_pxq_dequant_row(enum ggml_type type, const void * data, int64_t row, int64_t k, float * dst) {
     pxa_pxq_ensure_tables();
     PXA_PXQ_ASSERT(k % 32 == 0);
@@ -339,6 +349,7 @@ void pxa_pxq_dequant_row(enum ggml_type type, const void * data, int64_t row, in
         case GGML_TYPE_PXQN5:
         case GGML_TYPE_PXA4:
         case GGML_TYPE_PXQN4S8: pxa_pxqn_deq_row_fwd(type, data, row, k, dst); break;
+        case GGML_TYPE_PXQNC:   pxa_pxqnc_deq_row_fwd(type, data, row, k, dst); break;
         default: PXA_PXQ_ASSERT(!"pxa_pxq_dequant_row: not a PXQ type");
     }
 }

@@ -5293,6 +5293,10 @@ bool create_tensors_helper::merge_up_gate_exps(const LLM_TN & tn, int i, int bia
         LLAMA_LOG_INFO("%s: not merging because up/gate meta info is different\n", __func__);
         return false;
     }
+    if (!ggml_moe_up_gate_can_fuse(u_meta->type, g_meta->type)) {   // PXQN-C: no fused up/gate kernel for the tier
+        LLAMA_LOG_INFO("%s: not merging -- no fused up/gate kernel for %s\n", __func__, ggml_type_name(u_meta->type));
+        return false;
+    }
 
     auto u_ctx = get_context_for_tensor(ctx_split, u_name);
     auto g_ctx = get_context_for_tensor(ctx_split, g_name);

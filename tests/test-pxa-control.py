@@ -1250,10 +1250,19 @@ class FooterOnEveryPage(unittest.TestCase):
         f = self.foots[0]
         self.assertIn("https://discord.pxanetwork.com", f["hrefs"])
         self.assertIn("https://ko-fi.com/shatteredrealms1", f["hrefs"])
+        self.assertIn("https://www.reddit.com/r/PXANetwork/", f["hrefs"], "the subreddit link sits beside the Discord link")
         for i in ("sv-ver", "sv-up"):
             self.assertIn(i, f["ids"], i)
         self.assertEqual(self.html.count('id="sv-ver"'), 1)
         self.assertEqual(self.html.count('id="sv-up"'), 1)
+
+    def test_the_help_menu_lists_discord_and_the_subreddit_together(self):
+        menu = self.html.split('id="help-menu"', 1)[1].split("</div>", 1)[0]
+        d = menu.find('href="https://discord.pxanetwork.com"')
+        r = menu.find('href="https://www.reddit.com/r/PXANetwork/"')
+        self.assertTrue(0 <= d < r, "the Help menu has the Discord entry and then the Reddit entry")
+        self.assertIn("Reddit: r/PXANetwork", menu)
+        self.assertIn('rel="noopener"', menu[r:r + 200])
 
     def test_a_plugin_tab_adds_its_page_before_the_footer(self):
         self.assertNotIn("main.append(sec)", self.host, "a plugin page appended to <main> would land under the footer")

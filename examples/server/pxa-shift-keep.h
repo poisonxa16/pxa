@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
 
 template <typename Prompt, typename Cache>
 inline bool pxa_shift_keep_matches(Prompt & prompt, int32_t n_prompt,
@@ -36,4 +37,36 @@ inline bool pxa_shift_keep_matches(Prompt & prompt, int32_t n_prompt,
             != cache[(size_t) n_keep + (size_t) i]) return false;
     }
     return true;
+}
+
+// PXA_MTMD_SHIFT_SNAP_v1 (bug #379): a prompt shift drops tokens [n_keep, n_keep + n_discard). The one-step
+// n_discard is moved off image/audio chunks by adjust_n_to_support_context_shift, but a prompt longer than about
+// 1.5 x n_ctx drops several steps, and that end can land INSIDE a media chunk: the chunk's map entry goes with the
+// dropped part, its tail placeholders stay, and the first prompt batch throws "Chunk not found, or idx is not the
+// first token of a chunk" (llama-server abort -6). The same holds for the cache tokens of a restored prompt.
+// Move the end forward while it sits on a media placeholder that is not a chunk start, so the cut drops the whole
+// chunk. An end on a text token or on a chunk start is left as it is (every case that worked before is unchanged).
+// is_null(i): token i is a media placeholder (LLAMA_TOKEN_NULL); is_start(i): a media chunk starts at i.
+template <typename IsNull, typename IsStart>
+inline int32_t pxa_shift_snap_discard(int32_t n_tokens, int32_t n_keep, int32_t n_discard,
+                                      IsNull is_null, IsStart is_start) {
+    if (n_discard <= 0 || n_keep < 0) return n_discard;
+    int32_t end = n_keep + n_discard;
+    while (end < n_tokens && is_null(end) && !is_start(end)) ++end;
+    return end - n_keep;
+}
+
+// PXA_MTMD_NO_PROMPT_SHIFT_v1 (bug #379, decision 11-05): a NEW prompt that carries media and
+// does not fit the slot is refused with HTTP 400 instead of being shifted. A shift with n_keep 0 drops the
+// system prompt, the question and the user header, and the model then answers with EOS at once (measured:
+// SmolVLM2-2.2B, 5 images at -c 4096 -> a 1-token empty reply). Mainline refuses context shift with mtmd.
+// Text-only prompts keep the old truncation; the snap above stays for the cache-restore and mid-generation
+// shift paths.
+inline bool pxa_mtmd_prompt_rejected(bool has_media, int32_t ga_n, int32_t n_prompt, int32_t n_ctx) {
+    return has_media && ga_n == 1 && n_prompt >= n_ctx;
+}
+
+inline std::string pxa_mtmd_overflow_msg(int32_t n_prompt, int32_t n_ctx) {
+    return "the images in this chat need " + std::to_string(n_prompt) + " tokens but Context is " +
+           std::to_string(n_ctx) + "; raise Context (Control: model settings) or send fewer/smaller images";
 }

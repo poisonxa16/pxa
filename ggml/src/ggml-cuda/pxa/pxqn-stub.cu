@@ -4,6 +4,7 @@
 // have no incumbent route abort with ONE message (unreachable in practice: PXQN files are refused at load).
 #include "pxqn-api.cuh"
 #include "../../ggml-pxqn-api.h"
+#include "../../../include/ggml-pxqn-ext.h"
 #include "../../../include/ggml-cuda-p60.h"
 
 #include <cstdio>
@@ -200,6 +201,26 @@ int ggml_cuda_pxqn_get_rows(ggml_backend_cuda_context * ctx, const ggml_tensor *
 }
 int ggml_cuda_pxqn_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     return T() ? T()->p_ggml_cuda_pxqn_mul_mat_id(ctx, dst) : -1;
+}
+// PXQN-C: the "cbook" role's CUDA entries; the backend-context layout they take is the one the CUDA table was checked for
+static const ggml_pxqn_cbook_api * pxqnc_cuda_table() {
+    static const ggml_pxqn_cbook_api * t = [] {
+        const ggml_pxqn_cbook_api * c = T() ? ggml_pxqn_cbook_api_get() : nullptr;
+        return c && c->cuda_supports && c->cuda_mul_mat_id && c->cuda_rht_mul_mat_id ? c : nullptr;
+    }();
+    return t;
+}
+bool ggml_cuda_pxqnc_supported(const ggml_tensor * op) {
+    const ggml_pxqn_cbook_api * c = pxqnc_cuda_table();
+    return c && c->cuda_supports(op) == 1;
+}
+int ggml_cuda_pxqnc_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_pxqn_cbook_api * c = pxqnc_cuda_table();
+    return c ? c->cuda_mul_mat_id((void *) &ctx, dst) : -1;
+}
+int ggml_cuda_pxqnc_rht_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * rht, ggml_tensor * const * mm, int n_mm) {
+    const ggml_pxqn_cbook_api * c = pxqnc_cuda_table();
+    return c ? c->cuda_rht_mul_mat_id((void *) &ctx, rht, mm, (int32_t) n_mm) : -1;
 }
 int ggml_cuda_pxqn_moe_up_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * down, ggml_tensor * kpad) {
     return T() ? T()->p_ggml_cuda_pxqn_moe_up_gate(ctx, dst, down, kpad) : -1;

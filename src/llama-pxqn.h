@@ -7,10 +7,12 @@
 
 #include "ggml.h"
 #include "ggml-pxqn.h"
+#include "ggml-pxqn-ext.h"
 #include "llama-arch.h"
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #define LLAMA_PXQN_KEY_REV        "pxa.pxqn.rev"        // u32, 1 (absent = an old PXQ file)
 #define LLAMA_PXQN_KEY_ROT_SEED   "pxa.pxqn.rot.seed"   // u64
@@ -30,6 +32,34 @@
 // rot.sites names a site this build does not know -- each of those would otherwise decode wrong
 // without a sound.
 void llama_pxqn_read_keys(const struct gguf_context * ctx, uint32_t & rev, uint64_t & seed, uint32_t & sites);
+
+// PXQN-C (the codebook expert tier, GGML_TYPE_PXQNC) and its rotation scope B: only the ROUTED-EXPERT tensors are stored
+// rotated; the router (ffn_gate_inp) and the shared expert read the unrotated activation and the graph rotates a copy for
+// the routed experts (ffn_in once per token per layer, shared by gate + up; down_in per routed slot).
+#define LLAMA_PXQN_KEY_ROT_EXPS        "pxa.pxqn.rot.exps"         // string, comma list of routed-expert sites ("ffn_in,down_in")
+#define LLAMA_PXQN_KEY_ROT_EXPS_LAYERS "pxa.pxqn.rot.exps.layers"  // string, optional: the layers whose routed experts are
+                                                                   // rotated ("9", "0-39", "1,3,5-7"); absent = every layer
+#define LLAMA_PXQN_KEY_ROT_EXPS_SEED   "pxa.pxqn.rot.exps.seed"    // u64, optional: the experts' own seed (default rot.seed)
+#define LLAMA_PXQNC_KEY_REV            "pxa.pxqnc.rev"             // u32, the codebook tier's layout revision (0 = v0)
+
+// Reads the scope-B keys. sites = OR of PXQN_SITE_BIT (only ffn_in / down_in allowed), layers[il] = 1 where layer il's routed
+// experts are rotated (sized n_layer), seed = the experts' seed (rot.exps.seed, else `seed_default`). sites = 0 without the
+// key. THROWS on a wrong GGUF type, an unknown or non-expert site, a malformed / out-of-range layer list.
+void llama_pxqn_read_rot_exps(const struct gguf_context * ctx, uint32_t n_layer, uint64_t seed_default,
+                              uint32_t & sites, std::vector<uint8_t> & layers, uint64_t & seed);
+
+// Which routed-expert sites this build rotates under scope B for `arch` (OR of PXQN_SITE_BIT; 0 = none).
+uint32_t llama_pxqn_arch_rot_exps(llm_arch arch);
+
+// "blk.N.ffn_{gate,up,down}_exps.weight" (the only tensors the codebook tier may hold); site / layer out
+bool llama_pxqnc_tensor_ok(const std::string & tensor_name, int & layer, int & site);
+
+// The file's pxa.pxqnc.* keys handed to the library's codebook tier (role "cbook", ggml-pxqn-ext.h), untouched: returns the
+// library's model handle. THROWS with the library's sentence when it refuses the keys, or when the library has no such tier.
+void * llama_pxqnc_open(const struct gguf_context * ctx);
+void   llama_pxqnc_close(void * handle);
+// binds one codebook-tier weight tensor's bytes to the handle; THROWS when the library refuses it
+void   llama_pxqnc_bind(void * handle, const struct ggml_tensor * t);
 
 // "attn_in,out_in" <-> OR of PXQN_SITE_BIT(). parse throws on an unknown name.
 uint32_t    llama_pxqn_parse_sites(const std::string & s);

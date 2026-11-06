@@ -379,7 +379,7 @@ class Page(unittest.TestCase):
         self.assertNotIn("unsafe-inline' ; script", csp)
         html = b.decode()
         self.assertIn('src="/share.js"', html)
-        for need in ("discord.pxanetwork.com", "/#store", "Free"):
+        for need in ("discord.pxanetwork.com", "reddit.com/r/PXANetwork/", "/#store", "Free"):
             self.assertIn(need, html)
 
     def test_page_js_only_talks_to_the_share_routes(self):

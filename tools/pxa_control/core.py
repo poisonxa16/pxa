@@ -659,7 +659,8 @@ def lint_levers(levers, catalog_rows):
 # Extra llama-server arguments a profile may carry, appended after the launcher's own command (the
 # last occurrence wins in llama.cpp's parser). An ALLOW-LIST, value count per flag: anything that
 # reads or writes files the GUI does not vet (--path, --log-file, --ssl-*, --slot-save-path,
-# --lora, -m, --mmproj ...) or changes who can reach the server (--host, --api-key*) is refused.
+# --lora, -m ...) or changes who can reach the server (--host, --api-key*) is refused. The paths that ARE
+# allowed (-md drafter, -mm/--mmproj vision projector) obey the model folder rule in validate_launch.
 EXTRA_FLAGS = {
     "-t": 1, "--threads": 1, "-tb": 1, "--threads-batch": 1, "-b": 1, "--batch-size": 1,
     "-ub": 1, "--ubatch-size": 1, "-ngl": 1, "--n-gpu-layers": 1, "-ts": 1, "--tensor-split": 1,
@@ -675,7 +676,7 @@ EXTRA_FLAGS = {
     "-wgt": 1, "--rope-scaling": 1, "--rope-freq-base": 1, "--rope-freq-scale": 1, "--yarn-orig-ctx": 1,
     "--defrag-thold": 1, "-dt": 1, "--timeout": 1, "-to": 1, "--threads-http": 1, "--n-cpu-moe": 1,
     "-ncmoe": 1, "--cpu-moe": 0, "-cmoe": 0, "--draft-max": 1, "--draft-min": 1, "--draft-p-min": 1,
-    "-md": 1, "--model-draft": 1, "--sleep-idle-seconds": 1,
+    "-md": 1, "--model-draft": 1, "--sleep-idle-seconds": 1, "-mm": 1, "--mmproj": 1,
     "--spec-replace": 2, "-sm": 1, "--split-mode": 1, "--numa": 1, "--prio": 1, "--poll": 1,
     "--keep": 1, "--no-warmup": 0, "--verbose": 0, "-v": 0, "--log-verbosity": 1, "-lv": 1,
 }
@@ -817,6 +818,24 @@ def probe_gpus_fallback(timeout=15):
 # launch request validation -> launcher argv
 # ---------------------------------------------------------------------------------------------
 KV_TYPES = ["auto", "f16", "q8_0", "q6_0", "q5_0", "q4_0"]   # auto = pass nothing; the engine registry picks the measured KV; the rest largest to smallest
+# PXA_KV_K_GUARD (engine 4.0.4, bug #378): Qwen2-family models (these GGUF archs) answer garbage with a K cache of 4 bits or
+# fewer, so the engine raises such a K to q8_0 for them when the context is created; V stays as asked, and PXA_KV_K_GUARD=0
+# keeps the 4-bit K. Control still passes the KV the user picked; the Launch KV picker and the launch plan say what runs.
+KV_K_GUARD_ARCHS = ("qwen2", "qwen2vl", "qwen2moe")
+KV_K_GUARD_TYPES = ("q4_0", "q4_1", "iq4_nl")       # the <= 4-bit K cache types the engine accepts
+
+
+def kv_k_guard_note(arch, kv, levers=None):
+    """The note for a Qwen2-family model launched with a 4-bit KV cache type (None for any other pair): the engine runs
+    the K half at q8_0. Same rule and words as the Launch KV picker (tools/pxa_control_ui/index.html, kvGuardNote)."""
+    arch, kv = str(arch or ""), str(kv or "")
+    if arch not in KV_K_GUARD_ARCHS or kv not in KV_K_GUARD_TYPES:
+        return None
+    if str((levers or {}).get("PXA_KV_K_GUARD", "")).strip() == "0":
+        return (f"PXA_KV_K_GUARD=0: this {arch} model keeps a {kv} K cache, and Qwen2-family models give garbage "
+                f"output with a 4-bit K.")
+    return (f"Qwen2-family model ({arch}): the engine keeps the K cache at q8_0, because a {kv} K breaks these models; "
+            f"V stays {kv}. PXA_KV_K_GUARD=0 turns this off.")
 SPLIT_MODES = ["auto", "layer", "tensor"]
 FA_MODES = {"auto": None, "on": "chat", "off": "longdoc"}   # the launcher's FA regime IS the workload
 PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9 _.\-]{1,48}$")
@@ -1130,7 +1149,32 @@ def validate_launch(body, gpu_indexes, catalog_names, model_roots, gui_port=None
     for i, t in enumerate(xa[:-1]):            # H4: a drafter named in extra args obeys the drafter field's rule
         if t in ("-md", "--model-draft"):
             _draft_model({"draft_model": xa[i + 1]}, model, model_roots, check_model)
+    # A vision projector named in extra args obeys the same folder rule and goes to the launcher as its own --mmproj
+    # (the launcher's auto-pairing then neither refuses nor overrides it); it leaves the engine tail. Last one wins.
+    # A stored launch (seat.req on Restart/auto-start, a profile, a preset) carries it as "mmproj" with the flag already
+    # out of extra_args: keep it, under the same folder rule (it is client input too); extra args still override it.
+    mm = body.get("mmproj")
+    out["mmproj"], keep, i = (_projector(mm, model_roots, check_model) if mm not in (None, "") else ""), [], 0
+    while i < len(xa):
+        if xa[i] in ("-mm", "--mmproj") and i + 1 < len(xa):
+            out["mmproj"] = _projector(xa[i + 1], model_roots, check_model)
+            i += 2
+            continue
+        keep.append(xa[i])
+        i += 1
+    out["extra_args"] = keep
     return out
+
+
+def _projector(path, model_roots, check_model):
+    if not isinstance(path, str) or not path.lower().endswith(".gguf") or len(path) > 4096 or "\x00" in path:
+        raise Invalid("the vision projector (--mmproj) must be a .gguf file")
+    if check_model:
+        if not os.path.isfile(path):
+            raise Invalid("vision projector file not found: %s" % path)
+        if not model_path_ok(path, model_roots):
+            raise Invalid("the vision projector must be inside one of your model folders (Models tab)")
+    return path
 
 
 def _draft_model(body, model, model_roots, check_model):
@@ -1229,6 +1273,8 @@ def launcher_argv(req):
         argv += ["--allow-busy"]
     if req.get("draft_model"):
         argv += ["--draft-model", req["draft_model"]]
+    if req.get("mmproj"):
+        argv += ["--mmproj", req["mmproj"]]
     for spec in hot_model_argv(req.get("hot_models") or []):
         argv += ["--hot-model", spec]
     return argv
@@ -3934,7 +3980,7 @@ class App(object):
         quant = {k[len("pxa.quantizer."):]: v for k, v in kvs.items() if k.startswith("pxa.quantizer.")} or None
         arch = kvs.get("general.architecture")
         heads = sum(1 for t in h.get("tensors") or [] if "nextn" in t[0] or ".mtp" in t[0] or t[0].startswith("mtp."))
-        d = {"mtp_tensors": heads if h.get("ok") else None,
+        d = {"mtp_tensors": heads if h.get("ok") else None, "arch": arch,
              "mtp_kv": kvs.get(f"{arch}.nextn_predict_layers") if arch else None,
              "params": params, "size_label": kvs.get("general.size_label"),
              "name": kvs.get("general.name"), "dominant_type": name, "quantizer": quant}
@@ -4595,6 +4641,13 @@ class App(object):
                       "extra_args": req.get("extra_args") or [],
                       "overdrive": od_line(cap.text),
                       "decisions": decision_lines(cap.text)})
+        if ok and req.get("kv") in KV_K_GUARD_TYPES:
+            try:                    # PXA_KV_K_GUARD: say that a Qwen2-family model runs its K half at q8_0
+                kn = kv_k_guard_note(self._extra_facts(req["model"]).get("arch"), req["kv"], req.get("levers"))
+            except Exception:       # noqa: BLE001 - a note is advice, never a reason to fail the plan
+                kn = None
+            if kn:
+                d["notes"] = d["notes"] + [kn]
         th = getattr(cap, "thinking", None)
         if th:
             d["thinking"] = th
@@ -5588,10 +5641,12 @@ class App(object):
             "engine_commit": cm.group(1) if cm else None,
             "model_file": re.sub(r"[^A-Za-z0-9._+\-]", "_", base)[:128], "model_size_bytes": size, "codec": codec, "tier": tier,
             "ctx": toint(first("-c", "--ctx-size")) or (req.get("ctx") or None),
-            "kv_k": first("-ctk", "--cache-type-k") or (None if req.get("kv", "auto") == "auto" else req.get("kv"))
-                    or (str(res.get("kv") or "").split("/")[0] or None),
-            "kv_v": first("-ctv", "--cache-type-v") or (None if req.get("kv", "auto") == "auto" else req.get("kv"))
-                    or (str(res.get("kv") or "").split("/")[-1] or None),
+            # the KV the run measured first (served_kv: the engine's /props names the cache in use, e.g. a Qwen2-family
+            # -ctk q4_0 that PXA_KV_K_GUARD raised to q8_0), then the command line, then the Launch setting
+            "kv_k": (str(res.get("kv") or "").split("/")[0] or None) or first("-ctk", "--cache-type-k")
+                    or (None if req.get("kv", "auto") == "auto" else req.get("kv")),
+            "kv_v": (str(res.get("kv") or "").split("/")[-1] or None) or first("-ctv", "--cache-type-v")
+                    or (None if req.get("kv", "auto") == "auto" else req.get("kv")),
             "split_mode": split,
             "mtp": bool(mtp),
             "n_max": n_max,

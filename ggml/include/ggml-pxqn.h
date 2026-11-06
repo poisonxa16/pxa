@@ -71,10 +71,10 @@ extern "C" {
 // The slab layout lives in the closed library only (ggml-pxqn-codec.h).
 #define PXA4_QK               128
 #define PXA4_TYPE_SIZE        81
-//
-// (kept at this line count on purpose: the public headers' line layout
-//  matches the earlier revision, so ccache's preprocessed-mode hashes
-//  still hit for every file that includes this header)
+// PXQN-C (codebook expert tier): block of 256 elements, 55 B (+ the 2 B row anchor); layout closed.
+#define PXQNC_QK              256
+#define PXQNC_TYPE_SIZE       55
+// (the line count above stays as it was: ccache's preprocessed-mode hashes key on it)
 #define PXQN_REV_MAX          2u      // the newest revision this build READS (2: sealed recipe handle, pxa.pxqn.recipe)
 
 #define PXQN_REV              1u      // the revision the open quantizer writes (rotation in the clear)

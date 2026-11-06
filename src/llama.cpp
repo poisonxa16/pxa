@@ -17,6 +17,7 @@
 #include "llama-mmap.h"
 #include "llama-model-loader.h"
 #include "llama-model.h"
+#include "llama-pxqn.h"        // PXQN-C: the codebook tier's tables + bindings
 #include "llama-build-context.h"
 #include "llama-cparams.h"
 #include "llama-hparams.h"
@@ -36,6 +37,7 @@
 #include "llama-pxa-ple-pipe.h"     // PXA_PLE_PIPELINE: skip the per-graph PLE barrier under copy slots
 #include "llama-pxa-xcache-skip.h" // PXA_XCACHE_SKIP_COLD_RANK step counter and summary
 #include "llama-pxa-numa-il.h"   // PXA_NUMA_INTERLEAVE: host pages over every allowed node (host-expert layouts)
+#include "llama-pxa-kv-guard.h"  // PXA_KV_K_GUARD: Qwen2-family K cache of <= 4 bits -> q8_0
 
 #include "unicode.h"
 
@@ -495,6 +497,10 @@ llama_model::~llama_model() {
     }
     while (!lora_adapters.empty()) {
         llama_lora_adapter_free(*lora_adapters.begin());
+    }
+    if (pxqnc) {
+        llama_pxqnc_close(pxqnc);           // PXQN-C: unbind the (now freed) weights, free the tables
+        pxqnc = nullptr;
     }
 }
 
@@ -9077,6 +9083,33 @@ static bool llm_load_tensors(
         if (defer_expert_mmap) {
             ml.drop_mmap_expert_pages();
         }
+
+        // PXQN-C (the codebook expert tier): the file's tables go to the library, every such weight is bound by its address
+        // (host or device), so the decode entries find the table of a weight they are handed
+        {
+            std::vector<ggml_tensor *> cbt;
+            for (ggml_context * c : model.ctxs) {
+                for (ggml_tensor * t = ggml_get_first_tensor(c); t; t = ggml_get_next_tensor(c, t)) {
+                    if (ggml_pxqn_cbook_type(t->type)) cbt.push_back(t);
+                }
+            }
+            if (!cbt.empty()) {
+                // v0: whole expert tensors on one device or the host (no -sm row/graph/attn/tensor slicing of the tier yet)
+                if (model.split_mode != LLAMA_SPLIT_MODE_NONE && model.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+                    throw std::runtime_error("PXQN-C: this build runs the codebook expert tier with -sm none / -sm layer only");
+                }
+                model.pxqnc = llama_pxqnc_open(ml.meta);
+                for (ggml_tensor * t : cbt) {
+                    if (!t->data || t->extra) {
+                        throw std::runtime_error(std::string("PXQN-C: ") + t->name + " is not one placed tensor (split or unallocated): not supported yet");
+                    }
+                    llama_pxqnc_bind(model.pxqnc, t);
+                }
+                const struct ggml_pxqn_cbook_api * cb = ggml_pxqn_cbook_api_get();
+                LLAMA_LOG_INFO("%s: PXQN-C: %zu codebook-tier tensors bound (%s)\n", __func__, cbt.size(),
+                               cb && cb->describe ? cb->describe(model.pxqnc) : "?");
+            }
+        }
     }
 
     if (model.is_mla_model()) {
@@ -9514,9 +9547,10 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         }
 #endif
 
+        // PXA_KV_K_GUARD: the fit sizes the K cache the context will really allocate (the context prints the line)
         if (!llm_load_tensors(
             ml, model, params.n_gpu_layers, params.mla, params.split_mode, params.main_gpu, params.max_gpu, params.tensor_split,
-            params.type_k, params.type_v, params.extra_output_type,
+            llama_pxa_kv_k_guard_pick(model.arch, params.type_k, llama_pxa_kv_k_guard_enabled()), params.type_v, params.extra_output_type,
             params.max_ctx_size, params.n_seq_max, params.n_ubatch, params.amb, params.fit_margin, params.fit_margin_array,
             params.worst_graph_tokens, params.flash_attn,
             params.use_mlock, params.validate_quants, params.mtp, params.fit, params.dry_run,
@@ -9777,6 +9811,32 @@ static bool pxa_kv_seq_soa_enabled() {
 }
 static inline bool pxa_cell_has_seq(const llama_kv_cell & c, llama_seq_id s, bool soa) {
     return soa ? c.has_seq_fast(s) : c.has_seq_id(s);
+}
+
+// PXQN library hook (mask input copy): declined, or no library, the plain copy runs as before.
+extern "C" GGML_API void ggml_backend_pxa_kqmask_desc(const void * host, int64_t ne0, int64_t ne1, int64_t n_tokens, int64_t lim0, int64_t used);
+static void pxa_kq_mask_describe(const llama_batch & batch, const llama_kv_cache & kv, int64_t n_kv, int64_t n_tokens,
+                                 const ggml_tensor * m, bool soa) {
+    if (m == nullptr) return;
+    if (m->type != GGML_TYPE_F16 || m->ne[0] != n_kv || m->ne[1] < n_tokens || m->ne[2] != 1 || m->ne[3] != 1 ||
+        n_tokens < 1 || n_kv < 1 || batch.pos == nullptr || batch.seq_id == nullptr) {
+        ggml_backend_pxa_kqmask_desc(m->data, 0, 0, 0, 0, 0); return;
+    }
+    const llama_seq_id s  = batch.seq_id[0][0];
+    const llama_pos    p0 = batch.pos[0];
+    for (int64_t j = 1; j < n_tokens; ++j) {
+        if (batch.seq_id[j][0] != s || batch.pos[j] != p0 + (llama_pos) j) { ggml_backend_pxa_kqmask_desc(m->data, 0, 0, 0, 0, 0); return; }
+    }
+    const llama_pos c = pxa_cell_has_seq(kv.cells[0], s, soa) ? kv.cells[0].pos : 0;
+    int64_t used = 0;
+    while (used < n_kv && pxa_cell_has_seq(kv.cells[used], s, soa)) {
+        if (kv.cells[used].pos != c + (llama_pos) used) { ggml_backend_pxa_kqmask_desc(m->data, 0, 0, 0, 0, 0); return; }
+        ++used;
+    }
+    for (int64_t i = used; i < n_kv; ++i) {
+        if (pxa_cell_has_seq(kv.cells[i], s, soa)) { ggml_backend_pxa_kqmask_desc(m->data, 0, 0, 0, 0, 0); return; }
+    }
+    ggml_backend_pxa_kqmask_desc(m->data, m->ne[0], m->ne[1], n_tokens, (int64_t) p0 - (int64_t) c + 1, used);
 }
 
 // PXA_KQ_MASK_PROBE=1 (debug only, default OFF): the row-occupancy census of the causal attention
@@ -10214,6 +10274,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         auto tim1 = ggml_time_us();
 #endif
         const int64_t pxa_ht_mask0 = pxa_ht_every() ? ggml_time_us() : 0;
+        if (lctx.inp_KQ_mask) ggml_backend_pxa_kqmask_desc(lctx.inp_KQ_mask->data, 0, 0, 0, 0, 0);
         // NOTE: hparams.causal_attn indicates the model is capable of generation and uses the kv cache.
         if (cparams.causal_attn && !lctx.is_encoding) {
             const llama_kv_cache & mask_kv_self =
@@ -10372,6 +10433,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                         ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
                         std::fill(data_swa_f16 + int64_t(n_tokens)*n_kv, data_swa_f16 + n_tokens_padded*n_kv, h_inf);
                     }
+                }
+                // PXQN library hook (mask input copy)
+                if (data_f16 && !data_swa_f16 && !data && !data_swa && !hparams.use_alibi && cparams.flash_attn &&
+                    lctx.inp_KQ_mask && (void *) data_f16 == lctx.inp_KQ_mask->data) {
+                    pxa_kq_mask_describe(batch, mask_kv_self, n_kv, n_tokens, lctx.inp_KQ_mask, soa);
                 }
             }
             else {
@@ -15189,6 +15255,8 @@ static bool llama_pxa_env_is_not_lab(const std::string & name) {
         "PXA_VLLM_IMAGE", "PXA_PXQ4_LIB", "PXA_NO_TUI", "PXA_HOME", "PXA_MODEL", "PXA_GPUS",
         "PXA_ALLOW_BUSY", "PXA_LAUNCH_EXTRA", "PXA_NO_OVERDRIVE", "PXA_STORAGE_KIND", "PXA_CONTROL",
         "PXA_CACHE_DIR",
+        // correctness guards: their off switch is not a speed knob, and the guard prints its own line when it is set
+        "PXA_KV_K_GUARD",
     };
     if (name == LLAMA_PXA_ENV_MARKER) {
         return true;
@@ -15588,6 +15656,13 @@ bool llama_context_creation_failed_on_alloc(void) {
 
 const char * llama_context_creation_failed_detail(void) {
     return g_ctx_failed_detail.c_str();
+}
+
+enum ggml_type llama_pxa_kv_k_guard_type(const char * arch, enum ggml_type type_k) {
+    if (arch == nullptr) {
+        return type_k;
+    }
+    return llama_pxa_kv_k_guard_pick(llm_arch_from_string(arch), type_k, llama_pxa_kv_k_guard_enabled());
 }
 
 struct llama_context * llama_init_from_model(
@@ -16249,6 +16324,51 @@ struct llama_context * llama_init_from_model(
         // it's probably best to keep as much precision as possible for the states
         type_k = GGML_TYPE_F32; // required by ggml_ssm_conv for Mamba's conv_states
         type_v = GGML_TYPE_F32; // required by ggml_ssm_scan for Mamba's ssm_states
+    }
+
+    // PXA_KV_K_GUARD (4.0.4, src/llama-pxa-kv-guard.h): a Qwen2-family K cache of 4 bits or fewer is raised to q8_0.
+    // Its K bias channels do not survive 4 bits: garbage on the CPU and the cards alike (bug #378). V stays as asked.
+    // The first/last-layer K overrides follow the same rule; else a raised K would make a 4-bit override take effect.
+    {
+        const bool      on      = llama_pxa_kv_k_guard_enabled();
+        const ggml_type k_asked = type_k;
+        type_k = llama_pxa_kv_k_guard_pick(model->arch, type_k, on);
+        const ggml_type k_first = llama_pxa_kv_k_guard_pick(model->arch, params.type_k_first, on);
+        const ggml_type k_last  = llama_pxa_kv_k_guard_pick(model->arch, params.type_k_last,  on);
+        const bool edge = (params.n_k_first > 0 && k_first != params.type_k_first) ||
+                          (params.n_k_last  > 0 && k_last  != params.type_k_last);
+        params.type_k_first = k_first;
+        params.type_k_last  = k_last;
+        const char * arch_name = llama_model_arch_string(model);
+        if (type_k != k_asked || edge) {
+            std::string what = std::string("K cache ") + ggml_type_name(k_asked);
+            if (type_k != k_asked) {
+                what += std::string(" -> ") + ggml_type_name(type_k);
+            }
+            if (edge) {
+                what += ", first/last-layer K overrides -> q8_0";
+            }
+            // the V q8_0 hint (#62282): what -ctv q8_0 would add at this context, exactly: the layers whose V
+            // takes the base type (a first/last-layer V override keeps its own, as in llama_kv_cache_init), each with
+            // the row width the cache allocates (n_embd_v_gqa(il) on these archs), times the KV cells
+            std::vector<int64_t> v_width;
+            for (int il = 0; il < (int) hparams.n_layer; ++il) {
+                const bool v_first = params.type_v_first != type_v && params.n_v_first > 0 && il < params.n_v_first;
+                const bool v_last  = params.type_v_last  != type_v && params.n_v_last  > 0 &&
+                                     il >= (int) hparams.n_layer - params.n_v_last;
+                if (!v_first && !v_last) {
+                    v_width.push_back((int64_t) llama_kv_v_row_embd(*model, hparams, (uint32_t) il));
+                }
+            }
+            const std::string hint = llama_pxa_kv_k_guard_v_hint(type_v,
+                    llama_pxa_kv_v_q8_extra_bytes(v_width.data(), (int) v_width.size(), (int64_t) kv_size, type_v));
+            LLAMA_LOG_WARN("%s: PXA_KV_K_GUARD: arch %s: %s, V stays %s (a Qwen2-family K has bias channels a 4-bit "
+                           "cache cannot hold); PXA_KV_K_GUARD=0 keeps the 4-bit K%s%s\n",
+                           __func__, arch_name, what.c_str(), ggml_type_name(type_v), hint.empty() ? "" : "; ", hint.c_str());
+        } else if (!on && llama_pxa_kv_k_guard_arch(model->arch) && llama_pxa_kv_k_guard_low_bits(type_k)) {
+            LLAMA_LOG_WARN("%s: PXA_KV_K_GUARD=0: arch %s keeps a %s K cache (a Qwen2-family model gives garbage "
+                           "with a 4-bit K)\n", __func__, arch_name, ggml_type_name(type_k));
+        }
     }
 
     // DS4 stores K and V of the same compressed row, so the two cache types must be

@@ -476,6 +476,55 @@ class DrafterInExtraArgs(unittest.TestCase):
                 C.validate_extra_args(bad)
 
 
+class ProjectorInExtraArgs(unittest.TestCase):
+    """Discord #support 11-05: a vision projector (mmproj) the auto-pairing does not find (another name, another
+    folder, two precisions side by side) had no way in. --mmproj / -mm in extra args obeys the model folder rule and
+    reaches the launcher as its own --mmproj, so the launcher's pairing does not refuse or override it."""
+    def v(self, extra):
+        return C.validate_launch({"gpus": [0], "model": os.path.join(MODELS, "tiny.gguf"), "port": 18080,
+                                  "extra_args": extra}, [0, 1], set(), [MODELS])
+
+    def test_projector_flag_obeys_the_model_folder_rule(self):
+        for bad in (["--mmproj", os.path.join(OUTSIDE, "evil.gguf")], ["--mmproj=" + os.path.join(OUTSIDE, "evil.gguf")],
+                    ["-mm", "/etc/passwd"], ["--mmproj", os.path.join(MODELS, "..", "outside", "evil.gguf")],
+                    ["--mmproj", os.path.join(MODELS, "missing.gguf")]):
+            with self.assertRaises(C.Invalid, msg=bad):
+                self.v(bad)
+
+    def test_projector_goes_to_the_launcher_not_the_engine_tail(self):
+        mm = os.path.join(MODELS, "draft.gguf")
+        for extra in (["--mmproj", mm, "-c", "4096"], ["-mm", mm], ["--mmproj=" + mm]):
+            ok = self.v(extra)
+            self.assertEqual(ok["mmproj"], mm)
+            self.assertNotIn("--mmproj", ok["extra_args"])
+            self.assertNotIn("-mm", ok["extra_args"])
+            argv = C.launcher_argv(ok)
+            self.assertEqual(argv[argv.index("--mmproj") + 1], mm)
+        self.assertEqual(self.v(["-c", "4096"])["mmproj"], "")
+
+    def test_projector_survives_revalidation_restart_profile_preset(self):
+        # main-review404 #62369: every stored launch (seat.req, profile, preset) is the NORMALISED req; Restart,
+        # auto-start and a profile reload validate that dict again and must keep the projector.
+        mm = os.path.join(MODELS, "draft.gguf")
+        first = self.v(["--mmproj", mm, "-c", "4096"])
+        again = C.validate_launch(dict(first), [0, 1], set(), [MODELS])
+        self.assertEqual(again["mmproj"], mm)
+        self.assertEqual(again["extra_args"], ["-c", "4096"])
+        argv = C.launcher_argv(again)
+        self.assertEqual(argv[argv.index("--mmproj") + 1], mm)
+        # extra args still win over a stored value (last one wins)
+        other = os.path.join(MODELS, "tiny.gguf")
+        b = dict(first, extra_args=["--mmproj", other])
+        self.assertEqual(C.validate_launch(b, [0, 1], set(), [MODELS])["mmproj"], other)
+
+    def test_a_stored_projector_obeys_the_model_folder_rule(self):
+        base = {"gpus": [0], "model": os.path.join(MODELS, "tiny.gguf"), "port": 18080}
+        for bad in (os.path.join(OUTSIDE, "evil.gguf"), "/etc/passwd", os.path.join(MODELS, "missing.gguf"),
+                    os.path.join(MODELS, "..", "outside", "evil.gguf"), 7):
+            with self.assertRaises(C.Invalid, msg=bad):
+                C.validate_launch(dict(base, mmproj=bad), [0, 1], set(), [MODELS])
+
+
 # ---- H5 ---------------------------------------------------------------------------------------------------
 class DockerNames(unittest.TestCase):
     def test_a_name_that_reads_as_a_flag_never_reaches_docker(self):

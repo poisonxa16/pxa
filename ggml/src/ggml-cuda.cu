@@ -6845,9 +6845,8 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
     }
 
-    // PXA_PXQ4_RB: sm_60 one-column PXQ4 decode on the row-block half2 GEMV (pxa/pxq4-rb.cu);
-    // declines (other arch/type/width, lever off) fall through to the fp32 PXQ driver below unchanged.
-    if (src0->type == GGML_TYPE_PXQ4 && src1->ne[1] == 1 && pxa_pxq4_bufs_on_device(ctx, {src0, src1, dst}) &&
+    // PXQN library hook: declines fall through to the path below unchanged.
+    if (src0->type == GGML_TYPE_PXQ4 && src1->ne[1] >= 1 && src1->ne[1] <= 8 && pxa_pxq4_bufs_on_device(ctx, {src0, src1, dst}) &&
         ggml_cuda_pxq4_rb_mul_mat(ctx.device, ctx.stream(), src0, src1, dst) == 0) {
         return node_n;
     }
@@ -7244,6 +7243,15 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 
     CUDA_CHECK(cudaMemsetAsync((char *)dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+
+    // PXQN-C (the codebook expert tier): the library's decode entry (role "cbook"). The type has no other route on a
+    // card: supports_op places a node here only when the library serves it, so a decline is a contract break.
+    if (src0->type == GGML_TYPE_PXQNC) {
+        if (ggml_cuda_pxqnc_mul_mat_id(ctx, dst) != 0) {
+            GGML_ABORT("PXQN-C: libggml-pxqn declined MUL_MAT_ID %s (%s) on CUDA%d", dst->name, src0->name, ctx.device);
+        }
+        return false;
+    }
 
     // PXQN routed experts: the PXQN id-GEMV, direct at decode widths, over a device-built
     // expert row map above them. Declines (-1) fall through to the generic per-expert path below.
@@ -10606,8 +10614,8 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
         }
         // Fused single-launch decode form first; it declines to the split path below for any
         // shape/op/geometry it cannot serve.
-        // PXA_PXQ4_RB: a one-column PXQ4 up/gate on sm_60 -> ONE row-block half2 launch with the silu epilogue
-        if (!take_h2split && src0_1->type == GGML_TYPE_PXQ4 && src0_2->type == GGML_TYPE_PXQ4 && src1->ne[1] == 1 &&
+        // PXQN library hook: declines fall through to the path below unchanged.
+        if (!take_h2split && src0_1->type == GGML_TYPE_PXQ4 && src0_2->type == GGML_TYPE_PXQ4 && src1->ne[1] >= 1 && src1->ne[1] <= 8 &&
             pxa_pxq4_bufs_on_device(ctx, {src0_1, src0_2, src1, dst}) &&
             ggml_cuda_pxq4_rb_up_gate(ctx.device, ctx.stream(), dst) == 0) return;
         if (!take_h2split && pxa_pxq_gateup_2d(ctx, dst) == 0) return;
@@ -12388,6 +12396,27 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_up_gate_unary(ctx, dst, rq_rht, rq_mm);
         } break;
         case GGML_OP_PXQN_RHT: {
+            // PXQN-C routed experts (scope B: ffn_in feeds the up + gate MUL_MAT_IDs, down_in the down one): the library
+            // may absorb the rotation into its decode launches. Only when the adjacent MUL_MAT_IDs are the RHT's only readers.
+            if (fusion && next && next->op == GGML_OP_MUL_MAT_ID && next->src[1] == dst && next->src[0] &&
+                next->src[0]->type == GGML_TYPE_PXQNC && !(dst->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                ggml_tensor * mm[2] = { next, nullptr };
+                int n_mm = 1;
+                if (i + 2 < cgraph->n_nodes) {
+                    ggml_tensor * n2 = cgraph->nodes[i + 2];
+                    if (n2->op == GGML_OP_MUL_MAT_ID && n2->src[1] == dst && n2->src[0] && n2->src[0]->type == GGML_TYPE_PXQNC &&
+                        ops_are_same_device(cgraph, i, i + 2)) {
+                        mm[n_mm++] = n2;
+                    }
+                }
+                // mm[0] is node i+1: with two readers, the nodes after it may name dst only as mm[1]
+                const bool only = ops_are_same_device(cgraph, i, i + 1) &&
+                                  (n_mm == 1 ? pxa_g2_sole_consumer(cgraph, i, dst, mm[0]) : pxa_g2_sole_consumer(cgraph, i + 1, dst, mm[1]));
+                if (only && ggml_cuda_pxqnc_rht_mul_mat_id(ctx, dst, mm, n_mm) == 0) {
+                    i += n_mm;
+                    break;
+                }
+            }
             // out_in site: the RHT feeds exactly one PXQN MUL_MAT -> rotate inside its GEMV staging
             bool fused = false;
             if (fusion && next && next->op == GGML_OP_MUL_MAT && next->src[1] == dst &&
@@ -15366,6 +15395,9 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_PXQN5:
                     case GGML_TYPE_PXA4:      // lane pxa4
                         return true;
+                    // PXQN-C: routed experts only, when the library's codebook tier serves the node
+                    case GGML_TYPE_PXQNC:
+                        return op->op == GGML_OP_MUL_MAT_ID && ggml_cuda_pxqnc_supported(op);
                     default:
                         return false;
                 }
@@ -15749,6 +15781,11 @@ static int pxa_moe_offload_k_env() {   // -1 unset, 0 old bar, N > 0 the bar
 
 GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const ggml_tensor * op) {
     auto ctx = (ggml_backend_cuda_context *)backend->context;
+    // PXQN-C: host-resident codebook-tier experts stay on the host (the library decodes only the weights the model bound;
+    // the scheduler's temporary card copy would be an unbound one)
+    if (op->src[0] && op->src[0]->type == GGML_TYPE_PXQNC) {
+        return false;
+    }
     int min_batch_size = ctx->offload_batch_size; // originally: GGML_CUDA_MIN_BATCH_OFFLOAD;
 
     // Why do we want to do this? The heuristics that the batch must have more than min_batch_size tokens to be worth it

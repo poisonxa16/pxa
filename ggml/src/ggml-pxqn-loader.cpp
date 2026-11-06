@@ -96,6 +96,21 @@ static const struct ggml_pxqn_lib_api * pxqn_load(void) {
         dlclose(h);
         return nullptr;
     }
+    // SASS only (no PTX) since 2026-11-04: a card the library was not built for has no kernel image. Ask the library (its
+    // probe kernel through the CUDA runtime) before anything uses it; on such a card the library stays unused for the
+    // whole process (plain open kernels and policies, exactly as without the library) and is not unloaded (it has
+    // registered its device code with the CUDA runtime). A library without the probe (older) is used as before.
+    auto chk = (ggml_pxqn_cuda_image_check_fn) dlsym(h, GGML_PXQN_CUDA_IMAGE_CHECK_SYM);
+    if (chk) {
+        char msg[512];
+        msg[0] = 0;
+        if (chk(msg, (int) sizeof(msg)) > 0) {
+            fprintf(stderr, "pxqn: %s has no kernel image for %s (built SASS-only) -- closed library off, plain open "
+                            "kernels run (PXQN models need a supported card)\n",
+                    tried.empty() ? GGML_PXQN_LIB_NAME : tried.c_str(), msg);
+            return nullptr;
+        }
+    }
     fprintf(stderr, "pxqn: loaded %s (%s)\n", tried.empty() ? GGML_PXQN_LIB_NAME : tried.c_str(),
             api->build ? api->build : "?");
     g_pxqn_handle = h;
@@ -692,6 +707,15 @@ const struct ggml_pxqn_cache_api * ggml_pxqn_cache_api_get(void) {
         const auto * c = (const struct ggml_pxqn_cache_api *) ggml_pxqn_ext_table(GGML_PXQN_CACHE_ROLE, GGML_PXQN_CACHE_VERSION,
                                                                                  (uint32_t) sizeof(struct ggml_pxqn_cache_api));
         return c && c->create && c->destroy && c->batch && c->select ? c : nullptr;
+    }();
+    return t;
+}
+
+const struct ggml_pxqn_cbook_api * ggml_pxqn_cbook_api_get(void) {
+    static const struct ggml_pxqn_cbook_api * t = [] {
+        const auto * c = (const struct ggml_pxqn_cbook_api *) ggml_pxqn_ext_table(GGML_PXQN_CBOOK_ROLE, GGML_PXQN_CBOOK_VERSION,
+                                                                                 (uint32_t) sizeof(struct ggml_pxqn_cbook_api));
+        return c && c->model_open && c->model_close && c->bind && c->unbind && c->bound && c->deq_row ? c : nullptr;
     }();
     return t;
 }

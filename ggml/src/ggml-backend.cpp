@@ -2773,15 +2773,33 @@ static bool pxa_sched_stage_h2d(ggml_backend_t split_backend, bool async_now, gg
 #endif
 }
 
-// PXA_CLOSED_HOOK (host role KQ_MASK_COPY): the attention mask of a wide graph is the one large user input (n_kv x n_tokens
-// f16 per card); the library may have it enqueued instead of copied with the host blocked, so the per-card copies overlap
-// (and, mode 2, run under the graph's first ops). The same bytes reach the same device tensor; the end of the graph fences.
+// PXQN library hook (input copy); declined = the plain copy below.
+static const void * pxa_kqm_host = nullptr;
+static int64_t      pxa_kqm_d[8] = {0};
+extern "C" GGML_API void ggml_backend_pxa_kqmask_desc(const void * host, int64_t ne0, int64_t ne1, int64_t n_tokens, int64_t lim0, int64_t used);
+void ggml_backend_pxa_kqmask_desc(const void * host, int64_t ne0, int64_t ne1, int64_t n_tokens, int64_t lim0, int64_t used) {
+    if (host == nullptr || ne0 <= 0 || ne1 <= 0 || n_tokens <= 0 || n_tokens > ne1 || used < 0 || used > ne0) {
+        pxa_kqm_host = nullptr; pxa_kqm_d[0] = 0; return;
+    }
+    pxa_kqm_host = host;
+    pxa_kqm_d[0] = 0x50584b4d53594e31LL;   // "PXKMSYN1"
+    pxa_kqm_d[1] = ne0; pxa_kqm_d[2] = ne1; pxa_kqm_d[3] = n_tokens; pxa_kqm_d[4] = lim0; pxa_kqm_d[5] = used;
+    pxa_kqm_d[6] = (int64_t) (intptr_t) host; pxa_kqm_d[7] = 0;
+}
+
+// PXQN library hook (input copy); declined = the plain copy below.
 static bool pxa_sched_input_enqueue(ggml_backend_sched_t sched, int backend_id, const ggml_tensor * input, ggml_tensor * input_cpy) {
 #ifdef GGML_USE_CUDA
     if (input_cpy == nullptr || input->buffer == nullptr || !ggml_backend_buffer_is_host(input->buffer)) return false;
     if (strncmp(input->name, "KQ_mask", 7) != 0 || ggml_nbytes(input_cpy) != ggml_nbytes(input)) return false;
     const int mode = (int) ggml_pxqn_host_mode(GGML_PXQN_HOST_KQ_MASK_COPY, (int64_t) ggml_nbytes(input));
     if (mode <= 0) return false;
+    if (mode == 1 && pxa_kqm_host != nullptr && pxa_kqm_host == input->data && input->type == GGML_TYPE_F16 &&
+        pxa_kqm_d[1] == input->ne[0] && pxa_kqm_d[2] == input->ne[1] && (size_t) (pxa_kqm_d[1]*pxa_kqm_d[2]*2) == ggml_nbytes(input) &&
+        ggml_cuda_pxa_input_copy(sched->backends[backend_id], input_cpy, pxa_kqm_d, ggml_nbytes(input), 3)) {
+        sched->pxa_inq_mask |= 1u << backend_id;
+        return true;
+    }
     if (!ggml_cuda_pxa_input_copy(sched->backends[backend_id], input_cpy, input->data, ggml_nbytes(input), mode)) return false;
     sched->pxa_inq_mask |= 1u << backend_id;
     return true;
@@ -2791,8 +2809,7 @@ static bool pxa_sched_input_enqueue(ggml_backend_sched_t sched, int backend_id, 
 #endif
 }
 
-// mode 2: the device copies of the wide graph's mask are enqueued before any split runs (the library orders each one after the
-// card's earlier work and makes the graph's first reader wait for it), so they run under the ops ahead of the first attention
+// PXQN library hook (input copy); declined = the plain copy below.
 static bool pxa_sched_input_preissued(ggml_backend_sched_t sched, const ggml_tensor * input_cpy) {
     for (int k = 0; k < sched->pxa_pre_n; k++) if (sched->pxa_pre[k] == input_cpy) return true;
     return false;
@@ -2820,6 +2837,7 @@ static void pxa_sched_input_preissue(ggml_backend_sched_t sched) {
 }
 
 static void pxa_sched_input_fence(ggml_backend_sched_t sched) {
+    pxa_kqm_host = nullptr; pxa_kqm_d[0] = 0;
 #ifdef GGML_USE_CUDA
     for (int b = 0; sched->pxa_inq_mask != 0 && b < sched->n_backends; b++) {
         if (sched->pxa_inq_mask & (1u << b)) ggml_cuda_pxa_input_fence(sched->backends[b]);
@@ -5413,6 +5431,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     pxa_sched_input_preissue(sched);
     const enum ggml_status pxa_st = ggml_backend_sched_compute_splits(sched);
     if (sched->pxa_inq_mask) pxa_sched_input_fence(sched);   // the host may rewrite the inputs once this returns
+    pxa_kqm_host = nullptr; pxa_kqm_d[0] = 0;
     sched->pxa_pre_n = 0;
     if (pxa_kqmask_trace_on()) {
         static const int64_t every = [] {

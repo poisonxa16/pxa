@@ -143,6 +143,14 @@ struct llama_hparams {
     uint32_t pxqn_rev       = 0;
     uint64_t pxqn_rot_seed  = 0;
     uint32_t pxqn_rot_sites = 0;
+    // PXQN-C rotation scope B (pxa.pxqn.rot.exps): the routed-expert sites rotated (OR of PXQN_SITE_BIT), where
+    // (pxqn_rot_exps_layer[il] = 1) and under which seed; the router and the shared expert are not rotated
+    uint32_t pxqn_rot_exps      = 0;
+    uint64_t pxqn_rot_exps_seed = 0;
+    std::array<uint8_t, LLAMA_MAX_LAYERS> pxqn_rot_exps_layer = {};
+    uint32_t pxqn_rot_exps_at(int il) const {
+        return il >= 0 && il < LLAMA_MAX_LAYERS && pxqn_rot_exps_layer[il] ? pxqn_rot_exps : 0u;
+    }
 
     // for hybrid state-space models (e.g. qwen3next)
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;

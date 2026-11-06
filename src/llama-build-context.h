@@ -508,6 +508,9 @@ struct llm_build_context {
     ggml_tensor * pxqn_rot_in(ggml_tensor * x, int il, int site) const {
         return build_pxqn_rht(ctx0, hparams, x, il, site);
     }
+    // PXQN-C rotation scope B: the RHT128 of routed-expert site `site` (ffn_in / down_in) of layer `il` when the file stores
+    // that layer's routed experts rotated for it (pxa.pxqn.rot.exps); the identity otherwise
+    static ggml_tensor * build_pxqn_rht_exps(ggml_context * ctx, const llama_hparams & hparams, ggml_tensor * x, int il, int site);
     // global K offset of device `id`'s slice of a dim-0 split tensor (splits are laid out in device order)
     static int64_t pxqn_split_k0(const ggml_split_tensor_t * st, int id);
     // the lm-head matmul, cut into panel-aligned row chunks for a multi-row PXQ head (bug #204)

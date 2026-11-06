@@ -646,6 +646,8 @@ CURATED = {
     "PXA_KQ_MASK_COPY": ("1 (=0 the blocking copy; =2 is guarded off and runs as =1: the side-stream mode wedged a deep fill)", "the attention-mask device copies of a wide graph (>= PXA_KQ_MASK_COPY_MIB per card)", "default-on", "",
                          "each card's mask copy is enqueued on its own stream instead of copied with the host blocked card after card (2 x 629 MB in 392 ms per ubatch at ~153k depth on 2x P100): the copies overlap; same bytes, same stream order"),
     "PXA_KQ_MASK_COPY_MIB": ("16", "PXA_KQ_MASK_COPY", "site", "", "smallest device copy (MiB) the enqueued mask copy takes; decode masks stay on the engine's path"),
+    "PXA_KQ_MASK_SYNTH": ("1 (=0 copy the host bytes; =2 verify every device mask against the host bytes)", "a wide one-sequence causal flash-attention KQ mask (>= PXA_KQ_MASK_COPY_MIB per card)", "default-on", "",
+                          "the library writes the mask's f16 bits on each card from a six-integer description instead of copying n_kv x n_tokens f16 over PCIe (~805 MB per card per ubatch at ~192k depth); the host fill still runs; bit-identical"),
     "PXA_KQ_MASK_MT": ("4 threads past 64k cells (=0/1 single thread)", "decode-shaped KQ-mask fill (n_tokens < 32, flash attention)", "default-on", "",
                        "the cell range of the mask fill is split across threads, disjoint columns, identical bytes"),
     "PXA_KV_CELL_MAX_UB": ("1 (=0 full scan, =2 memo cross-checked, aborts on a mismatch)", "every decode ubatch (attention window sizing)", "default-on", "",

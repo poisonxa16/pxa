@@ -217,6 +217,16 @@ struct ggml_pxqn_lib_api {
 
 typedef const struct ggml_pxqn_lib_api * (*ggml_pxqn_get_api_fn)(uint32_t version);
 
+// Optional symbol (libggml-pxqn built with CUDA): can every visible CUDA device run the library's device code?
+// The closed library ships SASS only (no PTX, 2026-11-04), so a card it was not built for has no kernel image.
+// The library asks the CUDA runtime for a probe kernel's attributes on each device (cudaFuncGetAttributes; a missing image
+// is cudaErrorNoKernelImageForDevice) and returns how many devices have no image, 0 when all do, -1 when it could not
+// tell (no CUDA driver or device: nothing of the library's device code would run anyway). msg gets
+// "CUDA<i> sm_<cc> (<error name>)[, ...]" for the devices without an image. The loader leaves the library unused when the
+// count is > 0 (plain open kernels, one log line).
+#define GGML_PXQN_CUDA_IMAGE_CHECK_SYM "ggml_pxqn_cuda_image_check"
+typedef int (*ggml_pxqn_cuda_image_check_fn)(char * msg, int msg_len);
+
 // the layouts the table's callers and callees share; a library built against other layouts is refused
 static inline void ggml_pxqn_abi_sig(char * buf, size_t n) {
     snprintf(buf, n, "pxqn1:t%u:o%d:y%d:s%d:p%d:d%d", (unsigned) sizeof(struct ggml_tensor), (int) GGML_OP_COUNT,

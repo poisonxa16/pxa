@@ -26,11 +26,20 @@
 # (default pxa-release-build:cu128-u2204-cc, run with --network none, NVIDIA_VISIBLE_DEVICES=none).
 # Windows .dll/.exe (PE) files: the Linux cuobjdump cannot read them, the fatbin header scan decides.
 # The scan and cuobjdump must agree on ELF files (SCAN-DISAGREES fails the file).
-# Exit: 0 PASS, 2 FAIL (a CUDA binary misses an arch), 3 nothing to check / no device code found / tool error.
+# THE CLOSED LIBRARY (libggml-pxqn.so*, ggml-pxqn.dll; 2026-11-04 #61684) is SASS ONLY: a closed-lib binary FAILS when
+# any fatbin in it holds a PTX entry (header scan, and `cuobjdump --list-ptx` on ELF files) or when one of its fatbins
+# misses an arch of the closed list (default: the --archs list + 100 120, native Blackwell; the release toolkit is 12.8).
+#   --closed GLOB           basename glob of a closed-lib binary (repeatable; default libggml-pxqn*.so* and ggml-pxqn*.dll)
+#   --closed-archs LIST     required SASS archs of the closed library (default: --archs + "100 120")
+#   --require-closed        FAIL when no closed-lib binary is found in the paths (a release package always carries it)
+#   --no-closed             treat the closed library like any other binary (a 4.0.3-or-older build, a PXA_PXQN_SASS_ONLY=OFF build)
+# Exit: 0 PASS, 2 FAIL (a CUDA binary misses an arch, or the closed library carries PTX), 3 nothing to check / no device
+# code found / tool error.
 # On a shared box wrap it in `taskset -c <build cores> nice -n 15 ionice -c3`.
 set -euo pipefail
 
 ARCHS="60 61 70 75 80 86 89"; PTX="89"; WORK=""; JSON=""; VENDOR=0; NOCUO=0; KEEP=0; ALLOW=()
+CLOSED=(); CLOSED_ARCHS=""; NOCLOSED=0; REQCLOSED=0
 paths=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,14 +50,22 @@ while [ $# -gt 0 ]; do
     --json) JSON="${2:?}"; shift ;;
     --vendor) VENDOR=1 ;;
     --allow) ALLOW+=("${2:?}"); shift ;;
+    --closed) CLOSED+=("${2:?}"); shift ;;
+    --closed-archs) CLOSED_ARCHS="${2:?}"; shift ;;
+    --require-closed) REQCLOSED=1 ;;
+    --no-closed) NOCLOSED=1 ;;
     --no-cuobjdump) NOCUO=1 ;;
     --keep) KEEP=1 ;;
-    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "gate-sm75-check: unknown option $1" >&2; exit 3 ;;
     *) paths+=("$1") ;;
   esac
   shift
 done
+[ "$NOCLOSED" = 1 ] && [ "$REQCLOSED" = 1 ] && { echo "gate-sm75-check: --no-closed and --require-closed contradict" >&2; exit 3; }
+[ ${#CLOSED[@]} -gt 0 ] || CLOSED=("libggml-pxqn*.so*" "ggml-pxqn*.dll")
+[ -n "$CLOSED_ARCHS" ] || CLOSED_ARCHS="$ARCHS 100 120"
+[ "$NOCLOSED" = 1 ] && CLOSED=()
 [ ${#paths[@]} -gt 0 ] || { echo "gate-sm75-check: no PATH given (try --help)" >&2; exit 3; }
 command -v python3 >/dev/null || { echo "gate-sm75-check: python3 is required" >&2; exit 3; }
 
@@ -69,6 +86,7 @@ fi
 export GATE_ARCHS="$ARCHS" GATE_PTX="$PTX" GATE_WORK="$WORK" GATE_JSON="$JSON" GATE_VENDOR="$VENDOR" GATE_CUO="$CUO" \
        GATE_IMAGE="${PXA_CUOBJDUMP_IMAGE:-pxa-release-build:cu128-u2204-cc}"
 GATE_ALLOW=$(printf '%s\n' "${ALLOW[@]+"${ALLOW[@]}"}"); export GATE_ALLOW
+GATE_CLOSED=$(printf '%s\n' "${CLOSED[@]+"${CLOSED[@]}"}"); export GATE_CLOSED GATE_CLOSED_ARCHS="$CLOSED_ARCHS" GATE_REQCLOSED="$REQCLOSED"
 
 exec python3 -I - "${paths[@]}" <<'PY'
 import fnmatch, io, json, os, re, struct, subprocess, sys, tarfile, zipfile
@@ -78,6 +96,9 @@ PTX = [int(a) for a in os.environ.get("GATE_PTX", "").replace(";", " ").replace(
 WORK = os.environ["GATE_WORK"]; JSON = os.environ.get("GATE_JSON") or ""
 VENDOR = os.environ.get("GATE_VENDOR") == "1"; CUO = os.environ.get("GATE_CUO") or ""
 IMAGE = os.environ["GATE_IMAGE"]; ALLOW = [g for g in os.environ.get("GATE_ALLOW", "").split("\n") if g]
+CLOSED = [g for g in os.environ.get("GATE_CLOSED", "").split("\n") if g]
+CLOSED_ARCHS = [int(a) for a in os.environ.get("GATE_CLOSED_ARCHS", "").replace(";", " ").replace(",", " ").split()]
+REQCLOSED = os.environ.get("GATE_REQCLOSED") == "1"
 
 VENDOR_GLOBS = ["libcublas*", "libcublasLt*", "libcudart*", "libnccl*", "libcusparse*", "libcufft*", "libcurand*",
                 "libcusolver*", "libnvrtc*", "libnvJitLink*", "libcudnn*", "libnvblas*", "libcupti*", "libnvToolsExt*",
@@ -93,6 +114,11 @@ def base(name):
 def is_vendor(name):
     b = base(name)
     return any(fnmatch.fnmatch(b, g) for g in VENDOR_GLOBS)
+
+
+def is_closed(name):
+    b = base(name)
+    return any(fnmatch.fnmatch(b, g) for g in CLOSED)
 
 
 def allowed(name):
@@ -141,8 +167,11 @@ def check_bytes(label, data, disk_path=None):
     if not fbs:
         return
     sass = sorted({a for fb in fbs for k, a in fb if k == 2}); ptx = sorted({a for fb in fbs for k, a in fb if k == 1})
-    per_fb_missing = {a: sum(1 for fb in fbs if (2, a) not in fb) for a in ARCHS}
-    r = {"file": label, "fatbins": len(fbs), "sass": sass, "ptx": ptx,
+    closed = is_closed(label) and not is_vendor(label)
+    want = CLOSED_ARCHS if closed else ARCHS
+    per_fb_missing = {a: sum(1 for fb in fbs if (2, a) not in fb) for a in want}
+    r = {"file": label, "fatbins": len(fbs), "sass": sass, "ptx": ptx, "closed": closed,
+         "fatbins_with_ptx": sum(1 for fb in fbs if any(k == 1 for k, _a in fb)),
          "fatbins_missing": {f"sm_{a}": c for a, c in per_fb_missing.items() if c},
          "vendor": is_vendor(label), "allowed": allowed(label), "cuobjdump": None}
     results.append(r)
@@ -235,7 +264,9 @@ for p in sys.argv[1:]:
 
 tool_err = None
 if CUO and to_cuo:
-    script = 'for f in "$@"; do echo "== $f"; cuobjdump --list-elf "$f" 2>&1 || echo "!! cuobjdump exit $?"; done'
+    # --list-ptx too: the closed library must show none (a file without PTX prints nothing there)
+    script = ('for f in "$@"; do echo "== $f"; cuobjdump --list-elf "$f" 2>&1 || echo "!! cuobjdump exit $?"; '
+              'echo "-- ptx"; cuobjdump --list-ptx "$f" 2>&1 | grep -i "ptx" || true; done')
     files = [p for _, p in to_cuo]
     if CUO == "host":
         cmd = ["bash", "-c", script, "x"] + files
@@ -270,19 +301,30 @@ if CUO and to_cuo:
             if any(l.startswith("!! cuobjdump exit 126") or l.startswith("!! cuobjdump exit 127") for l in lines) and not tool_err:
                 tool_err = f"cuobjdump cannot run ({' '.join(l for l in lines if l.strip())[:160]}): the gate fails closed"
             continue
-        archs = sorted({int(a) for l in lines for a in re.findall(r"\.sm_(\d+)a?\.cubin", l)})
-        results[i]["cuobjdump"] = {"sass": archs, "cubins": sum(1 for l in lines if ".cubin" in l)}
+        cut = lines.index("-- ptx") if "-- ptx" in lines else len(lines)
+        elf, ptxl = lines[:cut], lines[cut + 1:]
+        archs = sorted({int(a) for l in elf for a in re.findall(r"\.sm_(\d+)a?\.cubin", l)})
+        ptxa = sorted({int(a) for l in ptxl for a in re.findall(r"\.(?:sm|compute)_(\d+)a?\.ptx", l)})
+        results[i]["cuobjdump"] = {"sass": archs, "cubins": sum(1 for l in elf if ".cubin" in l), "ptx": ptxa,
+                                   "ptx_lines": sum(1 for l in ptxl if ".ptx" in l)}
 
 fail = 0; checked = 0
 print(f"gate-sm75-check: required SASS archs {' '.join('sm_%d' % a for a in ARCHS)}; PTX {' '.join('compute_%d' % a for a in PTX) or '-'}; cuobjdump: {CUO or 'none (fatbin scan)'}")
+if CLOSED:
+    print(f"gate-sm75-check: closed library ({' '.join(CLOSED)}): SASS {' '.join('sm_%d' % a for a in CLOSED_ARCHS)}, NO PTX")
 for r in results:
     cu = r["cuobjdump"]
     sass_cu = cu.get("sass") if isinstance(cu, dict) and "sass" in cu else None
     have = set(sass_cu if sass_cu is not None else r["sass"])
-    miss = [a for a in ARCHS if a not in have]
-    miss_ptx = [a for a in PTX if a not in r["ptx"]]
+    closed = r.get("closed")
+    miss = [a for a in (CLOSED_ARCHS if closed else ARCHS) if a not in have]
+    miss_ptx = [] if closed else [a for a in PTX if a not in r["ptx"]]
+    ptx_cu = cu.get("ptx") if isinstance(cu, dict) and "ptx" in cu else None
     disagree = sass_cu is not None and set(sass_cu) != set(r["sass"])
-    bad = bool(miss) or bool(miss_ptx) or bool(r["fatbins_missing"]) or disagree
+    # the closed library: any PTX entry fails it (header scan, or cuobjdump --list-ptx printing a .ptx line)
+    closed_ptx = closed and (bool(r["ptx"]) or bool(ptx_cu) or bool(isinstance(cu, dict) and cu.get("ptx_lines")))
+    r["closed_ptx"] = bool(closed_ptx)
+    bad = bool(miss) or bool(miss_ptx) or bool(r["fatbins_missing"]) or disagree or closed_ptx
     if r["vendor"]:
         verdict = "INFO"
     elif bad and r["allowed"]:
@@ -301,6 +343,11 @@ for r in results:
         extra += " fatbins-missing " + ",".join(f"{k}x{v}" for k, v in r["fatbins_missing"].items())
     if disagree:
         extra += f" SCAN-DISAGREES(scan {r['sass']})"
+    if closed:
+        extra += " [closed lib: SASS only]"
+    if closed_ptx:
+        extra += (f" PTX-IN-CLOSED-LIB({r['fatbins_with_ptx']} of {r['fatbins']} fatbins; "
+                  f"{' '.join('compute_%d' % a for a in sorted(set(r['ptx']) | set(ptx_cu or []))) or 'cuobjdump .ptx'})")
     print(f"{verdict:<5} {r['file']}: sass {' '.join('sm_%d' % a for a in sorted(have)) or '-'} | ptx "
           f"{' '.join('compute_%d' % a for a in r['ptx']) or '-'} | fatbins {r['fatbins']} [{src}]"
           + (f" MISSING {' '.join(r['missing'])}" if r["missing"] else "") + extra)
@@ -308,18 +355,23 @@ for r in results:
 status = 0
 if tool_err:
     print(f"gate-sm75-check: {tool_err}", file=sys.stderr); status = 3
+nclosed = sum(1 for r in results if r.get("closed"))
+if REQCLOSED and nclosed == 0 and checked:
+    print("gate-sm75-check: FAIL --require-closed: no closed-library binary (" + " ".join(CLOSED) + ") in the given paths")
+    fail += 1
 if checked == 0:
     print("gate-sm75-check: NO CUDA device code found in the given paths (a CPU-only build, or the wrong path) -> exit 3")
     status = 3
 elif fail:
-    print(f"gate-sm75-check: FAIL {fail} of {checked} CUDA binaries miss a release arch"); status = 2
+    print(f"gate-sm75-check: FAIL {fail} of {checked} CUDA binaries miss a release arch or carry PTX in the closed library"); status = 2
 elif status == 0:
     nal = sum(1 for r in results if r["verdict"].startswith("ALLOWED"))
     print(f"gate-sm75-check: PASS {checked - nal} CUDA binaries carry {' '.join('sm_%d' % a for a in ARCHS)}{''.join(' compute_%d' % a for a in PTX)}"
+          + (f"; {nclosed} closed-library binaries SASS only ({' '.join('sm_%d' % a for a in CLOSED_ARCHS)}, no PTX)" if nclosed else "")
           + (f"; {nal} ALLOWED exception(s) miss an arch (--allow)" if nal else ""))
 if JSON:
     with open(JSON, "w") as f:
-        json.dump({"archs": ARCHS, "ptx": PTX, "cuobjdump": CUO or None, "status": status, "checked": checked, "fail": fail,
+        json.dump({"archs": ARCHS, "ptx": PTX, "closed": CLOSED, "closed_archs": CLOSED_ARCHS, "closed_binaries": nclosed, "cuobjdump": CUO or None, "status": status, "checked": checked, "fail": fail,
                    "files": results}, f, indent=1)
 sys.exit(status)
 PY

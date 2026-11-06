@@ -4950,7 +4950,17 @@ void server_context::print_tokens(const server_tokens& prompt, const server_toke
 
 }
 
-void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_slot& slot, int32_t n_keep, int32_t n_discard) {
+void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_slot& slot, int32_t n_keep, int32_t & n_discard) {
+    // PXA_MTMD_SHIFT_SNAP_v1 (bug #379): never cut the cached tokens inside a media chunk (the caller sees the snapped count)
+    if (slot.cache_tokens.has_mtmd && n_discard > 0) {
+        const int32_t snapped = pxa_shift_snap_discard((int32_t) slot.cache_tokens.n_tokens(), n_keep, n_discard,
+            [&](int32_t i) { return slot.cache_tokens[(size_t) i] == LLAMA_TOKEN_NULL; },
+            [&](int32_t i) { return slot.cache_tokens.is_media_start((size_t) i); });
+        if (snapped != n_discard) {
+            LLAMA_LOG_INFO("PXA shift snap: cache discard %d -> %d (end was inside a media chunk)\n", n_discard, snapped);
+            n_discard = snapped;
+        }
+    }
     auto kv_keep = slot.cache_tokens.pos_next(n_keep);
     auto kv_discard = slot.cache_tokens.pos_next(n_keep + n_discard) - kv_keep;
     // Prompt shift runs after n_past was set to 0. pos_next(0) makes seq_add's
@@ -5087,9 +5097,20 @@ void server_context::context_shift_prompt(llama_context* ctx, server_slot& slot,
 
     // Handle mistokenization between prompt and cache during context shift
     //
-    int32_t n_discard_cache = n_discard_prompt;
     int32_t n_kept = n_keep;
     slot.prompt_tokens.discard_n_tokens(n_keep, slot.n_discarded_prompt - n_discard_prompt);
+    // PXA_MTMD_SHIFT_SNAP_v1 (bug #379): k steps of n_discard can end inside an image chunk
+    if (slot.prompt_tokens.has_mtmd && n_discard_prompt > 0) {
+        const int32_t snapped = pxa_shift_snap_discard((int32_t) slot.prompt_tokens.n_tokens(), n_keep, n_discard_prompt,
+            [&](int32_t i) { return slot.prompt_tokens[(size_t) i] == LLAMA_TOKEN_NULL; },
+            [&](int32_t i) { return slot.prompt_tokens.is_media_start((size_t) i); });
+        if (snapped != n_discard_prompt) {
+            LLAMA_LOG_INFO("PXA shift snap: prompt discard %d -> %d (end was inside a media chunk)\n", n_discard_prompt, snapped);
+            slot.n_discarded_prompt += snapped - n_discard_prompt;
+            n_discard_prompt = snapped;
+        }
+    }
+    int32_t n_discard_cache = n_discard_prompt;
     if (n_discard_prompt > 0) {
         context_shift_find_n_tokens(ctx, slot.prompt_tokens, slot.cache_tokens, n_keep,
             n_discard, n_kept, n_discard_cache, exact);
@@ -6678,6 +6699,15 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     else {
                         // if input prompt is too big, truncate it (if group attention self-extend is disabled)
                         // context shift for prompt processing
+                        if (pxa_mtmd_prompt_rejected(prompt_tokens.has_mtmd_data(), slot.ga_n, slot.n_prompt_tokens, slot.n_ctx)) {
+                            // PXA_MTMD_NO_PROMPT_SHIFT_v1 (bug #379): never shift a new media prompt; a clear 400 instead
+                            LOG_WARNING("multimodal prompt exceeds the context, refused", {
+                                {"id_slot", slot.id}, {"id_task", slot.id_task},
+                                {"n_prompt_tokens", slot.n_prompt_tokens}, {"n_ctx", slot.n_ctx}});
+                            send_error(slot, pxa_mtmd_overflow_msg(slot.n_prompt_tokens, slot.n_ctx), ERROR_TYPE_INVALID_REQUEST);
+                            slot.release();
+                            continue;
+                        }
                         if (slot.ga_n == 1 && slot.n_prompt_tokens >= slot.n_ctx) {
                             if (!params_base.ctx_shift) {
                                 send_error(slot, "the request exceeds the available context size, try increasing it", ERROR_TYPE_SERVER);
