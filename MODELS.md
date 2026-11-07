@@ -5,12 +5,12 @@ Models quantized to PXA formats by the team, newest first. This page and the Mod
 | Model | Notes | Published by | Added | Downloads | Likes | Updated |
 | --- | --- | --- | --- | --- | --- |
 |[Swift-1.5-Qwen3.8-Flash-Next-PXQN2](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-Flash-Next-PXQN2) |  | PXANetwork | 2026-10-27 | 703 | 1 | 2026-11-04|
-|[PXA-Supporter-Models](https://huggingface.co/poisonxa/PXA-Supporter-Models) | <https://ko-fi.com/shatteredrealms1> | PXANetwork | 2026-10-24 | 299 | 5 | 2026-11-03|
-|[Swift-1.5-Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-10-01 | 1,021 | 2 | 2026-11-04|
-|[Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-09-30 | 2,323 | 2 | 2026-11-04|
-|[Ornith-1.5-35B-A3B-PXQ4-GGUF](https://huggingface.co/poisonxa/Ornith-1.5-35B-A3B-PXQ4-GGUF) | works with tensor split: -sm tensor | poisonxa | 2026-09-22 | 795 | 1 | 2026-11-04|
-|[PXA-Fusion4-35B-GGUF](https://huggingface.co/poisonxa/PXA-Fusion4-35B-GGUF) | Fusion4 35B | poisonxa | 2026-09-22 | 1,335 | 5 | 2026-11-04|
-|[Qwable-27B-GGUF](https://huggingface.co/poisonxa/Qwable-27B-GGUF) | 27B dense | poisonxa | 2026-09-22 | 899 | 2 | 2026-11-04|
-|[PXA-Coder-35B-PXQ4](https://huggingface.co/poisonxa/PXA-Coder-35B-PXQ4) | coder model in PXQ4 | poisonxa | 2026-09-22 | 741 | 1 | 2026-09-09|
+|[PXA-Supporter-Models](https://huggingface.co/poisonxa/PXA-Supporter-Models) | <https://ko-fi.com/shatteredrealms1> | PXANetwork | 2026-10-24 | 300 | 5 | 2026-11-03|
+|[Swift-1.5-Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-10-01 | 1,028 | 2 | 2026-11-04|
+|[Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-09-30 | 2,347 | 2 | 2026-11-04|
+|[Ornith-1.5-35B-A3B-PXQ4-GGUF](https://huggingface.co/poisonxa/Ornith-1.5-35B-A3B-PXQ4-GGUF) | works with tensor split: -sm tensor | poisonxa | 2026-09-22 | 798 | 1 | 2026-11-04|
+|[PXA-Fusion4-35B-GGUF](https://huggingface.co/poisonxa/PXA-Fusion4-35B-GGUF) | Fusion4 35B | poisonxa | 2026-09-22 | 1,380 | 5 | 2026-11-04|
+|[Qwable-27B-GGUF](https://huggingface.co/poisonxa/Qwable-27B-GGUF) | 27B dense | poisonxa | 2026-09-22 | 924 | 2 | 2026-11-04|
+|[PXA-Coder-35B-PXQ4](https://huggingface.co/poisonxa/PXA-Coder-35B-PXQ4) | coder model in PXQ4 | poisonxa | 2026-09-22 | 763 | 1 | 2026-09-09|
 
 Run any of them with the launcher: `./pxa-launch` finds the file and picks the cards.
