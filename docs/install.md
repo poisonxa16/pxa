@@ -91,7 +91,7 @@ Needs Windows 10, Windows 11, or Windows Server 2019 or newer, 64-bit, and an NV
 12. The package does not include a driver. Two files, plus one optional library:
 
 - `pxa-control-win64.exe`: PXA Control. Put it in a folder of its own.
-- `pxa-engine-win64-cuda12.zip`: the engine with the CUDA 12 runtime (sm_60, sm_61 and sm_70 cards).
+- `pxa-engine-win64-cuda12.zip`: the engine with the CUDA 12 runtime. Native code for sm_60, sm_61, sm_70, sm_75, sm_80, sm_86 and sm_89 (GTX 10xx, Tesla P100/P40, V100, Turing, RTX 30xx and RTX 40xx). Turing cards are not run-tested by us yet.
   Unzip it next to `pxa-control-win64.exe` and rename the unzipped folder to `engine`, so
   `engine\bin\llama-server.exe` exists. Control finds that folder by itself.
 - `ggml-pxqn.dll`: the PXQN library, published beside the zip, not inside it. Copy it into

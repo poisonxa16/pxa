@@ -34,9 +34,7 @@ GPU 1: Tesla V100-PCIE-16GB (UUID: GPU-9af9aaf0-...)
 | GTX 1080 Ti, GTX 10-series, Tesla P40 | yes | 11 GB on a 1080 Ti, so smaller models |
 | Tesla V100 (16 GB / 32 GB) | yes | the fastest of the three |
 | Titan Xp, Quadro P-series | yes | same generation as the 1080 Ti |
-| RTX 20-series and anything newer | **no** | the released build is compiled for the three
-  architectures above only. Your card is not broken — this build simply has no code for it, and
-  mainline llama.cpp serves you better anyway. |
+| RTX 20-series and newer, Tesla T4, GTX 16-series | **best effort** | since 4.0.4 the release tarball carries native code for these cards (`sm_75`, `sm_80`, `sm_86`, `sm_89`). We tune and measure on P100 and V100 only, and we have not yet run it on a Turing card ourselves, so a first report ("it started and answered" or "it did not") is welcome in the PXA Network Discord (#support). There are no speed numbers for these cards. |
 
 **What just happened.** `nvidia-smi` is the tool NVIDIA's driver installs. If that command printed
 nothing or said "command not found", you do not have a working NVIDIA driver yet, and nothing in
@@ -64,7 +62,7 @@ ldd (GNU libc) 2.42
 |---|---|---|
 | Linux, 64-bit Intel/AMD | any modern distro | — |
 | NVIDIA **driver** | **570.00 or newer** | the number in the `nvidia-smi` banner |
-| glibc | **2.38 or newer** for the main tarball (Ubuntu 24.04+, Debian 13+, Fedora 39+). **2.35 or newer** for the `-ubuntu22.04` tarball | `ldd --version` |
+| glibc | **2.35 or newer** (Ubuntu 22.04 and newer) | `ldd --version` |
 | `python3` | any version on your PATH | only the launcher and a couple of one-liners use it |
 | free disk | ~5 GB for the package, plus your model (10–20 GB) | `df -h .` |
 
@@ -77,8 +75,7 @@ has to match your kernel.
 >   first, reboot, and try again.
 > - **Driver version below 570** — upgrade the *driver*, not CUDA. Installing a CUDA toolkit will
 >   not help and is not needed.
-> - **glibc below 2.38** — use the `-ubuntu22.04` tarball (it needs 2.35), or the container path (guide 01),
->   which brings its own userspace.
+> - **glibc below 2.35** — use the container path (guide 01), which brings its own userspace.
 
 ---
 
@@ -90,7 +87,7 @@ Two ways to get the same binaries. Pick one; you can switch later.
 |---|---|---|
 | what it is | a `.tar.gz` you unpack into a folder | a Docker image you pull |
 | you need | just the driver | the driver, Docker, and the NVIDIA Container Toolkit |
-| glibc too old? | will not start | works anyway |
+| glibc older than 2.35? | will not start | works anyway |
 | where models live | anywhere you like | a folder you mount |
 | upgrading | download the new tarball | `docker pull` the new tag |
 | my advice | **start here if you have one box and root on it** | use this if you already run Docker, or your distro is old |
