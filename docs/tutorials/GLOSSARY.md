@@ -27,7 +27,7 @@ and the settings, so there is exactly one file to download and one file to point
 
 **PXQ** — my own family of quantization formats, written as PXQ2, PXQ3, PXQ4, PXQ4-HQ and PXQ6.
 They are laid out so the old Pascal and Volta cards can decode them quickly, which is the entire
-reason this project exists. Made with `pxq-quantize`, a separate download from this engine.
+reason this project exists. Made with the Encode tab in PXA Control.
 
 **PXQU** — a *mixed* PXQ file, where different parts of the model get different numbers of bits.
 The parts that matter most are stored more precisely, so you get better answers for the same file

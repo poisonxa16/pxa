@@ -3,8 +3,8 @@
 The PXQ types — `pxq1` (248), `pxq4` (252), `pxq4hq` (253), `pxq2` (254), `pxq3` (255),
 `pxq6` (256) — are 64-row **panel-interleaved** formats. A single weight row's bytes are
 scattered across the slabs of its panel, so the ggml type traits carry no `to_float` and no
-`vec_dot`, and `llama-quantize` refuses to read them (PXQ files are WRITTEN by `pxq-quantize`,
-a separate download; this document is about reading one back out):
+`vec_dot`, and `llama-quantize` refuses to read them (PXQ files are WRITTEN by the encoder in PXA Control's
+Encode tab; this document is about reading one back out):
 
 ```
 cannot requantize from a PXQ slab type (PXQ1/PXQ2/PXQ3/PXQ4/PXQ4-HQ/PXQ6: CUDA-only slab

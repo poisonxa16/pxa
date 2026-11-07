@@ -181,7 +181,7 @@ plain decode is faster than MTP decode at that depth on the files measured so fa
 
 ## Quantizing
 
-This one belongs to the separate `pxq-quantize` download, not to the engine — it changes how a
+This one belongs to the encoder in PXA Control's Encode tab, not to the engine — it changes how a
 PXQ file is **written**, never how one is read. Every PXQ file loads and runs the same either way.
 
 | variable | default | what it does for you | how to turn it off |

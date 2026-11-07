@@ -18,12 +18,13 @@ converts it into a vLLM-loadable safetensors directory.
                                                               vLLM safetensors directory
 ```
 
-Everything below needs only `pxq-quantize` (a separate download — see the release page) and
-Python. No GPU is required to quantize. `pxq-quantize` takes the same command line as
-`llama-quantize` and is the tool that writes the PXQ tiers; the `llama-quantize` built from
-this repo still handles every stock type and will tell you to fetch `pxq-quantize` if you ask
-it for a PXQ one. Where a command below says `llama-quantize` with a PXQ type, run
-`pxq-quantize` instead.
+To write PXQ tiers, use the Encode tab in PXA Control (see
+[guide 04](tutorials/04-quantize-your-own-model.md)). The converter's Python packages are not in
+the tarball; install them once with
+`python3 -m venv ~/pxa-convert && ~/pxa-convert/bin/pip install -r tools/requirements-convert.txt`,
+then start PXA Control with `PXA_CONVERT_PYTHON=~/pxa-convert/bin/python`. The Free encoder needs no
+graphics card. The `llama-quantize` built from this repo still handles every stock type but does
+not write PXQ tiers.
 
 ---
 
