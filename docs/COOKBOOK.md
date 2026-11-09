@@ -70,7 +70,7 @@ adaptive-VRAM ladder.
 On these pre-Turing cards (P100/V100/1080 Ti), flash-attention is a **decode win but a
 cold-prefill loss** — for this engine *and* for the parent engine. You run **one** setting per
 server, so choose by what you're doing. Measured (35B, cold 5.8k-token prompt, `-b 2048`, median
-of 3; full sweep in `bench/fair-battle.md`):
+of 3):
 
 | card | `-fa on` (interactive: chat/agent) | `-fa off` (batch: ingest/summarize/embed) |
 |---|---|---|
@@ -82,7 +82,7 @@ of 3; full sweep in `bench/fair-battle.md`):
   *and* a solid prefill in the same server — e.g. P100 gets **+59% prefill** vs upstream (the engine
   win). The accompanying **+30% decode** in that comparison comes from the smaller PXQ quant tier
   (PXQU-16 + q8_0 head vs upstream IQ3_KS) **plus MTP speculative decode**, not the kernel — the
-  same-quant engine control is decode +2.7–3.3% (see `bench/fair-battle.md`).
+  same-quant engine control is decode +2.7–3.3%.
 - **Prefill-heavy batch → `-fa off`.** Prefill jumps 26–56% (this is where the "+88% P100
   prefill" headline comes from) but decode drops 16–48%. Use it for one-shot ingest/summarize
   passes where you barely decode.
@@ -97,10 +97,7 @@ tokens against mainline's best prefill shape (its layer split) at **956 / 1,017 
 engine together** — same weights on both sides, but the arm that would separate the two (this engine on
 the same `Q4_K_S` file) has not been run **on this pair**. The 512-token class is not quoted at
 all: its bracket moved −1.81% and mainline's own 512 arm spread 21% across repetitions. Mainline's
-*tensor* split, the shape that wins its decode cells, is the slower one for prefill. The four-card
-P100 prefill cell **is** measured on stock files ([`../bench/LEADERBOARD.md`](../bench/LEADERBOARD.md))
-but against **pinned** competitor revisions, so it is provisional until they are rebuilt at their
-current heads.
+*tensor* split, the shape that wins its decode cells, is the slower one for prefill.
 
 ## 1× Tesla P100 16 GB — PXQU-16 (q8_0 head)
 
@@ -153,8 +150,7 @@ you have the headroom and you are serving long prompts across more than one card
 `-ub` does **not** transfer between configurations and there is no universal answer: with
 `-b 8192`, `-ub 2048` is the best cell on a 2× V100 pair and `-ub 256` is the best on a 2× P100
 pair — which is exactly why the engine only fills the cells it has measured. Measure it on your
-own cards. The published pair numbers and the protocol behind them are in
-[`bench/fair-battle.md`](../bench/fair-battle.md).
+own cards.
 
 ## 2× Tesla P100 — Qwen3.6-35B-A3B (PXQN4 with its MTP head): what a bare launch does
 
@@ -237,7 +233,7 @@ the measured configuration. (The
 older row for this card, 1,306 / 729 / 59.2 / 32.1, is the same engine launched with the levers
 and the flags spelled out by hand.) Against
 a fresh parent-engine IQ2_KS build on the same card that is **+15.4%** cold prefill and
-**+11.1%** chat decode, with chat prefill a tie (see [`bench/fair-battle.md`](../bench/fair-battle.md)).
+**+11.1%** chat decode, with chat prefill a tie.
 
 Warning: **Those numbers depend on the sm_61 int8 prefill tile, which the default ENHANCE level arms
 for you** — there is nothing to export. Without the tile the same build does 573 / 424 t/s, less
@@ -270,17 +266,16 @@ IQ_K, …). You do not need a PXQ file to get them:
 That's the whole recipe: point `-m` at a stock quant and run as normal — the tune is on by
 default. **Engine-only numbers** (same GGUF, two engines — upstream
 The parent engine vs this engine, matched config, isolating the kernel/arch fixes from any codec):
-from the "Same-quant control" table in [`bench/fair-battle.md`](../bench/fair-battle.md) —
+from the "Same-quant control" table —
 V100 decode 84.5 → 87.2 t/s (**+3.2%**, bit-identical output, same temp-0 sha), P100 decode 44.0
 → 45.2 t/s (**+2.7%**), 1080 Ti decode 52.2 → 53.9 t/s (**+3.3%**) — all on upstream's own IQ_K
 ggufs, no PXQ tensor involved. The bigger engine-only win is prefill — see the README's
-"Engine-only, the honest number" and `bench/fair-battle.md`'s regime tables for the fa-on/fa-off
-split on the same stock files.
+"Engine-only, the honest number" for the fa-on/fa-off split on the same stock files.
 
 ## 1× 12 GB card — PXQU-12
 
 Same command shape as PXQU-16 with `fusion2-35b-U12.gguf`. Measured on the 16 GB Teslas:
-58.4 t/s decode P100 / 97.6 V100 (see `bench/HEAD-TO-HEAD.md` §12 GB tier).
+58.4 t/s decode P100 / 97.6 V100.
 
 ## Vision / MTP extras
 

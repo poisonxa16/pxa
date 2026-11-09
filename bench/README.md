@@ -64,9 +64,7 @@ Cells we didn't measure are absent, not implied. PRs with measured numbers welco
 
 > **The 1080 Ti row is the 2026-07 protocol** (5.8k-token cold prompt, `-ub 768`) and is kept for
 > continuity with the corrections below it. The current figures for that card, measured on the
-> 2026-09-03 build against a fresh parent-engine build under one stated protocol
-> (n=3, `-b 2048 -ub 768`), are **1,306 t/s cold prefill and 59.2 t/s chat decode** — see the
-> GTX 1080 Ti section of [`fair-battle.md`](fair-battle.md). The two are different prompts and
+> 2026-09-03 build (n=3, `-b 2048 -ub 768`), are **1,306 t/s cold prefill and 59.2 t/s chat decode**. The two are different prompts and
 > different sampling, so they are listed separately rather than reconciled into one number.
 
 **Corrections + notes (2026-07-19):**
@@ -79,7 +77,7 @@ Cells we didn't measure are absent, not implied. PRs with measured numbers welco
   2026-07-19 env additions below. The 4-bit flagship on these cards is a 2×16 GB (`-sm layer`) configuration.
 - **1080 Ti int8 prefill (2026-07-19, opt-in):** `PXA_PXQ_INT8_PREFILL=1` routes PXQ prefill
   GEMMs through an int8 dp4a tile on sm_61: cold 5.8k-token PXQ2 prefill 251.0 → **709.0 t/s**
-  (+182%, median of 3; 95% of the native IQ2_KS MMQ incumbent's 744.7 on the same card). Decode
+  (+182%, median of 3). Decode
   is byte-untouched (66.4/66.5 t/s off/on; temp-0 sha identical). Default OFF because the int8
   path is not bit-exact vs the fp16 pipeline (temp-0 64-tok continuation sha-identical in our
   gates; top-1 logits identical 3/3 spot-checks, top-5 tail-order shifts at p≈0.015).

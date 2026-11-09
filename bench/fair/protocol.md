@@ -2,7 +2,7 @@
 
 The rules every number under `bench/fair/` — and the three headline numbers `run.sh` prints —
 must follow. This tightens (does not replace) the methodology already in
-[`../fair-battle.md`](../fair-battle.md): same three shapes (engine-only / codec-only / product),
+the earlier comparison page (retired): same three shapes (engine-only / codec-only / product),
 stricter reproducibility rules.
 
 ## Rules
@@ -32,7 +32,7 @@ stricter reproducibility rules.
 ## The three numbers
 
 Every `bench/fair/` report reduces to three numbers, matching the shapes in
-[`../fair-battle.md`](../fair-battle.md):
+the earlier comparison page (retired):
 
 | number | isolates | shape |
 |---|---|---|
@@ -50,7 +50,7 @@ with a number measured under a looser protocol.
 Two shapes stay **out** of the three blocks, on purpose:
 
 - an expert-codec comparison whose two sides are not the same base weights (the MoE decode row
-  against MXFP4 in [`../fair-battle.md`](../fair-battle.md) is that: same architecture and size
+  against MXFP4 in the earlier comparison page (retired) is that: same architecture and size
   class, a different model). A rig file declaring `PRODUCT_SAME_BASE_WEIGHTS=no` is refused as a
   product row rather than printed with a footnote;
 - multi-box, NVLink and sidecar-speculation rows. Different hardware or a different serving stack

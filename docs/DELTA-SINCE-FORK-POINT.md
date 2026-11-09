@@ -227,15 +227,15 @@ wins **6.0% lower perplexity** at the same 4.25 bpw file size (6.9704 → 6.5527
 bytes). Against the parent engine's own IQ_K quants, matched size/imatrix/corpus (measured 2026-07-18, while the
 PXQ tiers still consumed an imatrix — they ignore one by default since 2026-08-24): PXQ wins speed
 everywhere — decode **+3–15%**, prefill **+20–28%** — and at 2-bit PXQ2 beats
-IQ2_KS on both speed (**+3–28%**) and fidelity (KLD 0.205 vs 0.284) (`bench/HEAD-TO-HEAD.md`).
+IQ2_KS on both speed (**+3–28%**) and fidelity (KLD 0.205 vs 0.284).
 
 ## Measured vs upstream
 
 | comparison | result | source |
 |---|---|---|
 | Engine-only prefill, fixed weights, P100 | **~1.7×** (+59% `-fa on` serving, +88% `-fa off` batch) | `README.md` |
-| Engine-only prefill, fixed weights, V100 | +12–13% | `bench/fair-battle.md` |
-| Same-quant decode (IQ3_KS/IQ2_KS, all 3 cards) | **+2.7–3.3%**, V100 bit-identical output | `bench/fair-battle.md` |
+| Engine-only prefill, fixed weights, V100 | +12–13% | earlier measurement |
+| Same-quant decode (IQ3_KS/IQ2_KS, all 3 cards) | **+2.7–3.3%**, V100 bit-identical output | earlier measurement |
 | Codec-only, dense prefill, 2×P100 | **+19.2%** vs MXFP4 | `README.md` |
 | Codec-only, dense decode, 2×P100 | **+6.0%** vs MXFP4 | `README.md` |
 | 1×P100, 35B MoE, PXQU-16 | ~62 t/s decode, 827–843 t/s prefill | `README.md`, `bench/README.md` |

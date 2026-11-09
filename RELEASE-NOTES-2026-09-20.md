@@ -115,7 +115,7 @@ all-reduce below armed automatically at both decode and prefill — no flag need
 builder has no non-FA path). Pass `-sm layer` yourself at any time to go back to the previous
 default. The measurements and the "why opt-in" reasoning directly below predate that change and are
 kept for the record; the current rule, its board numbers and the gate that cleared it are in
-`docs/LAUNCHER.md` (§5b) and `bench/LEADERBOARD.md`.
+`docs/LAUNCHER.md` (§5b).
 
 ```
 llama-server -m <model>.gguf -ngl 99 -sm tensor -ts 1,1 ...

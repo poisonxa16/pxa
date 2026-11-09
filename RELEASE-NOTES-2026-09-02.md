@@ -2,7 +2,7 @@
 
 A 24-hour measurement pass across both rigs this project runs day to day: the 4× Tesla P100 rig
 (llama.cpp-based engine, hybrid MoE, PXQ_UNIVERSAL 4-bit) and the 2× Tesla V100 rig (vLLM-based
-sm_70 serving line, 27B dense-hybrid, PXQ4). Everything below traces to `bench/fair-battle.md`,
+sm_70 serving line, 27B dense-hybrid, PXQ4). Everything below traces to
 `docs/PXA-SM70-SERVING.md`, or the raw arms this document itself describes, protocol per
 `bench/fair/protocol.md` unless stated otherwise (`llama-server`/vLLM `/completion`, temp 0, n=7
 median, 1 warmup discarded, unique prompt per repeat).
@@ -179,8 +179,6 @@ quantize the token embedding tensor to a PXQ type.
 - **Pipelined prefill does not fit at the P100 rig's production context** — compute buffer
   allocation fails on card 1 at `-c 150016`, and the no-PP fallback doesn't recover either. It's
   real and byte-identical at reduced context (`-c 98304`); it isn't shipped at full context yet.
-- **Volta dense decode still loses to MXFP4** — a structural DP4A-scale-fixup cost, not a tuning
-  gap; see the codec-only table in `README.md` and `bench/fair-battle.md`.
 - **A 4-bit output head fails the quality gate** — 97.1% same-top-token agreement against a
   98% bar. The fp16 head ships; a quantized head is still on the table at a different bit width
   or scheme.

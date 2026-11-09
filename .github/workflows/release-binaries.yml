@@ -65,7 +65,7 @@ jobs:
           cat > notes.md <<'EOF'
           Prebuilt linux x86_64 CUDA 12 binaries (`llama-server`, `llama-quantize`, `llama-perplexity` + shared libs), arches sm 60/61/70/86/89 — built by this workflow from this tag (public build log). Unpack, `LD_LIBRARY_PATH=$PWD`, run — see RUN.txt inside.
 
-          Release highlights (full details in the README and `bench/fair-battle.md`):
+          Release highlights (full details in the README):
           - Head-to-head vs the parent engine, best config both sides: **P100 +88% prefill / +30% decode**, V100 +13%/+13%, 1080 Ti +25% decode.
           - New opt-in int8 dp4a prefill tile for GTX 10-series: 1080 Ti cold prefill 251 → 1,001 t/s.
           - New recommended env: `PXA_FUSE_DELTANET=3`, `PXA_G2_ADDFUSE=1`, q8_0 output head.

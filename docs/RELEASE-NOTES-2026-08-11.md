@@ -25,7 +25,7 @@ latency.
 ## Performance
 
 **`PXA_FA_TILE_VOLTA`** (new, default off) — routes sm_70 flash-attention to the tile kernel instead
-of WMMA. **+6.9% prefill**, decode unchanged. Measured with the protocol in `bench/fair-battle.md`.
+of WMMA. **+6.9% prefill**, decode unchanged.
 
 **Ubatch guidance.** On the dense 30B, prefill peaks at `-ub 1024` and is flat from 2048 upward,
 while decode is ubatch-insensitive. The effect is large enough to dominate several kernel levers, so

@@ -185,7 +185,7 @@ the launcher actually does.
 | cards | model | flags the launcher passes | measured result | source |
 |---|---|---|---|---|
 | 2× V100 (sm_70) | dense 27B, PXQ4 | `-b 8192 -ub 2048 -fa on -c 32768 -sm layer` | prefill **1,369** t/s @3,121 · **1,300** @20,801 · decode **39.5** @fill 8 (release binary, quiet box, no env) | `RELEASE-NOTES-2026-09-07.md:77` (measured 2026-09-05) |
-| 2× P100 (sm_60) | dense 27B, PXQ4 | `-b 8192 -ub 256 -fa on -c 32768 -sm layer` | prefill **337.6** t/s @3,121 · **315.3** @20,801 · decode **18.1** @fill 8 (release binary, quiet box, no env; fold n=7 reference 340.16 / 316.84 / 17.83) | `RELEASE-NOTES-2026-09-07.md:78`; `bench/fair-battle.md:303` (measured 2026-09-05) |
+| 2× P100 (sm_60) | dense 27B, PXQ4 | `-b 8192 -ub 256 -fa on -c 32768 -sm layer` | prefill **337.6** t/s @3,121 · **315.3** @20,801 · decode **18.1** @fill 8 (release binary, quiet box, no env; fold n=7 reference 340.16 / 316.84 / 17.83) | `RELEASE-NOTES-2026-09-07.md:78` (measured 2026-09-05) |
 | 1× GTX 1080 Ti (sm_61, 11 GB) | 35B MoE, PXQ2 | `-b 2048 -ub 768 -c 8192`, `-fa on` for chat / `-fa off` for long documents, `PXA_AUTO_SPEC=0` | **unmeasured with this recipe**, which keeps context checkpoints since 2026-09-25; the published cells were taken with `--ctx-checkpoints 0`: cold prefill 1,363.5 t/s (fa off) · chat prefill 746.6 (fa on) · decode 36.73 cold / 65.3 chat (release binary, no env). Add `--ctx-checkpoints 0` to run that configuration | `RELEASE-NOTES-2026-09-07.md:79` (measured 2026-09-04) |
 | 4× P100 (sm_60) | Qwen3.8 Flash-Next 64 GB (PXQN) | `-ngl 99 -np 1 -fa on -c 32768 -t 16 -b 2048 -ub 2048 -wgt 64 -sm layer -ts 0.95,1.01,1.01,1.03 -ot per_layer_token_embd\.weight=CPU -ot blk\.24\.ffn_down_exps=CUDA0 -ot blk\.23\.ffn_down_exps=CUDA3 --no-context-shift --cache-ram 0` (the v3 gate line, recipe `4xp100-flashnext`) | decode **27.8** prose / **36.3** code t/s with automatic speculation, 29.4 / 29.5 without · prefill **379** t/s @4,096 (v3 release gate) | v3 release gate report |
 | 1× P100 (sm_60) | 35B MoE, PXQU-16 + q8_0 head | `-b 2048 -ub 2048 -c 8192 -fa on` | decode 62.4 t/s · prefill 827-843 t/s | `docs/COOKBOOK.md:65-73` |
@@ -237,7 +237,7 @@ setting, so the launcher asks which one you want:
 | chat, serve | `on` | full decode speed and a solid prefill in the same server |
 | longdoc | `off` | 26-56% more cold prefill, 16-48% less decode |
 
-Measured per card in `docs/COOKBOOK.md:41-63` and `bench/fair-battle.md:35-50`.
+Measured per card in `docs/COOKBOOK.md:41-63`.
 On the 1080 Ti both cells were measured on the card itself, so that row's regime
 switch is `MEASURED` rather than inferred.
 
@@ -922,11 +922,11 @@ model, chat workload.
   ev: MEASURED topology row '2xp100-dense-pxq4' (2x Tesla P100 (sm_60), dense 27B, PXQ4): prefill 340.16 t/s @3,121
   tok | 316.84 @20,801 | decode 17.83 @fill 8 (n=7, two passes, GPUs 1;5, fold 24ebec4096)
   [RELEASE-NOTES-2026-09-07.md:78 (P100 headline row, carries this fold reference);
-  bench/fair-battle.md:217 (full fold n=7 table); RESULTS-2026-09-01-session2.md 2026-09-03 21:11
+  RESULTS-2026-09-01-session2.md 2026-09-03 21:11
   FINAL TABLE]
   ev: MEASURED FA regime: -fa on for workload 'chat' - the interactive/serving setting, and what every recipe row
   above was measured at. Switch with --workload longdoc if you are ingesting rather than chatting.
-  [docs/COOKBOOK.md:41-63 (Two FA regimes); bench/fair-battle.md:35-50]
+  [docs/COOKBOOK.md:41-63 (Two FA regimes)]
   ev: MEASURED envelope: exactly 2 cards, both sm_60 - the table applies as measured (the measurement record,
   the MoE crossover analysis)
   ** -ub does NOT transfer between pairs: 2,048 is best on the V100 pair and 256 on this one (-ub 256 gives 218.4
@@ -1053,11 +1053,11 @@ The same screen a few minutes later, serving.
   ev: MEASURED topology row '2xp100-dense-pxq4' (2x Tesla P100 (sm_60), dense 27B, PXQ4): prefill 340.16 t/s @3,121
   tok | 316.84 @20,801 | decode 17.83 @fill 8 (n=7, two passes, GPUs 1;5, fold 24ebec4096)
   [RELEASE-NOTES-2026-09-07.md:78 (P100 headline row, carries this fold reference);
-  bench/fair-battle.md:217 (full fold n=7 table); RESULTS-2026-09-01-session2.md 2026-09-03 21:11
+  RESULTS-2026-09-01-session2.md 2026-09-03 21:11
   FINAL TABLE]
   ev: MEASURED FA regime: -fa on for workload 'chat' - the interactive/serving setting, and what every recipe row
   above was measured at. Switch with --workload longdoc if you are ingesting rather than chatting.
-  [docs/COOKBOOK.md:41-63 (Two FA regimes); bench/fair-battle.md:35-50]
+  [docs/COOKBOOK.md:41-63 (Two FA regimes)]
   ev: MEASURED envelope: exactly 2 cards, both sm_60 - the table applies as measured (the measurement record,
   the MoE crossover analysis)
   ** -ub does NOT transfer between pairs: 2,048 is best on the V100 pair and 256 on this one (-ub 256 gives 218.4
@@ -1936,7 +1936,7 @@ pxa-launch: ENGINE = llama
   reason: tier is PXQ_UNIVERSAL: the vLLM backend implements PXQ4 ONLY and refuses every other tier cleanly at the conversion gate (PXQ-TYPE-MATRIX.md:69-70). llama.cpp reads PXQ2/PXQ3/PXQ4/PXQ4-HQ/PXQ6/UNIVERSAL. Cards: 6:Tesla P100-PCIE-16GB sm_60
   ev:     MEASURED tier support: PXQ-TYPE-MATRIX.md:69-70, :80-81
   ev:     MEASURED topology row '1xp100-pxqu16' (1x Tesla P100 16 GB (sm_60), 35B MoE, PXQU-16 + q8_0 head): decode 62.4 t/s (63.0 with ADDFUSE)  |  prefill 827-843 t/s @-ub 2048  [docs/COOKBOOK.md:65-73]
-  ev:     MEASURED FA regime: -fa on for workload 'chat' - the interactive/serving setting, and what every recipe row above was measured at. Switch with --workload longdoc if you are ingesting rather than chatting. [docs/COOKBOOK.md:41-63 (Two FA regimes); bench/fair-battle.md:35-50]
+  ev:     MEASURED FA regime: -fa on for workload 'chat' - the interactive/serving setting, and what every recipe row above was measured at. Switch with --workload longdoc if you are ingesting rather than chatting. [docs/COOKBOOK.md:41-63 (Two FA regimes)]
   ** PXQ_UNIVERSAL: this is a MIXED per-tensor tier map. PXQ-TYPE-MATRIX.md:119 Finding 8 records a UNIVERSAL MoE that loads PASS and generates INCOHERENT - with the doc's own caution that the incoherence is traceable to that build recipe (Q3_K_M source, no imatrix) rather than to the codecs. Nothing verifies a coherence check ran on THIS file. llama.cpp only, and you must acknowledge it.
   ** Decode is ub-insensitive on this row - drop to -b/-ub 512 if you want a smaller compute buffer (docs/COOKBOOK.md:72-73).
   ** PXQ_UNIVERSAL acknowledgement WAIVED by recipe row '1xp100-pxqu16': that row was measured on this tier, with output-gated boots, which is the coherence evidence the general PXQ_UNIVERSAL warning asks for. The warning above still stands for any OTHER UNIVERSAL file - it is waived for this cell, not for the tier.
@@ -2302,7 +2302,7 @@ too and must come back with no row at all rather than the nearest one.
              flags: -b 8192 -ub 256 -c 32768 -sm layer
              fa:    chat:-fa on/serve:-fa on/longdoc:-fa off
              env:   PXA_ENHANCE=1
-             src:   RELEASE-NOTES-2026-09-07.md:78 (P100 headline row); bench/fair-battle.md:217; ...
+             src:   RELEASE-NOTES-2026-09-07.md:78 (P100 headline row); ...
              meas:  prefill 340.16 t/s @3,121 tok | 316.84 @20,801 | decode 17.83 @fill 8
   [off-table] 3x sm_60 dense PXQ4 -> UNMEASURED, no -b/-ub emitted
 ```

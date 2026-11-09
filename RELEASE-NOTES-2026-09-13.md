@@ -89,8 +89,7 @@ floor on the whole reserve) — raised the two-slot draft to 23 tokens, and the 
 mainline's 178.64 (+24.3%), repetition 144.17 against 115.55 (+24.8%) and prose
 184.33 against 77.38 (+138.2%)**, sums over both slots in one valid bracket. The earlier
 two-client row (163.69 / 125.44 / 148.75) was measured on the build that over-committed the card and
-is withdrawn. Per-slot figures and the full accounting are in
-[`bench/LEADERBOARD.md`](bench/LEADERBOARD.md).
+is withdrawn.
 
 **Why the long n-gram stage and not the cascade, stated as the trade it is.** The previous default put
 an n-gram table in front of the trained MTP head: the table answers a model quoting its prompt, tool
@@ -129,7 +128,7 @@ from Pascal up (the banner names both measurements); the flags it arms are
 `--spec-type ngram:n_max=64,n_min=2,ngram_size_n=24` with `PXA_NGRAM_RESET_STREAK=0`, and
 `PXA_SPEC_AUTO_CHAIN=cascade` restores the previous chain. The repetition
 class there reads **21.25 against mainline's 19.54, +8.8%**, at REPS 6 in one bracket (capture
-capture C). [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md) has the full record.
+capture C).
 
 **And one thing about every speculative decoder, said plainly because it surprised me first.**
 See *Known behaviour* below: speculative output is **not byte-reproducible at temperature 0**. A verify
@@ -464,8 +463,7 @@ own best prefill shape rather than at one shape chosen to suit this note.
 
 **The four-card P100 prefill cell is green too, and it lives on the board rather than here**: 470.5
 t/s at 3,121 tokens against mainline's 212.8 and 420.2 at 20,801 against 266.3, quoted at this
-engine's fastest valid configuration (no speculation stage armed). Read it in
-[`bench/LEADERBOARD.md`](bench/LEADERBOARD.md).
+engine's fastest valid configuration (no speculation stage armed)..
 
 - **PXQ3's prefill dequant stops re-deriving what a 64-entry table already knows.**
 - **`PXA_FA_TILE_V2`** — a flash-attention tile schedule that can issue a 128-bit shared load. Ships
@@ -805,8 +803,7 @@ bytes rather than from a model name.
 All three engines read the same weights, so no cross-engine row here carries a *weights* confound. The
 rows still differ in **codec and engine** — one variable fewer, not none. Where a table quotes the
 pinned mainline build rather than its current head, it says so on the row. No table here is a codec
-measurement; the arm that is one — this engine driving `Q4_K_S` — has run on four P100s only, and it
-is published with the rest in [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md).
+measurement; the arm that is one — this engine driving `Q4_K_S` — has not run on the Volta pair.
 
 ---
 
