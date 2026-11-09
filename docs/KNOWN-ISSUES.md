@@ -6,7 +6,7 @@
 - **Nemotron.** The MTP draft head is not supported yet; leave MTP off for every Nemotron file. Image input (Super-VL, Bolt) is not in 4.0: both run as text models. Super ships as a PXQN2 file only. Nemotron 3 Nano 4B in PXQ4 is smaller than Q4_K_M but measures worse in KLD; the PXQN file measures better.
 - **Nemotron Bolt:** NVIDIA's own NVFP4 GGUF does not load yet. Convert the BF16 checkpoint with the bundled converter instead.
 - **GLM-5.3-Flash.** The release notes say whether it is supported or still experimental. A short-prompt failure (a NaN) on multi-device execution is narrowed but still open.
-- **Gemma 4 26B-A4B on one V100, PXQN4 file.** Prompt processing at a 64k prompt is slower than mainline llama.cpp's q4_0 file; the release notes' Known limits give the figures.
+- **Gemma 4 26B-A4B on one V100, PXQN4 file, 64k prompt.** We have not measured mainline llama.cpp against the 4.0 release build at this prompt length, so the release notes make no claim against it here.
 - **Qwen3.8 27B on one V100 at 32k context** may decode without speculation when the draft context cannot fit. The launch no longer exits.
 - **Windows and macOS builds are unsigned** (SmartScreen and Gatekeeper ask once; see [`install.md`](install.md)). The Windows PXQN library has no fast CPU math, no locked models and no expert-cache CPU pool. The Mac download is a client only. An Android client is in testing and is not a 4.0 download.
 - **Flash-Next on four P100 with speculation:** greedy text is not stable across server starts; see the v3 entry below for the way to get repeatable text.

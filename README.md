@@ -22,7 +22,7 @@ No build tools, no CUDA toolkit, no account. Prefer a container, or a Windows or
 
 The speed work targets [PXA quants](#use-pxa-quants) (PXQ and PXQN). A standard GGUF file loads and runs on the same server.
 
-The 4.0 numbers, measured against v3.1 on the same machine, are in the [4.0 release notes](RELEASE-NOTES-v4.0.md).
+The 4.0 numbers, measured against v3.1 and mainline llama.cpp (build b76b13379d, built 17 October 2026) on the same machine with the 4.0.0 release build, are in the [4.0 release notes](RELEASE-NOTES-v4.0.md), which also say what changed in later 4.0.x releases.
 
 **On this page:** [What PXA is](#what-pxa-is) · [Use PXA quants](#use-pxa-quants) · [Why it is fast](#why-it-is-fast-on-these-cards) · [Features](#features) · [Supported hardware](#supported-hardware) · [Quick start](#quick-start) · [Models](#models) · [Speed](#speed) · [FAQ](#faq) · [Docs](#docs) · [Community](#community-and-support) · [Credits](#credits) · [Licence](#licence)
 
@@ -66,13 +66,13 @@ Get PXA quants from [Hugging Face](https://huggingface.co/poisonxa), or make one
 
 ### PXQN tiers and what they are worth
 
-Quality is measured on Qwen3.8-27B: how far the quantized model's next-word probabilities drift from the original, scored on the tokens the assistant wrote in a chat test set (KL divergence, **lower is closer to the original**). The class label says which ordinary quant it matches.
+Quality is measured on Qwen3.8-27B: how far the quantized model's next-word probabilities drift from an 8-bit (Q8_0) reference of the same model, scored on the tokens the assistant wrote in a chat test set (24 x 2048 tokens; KL divergence, **lower is closer to the reference**). Scored over every token instead, the same PXQN4 file reads 0.053. The class label says which ordinary quant it matches.
 
 | Tier | Size (27B) | Quality class | Drift (KL) | In plain words |
 |---|---:|---|---:|---|
 | PXQN1 | 6.5 GB | 1-bit class | 2.205 | Experimental. Very lossy. Used for the biggest expert files. |
-| **PXQN2** | 9.6 GB | **3-bit class** | 0.161 | Performs like a classic 3-bit file at 2-bit size. |
-| PXQN3 | 12.7 GB | 3.5-bit class | 0.035 | A good size and quality trade. |
+| **PXQN2** | 9.6 GB | **3-bit class** | 0.17 | Performs like a classic 3-bit file at 2-bit size. |
+| PXQN3 | 12.7 GB | 3.5-bit class | 0.036 | A good size and quality trade. |
 | PXQN3bal | 13.5 GB | 4-bit class | 0.0238 | PXQN3 and PXQN4 mixed per tensor. |
 | **PXQN4** | 15.7 GB | **6-bit class** | 0.0079 | As faithful as a classic 6-bit file (PXQ6, 0.0076, 18.8 GB) in 15.7 GB. |
 | PXQN5 | 18.8 GB | Q6_K class | 0.0022 | The highest quality. Matches Q6_K (0.0023) in 84% of the space. |
@@ -133,7 +133,7 @@ The converter's Python packages are not in the tarball. Install them once:
 | GTX 1080 Ti | `sm_61` | 11 GB | Works. One card only. Smaller models. |
 | Tesla P40 | `sm_61` | 24 GB | Recognised and allowed to use the 16 GB-class settings. **Not measured by us yet.** |
 | Other GTX 10-series, Titan X, Titan Xp, Quadro P cards | `sm_61` | varies | Same chip family as the 1080 Ti. Expected to work. Not individually tested. |
-| RTX 20-series and newer, T4, GTX 16-series | `sm_75`, `sm_80`, `sm_86`, `sm_89` | varies | Best effort. The release tarball `pxa-v4.0.4-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz` carries native code for these cards. Not measured by us; Turing (`sm_75`) has not had a runtime test yet. |
+| RTX 20-series and newer, T4, GTX 16-series | `sm_75`, `sm_80`, `sm_86`, `sm_89` | varies | Best effort. The release tarball `pxa-v4.0.4-linux-x86_64-cuda12.8-sm60_61_70_75_80_86_89.tar.gz` carries native code for these cards. Not measured by us; we have not run a release build on Turing (`sm_75`) ourselves yet. A contributor's results on their own RTX 2080 Ti are in [`docs/SM75.md`](docs/SM75.md). |
 
 **Software.** Linux x86-64. An NVIDIA driver 570 or newer (the package brings its own CUDA 12.8 runtime, so you do not install the toolkit). `python3` for the launcher. Any x86-64 CPU. About 5 GB of disk for the package, plus your models. The tarball needs glibc 2.35 or newer (Ubuntu 22.04 and newer). The Windows engine and the Docker image have their own notes in [`docs/install.md`](docs/install.md). macOS has no engine: the Mac download is the PXA Control client for a rig on your network.
 
@@ -247,7 +247,7 @@ Full list with download counts: [MODELS.md](MODELS.md)
 
 ## Speed
 
-The 4.0 numbers are in the [4.0 release notes](RELEASE-NOTES-v4.0.md): decode and prompt speed against v3.1 on the same machine, in the same session, on the same model file, plus the Nemotron families and mainline llama.cpp on the same machine. Every number there is a greedy-output measurement on the release build, with the settings the engine picks for those cards and no flags typed.
+The 4.0 numbers are in the [4.0 release notes](RELEASE-NOTES-v4.0.md): decode and prompt speed against v3.1 on the same machine, in the same session, on the same model file, plus the Nemotron families and mainline llama.cpp (build b76b13379d, built 17 October 2026) on the same machine. Every number there is a greedy-output measurement on the 4.0.0 release build, with the settings the engine picks for those cards and no flags typed.
 
 The live leaderboard, with every measured card setup and the community scores sent from PXA Control (Benchmarks), is at [benchmarks.pxanetwork.com](https://benchmarks.pxanetwork.com). To measure your own rig, press **Run benchmark** on the Benchmarks page. The numbers from earlier releases are in [`RELEASE-NOTES-v3.md`](RELEASE-NOTES-v3.md) and [`RELEASE-NOTES-v3.1.md`](RELEASE-NOTES-v3.1.md).
 

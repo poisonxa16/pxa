@@ -35,7 +35,7 @@ Every number is a same-box measurement from the ledger; entries marked NOT-QUIET
 
 - Nemotron-H decode on one P100 is faster: Nano-4B Q8_0 tg128 85.9 tok/s vs mainline 63.5 (35-57 on the first port; NOT-QUIET). Open: Nano-4B Q4_K_M 69.6 tok/s vs mainline 68.4 and a popular community fork 87.0; a fix is built and stays off by default until it is measured on a P100.
 - Nemotron 3 Nano 30B-A3B with experts in system RAM: load the model from RAM, not by mmap from a slow disk. Page-cache eviction made one run three times slower.
-- Nemotron-4 Mini 4B PXQN4 decodes 4% slower than upstream llama.cpp's Q4_K_M on one V100 (155 vs 162 tok/s; prefill is 15-22% faster); on one P100 PXQN4 is the fastest Mini tier (120 tok/s).
+- Nemotron-4 Mini 4B PXQN4 prefill on one V100 is 15-22% faster than upstream llama.cpp's Q4_K_M; on one P100 PXQN4 is the fastest Mini tier (120 tok/s).
 - NVIDIA's own Nemotron 3.5 Bolt GGUF (NVFP4 weights) does not load yet; convert the BF16 checkpoint with the bundled converter instead.
 
 ### Long-context prefill

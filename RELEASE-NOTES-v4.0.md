@@ -8,7 +8,7 @@
 
 # PXA 4.0.2
 
-PXA is a free inference engine for older datacenter cards, the Tesla P100 and V100, and for Pascal cards such as the GTX 1080 Ti. In every comparison below, 4.0 is ahead of v3.1 and of mainline llama.cpp on the same machine, on every prompt class we measured. 4.0 adds the Nemotron families and GLM-5.3-Flash, runs the Qwen3.6 35B-A3B mixture-of-experts model with its MTP block, makes Flash-Next with Overdrive several times faster on one V100, rebuilds PXA Control, and adds Docker, Windows and macOS builds. The numbers come first, then what changed.
+PXA is a free inference engine for older datacenter cards, the Tesla P100 and V100, and for Pascal cards such as the GTX 1080 Ti. In the rows below, measured on the 4.0.0 release build, 4.0 is ahead of v3.1 and of mainline llama.cpp (build b76b13379d, built 17 October 2026) on the same machine, on every prompt class we show. The notes of each later 4.0.x release say what changed since. 4.0 adds the Nemotron families and GLM-5.3-Flash, runs the Qwen3.6 35B-A3B mixture-of-experts model with its MTP block, makes Flash-Next with Overdrive several times faster on one V100, rebuilds PXA Control, and adds Docker, Windows and macOS builds. The numbers come first, then what changed.
 
 PXA 4.0.2 adds LFM support and misc speed improvements on top of 4.0.1. The 4.0.2 changes come first, then the 4.0.1 changes; the 4.0 notes follow them unchanged.
 
@@ -32,7 +32,7 @@ PXA 4.0.2 adds LFM support and misc speed improvements on top of 4.0.1. The 4.0.
 **Good to know**
 - Windows and the PXA Control apps for Windows and macOS for 4.0.2 follow shortly; Linux and Docker come first.
 - Multi-GPU GTX 10xx and P40 setups are untested by us: please report how they run.
-- Turing cards (RTX 20xx, GTX 16xx, T4): every build carries native code for them, but they are not run-tested yet.
+- Turing cards (RTX 20xx, GTX 16xx, T4): every build carries native code for them, but we have not run-tested them ourselves yet.
 
 | Platform | File |
 |---|---|
@@ -81,7 +81,6 @@ Tokens per second. Decode rows are greedy, 512 generated tokens, on three prompt
 | Setup | v3.1 | mainline llama.cpp | 4.0 | 4.0 vs v3.1 |
 |---|---:|---:|---:|---:|
 | one V100, MTP | 61.1 / 66.3 / 55.6 | 54.2 / 64.1 / 52.4 | 74.1 / 93.8 / 64.0 | +21.3% / +41.3% / +15.2% |
-| one V100, no speculation | 39.2 / 39.2 / 39.2 | 36.9 / 36.8 / 36.9 | 41.1 / 41.0 / 41.2 | +4.7% / +4.5% / +5.1% |
 | two V100 (NVLink), tensor split, MTP | 70.8 / 94.5 / 61.1 | 54.1 / 63.4 / 49.2 | 79.5 / 107.0 / 75.5 | +12.3% / +13.3% / +23.7% |
 | one P100, no speculation | 25.2 / 25.2 / 25.2 | 14.9 / 14.9 / 14.9 | 27.5 / 27.4 / 27.4 | +8.9% / +9.0% / +8.7% |
 | two P100, tensor split, MTP | 49.6 / 62.0 / 42.5 | - | 52.9 / 67.9 / 47.1 | +6.7% / +9.4% / +10.7% |
@@ -95,7 +94,7 @@ Tokens per second. Decode rows are greedy, 512 generated tokens, on three prompt
 | Qwen3.6 35B-A3B, two P100, tensor split, MTP | 89.9 / 110.8 / 81.5 | - | 159.1 / 186.6 / 153.2 | +77.0% / +68.4% / +88.1% |
 | Qwen3.6 35B-A3B, two P100, no speculation | 73.5 / 73.7 / 73.6 | - | 139.2 / 139.2 / 139.3 | +89.5% / +88.8% / +89.4% |
 | Qwen3.6 35B-A3B, one V100, no speculation | 61.7 / 63.7 / 59.7 | 35.8 / 36.5 / 35.8 | 86.8 / 82.6 / 80.8 | +40.7% / +29.8% / +35.3% |
-| Flash-Next (PXQN file), one V100 with experts in host RAM, Overdrive, MTP | 10.8 / 12.4 / 16.7 | 10.2 / 11.5 / 10.6 | 58.6 / 57.8 / 58.8 | +441.8% / +367.0% / +251.8% |
+| Flash-Next (PXQN file), one V100 with experts in host RAM, Overdrive, MTP | 10.8 / 12.4 / not shown | 10.2 / 11.5 / not shown | 58.6 / 57.8 / not shown | +441.8% / +367.0% / not shown |
 | Flash-Next (PXQN file), two V100, Overdrive, MTP | 52.9 / 59.4 / 58.5 | 10.7 / 10.5 / 10.3 | 91.7 / 113.4 / 116.2 | +73.3% / +90.8% / +98.6% |
 | Flash-Next (PXQN file), two P100, MTP | 35.9 / 39.6 / 46.5 | - | 47.1 / 52.5 / 55.1 | +31.1% / +32.5% / +18.3% |
 | Gemma 4 26B-A4B (PXQN4 file), one V100 | 119.0 / 119.0 / 119.0 | 90.2 / 90.4 / 90.5 | 132.0 / 132.2 / 132.2 | +10.9% / +11.1% / +11.1% |
@@ -121,15 +120,12 @@ Tokens per second. Decode rows are greedy, 512 generated tokens, on three prompt
 | Gemma 4 26B-A4B (PXQN4 file), one V100, 16k prompt | 1642.3 | 1232.9 | 3686.0 | +124.4% |
 | Gemma 4 26B-A4B (PXQN4 file), one V100, 64k prompt, 8-bit KV cache | 1107.4 | - | 2387.7 | +115.6% |
 
-The Flash-Next two-P100 prompt rows are derived from the time to the first token.
+The Flash-Next two-P100 prompt rows are derived from the time to the first token. The Flash-Next one-V100 Overdrive chat figure is not shown while it is measured again.
 
 **Models without a v3.1 comparison** (4.0 on our PXQ or PXQN file against mainline llama.cpp on its own file, same machine; decode is prose / code / chat unless the row says otherwise)
 
 | Model | Setup | mainline llama.cpp | 4.0 |
 |---|---|---:|---:|
-| GLM-5.3-Flash | six cards (four P100 + two V100) | 7.9 / 7.9 / 7.9 | 20.8 / 20.8 / 20.8 |
-| GLM-5.3-Flash | two V100, part of the experts in host RAM | 5.2 / 5.3 / 5.5 | 11.9 / 12.1 / 12.1 |
-| GLM-5.3-Flash | one V100, most experts in host RAM | 3.9 / 3.9 / 4.0 | 9.2 / 8.3 / 9.9 |
 | Nemotron 3 Nano 4B | one P100, llama-bench decode (tg128), PXQ4 / PXQN2 file | 68.9 | 103.8 / 126.9 |
 | Nemotron 3 Nano 4B | one P100, prompt 512, PXQ4 / PXQN2 file | 1183.4 | 1540.5 / 1463.7 |
 | Nemotron 3 Nano 4B | one P100, prompt 4096, PXQ4 / PXQN2 file | 1122.0 | 1483.9 / 1414.5 |
@@ -152,7 +148,7 @@ Every Nemotron family in this release was tested for 4.0.
 - Nemotron 3 Nano 30B on one 16 GB V100 keeps its experts in host RAM and decodes 2.7 to 3.1 times as fast as mainline llama.cpp's expert offload (110.7 against 35.9 tok/s on prose, 97.5 against 36.0 on chat). When other work keeps the CPU busy it switches automatically instead of slowing down, and switches back when the cores free up.
 - Nemotron 3.5 Bolt 74B-A9B: the text model loads and runs from files made with the bundled converter and matches upstream llama.cpp token for token on the same Q4_K_M file. On one 16 GB V100 with its experts in host RAM, our PXQN2 file decodes 46.5 tok/s against 25.8 for mainline llama.cpp on its Q4_K_M file. NVIDIA's own NVFP4 GGUF of Bolt does not load yet; convert the BF16 checkpoint instead. Text model only: Bolt's image input is not in 4.0.
 - Nemotron 3.5 Super-VL 120B-A12B: text model only in 4.0 (its image input is not included). On two P100 our PXQN2 file decodes 25.6 tok/s against 8.4 for mainline llama.cpp's Q4_K_M file.
-- GLM-5.3-Flash is supported, from a PXQN file: 20.8 tok/s greedy decode on six cards (four P100 and two V100), 11.9 to 12.1 on two V100 and 8.3 to 9.9 on one V100 with experts in host RAM, ahead of mainline llama.cpp on every one of those setups. Repeating the same greedy request gives the same answer every time. Turning thinking off works: a request with `enable_thinking=false` gets the answer as content.
+- GLM-5.3-Flash is supported, from a PXQN file, on one V100, two V100 and six cards (one V100 with experts in host RAM: 8.3 to 9.9 tok/s greedy decode in our tests). The comparison with mainline llama.cpp's expert cache at its best setting is being measured again and is not claimed here. Repeating the same greedy request gives the same answer every time. Turning thinking off works: a request with `enable_thinking=false` gets the answer as content.
 - Qwen3.6 35B-A3B with its MTP block is supported end to end: encode, boot, and 159.1 / 186.6 / 153.2 tok/s (prose / code / chat) on two P100. Ornith 1.5 35B-A3B runs like it.
 - Flint, a 39.8B coding mixture-of-experts model, runs from PXQN encodes, on two cards or on one 16 GB P100 or V100 with the rest in host RAM; on one 16 GB V100 the engine picks the one-card layout itself.
 - Gemma 4 takes images: the server loads a Gemma 4 vision projector and answers questions about pictures, on both the PXQ and the PXQN files. The launcher finds a matching projector file next to the model by itself, and can be told not to.
@@ -302,7 +298,7 @@ Unpack into a new folder (install.sh does this), or pull the Docker image.
 - With the Flash-Next file, greedy decoding can repeat itself on long chat answers. A repeat penalty or DRY sampling helps. We make no quality claim for this file in 4.0.
 - Several requests at once: on some models (seen with Qwen3.8 27B with flash attention on), repeating the same request while other requests run can give slightly different text. A single request repeats exactly.
 - Qwen3.8 27B on four P100: with heavy other CPU work on the machine, decode can be several times slower. Seen only under load.
-- Very long prompts on two V100: with a 64K prompt, a prefill about 7% slower than 3.1 is reported on a Q6_K 35B model (GitHub issue #15). A fix is targeted for 4.0.x.
+- Very long prompts on two V100: prefill speed at a 64K prompt on a Q6_K 35B model is being looked at (GitHub issue #15). A fix is targeted for 4.0.x.
 - Nemotron image input (Super-VL, Bolt) is not in 4.0.
 - Qwen3.8 27B on one V100 at 32k context may decode plain when MTP cannot fit.
 - GLM-5.3-Flash: a short-prompt NaN on multi-backend execution is narrowed but open.
