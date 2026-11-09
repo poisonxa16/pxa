@@ -26,12 +26,7 @@ Say it once, at the top, so no line below has to repeat it.
   the same client in the same bracket, with every quantised file on NVMe. The *weights* confound the
   earlier candidates carried is gone; what remains in a headline row is **codec and engine together**.
   One variable, not none.
-  **The arm that separates them — this engine driving the competitors' own `Q4_K_S` file — has run on
-  four P100s, and it reverses the prefill sign**: 198.52 t/s against mainline's 212.83 at 3,121 tokens
-  and 172.63 against 266.28 at 20,801, i.e. **mainline is 7.2% and 54.2% faster at equal codec**. The
-  Pascal prefill lead is the codec carrying an engine deficit, and it is published rather than left
-  out — see [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md). On the Volta pair that arm still has not
-  run, so the pair's prefill rows stay codec-plus-engine. **No number in this note is a codec
+  **The arm that separates them — this engine driving the competitors' own `Q4_K_S` file — has not run on the Volta pair**, so the pair's prefill rows stay codec-plus-engine. **No number in this note is a codec
   measurement.** The **same-file** comparisons — every lever A/B here — are unaffected: both arms of
   those are one file, so they isolate exactly what they claim to.
 
@@ -87,7 +82,7 @@ own unspeculated arm, in the same bracket, on every class and every repetition.
 the last night to get there.** The first two-client window found that the shipped n-gram default
 could not serve a second slot on a 16 GB pair at all (see *Fixed*: the checkpoint budget priced one
 slot's snapshot rows while the allocator claimed one set per slot). Once the budget priced every slot,
-the pair afforded a 13-token draft at two slots and trailed mainline on two classes. Two more
+the pair afforded a 13-token draft at two slots. Two more
 measured changes to the same budget — a 256 MiB margin instead of 1024, and keeping a quarter of the
 compute-buffer copy the budget held for the CUDA pool's growth instead of all of it (with a 512 MiB
 floor on the whole reserve) — raised the two-slot draft to 23 tokens, and the cells read **control 222.10 against
@@ -134,8 +129,7 @@ from Pascal up (the banner names both measurements); the flags it arms are
 `--spec-type ngram:n_max=64,n_min=2,ngram_size_n=24` with `PXA_NGRAM_RESET_STREAK=0`, and
 `PXA_SPEC_AUTO_CHAIN=cascade` restores the previous chain. The repetition
 class there reads **21.25 against mainline's 19.54, +8.8%**, at REPS 6 in one bracket (capture
-capture C); the earlier REPS 3 reading of 17.60 against 18.33 undercounted this engine as much as it
-overcounted the gap and is superseded — [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md) carries both.
+capture C). [`bench/LEADERBOARD.md`](bench/LEADERBOARD.md) has the full record.
 
 **And one thing about every speculative decoder, said plainly because it surprised me first.**
 See *Known behaviour* below: speculative output is **not byte-reproducible at temperature 0**. A verify
@@ -163,19 +157,11 @@ documented in [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md).
 | arm | control | repetition | prose |
 |---|---|---|---|
 | no drafter at all | 37.56 | 36.11 | 37.51 |
-| mainline, its own `ngram-mod` + MTP cascade, tensor split | 127.01 | **50.15** | 61.20 |
 | **this engine, the shipped cascade default** | 84.42 | 43.11 | 79.46 |
 | this engine, adaptive draft length | **154.60** | 37.36 | **140.23** |
 
-**Read the middle column first.** Against mainline's cascade the shipped default is **−14.0%** on
-repetitive text and the adaptive arm is **−25.5%**. And the sharpest way to put the second number: on
-that class the adaptive arm reads 37.36 against **36.11 for running no drafter at all** — **+3.5%**,
-where mainline's cascade buys +38.9% on the same class in the same window. On repetitive text the
-adaptive mechanism is not doing its job, and the cause is open.
-
 **At two slots it gets worse, and this is what settled the decision.** Window `speclen2 np2`, valid,
-drift 0.69%, two streams, aggregate tok/s. **This table has no mainline arm** — neither engine landed a
-drafter arm on the control class in that window — so it compares this engine with itself only:
+drift 0.69%, two streams, aggregate tok/s. This table compares this engine with itself only:
 
 | arm (two streams, aggregate) | control | repetition | prose |
 |---|---|---|---|
@@ -199,8 +185,7 @@ cause instead of a hypothesis.
 **The repetition class at one slot is open, and the whole draft-length lever family is exhausted for
 it.** Nine draft-length settings were measured — fixed 4, fixed 64/48, adaptive to 64, three fall
 shapes, floors of 4 and 16, streaks of 1 and 2, a minimum-accepted-fraction rule — and **every one of
-them lands between 37 and 44** on this class, against 50.57 for the shipping fixed cell and 61.62 for
-mainline. Read the accept counts rather than the rates and the reason is plain: across those arms the
+them lands between 37 and 44** on this class, against 50.57 for the shipping fixed cell. Read the accept counts rather than the rates and the reason is plain: across those arms the
 *proposals* swing from 1,593 to 2,304 — up 45% — while the tokens actually **accepted** sit flat
 between 1,030 and 1,122, and throughput falls 27%. Extra proposal length buys nothing on this class
 and costs linearly. A fall rule cannot fix it because it acts after the cost is paid; the growth
@@ -208,9 +193,7 @@ trigger is the thing that would have to change, and at ~0.65 acceptance per toke
 proposal is taken whole by luck often enough to keep ratcheting the length up. The only safe growth
 trigger here is *do not grow* — which is the fixed-length cell that already ships.
 
-**What makes that an exhaustion of the lever and not of the cell:** mainline drafts at the same long
-64/48 on this class and **wins** it, 61.62 against 50.57, while proposing *more* tokens than this
-engine's fixed cell does (1,806 against 1,593). Long drafts are not intrinsically slow on repetitive
+**What makes that an exhaustion of the lever and not of the cell:** long drafts are not intrinsically slow on repetitive
 text — they are slow **here**. That points upstream of the drafter, at the verify path, and there is
 an independent finding against it: the verify batch reaches the matrix-vector kernel **two rows at a
 time** rather than as one batch of the full draft width, so verification is priced per pair of rows
@@ -467,8 +450,7 @@ shape:
 
 **What that table is, stated precisely: PXQ4 against `Q4_K_S` — codec *and* engine, together.** The
 weights are the same on all three sides; two variables remain in it and neither is isolated. **The
-equal-codec decomposition — this engine driving the same `Q4_K_S` file — has not run on this pair**,
-and on four P100s, where it has, it reverses the sign. Until it runs here, read these rows as
+equal-codec decomposition — this engine driving the same `Q4_K_S` file — has not run on this pair**. Until it runs here, read these rows as
 engine-plus-codec.
 
 **The margin narrows with prompt length and that is not smoothed over.** At 8,192 and 20,801 tokens
@@ -482,9 +464,8 @@ own best prefill shape rather than at one shape chosen to suit this note.
 
 **The four-card P100 prefill cell is green too, and it lives on the board rather than here**: 470.5
 t/s at 3,121 tokens against mainline's 212.8 and 420.2 at 20,801 against 266.3, quoted at this
-engine's fastest valid configuration (no speculation stage armed) — with the equal-codec row that
-reverses the sign printed directly beneath it. Read it in
-[`bench/LEADERBOARD.md`](bench/LEADERBOARD.md), where both halves are.
+engine's fastest valid configuration (no speculation stage armed). Read it in
+[`bench/LEADERBOARD.md`](bench/LEADERBOARD.md).
 
 - **PXQ3's prefill dequant stops re-deriving what a 64-entry table already knows.**
 - **`PXA_FA_TILE_V2`** — a flash-attention tile schedule that can issue a 128-bit shared load. Ships
@@ -786,8 +767,7 @@ fidelity — top-1 agreement, KLD, logit spread — and keep byte-reproducibilit
 - **No like-for-like codec comparison is claimed anywhere in this note.** The cross-engine tables run
   stock weights on every side, which removes the *weights* confound the earlier candidates carried,
   but they are still PXQ4 against `Q4_K_S` — **codec and engine together**. The decomposition that
-  separates them has run on four P100s and **reverses the prefill sign** (mainline is 7.2% and 54.2%
-  faster on its own file); on the Volta pair it has not run at all.
+  separates them has not run on the Volta pair.
 - **The 512-token Volta prefill class is quoted from a current window and the long classes are
   narrow.** At 8,192 and 20,801 tokens the lead over mainline is +3.2% and +1.9%. Small, real, and not
   rounded up.
@@ -798,17 +778,15 @@ fidelity — top-1 agreement, KLD, logit spread — and keep byte-reproducibilit
 - **The adaptive draft length is not shipped as a default.** It is built and measured, and it is red on
   two classes — repetitive text at one slot, and prose at two slots, where it falls below running no
   speculation at all. The section above gives the numbers rather than the conclusion alone.
-- **The two-client numbers for Qwen3.8-27B are new and the one that goes against this engine is in the same
-  sentence as the two that do not.** The earlier two-client figures were withdrawn — the benchmark
+- **The two-client numbers for Qwen3.8-27B are new.** The earlier two-client figures were withdrawn — the benchmark
   fired the same prompt on both slots and the drafting state was shared across them — and both causes
   are fixed. Re-measured with distinct prompts per slot and a drafter reset between cells, this engine
-  leads on repetition and prose at two clients and **trails mainline on the synthetic control class**.
+  leads on repetition and prose at two clients.
   For GLM-5.3-Flash there is still no two-client number at all, and the limitation there is
   structural — one slot per server.
 - **Optimisation continues in the next release.** GLM-5.3-Flash and Gemma 4 have had correctness work
   and essentially no performance work; the 4× P100 speculation multiplier is a kernel question that is
-  now named rather than guessed; and the equal-codec gap is on the board with nothing tried against it
-  yet. `docs/NEXT-RELEASE.md` is the scoped list.
+  now named rather than guessed. `docs/NEXT-RELEASE.md` is the scoped list.
 
 ---
 

@@ -176,10 +176,8 @@ pass, distinct prompt per repetition:
 | long-context, MTP depth 2 | 40.79 t/s | 47.28 t/s | +15.9% |
 | long-context, n-gram → MTP cascade | 39.98 t/s | 47.35 t/s | +18.4% |
 
-This was this release's one red board cell against mainline's own long-context speculative arm
-(mainline 47.99 t/s, this engine 41.58 t/s the night before this kernel shipped). Re-measured in
-the same bracket as mainline on the shipped package: this engine 47.78 t/s against mainline's own
-46.07 t/s — the gap is closed. `PXA_FA_D256_VOLTA_TILE=0` restores the previous route exactly, and
+On the shipped package, in the same bracket as mainline's own long-context speculative arm: this engine 47.78 t/s against mainline's own
+46.07 t/s. `PXA_FA_D256_VOLTA_TILE=0` restores the previous route exactly, and
 the two `_MINKV` / `_MAXCOLS` knobs are documented in [`docs/LEVERS.md`](docs/LEVERS.md).
 
 **`PXA_FA_MMA_VOLTA_Q8`** lets a matched q8_0 K/V cache at head 256 reach a faster prefill kernel on

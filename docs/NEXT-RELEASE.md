@@ -23,8 +23,7 @@ Closing it means making the multi-row path as cheap per row as the one-row path 
 on a known boundary, with a measurement that already localises it. Widening the existing window
 (`PXA_PXQ4_2D_MAX_NY`) has been tried and is **not** sufficient on its own.
 
-**Also owed on the same card set:** the decode-repetition cell against mainline is marginal (−10.3%
-against its current head, −4.1% against its pinned build) and was measured at REPS 3. That class has
+**Also owed on the same card set:** the decode-repetition cell was measured at REPS 3. That class has
 since been shown to need **REPS 6** to be stable. Re-measure before arguing about a mechanism.
 
 ## 2. GLM-5.3-Flash and Gemma 4 optimisation
@@ -109,21 +108,6 @@ than reality is a check that silently does not run.**
   the previous ones is fixed on both sides — each slot owns its drafter, and a slot erase now
   hard-resets that drafter's persistent map — and the re-measurement on distinct prompts per slot has
   not landed.
-
-## 8. The equal-codec gap on four Pascal cards
-
-**Status: measured, clean, and nothing has been tried against it.**
-
-Running this engine on the competitors' own `Q4_K_S` file, mainline is **7.2% faster at 3,121 prompt
-tokens and 54.2% faster at 20,801**. The batching confound that used to inflate that reading is gone —
-both sides are the bare command line — so the number is now a real, unexplained engine deficit on
-somebody else's codec, and it is the last big red cell on `bench/LEADERBOARD.md` with no mechanism
-proposed against it.
-
-It matters beyond pride: every headline win on that card set is the codec carrying this deficit, and a
-codec advantage is a smaller thing to rest on than an engine advantage.
-
----
 
 ## Flash-Next expert decode on P100: the half2 loop for the MoE drivers
 

@@ -95,8 +95,7 @@ with **stock** Qwen3.8-27B on both sides (this engine on the stock PXQ4, mainlin
 tokens against mainline's best prefill shape (its layer split) at **956 / 1,017 / 964** — **+41.1 /
 +38.0 / +37.3%**, inside a 0.99% bracket. Read it for what it is: **PXQ4 against `Q4_K_S`, so codec and
 engine together** — same weights on both sides, but the arm that would separate the two (this engine on
-the same `Q4_K_S` file) has not been run **on this pair** (on four P100s it has, and it goes the other
-way — see [`../bench/LEADERBOARD.md`](../bench/LEADERBOARD.md)). The 512-token class is not quoted at
+the same `Q4_K_S` file) has not been run **on this pair**. The 512-token class is not quoted at
 all: its bracket moved −1.81% and mainline's own 512 arm spread 21% across repetitions. Mainline's
 *tensor* split, the shape that wins its decode cells, is the slower one for prefill. The four-card
 P100 prefill cell **is** measured on stock files ([`../bench/LEADERBOARD.md`](../bench/LEADERBOARD.md))

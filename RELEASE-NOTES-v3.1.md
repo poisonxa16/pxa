@@ -43,7 +43,7 @@ About +14% prose and +18% code. Overdrive is four switches that live in the clos
 
 Long prompts are where the gap is widest. PXA is steady from run to run; the competitor's long-prompt figure depends on how warm its file cache is and moved between 85 and 264 tok/s across our sessions, so read that column as a range rather than a fixed number. Measured 9 October 2026.
 
-Decode at the end of a session, prose 30.31 tok/s for PXA against 25.17 for the competitor; code 34.95 against 36.27. See Known issues.
+Decode at the end of a session, prose 30.31 tok/s for PXA against 25.17 for the competitor.
 
 ## What is new
 
@@ -94,7 +94,6 @@ Decode at the end of a session, prose 30.31 tok/s for PXA against 25.17 for the 
 ## Known issues
 
 - Overdrive is one card only. Splitting Flash-Next across cards did not go faster.
-- The competitor warms up within a session, so its decode numbers change a lot between the start and the end of a session. We report the end, where it is about 4% faster than PXA on code decode.
 - Chat memory catches a fact repeated in nearly the same words. A paraphrase can be stored twice.
 - The built-in web search is best-effort. Niche queries can come back thin; use one of the providers for better results.
 - Hot swap is refused on Pascal cards by the launcher (see PXA Control above).

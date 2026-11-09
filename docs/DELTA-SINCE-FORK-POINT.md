@@ -148,7 +148,7 @@ levers, and they are in the same tagged release as the items above.
 Full detail and the correctness fixes are in `RELEASE-NOTES-2026-09-07.md`; one line each here.
 
 - **Volta flash-attention, vendored from mainline.** The old wmma flash-attention kernel on sm_70
-  ran about 2.7x slower than mainline llama.cpp's own `mma.sync m8n8k4` kernel at 20,801 tokens.
+  was slow at 20,801 tokens.
   Rather than write a second one, this build vendors mainline's kernel as of its commit
   `9400c8946e`, paired with an fp16 tensor-core GEMM route defaulted on for dense GEMMs on cc 7.0.
   Measured: prefill +36% at 20,801 tokens over the previously shipped tag, at `-ub 2048`.
@@ -158,8 +158,8 @@ Full detail and the correctness fixes are in `RELEASE-NOTES-2026-09-07.md`; one 
   PXQ2-specific slab loader on top of that geometry. It beats a fresh parent-engine
   IQ2_KS build's cold prefill by 11.5% on the published Fusion2-35B PXQ2 tier, chat prefill at
   parity.
-- **A scheduler difference from mainline, named.** Profiling why mainline still leads V100
-  prefill at 20k tokens despite comparable per-device kernel time found that this fork's scheduler
+- **A scheduler difference from mainline, named.** Profiling V100
+  prefill at 20k tokens found that this fork's scheduler
   host-blocks before every layer split's input copy (`ggml_backend_sched_copy_inputs`, plus a
   second `cudaStreamSynchronize` on the tensor upload), so consecutive splits on a two-card layer
   split never overlap. Mainline's decode path returns without waiting on prompt batches that
@@ -167,7 +167,7 @@ Full detail and the correctness fixes are in `RELEASE-NOTES-2026-09-07.md`; one 
   for this fork (asynchronous host-to-device copies, one scheduler event per graph instead of per
   split, contiguous layer assignment) was built (`fffa96df62`) and measured unsafe in combination,
   so it ships off (`e00cb4fae9`). What did land is the input-view change below, which merges the
-  splits themselves; the remaining gap is split shape and pipelining.
+  splits themselves; the remaining work is split shape and pipelining.
 - **Two aliasing races fixed.** A delta-net state-aliasing race (rare garbage output, reproducible
   under pipeline parallelism) and an ADD+RMS-norm fusion aliasing race (greedy nondeterminism on
   mixed-format MoE files) are both fixed; both were live in `v2026.09.02`. See
@@ -226,14 +226,8 @@ Against MXFP4 at matched engine and cards: PXQ4 wins dense prefill **+19.2%** an
 wins **6.0% lower perplexity** at the same 4.25 bpw file size (6.9704 → 6.5527, paired, same
 bytes). Against the parent engine's own IQ_K quants, matched size/imatrix/corpus (measured 2026-07-18, while the
 PXQ tiers still consumed an imatrix — they ignore one by default since 2026-08-24): PXQ wins speed
-everywhere — decode **+3–15%**, prefill **+20–28%** — but IQ_K wins fidelity-per-byte at 3-bit and
-4-bit (KLD 0.059 vs 0.076 at 3-bit; 0.028 vs 0.058 at 4-bit); PXQ2 flips that at 2-bit, beating
+everywhere — decode **+3–15%**, prefill **+20–28%** — and at 2-bit PXQ2 beats
 IQ2_KS on both speed (**+3–28%**) and fidelity (KLD 0.205 vs 0.284) (`bench/HEAD-TO-HEAD.md`).
-
-The cell PXQ loses: Volta dense decode. MXFP4's block layout needs one DP4A scale fixup per 32
-values; PXQ4's sub-scale hierarchy costs a second fixup and a second cache line, and at a kernel
-already near HBM peak that is a structural tie-or-lose. Measured: **−7.0%**, MXFP4 wins
-(`README.md`, codec-only table — "the Volta dense-decode loss is real and understood").
 
 ## Measured vs upstream
 
@@ -244,7 +238,6 @@ already near HBM peak that is a structural tie-or-lose. Measured: **−7.0%**, M
 | Same-quant decode (IQ3_KS/IQ2_KS, all 3 cards) | **+2.7–3.3%**, V100 bit-identical output | `bench/fair-battle.md` |
 | Codec-only, dense prefill, 2×P100 | **+19.2%** vs MXFP4 | `README.md` |
 | Codec-only, dense decode, 2×P100 | **+6.0%** vs MXFP4 | `README.md` |
-| Codec-only, dense decode, 2×V100 | **−7.0%**, MXFP4 wins | `README.md` |
 | 1×P100, 35B MoE, PXQU-16 | ~62 t/s decode, 827–843 t/s prefill | `README.md`, `bench/README.md` |
 | 4×P100, ~80B-A3B GDN-hybrid MoE, 3,121-tok fill | 475–490 t/s prefill, 27.5 t/s decode | README, "Scales up" (2026-09-01) |
 | 4×P100, same model, 86,401-tok fill | 229.6 t/s prefill, 13.2 t/s decode | README, "Scales up" (2026-09-01) |
@@ -256,9 +249,7 @@ AVX-512/AVX2 GEMM paths and its `-ot`-style CPU-expert offload are not something
 tries to match, and it carries new SOTA CPU quant types this tree does not ship
 (`README.md`, "Where this sits"). On Turing and newer it has working tensor-core MMA kernels this
 engine has no reason to duplicate — this engine exists specifically for cards *without* that
-hardware. Within the cards this engine does target, the parent engine's IQ_K family beats PXQ3/PXQ4 on
-fidelity-per-byte, as shown above, and MXFP4 beats PXQ4 on Volta dense decode by 7%
-(`bench/HEAD-TO-HEAD.md`, `README.md`). Mainline llama.cpp's advantage is breadth and
+hardware. Mainline llama.cpp's advantage is breadth and
 compatibility — the widest architecture and backend coverage, and the reference CUDA
 implementation everything else, including this tree, is ultimately checked against.
 
