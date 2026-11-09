@@ -670,3 +670,10 @@ you expect to want more than one target format.
 (`llama-quantize --allow-requantize --i-know-this-is-double-lossy` also accepts a PXQ file
 directly as `in.gguf`, skipping the export step; the two-step recipe above is the one to reach
 for when you want the intermediate F16/F32 file too.)
+
+
+## Resident Q6_K on two V100s
+
+For the dual-V100 configuration in issue #15, an opt-in launch-queue profile
+recovers the measured prefill regression while keeping numerical guards enabled.
+See [the configuration, measurements and limits](dual-volta-launch-queues.md).
