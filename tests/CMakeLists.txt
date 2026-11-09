@@ -2042,3 +2042,23 @@ endif()
 
 # the closed tree's own tests (closed itself; absent from the public tree)
 include(${CMAKE_CURRENT_SOURCE_DIR}/pxa-closed-tests.cmake OPTIONAL)
+
+# Synthetic, model-free check for the experimental SM70 Q6_K down projection.
+option(PXA_BUILD_Q6K_DOWN2_TEST "Build the CUDA Q6_K two-token down-projection test" OFF)
+if (PXA_BUILD_Q6K_DOWN2_TEST AND GGML_CUDA)
+    add_executable(test-cuda-q6k-down2 test-cuda-q6k-down2.cu)
+    target_include_directories(test-cuda-q6k-down2 PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    target_compile_definitions(test-cuda-q6k-down2 PRIVATE GGML_USE_CUDA
+        K_QUANTS_PER_ITERATION=${GGML_CUDA_KQUANTS_ITER}
+        GGML_CUDA_FUSION=${GGML_CUDA_FUSION}
+        GGML_CUDA_MIN_BATCH_OFFLOAD=${GGML_CUDA_MIN_BATCH_OFFLOAD}
+        GGML_CUDA_DMMV_X=${GGML_CUDA_DMMV_X}
+        GGML_CUDA_MMV_Y=${GGML_CUDA_MMV_Y}
+        GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+    target_compile_options(test-cuda-q6k-down2 PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math;--expt-relaxed-constexpr>)
+    set_target_properties(test-cuda-q6k-down2 PROPERTIES CUDA_STANDARD 17)
+    target_link_libraries(test-cuda-q6k-down2 PRIVATE ggml CUDA::cudart CUDA::cuda_driver)
+endif()
