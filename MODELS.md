@@ -4,7 +4,7 @@ Models quantized to PXA formats by the team, newest first. This page and the Mod
 
 | Model | Notes | Published by | Added | Downloads | Likes | Updated |
 | --- | --- | --- | --- | --- | --- |
-|[Swift-1.5-Qwen3.8-Flash-Next-PXQN2](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-Flash-Next-PXQN2) |  | PXANetwork | 2026-10-27 | 784 | 1 | 2026-11-04|
+|[Swift-1.5-Qwen3.8-Flash-Next-PXQN2](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-Flash-Next-PXQN2) |  | PXANetwork | 2026-10-27 | 820 | 1 | 2026-11-04|
 |[PXA-Supporter-Models](https://huggingface.co/poisonxa/PXA-Supporter-Models) | <https://ko-fi.com/shatteredrealms1> | PXANetwork | 2026-10-24 | 239 | 5 | 2026-11-11|
 |[Swift-1.5-Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Swift-1.5-Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-10-01 | 890 | 2 | 2026-11-04|
 |[Qwen3.8-27B-PXQN-OneCard](https://huggingface.co/poisonxa/Qwen3.8-27B-PXQN-OneCard) |  | PXANetwork | 2026-09-30 | 984 | 2 | 2026-11-04|
